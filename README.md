@@ -33,6 +33,24 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ## Quick Install
 
+> **This is a fork** (`alt-glitch/hermes-agent`, branch `sid/opentui`) — it ships the
+> **native OpenTUI terminal UI** on top of upstream Hermes. To install *this fork's*
+> TUI (Node 26.3+ required for the native engine; older Node auto-falls-back to Ink):
+>
+> ```bash
+> fnm install 26.3.0 && fnm default 26.3.0        # or any Node ≥ 26.3 on PATH
+> git clone -b sid/opentui https://github.com/alt-glitch/hermes-agent.git
+> cd hermes-agent && ./scripts/install.sh         # auto-detects the fork branch+repo
+> ```
+>
+> Update later with `hermes update` (follows the current branch). Already have a
+> stock Hermes install? `install.sh` switches `~/.hermes/hermes-agent` to this fork
+> (reversible: `cd ~/.hermes/hermes-agent && git checkout main`); pass
+> `--dir ~/.hermes/hermes-opentui` to keep both side-by-side. See
+> [`docs/opentui-fork-cutover-cheatsheet.md`](docs/opentui-fork-cutover-cheatsheet.md).
+>
+> Everything below is the **upstream** install (NousResearch/main — the Ink TUI).
+
 ### Linux, macOS, WSL2, Termux
 
 ```bash

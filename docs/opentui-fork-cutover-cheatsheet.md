@@ -1,7 +1,38 @@
-# Cutover cheat-sheet — install `sid/opentui` as your real `hermes` (replaces the canonical install)
+# Installing the OpenTUI fork (`sid/opentui`)
+
+Two audiences:
+- **A. New users / coworkers** trying the fork on a fresh-ish machine → the 3-line
+  install just below. This is all most people need.
+- **B. glitch's personal cutover** (repointing an existing dual install) → the
+  detailed, machine-specific steps further down. Skip unless you're glitch.
+
+---
+
+## A. Fresh install (coworkers / anyone) — the simple path
+
+```bash
+fnm install 26.3.0 && fnm default 26.3.0        # Node ≥ 26.3 (else OpenTUI → Ink fallback)
+git clone -b sid/opentui https://github.com/alt-glitch/hermes-agent.git
+cd hermes-agent && ./scripts/install.sh         # auto-detects this fork's branch+repo
+```
+- `install.sh` (no flags) detects it's running from a `sid/opentui` checkout of the
+  fork and installs **that** — no `--repo`/`--branch` needed.
+- **Update later:** `hermes update` (now follows the current branch = stays on the fork).
+- **Already have a stock Hermes install?** `install.sh` defaults `INSTALL_DIR` to
+  `~/.hermes/hermes-agent` and will **switch that to the fork**
+  (reversible: `cd ~/.hermes/hermes-agent && git checkout main && hermes update --branch main`).
+  To keep both side-by-side instead: `./scripts/install.sh --dir ~/.hermes/hermes-opentui`.
+- **Launch:** `hermes` (auto-selects OpenTUI on Node ≥ 26.3) or `HERMES_TUI_ENGINE=opentui hermes`.
+
+That's the whole story for new users. Everything below (Section B) is glitch's
+one-time machine-specific cutover — not needed for a fresh install.
+
+---
+
+# B. glitch's cutover cheat-sheet — replace the existing dual install with `sid/opentui`
 
 Copy-paste. Reversible. Live setup is **untouched** until you run these.
-Generated 2026-06-16 with your actual machine state. **Model: B — replace the
+Generated 2026-06-16 with glitch's actual machine state. **Model: B — replace the
 canonical install at `~/.hermes/hermes-agent` with the fork's `sid/opentui`.**
 
 ## Your actual topology (read this — it's interconnected)
