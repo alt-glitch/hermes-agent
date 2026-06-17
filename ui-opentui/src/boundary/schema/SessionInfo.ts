@@ -50,6 +50,9 @@ export const SessionInfoPatchSchema = Schema.Struct({
   model: opt(Str),
   reasoning_effort: opt(Str),
   fast: opt(Bool),
+  // inference provider backing the active model (e.g. "openrouter", "anthropic")
+  // — round-tripped from the merged server's session.info; compat-only, no UI.
+  provider: opt(Str),
   cwd: opt(Str),
   branch: opt(Str),
   // session title ("" until the first exchange titles it) — drives the

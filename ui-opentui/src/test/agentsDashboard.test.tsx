@@ -48,4 +48,30 @@ describe('agents dashboard de-crowd (P2)', () => {
     expect(frame).toContain('all ten timestamps collected') // summary text (detail, not master)
     expect(frame).toContain('poll 4 of 10 recorded') // progress entry
   })
+
+  test('a streamed subagent reply renders as a coalesced ❯ reply line (subagent.text)', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({
+      type: 'subagent.start',
+      payload: { subagent_id: 'a1', goal: 'summarize the changelog', model: 'anthropic/claude-opus-4-8', depth: 0 }
+    })
+    // per-token reply mirror — three frames the server emits one token at a time
+    store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'The release ' } })
+    store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'ships two ' } })
+    store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'features.' } })
+    store.openDashboard()
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { until: 'Agents', width: 116, height: 30 }
+    )
+    expect(frame).toContain('❯') // reply entry glyph (terminal-safe single-width, not a color emoji)
+    // the three per-token frames COALESCED into one line, not three '❯' rows
+    expect(frame).toContain('The release ships two features.')
+    expect(frame.split('❯').length - 1).toBe(1) // exactly one reply glyph in the frame
+  })
 })

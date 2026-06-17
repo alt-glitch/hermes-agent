@@ -161,7 +161,7 @@ export interface CompletionItem {
 /** One typed entry in a subagent's activity trace — `kind` drives glyph + color
  *  in the dashboard so the trace reads like a transcript, not flat dumped lines. */
 export interface TraceEntry {
-  kind: 'start' | 'tool' | 'progress' | 'summary'
+  kind: 'start' | 'tool' | 'progress' | 'summary' | 'reply'
   text: string
 }
 
@@ -219,6 +219,9 @@ export interface SessionInfo {
   model?: string
   effort?: string
   fast?: boolean
+  /** Inference provider backing the active model (`provider`) — round-tripped
+   *  from the merged server's session.info; compat-only, no chrome consumes it yet. */
+  provider?: string
   cwd?: string
   branch?: string
   /** Session title (auto-titled after the first exchange / renamed via the
@@ -392,6 +395,7 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   if (d.model) patch.model = d.model
   if (d.reasoning_effort) patch.effort = d.reasoning_effort
   if (d.fast !== undefined) patch.fast = d.fast
+  if (d.provider) patch.provider = d.provider
   if (d.cwd) patch.cwd = d.cwd
   if (d.branch) patch.branch = d.branch
   if (d.title) patch.title = d.title
@@ -477,6 +481,7 @@ function subagentStatusFor(type: string): string {
   if (type === 'subagent.thinking') return 'thinking'
   if (type === 'subagent.tool') return 'tool'
   if (type === 'subagent.progress') return 'working'
+  if (type === 'subagent.text') return 'replying'
   return 'running'
 }
 
@@ -1208,7 +1213,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
       case 'subagent.thinking':
       case 'subagent.tool':
       case 'subagent.progress':
-      case 'subagent.complete': {
+      case 'subagent.complete':
+      case 'subagent.text': {
         const id = readStr(event.payload, 'subagent_id')
         if (!id) break
         setState(
@@ -1240,6 +1246,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
             else if (event.type === 'subagent.progress' && text) trace.push({ kind: 'progress', text })
             else if (event.type === 'subagent.complete') trace.push({ kind: 'summary', text: summary ?? 'done' })
             else if (event.type === 'subagent.thinking' && text) sa.thought = text
+            // Per-token reply text (subagent.text): COALESCE into one growing
+            // 'reply' line. The server mirrors this once per token, so appending
+            // to the last reply entry (vs pushing) keeps the trace from flooding.
+            else if (event.type === 'subagent.text' && text) {
+              const last = trace[trace.length - 1]
+              if (last && last.kind === 'reply') last.text += text
+              else trace.push({ kind: 'reply', text })
+            }
             if (trace.length > SUBAGENT_TRACE_LIMIT) trace.splice(0, trace.length - SUBAGENT_TRACE_LIMIT)
           })
         )

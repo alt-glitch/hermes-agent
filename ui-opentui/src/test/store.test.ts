@@ -381,6 +381,24 @@ describe('session store — subagents (Phase 5e agents dashboard)', () => {
     ])
   })
 
+  test('subagent.text per-token frames COALESCE into ONE growing reply trace entry', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'subagent.start', payload: { subagent_id: 'a1', goal: 'answer' } })
+    // two consecutive per-token mirrors for the same subagent
+    store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'Hello' } })
+    store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: ', world' } })
+    const sa = store.state.subagents[0]!
+    // grows by ONE (the reply), not two — the start entry + one coalesced reply
+    expect(sa.trace).toHaveLength(2)
+    expect(sa.trace![1]).toEqual({ kind: 'reply', text: 'Hello, world' })
+    expect(sa.status).toBe('replying')
+    // a non-reply entry between two text frames breaks coalescing → a fresh reply line
+    store.apply({ type: 'subagent.progress', payload: { subagent_id: 'a1', text: 'mid' } })
+    store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'again' } })
+    expect(sa.trace).toHaveLength(4)
+    expect(sa.trace![3]).toEqual({ kind: 'reply', text: 'again' })
+  })
+
   test('clearTranscript also clears subagents', () => {
     const store = createSessionStore()
     store.apply({ type: 'subagent.start', payload: { subagent_id: 'a1', goal: 'g' } })
@@ -412,6 +430,18 @@ describe('session store — session chrome / status bar (item 14)', () => {
     expect(info.branch).toBe('main')
     expect(info.contextPercent).toBe(21)
     expect(info.contextMax).toBe(200000)
+  })
+
+  test('session.info round-trips the inference `provider` field (Port #1 compat)', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'session.info',
+      payload: { model: 'anthropic/claude-opus-4-8', provider: 'openrouter', reasoning_effort: 'high' }
+    })
+    const info = store.state.info
+    expect(info.model).toBe('anthropic/claude-opus-4-8')
+    expect(info.provider).toBe('openrouter')
+    expect(info.effort).toBe('high')
   })
 
   test('session.info reads context from TOP-LEVEL fields when there is no nested usage', () => {
