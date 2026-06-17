@@ -8141,12 +8141,36 @@ def _finalize_update_output(state):
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    Centralizes the "accept --branch override, else default to the CHECKOUT'S
+    CURRENT branch (so fork installs update themselves, not upstream main),
+    falling back to main only when detection fails or HEAD is detached" parsing
+    so every consumer of ``--branch`` (check path, git-update path, ZIP-fallback
+    path) agrees on the same answer.
+
+    Fork-install behavior (changed from the upstream hardcoded "main"): a
+    checkout sitting on e.g. ``sid/opentui`` updates ``sid/opentui`` by default,
+    so a bare ``hermes update`` never silently yanks the install onto upstream
+    main. Pass ``--branch main`` explicitly to target main.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    explicit = getattr(args, "branch", None)
+    if explicit and explicit.strip():
+        return explicit.strip()
+    # No --branch: default to the current branch of the install checkout.
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        current = result.stdout.strip()
+        # "HEAD" means detached — no branch to follow, fall back to main.
+        if current and current != "HEAD":
+            return current
+    except Exception:
+        pass
+    return "main"
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
