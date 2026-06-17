@@ -43,8 +43,8 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
-REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+REPO_URL_SSH="${HERMES_REPO_URL_SSH:-git@github.com:NousResearch/hermes-agent.git}"
+REPO_URL_HTTPS="${HERMES_REPO_URL_HTTPS:-https://github.com/NousResearch/hermes-agent.git}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -113,6 +113,26 @@ while [[ $# -gt 0 ]]; do
             BRANCH="$2"
             shift 2
             ;;
+        --repo|-Repo)
+            # Install from a fork instead of NousResearch. Accepts either a full
+            # git URL (git@.../https://...) or "owner/repo" shorthand (expanded to
+            # both SSH + HTTPS forms so the clone fallback still works).
+            case "$2" in
+                git@*|https://*|http://*|ssh://*)
+                    REPO_URL_SSH="$2"
+                    REPO_URL_HTTPS="$2"
+                    ;;
+                */*)
+                    REPO_URL_SSH="git@github.com:$2.git"
+                    REPO_URL_HTTPS="https://github.com/$2.git"
+                    ;;
+                *)
+                    echo "ERROR: --repo expects a git URL or owner/repo (got: $2)" >&2
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
         --commit|-Commit)
             INSTALL_COMMIT="$2"
             shift 2
@@ -167,6 +187,9 @@ while [[ $# -gt 0 ]]; do
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
             echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --repo URL|OWNER/REPO  Install from a fork instead of NousResearch"
+            echo "                   (full git URL or owner/repo shorthand). Updates the"
+            echo "                   existing checkout's 'origin' to this repo too."
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
             echo "  --manifest     Print desktop bootstrap stage manifest as JSON"
             echo "  --stage NAME   Run one desktop bootstrap stage"
@@ -1161,6 +1184,12 @@ clone_repo() {
             # every ref, and this repo carries thousands of auto-generated
             # branches — on a non-single-branch checkout that turns each update
             # into a multi-minute download that can stall the installer.
+            # If --repo pointed us at a fork, repoint the existing checkout's
+            # 'origin' at it so the fetch/checkout below land on the fork's branch
+            # (an install over a stock NousResearch checkout would otherwise fetch
+            # upstream and never see the fork branch).
+            git remote set-url origin "$REPO_URL_SSH" 2>/dev/null \
+                || git remote set-url origin "$REPO_URL_HTTPS" 2>/dev/null || true
             git remote set-branches origin "$BRANCH" 2>/dev/null || true
             git fetch origin "$BRANCH"
             git checkout "$BRANCH"
