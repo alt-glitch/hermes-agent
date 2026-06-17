@@ -72,6 +72,8 @@ RUN_SETUP=true
 SKIP_BROWSER=false
 NO_SKILLS=false
 BRANCH="main"
+BRANCH_EXPLICIT=false
+REPO_EXPLICIT=false
 INSTALL_COMMIT=""
 ENSURE_DEPS=""
 POSTINSTALL_MODE=false
@@ -111,12 +113,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --branch|-Branch)
             BRANCH="$2"
+            BRANCH_EXPLICIT=true
             shift 2
             ;;
         --repo|-Repo)
             # Install from a fork instead of NousResearch. Accepts either a full
             # git URL (git@.../https://...) or "owner/repo" shorthand (expanded to
             # both SSH + HTTPS forms so the clone fallback still works).
+            REPO_EXPLICIT=true
             case "$2" in
                 git@*|https://*|http://*|ssh://*)
                     REPO_URL_SSH="$2"
@@ -224,6 +228,30 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# When neither --branch nor --repo is given, default to the branch + origin URL
+# of the checkout this script is running FROM (instead of the hardcoded
+# NousResearch/main). This makes a fork install "sticky": running
+# ./scripts/install.sh from a sid/opentui checkout re-installs sid/opentui from
+# that fork, rather than silently yanking the install onto upstream main.
+# Explicit --branch / --repo always win. Detection is best-effort: if the script
+# isn't inside a git checkout (curl|bash, tarball), the upstream defaults stand.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+if [ "$BRANCH_EXPLICIT" = false ] || [ "$REPO_EXPLICIT" = false ]; then
+    if _self_branch="$(git -C "$_SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)" \
+        && [ -n "$_self_branch" ] && [ "$_self_branch" != "HEAD" ]; then
+        if [ "$BRANCH_EXPLICIT" = false ]; then
+            BRANCH="$_self_branch"
+        fi
+        if [ "$REPO_EXPLICIT" = false ]; then
+            if _self_origin="$(git -C "$_SCRIPT_DIR" remote get-url origin 2>/dev/null)" \
+                && [ -n "$_self_origin" ]; then
+                REPO_URL_SSH="$_self_origin"
+                REPO_URL_HTTPS="$_self_origin"
+            fi
+        fi
+    fi
+fi
 
 # ============================================================================
 # Helper functions
