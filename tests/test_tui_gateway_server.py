@@ -4998,6 +4998,39 @@ def test_mirror_slash_side_effects_allowed_when_idle(monkeypatch):
     assert applied["model"]
 
 
+def test_mirror_slash_yolo_toggles_gateway_session_flag(monkeypatch):
+    """Regression: /yolo in the TUI runs inside the _SlashWorker SUBPROCESS, so
+    its toggle only flips _session_yolo in the worker's tools.approval module —
+    the gateway-process approval gate never saw it and commands stayed gated.
+    _mirror_slash_side_effects must bridge the toggle into THIS process so the
+    bypass actually takes effect (the same set is_session_yolo_enabled reads)."""
+    import types
+
+    from tools import approval
+
+    key = "yolo-mirror-key"
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    session = _session(running=False, session_key=key)
+    session["agent"] = types.SimpleNamespace(model="x")
+
+    approval.disable_session_yolo(key)
+    try:
+        # bare /yolo → toggles ON
+        server._mirror_slash_side_effects("sid", session, "/yolo")
+        assert approval.is_session_yolo_enabled(key) is True
+        # explicit off
+        server._mirror_slash_side_effects("sid", session, "/yolo off")
+        assert approval.is_session_yolo_enabled(key) is False
+        # explicit on
+        server._mirror_slash_side_effects("sid", session, "/yolo on")
+        assert approval.is_session_yolo_enabled(key) is True
+        # bare toggle again → back off
+        server._mirror_slash_side_effects("sid", session, "/yolo")
+        assert approval.is_session_yolo_enabled(key) is False
+    finally:
+        approval.disable_session_yolo(key)
+
+
 def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
     """Regression guard: /compress side effect must not hold history_lock
     when calling _compress_session_history (the helper snapshots under

@@ -9684,6 +9684,38 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             elif mode in {"normal", "off"}:
                 agent.service_tier = None
             _emit("session.info", sid, _session_info(agent, session))
+        elif name == "yolo":
+            # The slash worker is a SEPARATE subprocess (_SlashWorker), so its
+            # /yolo toggle only flips _session_yolo in the worker's own
+            # tools.approval module state — the gateway-process approval gate
+            # (check_all_command_guards / is_session_yolo_enabled, keyed by
+            # session["session_key"]) never sees it, so commands stay gated.
+            # Bridge the toggle into THIS (gateway) process so the bypass
+            # actually takes effect, mirroring the config.set key=="yolo"
+            # session-scope path. session-scope only here; the global zap goes
+            # through config.set scope="global".
+            from tools.approval import (
+                disable_session_yolo,
+                enable_session_yolo,
+                is_session_yolo_enabled,
+            )
+
+            session_key = session.get("session_key")
+            if session_key:
+                raw = arg.strip().lower()
+                current = bool(is_session_yolo_enabled(session_key))
+                if raw in {"1", "on", "true", "yes"}:
+                    enable = True
+                elif raw in {"0", "off", "false", "no"}:
+                    enable = False
+                else:
+                    enable = not current
+                if enable:
+                    enable_session_yolo(session_key)
+                else:
+                    disable_session_yolo(session_key)
+                if agent is not None:
+                    _emit("session.info", sid, _session_info(agent, session))
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()
         elif name == "stop":
