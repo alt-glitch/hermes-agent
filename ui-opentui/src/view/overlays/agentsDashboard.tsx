@@ -31,11 +31,19 @@ function statusColor(status: string, theme: ReturnType<typeof useTheme>): string
 /** Per-kind glyph + color for a trace entry — makes the detail pane read like a
  *  transcript (tool calls pop, progress is quiet, the summary is the payoff). */
 function traceGlyph(kind: TraceEntry['kind']): string {
-  return kind === 'tool' ? '⚡' : kind === 'summary' ? '✓' : kind === 'start' ? '▶' : '·'
+  return kind === 'tool' ? '⚡' : kind === 'summary' ? '✓' : kind === 'start' ? '▶' : kind === 'reply' ? '❯' : '·'
 }
 function traceColor(kind: TraceEntry['kind'], theme: ReturnType<typeof useTheme>): string {
   const c = theme().color
-  return kind === 'tool' ? c.accent : kind === 'summary' ? c.ok : kind === 'start' ? c.label : c.muted
+  return kind === 'tool'
+    ? c.accent
+    : kind === 'summary'
+      ? c.ok
+      : kind === 'start'
+        ? c.label
+        : kind === 'reply'
+          ? c.text
+          : c.muted
 }
 
 export function AgentsDashboard(props: {
@@ -164,7 +172,14 @@ export function AgentsDashboard(props: {
                       {entry => (
                         <text>
                           <span style={{ fg: traceColor(entry.kind, theme) }}>{`${traceGlyph(entry.kind)} `}</span>
-                          <span style={{ fg: entry.kind === 'summary' ? theme().color.text : theme().color.muted }}>
+                          <span
+                            style={{
+                              fg:
+                                entry.kind === 'summary' || entry.kind === 'reply'
+                                  ? theme().color.text
+                                  : theme().color.muted
+                            }}
+                          >
                             {entry.text}
                           </span>
                         </text>

@@ -67,6 +67,16 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
+  test('decodes a subagent.text frame (per-token reply mirror) into the typed event', () => {
+    const ev = decode({ type: 'subagent.text', session_id: 's1', payload: { subagent_id: 'a1', text: 'hel' } })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'subagent.text') {
+      expect(ev.value.session_id).toBe('s1')
+      expect(ev.value.payload.subagent_id).toBe('a1')
+      expect(ev.value.payload.text).toBe('hel')
+    }
+  })
+
   test('SKIPS an unrecognized event type (Option.none, no throw)', () => {
     expect(Option.isNone(decode({ type: 'totally.unknown.event', foo: 1 }))).toBe(true)
   })

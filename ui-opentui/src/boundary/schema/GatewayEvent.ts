@@ -178,6 +178,10 @@ const SubagentThinking = Schema.Struct({ type: Schema.Literal('subagent.thinking
 const SubagentTool = Schema.Struct({ type: Schema.Literal('subagent.tool'), ...SubagentShape })
 const SubagentProgress = Schema.Struct({ type: Schema.Literal('subagent.progress'), ...SubagentShape })
 const SubagentComplete = Schema.Struct({ type: Schema.Literal('subagent.complete'), ...SubagentShape })
+// Per-token streamed reply text from a subagent. The server mirrors this once per
+// token, so the store COALESCES consecutive frames into one growing trace line
+// (see store.ts reducer) rather than one line per token.
+const SubagentText = Schema.Struct({ type: Schema.Literal('subagent.text'), ...SubagentShape })
 
 // transport errors
 const ErrorEvent = Schema.Struct({
@@ -247,6 +251,7 @@ export const GatewayEventSchema = Schema.Union([
   SubagentTool,
   SubagentProgress,
   SubagentComplete,
+  SubagentText,
   ErrorEvent,
   GatewayStderr,
   GatewayStartTimeout,
