@@ -444,6 +444,38 @@ describe('session store — session chrome / status bar (item 14)', () => {
     expect(info.effort).toBe('high')
   })
 
+  test('session.info mcp count = CONNECTED servers, not configured-but-disabled ones', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'session.info',
+      payload: {
+        model: 'gpt-5.4',
+        // two configured servers; only one is connected (e.g. a disabled `linear`
+        // alongside a connected `nous-support`). The bar's `mcp: N` must read the
+        // CONNECTED count (1), never the configured total (2) — mirroring the
+        // classic CLI banner (`sum(s.connected)`) and the Ink SessionPanel headline.
+        mcp_servers: [
+          { name: 'nous-support', transport: 'http', connected: true, tools: ['a', 'b'] },
+          { name: 'linear', transport: 'stdio', connected: false, tools: [] }
+        ]
+      }
+    })
+    expect(store.state.info.mcpServers).toBe(1)
+  })
+
+  test('session.info mcp count is 0 when no servers are connected (segment drops)', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'session.info',
+      payload: {
+        model: 'gpt-5.4',
+        mcp_servers: [{ name: 'linear', transport: 'stdio', connected: false, tools: [] }]
+      }
+    })
+    // all configured servers disabled → connected count 0 (statusBar drops `mcp:` when n <= 0).
+    expect(store.state.info.mcpServers).toBe(0)
+  })
+
   test('session.info reads context from TOP-LEVEL fields when there is no nested usage', () => {
     const store = createSessionStore()
     store.apply({

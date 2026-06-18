@@ -70,7 +70,9 @@ describe('store.applyInfo — chrome merge', () => {
       update_behind: 4,
       update_command: 'uv tool upgrade hermes',
       profile_name: 'researcher',
-      mcp_servers: [{}, {}, {}],
+      // mcpServers now counts CONNECTED servers (not configured-but-disabled);
+      // all three are connected here, so the merged count is 3.
+      mcp_servers: [{ connected: true }, { connected: true }, { connected: true }],
       usage: { cost_usd: 0.4129, context_percent: 42 }
     })
     expect(store.state.info.costUsd).toBeCloseTo(0.4129)
@@ -203,7 +205,8 @@ function seededStore(): SessionStore {
     cwd: '/tmp/proj',
     branch: 'main',
     profile_name: 'researcher',
-    mcp_servers: [{}, {}],
+    // both servers connected → `mcp: 2` (the count is connected servers, not configured).
+    mcp_servers: [{ connected: true }, { connected: true }],
     usage: { context_percent: 42, context_used: 84_000, context_max: 200_000, cost_usd: 0.41, compressions: 2 }
   })
   return store

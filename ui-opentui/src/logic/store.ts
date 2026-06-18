@@ -414,13 +414,30 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   if (typeof d.update_behind === 'number') patch.updateBehind = d.update_behind
   if (d.update_command) patch.updateCommand = d.update_command
   if (d.profile_name) patch.profileName = d.profile_name
-  if (d.mcp_servers) patch.mcpServers = d.mcp_servers.length
+  // Count *connected* servers, not configured-but-disabled ones, so the bar's
+  // `mcp: N` matches the classic CLI banner (`sum(s.connected)`) and the Ink
+  // SessionPanel headline. Each wire entry is `{name,transport,connected,tools}`
+  // (Schema.Unknown elements — read `connected` defensively).
+  if (d.mcp_servers) patch.mcpServers = countConnectedMcp(d.mcp_servers)
   return patch
 }
 
 /** Keep only the string elements of a decoded (unknown-element) array. */
 function onlyStrings(items: ReadonlyArray<unknown> | undefined): string[] {
   return (items ?? []).filter((s): s is string => typeof s === 'string')
+}
+
+/** Count the *connected* MCP servers in a loose `mcp_servers` wire array.
+ *  Each entry is `{name,transport,connected,tools}` but arrives as `unknown`
+ *  (Schema.Unknown), so read `connected` defensively: only entries whose
+ *  `connected` is exactly `true` count. A configured-but-disabled server
+ *  (connected !== true) is excluded — matching the classic CLI banner's
+ *  `sum(s.connected)` and the Ink SessionPanel headline. */
+function countConnectedMcp(items: ReadonlyArray<unknown> | undefined): number {
+  return (items ?? []).reduce<number>(
+    (n, s) => (typeof s === 'object' && s !== null && (s as { connected?: unknown }).connected === true ? n + 1 : n),
+    0
+  )
 }
 
 function normalizeTodoStatus(s: unknown): TodoStatus {
