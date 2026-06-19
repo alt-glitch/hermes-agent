@@ -538,6 +538,44 @@ describe('file tool — output suppression under a rendered diff (no raw JSON, e
       probe.destroy()
     }
   })
+
+  test('V4A hunk-less add-file diff RENDERS as a diff (not the raw-params fallback)', async () => {
+    // The bug: a V4A (mode='patch') add-file diff has --- /dev/null + +++ b/<path>
+    // and `+` body lines but NO `@@` header, so splitUnifiedDiff used to drop it
+    // and the card fell back to labeled params. Now splitUnifiedDiff synthesizes
+    // a hunk header; assert the new-file CONTENT paints through the native <diff>.
+    const v4aAdd = ['--- /dev/null', '+++ b/notes.md', '+# Release Notes', '+', '+- shipped the thing'].join('\n')
+    const addPart: ToolPartState = {
+      type: 'tool',
+      id: 'v4a1',
+      name: 'patch',
+      state: 'complete',
+      args: { path: '/p/notes.md' },
+      // a typical V4A result_text is the JSON echo of the diff → suppressed below it
+      resultText: JSON.stringify({ success: true, diff: v4aAdd }),
+      diffUnified: v4aAdd,
+      diffStats: { added: 3, removed: 0 }
+    }
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider>
+          <FileToolBody part={addPart} width={70} />
+        </ThemeProvider>
+      ),
+      { width: 80, height: 16 }
+    )
+    try {
+      // the native <diff> must paint the added content (proves the synthesized
+      // @@ header parsed) — pre-fix this frame showed `old_string`/`path` params.
+      const frame = await probe.waitForFrame(f => f.includes('Release Notes'))
+      expect(frame).toContain('Release Notes')
+      expect(frame).toContain('shipped the thing')
+      expect(frame).not.toContain('old_string') // never the raw-params fallback
+      expect(frame).not.toContain('{"') // and never the raw JSON echo
+    } finally {
+      probe.destroy()
+    }
+  })
 })
 
 describe('tool lifecycle states — running / done / failed (Epic 2.5)', () => {

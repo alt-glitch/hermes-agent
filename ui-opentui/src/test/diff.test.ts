@@ -76,4 +76,49 @@ describe('splitUnifiedDiff', () => {
     const created = ['--- /dev/null', '+++ b/new.txt', '@@ -0,0 +1 @@', '+hello'].join('\n')
     expect(splitUnifiedDiff(created)[0]?.path).toBe('new.txt')
   })
+
+  // ── V4A hunk-less diffs (the bug this PR fixes) ─────────────────────────
+  // Hermes' V4A (mode='patch') add-file path hand-builds a diff with a
+  // `--- /dev/null` / `+++ b/<path>` header pair and `+` body lines but NO `@@`
+  // hunk header. The native DiffRenderable regex-requires `@@ -a,b +c,d @@`, so
+  // pre-fix these sections were DROPPED and the tool card fell back to raw
+  // params. Now they're kept with a synthesized hunk header.
+  test('V4A add-file diff with NO @@ header is kept + gets a synthesized hunk', () => {
+    const v4aAdd = ['--- /dev/null', '+++ b/notes.md', '+# Title', '+', '+Body line'].join('\n')
+    const sections = splitUnifiedDiff(v4aAdd)
+    expect(sections).toHaveLength(1)
+    expect(sections[0]?.path).toBe('notes.md')
+    // a parseable hunk header was injected after the +++ line (add → -0,0)
+    expect(sections[0]?.diff).toContain('@@ -0,0 +1,3 @@')
+    // the native renderer's hunk regex must match the synthesized header
+    expect(sections[0]?.diff).toMatch(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/)
+    // body lines preserved in order, after the header
+    const lines = sections[0]!.diff.split('\n')
+    expect(lines.slice(-3)).toEqual(['+# Title', '+', '+Body line'])
+  })
+
+  test('V4A hunk-less MODIFY diff (--- a / +++ b, +/- body) is kept + synthesized', () => {
+    const v4aMod = ['--- a/x.ts', '+++ b/x.ts', ' kept', '-old', '+new'].join('\n')
+    const sections = splitUnifiedDiff(v4aMod)
+    expect(sections).toHaveLength(1)
+    expect(sections[0]?.path).toBe('x.ts')
+    // 1 context + 1 removed = 2 old lines (from 1); 1 context + 1 added = 2 new lines
+    expect(sections[0]?.diff).toContain('@@ -1,2 +1,2 @@')
+  })
+
+  test('a comment-only section (# Moved: a -> b) with no header pair is dropped', () => {
+    // V4A move emits a `# Moved:` line — nothing for the native renderer to show.
+    const moved = '# Moved: old/x.ts -> new/x.ts'
+    expect(splitUnifiedDiff(moved)).toEqual([])
+  })
+
+  test('a hunked file + a hunk-less add-file in one diff: both kept, both parseable', () => {
+    const mix = `${ONE_FILE}\n--- /dev/null\n+++ b/created.txt\n+line one\n+line two`
+    const sections = splitUnifiedDiff(mix)
+    expect(sections.map(s => s.path)).toEqual(['src/main.ts', 'created.txt'])
+    // the pre-hunked file is untouched; the add-file got a synthesized header
+    expect(sections[0]?.diff).toBe(ONE_FILE)
+    expect(sections[1]?.diff).toContain('@@ -0,0 +1,2 @@')
+    sections.forEach(s => expect(s.diff).toMatch(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/))
+  })
 })
