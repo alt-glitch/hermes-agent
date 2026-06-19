@@ -25,6 +25,7 @@ import {
 } from '../logic/slash.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
 import type { PickerItem } from '../logic/store.ts'
+import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
 
 // the picker-refresh/tabs/prefetch seams are module-level state — never leak them across tests
 afterEach(() => {
@@ -32,6 +33,30 @@ afterEach(() => {
   registerPickerTabs(undefined)
   registerModelPrefetch(undefined)
 })
+
+/** A minimal billing.state snapshot for the /billing dispatch tests. */
+function fakeBillingState(over: Partial<BillingStateResponse> = {}): BillingStateResponse {
+  return {
+    auto_reload: null,
+    balance_display: '$42.00',
+    balance_usd: '42.00',
+    can_charge: true,
+    card: null,
+    charge_presets: ['10', '25', '100'],
+    charge_presets_display: ['$10', '$25', '$100'],
+    cli_billing_enabled: true,
+    is_admin: true,
+    logged_in: true,
+    max_usd: '1000',
+    min_usd: '5',
+    monthly_cap: null,
+    ok: true,
+    org_name: 'Nous',
+    portal_url: 'https://portal.example/billing',
+    role: 'owner',
+    ...over
+  }
+}
 
 /** A `model.options` payload: two authed providers + two unconfigured skeleton
  *  rows (the gateway sends them with `include_unconfigured=True,
@@ -240,6 +265,7 @@ interface Probe {
   sessionPickers: SessionTabId[]
   resumed: string[]
   pickers: Array<{ title: string; items: PickerItem[]; onPick: (value: string) => void }>
+  billed: BillingOverlayState[]
   quit: { value: boolean }
   cleared: { value: boolean }
   dashboard: { value: boolean }
@@ -261,6 +287,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const sessionPickers: SessionTabId[] = []
   const resumed: string[] = []
   const pickers: Probe['pickers'] = []
+  const billed: Probe['billed'] = []
   const quit = { value: false }
   const cleared = { value: false }
   const dashboard = { value: false }
@@ -286,6 +313,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     setModelItems: items => (modelCache.value = items),
     openDashboard: () => (dashboard.value = true),
     openBackgroundPanel: () => {},
+    openBilling: overlay => billed.push(overlay),
     addBgTask: () => {},
     openPager: (title, text) => paged.push({ text, title }),
     openPicker: p => pickers.push(p),
@@ -313,6 +341,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     modelCache,
     paged,
     pickers,
+    billed,
     quit,
     resumed,
     sessionPickers,
@@ -644,6 +673,36 @@ describe('dispatchSlash — client commands', () => {
     await dispatchSlash('/help', p.ctx)
     expect(p.calls[0]?.method).toBe('commands.catalog')
     expect(p.system.join('\n')).toContain('/model — switch model')
+  })
+
+  test('/billing fetches billing.state and opens the overlay on overview', async () => {
+    const state = fakeBillingState({ logged_in: true })
+    const p = makeCtx(async method => (method === 'billing.state' ? state : {}))
+    await dispatchSlash('/billing', p.ctx)
+    expect(p.calls[0]?.method).toBe('billing.state')
+    expect(p.billed).toHaveLength(1)
+    expect(p.billed[0]!.screen).toBe('overview')
+    expect(p.billed[0]!.pendingCharge).toBeNull()
+    expect(p.billed[0]!.state.balance_display).toBe('$42.00')
+    // the ctx bundle is wired (RPC + validation reachable from the overlay)
+    expect(typeof p.billed[0]!.ctx.charge).toBe('function')
+    expect(p.billed[0]!.ctx.validate('10').amount).toBe('10')
+  })
+
+  test('/billing on a logged-out portal explains how to log in (no overlay)', async () => {
+    const p = makeCtx(async method => (method === 'billing.state' ? fakeBillingState({ logged_in: false }) : {}))
+    await dispatchSlash('/billing', p.ctx)
+    expect(p.billed).toHaveLength(0)
+    expect(p.system.join('\n')).toContain('Not logged into Nous Portal')
+  })
+
+  test('/billing surfaces a request failure instead of throwing', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('gateway down')
+    })
+    await dispatchSlash('/billing', p.ctx)
+    expect(p.billed).toHaveLength(0)
+    expect(p.system.join('\n')).toContain('/billing: gateway down')
   })
 })
 

@@ -15,6 +15,7 @@ import { Option } from 'effect'
 import { createStore, produce } from 'solid-js/store'
 
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
+import type { BillingOverlayState } from '../boundary/billing.ts'
 import {
   decodeCatalog,
   decodeSessionInfoPatch,
@@ -299,6 +300,8 @@ export interface StoreState {
   dashboardAgent: string | undefined
   /** Whether the OS background-process panel overlay is open (/processes). */
   backgroundPanel: boolean
+  /** The open /billing overlay (full-screen modal; undefined when closed). */
+  billing: BillingOverlayState | undefined
   /** OS background processes (from `agents.list`) — shown in the /processes panel. */
   backgroundProcesses: BackgroundProcess[]
   /** In-flight background-PROMPT task ids (`/bg` → `prompt.background`, cleared on
@@ -571,6 +574,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     dashboard: false,
     dashboardAgent: undefined,
     backgroundPanel: false,
+    billing: undefined,
     backgroundProcesses: [],
     bgTasks: [],
     lastNotification: undefined,
@@ -836,6 +840,20 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function closeBackgroundPanel() {
     setState('backgroundPanel', false)
   }
+
+  /** Open the /billing overlay with the fetched gateway state + ctx bundle. */
+  function openBilling(overlay: BillingOverlayState) {
+    setState('billing', overlay)
+  }
+  function closeBilling() {
+    setState('billing', undefined)
+  }
+  /** Patch the open billing overlay (screen transitions + pending charge). The
+   *  overlay is a state machine; the view drives transitions through this. */
+  function patchBilling(next: Partial<BillingOverlayState>) {
+    if (!state.billing) return
+    setState('billing', prev => (prev ? { ...prev, ...next } : prev))
+  }
   /** Replace the OS-process snapshot (drives the /processes panel). */
   function setBackgroundProcesses(procs: BackgroundProcess[]) {
     setState('backgroundProcesses', procs)
@@ -1057,6 +1075,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
           level: 'info',
           text: `bg ${event.payload.task_id} → ${event.payload.text}`
         })
+        break
+      }
+      // The self-improvement background review finished and emitted a persistent
+      // summary of what it saved to memory/skills. Surface it as a system line so
+      // it never gets lost to a transient status flash — the gateway already
+      // formats the text ("💾 Self-improvement review: …") and only emits this
+      // when display.memory_notifications is on (off → no event). Mirrors the Ink
+      // handler (createGatewayEventHandler.ts `case 'review.summary'`).
+      case 'review.summary': {
+        const text = event.payload?.text?.trim()
+        if (text) pushSystem(text)
         break
       }
       // reasoning.delta is the model's actual reasoning — a (dim) transcript part.
@@ -1435,6 +1464,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     closeDashboard,
     openBackgroundPanel,
     closeBackgroundPanel,
+    openBilling,
+    closeBilling,
+    patchBilling,
     setBackgroundProcesses,
     addBgTask,
     hydrate,

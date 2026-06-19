@@ -17,6 +17,8 @@ import { formatBytes, memReport, performHeapdump } from './diagnostics.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './replay.ts'
 import { mapSessionRows, parseSessionTabArg, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
 import type { CompletionItem, PickerItem, PickerState } from './store.ts'
+import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
+import { buildBillingCtx } from './billing.ts'
 
 export interface ParsedSlash {
   name: string
@@ -75,6 +77,8 @@ export interface SlashContext {
   readonly openDashboard: () => void
   /** Open the OS background-process panel (/processes). */
   readonly openBackgroundPanel: () => void
+  /** Open the /billing overlay with a fetched state snapshot + ctx bundle. */
+  readonly openBilling: (overlay: BillingOverlayState) => void
   /** Track an in-flight background-prompt task id (`/bg` → prompt.background). */
   readonly addBgTask: (id: string) => void
   /** Cached `/model` picker rows (Epic 7 instant open); undefined until prefetched. */
@@ -735,6 +739,34 @@ const toolsCmd: ClientHandler = async (arg, ctx) => {
   }
 }
 
+/** `/billing` — fetch the gateway billing state and open the interactive overlay
+ *  (buy credits / auto-reload / monthly limit). ZERO sub-commands (CLI/TUI
+ *  parity): any arg is ignored. All RPC + error mapping lives in logic/billing.ts
+ *  (`buildBillingCtx`); this handler just fetches state and opens. */
+const billingCmd: ClientHandler = async (_arg, ctx) => {
+  try {
+    const s = (await ctx.request('billing.state', {})) as BillingStateResponse
+    if (!s.logged_in) {
+      ctx.pushSystem('💳 Not logged into Nous Portal — run /portal to log in, then /billing.')
+      return
+    }
+    const billingHost = {
+      request: ctx.request,
+      pushSystem: ctx.pushSystem,
+      confirm: ctx.confirm,
+      sessionId: ctx.sessionId
+    }
+    ctx.openBilling({
+      ctx: buildBillingCtx(billingHost, s),
+      pendingCharge: null,
+      screen: 'overview',
+      state: s
+    })
+  } catch (error) {
+    ctx.pushSystem(`/billing: ${error instanceof Error ? error.message : 'billing.state failed'}`)
+  }
+}
+
 /** `/bg <prompt>` (aliases /background, /btw) — launch a background PROMPT via
  *  `prompt.background` (Ink parity): echo "bg <id> started" and track the task so
  *  the `bg: N` badge counts it until `background.complete` clears it. NOT the OS
@@ -764,6 +796,7 @@ const CLIENT: Record<string, ClientHandler> = {
   agents: (_arg, ctx) => ctx.openDashboard(),
   background: backgroundCmd,
   bg: backgroundCmd,
+  billing: billingCmd,
   btw: backgroundCmd,
   clear: (_arg, ctx) => ctx.confirm('Clear the transcript?', ctx.clearTranscript),
   compact: compactCmd,

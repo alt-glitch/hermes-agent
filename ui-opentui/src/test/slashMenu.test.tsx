@@ -18,7 +18,7 @@
  */
 import { describe, expect, test } from 'vitest'
 
-import { MENU_MAX, routeMenuKey, type MenuKeyContext } from '../logic/completionMenu.ts'
+import { MENU_MAX, acceptChangesToken, routeMenuKey, type MenuKeyContext } from '../logic/completionMenu.ts'
 import { createPromptHistory } from '../logic/history.ts'
 import { planCompletion } from '../logic/slash.ts'
 import { createSessionStore, type CompletionItem } from '../logic/store.ts'
@@ -78,6 +78,36 @@ describe('routeMenuKey — key-routing precedence table', () => {
   test('a stranded selection clamps into the visible range before moving/accepting', () => {
     expect(routeMenuKey('down', false, ctx({ count: 2, selected: 5 }))).toEqual({ kind: 'move', selected: 0 })
     expect(routeMenuKey('return', false, ctx({ count: 2, selected: 5 }))).toEqual({ index: 1, kind: 'accept' })
+  })
+})
+
+describe('acceptChangesToken — Enter-accept vs. submit (trailing-space guard)', () => {
+  // Mirrors Ink domain/slash.ts completionApply tests: the engine's
+  // acceptCompletion writes `before + itemText + ' '`, so the predicate is
+  // computed against that exact shape (replace_from = token start).
+  test('finishing a partial command name IS a real change (accept)', () => {
+    // `/ex` (from=1, replace the `ex` token) → `/exit ` — meaningful.
+    expect(acceptChangesToken('/ex', 'exit', 1)).toBe(true)
+  })
+
+  test('an already-complete command + trailing-space-only row is NOT a change (submit)', () => {
+    // THE bug: `/exit` fully typed, gateway keeps `exit` open → accept would set
+    // `/exit ` (only a trailing space) and swallow the Enter. Must submit instead.
+    expect(acceptChangesToken('/exit', 'exit', 1)).toBe(false)
+  })
+
+  test('a fully-typed argument + trailing-space-only is NOT a change (submit)', () => {
+    expect(acceptChangesToken('/cron add', 'add', 6)).toBe(false)
+  })
+
+  test('a real argument completion after a space IS a change (accept)', () => {
+    // `/cron ad` (from=6) → `/cron add ` — finishes the arg token.
+    expect(acceptChangesToken('/cron ad', 'add', 6)).toBe(true)
+  })
+
+  test('clamps an out-of-range from instead of throwing', () => {
+    // from past the end clamps to length; `/exit` + 'exit' → `/exitexit ` (a change).
+    expect(acceptChangesToken('/exit', 'exit', 999)).toBe(true)
   })
 })
 
@@ -262,6 +292,50 @@ describe('slash menu — Esc / Tab / no-dropdown routing', () => {
       expect(h.submitted).toEqual(['/help'])
     } finally {
       h.probe.destroy()
+    }
+  })
+
+  test('Enter on an already-complete command SUBMITS even when the menu stays open (no trailing-space swallow)', async () => {
+    // Reproduces the real gateway behavior the Ink fix targeted: once the
+    // command name is fully typed, the gateway KEEPS the completion row open
+    // (returns the same `/help` row so the classic-CLI dropdown stays up). The
+    // engine must NOT let that open menu swallow the Enter into `/help ` — the
+    // command is complete, so Enter submits. (mountComposer's onType closes the
+    // menu on an exact match, which hides the bug, so this harness mirrors the
+    // gateway and keeps the row open on an exact match.)
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    const submitted: string[] = []
+    const onType = (text: string) => {
+      const plan = planCompletion(text)
+      if (!plan || plan.method !== 'complete.slash') return store.clearCompletions()
+      const q = String(plan.params.text).toLowerCase()
+      // Gateway-faithful: an EXACT match keeps its row open (drops only the
+      // `c.text !== q` guard mountComposer uses), so the dropdown is still up
+      // when Enter arrives on the complete command.
+      const items = CATALOG.filter(c => c.text.startsWith(q))
+      if (items.length) store.setCompletions(items, plan.from)
+      else store.clearCompletions()
+    }
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} onSubmit={t => submitted.push(t)} onType={onType} history={createPromptHistory({})} />
+        </ThemeProvider>
+      ),
+      { height: 24, kittyKeyboard: true, width: 70 }
+    )
+    try {
+      await probe.keys.typeText('/help')
+      await probe.settle()
+      // the menu is STILL open on the exact command (the gateway behavior)
+      await probe.waitForFrame(f => f.includes('list commands'))
+      probe.keys.pressEnter()
+      await probe.settle()
+      // THE fix: Enter submitted the complete command instead of being eaten.
+      expect(submitted).toEqual(['/help'])
+    } finally {
+      probe.destroy()
     }
   })
 

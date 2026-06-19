@@ -29,6 +29,7 @@ import { Header } from './header.tsx'
 import { NoticeBanner } from './noticeBanner.tsx'
 import { AgentsDashboard } from './overlays/agentsDashboard.tsx'
 import { BackgroundPanel } from './overlays/backgroundPanel.tsx'
+import { BillingOverlay } from './overlays/billing.tsx'
 import { Pager } from './overlays/pager.tsx'
 import { Picker } from './overlays/picker.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
@@ -85,6 +86,7 @@ export function App(props: AppProps) {
   const pager = () => props.store.state.pager
   const dashboard = () => props.store.state.dashboard
   const backgroundPanel = () => props.store.state.backgroundPanel
+  const billing = () => props.store.state.billing
   const sessionPicker = () => props.store.state.sessionPicker
   const picker = () => props.store.state.picker
   const promptHistory = () => props.store.state.promptHistory
@@ -93,6 +95,7 @@ export function App(props: AppProps) {
   const closePager = () => deferClose(() => props.store.closePager())
   const closeDashboard = () => deferClose(() => props.store.closeDashboard())
   const closeBackgroundPanel = () => deferClose(() => props.store.closeBackgroundPanel())
+  const closeBilling = () => deferClose(() => props.store.closeBilling())
   // Fetch the current OS-process snapshot into the store (panel refresh + the bg badge).
   const refreshBackground = () => {
     void props.backgroundOps
@@ -238,6 +241,11 @@ export function App(props: AppProps) {
                 }}
                 onClose={closeBackgroundPanel}
               />
+            </Match>
+            <Match when={billing()}>
+              {b => (
+                <BillingOverlay overlay={b()} onPatch={next => props.store.patchBilling(next)} onClose={closeBilling} />
+              )}
             </Match>
           </Switch>
         </box>

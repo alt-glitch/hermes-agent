@@ -614,6 +614,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             .map(e => `${e.scope}: ${e.msg}`),
         openDashboard: () => store.openDashboard(),
         openBackgroundPanel: () => store.openBackgroundPanel(),
+        openBilling: overlay => store.openBilling(overlay),
         addBgTask: id => store.addBgTask(id),
         openPager: (title, text) => store.openPager(title, text),
         openPicker: picker => store.openPicker(picker),
