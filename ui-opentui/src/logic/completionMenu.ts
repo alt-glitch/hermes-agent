@@ -64,3 +64,29 @@ export function routeMenuKey(name: string, modified: boolean, ctx: MenuKeyContex
   if (name === 'return') return { index: sel, kind: 'accept' }
   return PASS
 }
+
+/**
+ * Would accepting `itemText` (replacing from `from`) MEANINGFULLY change the
+ * buffer, or would it only re-append the trailing space the composer adds on
+ * accept? Mirrors Ink `domain/slash.ts::completionToApplyOnSubmit` (fix:
+ * "don't make Enter swallow trailing-space-only slash completions").
+ *
+ * The bug it guards: once a command name is fully typed (`/exit`), the gateway
+ * keeps the completion row open (it returns the same `exit` row so the classic
+ * CLI's prompt_toolkit dropdown stays up). The composer's accept always writes
+ * `before + itemText + ' '`, so an Enter here would set `/exit ` and PREVENT
+ * the submit — every slash command would need an extra Enter (type → Enter
+ * completes → Enter adds space → Enter finally submits). When the only delta is
+ * trailing whitespace (or no change at all), Enter should SUBMIT instead.
+ *
+ * Returns true ⇒ accepting is a real token change (the composer should accept +
+ * swallow the Enter); false ⇒ no-op/whitespace-only (let Enter fall through to
+ * submit). `from` is the gateway's `replace_from` / token start the composer
+ * splices from; the composer appends a single space on accept (matched here).
+ */
+export function acceptChangesToken(bufText: string, itemText: string, from: number): boolean {
+  const at = Math.min(Math.max(0, from), bufText.length)
+  const before = bufText.slice(0, at)
+  const next = `${before}${itemText} ` // the composer's acceptCompletion shape (trailing space)
+  return next !== bufText && next.trimEnd() !== bufText.trimEnd()
+}

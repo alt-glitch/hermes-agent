@@ -70,6 +70,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     setModelItems: () => {},
     openDashboard: () => {},
     openBackgroundPanel: () => {},
+    openBilling: () => {},
     addBgTask: () => {},
     openPager: (title, text) => paged.push({ text, title }),
     openPicker: () => {},

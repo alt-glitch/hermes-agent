@@ -444,6 +444,23 @@ describe('session store — session chrome / status bar (item 14)', () => {
     expect(info.effort).toBe('high')
   })
 
+  test('session.info keeps a CUSTOM provider name verbatim (never collapsed to "custom")', () => {
+    // Upstream added custom-provider session persistence; the engine boundary
+    // must surface the gateway's exact provider slug (e.g. a `custom:<name>`
+    // registered backend) rather than flattening it to the bare dialect word
+    // "custom". infoPatchFrom passes `d.provider` straight through, so whatever
+    // the gateway sends round-trips unchanged.
+    const store = createSessionStore()
+    store.apply({
+      type: 'session.info',
+      payload: { model: 'my-local-llm', provider: 'custom:lab-proxy' }
+    })
+    expect(store.state.info.provider).toBe('custom:lab-proxy')
+    // a later partial patch that omits provider must not wipe it (merge, not replace).
+    store.applyInfo({ branch: 'main' })
+    expect(store.state.info.provider).toBe('custom:lab-proxy')
+  })
+
   test('session.info mcp count = CONNECTED servers, not configured-but-disabled ones', () => {
     const store = createSessionStore()
     store.apply({
@@ -589,6 +606,25 @@ describe('session store — gateway lifecycle / transport errors (auto-heal foun
     store.apply({ type: 'error', payload: { message: 'boom' } })
     const sys = store.state.messages.filter(m => m.role === 'system')
     expect(sys.map(m => m.text)).toEqual(['gateway protocol error: <garbled>', 'error: boom'])
+  })
+
+  test('review.summary surfaces the self-improvement digest as a system line', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'review.summary',
+      payload: { text: '💾 Self-improvement review: saved 1 skill, 2 memories' }
+    })
+    const sys = store.state.messages.filter(m => m.role === 'system')
+    expect(sys).toHaveLength(1)
+    expect(sys[0]!.text).toBe('💾 Self-improvement review: saved 1 skill, 2 memories')
+  })
+
+  test('review.summary with empty/missing text is ignored (no blank system line)', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'review.summary', payload: { text: '   ' } })
+    store.apply({ type: 'review.summary', payload: {} })
+    store.apply({ type: 'review.summary' })
+    expect(store.state.messages.filter(m => m.role === 'system')).toHaveLength(0)
   })
 })
 

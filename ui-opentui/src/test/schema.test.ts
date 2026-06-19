@@ -77,6 +77,25 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
+  test('decodes a review.summary frame (self-improvement memory digest)', () => {
+    const ev = decode({
+      type: 'review.summary',
+      session_id: 's1',
+      payload: { text: '💾 Self-improvement review: saved 2 skills' }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'review.summary') {
+      expect(ev.value.session_id).toBe('s1')
+      expect(ev.value.payload?.text).toBe('💾 Self-improvement review: saved 2 skills')
+    }
+  })
+
+  test('decodes a review.summary frame with no payload (lenient optional)', () => {
+    // The struct's payload is optional, so a bare frame still decodes (the
+    // reducer simply renders nothing). Proves the union member is lenient.
+    expect(Option.isSome(decode({ type: 'review.summary' }))).toBe(true)
+  })
+
   test('SKIPS an unrecognized event type (Option.none, no throw)', () => {
     expect(Option.isNone(decode({ type: 'totally.unknown.event', foo: 1 }))).toBe(true)
   })

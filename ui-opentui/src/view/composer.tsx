@@ -53,7 +53,7 @@ import { SyntaxStyle, type PasteEvent, type TextareaRenderable } from '@opentui/
 import { useKeyboard, useRenderer } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
-import { MENU_MAX, routeMenuKey } from '../logic/completionMenu.ts'
+import { MENU_MAX, acceptChangesToken, routeMenuKey } from '../logic/completionMenu.ts'
 import { envComposerRows } from '../logic/env.ts'
 import { createDoublePress } from '../logic/promptHistory.ts'
 import { analyzeSlash, learnableNames, nativeCharOffset } from '../logic/skillMatch.ts'
@@ -332,6 +332,20 @@ export function Composer(props: {
     props.onDismiss?.()
   }
 
+  /** Whether accepting the n-th candidate is a MEANINGFUL token change (vs. only
+   *  re-appending the trailing space the gateway leaves on an already-complete
+   *  command). Gates the Enter-accept path so a complete `/exit` submits instead
+   *  of being swallowed into `/exit ` (Ink parity:
+   *  completionToApplyOnSubmit). Tab always accepts regardless — it's an explicit
+   *  accept gesture, not a submit. */
+  const acceptWouldChangeToken = (index: number): boolean => {
+    const item = menuItems()[index] ?? menuItems()[0]
+    if (!item || !ta) return false
+    const synthetic = storeItems().length === 0
+    const from = synthetic ? (suggested()?.from ?? 1) : (props.completionFrom?.() ?? 0)
+    return acceptChangesToken(ta.plainText, item.text, from)
+  }
+
   // Esc+Esc → session prompt history (Epic 5; free-code's double-press model).
   // ONLY an Esc that nothing else consumed counts: the dropdown-dismiss branch
   // returns before press() is reached (so a dismissing Esc never arms), and any
@@ -434,11 +448,20 @@ export function Composer(props: {
         return
       }
       if (action.kind === 'accept') {
-        acceptCompletion(action.index)
-        if (key.name === 'return') key.preventDefault()
-        return
-      }
-      if (action.kind === 'dismiss') {
+        // Tab is an explicit accept gesture — always splice. Enter, however,
+        // doubles as SUBMIT: when the highlighted row only re-appends the
+        // trailing space the gateway leaves on an already-complete command
+        // (`/exit` → `/exit `), accepting would swallow the Enter and force an
+        // extra keypress to submit. In that no-op case DON'T accept — fall
+        // through so the textarea's own Enter→submit fires (Ink parity:
+        // completionToApplyOnSubmit).
+        const enterNoop = key.name === 'return' && !acceptWouldChangeToken(action.index)
+        if (!enterNoop) {
+          acceptCompletion(action.index)
+          if (key.name === 'return') key.preventDefault()
+          return
+        }
+      } else if (action.kind === 'dismiss') {
         // also park the synthetic suggestion for this exact text (Esc must not
         // re-open it on the next analysis pass); any edit re-arms it.
         setDismissedFor(ta?.plainText ?? '')
