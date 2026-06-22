@@ -2200,8 +2200,10 @@ def test_session_title_clears_pending_after_persist(monkeypatch):
             return True
 
     db = _FakeDB()
+    emitted = []
     server._sessions["sid"] = _session(pending_title="stale")
     monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
     try:
         resp = server.handle_request(
             {
@@ -2214,6 +2216,8 @@ def test_session_title_clears_pending_after_persist(monkeypatch):
         assert resp["result"]["pending"] is False
         assert resp["result"]["title"] == "fresh"
         assert server._sessions["sid"]["pending_title"] is None
+        assert emitted[-1][0:2] == ("session.info", "sid")
+        assert emitted[-1][2]["title"] == "fresh"
     finally:
         server._sessions.pop("sid", None)
 
