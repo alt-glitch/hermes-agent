@@ -756,6 +756,46 @@ describe('dispatchSlash — server ladder', () => {
     await dispatchSlash('/whatever', p.ctx)
     expect(p.system).toContain('done')
   })
+
+  // The server's slash.exec routes _PENDING_INPUT_COMMANDS (goal/queue/steer/retry/
+  // plan/undo) to command.dispatch and returns a {type:…} dispatch payload DIRECTLY
+  // on the SUCCESS path — not a {output} payload. The slash.exec branch must detect
+  // that shape and render it via handleDispatchResult, NOT as "/<name>: no output".
+  test('slash.exec returns a {type:send} dispatch payload → notice + submit (no "no output")', async () => {
+    const p = makeCtx(async method =>
+      method === 'slash.exec' ? { type: 'send', notice: '⊙ Goal set', message: 'do the goal' } : {}
+    )
+    await dispatchSlash('/goal do the goal', p.ctx)
+    // Stayed on the slash.exec path (no command.dispatch fallback needed).
+    expect(p.calls.map(c => c.method)).toEqual(['slash.exec'])
+    expect(p.calls[0]).toEqual({
+      method: 'slash.exec',
+      params: { command: 'goal do the goal', session_id: 'sid-1' }
+    })
+    // The notice rendered AND the kickoff was submitted as a user turn…
+    expect(p.system).toContain('⊙ Goal set')
+    expect(p.submitted).toEqual(['do the goal'])
+    // …and the bogus "/goal: no output" line is NOT present.
+    expect(p.system).not.toContain('/goal: no output')
+  })
+
+  test('slash.exec returns a {type:exec} dispatch payload → exec output (no "no output")', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { type: 'exec', output: '⏸ Goal paused' } : {}))
+    await dispatchSlash('/goal pause', p.ctx)
+    expect(p.calls.map(c => c.method)).toEqual(['slash.exec'])
+    expect(p.system).toContain('⏸ Goal paused')
+    expect(p.system).not.toContain('/goal: no output')
+  })
+
+  test('REGRESSION: a plain {output} result (no `type`) still renders normally', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'hello' } : {}))
+    await dispatchSlash('/goal status', p.ctx)
+    expect(p.calls.map(c => c.method)).toEqual(['slash.exec'])
+    // Short output → system line (unchanged normal path); no dispatch handling.
+    expect(p.system).toContain('hello')
+    expect(p.submitted).toHaveLength(0)
+    expect(p.paged).toHaveLength(0)
+  })
 })
 
 describe('diagnostic command gating (HERMES_TUI_DIAGNOSTICS)', () => {
