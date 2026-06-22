@@ -588,6 +588,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         setCompact: on => store.setCompact(on),
         details: () => store.state.details,
         setDetails: mode => store.setDetails(mode),
+        timestamps: () => store.state.timestamps,
+        setTimestamps: on => store.setTimestamps(on),
+        reasoningFull: () => store.state.reasoningFull,
+        setReasoningFull: on => store.setReasoningFull(on),
         renderableCount: () => {
           try {
             return descendantCount(renderer.root)

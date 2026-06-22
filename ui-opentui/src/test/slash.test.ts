@@ -276,6 +276,10 @@ interface Probe {
   /** Display flags (/compact, /details — Epic 3). */
   compactFlag: { value: boolean }
   detailsFlag: { value: DetailsMode }
+  /** /timestamps display flag — show [HH:MM] on messages (port of 5ff11a689). */
+  timestampsFlag: { value: boolean }
+  /** /reasoning full|clamp display flag — expand all thinking. */
+  reasoningFullFlag: { value: boolean }
 }
 
 function makeCtx(request: (method: string, params: Record<string, unknown>) => Promise<unknown>): Probe {
@@ -296,12 +300,18 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const modelCache: Probe['modelCache'] = { value: undefined }
   const compactFlag: Probe['compactFlag'] = { value: false }
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
+  const timestampsFlag: Probe['timestampsFlag'] = { value: false }
+  const reasoningFullFlag: Probe['reasoningFullFlag'] = { value: false }
   const ctx: SlashContext = {
     clearTranscript: () => (cleared.value = true),
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,
     setDetails: mode => (detailsFlag.value = mode),
+    timestamps: () => timestampsFlag.value,
+    setTimestamps: on => (timestampsFlag.value = on),
+    reasoningFull: () => reasoningFullFlag.value,
+    setReasoningFull: on => (reasoningFullFlag.value = on),
     renderableCount: () => undefined,
     confirm: (message, onConfirm) => confirmed.push({ message, onConfirm }),
     copyResponse: n => {
@@ -338,6 +348,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     ctx,
     dashboard,
     detailsFlag,
+    timestampsFlag,
+    reasoningFullFlag,
     modelCache,
     paged,
     pickers,

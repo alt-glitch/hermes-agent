@@ -92,6 +92,34 @@ export function lastTextId(parts: readonly Part[] | undefined): string | undefin
 }
 
 /**
+ * The id of a turn's FIRST text part — where the /timestamps [HH:MM] prefix lands
+ * for a parts-based (settled/resumed) assistant turn, so the stamp shows once at
+ * the top of the answer rather than repeating on every text part. Pure — exported
+ * for tests.
+ */
+export function firstTextId(parts: readonly Part[] | undefined): string | undefined {
+  if (!parts) return undefined
+  for (const p of parts) {
+    if (p && p.type === 'text') return p.id
+  }
+  return undefined
+}
+
+/**
+ * Format a unix-SECONDS timestamp as a zero-padded 24h local `[HH:MM]` (e.g.
+ * 9:05 → `[09:05]`). Pure — exported for tests. Port of upstream 5ff11a689's
+ * `/timestamps` (classic CLI); here it's a muted render-time prefix only, never
+ * folded into copied/wire text. Uses LOCAL time (the user's clock), matching the
+ * classic CLI's `time.strftime("%H:%M")` on a local-time struct.
+ */
+export function formatTimestamp(unixSeconds: number): string {
+  const d = new Date(unixSeconds * 1000)
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `[${hh}:${mm}]`
+}
+
+/**
  * The quiet per-block copy chip — a muted `⧉ copy` run on its own line at the
  * block's BOTTOM-LEFT (never the right edge: that column belongs to the
  * scrollbar). `alignSelf: flex-start` shrinks the click target to the run
@@ -130,6 +158,15 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
   // A `notification` row is background-activity chrome — render the distinct
   // inline card instead of the normal role row (glitch 2026-06-13).
   const notif = () => (m().role === 'notification' ? m().notification : undefined)
+
+  // /timestamps: the muted `[HH:MM]` label to show, or undefined when the flag
+  // is off OR this message carries no stored timestamp (never fabricated). An
+  // accessor (not a `!` assertion) so the keyed <Show> below binds the formatted
+  // value — the project's eslint forbids non-null assertions.
+  const tsLabel = (): string | undefined => {
+    const ts = m().timestamp
+    return display().timestamps && ts != null ? formatTimestamp(ts) : undefined
+  }
   return (
     <Show
       when={notif()}
@@ -168,6 +205,14 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                     // nothing to copy) — never the right edge: scrollbar column.
                     <box style={{ flexDirection: 'column', flexShrink: 0 }}>
                       <text selectionBg={theme().color.selectionBg}>
+                        {/* /timestamps: muted [HH:MM] prefix on the first line, ONLY when
+                        the flag is on AND this message carries a stored timestamp (never
+                        fabricated). It's render chrome — kept OUT of m().text so CopyChip /
+                        copied source stay untouched. Flat span sibling (OpenTUI <text> is
+                        flat spans, not nested <Text>). */}
+                        <Show when={tsLabel()}>
+                          {label => <span style={{ fg: theme().color.muted }}>{label() + ' '}</span>}
+                        </Show>
                         <span style={{ fg: bodyFg() }}>{m().text}</span>
                       </text>
                       <Show when={m().role !== 'system' && m().text.trim() && !display().compact}>
@@ -209,6 +254,16 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                       (off the scrollbar's right-edge column). */}
                       {t => (
                         <box style={{ flexDirection: 'column', flexShrink: 0 }}>
+                          {/* /timestamps: muted [HH:MM] above the FIRST text part of a
+                          settled assistant turn (covers resumed rows, which carry parts).
+                          Render chrome only — never folded into the copied/markdown source. */}
+                          <Show when={!m().streaming && t().id === firstTextId(m().parts) ? tsLabel() : undefined}>
+                            {label => (
+                              <text selectable={false}>
+                                <span style={{ fg: theme().color.muted }}>{label()}</span>
+                              </text>
+                            )}
+                          </Show>
                           <Markdown
                             text={t().text.replace(/^\n+|\n+$/g, '')}
                             streaming={m().streaming ?? false}

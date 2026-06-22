@@ -46,6 +46,8 @@ interface Probe {
   paged: Array<{ title: string; text: string }>
   compactFlag: { value: boolean }
   detailsFlag: { value: DetailsMode }
+  timestampsFlag: { value: boolean }
+  reasoningFullFlag: { value: boolean }
   renderables: { value: number | undefined }
 }
 
@@ -55,6 +57,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const paged: Probe['paged'] = []
   const compactFlag = { value: false }
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
+  const timestampsFlag = { value: false }
+  const reasoningFullFlag = { value: false }
   const renderables: Probe['renderables'] = { value: undefined }
   const ctx: SlashContext = {
     clearTranscript: () => {},
@@ -62,6 +66,10 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,
     setDetails: mode => (detailsFlag.value = mode),
+    timestamps: () => timestampsFlag.value,
+    setTimestamps: on => (timestampsFlag.value = on),
+    reasoningFull: () => reasoningFullFlag.value,
+    setReasoningFull: on => (reasoningFullFlag.value = on),
     renderableCount: () => renderables.value,
     confirm: () => {},
     copyResponse: () => false,
@@ -85,7 +93,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     sessionId: () => 'sid-1',
     submit: () => {}
   }
-  return { calls, compactFlag, ctx, detailsFlag, paged, renderables, system }
+  return { calls, compactFlag, ctx, detailsFlag, paged, renderables, reasoningFullFlag, system, timestampsFlag }
 }
 
 /** Let the fire-and-forget config.set promise settle (it's detached). */
@@ -199,6 +207,68 @@ describe('/details', () => {
     const p = makeCtx(async () => ({}))
     await dispatchSlash('/detail expanded', p.ctx)
     expect(p.detailsFlag.value).toBe('expanded')
+  })
+})
+
+describe('/reasoning', () => {
+  test('/reasoning full → flag on + persists config.set reasoning=full', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/reasoning full', p.ctx)
+    expect(p.reasoningFullFlag.value).toBe(true)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'reasoning', value: 'full' } })
+    expect(p.system).toEqual(['reasoning: full'])
+  })
+
+  test('/reasoning all is an alias for full', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/reasoning all', p.ctx)
+    expect(p.reasoningFullFlag.value).toBe(true)
+    expect(p.system).toEqual(['reasoning: full'])
+  })
+
+  test('/reasoning clamp → flag off + persists config.set reasoning=clamp', async () => {
+    const p = makeCtx(async () => ({}))
+    p.reasoningFullFlag.value = true
+    await dispatchSlash('/reasoning clamp', p.ctx)
+    expect(p.reasoningFullFlag.value).toBe(false)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'reasoning', value: 'clamp' } })
+    expect(p.system).toEqual(['reasoning: clamp'])
+  })
+
+  test('/reasoning collapse and short are aliases for clamp', async () => {
+    for (const alias of ['collapse', 'short'] as const) {
+      const p = makeCtx(async () => ({}))
+      p.reasoningFullFlag.value = true
+      await dispatchSlash(`/reasoning ${alias}`, p.ctx)
+      expect(p.reasoningFullFlag.value).toBe(false)
+      expect(p.system).toEqual(['reasoning: clamp'])
+    }
+  })
+
+  test('bare /reasoning reads config.get reasoning_full and syncs the flag', async () => {
+    const p = makeCtx(async method => (method === 'config.get' ? { value: 'medium', reasoning_full: true } : {}))
+    await dispatchSlash('/reasoning', p.ctx)
+    expect(p.calls[0]).toEqual({ method: 'config.get', params: { key: 'reasoning' } })
+    expect(p.reasoningFullFlag.value).toBe(true)
+    expect(p.system).toEqual(['reasoning: full'])
+  })
+
+  test('bare /reasoning with config.get failing falls back to the live flag', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('no config.get')
+    })
+    p.reasoningFullFlag.value = true
+    await dispatchSlash('/reasoning', p.ctx)
+    expect(p.system).toEqual(['reasoning: full'])
+  })
+
+  test('a non-handled arg (effort/show/hide) re-dispatches to the gateway slash.exec', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'reasoning effort: high' } : {}))
+    await dispatchSlash('/reasoning high', p.ctx)
+    // routed through the gateway, NOT handled locally → display flag untouched
+    expect(p.reasoningFullFlag.value).toBe(false)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'reasoning high', session_id: 'sid-1' } }])
+    expect(p.system).toEqual(['reasoning effort: high'])
   })
 })
 

@@ -509,7 +509,14 @@ export function Transcript(props: { store: SessionStore }) {
       >
         <ScrollAnchorProvider scroll={scroll}>
           {/* display flags (/compact, /details — Epic 3) for the rows below */}
-          <DisplayProvider flags={() => ({ compact: props.store.state.compact, details: props.store.state.details })}>
+          <DisplayProvider
+            flags={() => ({
+              compact: props.store.state.compact,
+              details: props.store.state.details,
+              timestamps: props.store.state.timestamps,
+              reasoningFull: props.store.state.reasoningFull
+            })}
+          >
             {/* empty-transcript home screen (item 12); replaced by messages on the first turn */}
             <Show when={props.store.state.messages.length === 0}>
               <HomeHint store={props.store} />

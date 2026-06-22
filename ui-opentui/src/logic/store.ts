@@ -90,6 +90,11 @@ export interface Message {
   /** Background-activity card payload (role `'notification'` only) — rendered as
    *  an inline NotificationCard instead of a normal role row. */
   notification?: ActivityNotification
+  /** Wall-clock send/receive time in unix SECONDS (matches the server's per-message
+   *  `timestamp` key — a sanctioned NON-WIRE field, stripped before the API call).
+   *  Rendered as a muted `[HH:MM]` prefix only when /timestamps is ON. Optional:
+   *  live rows that lack a stored timestamp NEVER get a fabricated one. */
+  timestamp?: number
 }
 
 /**
@@ -344,6 +349,16 @@ export interface StoreState {
   /** Global tool/reasoning detail mode (/details): collapsed (default) /
    *  expanded (bodies default-open) / hidden (runs fold to one muted line). */
   details: DetailsMode
+  /** Show a muted `[HH:MM]` time next to each transcript message that carries a
+   *  stored unix `timestamp` (/timestamps — port of upstream 5ff11a689). Defaults
+   *  OFF; like `compact`, the persisted pref doesn't reach the TUI via session.info,
+   *  so it starts false each launch. */
+  timestamps: boolean
+  /** /reasoning full — expand ALL thinking ("Thinking"/"Thought") sections to show
+   *  their full body, independently of the global /details mode. Defaults OFF;
+   *  bare `/reasoning` syncs it from the persisted `display.reasoning_full` (via
+   *  config.get), so it reflects the saved pref on first invocation. */
+  reasoningFull: boolean
 }
 
 const LRU_LIMIT = 1000
@@ -589,7 +604,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     modelItems: undefined,
     sessionId: undefined,
     compact: false,
-    details: 'collapsed'
+    details: 'collapsed',
+    timestamps: false,
+    reasoningFull: false
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
@@ -668,7 +685,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function ensureAssistant(draft: StoreState): Message {
     const live = liveAssistant(draft, true)
     if (live) return live
-    const created: Message = { role: 'assistant', text: '', parts: [], streaming: true }
+    const created: Message = {
+      role: 'assistant',
+      text: '',
+      parts: [],
+      streaming: true,
+      timestamp: Math.floor(Date.now() / 1000)
+    }
     draft.messages.push(created)
     return created
   }
@@ -690,7 +713,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function pushUser(text: string) {
     setState(
       produce(draft => {
-        draft.messages.push({ role: 'user', text })
+        // Stamp the user turn with wall-clock send time (unix SECONDS — matches the
+        // server's non-wire `timestamp` key) so /timestamps can render [HH:MM].
+        draft.messages.push({ role: 'user', text, timestamp: Math.floor(Date.now() / 1000) })
         capMessages(draft)
       })
     )
@@ -936,6 +961,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('details', mode)
   }
 
+  /** /timestamps — set the show-[HH:MM] display flag (port of upstream 5ff11a689). */
+  function setTimestamps(on: boolean): void {
+    setState('timestamps', on)
+  }
+
+  /** /reasoning full|clamp — set the expand-all-thinking display flag. */
+  function setReasoningFull(on: boolean): void {
+    setState('reasoningFull', on)
+  }
+
   /** Merge a session-info patch into the chrome state (status bar — item 14). */
   function applyInfo(raw: { readonly [k: string]: unknown }): void {
     const patch = readInfoPatch(raw)
@@ -990,7 +1025,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
         setState('info', prev => ({ ...prev, running: true }))
         setState(
           produce(draft => {
-            draft.messages.push({ role: 'assistant', text: '', parts: [], streaming: true })
+            draft.messages.push({
+              role: 'assistant',
+              text: '',
+              parts: [],
+              streaming: true,
+              timestamp: Math.floor(Date.now() / 1000)
+            })
             capMessages(draft)
           })
         )
@@ -1460,6 +1501,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setHint,
     setCompact,
     setDetails,
+    setTimestamps,
+    setReasoningFull,
     openDashboard,
     closeDashboard,
     openBackgroundPanel,

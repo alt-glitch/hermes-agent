@@ -24,6 +24,18 @@ function readNum(value: unknown, key: string): number {
   return typeof v === 'number' ? v : 0
 }
 
+/**
+ * Read an OPTIONAL finite numeric field (the per-message `timestamp` key, unix
+ * seconds — see SessionPeek.ts `timestamp: opt(Schema.NullOr(Schema.Unknown))`).
+ * Returns undefined when absent/null/non-finite so we NEVER fabricate a stamp.
+ * (Distinct from `readNum`, which defaults missing → 0 for counts.)
+ */
+function readOptNum(value: unknown, key: string): number | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const v = (value as { [k: string]: unknown })[key]
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
 /** Map a `session.list` result into switcher rows (loose-typed read). */
 export function mapSessionList(result: unknown): SessionItem[] {
   if (!result || typeof result !== 'object') return []
@@ -52,6 +64,9 @@ export function mapResumeHistory(history: unknown): Message[] {
 
   for (const raw of history) {
     const role = readStr(raw, 'role')
+    // Optional stored send/receive time (unix seconds). Carried onto the produced
+    // Message so /timestamps can render [HH:MM]; undefined when the entry lacks it.
+    const ts = readOptNum(raw, 'timestamp')
 
     if (role === 'tool') {
       const name = readStr(raw, 'name') ?? 'tool'
@@ -80,6 +95,7 @@ export function mapResumeHistory(history: unknown): Message[] {
       }
       if (!currentAssistant) {
         currentAssistant = { role: 'assistant', text: '', parts: [] }
+        if (ts !== undefined) currentAssistant.timestamp = ts
         out.push(currentAssistant)
       }
       ;(currentAssistant.parts ??= []).push(tool)
@@ -90,9 +106,12 @@ export function mapResumeHistory(history: unknown): Message[] {
     if (role === 'assistant') {
       const parts: Part[] = text ? [{ type: 'text', id: id(), text }] : []
       currentAssistant = { role: 'assistant', text, parts }
+      if (ts !== undefined) currentAssistant.timestamp = ts
       out.push(currentAssistant)
     } else if (role === 'user' || role === 'system') {
-      out.push({ role, text })
+      const msg: Message = { role, text }
+      if (ts !== undefined) msg.timestamp = ts
+      out.push(msg)
       currentAssistant = undefined
     }
   }

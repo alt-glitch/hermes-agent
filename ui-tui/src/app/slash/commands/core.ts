@@ -81,6 +81,9 @@ const DETAILS_SECTION_USAGE = 'usage: /details <section> [hidden|collapsed|expan
 export const DASHBOARD_EXIT_DISABLED_MESSAGE =
   'exit is disabled in hosted dashboard chat — use /new to start a fresh session'
 
+export const DASHBOARD_UPDATE_DISABLED_MESSAGE =
+  'update is disabled in hosted dashboard chat — the hosted environment is managed separately'
+
 export const coreCommands: SlashCommand[] = [
   {
     help: 'list commands + hotkeys',
@@ -140,6 +143,12 @@ export const coreCommands: SlashCommand[] = [
     help: 'update Hermes Agent to the latest version (exits TUI)',
     name: 'update',
     run: (_arg, ctx) => {
+      if (DASHBOARD_TUI_MODE) {
+        ctx.transcript.sys(DASHBOARD_UPDATE_DISABLED_MESSAGE)
+
+        return
+      }
+
       ctx.transcript.sys('exiting TUI to run update...')
       // Exit code 42 signals the Python wrapper to exec `hermes update`.
       // Use dieWithCode for proper cleanup (gateway kill + Ink unmount).
@@ -418,6 +427,24 @@ export const coreCommands: SlashCommand[] = [
     help: 'attach clipboard image',
     name: 'paste',
     run: (arg, ctx) => (arg ? ctx.transcript.sys('usage: /paste') : ctx.composer.paste())
+  },
+
+  {
+    aliases: ['compose'],
+    help: 'compose your next prompt in $EDITOR (same as Ctrl+G)',
+    name: 'prompt',
+    run: (arg, ctx) => {
+      if (arg) {
+        // The TUI editor opens with the current composer draft; there is no
+        // separate seed arg. Drop any inline text into the composer first so
+        // it carries into the editor, matching the CLI's /prompt <text>.
+        ctx.composer.setInput(arg)
+      }
+
+      void ctx.composer.openEditor().catch((err: unknown) => {
+        ctx.transcript.sys(`editor failed: ${String(err)}`)
+      })
+    }
   },
 
   {
