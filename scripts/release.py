@@ -45,7 +45,9 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "21178861+ScotterMonk@users.noreply.github.com": "ScotterMonk",  # PR #50145 salvage (cron output truncation: adapter-aware chunking, #50126)
     "rrandqua@gmail.com": "TutkuEroglu",  # PR #50481 salvage (AGENTS.md stale token-lock adapter path)
+    "f@trycua.com": "f-trycua",  # PR #50507 salvage (cross-platform computer_use; supersedes #44221/#30660)
     "pedro.m.simoes@gmail.com": "pmos69",  # PR #29474 salvage (native Antigravity OAuth provider; Gemini CLI sunset #29294/#49701)
     "mediratta01.pally@gmail.com": "orbisai0security",  # PR #9560 salvage (session.py path-traversal guard, V-009)
     "panghuer023@users.noreply.github.com": "panghuer023",  # PR #37994 salvage (interrupt unblocks pending gateway approval; #8697)
@@ -313,6 +315,7 @@ AUTHOR_MAP = {
     "32711803+waefrebeorn@users.noreply.github.com": "waefrebeorn",
     "32869278+dusterbloom@users.noreply.github.com": "dusterbloom",
     "189737461+basilalshukaili@users.noreply.github.com": "basilalshukaili",
+    "basilalshukaili@gmail.com": "basilalshukaili",
     "liuhao1024@users.noreply.github.com": "liuhao1024",
     "Rivuza@users.noreply.github.com": "Rivuza",
     "annguyenNous@users.noreply.github.com": "annguyenNous",
@@ -1225,6 +1228,8 @@ AUTHOR_MAP = {
     "holynn@placeholder.local": "holynn-q",
     "agent@hermes.local": "jacdevos",
     "sunsky.lau@gmail.com": "liuhao1024",
+    "mohamed.origami@gmail.com": "mohamedorigami-jpg",  # PR #32117 (cron storage root anchor; #32091)
+    "58446328+sherman-yang@users.noreply.github.com": "sherman-yang",  # PR #32788 (cron per-job MCP merge; #23997)
     "rob@rbrtbn.com": "rbrtbn",
     "haaasined@gmail.com": "VinciZhu",
     "fabianoeq@gmail.com": "rodrigoeqnit",
@@ -1407,6 +1412,8 @@ AUTHOR_MAP = {
     "caojiguang@gmail.com": "caojiguang",  # PR #35117 carries #31853 (weixin _api_post/_api_get wait_for)
     "gooku94123@gmail.com": "goku94123",  # PR #46609 salvage (MiniMax reasoning extra_body)
     # pander: empty email, salvaged via PR #19665 from #16126 by @ms-alan
+    "chaithanya.kumar42a@gmail.com": "chaithanyak42",  # PR #15624
+    "kartik.labhshetwar@mem0.ai": "kartik-mem0",  # PR #15624
     "ayman.a.kamal@hotmail.com": "A-kamal",  # PR #18678 (xAI image resolution fix)
     # Kanban bug-fix batch salvage (May 2026)
     "frowte3k@gmail.com": "Frowtek",  # salvage of #23206 (gateway --board auto-subscribe)
