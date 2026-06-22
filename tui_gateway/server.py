@@ -10256,7 +10256,20 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     # worker thread running agent.run_conversation is using.  Parity
     # with the session.compress / session.undo guards and the gateway
     # runner's running-agent /model guard.
-    _MUTATES_WHILE_RUNNING = {"model", "personality", "prompt", "compress"}
+    #
+    # reload-mcp belongs here too: the branch mirrors the reload.mcp RPC's
+    # FULL sequence — shutdown_mcp_servers() → discover_mcp_tools() →
+    # refresh_agent_mcp_tools() — which mutates the process-global tool
+    # registry and then rebuilds agent.tools (+ valid_tool_names) from it.
+    # That tools[] array IS the request prefix the worker thread is sending
+    # mid-turn.  Mutating it while a turn is in flight both races the
+    # worker's snapshot read and invalidates the cached prompt prefix (see
+    # AGENTS.md / the MCP tool-snapshot architecture: tool schemas ride in
+    # `tools=`, which is part of the cached request prefix).  The dedicated
+    # reload.mcp RPC gates the same hazard behind explicit user consent + a
+    # prompt-cache warning; the slash mirror gates it via the busy guard
+    # (which also guarantees the shutdown/discover/rebuild only runs at idle).
+    _MUTATES_WHILE_RUNNING = {"model", "personality", "prompt", "compress", "reload-mcp"}
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return f"session busy — /interrupt the current turn before running /{name}"
 
@@ -10355,8 +10368,81 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                     disable_session_yolo(session_key)
                 if agent is not None:
                     _emit("session.info", sid, _session_info(agent, session))
-        elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
-            agent.reload_mcp_tools()
+        elif name == "reload-mcp" and agent:
+            # Rebuild the live agent's tool snapshot so /reload-mcp on the
+            # OpenTUI TUI (which routes every slash command through
+            # slash.exec → here) actually picks up added/removed MCP tools.
+            # The previous code called a non-existent agent.reload_mcp_tools()
+            # behind a hasattr() guard that was ALWAYS False, so the branch
+            # was a silent no-op: the banner flipped to "MCP loaded" but the
+            # agent's frozen tools snapshot was never rebuilt and it kept
+            # answering "Tool 'mcp_...' does not exist".
+            #
+            # Mirror the dedicated reload.mcp RPC's FULL sequence, in order:
+            #   1. shutdown_mcp_servers() — tear down live connections and
+            #      de-register their tools from the process-global registry.
+            #   2. discover_mcp_tools()  — connect newly-enabled servers and
+            #      register their tools into that same registry.
+            #   3. refresh_agent_mcp_tools(...) — rebuild the live agent's
+            #      tools[] + valid_tool_names snapshot FROM the (now-mutated)
+            #      registry, atomically under a lock, re-injecting post-build
+            #      tool families and re-resolving enabled toolsets.
+            #   4. re-emit session.info so the client refreshes.
+            #
+            # Steps 1+2 are LOAD-BEARING and were the blocking bug in the first
+            # cut of this branch: refresh_agent_mcp_tools only READS the
+            # in-process registry (via get_tool_definitions, memoized on
+            # registry._generation, which only moves on an in-process
+            # register/deregister).  Without shutdown_mcp_servers() +
+            # discover_mcp_tools() first, the gateway-process registry is never
+            # mutated → the rebuild diffs the SAME tool set → new_names ==
+            # current → empty added-set → the live agent snapshot is left
+            # untouched → added/removed MCP servers are NOT picked up (the exact
+            # bug this branch exists to fix).  The /reload-mcp slash command DOES
+            # run shutdown/discover, but inside the _SlashWorker SUBPROCESS — its
+            # own registry/transports, invisible to THIS gateway agent that
+            # answers turns.  So we must run them here in the gateway process.
+            # Mirrors the reload.mcp RPC at ~L8957-8978.
+            #
+            # Local try/except + logger.warning (like the RPC) so a failure here
+            # doesn't abort other mirrored side effects.  Note: the
+            # _MUTATES_WHILE_RUNNING guard above already rejected this command
+            # mid-turn, so the shutdown/discover/rebuild here only ever runs at
+            # an idle (cache-safe) moment.
+            #
+            # CONFIRM-GATE DIVERGENCE (intentional, flagged for review): the
+            # reload.mcp RPC gates the reload behind a confirm prompt
+            # ("/reload-mcp invalidates the prompt cache") via
+            # approvals.mcp_reload_confirm before doing any work; this slash
+            # mirror does NOT round-trip a second confirm.  Rationale: this path
+            # is the slash.exec fallback and the user explicitly typed
+            # /reload-mcp, so proceeding is acceptable for now — and the
+            # _MUTATES_WHILE_RUNNING busy-guard is the fork's equivalent gate
+            # for the mid-turn cache hazard.  Flagged so a controller/human can
+            # decide whether to add a full confirm round-trip here later.
+            try:
+                from tools.mcp_tool import (
+                    discover_mcp_tools,
+                    refresh_agent_mcp_tools,
+                    shutdown_mcp_servers,
+                )
+
+                # Mutate the gateway-process registry FIRST (RPC L8959-8960)...
+                shutdown_mcp_servers()
+                discover_mcp_tools()
+                # ...then rebuild the live agent's snapshot from it.
+                refresh_agent_mcp_tools(
+                    agent,
+                    enabled_override=_load_enabled_toolsets(),
+                    quiet_mode=True,
+                )
+                _emit("session.info", sid, _session_info(agent, session))
+            except Exception as _exc:
+                logger.warning(
+                    "Failed to refresh live agent tools after /reload-mcp: %s",
+                    _exc,
+                )
+                return f"live session sync failed: {_exc}"
         elif name == "stop":
             from tools.process_registry import process_registry
 
