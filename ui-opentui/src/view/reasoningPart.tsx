@@ -52,8 +52,12 @@ export function ReasoningPart(props: { text: string; streaming?: boolean }) {
   const display = useDisplay()
   const [override, setOverride] = createSignal<boolean | undefined>(undefined)
   // live → expanded so you see it think; settled → collapsed, unless the global
-  // /details mode is `expanded` (previews default-open). Click overrides.
-  const expanded = () => override() ?? (!!props.streaming || display().details === 'expanded')
+  // /details mode is `expanded` (previews default-open) OR /reasoning full is on
+  // (expands ALL thinking independently of the global /details mode). Click
+  // overrides — a user who clicked a section collapsed keeps it until they click
+  // again (override() still wins).
+  const expanded = () =>
+    override() ?? (!!props.streaming || display().details === 'expanded' || display().reasoningFull)
   const toggle = () => anchor(() => setOverride(!expanded()))
   const summary = createMemo(() => reasoningSummary(props.text))
   const label = () => (props.streaming ? 'Thinking' : 'Thought')

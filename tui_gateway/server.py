@@ -8696,7 +8696,16 @@ def _(rid, params: dict) -> dict:
             if bool((cfg.get("display") or {}).get("show_reasoning", False))
             else "hide"
         )
-        return _ok(rid, {"value": effort, "display": display})
+        return _ok(
+            rid,
+            {
+                "value": effort,
+                "display": display,
+                "reasoning_full": bool(
+                    (cfg.get("display") or {}).get("reasoning_full", False)
+                ),
+            },
+        )
     if key == "fast":
         return _ok(
             rid,

@@ -440,3 +440,110 @@ Stage all code as LOCAL commits on the throwaway/PR branch. The PUSH and the PR 
 public steps (he was burned before — hand off, don't execute) UNLESS he explicitly says "push it"
 this session. Never restart his gateway from inside a session (self-kill) — emit the
 `systemctl --user restart hermes-gateway-daimon.service` command for him.
+
+---
+
+## 10. PART B EXECUTION FINDINGS (2026-06-22)
+
+The recon collapsed the 12-item backlog hard: **most items were already done server-side on the
+defer branch, or were non-bugs / N-A**. Only THREE genuine engine ports were left, and one of those
+turned out to rest on a wrong premise and was deferred to a follow-up issue. Net delivered: **2
+engine ports** (`/timestamps`, `/reasoning full|clamp`), **1 spike + filed issue** (`/prompt` +
+Ctrl+G), the rest verify-only / no-change.
+
+**Working base:** throwaway worktree off `origin/sync/defer-20260619-153127` (head `2334173c9`),
+NOT live `sid/opentui` (which is 463 behind upstream and lacks the merged server-side batch). The
+handoff's `tui_gateway/server.py` line numbers were from the doc-writing-time tree; the batch grew
+~211 commits since, so all anchors shifted — re-derived every one.
+
+### 10.1 Verdict table (what was actually true on the defer branch)
+
+| Item | Handoff tier | VERDICT |
+|---|---|---|
+| `169952563` pending-input routing | Tier 0 | **VERIFY-ONLY.** server `command.dispatch` (`@method` ~9241) already handles `retry/queue/q/steer/goal/undo` (~9317-9447); `slash.exec` routes them (~9053-9059); OpenTUI `dispatchSlash` already has the `command.dispatch` fallback + `handleDispatchResult` (slash.ts:861). `/undo` `prefill` (slash.ts:883) shows-not-prefills — acceptable. NO CODE. |
+| `c7e8854cb` persist on force-quit | Tier 0 | **VERIFY-ONLY.** `_finalize_session` (~389) + `_teardown` (~508) + entry.py signal handlers present; shared path. NO CODE. |
+| **MCP §4** | §4 | **ALREADY DONE on the defer branch.** The `reload-mcp` mirror branch (server.py ~10371) was fully reworked: `shutdown_mcp_servers()` → `discover_mcp_tools()` → `refresh_agent_mcp_tools(...)` → re-emit `session.info`, with the load-bearing shutdown/discover (the exact Part-A-round-1 blocking bug) present + a documented confirm-gate divergence flagged in-code. Per-turn auto-refresh wired in `agent/turn_context.py:129`. NO CODE. |
+| `d0de4601d` `/compress` summary | Tier 1 | **DONE server-side.** `_mirror_slash_side_effects` `compress` branch (~10288-10331) builds + RETURNS the before/after summary string → `slash.exec` → `present()`. `/compress` is NOT in the OpenTUI CLIENT map so it flows through cleanly. `/compact` (local display flag) ≠ `/compress` (server compaction) — correctly distinct. VERIFY render only. |
+| `5ff11a689` `/timestamps` | Tier 1 | **PORTED.** See 10.2. |
+| `9e96e7099` `/prompt` + `74f0dd62e` Ctrl+G-submit | Tier 2 | **PREMISE WRONG → SPIKED + ISSUE FILED.** See 10.3. |
+| `95d53c3bc` `/reasoning full\|clamp` | Tier 2 | **PORTED.** See 10.2. |
+| `a7983d5ad` sidecar filter | Tier 3 | **NON-BUG** (Part A confirmed). server deny = `frozenset({"tool"})` (~4596, ~4825); sidecar carries `source:"tool"` (already denied); no `"sidecar"` label exists anywhere. NO CHANGE. |
+| `a7b4fbcbc` `/update` guard | Tier 3 | **N/A.** OpenTUI has NO `/update` handler (not in slash.ts CLIENT, not in server `command.dispatch`); no `exit(42)`/PTY-death path exists. `/update` falls through `slash.exec` gracefully. NO CHANGE. |
+| `857d0244a` dispatch payloads | Tier 3 | **VERIFY-ONLY.** `handleDispatchResult` (slash.ts:861) covers `exec/plugin/alias/skill/send/prefill` + default err. No payload shape dropped. NO CHANGE. |
+| `ab8f06381`+`e52fffb60` fast-echo tmux | Tier 3 | **N/A confirmed** (Part A). No fast-echo/localEcho bypass in `ui-opentui/src` (grep empty). Advancing can't introduce drift. NO CHANGE. |
+| §5a in-place compaction | §5 | **VERIFY-ONLY, no-op to advance.** `compression.in_place` defaults `False` (config.py ~1296); OpenTUI already decodes `compressions` (SessionInfo.ts ~45/72, store.ts ~413). DEFAULT-ON for the OpenTUI engine = glitch decision; he chose **leave OFF** (revisit as a separate change). |
+| §5b session finalization | §5 | **VERIFY-ONLY.** `_finalize_session` is `_finalized`-guarded (~398); `end_session` first-reason-wins (~476); `reopen_session` on resume (~4956, ~5054); liveness filter excludes `_finalized` (~5344). Composes correctly (Part A). NO CHANGE. |
+
+### 10.2 The two ports delivered (engine-only; gate: 873 vitest in 57 files + 310 py, build clean)
+
+**`/timestamps [on|off|status]` (alias `/ts`)** — NOTE: the upstream commit targets the CLASSIC CLI,
+not the Ink TUI; there was no Ink-TUI source to mirror. The OpenTUI engine renders NO message labels
+(glyph-based, `❯`/`⚕` in a 2-cell gutter), so `[HH:MM]` lands as a **muted prefix** on the body's
+first line. Files: `logic/store.ts` (Message `timestamp?:number`, `timestamps` flag + `setTimestamps`,
+stamp on submit/stream-start with `Math.floor(Date.now()/1000)`), `logic/resume.ts` (`readOptNum` +
+carry stored ts, OMIT when absent/non-finite — never fabricate on RESUMED turns), `view/display.tsx`
+(+`timestamps` flag), `view/transcript.tsx` (thread it), `view/messageLine.tsx` (`formatTimestamp` +
+muted prefix via a keyed `<Show when={tsLabel()}>` accessor — NO `!` assertion, eslint forbids it in
+src), `logic/slash.ts` (`timestampsCmd` mirroring `compactCmd` + `/timestamps`/`/ts` CLIENT + help),
+`entry/main.tsx` (wire SlashContext), `test/timestamps.test.ts`. Live turns DO get a real wall-clock
+stamp (their genuine send time — that's the classic CLI's behaviour, not fabrication); "never
+fabricate" applies only to resumed turns lacking a stored ts.
+
+**`/reasoning full|clamp`** — the SERVER side was already done (`config.set key=reasoning` maps
+`full`→`sections.thinking=expanded`+persist `display.reasoning_full`, `clamp`→collapsed; server.py
+~8398-8435), explicitly commented "the TUI renders thinking as an expand/collapse section." KEY
+nuance: the upstream feature fixes a CLASSIC-CLI 10-line reasoning CLAMP that **does not exist in the
+OpenTUI engine** (its reasoning is full-when-expanded). So the OpenTUI semantics = a reasoning-SPECIFIC
+expand toggle, independent of the global `/details` mode. Files: `logic/store.ts` (`reasoningFull`
+flag + `setReasoningFull`), `view/display.tsx`, `view/transcript.tsx`, `view/reasoningPart.tsx`
+(predicate `override() ?? (streaming || details==='expanded' || reasoningFull)` — `override()` click
+still wins), `logic/slash.ts` (`reasoningCmd`: bare=`config.get` sync, `full`/`all`, `clamp`/`collapse`/
+`short`, any OTHER arg [effort/show/hide] RE-DISPATCHED to the gateway via `slash.exec`), `entry/main.tsx`,
+`tui_gateway/server.py` (1-line ADDITIVE `config.get key=reasoning` now returns `reasoning_full` so
+bare `/reasoning` can sync), `test/reasoning.test.tsx` + both SlashContext test fakes updated.
+
+Display flags follow the engine's established convention: start OFF each launch (the persisted pref
+doesn't reach the TUI via `session.info`, same as `compact`/`details`); `/reasoning` bare syncs from
+the persisted value via `config.get`.
+
+### 10.3 Tier 2 `$EDITOR` — premise was wrong; spiked + filed as a follow-up issue
+
+The handoff said "OpenTUI already has an editor-open via Ctrl+G" — it does NOT. Grep for
+`openEditor`/`EDITOR`/`spawnEditor`/ctrl-g across `ui-opentui/src` is EMPTY. Both upstream commits say
+"the TUI already opens $EDITOR via Ctrl+G" but that's the **Ink TUI** (`ui-tui/`), not the OpenTUI
+engine. The engine only spawns DETACHED/background children (`boundary/openExternalUrl.ts`,
+`boundary/clipboard.ts` — `detached:true, stdio:'ignore'`); no foreground-TTY child, no renderer
+suspend/release in use. So `/prompt` + Ctrl+G-submit require BUILDING a `$EDITOR` integration from
+scratch (release alt-screen → foreground child sharing the TTY → reclaim → temp-file roundtrip), not
+"wiring an existing opener."
+
+**Spike verdict: FEASIBLE, low-moderate risk.** `@opentui/core` 0.4.1's `CliRenderer` ships
+purpose-built `suspend()` / `resume()` (verified in `renderer.d.ts` + compiled body): `suspend()`
+pauses the loop, `lib.suspendRenderer`, `stdin.setRawMode(false)` (cooked mode for the editor),
+removes the data listener + `stdin.pause()` (child reads stdin), disables mouse, removes exit
+listeners; `resume()` is the exact inverse + forces a full repaint. `useRenderer()` is reachable from
+the composer keyboard handler, and `props.onSubmit` is the submit path. So the hard part is
+library-supported.
+
+Per glitch: this was DEFERRED to its own focused PR. Full implementation spec filed as a GitHub issue
+on the fork (issues were disabled on the fork; enabled them first; issue body scrubbed of any
+GitHub auto-linking refs). The issue covers a new `boundary/openInEditor.ts` helper, the composer
+Ctrl+G branch, the `/prompt`+`/compose` slash command, and the always-`resume()`-in-`finally` /
+no-shell / empty-save-cancels gotchas.
+
+### 10.4 Method notes for the next porter
+
+- The recon SPIKE is the single biggest time-saver — `execute_code` batching `grep`/`sed`/`read`
+  closed the whole 12-item classification in a handful of calls. TWO-THIRDS of the backlog evaporated
+  at the spike stage (already-done / non-bug / N-A). VERIFY THE PREMISE before dispatching an
+  implementer (AGENTS.md rule) — the Tier 2 `$EDITOR` premise was wrong and would have wasted a build.
+- The handoff's `server.py` line numbers were stale (batch grew ~211 commits). Always re-derive
+  anchors against the actual worktree tree.
+- ESLint forbids `no-non-null-assertion` AND unnecessary conditionals in `src/**` (but TURNS BOTH OFF
+  for `**/*.test.*` + `src/test/lib/**` — see `eslint.config.mjs:79-81`). `check.sh` runs prettier →
+  type-check → lint → vitest with `set -e`, so a lint error aborts BEFORE vitest. Use the keyed
+  `<Show when={accessor()}>{v => …}` pattern in views, never `value!`.
+- Adversarial review converged immediately (no blocking findings) because the implementer briefs were
+  precise (full file:line anchors + the cache/alternation invariant + the eslint constraint). The
+  headless `claude -p` review TIMED OUT at 300s this session — fell back to a manual line-by-line
+  audit of the 809-line diff, which was sufficient given the small, well-scoped surface.

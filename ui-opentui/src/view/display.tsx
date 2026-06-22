@@ -14,9 +14,13 @@ import type { DetailsMode } from '../logic/details.ts'
 export interface DisplayFlags {
   compact: boolean
   details: DetailsMode
+  /** /timestamps: render a muted [HH:MM] next to each message that has a stored timestamp. */
+  timestamps: boolean
+  /** /reasoning full: expand all thinking sections (independent of `details`). */
+  reasoningFull: boolean
 }
 
-const DEFAULTS: DisplayFlags = { compact: false, details: 'collapsed' }
+const DEFAULTS: DisplayFlags = { compact: false, details: 'collapsed', timestamps: false, reasoningFull: false }
 const DEFAULT_FLAGS: Accessor<DisplayFlags> = () => DEFAULTS
 
 const Ctx = createContext<Accessor<DisplayFlags>>()

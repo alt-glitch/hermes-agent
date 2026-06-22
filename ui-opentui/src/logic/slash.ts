@@ -91,6 +91,12 @@ export interface SlashContext {
   /** Read / set the global tool/reasoning detail mode (/details — Epic 3). */
   readonly details: () => DetailsMode
   readonly setDetails: (mode: DetailsMode) => void
+  /** Read / set the show-[HH:MM] display flag (/timestamps — port of upstream 5ff11a689). */
+  readonly timestamps: () => boolean
+  readonly setTimestamps: (on: boolean) => void
+  /** Read / set the expand-all-thinking display flag (/reasoning full|clamp). */
+  readonly reasoningFull: () => boolean
+  readonly setReasoningFull: (on: boolean) => void
   /** Mounted-renderable count under the live renderer root (a /mem diagnostic);
    *  undefined when no renderer is reachable (tests). */
   readonly renderableCount: () => number | undefined
@@ -262,6 +268,8 @@ const CLIENT_HELP_LINES = [
   '/clear, /new — clear the transcript (confirm)',
   '/compact [on|off|toggle] — compact transcript spacing',
   '/details [hidden|collapsed|expanded|cycle] — tool/reasoning detail',
+  '/reasoning [full|clamp] — expand/collapse all thinking',
+  '/timestamps [on|off|status] — show [HH:MM] on messages (alias /ts)',
   '/bg <prompt> — launch a background prompt',
   '/processes — OS background processes (list + stop all)',
   '/replay [n|path] — inspect an archived spawn tree',
@@ -597,6 +605,35 @@ const compactCmd: ClientHandler = (arg, ctx) => {
   ctx.pushSystem(`compact ${next ? 'on' : 'off'}`)
 }
 
+/** `/timestamps [on|off|status]` (alias `/ts`) — toggle the muted `[HH:MM]` shown
+ *  next to each message that carries a stored unix `timestamp`. Port of upstream
+ *  5ff11a689 ("/timestamps") reproduced natively in the OpenTUI engine.
+ *
+ *  JUDGMENT CALLS:
+ *  - `status` (or `?`) reports `Message timestamps: ON|OFF` WITHOUT toggling.
+ *  - Otherwise `flagFromArg` parses on/off/toggle (bare = toggle); garbage → usage.
+ *  - Persisted via the same fire-and-forget `config.set` seam as /compact, with
+ *    key `timestamps` (matching compactCmd's `key: 'compact'` convention — the
+ *    classic CLI's `display.timestamps` is its dotted config path, but this RPC
+ *    uses the short flag name, so we mirror compact). The flag flips locally
+ *    regardless (the store drives the render); each launch starts OFF (the
+ *    persisted pref doesn't reach this TUI via session.info — see store.ts). */
+const timestampsCmd: ClientHandler = (arg, ctx) => {
+  const mode = arg.trim().toLowerCase()
+  if (mode === 'status' || mode === '?') {
+    ctx.pushSystem(`Message timestamps: ${ctx.timestamps() ? 'ON' : 'OFF'}`)
+    return
+  }
+  const next = flagFromArg(arg, ctx.timestamps())
+  if (next === null) {
+    ctx.pushSystem('usage: /timestamps [on|off|status]')
+    return
+  }
+  ctx.setTimestamps(next)
+  void ctx.request('config.set', { key: 'timestamps', value: next ? 'on' : 'off' }).catch(() => {})
+  ctx.pushSystem(`timestamps ${next ? 'on' : 'off'}`)
+}
+
 /**
  * `/details [hidden|collapsed|expanded|cycle]` — GLOBAL detail mode (per-section
  * overrides deferred; the gateway's arg completion also suggests section names,
@@ -629,6 +666,58 @@ const detailsCmd: ClientHandler = async (arg, ctx) => {
   ctx.setDetails(next)
   void ctx.request('config.set', { key: 'details_mode', value: next }).catch(() => {})
   ctx.pushSystem(`details: ${next}`)
+}
+
+/**
+ * `/reasoning [full|clamp]` — expand/collapse ALL thinking ("Thinking"/"Thought")
+ * sections, independently of the global /details mode. Mirrors detailsCmd.
+ *
+ *   - bare `/reasoning`: `config.get {key:'reasoning'}` → read the persisted
+ *     `reasoning_full` boolean (added server-side), sync the local flag, and
+ *     report `reasoning: full|clamp`. On error, report the current local flag.
+ *   - `full` (alias `all`): expand all → local flag on + persist `value:'full'`.
+ *   - `clamp` (aliases `collapse`, `short`): collapse all → flag off + `value:'clamp'`.
+ *
+ * ROUTING DECISION (non-handled args): the server-side `/reasoning` ALSO accepts a
+ * reasoning EFFORT (`high`/`medium`/`low`) and visibility (`show`/`hide`). Those are
+ * NOT display-expansion concerns, so we do NOT reimplement them here — for any arg
+ * other than bare/full/all/clamp/collapse/short we re-dispatch through the gateway
+ * via `slash.exec` and surface its `output`. This keeps the client handler tiny
+ * while still letting the full server-side `/reasoning` surface work from the TUI.
+ */
+const reasoningCmd: ClientHandler = async (arg, ctx) => {
+  const first = arg.trim().toLowerCase().split(/\s+/)[0] ?? ''
+  if (!first) {
+    try {
+      const r = await ctx.request('config.get', { key: 'reasoning' })
+      const full = !!(r && typeof r === 'object' && (r as { [k: string]: unknown }).reasoning_full)
+      ctx.setReasoningFull(full)
+      ctx.pushSystem(`reasoning: ${full ? 'full' : 'clamp'}`)
+    } catch {
+      ctx.pushSystem(`reasoning: ${ctx.reasoningFull() ? 'full' : 'clamp'}`)
+    }
+    return
+  }
+  if (first === 'full' || first === 'all') {
+    ctx.setReasoningFull(true)
+    void ctx.request('config.set', { key: 'reasoning', value: 'full' }).catch(() => {})
+    ctx.pushSystem('reasoning: full')
+    return
+  }
+  if (first === 'clamp' || first === 'collapse' || first === 'short') {
+    ctx.setReasoningFull(false)
+    void ctx.request('config.set', { key: 'reasoning', value: 'clamp' }).catch(() => {})
+    ctx.pushSystem('reasoning: clamp')
+    return
+  }
+  // Non-handled arg (effort like high/medium/low, or show/hide): re-dispatch to
+  // the gateway's full `/reasoning` surface and surface its output.
+  try {
+    const r = await ctx.request('slash.exec', { command: `reasoning ${first}`, session_id: ctx.sessionId() })
+    ctx.pushSystem(readStr(r, 'output') || 'reasoning updated')
+  } catch {
+    ctx.pushSystem('reasoning: failed to update')
+  }
 }
 
 /** `/skin [name]` — switch the active theme skin (Ink parity:
@@ -812,6 +901,7 @@ const CLIENT: Record<string, ClientHandler> = {
   processes: (_arg, ctx) => ctx.openBackgroundPanel(),
   procs: (_arg, ctx) => ctx.openBackgroundPanel(),
   model: modelCmd,
+  reasoning: reasoningCmd,
   replay: replayCmd,
   resume: resumeCmd,
   session: sessionsCmd,
@@ -820,6 +910,8 @@ const CLIENT: Record<string, ClientHandler> = {
   skin: skinCmd,
   switch: sessionsCmd,
   tasks: (_arg, ctx) => ctx.openDashboard(),
+  timestamps: timestampsCmd,
+  ts: timestampsCmd,
   tools: toolsCmd,
   help: async (_arg, ctx) => {
     // Prefer the live catalog; fall back to the client list if it's unavailable.
