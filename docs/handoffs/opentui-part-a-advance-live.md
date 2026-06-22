@@ -195,14 +195,22 @@ This is a hard gate on the advance (glitch's explicit ask).
   of a live OpenTUI session; `/resume` still reopens via `reopen_session()`.
 - Render-verify: clean quit AND force-quit both finalize once + persist messages; `/resume` reopens.
 
-### 6c. Sidecar filter (`a7983d5ad`) — real client work, NOT free (adversarial review correction)
-- The server deny-list is `frozenset({"tool"})` at `server.py:4596` AND `:4825` — it does **NOT**
-  include `"sidecar"`. The server only RECORDS the real `source` on the row; "hide from history"
-  lives client-side (Ink: `web/src/components/ChatSidebar.tsx`). OpenTUI's `sessionPicker.ts`
-  `INTERACTIVE_SOURCES=['cli','tui','acp']` excludes sidecar, BUT its "All" tab omits the `sources`
-  param, so the server returns sidecar rows → **a sidecar session WILL show in the OpenTUI All tab.**
-- **Fix (recommend server-side, fixes both surfaces uniformly):** add `"sidecar"` to the deny
-  `frozenset` at `server.py:4596` + `:4825`. Alternative: client-side deny in `sessionPicker.ts`.
+### 6c. Sidecar filter (`a7983d5ad`) — NO CODE CHANGE (premise refuted on execution)
+- **The plan's earlier claim that OpenTUI needs a sidecar filter was WRONG** (premise verified
+  against the merged tree during Part A execution, 2026-06-22):
+  - `a7983d5ad` creates sidecar/`close_on_disconnect` sessions with **`source: "tool"`** (web
+    `ChatSidebar.tsx` passes `source: "tool"`), NOT `source: "sidecar"`. `"tool"` is **already** in
+    the server deny-list (`frozenset({"tool"})`). There is no `"sidecar"` source label anywhere in
+    the tree — adding `"sidecar"` to the deny-list would be DEAD CODE.
+  - The server deny-list applies in BOTH the legacy path (sources omitted — the OpenTUI "All" tab)
+    AND the filtered path, so sidecar/`tool` sessions are dropped server-side regardless. The
+    OpenTUI `sessionPicker.ts` comment documents this exactly: *"All omits it (the gateway
+    deny-lists `tool` server-side)."*
+  - The OpenTUI engine creates exactly one normal interactive session (`entry/main.tsx:235`) and
+    has NO `close_on_disconnect`/sidecar session-create path of its own — nothing to filter.
+  - This is intentional design (deny-list the noisy internal `tool` source; sidecar reuses it), not
+    a gap. No change needed; the adversarial reviewer's B2 and this section's original
+    recommendation rested on a wrong premise (`source == "sidecar"`).
 
 ---
 

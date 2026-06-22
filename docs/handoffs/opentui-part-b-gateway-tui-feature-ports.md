@@ -286,3 +286,157 @@ python -m pytest tests/test_tui_gateway_server.py -o 'addopts=' -q -p no:cachepr
 - **Never restart glitch's gateway from inside an agent session** (self-kill) — hand off the
   `systemctl --user restart hermes-gateway-daimon.service` step.
 - **Public/destructive git is glitch's** — stage local, hand off push/merge.
+
+---
+
+## 9. HOW TO WORK THESE TASKS — the proven method (from the Part A session, 2026-06-22)
+
+This is the workflow that produced the Part A code change cleanly. Mirror it for Part B. It
+combines four skills: `subagent-driven-development` (the controller/implementer loop),
+`adversarial-review-loop` (Claude Code per-task review + `/simplify`), `hermes-agent-dev` (codebase
+conventions), and the three OpenTUI skills in §0 (for any `ui-opentui/` work).
+
+### 9.1 The shape of the work (read this first — it changes how you scope)
+
+Part B tasks fall into THREE buckets, and **most are NOT green-field code**. Before writing
+anything, classify each task — this is the single biggest time-saver:
+
+- **Verify-only** — the server-side fix already flows through; you just confirm behavior. (Part A
+  example: the sidecar "fix" turned out to be a non-bug — see 9.6.)
+- **Display/catalog polish** — logic already flows through `slash.exec` → `present()`; you wire the
+  command into the completion catalog and confirm the output renders.
+- **Real client port** — genuine new Solid view/logic in `ui-opentui/` (`/prompt`, `/reasoning
+  full`, Ctrl+G-submit). These are the only ones that need the full implementer + render-ladder loop.
+
+A task you assumed was a port is often verify-only once you read the real code. **Do the recon
+before you dispatch an implementer.**
+
+### 9.2 Controller-driven loop (you are the controller; subagents are leaves)
+
+The pattern, per task:
+
+1. **SPIKE first (controller does this directly, read-only).** Before any code, run a focused
+   recon to (a) confirm the bug/feature premise against the real tree, (b) find the exact insertion
+   point(s) with `file:line`, and (c) decide verify-only vs port. Use `execute_code` to batch
+   several `terminal`/`grep`/`sed` reads in ONE call — this session closed all four Part A spikes
+   (MCP, sidecar, fast-echo, finalization) in ~4 batched calls. Pin every claim to a line number.
+   **Verify the premise BEFORE writing code** (AGENTS.md rule). Two of four Part A "tasks"
+   evaporated at the spike stage (sidecar non-bug; finalization composes correctly) — that's the
+   spike doing its job.
+2. **Dispatch ONE implementer subagent** for the actual code task (never parallel implementers —
+   they conflict). Give it the FULL task text inline (don't make it read the plan), the spike's
+   `file:line` findings as `context`, scoped toolsets, and tell it to load the relevant skill.
+3. **Verify the self-report yourself.** Re-read the actual edit (`sed`/`read_file`), re-run the
+   tests from the controller — do NOT trust the subagent's pasted "all green." Confirm `git status`
+   shows only the intended file (no lockfile/pycache churn).
+4. **Adversarial review with Claude Code** (per-task, not per-phase). See 9.4.
+5. **Fix → re-review** until the round's findings degrade to nits. Then `/simplify` (9.5).
+6. Mark the todo done, move to the next task.
+
+### 9.3 Subagent dispatch recipe (what actually worked)
+
+For a hermes-agent **Python/gateway** code task (e.g. the MCP fix), the `delegate_task` call that
+worked:
+- **`toolsets: ["file", "search", "terminal", "skills"]`** — `skills` so it can load
+  `hermes-agent-dev`; `terminal` to run tests.
+- **`context`** must contain: the worktree path + "cd there first", "load `hermes-agent-dev`
+  skill", "git blame the lines before editing", the **no-`.venv` fact** ("use
+  `~/github/hermes-agent/.venv/bin/python -m pytest <file> -o 'addopts=' -q -p no:cacheprovider`,
+  NOT scripts/run_tests.sh"), "edit with the `patch` tool", file sizes ("server.py is ~11.6k lines,
+  read only the regions you need"), the cache-safety constraint, and **"Respond in English"** +
+  **"DO NOT git commit or git add"**.
+- **`goal`** = the full self-contained task: the bug, the exact fix with the canonical pattern to
+  mirror (with `file:line`), numbered REQUIREMENTS, and a VERIFY block (AST parse + grep proof +
+  the exact pytest command + expected baseline counts). Tell it to report DONE / DONE_WITH_CONCERNS
+  / BLOCKED and to document any judgment call in a code comment + its report.
+- For a `ui-opentui/` **Solid/view** task, ALSO include the OpenTUI skills in the context and tell
+  it to `skill_view(name="opentui", ...)` + `skill_view(name="opentui-app-engineering")` BEFORE
+  writing (the `attributes`-bitmask bug is what guessing-without-docs produces).
+- **Fix loop:** when review finds an issue, dispatch a FRESH subagent with the precise finding (tell
+  it "you are FIXING an in-progress uncommitted edit, not starting fresh; read the current file
+  state first"). Don't fix manually (context pollution) unless it's a one-line nit.
+
+### 9.4 Adversarial review with Claude Code (the per-task gate)
+
+- Small diff (< ~5k lines) → **pipe context+diff via stdin**: `cat /tmp/ctx.md | claude -p
+  --dangerously-skip-permissions --max-turns 12 '<focused prompt>' 2>/dev/null > /tmp/review.md`.
+- **ALWAYS tell it: "Do NOT spawn sub-agents / do not use the Task tool (it deadlocks headless)."**
+  This is the #1 way a headless `claude -p` review hangs with zero output.
+- Give it the diff + the reference code to verify against (`file:line` ranges), and ask for
+  PROBLEM / EVIDENCE(file:line) / FIX, "blocking vs nit", and an explicit "No remaining issues
+  found" when clean.
+- **Round-over-round:** tell each round what the prior round fixed and to report only NEW issues.
+  Convergence = findings degrade (round 1 real bug → round 2 subtle → round 3 nit/already-correct).
+  Part A converged in 3 rounds: round 1 caught a **real blocking bug** (the fix omitted the
+  load-bearing `shutdown_mcp_servers()` + `discover_mcp_tools()` calls — would've shipped another
+  no-op), round 2 clean, final round "ready to commit."
+- **Triage every finding against the real code before accepting** — but this session all findings
+  verified true (the reviewer read the actual tree). Don't blindly obey a reviewer whose suggestion
+  contradicts a green tested contract; document the divergence instead.
+
+### 9.5 `/simplify` (run after review converges, on a fix/feature diff — NOT on a pure refactor)
+
+- `/simplify` is interactive — run it in **tmux**, not `-p` (it's a slash command):
+  `tmux new-session -d -s simplify ...; claude --dangerously-skip-permissions`, then
+  `tmux send-keys` the `/simplify the uncommitted change in <file> (lines …); this is a bug-fix,
+  NOT a refactor — only behavior-preserving simplifications, do NOT spawn sub-agents`.
+- **Wait ~2 min** (it churns at high effort). Capture with `tmux capture-pane -p -S -150`.
+- **DANGER:** after it answers, the prompt sits waiting — do NOT let a stray `commit this` (or any
+  text in the captured pane) get an Enter. **`tmux kill-session` immediately** once you've read the
+  output; then confirm `git log` shows NO new commit. (This session a `commit this` appeared in the
+  pane; killing the session before any Enter prevented an unwanted commit.)
+- Expect `/simplify` to mostly return "already minimal" on a tight fix. It correctly flags
+  out-of-scope refactors (e.g. "extract a shared helper across both call sites") — **do NOT apply
+  those** on a bug-fix; note them as follow-ups (over-reach is a real failure mode).
+
+### 9.6 The premise-verification lesson (saved 3 dead-code commits in Part A)
+
+Three of the four Part A scrutiny items were **non-bugs once verified against the tree** — and the
+adversarial reviewer's own finding (B2 sidecar) was built on a wrong premise. Before "fixing"
+anything in Part B, prove the premise:
+- **Sidecar filter** — assumed sidecar sessions carry `source: "sidecar"`. They carry
+  `source: "tool"` (web `ChatSidebar.tsx` passes `"tool"`), which is ALREADY deny-listed. No
+  `"sidecar"` label exists anywhere → adding one is dead code. The OpenTUI "All" tab already hides
+  them (server deny-list applies even when `sources` is omitted). NO CHANGE.
+- **Session finalization** — `_finalize_session` (`tui_gateway/server.py:389`) is `_finalized`-
+  guarded and ends the row; the core `b17180d95` `AIAgent.close()` also ends it, but `end_session`
+  is **first-reason-wins** (run_agent.py:3257) → no double-finalize. `_teardown_session` finalizes
+  THEN closes, so the TUI reason wins. NO CHANGE.
+- **fast-echo-tmux** (`ab8f06381`) — OpenTUI's input has NO fast-echo bypass (`grep` empty) → the
+  Ink fix is N/A; advancing cannot introduce cursor drift. NO CHANGE.
+- **in-place compaction** — `compression.in_place` defaults False; the engine already decodes
+  `session.info.compressions`. NO engine change to ADVANCE (default-ON is a separate decision).
+
+The rule (AGENTS.md): if you can't point to the exact line where the bug manifests AND show your
+fix changes that line's behavior, you haven't verified the premise. A confirmed reproduction on the
+real tree beats a plausible-sounding rationale every time.
+
+### 9.7 How the to-dos were structured (the controller's todo list)
+
+Keep the controller `todo` list as the spine. The Part A structure that worked:
+1. One **push/setup** item (push docs + branch).
+2. One **SPIKE** item per scrutiny area (MCP, sidecar, fast-echo, finalization) — collapse to DONE
+   with the one-line verdict (e.g. "fast-echo N/A — no bypass").
+3. One **CODE** item per real code task, with a **paired REVIEW** item right after it
+   (verify + Claude Code adversarial + `/simplify`). Don't batch reviews.
+4. A **final gate** item (engine + python + integration review) and a **hand-off** item (commit
+   local → glitch pushes/merges).
+Mark spikes done with their verdict so a non-bug is visible as resolved, not silently dropped. Only
+ONE item `in_progress` at a time.
+
+### 9.8 Pre-existing flake to expect (not yours)
+
+Running the whole `tests/tui_gateway/` dir in ONE pytest process surfaces a test-ordering failure
+(`test_goal_command.py::test_goal_set_returns_send_with_notice`) that **passes in isolation** and
+reproduces on the clean merged tree. It is upstream cross-file state pollution, not a regression —
+the canonical `scripts/run_tests.sh` avoids it via per-file subprocess isolation (but that wrapper
+needs a `.venv` the worktree lacks; the upstream-clone venv runs everything in one process). When
+you see it, run the single test alone to confirm it's the flake, and/or stash your change and re-run
+the batch on the clean tree.
+
+### 9.9 Hand-off boundary
+
+Stage all code as LOCAL commits on the throwaway/PR branch. The PUSH and the PR MERGE are glitch's
+public steps (he was burned before — hand off, don't execute) UNLESS he explicitly says "push it"
+this session. Never restart his gateway from inside a session (self-kill) — emit the
+`systemctl --user restart hermes-gateway-daimon.service` command for him.
