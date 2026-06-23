@@ -491,6 +491,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // Submit a user turn: the service value is in hand, so `gateway.request(...)`
       // is Effect<…, never> — fire it detached with runFork; failures are logged.
       const submitPrompt = (text: string) => {
+        // Busy guard (layer A of the busy-queue fix): a prompt sent while a turn
+        // runs CANNOT go straight to the gateway (the server rejects it with 4009
+        // "session busy" and the client used to swallow it → silent drop). Park it
+        // in the store's client queue; the registered turn-complete drain re-submits
+        // it once the current turn finishes (info.running is false by then).
+        if (store.state.info.running) {
+          store.enqueuePrompt(text)
+          store.pushSystem(`⏳ queued — will send after the current turn (${store.queuedCount()} queued)`)
+          return
+        }
         store.pushUser(text)
         const sid = gateway.sessionId()
         if (!sid) {
@@ -498,11 +508,27 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           return
         }
         Effect.runFork(
-          gateway
-            .request('prompt.submit', { session_id: sid, text })
-            .pipe(
-              Effect.catchCause(cause => Effect.sync(() => getLog().warn('submit', 'failed', { cause: String(cause) })))
+          gateway.request('prompt.submit', { session_id: sid, text }).pipe(
+            Effect.catchCause(cause =>
+              Effect.sync(() => {
+                // Ink-parity (useSubmission.ts): the busy-guard above + the
+                // settle-edge drain (store.applyInfo on the server-confirmed
+                // running:false edge) mean we NEVER optimistically submit while a
+                // turn is in flight — so a prompt is enqueued, then drained and
+                // submitted exactly ONCE, after the gateway is idle. We therefore
+                // do NOT re-queue on a 4009 here: an earlier cut did, but a 4009
+                // that races a still-finishing nested turn (e.g. /goal's kickoff)
+                // can fire even though the submit ACTUALLY went through, and the
+                // re-queue then ran the prompt a SECOND time (the /goal
+                // double-run). Ink never optimistically submits, so it never has a
+                // 4009 to recover from; mirror that — just log. (If a 4009 ever
+                // reaches here it means the drain fired too early, which is a bug
+                // to fix at the edge, not to paper over with a duplicate-prone
+                // retry.) Defensive — never throws out.
+                getLog().warn('submit', 'failed', { cause: String(cause) })
+              })
             )
+          )
         )
       }
 
@@ -641,6 +667,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         else if (route.kind === 'slash') void dispatchSlash(route.payload, slashCtx)
         else submitPrompt(route.payload)
       }
+
+      // Drain the client busy queue ONCE per turn-completion: the store fires this
+      // on every `message.complete`. Pop ONE queued prompt and re-submit it — and
+      // because submitPrompt now guards on info.running (false at completion time),
+      // it submits cleanly. Draining ONE per completion preserves ordering + lets
+      // each queued prompt stream as its own turn (the next completion drains the next).
+      store.registerTurnCompleteHandler(() => {
+        const next = store.dequeuePrompt()
+        if (next !== undefined) submitPrompt(next)
+      })
 
       // Live completions (items 5 + 13): a `/command [args]` line queries
       // `complete.slash` (the gateway completes names AND args); a trailing
