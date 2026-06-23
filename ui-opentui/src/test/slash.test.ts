@@ -260,6 +260,8 @@ interface Probe {
   calls: Array<{ method: string; params: Record<string, unknown> }>
   system: string[]
   submitted: string[]
+  /** Skill invocations routed through submitSkill: [command, body] pairs. */
+  skillSubmitted: Array<{ command: string; body: string }>
   confirmed: Array<{ message: string; onConfirm: () => void }>
   paged: Array<{ title: string; text: string }>
   sessionPickers: SessionTabId[]
@@ -286,6 +288,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const calls: Probe['calls'] = []
   const system: string[] = []
   const submitted: string[] = []
+  const skillSubmitted: Probe['skillSubmitted'] = []
   const confirmed: Probe['confirmed'] = []
   const paged: Probe['paged'] = []
   const sessionPickers: SessionTabId[] = []
@@ -336,7 +339,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       return request(method, params)
     },
     sessionId: () => 'sid-1',
-    submit: text => submitted.push(text)
+    submit: text => submitted.push(text),
+    submitSkill: (command, body) => skillSubmitted.push({ command, body })
   }
   return {
     calls,
@@ -356,6 +360,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     billed,
     quit,
     resumed,
+    skillSubmitted,
     sessionPickers,
     submitted,
     system
@@ -795,6 +800,31 @@ describe('dispatchSlash — server ladder', () => {
     expect(p.system).toContain('hello')
     expect(p.submitted).toHaveLength(0)
     expect(p.paged).toHaveLength(0)
+  })
+
+  // A skill slash command (/dogfood) returns {type:'skill', name, message:<body>}.
+  // It must route through submitSkill (collapsed render + full body to the model),
+  // NOT through submit (which would dump the whole body as a giant user bubble).
+  test('slash.exec returns a {type:skill} dispatch payload → submitSkill (collapsed), not submit', async () => {
+    const body = '# Dogfood Skill\n\nfull body line 1\nfull body line 2'
+    const p = makeCtx(async method =>
+      method === 'slash.exec' ? { type: 'skill', name: 'dogfood', message: body } : {}
+    )
+    await dispatchSlash('/dogfood', p.ctx)
+    expect(p.calls.map(c => c.method)).toEqual(['slash.exec'])
+    // Routed to submitSkill with the slash command + the FULL body…
+    expect(p.skillSubmitted).toEqual([{ command: '/dogfood', body }])
+    // …and NOT to submit (no giant user bubble).
+    expect(p.submitted).toHaveLength(0)
+    expect(p.system).not.toContain('/dogfood: no output')
+  })
+
+  test('a {type:skill} with args preserves the args in the rendered command', async () => {
+    const p = makeCtx(async method =>
+      method === 'slash.exec' ? { type: 'skill', name: 'triage-nous', message: 'body' } : {}
+    )
+    await dispatchSlash('/triage-nous since yesterday', p.ctx)
+    expect(p.skillSubmitted).toEqual([{ command: '/triage-nous since yesterday', body: 'body' }])
   })
 })
 

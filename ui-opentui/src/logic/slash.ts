@@ -59,6 +59,11 @@ export interface SlashContext {
   readonly openPager: (title: string, text: string) => void
   /** Submit a user turn (skill/send dispatch results). */
   readonly submit: (text: string) => void
+  /** Submit a SKILL invocation: the full body goes to the model, but the
+   *  transcript renders a COLLAPSED `▶ /name · N lines` row instead of dumping
+   *  the whole skill body. `command` is the slash invocation as typed (incl.
+   *  args). (glitch 2026-06-23) */
+  readonly submitSkill: (command: string, body: string) => void
   /** Open a local Y/N confirm; `onConfirm` runs on Yes. */
   readonly confirm: (message: string, onConfirm: () => void) => void
   readonly clearTranscript: () => void
@@ -963,7 +968,20 @@ function handleDispatchResult(parsed: ParsedSlash, raw: unknown, ctx: SlashConte
       if (target) void dispatchSlash(`/${target}${argTail}`, ctx)
       return
     }
-    case 'skill':
+    case 'skill': {
+      // A skill slash command (e.g. /dogfood): the FULL skill body goes to the
+      // model, but render a COLLAPSED `▶ /name · N lines` row instead of dumping
+      // the whole body into the transcript (glitch 2026-06-23). The command is
+      // the slash invocation as typed, incl. args (`/triage-nous since yesterday`).
+      const notice = readStr(raw, 'notice')
+      if (notice) ctx.pushSystem(notice)
+      const message = readStr(raw, 'message')
+      if (message?.trim()) {
+        const skillName = readStr(raw, 'name') || parsed.name
+        ctx.submitSkill(`/${skillName}${argTail}`, message)
+      } else ctx.pushSystem(`/${parsed.name}: empty message`)
+      return
+    }
     case 'send': {
       const notice = readStr(raw, 'notice')
       if (notice) ctx.pushSystem(notice)

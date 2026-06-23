@@ -532,6 +532,38 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
+      // Submit a SKILL invocation (e.g. /dogfood): the full skill body still
+      // goes to the model (so the model consumes the skill, prompt-cache intact),
+      // but the transcript renders a COLLAPSED `▶ /name · N lines` row via
+      // pushSkill instead of dumping the whole body as a giant user bubble
+      // (glitch 2026-06-23). Mirrors submitPrompt's busy-guard + send path.
+      const submitSkill = (command: string, body: string) => {
+        // Busy guard: same as submitPrompt. A skill fired mid-turn can't go
+        // straight to the gateway (4009). Queue the raw body — it drains as a
+        // normal prompt (the collapsed render is a nicety lost only in the rare
+        // mid-turn case; the body still reaches the model correctly).
+        if (store.state.info.running) {
+          store.enqueuePrompt(body)
+          store.pushSystem(`⏳ queued — will send after the current turn (${store.queuedCount()} queued)`)
+          return
+        }
+        store.pushSkill(command, body)
+        const sid = gateway.sessionId()
+        if (!sid) {
+          getLog().warn('submitSkill', 'no session yet — dropping skill', { command })
+          return
+        }
+        Effect.runFork(
+          gateway
+            .request('prompt.submit', { session_id: sid, text: body })
+            .pipe(
+              Effect.catchCause(cause =>
+                Effect.sync(() => getLog().warn('submitSkill', 'failed', { cause: String(cause) }))
+              )
+            )
+        )
+      }
+
       // `!cmd` — run a shell command directly (Ink/free-code parity: F9). The
       // gateway's `shell.exec` runs it (30s timeout, dangerous/hardline guards)
       // and returns {stdout, stderr, code}; we echo the invocation as a user line
@@ -656,7 +688,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         },
         request: (method, params) => Effect.runPromise(gateway.request(method, params)),
         sessionId: () => gateway.sessionId(),
-        submit: submitPrompt
+        submit: submitPrompt,
+        submitSkill
       }
 
       // The composer's submit: `!cmd` runs a shell command (F9), `/command`
