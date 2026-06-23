@@ -1003,6 +1003,18 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
   const sid = ctx.sessionId()
   try {
     const result = await ctx.request('slash.exec', { command: input.slice(1), session_id: sid })
+    // The server's slash.exec routes _PENDING_INPUT_COMMANDS (goal/queue/steer/
+    // retry/plan/undo — server.py:10483) to command.dispatch and returns its
+    // result DIRECTLY: a {type: 'send'|'exec'|'prefill'|'alias'|...} payload, NOT
+    // a {output} payload. Detect that shape and render it through the same
+    // dispatch handler as the command.dispatch fallback (so /goal shows its
+    // "Goal set" notice + submits the kickoff, instead of "/goal: no output").
+    // readStr → undefined for a normal {output} result (no `type`), so that path
+    // is unchanged.
+    if (readStr(result, 'type') !== undefined) {
+      handleDispatchResult(parsed, result, ctx)
+      return
+    }
     const output = readStr(result, 'output') || `/${parsed.name}: no output`
     const warning = readStr(result, 'warning')
     const text = warning ? `warning: ${warning}\n${output}` : output

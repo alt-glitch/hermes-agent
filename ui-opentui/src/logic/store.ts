@@ -327,6 +327,10 @@ export interface StoreState {
    *  `message.complete` so a notice never flashes over a live reply. Latest-wins
    *  (a newer pending replaces an older). null = nothing held. */
   pendingNotice: ActivityNotification | null
+  /** Prompts submitted while a turn is running (info.running) — queued here and
+   *  drained one-per-turn-completion by the entry's onTurnComplete drain. NOT the
+   *  transcript. */
+  queuedPrompts: string[]
   /** Live session chrome for the status bar (model/effort/cwd/branch/context/running). */
   info: SessionInfo
   /** Transient hint shown above the composer (e.g. "Ctrl+C again to quit" — item 11);
@@ -595,6 +599,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     lastNotification: undefined,
     notice: null,
     pendingNotice: null,
+    queuedPrompts: [],
     status: undefined,
     // startedAt is set ONCE here (store creation ≈ session start) — the status
     // bar's session-duration segment ticks from it; wire patches never carry it.
@@ -819,6 +824,60 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('pendingNotice', null)
   }
 
+  // ── client busy queue (transport-free) ───────────────────────────────────
+  // A prompt submitted while a turn runs can't go straight to the gateway (the
+  // server rejects with 4009 "session busy"), so the entry's submit-guard parks
+  // it here and the entry drains one per turn-completion via the registered
+  // onTurnComplete handler below. The store NEVER touches the gateway — it only
+  // owns the FIFO queue + the completion hook.
+  let onTurnComplete: (() => void) | undefined
+
+  // The drain fires on the SERVER-confirmed end of a turn — the running
+  // true→false edge in a `session.info` (see applyInfo). It does NOT fire on
+  // `message.complete`: the gateway emits message.complete BEFORE it clears its
+  // server-side `running` flag (server.py emits complete at ~7076 but only sets
+  // session["running"]=False in the finally block at ~7224, after the
+  // /goal-continuation hook), so draining there races a still-busy session →
+  // 4009 bounces + duplicate submits. message.complete STILL flips info.running
+  // false LOCALLY (optimistic UI — the spinner must stop instantly; see
+  // statusLineSpinner.test.tsx), which means by the time the server's
+  // session.info(running:false) lands, state.info.running is ALREADY false and a
+  // naive wasRunning-edge would never see the true→false transition. So we track
+  // turn-in-flight SEPARATELY from the optimistic UI flag: message.start arms it,
+  // and applyInfo disarms+drains on the server's session.info(running:false). The
+  // server reliably emits that session.info in run()'s finally (server.py ~7227)
+  // after EVERY turn (success/error/interrupt), so the drain always fires once.
+  let turnInFlight = false
+
+  /** Register the drain callback the entry runs once per server-confirmed
+   *  turn-completion (the entry owns the gateway; the store stays transport-free). */
+  function registerTurnCompleteHandler(fn: () => void): void {
+    onTurnComplete = fn
+  }
+
+  /** Park a prompt that arrived mid-turn (FIFO tail). */
+  function enqueuePrompt(text: string): void {
+    setState('queuedPrompts', prev => [...prev, text])
+  }
+
+  /** Pop the FIFO head (oldest queued prompt) and remove it; undefined if empty. */
+  function dequeuePrompt(): string | undefined {
+    const head = state.queuedPrompts[0]
+    if (head === undefined) return undefined
+    setState('queuedPrompts', prev => prev.slice(1))
+    return head
+  }
+
+  /** Drop every queued prompt (e.g. /clear, /new). */
+  function clearQueue(): void {
+    setState('queuedPrompts', [])
+  }
+
+  /** How many prompts are currently queued. */
+  function queuedCount(): number {
+    return state.queuedPrompts.length
+  }
+
   /** Clear the transcript (e.g. /clear, /new) and any tracked subagents. */
   function clearTranscript() {
     setState('messages', [])
@@ -830,6 +889,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
     applied.clear()
     // A chrome notice must not survive a transcript reset (new session context).
     clearNoticeState()
+    // A fresh session must not carry over prompts queued against the OLD turn —
+    // they'd drain into the new session's first completion (cross-session bleed).
+    clearQueue()
+    // Disarm the busy-queue drain edge: a reset mid-turn must not leave it armed,
+    // or the next session.info(running:false) would fire a (harmless, queue-empty)
+    // drain attributed to a turn that no longer exists.
+    turnInFlight = false
     // /new and /clear start a fresh context: the status-bar usage gauges
     // (ctx %, tokens, cost, compressions) must zero out. They can't clear via a
     // later session.info because infoPatchFrom only MERGES present fields, so a
@@ -971,10 +1037,30 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('reasoningFull', on)
   }
 
-  /** Merge a session-info patch into the chrome state (status bar — item 14). */
+  /** Merge a session-info patch into the chrome state (status bar — item 14).
+   *  Also the SOLE drain trigger for the busy queue: on a server-confirmed
+   *  running true→false edge it fires onTurnComplete (once per turn). See the
+   *  turnInFlight comment near onTurnComplete for why this — and not
+   *  message.complete — is the correct, race-free drain point. */
   function applyInfo(raw: { readonly [k: string]: unknown }): void {
     const patch = readInfoPatch(raw)
-    if (Object.keys(patch).length) setState('info', prev => ({ ...prev, ...patch }))
+    if (Object.keys(patch).length === 0) return
+    setState('info', prev => ({ ...prev, ...patch }))
+    // Drain the busy queue ONLY when the SERVER confirms the turn ended: a
+    // session.info carrying running:false while a turn was in flight. We gate on
+    // turnInFlight (armed by message.start) rather than the optimistic
+    // info.running flag, because message.complete already flipped info.running
+    // false locally for instant spinner-stop UX — so by the time this server
+    // session.info lands, info.running is already false and a wasRunning-edge
+    // would miss it. turnInFlight is the un-optimistically-touched signal. The
+    // server emits session.info(running:false) in run()'s finally after EVERY
+    // turn (server.py ~7227), AFTER it clears its server-side running flag, so
+    // the drained prompt's prompt.submit lands cleanly (no 4009 race). Disarm
+    // first so it fires exactly once per turn, never on later idle info patches.
+    if (turnInFlight && patch.running === false) {
+      turnInFlight = false
+      onTurnComplete?.()
+    }
   }
 
   /** Set / clear the live completion candidates (composer dropdown). `from` is the
@@ -1023,6 +1109,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
           if (k === 'credits.usage' || k === 'credits.grant_spent') clearNotice(k)
         }
         setState('info', prev => ({ ...prev, running: true }))
+        // Arm the busy-queue drain edge. The drain fires on the server-confirmed
+        // running true→false transition in applyInfo (see the turnInFlight
+        // comment near onTurnComplete) — NOT on message.complete, which races the
+        // server's still-set running flag. message.start is the only arm point.
+        turnInFlight = true
         setState(
           produce(draft => {
             draft.messages.push({
@@ -1063,6 +1154,15 @@ export function createSessionStore(options?: SessionStoreOptions) {
           })
         )
         setState('status', undefined)
+        // LOCAL optimistic running:false flip — stops the busy spinner INSTANTLY
+        // (statusLineSpinner.test.tsx) without waiting for the server's
+        // session.info round-trip. NOTE: this does NOT drain the busy queue. The
+        // drain fires on the SERVER-confirmed running true→false edge in applyInfo
+        // (the session.info the gateway emits in run()'s finally AFTER it clears
+        // its server-side running flag) — message.complete arrives BEFORE that
+        // flag clears, so draining here would race a still-busy session → 4009
+        // bounces + duplicate submits. See the turnInFlight comment near
+        // onTurnComplete for the full ordering rationale.
         setState('info', prev => ({ ...prev, running: false }))
         // Apply any chrome notice held mid-turn now the turn's done (no flash over
         // a live reply). No-op when nothing was held.
@@ -1428,6 +1528,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
     // gateway re-emits on the next header parse — acceptable vs. cross-session
     // bleed + a leaked timer.
     clearNoticeState()
+    // …same reasoning for the client busy queue: a resumed/different session must
+    // not drain a prior session's queued prompts into its first turn-completion.
+    clearQueue()
+    // …and disarm the drain edge so a resume mid-turn doesn't leave it armed.
+    turnInFlight = false
     // …same reasoning for the pinned todo panel: a resumed/different session must
     // not inherit the prior session's plan. The resumed session re-emits its own
     // `todo` snapshot if it has one (mirrors clearTranscript's reset).
@@ -1482,6 +1587,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
     pushNotification,
     showNotice,
     clearNotice,
+    enqueuePrompt,
+    dequeuePrompt,
+    clearQueue,
+    queuedCount,
+    registerTurnCompleteHandler,
     setCatalog,
     setSessionId,
     clearTranscript,
