@@ -91,7 +91,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       return request(method, params)
     },
     sessionId: () => 'sid-1',
-    submit: () => {}
+    submit: () => {},
+    submitSkill: () => {}
   }
   return { calls, compactFlag, ctx, detailsFlag, paged, renderables, reasoningFullFlag, system, timestampsFlag }
 }

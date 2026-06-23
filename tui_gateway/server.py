@@ -6794,7 +6794,13 @@ def _notification_poller_loop(
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit_process_completion_card(sid, evt)
-            _emit("message.start", sid)
+            # NOTE: do NOT emit a manual ``message.start`` here. _run_prompt_submit
+            # already emits its own ``message.start`` for the turn it runs; emitting
+            # a second one created an EXTRA empty assistant message in the OpenTUI
+            # store (store.ts pushes {role:'assistant', text:'', streaming:true} on
+            # every message.start) that never received any deltas — leaving an
+            # orphaned blank "⚕ ▍" row above the real completion reply. (glitch
+            # 2026-06-23 — the "??? whats this" janky empty row.)
             _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
             print(
@@ -6838,7 +6844,13 @@ def _notification_poller_loop(
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit_process_completion_card(sid, evt)
-            _emit("message.start", sid)
+            # NOTE: do NOT emit a manual ``message.start`` here. _run_prompt_submit
+            # already emits its own ``message.start`` for the turn it runs; emitting
+            # a second one created an EXTRA empty assistant message in the OpenTUI
+            # store (store.ts pushes {role:'assistant', text:'', streaming:true} on
+            # every message.start) that never received any deltas — leaving an
+            # orphaned blank "⚕ ▍" row above the real completion reply. (glitch
+            # 2026-06-23 — the "??? whats this" janky empty row.)
             _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
             print(
@@ -7261,7 +7273,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     return
                 session["running"] = True
             try:
-                _emit("message.start", sid)
+                # No manual message.start — _run_prompt_submit emits its own;
+                # a second one orphaned an empty "⚕ ▍" assistant row. (glitch 2026-06-23)
                 _run_prompt_submit(rid, sid, session, goal_followup)
             except Exception as _cont_exc:
                 print(
@@ -7286,7 +7299,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     session["running"] = True
                 try:
                     _emit_process_completion_card(sid, _evt)
-                    _emit("message.start", sid)
+                    # No manual message.start — _run_prompt_submit emits its own;
+                    # a second one orphaned an empty "⚕ ▍" assistant row (see the
+                    # poller fix above). (glitch 2026-06-23)
                     _run_prompt_submit(rid, sid, session, synth)
                 except Exception as _n_exc:
                     print(

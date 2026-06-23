@@ -21,6 +21,7 @@ import type { ToolPartState } from '../../logic/store.ts'
 import { bashRenderer } from './bashTool.tsx'
 import { clarifyRenderer } from './clarifyTool.tsx'
 import { defaultRenderer } from './defaultTool.tsx'
+import { delegateRenderer } from './delegateTool.tsx'
 import { fileRenderer } from './fileTool.tsx'
 import { readRenderer } from './readTool.tsx'
 import { searchRenderer } from './searchTool.tsx'
@@ -92,9 +93,9 @@ const TOOLS: Record<string, ToolRenderer> = {
   // clarify (item 4): collapsed = `question: answer`; expanded = `User
   // answered:` + `· q: a` rows — NEVER the raw JSON result.
   clarify: clarifyRenderer,
-  // delegate_task: default labeled fields + the Ink-parity monitor hint
-  // (ui-tui/src/components/thinking.tsx — "(/agents to monitor)").
-  delegate_task: { ...defaultRenderer, hint: () => '(/agents to monitor)' },
+  // delegate_task: structured agent-fan-out render (dispatched goals OR joined
+  // per-task results) + the Ink-parity monitor hint — NEVER the raw JSON dump.
+  delegate_task: delegateRenderer,
   // shell-ish tools (Epic 2.4): collapsed = the command verbatim; expanded =
   // full output (+ the command echo only when the header truncated it, item 3;
   // execute_code's code arg is Tree-sitter highlighted, item 7).

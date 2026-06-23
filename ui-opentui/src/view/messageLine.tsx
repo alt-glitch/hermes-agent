@@ -40,6 +40,7 @@ import { useDisplay } from './display.tsx'
 import { Markdown } from './markdown.tsx'
 import { NotificationCard } from './notificationCard.tsx'
 import { ReasoningPart } from './reasoningPart.tsx'
+import { SkillLine } from './skillLine.tsx'
 import { useTheme } from './theme.tsx'
 import { ToolPart } from './toolPart.tsx'
 
@@ -159,6 +160,11 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
   // inline card instead of the normal role row (glitch 2026-06-13).
   const notif = () => (m().role === 'notification' ? m().notification : undefined)
 
+  // A `skill` user row — a skill slash command (/dogfood) whose full body is in
+  // m().text but renders COLLAPSED so it doesn't dump the whole skill body as a
+  // giant bubble (glitch 2026-06-23). Render the distinct SkillLine.
+  const skillRow = () => (m().role === 'user' ? m().skill : undefined)
+
   // /timestamps: the muted `[HH:MM]` label to show, or undefined when the flag
   // is off OR this message carries no stored timestamp (never fabricated). An
   // accessor (not a `!` assertion) so the keyed <Show> below binds the formatted
@@ -169,121 +175,133 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
   }
   return (
     <Show
-      when={notif()}
+      when={skillRow()}
       fallback={
-        // Turn-boundary spacing > part gap (see turnSpacing); /compact collapses it
-        // so long sessions read denser. The earned-gold glyphs do the rest.
-        <box style={{ flexDirection: 'row', flexShrink: 0, marginTop: spacing().top, marginBottom: spacing().bottom }}>
-          <box style={{ flexShrink: 0, width: GUTTER }}>
-            {/* the role glyph is decorative — exclude it from mouse selection (item 4).
+        <Show
+          when={notif()}
+          fallback={
+            // Turn-boundary spacing > part gap (see turnSpacing); /compact collapses it
+            // so long sessions read denser. The earned-gold glyphs do the rest.
+            <box
+              style={{ flexDirection: 'row', flexShrink: 0, marginTop: spacing().top, marginBottom: spacing().bottom }}
+            >
+              <box style={{ flexShrink: 0, width: GUTTER }}>
+                {/* the role glyph is decorative — exclude it from mouse selection (item 4).
             Bold so the user `❯` / assistant `⚕` turn boundaries pop (item 8). */}
-            <text selectable={false}>
-              <span style={{ fg: glyphFg() }}>
-                <b>{glyph()}</b>
-              </span>
-            </text>
-          </box>
-          {/* gap owns ALL inter-part spacing (item 5) — uniform 1 line between text /
+                <text selectable={false}>
+                  <span style={{ fg: glyphFg() }}>
+                    <b>{glyph()}</b>
+                  </span>
+                </text>
+              </box>
+              {/* gap owns ALL inter-part spacing (item 5) — uniform 1 line between text /
           reasoning / tool regardless of order or stream timing, so blank lines
           don't pop in and out as parts are created/merged mid-stream. /compact
           drops the gap along with the per-turn margins above. */}
-          <box style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0, gap: display().compact ? 0 : 1 }}>
-            <Show
-              when={m().role === 'assistant' && hasParts()}
-              fallback={
-                // No parts yet: the just-started streaming turn shows ONLY the caret,
-                // inline with the glyph (not an empty line + a dangling caret below —
-                // item 10 cursor misalignment); a settled row shows its flat text.
+              <box style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0, gap: display().compact ? 0 : 1 }}>
                 <Show
-                  when={m().streaming && !hasParts()}
+                  when={m().role === 'assistant' && hasParts()}
                   fallback={
-                    // themed selection: a solid muted/accent bar that preserves the
-                    // text fg (no selectionFg → the original color shows through, so a
-                    // highlight over content reads as a clean bar, not SGR-inverse).
-                    // A quiet ⧉ copy run sits bottom-left under the block (user
-                    // prompts + settled assistant rows; system notes are chrome,
-                    // nothing to copy) — never the right edge: scrollbar column.
-                    <box style={{ flexDirection: 'column', flexShrink: 0 }}>
-                      <text selectionBg={theme().color.selectionBg}>
-                        {/* /timestamps: muted [HH:MM] prefix on the first line, ONLY when
+                    // No parts yet: the just-started streaming turn shows ONLY the caret,
+                    // inline with the glyph (not an empty line + a dangling caret below —
+                    // item 10 cursor misalignment); a settled row shows its flat text.
+                    <Show
+                      when={m().streaming && !hasParts()}
+                      fallback={
+                        // themed selection: a solid muted/accent bar that preserves the
+                        // text fg (no selectionFg → the original color shows through, so a
+                        // highlight over content reads as a clean bar, not SGR-inverse).
+                        // A quiet ⧉ copy run sits bottom-left under the block (user
+                        // prompts + settled assistant rows; system notes are chrome,
+                        // nothing to copy) — never the right edge: scrollbar column.
+                        <box style={{ flexDirection: 'column', flexShrink: 0 }}>
+                          <text selectionBg={theme().color.selectionBg}>
+                            {/* /timestamps: muted [HH:MM] prefix on the first line, ONLY when
                         the flag is on AND this message carries a stored timestamp (never
                         fabricated). It's render chrome — kept OUT of m().text so CopyChip /
                         copied source stay untouched. Flat span sibling (OpenTUI <text> is
                         flat spans, not nested <Text>). */}
-                        <Show when={tsLabel()}>
-                          {label => <span style={{ fg: theme().color.muted }}>{label() + ' '}</span>}
-                        </Show>
-                        <span style={{ fg: bodyFg() }}>{m().text}</span>
+                            <Show when={tsLabel()}>
+                              {label => <span style={{ fg: theme().color.muted }}>{label() + ' '}</span>}
+                            </Show>
+                            <span style={{ fg: bodyFg() }}>{m().text}</span>
+                          </text>
+                          <Show when={m().role !== 'system' && m().text.trim() && !display().compact}>
+                            <CopyChip source={() => m().text} />
+                          </Show>
+                        </box>
+                      }
+                    >
+                      <text selectable={false}>
+                        {/* streaming caret — a cursor glyph, not content (item 4) */}
+                        <span style={{ fg: theme().color.muted }}>▍</span>
                       </text>
-                      <Show when={m().role !== 'system' && m().text.trim() && !display().compact}>
-                        <CopyChip source={() => m().text} />
-                      </Show>
-                    </box>
+                    </Show>
                   }
                 >
-                  <text selectable={false}>
-                    {/* streaming caret — a cursor glyph, not content (item 4) */}
-                    <span style={{ fg: theme().color.muted }}>▍</span>
-                  </text>
-                </Show>
-              }
-            >
-              <For each={displayParts()}>
-                {part => (
-                  <Switch>
-                    <Match when={part.type === 'tool' && part}>{tool => <ToolPart part={tool()} />}</Match>
-                    <Match when={part.type === 'reasoning' && part}>
-                      {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
-                    </Match>
-                    <Match when={part.type === 'hiddenRun' && part}>
-                      {/* /details hidden — the honest minimal render for a folded
+                  <For each={displayParts()}>
+                    {part => (
+                      <Switch>
+                        <Match when={part.type === 'tool' && part}>{tool => <ToolPart part={tool()} />}</Match>
+                        <Match when={part.type === 'reasoning' && part}>
+                          {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
+                        </Match>
+                        <Match when={part.type === 'hiddenRun' && part}>
+                          {/* /details hidden — the honest minimal render for a folded
                       tool/reasoning run; chrome, not copyable content. */}
-                      {run => (
-                        <text selectable={false}>
-                          <span style={{ fg: theme().color.muted }}>{`⚡ ${hiddenRunLabel(run())}`}</span>
-                        </text>
-                      )}
-                    </Match>
-                    <Match when={part.type === 'text' && part}>
-                      {/* ONE stable native <markdown> fed the growing text in place (no
+                          {run => (
+                            <text selectable={false}>
+                              <span style={{ fg: theme().color.muted }}>{`⚡ ${hiddenRunLabel(run())}`}</span>
+                            </text>
+                          )}
+                        </Match>
+                        <Match when={part.type === 'text' && part}>
+                          {/* ONE stable native <markdown> fed the growing text in place (no
                       per-delta remount → no scrollbar flicker, #2); it renders GFM
                       tables natively (#3). Leading/trailing blanks stripped so the
                       column `gap` is the sole inter-part spacing (item 5).
                       Interstitial narration demotes to muted once settled; a
                       quiet ⧉ copy run sits bottom-left under the settled block
                       (off the scrollbar's right-edge column). */}
-                      {t => (
-                        <box style={{ flexDirection: 'column', flexShrink: 0 }}>
-                          {/* /timestamps: muted [HH:MM] above the FIRST text part of a
+                          {t => (
+                            <box style={{ flexDirection: 'column', flexShrink: 0 }}>
+                              {/* /timestamps: muted [HH:MM] above the FIRST text part of a
                           settled assistant turn (covers resumed rows, which carry parts).
                           Render chrome only — never folded into the copied/markdown source. */}
-                          <Show when={!m().streaming && t().id === firstTextId(m().parts) ? tsLabel() : undefined}>
-                            {label => (
-                              <text selectable={false}>
-                                <span style={{ fg: theme().color.muted }}>{label()}</span>
-                              </text>
-                            )}
-                          </Show>
-                          <Markdown
-                            text={t().text.replace(/^\n+|\n+$/g, '')}
-                            streaming={m().streaming ?? false}
-                            fg={textFg(t().id)}
-                          />
-                          <Show when={!m().streaming && !display().compact}>
-                            <CopyChip source={() => t().text} />
-                          </Show>
-                        </box>
-                      )}
-                    </Match>
-                  </Switch>
-                )}
-              </For>
-            </Show>
-          </box>
-        </box>
+                              <Show when={!m().streaming && t().id === firstTextId(m().parts) ? tsLabel() : undefined}>
+                                {label => (
+                                  <text selectable={false}>
+                                    <span style={{ fg: theme().color.muted }}>{label()}</span>
+                                  </text>
+                                )}
+                              </Show>
+                              <Markdown
+                                text={t().text.replace(/^\n+|\n+$/g, '')}
+                                streaming={m().streaming ?? false}
+                                fg={textFg(t().id)}
+                              />
+                              <Show when={!m().streaming && !display().compact}>
+                                <CopyChip source={() => t().text} />
+                              </Show>
+                            </box>
+                          )}
+                        </Match>
+                      </Switch>
+                    )}
+                  </For>
+                </Show>
+              </box>
+            </box>
+          }
+        >
+          {n => <NotificationCard notification={n()} compact={display().compact} />}
+        </Show>
       }
     >
-      {n => <NotificationCard notification={n()} compact={display().compact} />}
+      {/* skill slash-command row — collapsed, with user turn-boundary spacing */}
+      <box style={{ flexDirection: 'column', flexShrink: 0, marginTop: spacing().top, marginBottom: spacing().bottom }}>
+        <SkillLine message={m()} />
+      </box>
     </Show>
   )
 }

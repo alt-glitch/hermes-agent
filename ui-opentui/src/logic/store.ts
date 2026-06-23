@@ -90,6 +90,13 @@ export interface Message {
   /** Background-activity card payload (role `'notification'` only) — rendered as
    *  an inline NotificationCard instead of a normal role row. */
   notification?: ActivityNotification
+  /** Skill-invocation payload (role `'user'` only) — when a skill slash command
+   *  (e.g. `/dogfood`) is submitted, the FULL skill body still goes to the model
+   *  (it lives in `text`, the API/`/copy` source), but the transcript renders a
+   *  COLLAPSED row (`▶ /dogfood · 312 lines`) instead of dumping the whole body.
+   *  `command` is the slash invocation as typed (incl. args); `lineCount` is the
+   *  body's line count for the header. (glitch 2026-06-23) */
+  skill?: { command: string; lineCount: number }
   /** Wall-clock send/receive time in unix SECONDS (matches the server's per-message
    *  `timestamp` key — a sanctioned NON-WIRE field, stripped before the API call).
    *  Rendered as a muted `[HH:MM]` prefix only when /timestamps is ON. Optional:
@@ -721,6 +728,26 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // Stamp the user turn with wall-clock send time (unix SECONDS — matches the
         // server's non-wire `timestamp` key) so /timestamps can render [HH:MM].
         draft.messages.push({ role: 'user', text, timestamp: Math.floor(Date.now() / 1000) })
+        capMessages(draft)
+      })
+    )
+  }
+
+  /** Push a SKILL invocation as a user row that renders COLLAPSED (the full body
+   *  stays in `text` for the API/copy, but the transcript shows `▶ /name · N
+   *  lines` instead of dumping the whole skill body). `command` is the slash
+   *  invocation as typed (incl. args); `body` is the full skill content that the
+   *  caller ALSO sends to the model via prompt.submit. (glitch 2026-06-23) */
+  function pushSkill(command: string, body: string) {
+    const lineCount = body ? body.split('\n').length : 0
+    setState(
+      produce(draft => {
+        draft.messages.push({
+          role: 'user',
+          text: body,
+          skill: { command, lineCount },
+          timestamp: Math.floor(Date.now() / 1000)
+        })
         capMessages(draft)
       })
     )
@@ -1583,6 +1610,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     state,
     apply,
     pushUser,
+    pushSkill,
     pushSystem,
     pushNotification,
     showNotice,
