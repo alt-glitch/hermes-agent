@@ -13,6 +13,7 @@ import { createSessionStore, type ToolPartState } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { clarifyQA, clarifyRenderer } from '../view/tools/clarifyTool.tsx'
+import { delegateInfoOf, delegateRenderer } from '../view/tools/delegateTool.tsx'
 import { readContentOf, readRenderer, stripLineNumbers } from '../view/tools/readTool.tsx'
 import { patternOf, searchRenderer, searchResultLines } from '../view/tools/searchTool.tsx'
 import { skillInfoOf, skillRenderer } from '../view/tools/skillTool.tsx'
@@ -278,5 +279,92 @@ describe('read_file content extraction (items 1 + 7 logic)', () => {
     }
     expect(readContentOf(resumed)).toBeUndefined()
     expect(readRenderer.expandable(resumed)).toBe(true) // output fallback still expandable
+  })
+})
+
+describe('delegate_task renderer — structured fan-out, never JSON dump (glitch 2026-06-23)', () => {
+  test('background dispatch shape → "N agents dispatched" + goal rows', () => {
+    // REAL wire shape (tools/delegate_tool.py background dispatch payload).
+    const part: ToolPartState = {
+      id: 'd1',
+      name: 'delegate_task',
+      args: { tasks: [{ goal: 'Research WebGPU' }, { goal: 'Summarize MoE papers' }, { goal: 'SQLite WAL notes' }] },
+      result: {
+        status: 'dispatched',
+        mode: 'background',
+        count: 3,
+        delegation_id: 'deleg_69782cb2',
+        goals: ['Research WebGPU', 'Summarize MoE papers', 'SQLite WAL notes'],
+        note: '3 subagents are running in parallel in the background.'
+      },
+      state: 'complete',
+      type: 'tool'
+    }
+    const info = delegateInfoOf(part)
+    expect(info?.dispatched).toBe(true)
+    expect(info?.rows).toEqual([
+      { state: 'dispatched', goal: 'Research WebGPU' },
+      { state: 'dispatched', goal: 'Summarize MoE papers' },
+      { state: 'dispatched', goal: 'SQLite WAL notes' }
+    ])
+    expect(delegateRenderer.subtitle(part)).toBe('3 agents dispatched (background)')
+    expect(delegateRenderer.expandable(part)).toBe(true)
+    // honest "(N lines)": one row per goal, no detail rows on dispatch
+    expect(delegateRenderer.lines?.(part)).toEqual([
+      '→ Research WebGPU',
+      '→ Summarize MoE papers',
+      '→ SQLite WAL notes'
+    ])
+    // single-agent grammar
+    const one: ToolPartState = {
+      ...part,
+      result: { status: 'dispatched', mode: 'background', count: 1, delegation_id: 'd', goals: ['solo'], note: '' }
+    }
+    expect(delegateRenderer.subtitle(one)).toBe('1 agent dispatched (background)')
+  })
+
+  test('completion shape → per-task ok/failed rows + summary/error detail; goals matched by task_index', () => {
+    // REAL wire shape (tools/delegate_tool.py _execute_and_aggregate return).
+    const part: ToolPartState = {
+      id: 'd2',
+      name: 'delegate_task',
+      args: { tasks: [{ goal: 'crunch the data' }, { goal: 'child probe' }] },
+      result: {
+        results: [
+          { task_index: 0, status: 'ok', summary: 'Computed pi to 1000 digits.', duration_seconds: 12.4 },
+          { task_index: 1, status: 'error', summary: null, error: 'tool timed out' }
+        ],
+        total_duration_seconds: 12.6
+      },
+      state: 'complete',
+      type: 'tool'
+    }
+    const info = delegateInfoOf(part)
+    expect(info?.dispatched).toBe(false)
+    expect(info?.okCount).toBe(1)
+    expect(info?.failedCount).toBe(1)
+    expect(info?.rows).toEqual([
+      { state: 'ok', goal: 'crunch the data', detail: 'Computed pi to 1000 digits.' },
+      { state: 'failed', goal: 'child probe', detail: 'tool timed out' }
+    ])
+    expect(delegateRenderer.subtitle(part)).toBe('2 agents · 1 ok · 1 failed')
+    // all-ok grammar
+    const allOk: ToolPartState = {
+      ...part,
+      result: { results: [{ task_index: 0, status: 'ok', summary: 'done' }], total_duration_seconds: 1 }
+    }
+    expect(delegateRenderer.subtitle(allOk)).toBe('1 agent · all done')
+  })
+
+  test('falls back to default renderer for an unknown result shape (no crash, no JSON contract)', () => {
+    const part: ToolPartState = {
+      id: 'd3',
+      name: 'delegate_task',
+      result: { something: 'unexpected' },
+      state: 'complete',
+      type: 'tool'
+    }
+    expect(delegateInfoOf(part)).toBeUndefined()
+    expect(delegateRenderer.expandable(part)).toBe(false)
   })
 })
