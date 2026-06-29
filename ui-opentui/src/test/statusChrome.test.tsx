@@ -58,6 +58,15 @@ describe('SessionInfoPatchSchema — chrome wire fields', () => {
   test('all chrome fields absent still decodes (every key optional)', () => {
     expect(Option.isSome(decodeSessionInfoPatch({ model: 'm' }))).toBe(true)
   })
+
+  test('active_subagents decodes from nested usage AND the top-level fallback', () => {
+    const nested = decodeSessionInfoPatch({ usage: { active_subagents: 3 } })
+    expect(Option.isSome(nested)).toBe(true)
+    if (Option.isSome(nested)) expect(nested.value.usage?.active_subagents).toBe(3)
+    const top = decodeSessionInfoPatch({ active_subagents: 2 })
+    expect(Option.isSome(top)).toBe(true)
+    if (Option.isSome(top)) expect(top.value.active_subagents).toBe(2)
+  })
 })
 
 // ── 2. store applyInfo ───────────────────────────────────────────────────
@@ -103,6 +112,22 @@ describe('store.applyInfo — chrome merge', () => {
     const seeded = store.state.info.startedAt
     store.applyInfo({ model: 'opus' })
     expect(store.state.info.startedAt).toBe(seeded)
+  })
+
+  test('merges usage.active_subagents into SessionInfo', () => {
+    const store = createSessionStore()
+    store.applyInfo({ usage: { active_subagents: 3 } })
+    expect(store.state.info.activeSubagents).toBe(3)
+  })
+
+  test('activeSubagents is a per-turn gauge: clearTranscript deletes it (no cross-session bleed)', () => {
+    const store = createSessionStore()
+    store.applyInfo({ model: 'opus', usage: { active_subagents: 2 } })
+    expect(store.state.info.activeSubagents).toBe(2)
+    store.clearTranscript()
+    expect(store.state.info.activeSubagents).toBeUndefined()
+    // session identity survives the clear
+    expect(store.state.info.model).toBe('opus')
   })
 })
 
@@ -294,6 +319,47 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     expect(frame).not.toContain('█') // bar detail dropped
     expect(frame).not.toContain('84k')
     expect(frame).not.toContain('$0.41')
+  })
+
+  test('↩ resume hint paints when IDLE with a background subagent, but not while running', async () => {
+    const store = seededStore()
+    // idle + 1 background subagent → the verbose reassurance shows on a wide bar
+    store.applyInfo({ running: false, usage: { active_subagents: 1 } })
+    const idle = await captureFrame(bar(store), { width: 220, height: 4 })
+    expect(idle).toContain('↩ resumes when subagent finishes')
+    // while the turn is RUNNING the hint is suppressed (the spinner conveys activity);
+    // the running subagents themselves still show in the ⚡ tray/dashboard (not this bar).
+    store.applyInfo({ running: true, usage: { active_subagents: 1 } })
+    const busy = await captureFrame(bar(store), { width: 220, height: 4 })
+    expect(busy).not.toContain('↩ resumes')
+    // plural grammar at >1
+    store.applyInfo({ running: false, usage: { active_subagents: 3 } })
+    const idle3 = await captureFrame(bar(store), { width: 220, height: 4 })
+    expect(idle3).toContain('↩ resumes when 3 subagents finish')
+    // hidden at zero
+    store.applyInfo({ running: false, usage: { active_subagents: 0 } })
+    const none = await captureFrame(bar(store), { width: 220, height: 4 })
+    expect(none).not.toContain('↩ resumes')
+  })
+
+  test('the resume hint is WIDTH-BUDGETED: it never wraps the bar to two lines', async () => {
+    // Regression for the gate-boundary wrap bug: a FIXED column gate (150) turned
+    // the verbose hint on before it actually fit, spilling mcp/cwd onto a 2nd row.
+    // The hint is now budgeted on real remaining width, so at every width either
+    // the hint shows AND the bar is one line, or it's dropped — never a wrap.
+    const store = seededStore()
+    store.applyInfo({ running: false, usage: { active_subagents: 2 } })
+    for (const width of [148, 150, 152, 160, 170, 185, 200]) {
+      const frame = await captureFrame(bar(store), { width, height: 4 })
+      const chromeRows = frame.split('\n').filter(r => r.includes('│'))
+      // the status bar is exactly ONE physical row at every width (no wrap)
+      expect(chromeRows.length, `width ${width} must not wrap`).toBe(1)
+      // and if the hint shows, it is the WHOLE phrase (never mid-word truncated)
+      const row = chromeRows[0] ?? ''
+      if (row.includes('↩ resumes')) {
+        expect(row, `width ${width}: hint must be whole`).toContain('subagents finish')
+      }
+    }
   })
 
   test('update notice borrows the line and Esc dismisses it back to the normal bar', async () => {
