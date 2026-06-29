@@ -60,7 +60,9 @@ export function collapseHiddenParts(parts: readonly Part[]): DisplayPart[] {
   const out: DisplayPart[] = []
   let run: HiddenRun | undefined
   for (const part of parts) {
-    if (part.type === 'text') {
+    // text AND moaReference are PRIMARY content (the latter is the mixture-of-agents
+    // process the user opted into) — never fold them into the hidden run.
+    if (part.type === 'text' || part.type === 'moaReference') {
       run = undefined
       out.push(part)
       continue

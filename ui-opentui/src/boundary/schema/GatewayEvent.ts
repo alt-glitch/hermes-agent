@@ -82,6 +82,29 @@ const ThinkingDelta = Schema.Struct({
   payload: opt(Schema.Struct({ text: opt(Str) }))
 })
 
+// MoA (mixture-of-agents) reference blocks: each reference model's full output is
+// shown as a labelled block BEFORE the aggregator responds. `moa.reference` is
+// emitted ONCE per reference with the whole text (label/index/count optional —
+// index/count are OMITTED when absent). `moa.aggregating` is a status-only
+// transition (no transcript entry). See tui_gateway/server.py _on_tool_progress.
+const MoaReference = Schema.Struct({
+  type: Schema.Literal('moa.reference'),
+  session_id: opt(Str),
+  payload: opt(
+    Schema.Struct({
+      label: opt(Str),
+      text: opt(Str),
+      index: opt(Schema.Number),
+      count: opt(Schema.Number)
+    })
+  )
+})
+const MoaAggregating = Schema.Struct({
+  type: Schema.Literal('moa.aggregating'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ aggregator: opt(Str) }))
+})
+
 // tools
 const ToolStart = Schema.Struct({
   type: Schema.Literal('tool.start'),
@@ -245,6 +268,8 @@ export const GatewayEventSchema = Schema.Union([
   BrowserProgress,
   BackgroundComplete,
   ReviewSummary,
+  MoaReference,
+  MoaAggregating,
   SubagentSpawnRequested,
   SubagentStart,
   SubagentThinking,
