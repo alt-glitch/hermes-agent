@@ -245,6 +245,10 @@ export interface SessionInfo {
   contextMax?: number
   contextPercent?: number
   compressions?: number
+  /** Live count of background/async delegations still running
+   *  (`usage.active_subagents` ← `tools.async_delegation.active_count()`). Drives the
+   *  status bar's idle resume-hint; the running subagents themselves show in the `⚡` tray. */
+  activeSubagents?: number
   /** Estimated session cost in USD (`usage.cost_usd` — only when the gateway's
    *  pricing estimate succeeds; absent otherwise). */
   costUsd?: number
@@ -438,6 +442,8 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   if (pct !== undefined) patch.contextPercent = pct
   const comp = d.usage?.compressions ?? d.compressions
   if (comp !== undefined) patch.compressions = comp
+  const subs = d.usage?.active_subagents ?? d.active_subagents
+  if (subs !== undefined) patch.activeSubagents = subs
   if (d.usage?.cost_usd !== undefined) patch.costUsd = d.usage.cost_usd
   // null = "update check not resolved yet" — leave the prior value alone.
   if (typeof d.update_behind === 'number') patch.updateBehind = d.update_behind
@@ -937,6 +943,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         delete info.contextPercent
         delete info.costUsd
         delete info.compressions
+        delete info.activeSubagents
       })
     )
   }

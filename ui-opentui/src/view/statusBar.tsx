@@ -29,9 +29,14 @@
  * metrics + labels, ok/warn dot, level-tinted ctx bar and cmp count.
  *
  * Background-activity chrome (glitch 2026-06-13): `⚡ N` = running subagents
- * (folded here from the old agents-tray line), `bg: N` = in-flight background
- * PROMPTS (`/bg` → prompt.background, cleared on background.complete). Both
- * hidden at zero. (OS background processes live in the /processes panel.)
+ * (folded here from the old agents-tray line; includes background/async
+ * delegations, which also emit `subagent.*` events while they run), `bg: N` =
+ * in-flight background PROMPTS (`/bg` → prompt.background, cleared on
+ * background.complete). When the turn is IDLE but a background delegation is
+ * still in flight, the bar adds `↩ resumes when subagent finishes` (driven by
+ * the registry-backed `usage.active_subagents`, the one signal `⚡` can't give —
+ * SubagentInfo has no fg/bg flag). All hidden at zero. (OS background processes
+ * live in the /processes panel.)
  *
  * Parity notes (data that does not reach this TUI yet — reported, not faked):
  *   - `display.show_cost`: Ink reads it from its `config.get` polling loop,
@@ -266,6 +271,14 @@ export function StatusBar(props: { store: SessionStore }) {
     const n = props.store.state.subagents.filter(isTrayAgent).length
     return segs().agents && n > 0 ? `⚡ ${n}` : ''
   })
+  // Count of background/async delegations still running (`delegate_task(background=true)`,
+  // from `usage.active_subagents` ← async_delegation.active_count()). NOTE: these also
+  // appear in the `⚡ N` tray above while they emit `subagent.*` events, so we do NOT
+  // render a separate count chip (it would double-count). We use this registry-backed
+  // count only to drive the idle resume-hint below — the one signal `⚡` can't give,
+  // because SubagentInfo carries no foreground/background flag (a foreground subagent
+  // blocks the turn and can never be "resuming").
+  const subagentCount = () => info().activeSubagents ?? 0
   // `☑ done/total` — the at-a-glance todo signal. The full live list is the
   // pinned TodoPanel above the composer; this chip persists even when the panel
   // auto-hides (no active work), so progress is never lost from view. It's tiny
@@ -276,11 +289,10 @@ export function StatusBar(props: { store: SessionStore }) {
     if (!snap || snap.counts.total === 0) return ''
     return `☑ ${snap.counts.completed}/${snap.counts.total}`
   })
-
-  // The cwd flows LAST on the same line (not right-pinned): its budget is the
-  // row width minus every segment before it; it tail-truncates into that, and
-  // drops whole below CWD_MIN.
-  const leftLen = createMemo(() => {
+  // Length of the left run WITHOUT the verbose resume hint and WITHOUT the cwd —
+  // the fixed-ish segments. Used both to width-budget the resume hint (so it only
+  // appears when it genuinely fits) and as the base for leftLen below.
+  const baseLeftLen = createMemo(() => {
     let len = 1 // dot
     if (model()) len += 1 + model().length + effort().length
     for (const seg of [
@@ -296,6 +308,31 @@ export function StatusBar(props: { store: SessionStore }) {
     ]) {
       if (seg) len += SEP.length + seg.length
     }
+    return len
+  })
+  // `↩ resumes when subagent finishes` — parked-background reassurance. When the
+  // turn is IDLE (not running) but a background delegation is still in flight, the
+  // result will re-enter on its own as a fresh turn — nothing to poll, no spinner.
+  // Lowest-priority verbose segment: it's WIDTH-BUDGETED on the ACTUAL remaining
+  // space (not a fixed column gate), so it only appears when the whole bar — incl.
+  // mcp and a minimum cwd allowance — still fits on ONE line. A fixed gate was
+  // brittle: the hint's width varies with the count's digits + which segments are
+  // present, so a gate tuned for one content width wrapped the bar at another.
+  const resumeHintText = createMemo(() => {
+    const n = subagentCount()
+    if (info().running || n <= 0) return ''
+    const text = n === 1 ? '↩ resumes when subagent finishes' : `↩ resumes when ${n} subagents finish`
+    // Reserve room for the leading run + this segment's ` │ ` + a minimal cwd.
+    const need = baseLeftLen() + SEP.length + text.length + SEP.length + CWD_MIN
+    return need <= dims().width - ROW_PADDING ? text : ''
+  })
+
+  // The cwd flows LAST on the same line (not right-pinned): its budget is the
+  // row width minus every segment before it; it tail-truncates into that, and
+  // drops whole below CWD_MIN.
+  const leftLen = createMemo(() => {
+    let len = baseLeftLen()
+    if (resumeHintText()) len += SEP.length + resumeHintText().length
     return len
   })
   // The cwd is RIGHT-PINNED on its own (F10 — glitch 2026-06-13): left-aligning
@@ -371,6 +408,7 @@ export function StatusBar(props: { store: SessionStore }) {
               (design pass); the navy fill is the bar's one blue surface. */}
           <Seg text={profileText()} fg={theme().color.statusFg} />
           <Seg text={bgText()} fg={theme().color.statusWarn} />
+          <Seg text={resumeHintText()} />
           <Seg text={mcpText()} />
         </text>
         {/* the cwd is RIGHT-PINNED (F10): a flex spacer eats the slack so the
