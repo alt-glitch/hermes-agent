@@ -38,6 +38,7 @@ import type { Message, Part } from '../logic/store.ts'
 import type { ThemeColors } from '../logic/theme.ts'
 import { useDisplay } from './display.tsx'
 import { Markdown } from './markdown.tsx'
+import { MoaReferencePart } from './moaReferencePart.tsx'
 import { NotificationCard } from './notificationCard.tsx'
 import { ReasoningPart } from './reasoningPart.tsx'
 import { SkillLine } from './skillLine.tsx'
@@ -245,6 +246,9 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                         <Match when={part.type === 'tool' && part}>{tool => <ToolPart part={tool()} />}</Match>
                         <Match when={part.type === 'reasoning' && part}>
                           {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
+                        </Match>
+                        <Match when={part.type === 'moaReference' && part}>
+                          {ref => <MoaReferencePart part={ref()} />}
                         </Match>
                         <Match when={part.type === 'hiddenRun' && part}>
                           {/* /details hidden — the honest minimal render for a folded

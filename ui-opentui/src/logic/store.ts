@@ -78,6 +78,7 @@ export interface ToolPartState {
 export type Part =
   | { type: 'text'; id: string; text: string }
   | { type: 'reasoning'; id: string; text: string }
+  | { type: 'moaReference'; id: string; label: string; text: string; index?: number; count?: number }
   | ToolPartState
 
 export interface Message {
@@ -1274,6 +1275,37 @@ export function createSessionStore(options?: SessionStoreOptions) {
         )
         break
       }
+      // moa.reference — one reference model's FULL output, shown as its own labelled
+      // block (◇ Reference i/n — label) before the aggregator responds. Each event
+      // is a SEPARATE committed block (push, never append-merge). Attach ONLY to a
+      // live streaming assistant — a stray reference after the turn settles/interrupts
+      // must NOT spawn a new empty assistant bubble (mirrors Ink's `if (interrupted) return`).
+      case 'moa.reference': {
+        const label = event.payload?.label ?? 'reference'
+        const text = event.payload?.text ?? ''
+        const index = event.payload?.index
+        const count = event.payload?.count
+        setState(
+          produce(draft => {
+            // Attach ONLY to a live streaming assistant — a stray reference after the
+            // turn settles/interrupts must NOT spawn a new empty assistant bubble.
+            const m = liveAssistant(draft, true)
+            if (!m) return
+            const part: Part = { type: 'moaReference', id: nextId(), label, text }
+            // exactOptionalPropertyTypes: assign optionals only when present.
+            if (index !== undefined) part.index = index
+            if (count !== undefined) part.count = count
+            ;(m.parts ??= []).push(part)
+          })
+        )
+        break
+      }
+      // moa.aggregating — the references are done; the aggregator now answers. This
+      // is a status-only transition: the aggregator's reply streams via the normal
+      // message.delta path, so there's NO transcript entry here (matches Ink). The
+      // case exists so the event is "handled", not an unknown-event no-op.
+      case 'moa.aggregating':
+        break
       case 'tool.start': {
         const id = readStr(event.payload, 'tool_id')
         if (!id) break
