@@ -8385,7 +8385,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "copy":
             self._handle_copy_command(cmd_original)
         elif canonical == "debug":
-            self._handle_debug_command()
+            self._handle_debug_command(cmd_original)
         elif canonical == "update":
             if self._handle_update_command():
                 return False
@@ -8485,6 +8485,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_stop_command()
         elif canonical == "agents":
             self._handle_agents_command()
+        elif canonical == "journey":
+            try:
+                import argparse
+                import shlex
+
+                from hermes_cli.journey import register_cli as _register_journey_cli
+
+                parser = argparse.ArgumentParser(prog="/journey", add_help=False)
+                _register_journey_cli(parser)
+                argv = shlex.split(cmd_original.split(None, 1)[1]) if len(cmd_original.split(None, 1)) > 1 else []
+                args = parser.parse_args(argv)
+                args.func(args)
+            except SystemExit:
+                pass
+            except Exception as exc:
+                _cprint(f"  /journey failed: {exc}")
         elif canonical == "background":
             self._handle_background_command(cmd_original)
         elif canonical == "queue":
@@ -10091,9 +10107,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             target=self._reload_mcp, daemon=True
         )
         _reload_thread.start()
-        _reload_thread.join(timeout=30)
-        if _reload_thread.is_alive():
-            print("  ⚠️  MCP reload timed out (30s). Some servers may not have reconnected.")
+        # Do NOT join here — process_loop calls this from its idle branch, so a
+        # blocking join would freeze input consumption for up to 30s (and a hung
+        # MCP server could block far longer). The reload runs purely in the
+        # background daemon thread, which reports its own progress/completion
+        # status via print() inside _reload_mcp().
 
     # Inline-skip tokens that bypass the destructive-slash confirmation modal.
     # A general escape hatch for non-interactive use (scripting/automation) and
@@ -10721,8 +10739,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except Exception:
             pass
 
+        # Recorder creation can fail (no input device, PortAudio init error).
+        # Reset the flag on failure or _voice_recording stays True forever and
+        # every future voice start is silently skipped by the guard above.
         if self._voice_recorder is None:
-            self._voice_recorder = create_audio_recorder()
+            try:
+                self._voice_recorder = create_audio_recorder()
+            except Exception:
+                with self._voice_lock:
+                    self._voice_recording = False
+                raise
 
         # Apply config-driven silence params (numeric-guarded so YAML
         # scalar corruption doesn't break recording start-up).
