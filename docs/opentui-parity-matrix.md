@@ -20,7 +20,7 @@ Status meanings:
 - **In progress** — actively being implemented; never counts as shipped.
 - **Intentional skip** — an explicit supported-platform/product decision.
 
-Current slash tally: **6 Covered, 27 Thinner, 22 Missing, 2 In progress, 1
+Current slash tally: **7 Covered, 27 Thinner, 22 Missing, 1 In progress, 1
 Intentional skip**.
 
 ## Slash commands
@@ -31,7 +31,7 @@ Intentional skip**.
 | 2 | `/quit`, `/exit` | Thinner | Refuse to destroy a hosted dashboard chat; verify the dashboard PTY path. |
 | 3 | `/update` | Missing | Exit the renderer with code 42 so the Python launcher performs the update. |
 | 4 | `/mouse`, `/scroll` | Missing | Hot-swap renderer tracking modes and persist them; launch-time mouse config alone is insufficient. |
-| 5 | `/clear`, `/new [title]` | In progress | Busy guard, confirm, `setup.status → session.close → session.create`, complete state adoption, title support, and old-SID event fencing. |
+| 5 | `/clear`, `/new [title]` | Covered | Busy guard and Ink-equivalent confirmation feed a transactional `setup.status → session.close → session.create`; adoption resets all session-owned state, preserves process-global presentation, supports titles, fences old live SIDs, and safely drains submissions queued during the switch. |
 | 6 | `/redraw` | Missing | Invoke the supported native repaint primitive and verify recovery in a real TTY. |
 | 7 | `/status` | Thinner | Use direct `session.status`; the slash worker is not authoritative for current live state. |
 | 8 | `/title` | Thinner | Direct `session.title`, pending/error feedback, and immediate header refresh. |
@@ -54,7 +54,7 @@ Intentional skip**.
 | 25 | `/credits` | Thinner | Direct balance/identity/top-up RPCs, confirmation, and safe URL opening. |
 | 26 | `/background`, `/bg`, `/btw` | Covered | Direct `prompt.background` and background-task badge tracking. |
 | 27 | `/model` | Thinner | Busy guard, refresh, provider onboarding, expensive-model confirm, and session/global persistence choice. |
-| 28 | `/sessions`, `/session`, `/switch`, `/resume` | Thinner | Picker/direct resume work; add live siblings, `/sessions new`, close/switch lifecycle, and guards. |
+| 28 | `/sessions`, `/session`, `/switch`, `/resume` | Thinner | Picker/direct resume now use guarded transactional live switching with persisted-vs-ephemeral SID separation, rollback, event buffering/fencing, catalog refresh, and bounded submission drain; add live siblings, `/sessions new`, close/delete, and model-selection flows. |
 | 29 | `/image` | Missing | Reuse direct `image.attach` and preserve any remainder text for the composer. |
 | 30 | `/personality` | Covered | The live gateway mirror applies personality without a detached-only mutation. |
 | 31 | `/compress` | Thinner | Gateway compression works; replace the visible snapshot/info/usage afterward. |
@@ -108,8 +108,8 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | Composer editing/completion/history | Covered | Native textarea, cursor-aware slash/`@`, shell `!`, paste, and per-directory history. |
 | Composer external editor | Missing | Ctrl+G and `/prompt` suspend/restore `$EDITOR` lifecycle. |
 | Busy queue UX | Missing | Queue/steer/interrupt policy, visible queued rows, edit/remove/send. |
-| New/clear session adoption | In progress | Real SID replacement, sparse-info replacement, no launch prompt/image replay, and complete session-owned reset. |
-| Session event scope | In progress | Reject late non-gateway events whose `session_id` differs from the active store SID before reducer or side effects. |
+| New/clear session adoption | Covered | `sessionLifecycle` performs decoded create/replace/resume transactions; the store atomically replaces sparse info and every session-owned slice without replaying launch prompt/images, while a bounded transition queue preserves submissions safely. |
+| Session event scope | Covered | `eventMayEnterStore` gates reducer and side effects by the active ephemeral SID; resume buffering admits events only into a transaction buffer whose commit/abort filters against the adopted/restored live SID. |
 | Session picker/live siblings | Thinner | Cold browse/search/peek/resume works; add active switching/close/delete/new-model flows. |
 | Approval permanence security | In progress | Preserve explicit `allow_permanent=false` through Effect Schema/store/view and never emit `always`. |
 | Clarify/confirm polish | Thinner | Add numeric quick-picks, wrapped long commands, and Esc-back from custom input. |
@@ -123,7 +123,7 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | Status core/profile/MCP | Covered | Model/context/cost/duration/cwd/branch/profile/MCP are present and responsive. |
 | Status voice/browser/live sessions | Missing | Add only after their underlying live state is real. |
 | Theme/skins and terminal chrome | Covered | Reactive skins, OSC title, and native notifications; require live repaint smoke. |
-| Gateway crash recovery | Covered | Bounded respawn/backoff and re-resume; keep crash-loop regression tests. |
+| Gateway crash recovery | Covered | Bounded respawn/backoff re-resumes by persisted SID, clears dead ephemeral tracking before recovery, and respawns a detached gateway so `/new` and `/resume` remain usable; real-child and crash-loop contracts are tested. |
 | Launcher engine selection | Thinner | Precedence/fallback works; close Node/npm and freshness rows below. |
 | OpenTUI bundle freshness | Missing | Rebuild when source, lockfile, or build inputs are newer; test stale installed bundles. |
 | Node/npm pairing | Missing | Invoke npm belonging to the selected Node 26 installation in launcher and installer. |
@@ -138,9 +138,9 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | Packaged runtime matrix | Missing | Linux x64/arm64 clean install and launch; Windows/Termux intentionally fall back to Ink. |
 | Release metadata/docs | Missing | Replace experimental/0.0.0/Ink-default claims with accurate v1 support and rollback policy. |
 | Startup benchmark | Thinner | Target-pinned PTY result exists locally; version and retain raw evidence in the release report. |
-| Cold hydration benchmark | In progress | Component benchmark must be paired with real `session.resume` RPC→stable-paint timing. |
-| Warm-switch benchmark | In progress | Same-renderer replacement must prove old allocations/renderables release and no event bleed. |
-| Fixture memory/renderables | In progress | Separate-process realistic fixture, effective cap assertion, native allocation/renderable counts, and highlight settlement. |
+| Cold hydration benchmark | In progress | Actual `commitSessionSnapshot` path is measured at 100 messages (three-run median: 65.19 ms adoption, 195.03 ms through highlight, 197.1 MB RSS); pair it with real `session.resume` RPC→stable-paint timing. |
+| Warm-switch benchmark | In progress | Same-renderer replacement is measured (three-run median: 37.25 ms adoption, 71.55 ms through highlight, 179.8 MB RSS; 847 renderables); add real RPC timing and repeated-switch release proof. |
+| Fixture memory/renderables | In progress | The bounded 100-message fixture settles at 903 renderables and 1,367 native allocations after highlight (204.9 MB process RSS); retain raw release evidence and add repeated-cycle leak assertions. |
 | Resource ceiling | Thinner | Record duration/CPU/peak RSS and run native gates sequentially on constrained hosts. |
 | Memory architecture docs | Missing | Replace Yoga-WASM/current claims with the actual 0.4.1 native-layout runtime; label historical results. |
 | Upstream alignment docs | Missing | Update dependency/test counts, shim ledger, and upgrade gates. |

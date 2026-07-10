@@ -1336,10 +1336,29 @@ def _read_tui_active_session_file(path: Optional[str]) -> Optional[str]:
         return None
 
 
+def _tui_active_session_file_is_detached(path: Optional[str]) -> bool:
+    """Return whether the TUI explicitly closed its session without a replacement.
+
+    An empty/malformed sidecar means "no update yet" and keeps the launcher's
+    legacy fallback behavior. ``detached: true`` is an intentional tombstone:
+    falling back to the launch SID would advertise a conversation the TUI has
+    already closed after a failed replacement.
+    """
+    if not path:
+        return False
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data.get("detached") is True
+    except Exception:
+        return False
+
+
 def _print_tui_exit_summary(
     session_id: Optional[str], active_session_file: Optional[str] = None
 ) -> None:
     """Print a shell-visible epilogue after TUI exits."""
+    if _tui_active_session_file_is_detached(active_session_file):
+        return
     target = (
         _read_tui_active_session_file(active_session_file)
         or session_id

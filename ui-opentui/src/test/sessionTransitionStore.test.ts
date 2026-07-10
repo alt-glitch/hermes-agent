@@ -1,0 +1,138 @@
+import { describe, expect, test } from 'vitest'
+
+import { eventBelongsToSession } from '../logic/eventScope.ts'
+import { createSessionStore, type Message } from '../logic/store.ts'
+
+describe('session-store replacement boundary', () => {
+  test('fresh adoption replaces all session slices and preserves process/global preferences', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'gateway.ready',
+      payload: { skin: { branding: { agent_name: 'Aurora' }, colors: { ui_primary: '#abcdef' } } }
+    })
+    store.setCompact(true)
+    store.setDetails('expanded')
+    store.setTimestamps(true)
+    store.setReasoningFull(true)
+    store.setBackgroundProcesses([{ command: 'sleep 10', sessionId: 'proc-42', status: 'running', uptimeSeconds: 5 }])
+    store.setSessionId('old-live')
+    store.pushUser('old transcript')
+    store.setComposerDraft('old draft')
+    store.enqueuePrompt('old queued prompt')
+    store.openPager('Old', 'old pager')
+    store.openSessionPicker('all')
+    store.openDashboard('agent-1')
+    store.openBackgroundPanel()
+    store.addBgTask('bg-old')
+    store.setModelItems([{ label: 'old-model', value: 'old-model' }])
+    store.setCompletions([{ display: '/old', meta: '', text: '/old' }], 2)
+    store.applyInfo({
+      branch: 'old-branch',
+      cwd: '/old',
+      model: 'old-model',
+      provider: 'old-provider',
+      running: true,
+      title: 'Old title',
+      usage: { compressions: 3, context_percent: 50, context_used: 100, cost_usd: 1.25 }
+    })
+
+    const before = Date.now()
+    store.adoptFreshSession('new-live', { cwd: '/new', model: 'new-model' })
+
+    expect(store.state.ready).toBe(true)
+    expect(store.state.theme.brand.name).toBe('Aurora')
+    expect(store.state.compact).toBe(true)
+    expect(store.state.details).toBe('expanded')
+    expect(store.state.timestamps).toBe(true)
+    expect(store.state.reasoningFull).toBe(true)
+    expect(store.state.backgroundProcesses).toEqual([
+      { command: 'sleep 10', sessionId: 'proc-42', status: 'running', uptimeSeconds: 5 }
+    ])
+
+    expect(store.state.sessionId).toBe('new-live')
+    expect(store.state.resumeId).toBe('new-live')
+    expect(store.state.messages).toEqual([])
+    expect(store.state.composerDraft).toBe('')
+    expect(store.state.queuedPrompts).toEqual([])
+    expect(store.state.pager).toBeUndefined()
+    expect(store.state.sessionPicker).toBeUndefined()
+    expect(store.state.dashboard).toBe(false)
+    expect(store.state.dashboardAgent).toBeUndefined()
+    expect(store.state.backgroundPanel).toBe(false)
+    expect(store.state.bgTasks).toEqual([])
+    expect(store.state.modelItems).toBeUndefined()
+    expect(store.state.completions).toBeUndefined()
+    expect(store.state.info).toMatchObject({ cwd: '/new', model: 'new-model' })
+    expect(store.state.info.startedAt).toBeGreaterThanOrEqual(before)
+    for (const stale of [
+      'branch',
+      'provider',
+      'running',
+      'title',
+      'compressions',
+      'contextPercent',
+      'contextUsed',
+      'costUsd'
+    ]) {
+      expect(store.state.info).not.toHaveProperty(stale)
+    }
+  })
+
+  test('detach leaves an honest no-session state after close/create failure', () => {
+    const store = createSessionStore()
+    store.setSessionId('closed-live')
+    store.pushUser('closed transcript')
+    store.detachSession()
+    expect(store.state.sessionId).toBeUndefined()
+    expect(store.state.messages).toEqual([])
+    expect(store.state.info.title).toBeUndefined()
+  })
+
+  test('failed resume aborts buffering and replays the still-active session events', () => {
+    const store = createSessionStore()
+    store.pushUser('existing')
+    store.beginBuffer()
+    store.apply({ type: 'message.start', session_id: 'old-live' })
+    store.apply({ type: 'message.delta', session_id: 'old-live', payload: { text: 'still here' } })
+    expect(store.state.messages).toHaveLength(1)
+    store.abortBuffer()
+    expect(store.state.messages).toHaveLength(2)
+    expect(store.state.messages.at(-1)?.parts?.[0]).toMatchObject({ text: 'still here', type: 'text' })
+  })
+
+  test('resume adoption filters coalesced old-session events before replay', () => {
+    const store = createSessionStore()
+    store.beginBuffer()
+    store.apply({ type: 'message.start', session_id: 'old-live' })
+    store.apply({ type: 'message.delta', session_id: 'old-live', payload: { text: 'stale' } })
+    store.apply({ type: 'message.start', session_id: 'new-live' })
+    store.apply({ type: 'message.delta', session_id: 'new-live', payload: { text: 'fresh' } })
+    const snapshot: Message[] = [{ role: 'user', text: 'resumed question' }]
+
+    store.commitSessionSnapshot(
+      'new-live',
+      snapshot,
+      { model: 'resumed-model' },
+      event => eventBelongsToSession(event, 'new-live'),
+      'persisted-key'
+    )
+
+    expect(store.state.sessionId).toBe('new-live')
+    expect(store.state.resumeId).toBe('persisted-key')
+    expect(store.state.messages).toHaveLength(2)
+    expect(store.state.messages[0]?.text).toBe('resumed question')
+    expect(store.state.messages[1]?.parts?.[0]).toMatchObject({ text: 'fresh', type: 'text' })
+    expect(JSON.stringify(store.state.messages)).not.toContain('stale')
+  })
+
+  test('busy lifetime includes message.complete until server-confirmed idle', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start', session_id: 'live' })
+    expect(store.isTurnInFlight()).toBe(true)
+    store.apply({ type: 'message.complete', session_id: 'live' })
+    expect(store.state.info.running).toBe(false)
+    expect(store.isTurnInFlight()).toBe(true)
+    store.apply({ type: 'session.info', session_id: 'live', payload: { running: false } })
+    expect(store.isTurnInFlight()).toBe(false)
+  })
+})

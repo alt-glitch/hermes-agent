@@ -104,6 +104,17 @@ export interface Message {
   timestamp?: number
 }
 
+/** Local destructive-confirm copy/styling (gateway prompts use their own types). */
+export interface ConfirmSpec {
+  readonly title: string
+  readonly detail?: string
+  readonly confirmLabel?: string
+  readonly cancelLabel?: string
+  readonly danger?: boolean
+}
+
+export type ConfirmRequest = string | ConfirmSpec
+
 /**
  * A BLOCKING interactive request from the agent (spec §8 #6 — unhandled = deadlock).
  * Each is answered via the matching `*.respond` RPC; Esc/Ctrl+C sends deny/empty.
@@ -114,7 +125,7 @@ export type ActivePrompt =
   | { kind: 'sudo'; requestId: string }
   | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
-  | { kind: 'confirm'; message: string; onConfirm: () => void }
+  | { kind: 'confirm'; spec: ConfirmSpec; onConfirm: () => void }
 
 /** A full-screen scrollable text viewer (long slash output: /status, /logs, …). */
 export interface PagerState {
@@ -352,6 +363,8 @@ export interface StoreState {
   modelItems: PickerItem[] | undefined
   /** The current session id (shown in the home panel; updated on create/resume). */
   sessionId: string | undefined
+  /** Persisted DB/session key used only for resume sidecars and crash recovery. */
+  resumeId: string | undefined
   // ── display flags (utility commands — Epic 3) ────────────────────────────
   /** Compact transcript (/compact): collapses the blank line between turns/parts.
    *  Defaults OFF — the persisted `display.tui_compact` config doesn't reach the
@@ -615,6 +628,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     catalog: undefined,
     modelItems: undefined,
     sessionId: undefined,
+    resumeId: undefined,
     compact: false,
     details: 'collapsed',
     timestamps: false,
@@ -941,6 +955,108 @@ export function createSessionStore(options?: SessionStoreOptions) {
     )
   }
 
+  /**
+   * Atomically clear every session-owned slice while preserving process/global
+   * state (gateway readiness, theme, display preferences, prompt history data,
+   * and the OS background-process snapshot). This is the hard boundary used by
+   * real session replacement; unlike `clearTranscript`, it must not retain a
+   * sparse old `info` field or an overlay/cache tied to the closed session.
+   */
+  function resetSessionOwnedState(
+    sessionId: string | undefined,
+    rawInfo?: { readonly [k: string]: unknown },
+    snapshot: Message[] = [],
+    resumeId: string | undefined = sessionId
+  ): void {
+    if (noticeTimer) clearTimeout(noticeTimer)
+    noticeTimer = undefined
+    applied.clear()
+    buffering = null
+    turnInFlight = false
+    const info: SessionInfo = { startedAt: Date.now(), ...(rawInfo ? readInfoPatch(rawInfo) : {}) }
+    const capped = snapshot.length > MESSAGE_CAP ? snapshot.slice(-MESSAGE_CAP) : snapshot
+
+    setState(
+      produce(draft => {
+        draft.messages = capped
+        draft.dropped = snapshot.length - capped.length
+        draft.prompt = undefined
+        draft.composerDraft = ''
+        draft.latestTodos = undefined
+        draft.pager = undefined
+        draft.sessionPicker = undefined
+        draft.picker = undefined
+        draft.promptHistory = false
+        draft.completions = undefined
+        draft.completionFrom = 0
+        draft.subagents = []
+        draft.dashboard = false
+        draft.dashboardAgent = undefined
+        draft.backgroundPanel = false
+        draft.billing = undefined
+        draft.bgTasks = []
+        draft.status = undefined
+        draft.lastNotification = undefined
+        draft.notice = null
+        draft.pendingNotice = null
+        draft.queuedPrompts = []
+        draft.info = info
+        draft.hint = undefined
+        draft.catalog = undefined
+        draft.modelItems = undefined
+        draft.sessionId = sessionId
+        draft.resumeId = resumeId
+      })
+    )
+  }
+
+  /** The prior gateway session was closed; leave an honest no-session UI. */
+  function detachSession(): void {
+    resetSessionOwnedState(undefined)
+  }
+
+  /** Adopt a newly-created live session with REPLACEMENT (not merge) semantics. */
+  function adoptFreshSession(
+    sessionId: string,
+    rawInfo?: { readonly [k: string]: unknown },
+    resumeId: string = sessionId
+  ): void {
+    resetSessionOwnedState(sessionId, rawInfo, [], resumeId)
+  }
+
+  /**
+   * Atomically adopt a resumed live session, then replay only buffered events
+   * that the caller proves belong to that live SID. This prevents coalesced
+   * events from the prior session crossing the resume boundary.
+   */
+  function commitSessionSnapshot(
+    sessionId: string,
+    snapshot: Message[],
+    rawInfo: { readonly [k: string]: unknown } | undefined,
+    acceptEvent: (event: GatewayEvent) => boolean,
+    resumeId: string = sessionId
+  ): void {
+    const pending = buffering ?? []
+    resetSessionOwnedState(sessionId, rawInfo, snapshot, resumeId)
+    for (const event of pending) if (acceptEvent(event)) applyNow(event)
+  }
+
+  /** Cancel a failed resume and replay events buffered for the still-active session. */
+  function abortBuffer(acceptEvent: (event: GatewayEvent) => boolean = () => true): void {
+    const pending = buffering ?? []
+    buffering = null
+    for (const event of pending) if (acceptEvent(event)) applyNow(event)
+  }
+
+  function isBuffering(): boolean {
+    return buffering !== null
+  }
+
+  /** Includes the message.complete → server-confirmed-idle settle window. */
+  function isTurnInFlight(): boolean {
+    return turnInFlight
+  }
+
   /** Open / close the agents dashboard overlay (/agents). The optional `agentId`
    *  preselects that subagent's row (the tray's Enter — Epic 2.7). */
   function openDashboard(agentId?: string) {
@@ -988,8 +1104,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
   }
 
   /** Open a local Y/N confirm dialog (non-gateway; e.g. /clear). */
-  function setConfirm(message: string, onConfirm: () => void) {
-    setState('prompt', { kind: 'confirm', message, onConfirm })
+  function setConfirm(request: ConfirmRequest, onConfirm: () => void) {
+    const spec = typeof request === 'string' ? { title: request } : request
+    setState('prompt', { kind: 'confirm', spec, onConfirm })
   }
 
   /** Open the pager overlay (long slash output: /status, /logs, …). */
@@ -1039,6 +1156,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function setHint(text: string | undefined): void {
     setState('hint', text)
   }
+
+  function setStatus(text: string | undefined): void {
+    setState('status', text)
+  }
   // Per-block copy feedback (design pass piece 2): deep view nodes flash
   // "Copied" on this store's hint line via the notify seam — the same surface
   // the entry's flashHint uses. One live store per app; latest wins.
@@ -1073,6 +1194,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     const patch = readInfoPatch(raw)
     if (Object.keys(patch).length === 0) return
     setState('info', prev => ({ ...prev, ...patch }))
+    if (state.status === 'starting agent…') setState('status', undefined)
     // Drain the busy queue ONLY when the SERVER confirms the turn ended: a
     // session.info carrying running:false while a turn was in flight. We gate on
     // turnInFlight (armed by message.start) rather than the optimistic
@@ -1606,6 +1728,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('sessionId', sid)
   }
 
+  function setResumeId(id: string | undefined): void {
+    setState('resumeId', id)
+  }
+
   return {
     /** Effective retained-message cap after the production windowing ceiling. */
     messageCap: MESSAGE_CAP,
@@ -1624,6 +1750,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
     registerTurnCompleteHandler,
     setCatalog,
     setSessionId,
+    setResumeId,
+    detachSession,
+    adoptFreshSession,
+    commitSessionSnapshot,
+    abortBuffer,
+    isBuffering,
+    isTurnInFlight,
     clearTranscript,
     setConfirm,
     openPager,
@@ -1639,6 +1772,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     clearCompletions,
     applyInfo,
     setHint,
+    setStatus,
     setCompact,
     setDetails,
     setTimestamps,

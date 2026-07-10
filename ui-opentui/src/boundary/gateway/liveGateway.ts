@@ -26,6 +26,29 @@ const COALESCE_MS = 16
 
 const decodeEvent = Schema.decodeUnknownOption(GatewayEventSchema)
 
+/**
+ * Advance the transport's authoritative live-session id after a successful RPC.
+ * `session.close` is as important as create/resume: retaining a closed id makes
+ * every later prompt/approval target a dead session if replacement creation
+ * fails. Closing some other live session must not disturb the active one.
+ */
+export function trackedSessionIdAfterRequest(
+  current: string | undefined,
+  method: string,
+  params: unknown,
+  result: unknown
+): string | undefined {
+  if ((method === 'session.create' || method === 'session.resume') && result && typeof result === 'object') {
+    const sid = (result as { session_id?: unknown }).session_id
+    return typeof sid === 'string' && sid.trim() ? sid.trim() : current
+  }
+  if (method === 'session.close' && params && typeof params === 'object') {
+    const target = (params as { session_id?: unknown }).session_id
+    if (typeof target === 'string' && target === current) return undefined
+  }
+  return current
+}
+
 function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
   const log = getLog()
   const handlers = new Set<(event: GatewayEvent) => void>()
@@ -88,13 +111,18 @@ function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
     log.warn('gateway', 'transport exited', { reason })
     // Clears the frozen spinner + shows status (store handles gateway.exited).
     enqueue({ type: 'gateway.exited', payload: { reason } })
-    const plan = planGatewayRecovery(sessionId ?? null, recoverSid ?? null, recoveryAttempts, Date.now())
+    const exitedSessionId = sessionId
+    // The ephemeral id belonged to the dead Python process. Recovery resumes by
+    // the store's persisted key; retaining this id makes the new gateway waste a
+    // guaranteed-failing session.close and misroutes any early UI action.
+    sessionId = undefined
+    const plan = planGatewayRecovery(exitedSessionId ?? null, recoverSid ?? null, recoveryAttempts, Date.now())
     recoveryAttempts = plan.attempts
-    if (!plan.recover || plan.sid === null) {
-      enqueue({ type: 'error', payload: { message: 'gateway exited repeatedly — type /resume to retry' } })
+    if (!plan.recover) {
+      enqueue({ type: 'error', payload: { message: 'gateway exited repeatedly — restart the TUI to retry' } })
       return
     }
-    recoverSid = plan.sid
+    recoverSid = plan.sid ?? undefined
     const attempt = recoveryAttempts.length
     const delay = backoffMs(attempt)
     enqueue({ type: 'gateway.recovering', payload: { attempt, delay_ms: delay } })
@@ -135,12 +163,16 @@ function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
           return new GatewayError({ method, reason, message })
         }
       }).pipe(
-        // Capture session id from create/resume results so approval.respond works.
+        // Keep the live routing id aligned with create/resume/close so prompts,
+        // approvals, interrupts, and crash recovery never target a closed SID.
         Effect.tap(result =>
           Effect.sync(() => {
-            if ((method === 'session.create' || method === 'session.resume') && result && typeof result === 'object') {
-              const sid = (result as { session_id?: unknown }).session_id
-              if (typeof sid === 'string') sessionId = sid
+            const previous = sessionId
+            sessionId = trackedSessionIdAfterRequest(sessionId, method, params, result)
+            if ((method === 'session.create' || method === 'session.resume') && sessionId !== previous) {
+              recoverSid = undefined
+            } else if (method === 'session.close' && previous !== undefined && sessionId === undefined) {
+              recoverSid = undefined
             }
           })
         )

@@ -96,7 +96,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
       <Match when={asConfirm()}>
         {p => (
           <ConfirmPrompt
-            message={p().message}
+            spec={p().spec}
             onYes={() => {
               p().onConfirm()
               clearSoon()

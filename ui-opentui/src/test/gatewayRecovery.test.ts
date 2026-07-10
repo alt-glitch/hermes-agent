@@ -1,7 +1,7 @@
 /**
  * Recovery-budget policy test (LOGIC side, pure). The crash-loop bound: attempts
- * are capped within a sliding window, stale attempts are pruned, and recovery is
- * refused with no session. Plus opencode-style exponential backoff (1s→30s cap).
+ * are capped within a sliding window, stale attempts are pruned, and a detached
+ * UI still respawns without a resume target. Plus exponential backoff (1s→30s cap).
  */
 import { describe, expect, test } from 'vitest'
 
@@ -44,11 +44,11 @@ describe('planGatewayRecovery — crash-loop budget', () => {
     expect(plan.attempts).toEqual([now - 30_000, now])
   })
 
-  test('refuses recovery when there is no session id (live nor recover)', () => {
+  test('respawns within budget when detached, without inventing a resume target', () => {
     const plan = planGatewayRecovery(null, null, [], 1_000_000)
-    expect(plan.recover).toBe(false)
+    expect(plan.recover).toBe(true)
     expect(plan.sid).toBeNull()
-    expect(plan.attempts).toEqual([])
+    expect(plan.attempts).toEqual([1_000_000])
   })
 
   test('falls back to the recoverSid when the live sid was already cleared', () => {

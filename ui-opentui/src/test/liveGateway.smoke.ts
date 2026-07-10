@@ -16,6 +16,7 @@ import { GatewayService } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
 import type { GatewayEvent } from '../boundary/schema/GatewayEvent.ts'
+import { createSession } from '../boundary/sessionLifecycle.ts'
 
 const READY_TIMEOUT_MS = 20_000
 
@@ -39,12 +40,19 @@ async function main(): Promise<void> {
     }
     if (!ready) return { ok: false, why: 'no gateway.ready within timeout' }
 
-    // Create a session (NOT a long handler — responds inline).
-    const created = yield* gateway.request<{ session_id?: string }>('session.create', { cols: 80 })
-    const sid = created?.session_id ?? gateway.sessionId()
-    if (!sid) return { ok: false, why: 'session.create returned no session_id' }
+    // Exercise the real create → close → create tracker contract. The second
+    // create proves a matching close clears the transport SID rather than
+    // allowing a malformed replacement to fall back to the dead first one.
+    const first = yield* createSession(gateway, { cols: 80, cwd: undefined })
+    if (gateway.sessionId() !== first.sessionId) return { ok: false, why: 'first live SID was not tracked' }
+    yield* gateway.request('session.close', { session_id: first.sessionId })
+    if (gateway.sessionId() !== undefined) return { ok: false, why: 'matching session.close did not clear live SID' }
+    const replacement = yield* createSession(gateway, { cols: 80, cwd: undefined })
+    if (replacement.sessionId === first.sessionId) return { ok: false, why: 'replacement reused the closed live SID' }
+    if (gateway.sessionId() !== replacement.sessionId) return { ok: false, why: 'replacement live SID was not tracked' }
+    yield* gateway.request('session.close', { session_id: replacement.sessionId })
 
-    return { ok: true, sid, events: seen.length }
+    return { ok: true, sid: replacement.sessionId, events: seen.length }
   })
 
   try {

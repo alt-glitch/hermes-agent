@@ -6,7 +6,16 @@ export default tseslint.config(
   {
     // .bench/ and .demo/ are build artifacts (bench `nodes` cell and the
     // smoke demo: `node scripts/build.mjs scripts/demo.tsx .demo`) — never lint.
-    ignores: ["node_modules/**", "dist/**", ".bench/**", ".demo/**", ".repos/**", "*.frame.txt", "*.ansi"],
+    ignores: [
+      "node_modules/**",
+      "dist/**",
+      ".accept*/**",
+      ".bench/**",
+      ".demo/**",
+      ".repos/**",
+      "*.frame.txt",
+      "*.ansi",
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,

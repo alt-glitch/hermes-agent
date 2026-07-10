@@ -18,6 +18,7 @@ import type {
   BillingStateResponse
 } from '../boundary/billing.ts'
 import { openExternalUrl } from '../boundary/openExternalUrl.ts'
+import type { ConfirmRequest } from './store.ts'
 
 /** Poll cadence (frozen): 2s interval, 5-minute cap. */
 const POLL_INTERVAL_MS = 2000
@@ -27,7 +28,7 @@ const POLL_CAP_MS = 5 * 60 * 1000
 export interface BillingHost {
   request: (method: string, params: Record<string, unknown>) => Promise<unknown>
   pushSystem: (text: string) => void
-  confirm: (message: string, onConfirm: () => void) => void
+  confirm: (request: ConfirmRequest, onConfirm: () => void) => void
   sessionId: () => string | undefined
 }
 

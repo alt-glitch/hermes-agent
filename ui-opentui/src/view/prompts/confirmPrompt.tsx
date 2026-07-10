@@ -7,9 +7,10 @@ import type { BoxRenderable } from '@opentui/core'
 import { useBindings } from '@opentui/keymap/solid'
 import { onMount } from 'solid-js'
 
+import type { ConfirmSpec } from '../../logic/store.ts'
 import { useTheme } from '../theme.tsx'
 
-export function ConfirmPrompt(props: { message: string; onYes: () => void; onNo: () => void }) {
+export function ConfirmPrompt(props: { spec: ConfirmSpec; onYes: () => void; onNo: () => void }) {
   const theme = useTheme()
   let rootRef: BoxRenderable | undefined
   // No focusable child here (unlike the <select> prompts), so focus the dialog box
@@ -49,10 +50,13 @@ export function ConfirmPrompt(props: { message: string; onYes: () => void; onNo:
       style={{ borderColor: theme().color.border, flexDirection: 'column', flexShrink: 0, marginTop: 1, padding: 1 }}
       border
     >
-      <text fg={theme().color.warn}>
-        <b>{props.message}</b>
+      <text fg={props.spec.danger ? theme().color.error : theme().color.warn}>
+        <b>{props.spec.title}</b>
       </text>
-      <text fg={theme().color.muted}>y/Enter confirm · n/Esc cancel</text>
+      {props.spec.detail ? <text fg={theme().color.muted}>{props.spec.detail}</text> : null}
+      <text fg={theme().color.muted}>
+        y/Enter {props.spec.confirmLabel ?? 'confirm'} · n/Esc {props.spec.cancelLabel ?? 'cancel'}
+      </text>
     </box>
   )
 }

@@ -7,7 +7,8 @@
 #      (the engine must NOT need it).
 #   2. `npm run check`  — prettier + tsc + eslint + vitest (151+), all on Node.
 #   3. live-gateway transport smoke — spawns the real Python tui_gateway via the
-#      node:child_process client, asserts gateway.ready + session.create.
+#      node:child_process client, asserts gateway.ready + create→close→create
+#      live-SID tracking.
 #      (Skipped if no Hermes venv resolves — CI parity.)
 #   4. selection/markdown smoke in a real tmux TTY — asserts the native <markdown>
 #      (Tree-sitter) PAINTS under node --experimental-ffi and that a selection

@@ -22,7 +22,7 @@
 import { createDefaultOpenTuiKeymap } from '@opentui/keymap/opentui'
 import { KeymapProvider } from '@opentui/keymap/solid'
 import { render } from '@opentui/solid'
-import { Deferred, Duration, Effect } from 'effect'
+import { Cause, Deferred, Duration, Effect } from 'effect'
 import { writeFileSync } from 'node:fs'
 
 import { readClipboardImage, writeClipboard } from '../boundary/clipboard.ts'
@@ -35,6 +35,7 @@ import { startProactiveGc } from '../boundary/proactiveGc.ts'
 import { registerRemoteParsers } from '../boundary/parsers.ts'
 import { acquireRenderer } from '../boundary/renderer.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
+import { createSession, replaceSession, resumeSession } from '../boundary/sessionLifecycle.ts'
 import { nthAssistantResponse } from '../logic/copy.ts'
 import { performHeapdump } from '../logic/diagnostics.ts'
 import {
@@ -49,8 +50,13 @@ import {
 } from '../logic/env.ts'
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
 import { parseProcessList } from '../logic/backgroundActivity.ts'
+import { eventMayEnterStore } from '../logic/eventScope.ts'
 import { createPasteStore } from '../logic/pastes.ts'
-import { mapResumeHistory } from '../logic/resume.ts'
+import {
+  planTransitionDrain,
+  SESSION_TRANSITION_QUEUE_LIMIT,
+  type TransitionSubmission
+} from '../logic/transitionQueue.ts'
 import {
   classifySubmit,
   catalogCommandItems,
@@ -115,7 +121,7 @@ function descendantCount(node: { getChildren(): unknown[] }): number {
 /**
  * Resume a session INTO the store: buffer live events across the `session.resume`
  * RPC, then replace history + replay (gotcha §8 #5 tool rows handled by
- * mapResumeHistory). Shared by the launch bootstrap and the session switcher.
+ * the boundary's ordered history mapper). Shared by launch and switching.
  * Timed (rpc_ms / hydrate_ms) for the resume profile.
  */
 /**
@@ -128,9 +134,11 @@ function descendantCount(node: { getChildren(): unknown[] }): number {
  */
 const writeActiveSession = (sid: string | undefined) => {
   const file = process.env.HERMES_TUI_ACTIVE_SESSION_FILE
-  if (!file || !sid) return
+  if (!file) return
   try {
-    writeFileSync(file, JSON.stringify({ session_id: sid }), { mode: 0o600 })
+    writeFileSync(file, JSON.stringify(sid ? { session_id: sid } : { detached: true, session_id: null }), {
+      mode: 0o600
+    })
   } catch (cause) {
     getLog().warn('bootstrap', 'active-session-file write failed', { cause: String(cause) })
   }
@@ -138,27 +146,32 @@ const writeActiveSession = (sid: string | undefined) => {
 
 const resumeInto = (gateway: GatewayServiceShape, store: SessionStore, sid: string, cols: number) =>
   Effect.gen(function* () {
-    writeActiveSession(sid) // the session we're switching to is now the active one (#5)
-    store.setSessionId(sid)
-    store.beginBuffer()
-    const t0 = Date.now()
-    const resumed = yield* gateway.request<{ messages?: unknown; info?: Record<string, unknown> }>('session.resume', {
+    const resumed = yield* resumeSession(gateway, store, {
       cols,
-      session_id: sid,
-      // native engine renders tools collapsed → safe to fold each tool's capped
-      // result into the resume snapshot so resumed turns render like live (item 1).
-      with_tool_output: true
+      targetSessionId: sid
     })
-    const t1 = Date.now()
-    const snapshot = mapResumeHistory(resumed?.messages)
-    store.commitSnapshot(snapshot)
-    if (resumed?.info) store.applyInfo(resumed.info)
+    // The launcher resumes by the persisted DB id (`resumed`), while all live
+    // RPC/event routing uses the ephemeral `session_id` returned above.
+    writeActiveSession(resumed.resumedId)
     getLog().info('bootstrap', 'session resumed', {
-      count: snapshot.length,
-      hydrate_ms: Date.now() - t1,
-      rpc_ms: t1 - t0,
-      sid
+      count: resumed.messageCount,
+      hydrate_ms: resumed.hydrateMs,
+      rpc_ms: resumed.rpcMs,
+      resumed: resumed.resumedId,
+      sid: resumed.sessionId
     })
+    if (resumed.previousSessionId) {
+      Effect.runFork(
+        gateway
+          .request('session.close', { session_id: resumed.previousSessionId })
+          .pipe(
+            Effect.catchCause(cause =>
+              Effect.sync(() => getLog().warn('resume', 'previous session close failed', { cause: String(cause) }))
+            )
+          )
+      )
+    }
+    return resumed.sessionId
   })
 
 /**
@@ -178,10 +191,11 @@ const postSessionSetup = (
   initialImage?: string
 ) =>
   Effect.gen(function* () {
+    const isActive = () => gateway.sessionId() === sid && store.state.sessionId === sid
     const catalog = yield* gateway
       .request<unknown>('startup.catalog', { session_id: sid })
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-    if (catalog) store.setCatalog(catalog)
+    if (catalog && isActive()) store.setCatalog(catalog)
 
     // Seed the composer's slash-highlight catalog ONCE at boot (glitch
     // 2026-06-14): `commands.catalog` returns the full uncapped command + skill
@@ -192,7 +206,12 @@ const postSessionSetup = (
     const cmdCatalog = yield* gateway
       .request<unknown>('commands.catalog', {})
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-    seedLearnedNames(catalogCommandItems(cmdCatalog))
+    if (isActive()) seedLearnedNames(catalogCommandItems(cmdCatalog))
+
+    // A session switch may have completed while either best-effort catalog RPC
+    // was in flight. Never attach an image, submit a prompt, or publish a cache
+    // into the successor session from this stale setup fiber.
+    if (!isActive()) return
 
     // Seeded image (`hermes --tui --image <path>`): attach BEFORE submitting, so
     // the next prompt.submit picks it up — exact Ink parity (createGatewayEventHandler
@@ -221,7 +240,7 @@ const postSessionSetup = (
         .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
     ).then(modelOpts => {
       const modelItems = mapModelOptions(modelOpts)
-      if (modelItems.length) store.setModelItems(modelItems)
+      if (modelItems.length && isActive()) store.setModelItems(modelItems)
     })
     registerModelPrefetch(prefetch)
     yield* Effect.promise(() => prefetch)
@@ -232,7 +251,7 @@ const postSessionSetup = (
  *  must still leave a usable session behind). */
 const createFreshSession = (gateway: GatewayServiceShape, store: SessionStore, input: TuiInput) =>
   Effect.gen(function* () {
-    const created = yield* gateway.request<{ session_id?: string; info?: Record<string, unknown> }>('session.create', {
+    const created = yield* createSession(gateway, {
       cols: input.cols,
       // The launch directory IS the workspace choice in a terminal (you cd'd
       // here) — passing it makes the gateway treat it as explicit, so the
@@ -246,16 +265,12 @@ const createFreshSession = (gateway: GatewayServiceShape, store: SessionStore, i
       // launch dir is meaningless; see _ensure_session_db_row.)
       cwd: launchCwd()
     })
-    const sid = created?.session_id ?? gateway.sessionId()
-    if (!sid) {
-      getLog().warn('bootstrap', 'session.create returned no session_id')
-      return
-    }
-    if (created?.info) store.applyInfo(created.info)
-    writeActiveSession(sid) // record the new session for the launcher's exit epilogue (#5)
-    store.setSessionId(sid)
-    getLog().info('bootstrap', 'session created', { sid })
-    yield* postSessionSetup(gateway, store, sid, input.initialPrompt, input.initialImage)
+    if (created.info) store.applyInfo(created.info)
+    writeActiveSession(created.resumeId) // persisted id for launcher/recovery (#5)
+    store.setSessionId(created.sessionId)
+    store.setResumeId(created.resumeId)
+    getLog().info('bootstrap', 'session created', { resumeId: created.resumeId, sid: created.sessionId })
+    yield* postSessionSetup(gateway, store, created.sessionId, input.initialPrompt, input.initialImage)
   })
 
 /**
@@ -293,14 +308,14 @@ const bootstrapSession = (gateway: GatewayServiceShape, store: SessionStore, inp
       let sid: string | undefined = input.resumeId
       if (sid === 'recent' || sid === 'last') {
         const recent = yield* gateway.request<{ session_id?: string }>('session.most_recent', {})
-        sid = recent?.session_id
+        sid = recent.session_id
       }
       if (!sid) {
         log.warn('bootstrap', 'no session to resume', { resumeId: input.resumeId })
         return
       }
-      yield* resumeInto(gateway, store, sid, input.cols)
-      yield* postSessionSetup(gateway, store, sid, input.initialPrompt, input.initialImage)
+      const liveSessionId = yield* resumeInto(gateway, store, sid, input.cols)
+      yield* postSessionSetup(gateway, store, liveSessionId, input.initialPrompt, input.initialImage)
       return
     }
 
@@ -335,21 +350,111 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // the session so the transcript continues. The INITIAL gateway.ready has
       // `recoverSid === undefined`, so the normal bootstrap path is untouched.
       const gateway = yield* GatewayService
+      let sessionTransitionInFlight = false
+      const isSessionTransitioning = () => sessionTransitionInFlight
+      let imageAttachInFlight = false
+      const transitionSubmissions: TransitionSubmission[] = []
+      let drainTransitionSubmissions: () => void = () => {}
+
+      const reportFailedTransitionSubmissions = (): void => {
+        if (transitionSubmissions.length === 0) return
+        const liveSessionId = gateway.sessionId()
+        if (liveSessionId && store.state.sessionId === liveSessionId) {
+          const dropped = transitionSubmissions.splice(0).length
+          store.pushSystem(`${dropped} queued submission(s) not sent — the previous session remains active`)
+          return
+        }
+        store.pushSystem(
+          `${transitionSubmissions.length} queued submission(s) held for the next successful session switch`
+        )
+      }
+
+      const guardBusySessionSwitch = (what = 'switch sessions'): boolean => {
+        if (store.state.info.running || store.isTurnInFlight()) {
+          store.pushSystem(`interrupt the current turn before trying to ${what}`)
+          return true
+        }
+        if (imageAttachInFlight) {
+          store.pushSystem('wait for the image attachment before trying to switch sessions')
+          return true
+        }
+        if (sessionTransitionInFlight) {
+          store.pushSystem('a session switch is already in progress')
+          return true
+        }
+        return false
+      }
+
       let recoverSid: string | undefined
+      let recoveryRetryTimer: ReturnType<typeof setTimeout> | undefined
+
+      const schedulePendingRecovery = (): void => {
+        if (recoveryRetryTimer) return
+        recoveryRetryTimer = setTimeout(() => {
+          recoveryRetryTimer = undefined
+          const sid = recoverSid
+          if (!sid) return
+          if (sessionTransitionInFlight) {
+            schedulePendingRecovery()
+            return
+          }
+          recoverSid = undefined
+          startRecovery(sid)
+        }, 100)
+      }
+
+      const startRecovery = (resumeId: string): void => {
+        if (sessionTransitionInFlight) {
+          recoverSid = resumeId
+          schedulePendingRecovery()
+          return
+        }
+        sessionTransitionInFlight = true
+        store.setHint('recovering session…')
+        let transitionSucceeded = false
+        Effect.runFork(
+          Effect.gen(function* () {
+            const liveSessionId = yield* resumeInto(gateway, store, resumeId, input.cols)
+            transitionSucceeded = true
+            Effect.runFork(
+              postSessionSetup(gateway, store, liveSessionId).pipe(
+                Effect.catchCause(cause =>
+                  Effect.sync(() => getLog().warn('recover', 'post-resume setup failed', { cause: String(cause) }))
+                )
+              )
+            )
+          }).pipe(
+            Effect.catchCause(cause =>
+              Effect.sync(() => {
+                const error = Cause.squash(cause)
+                const detail = error instanceof Error ? error.message : String(error)
+                getLog().warn('recover', 'resume failed', { cause: detail })
+                store.pushSystem(`recovery failed: ${detail} — use /resume to retry`)
+              })
+            ),
+            Effect.ensuring(
+              Effect.sync(() => {
+                sessionTransitionInFlight = false
+                if (store.state.hint === 'recovering session…') store.setHint(undefined)
+                if (transitionSucceeded) {
+                  drainTransitionSubmissions()
+                } else reportFailedTransitionSubmissions()
+                if (recoverSid) schedulePendingRecovery()
+              })
+            )
+          )
+        )
+      }
+
       yield* gateway.subscribe(event => {
+        if (!eventMayEnterStore(event, gateway.sessionId(), store.isBuffering())) return
         store.apply(event)
         if (event.type === 'gateway.exited') {
-          recoverSid = gateway.sessionId() ?? recoverSid
+          recoverSid = store.state.resumeId
         } else if (event.type === 'gateway.ready' && recoverSid !== undefined) {
           const sid = recoverSid
           recoverSid = undefined
-          Effect.runFork(
-            resumeInto(gateway, store, sid, input.cols).pipe(
-              Effect.catchCause(cause =>
-                Effect.sync(() => getLog().warn('recover', 'resume failed', { cause: String(cause) }))
-              )
-            )
-          )
+          startRecovery(sid)
         }
       })
 
@@ -420,16 +525,25 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // session (image.attach_bytes); the next prompt.submit picks it up.
       const onImagePaste = () => {
         void (async () => {
+          if (isSessionTransitioning()) {
+            flashHint('Session switch in progress', 2000)
+            return
+          }
           const img = await readClipboardImage()
           if (!img) {
             flashHint('No image in clipboard', 2000)
             return
           }
           const sid = gateway.sessionId()
+          if (isSessionTransitioning()) {
+            flashHint('Session switch in progress', 2000)
+            return
+          }
           if (!sid) {
             flashHint('No session for image', 2000)
             return
           }
+          imageAttachInFlight = true
           try {
             await Effect.runPromise(
               gateway.request('image.attach_bytes', {
@@ -441,6 +555,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             flashHint('🖼 image attached — type a message and send', 3000)
           } catch {
             flashHint('Image attach failed', 2000)
+          } finally {
+            imageAttachInFlight = false
           }
         })()
       }
@@ -452,6 +568,12 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         onCtrlC,
         onCopySelection
       })
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (recoveryRetryTimer) clearTimeout(recoveryRetryTimer)
+          recoveryRetryTimer = undefined
+        })
+      )
       // Fleet memory self-sampling (HERMES_TUI_MEMLOG / diagnostics master
       // switch — boundary/memlog.ts). Scoped acquire→release like the renderer.
       const stopMemlog = startMemlog()
@@ -491,6 +613,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // Submit a user turn: the service value is in hand, so `gateway.request(...)`
       // is Effect<…, never> — fire it detached with runFork; failures are logged.
       const submitPrompt = (text: string) => {
+        if (sessionTransitionInFlight) {
+          if (transitionSubmissions.length >= SESSION_TRANSITION_QUEUE_LIMIT) {
+            store.pushSystem(
+              `session-switch queue full (${SESSION_TRANSITION_QUEUE_LIMIT}) — wait for the switch to finish`
+            )
+            return
+          }
+          transitionSubmissions.push({ kind: 'prompt', text })
+          store.pushSystem(`⏳ queued for the new session (${transitionSubmissions.length} queued)`)
+          return
+        }
         // Busy guard (layer A of the busy-queue fix): a prompt sent while a turn
         // runs CANNOT go straight to the gateway (the server rejects it with 4009
         // "session busy" and the client used to swallow it → silent drop). Park it
@@ -501,12 +634,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem(`⏳ queued — will send after the current turn (${store.queuedCount()} queued)`)
           return
         }
-        store.pushUser(text)
         const sid = gateway.sessionId()
         if (!sid) {
-          getLog().warn('submit', 'no session yet — dropping prompt', { text })
+          getLog().warn('submit', 'no active session', { text })
+          store.pushSystem('no active session — run /new to retry')
           return
         }
+        store.pushUser(text)
         Effect.runFork(
           gateway.request('prompt.submit', { session_id: sid, text }).pipe(
             Effect.catchCause(cause =>
@@ -538,6 +672,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // pushSkill instead of dumping the whole body as a giant user bubble
       // (glitch 2026-06-23). Mirrors submitPrompt's busy-guard + send path.
       const submitSkill = (command: string, body: string) => {
+        if (sessionTransitionInFlight) {
+          if (transitionSubmissions.length >= SESSION_TRANSITION_QUEUE_LIMIT) {
+            store.pushSystem(
+              `session-switch queue full (${SESSION_TRANSITION_QUEUE_LIMIT}) — wait for the switch to finish`
+            )
+            return
+          }
+          transitionSubmissions.push({ body, command, kind: 'skill' })
+          store.pushSystem(`⏳ queued for the new session (${transitionSubmissions.length} queued)`)
+          return
+        }
         // Busy guard: same as submitPrompt. A skill fired mid-turn can't go
         // straight to the gateway (4009). Queue the raw body — it drains as a
         // normal prompt (the collapsed render is a nicety lost only in the rare
@@ -547,12 +692,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem(`⏳ queued — will send after the current turn (${store.queuedCount()} queued)`)
           return
         }
-        store.pushSkill(command, body)
         const sid = gateway.sessionId()
         if (!sid) {
-          getLog().warn('submitSkill', 'no session yet — dropping skill', { command })
+          getLog().warn('submitSkill', 'no active session', { command })
+          store.pushSystem('no active session — run /new to retry')
           return
         }
+        store.pushSkill(command, body)
         Effect.runFork(
           gateway
             .request('prompt.submit', { session_id: sid, text: body })
@@ -562,6 +708,19 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               )
             )
         )
+      }
+
+      drainTransitionSubmissions = (): void => {
+        const pending = transitionSubmissions.splice(0)
+        if (pending.length === 0) return
+        const { first, queued } = planTransitionDrain(pending)
+        // Exactly one request may start immediately. The remaining inputs join
+        // the existing one-per-server-confirmed-turn queue; firing them all in
+        // one tick races message.start and causes 4009 drops.
+        if (first?.kind === 'prompt') submitPrompt(first.text)
+        else if (first) submitSkill(first.command, first.body)
+        for (const text of queued) store.enqueuePrompt(text)
+        if (queued.length > 0) store.pushSystem(`⏳ ${queued.length} more queued for this session`)
       }
 
       // `!cmd` — run a shell command directly (Ink/free-code parity: F9). The
@@ -596,12 +755,41 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // surface (bare `--resume`), no create ever ran, so the post-session
       // setup (catalog, /model prefetch) runs here exactly once.
       const onResume = (resumeSid: string) => {
+        if (guardBusySessionSwitch()) return
+        sessionTransitionInFlight = true
+        store.setHint('resuming…')
+        let transitionSucceeded = false
         Effect.runFork(
           Effect.gen(function* () {
-            yield* resumeInto(gateway, store, resumeSid, input.cols)
-            if (!store.state.catalog) yield* postSessionSetup(gateway, store, resumeSid)
+            const liveSessionId = yield* resumeInto(gateway, store, resumeSid, input.cols)
+            transitionSucceeded = true
+            if (!store.state.catalog) {
+              Effect.runFork(
+                postSessionSetup(gateway, store, liveSessionId).pipe(
+                  Effect.catchCause(cause =>
+                    Effect.sync(() => getLog().warn('resume', 'post-resume setup failed', { cause: String(cause) }))
+                  )
+                )
+              )
+            }
           }).pipe(
-            Effect.catchCause(cause => Effect.sync(() => getLog().warn('resume', 'failed', { cause: String(cause) })))
+            Effect.catchCause(cause =>
+              Effect.sync(() => {
+                const error = Cause.squash(cause)
+                const detail = error instanceof Error ? error.message : String(error)
+                getLog().warn('resume', 'failed', { cause: detail })
+                store.pushSystem(`resume failed: ${detail}`)
+              })
+            ),
+            Effect.ensuring(
+              Effect.sync(() => {
+                sessionTransitionInFlight = false
+                if (store.state.hint === 'resuming…') store.setHint(undefined)
+                if (transitionSucceeded) {
+                  drainTransitionSubmissions()
+                } else reportFailedTransitionSubmissions()
+              })
+            )
           )
         )
       }
@@ -629,10 +817,142 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // the composer has somewhere to send prompts.
       const onSessionPickerClosed = () => {
         if (gateway.sessionId()) return
+        if (guardBusySessionSwitch('start a session')) return
+        sessionTransitionInFlight = true
+        store.setHint('starting session…')
+        let transitionSucceeded = false
         Effect.runFork(
           createFreshSession(gateway, store, input).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                transitionSucceeded = gateway.sessionId() !== undefined
+              })
+            ),
             Effect.catchCause(cause =>
-              Effect.sync(() => getLog().warn('bootstrap', 'post-picker create failed', { cause: String(cause) }))
+              Effect.sync(() => {
+                getLog().warn('bootstrap', 'post-picker create failed', { cause: String(cause) })
+                store.pushSystem(`session create failed: ${String(cause)}`)
+              })
+            ),
+            Effect.ensuring(
+              Effect.sync(() => {
+                sessionTransitionInFlight = false
+                if (store.state.hint === 'starting session…') store.setHint(undefined)
+                if (transitionSucceeded) {
+                  drainTransitionSubmissions()
+                } else reportFailedTransitionSubmissions()
+              })
+            )
+          )
+        )
+      }
+
+      const startNewSession = (message?: string, title?: string): void => {
+        if (guardBusySessionSwitch()) return
+        sessionTransitionInFlight = true
+        store.setHint('forging session…')
+        const previousLiveSessionId = gateway.sessionId()
+        let transitionSucceeded = false
+
+        Effect.runFork(
+          Effect.gen(function* () {
+            const result = yield* replaceSession(gateway, {
+              activeSessionId: previousLiveSessionId,
+              cols: input.cols,
+              cwd: launchCwd(),
+              onClosed: () => {
+                // The transport has already cleared its routing SID. Detach the
+                // Solid state and sidecar at the same boundary so a failed
+                // create cannot masquerade as the now-closed conversation.
+                store.detachSession()
+                pasteStore.clear()
+                writeActiveSession(undefined)
+              }
+            })
+
+            if (result.kind === 'setup-required') {
+              store.setHint('setup required')
+              store.openPager(
+                'Setup Required',
+                [
+                  'A new session cannot start until a model provider is configured.',
+                  '',
+                  '• /model — choose from available configured providers',
+                  '• /setup — run the guided provider setup',
+                  '• Ctrl+C — exit, then run `hermes setup`'
+                ].join('\n')
+              )
+              return
+            }
+
+            store.adoptFreshSession(result.sessionId, result.info, result.resumeId)
+            pasteStore.clear()
+            writeActiveSession(result.resumeId)
+            store.setStatus('starting agent…')
+            getLog().info('session', 'fresh session created', { resumeId: result.resumeId, sid: result.sessionId })
+            transitionSucceeded = true
+
+            for (const key of ['credential_warning', 'config_warning'] as const) {
+              const warning = result.info?.[key]
+              if (typeof warning === 'string' && warning.trim()) store.pushSystem(`warning: ${warning.trim()}`)
+            }
+            if (message) store.pushSystem(message)
+
+            const requestedTitle = title?.trim()
+            if (requestedTitle) {
+              Effect.runFork(
+                gateway
+                  .request<{ pending?: boolean; title?: string }>('session.title', {
+                    session_id: result.sessionId,
+                    title: requestedTitle
+                  })
+                  .pipe(
+                    Effect.tap(titleResult =>
+                      Effect.sync(() => {
+                        if (gateway.sessionId() !== result.sessionId) return
+                        const nextTitle = titleResult.title?.trim() || requestedTitle
+                        const suffix = titleResult.pending ? ' (queued while session initializes)' : ''
+                        store.pushSystem(`session title set: ${nextTitle}${suffix}`)
+                      })
+                    ),
+                    Effect.catchCause(cause =>
+                      Effect.sync(() => {
+                        if (gateway.sessionId() !== result.sessionId) return
+                        const error = Cause.squash(cause)
+                        const detail = error instanceof Error ? error.message : String(error)
+                        store.pushSystem(`warning: failed to set session title: ${detail}`)
+                      })
+                    )
+                  )
+              )
+            }
+
+            // Catalog/model hydration is best-effort and SID-gated internally;
+            // it must not hold the transition lock or block the new composer.
+            Effect.runFork(
+              postSessionSetup(gateway, store, result.sessionId).pipe(
+                Effect.catchCause(cause =>
+                  Effect.sync(() => getLog().warn('session', 'post-create setup failed', { cause: String(cause) }))
+                )
+              )
+            )
+          }).pipe(
+            Effect.catchCause(cause =>
+              Effect.sync(() => {
+                const error = Cause.squash(cause)
+                const detail = error instanceof Error ? error.message : String(error)
+                getLog().warn('session', 'fresh session replacement failed', { cause: detail })
+                store.pushSystem(`new session failed: ${detail} — run /new to retry`)
+              })
+            ),
+            Effect.ensuring(
+              Effect.sync(() => {
+                sessionTransitionInFlight = false
+                if (store.state.hint === 'forging session…') store.setHint(undefined)
+                if (transitionSucceeded) {
+                  drainTransitionSubmissions()
+                } else reportFailedTransitionSubmissions()
+              })
             )
           )
         )
@@ -641,7 +961,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // Slash dispatch context (Solid logic; the boundary just hands it a
       // Promise-returning `request` + the host capabilities it needs).
       const slashCtx: SlashContext = {
-        clearTranscript: () => store.clearTranscript(),
+        guardBusySessionSwitch,
+        newSession: startNewSession,
         compact: () => store.state.compact,
         setCompact: on => store.setCompact(on),
         details: () => store.state.details,
@@ -759,8 +1080,26 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
-      // Live backend: drive a session (create + optional initial prompt) concurrently.
-      if (!input.fake) yield* Effect.forkScoped(bootstrapSession(gateway, store, input))
+      // Live backend: drive a session (create + optional initial prompt)
+      // concurrently, but acquire the same transition lock BEFORE rendering so
+      // an early /new or /resume cannot race boot hydration.
+      if (!input.fake) {
+        sessionTransitionInFlight = true
+        store.setHint('starting session…')
+        yield* Effect.forkScoped(
+          bootstrapSession(gateway, store, input).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                sessionTransitionInFlight = false
+                if (store.state.hint === 'starting session…') store.setHint(undefined)
+                if (gateway.sessionId() && store.state.sessionId) {
+                  drainTransitionSubmissions()
+                } else if (!store.state.sessionPicker) reportFailedTransitionSubmissions()
+              })
+            )
+          )
+        )
+      }
 
       // (No ambient OS-process poll: the `bg:` badge now counts in-flight
       // background-PROMPT tasks from the event stream, and the /processes panel

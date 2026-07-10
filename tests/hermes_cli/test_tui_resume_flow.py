@@ -1203,3 +1203,25 @@ def test_print_tui_exit_summary_prefers_actual_active_session_file(
     assert seen == ["actual_session"]
     assert "hermes --tui --resume actual_session" in out
     assert "startup_resume" not in out
+
+
+def test_print_tui_exit_summary_honors_detached_active_session_tombstone(
+    monkeypatch, capsys, tmp_path
+):
+    """A failed /new after close must not advertise the closed launch session."""
+    import hermes_cli.main as main_mod
+
+    active = tmp_path / "active.json"
+    active.write_text('{"detached": true, "session_id": null}', encoding="utf-8")
+
+    class _ShouldNotOpenDB:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("detached sidecar should return before SessionDB")
+
+    monkeypatch.setitem(
+        sys.modules, "hermes_state", types.SimpleNamespace(SessionDB=_ShouldNotOpenDB)
+    )
+
+    main_mod._print_tui_exit_summary("closed_launch_session", str(active))
+
+    assert capsys.readouterr().out == ""

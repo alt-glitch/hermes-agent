@@ -24,7 +24,7 @@ import {
   type SlashContext
 } from '../logic/slash.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
-import type { PickerItem } from '../logic/store.ts'
+import type { ConfirmRequest, PickerItem } from '../logic/store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
 
 // the picker-refresh/tabs/prefetch seams are module-level state — never leak them across tests
@@ -262,14 +262,15 @@ interface Probe {
   submitted: string[]
   /** Skill invocations routed through submitSkill: [command, body] pairs. */
   skillSubmitted: Array<{ command: string; body: string }>
-  confirmed: Array<{ message: string; onConfirm: () => void }>
+  confirmed: Array<{ request: ConfirmRequest; onConfirm: () => void }>
   paged: Array<{ title: string; text: string }>
   sessionPickers: SessionTabId[]
   resumed: string[]
   pickers: Array<{ title: string; items: PickerItem[]; onPick: (value: string) => void }>
   billed: BillingOverlayState[]
   quit: { value: boolean }
-  cleared: { value: boolean }
+  newSessions: Array<[string | undefined, string | undefined]>
+  busy: { value: boolean }
   dashboard: { value: boolean }
   copied: number[]
   copyN: { value: (n: number) => boolean }
@@ -296,7 +297,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const pickers: Probe['pickers'] = []
   const billed: Probe['billed'] = []
   const quit = { value: false }
-  const cleared = { value: false }
+  const newSessions: Probe['newSessions'] = []
+  const busy = { value: false }
   const dashboard = { value: false }
   const copied: number[] = []
   const copyN: Probe['copyN'] = { value: () => false }
@@ -306,7 +308,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const timestampsFlag: Probe['timestampsFlag'] = { value: false }
   const reasoningFullFlag: Probe['reasoningFullFlag'] = { value: false }
   const ctx: SlashContext = {
-    clearTranscript: () => (cleared.value = true),
+    guardBusySessionSwitch: () => busy.value,
+    newSession: (message, title) => newSessions.push([message, title]),
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,
@@ -316,7 +319,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     reasoningFull: () => reasoningFullFlag.value,
     setReasoningFull: on => (reasoningFullFlag.value = on),
     renderableCount: () => undefined,
-    confirm: (message, onConfirm) => confirmed.push({ message, onConfirm }),
+    confirm: (request, onConfirm) => confirmed.push({ request, onConfirm }),
     copyResponse: n => {
       copied.push(n)
       return copyN.value(n)
@@ -344,7 +347,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   }
   return {
     calls,
-    cleared,
+    newSessions,
+    busy,
     compactFlag,
     confirmed,
     copied,
@@ -375,13 +379,37 @@ describe('dispatchSlash — client commands', () => {
     expect(p.calls).toHaveLength(0)
   })
 
-  test('/clear opens a confirm; running onConfirm clears the transcript', async () => {
+  test('/clear opens the destructive session confirm and starts a replacement only after confirmation', async () => {
     const p = makeCtx(async () => ({}))
     await dispatchSlash('/clear', p.ctx)
     expect(p.confirmed).toHaveLength(1)
-    expect(p.cleared.value).toBe(false)
+    expect(p.confirmed[0]?.request).toEqual({
+      cancelLabel: 'No, keep going',
+      confirmLabel: 'Yes, clear the session',
+      danger: true,
+      detail: 'This ends the current conversation and clears the transcript.',
+      title: 'Clear the current session?'
+    })
+    expect(p.newSessions).toHaveLength(0)
     p.confirmed[0]!.onConfirm()
-    expect(p.cleared.value).toBe(true)
+    expect(p.newSessions).toEqual([[undefined, undefined]])
+  })
+
+  test('/new trims and forwards its title; busy sessions never open the confirm', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/new   release candidate  ', p.ctx)
+    expect(p.confirmed[0]?.request).toMatchObject({
+      confirmLabel: 'Yes, start a new session',
+      title: 'Start a new session?'
+    })
+    p.confirmed[0]!.onConfirm()
+    expect(p.newSessions).toEqual([['new session started', 'release candidate']])
+
+    const blocked = makeCtx(async () => ({}))
+    blocked.busy.value = true
+    await dispatchSlash('/clear', blocked.ctx)
+    expect(blocked.confirmed).toHaveLength(0)
+    expect(blocked.newSessions).toHaveLength(0)
   })
 
   test('/logs opens the pager with the recent ring lines', async () => {

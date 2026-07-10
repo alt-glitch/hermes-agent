@@ -16,7 +16,7 @@ import { DETAILS_SECTIONS, DETAILS_USAGE, type DetailsMode, nextDetailsMode, par
 import { formatBytes, memReport, performHeapdump } from './diagnostics.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './replay.ts'
 import { mapSessionRows, parseSessionTabArg, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
-import type { CompletionItem, PickerItem, PickerState } from './store.ts'
+import type { CompletionItem, ConfirmRequest, PickerItem, PickerState } from './store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
 import { buildBillingCtx } from './billing.ts'
 
@@ -65,8 +65,11 @@ export interface SlashContext {
    *  args). (glitch 2026-06-23) */
   readonly submitSkill: (command: string, body: string) => void
   /** Open a local Y/N confirm; `onConfirm` runs on Yes. */
-  readonly confirm: (message: string, onConfirm: () => void) => void
-  readonly clearTranscript: () => void
+  readonly confirm: (request: ConfirmRequest, onConfirm: () => void) => void
+  /** Refuse a session transition while a turn/transition is active. */
+  readonly guardBusySessionSwitch: (what?: string) => boolean
+  /** Close the current live session and create/adopt a replacement. */
+  readonly newSession: (message?: string, title?: string) => void
   /** Copy the n-th newest assistant response to the clipboard; returns whether something was copied. */
   readonly copyResponse: (n: number) => boolean
   readonly quit: () => void
@@ -270,7 +273,7 @@ const CLIENT_HELP_LINES = [
   '/skin [name] — switch theme skin (live)',
   '/sessions [cron|gateways|all] — browse/resume sessions (tabbed picker)',
   '/resume [id|name] — resume directly, or open the picker',
-  '/clear, /new — clear the transcript (confirm)',
+  '/clear, /new [title] — start a new session (confirm)',
   '/compact [on|off|toggle] — compact transcript spacing',
   '/details [hidden|collapsed|expanded|cycle] — tool/reasoning detail',
   '/reasoning [full|clamp] — expand/collapse all thinking',
@@ -885,6 +888,23 @@ const backgroundCmd: ClientHandler = async (arg, ctx) => {
   }
 }
 
+const freshSessionCmd =
+  (isNew: boolean): ClientHandler =>
+  (arg, ctx) => {
+    if (ctx.guardBusySessionSwitch('switch sessions')) return
+    const requestedTitle = isNew ? arg.trim() : ''
+    ctx.confirm(
+      {
+        cancelLabel: 'No, keep going',
+        confirmLabel: isNew ? 'Yes, start a new session' : 'Yes, clear the session',
+        danger: true,
+        detail: 'This ends the current conversation and clears the transcript.',
+        title: isNew ? 'Start a new session?' : 'Clear the current session?'
+      },
+      () => ctx.newSession(isNew ? 'new session started' : undefined, requestedTitle || undefined)
+    )
+  }
+
 /** The TUI-only client commands (run in-process, never hit the gateway). */
 const CLIENT: Record<string, ClientHandler> = {
   agents: (_arg, ctx) => ctx.openDashboard(),
@@ -892,7 +912,7 @@ const CLIENT: Record<string, ClientHandler> = {
   bg: backgroundCmd,
   billing: billingCmd,
   btw: backgroundCmd,
-  clear: (_arg, ctx) => ctx.confirm('Clear the transcript?', ctx.clearTranscript),
+  clear: freshSessionCmd(false),
   compact: compactCmd,
   copy: (arg, ctx) => {
     const n = Math.max(1, Number.parseInt(arg, 10) || 1)
@@ -928,7 +948,7 @@ const CLIENT: Record<string, ClientHandler> = {
     }
   },
   logs: (_arg, ctx) => ctx.openPager('Logs', ctx.logTail().join('\n') || '(log empty)'),
-  new: (_arg, ctx) => ctx.confirm('Start fresh? (clears the transcript)', ctx.clearTranscript),
+  new: freshSessionCmd(true),
   quit: (_arg, ctx) => ctx.quit()
 }
 

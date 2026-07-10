@@ -13,8 +13,9 @@ export const GATEWAY_RECOVERY_LIMIT = 3
 export const GATEWAY_RECOVERY_WINDOW_MS = 60_000
 
 export interface RecoveryPlan {
-  /** Attempt timestamps to persist (the pruned window, plus `now` iff recovering). */
+  /** Attempt timestamps to persist (the pruned window, plus `now` iff respawning). */
   attempts: number[]
+  /** Whether the gateway process may be respawned inside the crash-loop budget. */
   recover: boolean
   /**
    * Session to resume — the live sid, or the not-yet-consumed recovery target
@@ -24,7 +25,7 @@ export interface RecoveryPlan {
 }
 
 /**
- * Decide whether to respawn+resume after a gateway death. `liveSid` is the
+ * Decide whether to respawn (and, when a SID exists, resume) after a gateway death. `liveSid` is the
  * current session (nulled on the first exit); `recoverSid` is a pending
  * recovery target carried across a respawn that died before gateway.ready —
  * so a startup crash-loop keeps retrying the same session up to the budget
@@ -38,7 +39,9 @@ export function planGatewayRecovery(
 ): RecoveryPlan {
   const sid = liveSid ?? recoverSid
   const recent = attempts.filter(t => now - t < GATEWAY_RECOVERY_WINDOW_MS)
-  const recover = Boolean(sid) && recent.length < GATEWAY_RECOVERY_LIMIT
+  // A detached UI still needs a live gateway so /new and /resume can recover it.
+  // The same crash-loop budget applies even when there is no session to resume.
+  const recover = recent.length < GATEWAY_RECOVERY_LIMIT
 
   return { attempts: recover ? [...recent, now] : recent, recover, sid }
 }

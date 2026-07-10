@@ -61,7 +61,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const reasoningFullFlag = { value: false }
   const renderables: Probe['renderables'] = { value: undefined }
   const ctx: SlashContext = {
-    clearTranscript: () => {},
+    guardBusySessionSwitch: () => false,
+    newSession: () => {},
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,

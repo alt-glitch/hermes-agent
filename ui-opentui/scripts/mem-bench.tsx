@@ -37,11 +37,11 @@
  * memory, not garbage — the harness fails fast unless Node has `--expose-gc`.
  *
  * RESUME MODES are component benchmarks, not end-to-end RPC timings. They build
- * the mapped Message[] before measurement, then time `commitSnapshot`, a
- * headless layout flush, and bounded public-API Tree-sitter settlement. Cold
+ * the mapped Message[] before measurement, then time `commitSessionSnapshot`,
+ * a headless layout flush, and bounded public-API Tree-sitter settlement. Cold
  * starts from an empty mounted app; switch replaces an already-mounted session.
- * Gateway latency, `mapResumeHistory`, `applyInfo`, and terminal transport paint
- * are intentionally excluded and must be measured by the PTY suite.
+ * Gateway latency, `mapResumeHistory`, and terminal transport paint are
+ * intentionally excluded and must be measured by the PTY suite.
  */
 import { CodeRenderable, resolveRenderLib } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
@@ -261,7 +261,7 @@ async function main(): Promise<void> {
     if (!targetFixture) throw new Error(`missing target fixture for ${MODE}`)
     if (previousFixture) {
       store.beginBuffer()
-      store.commitSnapshot(previousFixture)
+      store.commitSessionSnapshot('bench-previous', previousFixture, { model: 'fixture-previous' }, () => true)
       await setup.renderOnce()
       await setup.flush()
       const previousSettlement = await settleHighlights(setup.renderer.root)
@@ -287,7 +287,7 @@ async function main(): Promise<void> {
 
     const hydrateStartedAt = performance.now()
     store.beginBuffer()
-    store.commitSnapshot(targetFixture)
+    store.commitSessionSnapshot('bench-target', targetFixture, { model: 'fixture-target' }, () => true)
     const snapshotCommittedAt = performance.now()
     const expectedMounted = Math.min(targetFixture.length, store.messageCap)
     if (store.state.messages.length !== expectedMounted) {
@@ -308,7 +308,7 @@ async function main(): Promise<void> {
     if (settlement.codeRenderables === 0) {
       throw new Error('resume fixture mounted zero CodeRenderables')
     }
-    process.stdout.write(`\n--- resume component path (${MODE}; RPC/map/applyInfo/terminal paint excluded) ---\n`)
+    process.stdout.write(`\n--- resume component path (${MODE}; RPC/map/terminal paint excluded) ---\n`)
     process.stdout.write(`requested cap      : ${REQUESTED_CAP}\n`)
     process.stdout.write(`effective cap      : ${store.messageCap}\n`)
     process.stdout.write(`fixture msgs built : ${targetFixture.length}\n`)
@@ -319,7 +319,7 @@ async function main(): Promise<void> {
     process.stdout.write(`allocation delta   : ${allocations - baselineAllocs}\n`)
     process.stdout.write(`rss(MB)            : ${MB(memory.rss)}\n`)
     process.stdout.write(`rss delta(MB)      : ${MB(memory.rss - baselineMemory.rss)}\n`)
-    process.stdout.write(`commitSnapshot(ms) : ${(snapshotCommittedAt - hydrateStartedAt).toFixed(2)}\n`)
+    process.stdout.write(`session adoption(ms): ${(snapshotCommittedAt - hydrateStartedAt).toFixed(2)}\n`)
     process.stdout.write(`layout stage(ms)   : ${(layoutFlushedAt - snapshotCommittedAt).toFixed(2)}\n`)
     process.stdout.write(
       `highlight settle   : ${settlement.complete ? 'complete' : 'timeout'} ` +
