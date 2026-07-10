@@ -12,62 +12,174 @@
  * LOOSE memory proxy and we're choosing a cap default.
  *
  *   node scripts/build.mjs scripts/mem-bench.tsx .bench   # build once (Solid+TS → JS)
- *   Uncapped:  MEM_BENCH_TOTAL=8000 HERMES_TUI_MAX_MESSAGES=100000 \
+ *   Live:       MEM_BENCH_MODE=live MEM_BENCH_TOTAL=4000 \
  *     node --experimental-ffi --expose-gc --no-warnings .bench/mem-bench.js
- *   Capped:    MEM_BENCH_TOTAL=8000 HERMES_TUI_MAX_MESSAGES=1500 \
+ *   Cold resume: MEM_BENCH_MODE=resume-cold MEM_BENCH_TOTAL=4000 \
+ *     node --experimental-ffi --expose-gc --no-warnings .bench/mem-bench.js
+ *   Warm switch: MEM_BENCH_MODE=resume-switch MEM_BENCH_TOTAL=4000 \
  *     node --experimental-ffi --expose-gc --no-warnings .bench/mem-bench.js
  *
- * Run each cap as a SEPARATE node invocation so the WASM/native heap starts fresh.
- * The matrix loop:
- *   for cap in 400 1500 3000 6000 100000; do \
- *     MEM_BENCH_TOTAL=8000 HERMES_TUI_MAX_MESSAGES=$cap \
+ * Run each mode/cap as a SEPARATE node invocation so the native heap starts
+ * fresh. Production clamps the requested cap to 3,000 with windowing or 1,000
+ * without it, so this diagnostic never labels a clamped run "uncapped":
+ *   for cap in 400 1500 3000; do \
+ *     MEM_BENCH_MODE=live MEM_BENCH_TOTAL=4000 HERMES_TUI_MAX_MESSAGES=$cap \
  *       node --experimental-ffi --expose-gc --no-warnings .bench/mem-bench.js; done
  *
  * Signal: native `getAllocatorStats().activeAllocations` (the Zig-side allocator
- * count — every live renderable/Yoga subtree contributes) and the recursive
+ * count — every live renderable/layout subtree contributes) and the recursive
  * renderable descendant count under `renderer.root`. RSS is reported too but is
- * noisy and grow-only (WASM linear memory never returns to the OS), so the
- * meaningful comparison is the STEADY-STATE plateau: capped should flatten after
- * ~CAP messages; uncapped should keep climbing.
+ * noisy and native allocator pools may not return promptly to the OS, so the
+ * meaningful comparison is the STEADY-STATE plateau: a smaller requested cap
+ * should flatten before the production 3,000-row ceiling.
  *
  * GC: forces `global.gc()` (synchronous) before each sample to measure RETAINED
- * memory, not garbage — run Node with `--expose-gc` or the GC call is a no-op.
+ * memory, not garbage — the harness fails fast unless Node has `--expose-gc`.
  *
- * RESUME PATH: after the live push matrix, builds the full fixture as a settled
- * Message[] and `commitSnapshot`s it (the resume path), reporting mounted nodes +
- * RSS — verifying the slice-before-set fix bounds resume mounting to ≤ cap.
+ * RESUME MODES are component benchmarks, not end-to-end RPC timings. They build
+ * the mapped Message[] before measurement, then time `commitSnapshot`, a
+ * headless layout flush, and bounded public-API Tree-sitter settlement. Cold
+ * starts from an empty mounted app; switch replaces an already-mounted session.
+ * Gateway latency, `mapResumeHistory`, `applyInfo`, and terminal transport paint
+ * are intentionally excluded and must be measured by the PTY suite.
  */
-import { resolveRenderLib } from '@opentui/core'
+import { CodeRenderable, resolveRenderLib } from '@opentui/core'
 import type { Renderable } from '@opentui/core'
 import { testRender } from '@opentui/solid'
 
+import { installFfiCoordSafety } from '../src/boundary/ffiSafe.ts'
 import { createSessionStore } from '../src/logic/store.ts'
 import { App } from '../src/view/App.tsx'
 import { ThemeProvider } from '../src/view/theme.tsx'
 import { applyTurn, materialize, rowsPerTurn } from './fixture.ts'
 
+// `testRender` creates its own renderer instead of going through
+// boundary/renderer.ts, so install the same Node-FFI coordinate guard that the
+// production entrypoint uses before mounting any native renderables.
+installFfiCoordSafety()
+
 const lib = resolveRenderLib()
 
-const TOTAL = Number.parseInt(process.env.MEM_BENCH_TOTAL ?? '8000', 10)
+const TOTAL = Number.parseInt(process.env.MEM_BENCH_TOTAL ?? '4000', 10)
 const SAMPLE_EVERY = Number.parseInt(process.env.MEM_BENCH_SAMPLE ?? '500', 10)
-const cap = process.env.HERMES_TUI_MAX_MESSAGES ?? '(default 400)'
+const HIGHLIGHT_TIMEOUT_MS = Number.parseInt(process.env.MEM_BENCH_HIGHLIGHT_TIMEOUT_MS ?? '750', 10)
+const REQUESTED_CAP = process.env.HERMES_TUI_MAX_MESSAGES ?? '(production default)'
+const MODE = (() => {
+  const value = process.env.MEM_BENCH_MODE ?? 'live'
+  if (value === 'live' || value === 'resume-cold' || value === 'resume-switch') return value
+  throw new Error(`invalid MEM_BENCH_MODE: ${value}`)
+})()
 
 const MB = (bytes: number) => (bytes / 1024 / 1024).toFixed(1)
 
-/** Force a synchronous full GC to measure RETAINED memory. No-op without `node --expose-gc`. */
-const forceGc = (): void => {
-  const gc = (globalThis as { gc?: () => void }).gc
-  if (gc) gc()
+type DeadlineResult<T> = { readonly timedOut: true } | { readonly timedOut: false; readonly value: T }
+
+async function completesWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<DeadlineResult<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise.then(value => ({ timedOut: false as const, value })),
+      new Promise<DeadlineResult<T>>(resolve => {
+        timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
 }
 
-/** Recursively count every Renderable under root (a proxy for live Yoga nodes). */
+/** Force a synchronous full GC to measure RETAINED memory. */
+const forceGc = (): void => {
+  const gc = (globalThis as { gc?: () => void }).gc
+  if (!gc) throw new Error('mem-bench requires node --expose-gc')
+  gc()
+}
+
+/** Recursively count every Renderable under root (a proxy for live layout nodes). */
 function descendantCount(node: Renderable): number {
   let n = 0
   for (const child of node.getChildren()) n += 1 + descendantCount(child)
   return n
 }
 
+function codeRenderables(node: Renderable, found: CodeRenderable[] = []): CodeRenderable[] {
+  if (node instanceof CodeRenderable) found.push(node)
+  for (const child of node.getChildren()) codeRenderables(child, found)
+  return found
+}
+
+interface HighlightSettlement {
+  readonly codeRenderables: number
+  readonly elapsedMs: number
+  readonly pending: number
+  readonly rejected: number
+  readonly complete: boolean
+}
+
+/** Await mounted code renderables through OpenTUI's public highlightingDone API. */
+async function settleHighlights(root: Renderable): Promise<HighlightSettlement> {
+  const startedAt = performance.now()
+  const timeout = Number.isFinite(HIGHLIGHT_TIMEOUT_MS) ? Math.max(0, HIGHLIGHT_TIMEOUT_MS) : 750
+  const deadline = startedAt + timeout
+  let seen = codeRenderables(root)
+  let rejected = 0
+  for (;;) {
+    const pending = seen.filter(code => code.isHighlighting)
+    if (pending.length === 0) {
+      return {
+        codeRenderables: seen.length,
+        elapsedMs: performance.now() - startedAt,
+        pending: 0,
+        rejected,
+        complete: true
+      }
+    }
+    const remaining = deadline - performance.now()
+    if (remaining <= 0) {
+      return {
+        codeRenderables: seen.length,
+        elapsedMs: performance.now() - startedAt,
+        pending: pending.length,
+        rejected,
+        complete: false
+      }
+    }
+    const completed = await completesWithin(Promise.allSettled(pending.map(code => code.highlightingDone)), remaining)
+    if (completed.timedOut) {
+      seen = codeRenderables(root)
+      return {
+        codeRenderables: seen.length,
+        elapsedMs: performance.now() - startedAt,
+        pending: seen.filter(code => code.isHighlighting).length,
+        rejected,
+        complete: false
+      }
+    }
+    rejected += completed.value.filter(result => result.status === 'rejected').length
+    if (rejected > 0) {
+      seen = codeRenderables(root)
+      return {
+        codeRenderables: seen.length,
+        elapsedMs: performance.now() - startedAt,
+        pending: seen.filter(code => code.isHighlighting).length,
+        rejected,
+        complete: false
+      }
+    }
+    // Highlight callbacks may create/reveal another code renderable; re-scan
+    // until the mounted tree is quiescent or the shared deadline expires.
+    seen = codeRenderables(root)
+  }
+}
+
 async function main(): Promise<void> {
+  // Build resume fixtures before the renderer exists and GC the throwaway Solid
+  // stores used by materialize(). Both old+new arrays intentionally remain live
+  // for resume-switch, matching production while an RPC result replaces history.
+  const targetFixture = MODE === 'live' ? undefined : materialize(TOTAL, MODE === 'resume-switch' ? 10_000 : 0)
+  const previousFixture = MODE === 'resume-switch' ? materialize(TOTAL) : undefined
+  forceGc()
+
   const store = createSessionStore()
   store.apply({ type: 'gateway.ready' })
 
@@ -79,99 +191,150 @@ async function main(): Promise<void> {
     ),
     { width: 100, height: 40, exitOnCtrlC: false }
   )
-  await setup.renderOnce()
-  await setup.flush()
-
-  process.stdout.write(
-    `\n=== mem-bench (REALISTIC fixture)  cap=${cap}  total=${TOTAL}  sampleEvery=${SAMPLE_EVERY} ===\n`
-  )
-  process.stdout.write(
-    'pushes | msgs | rss(MB) | heapUsed(MB) | external(MB) | arrayBuf(MB) | activeAllocs | renderables\n'
-  )
-  process.stdout.write(
-    '-------+------+---------+--------------+--------------+--------------+--------------+------------\n'
-  )
-
-  async function sample(pushes: number): Promise<void> {
+  try {
     await setup.renderOnce()
     await setup.flush()
-    forceGc() // synchronous, full GC — measure retained, not garbage
-    const m = process.memoryUsage()
-    const alloc = lib.getAllocatorStats()
-    const renderables = descendantCount(setup.renderer.root)
-    const cols = [
-      String(pushes).padStart(6),
-      String(store.state.messages.length).padStart(4),
-      MB(m.rss).padStart(7),
-      MB(m.heapUsed).padStart(12),
-      MB(m.external).padStart(12),
-      MB(m.arrayBuffers).padStart(12),
-      String(alloc.activeAllocations).padStart(12),
-      String(renderables).padStart(11)
-    ]
-    process.stdout.write(cols.join(' | ') + '\n')
-  }
 
-  await sample(0)
-  // Pump turns inline, sampling each time the cumulative produced-row count crosses
-  // a SAMPLE_EVERY boundary. Sampling is async (renderOnce/flush/gc), so it lives
-  // in the loop rather than a sync callback. Mounting is synchronous in Solid, so a
-  // render pass at the boundary reflects the just-pushed turns.
-  let pushed = 0
-  let nextSample = SAMPLE_EVERY
-  let turn = 0
-  while (pushed < TOTAL) {
-    applyTurn(store, turn)
-    pushed += rowsPerTurn(turn)
-    turn++
-    if (pushed >= nextSample) {
-      await sample(Math.min(pushed, TOTAL))
-      while (nextSample <= pushed) nextSample += SAMPLE_EVERY
+    if (MODE === 'live') {
+      process.stdout.write(
+        `\n=== mem-bench (REALISTIC fixture) mode=live requestedCap=${REQUESTED_CAP} ` +
+          `total=${TOTAL} sampleEvery=${SAMPLE_EVERY} ===\n`
+      )
+      process.stdout.write(
+        'pushes | msgs | rss(MB) | heapUsed(MB) | external(MB) | arrayBuf(MB) | activeAllocs | renderables\n'
+      )
+      process.stdout.write(
+        '-------+------+---------+--------------+--------------+--------------+--------------+------------\n'
+      )
+
+      async function sample(pushes: number): Promise<void> {
+        await setup.renderOnce()
+        await setup.flush()
+        const settlement = await settleHighlights(setup.renderer.root)
+        if (pushes > 0 && settlement.codeRenderables === 0) {
+          throw new Error('fixture mounted zero CodeRenderables; check duplicate @opentui/core resolution')
+        }
+        if (!settlement.complete) {
+          throw new Error(
+            `highlight settlement failed (${settlement.pending} pending, ${settlement.rejected} rejected)`
+          )
+        }
+        await setup.renderOnce()
+        await setup.flush()
+        forceGc() // synchronous, full GC — measure retained, not garbage
+        const m = process.memoryUsage()
+        const alloc = lib.getAllocatorStats()
+        const renderables = descendantCount(setup.renderer.root)
+        const cols = [
+          String(pushes).padStart(6),
+          String(store.state.messages.length).padStart(4),
+          MB(m.rss).padStart(7),
+          MB(m.heapUsed).padStart(12),
+          MB(m.external).padStart(12),
+          MB(m.arrayBuffers).padStart(12),
+          String(alloc.activeAllocations).padStart(12),
+          String(renderables).padStart(11)
+        ]
+        process.stdout.write(cols.join(' | ') + '\n')
+      }
+
+      await sample(0)
+      // Pump turns inline, sampling each time the cumulative produced-row count
+      // crosses a SAMPLE_EVERY boundary. Each boundary awaits mounted code
+      // highlighting through the public OpenTUI promise before retained sampling.
+      let pushed = 0
+      let nextSample = SAMPLE_EVERY
+      let turn = 0
+      while (pushed < TOTAL) {
+        applyTurn(store, turn)
+        pushed += rowsPerTurn(turn)
+        turn++
+        if (pushed >= nextSample) {
+          await sample(Math.min(pushed, TOTAL))
+          while (nextSample <= pushed) nextSample += SAMPLE_EVERY
+        }
+      }
+      process.stdout.write('highlight settlement: complete\n')
+      return
     }
+
+    if (!targetFixture) throw new Error(`missing target fixture for ${MODE}`)
+    if (previousFixture) {
+      store.beginBuffer()
+      store.commitSnapshot(previousFixture)
+      await setup.renderOnce()
+      await setup.flush()
+      const previousSettlement = await settleHighlights(setup.renderer.root)
+      await setup.renderOnce()
+      await setup.flush()
+      if (previousSettlement.codeRenderables === 0) {
+        throw new Error('previous fixture mounted zero CodeRenderables')
+      }
+      if (!previousSettlement.complete) {
+        throw new Error(
+          `previous-session highlighting failed ` +
+            `(${previousSettlement.pending} pending, ${previousSettlement.rejected} rejected)`
+        )
+      }
+    }
+
+    // Both mapped fixtures were allocated before renderer setup; collect
+    // materialization garbage now so it cannot trigger GC inside the timed commit.
+    forceGc()
+    const baselineMemory = process.memoryUsage()
+    const baselineAllocs = lib.getAllocatorStats().activeAllocations
+    const baselineRenderables = descendantCount(setup.renderer.root)
+
+    const hydrateStartedAt = performance.now()
+    store.beginBuffer()
+    store.commitSnapshot(targetFixture)
+    const snapshotCommittedAt = performance.now()
+    const expectedMounted = Math.min(targetFixture.length, store.messageCap)
+    if (store.state.messages.length !== expectedMounted) {
+      throw new Error(`message cap regression: mounted ${store.state.messages.length}, expected ${expectedMounted}`)
+    }
+    await setup.renderOnce()
+    await setup.flush()
+    const layoutFlushedAt = performance.now()
+    const settlement = await settleHighlights(setup.renderer.root)
+    await setup.renderOnce()
+    await setup.flush()
+    const postHighlightFlushAt = performance.now()
+    forceGc()
+
+    const memory = process.memoryUsage()
+    const allocations = lib.getAllocatorStats().activeAllocations
+    const renderables = descendantCount(setup.renderer.root)
+    if (settlement.codeRenderables === 0) {
+      throw new Error('resume fixture mounted zero CodeRenderables')
+    }
+    process.stdout.write(`\n--- resume component path (${MODE}; RPC/map/applyInfo/terminal paint excluded) ---\n`)
+    process.stdout.write(`requested cap      : ${REQUESTED_CAP}\n`)
+    process.stdout.write(`effective cap      : ${store.messageCap}\n`)
+    process.stdout.write(`fixture msgs built : ${targetFixture.length}\n`)
+    process.stdout.write(`mounted msgs       : ${store.state.messages.length}\n`)
+    process.stdout.write(`renderables        : ${renderables}\n`)
+    process.stdout.write(`renderable delta   : ${renderables - baselineRenderables}\n`)
+    process.stdout.write(`activeAllocations  : ${allocations}\n`)
+    process.stdout.write(`allocation delta   : ${allocations - baselineAllocs}\n`)
+    process.stdout.write(`rss(MB)            : ${MB(memory.rss)}\n`)
+    process.stdout.write(`rss delta(MB)      : ${MB(memory.rss - baselineMemory.rss)}\n`)
+    process.stdout.write(`commitSnapshot(ms) : ${(snapshotCommittedAt - hydrateStartedAt).toFixed(2)}\n`)
+    process.stdout.write(`layout stage(ms)   : ${(layoutFlushedAt - snapshotCommittedAt).toFixed(2)}\n`)
+    process.stdout.write(
+      `highlight settle   : ${settlement.complete ? 'complete' : 'timeout'} ` +
+        `${settlement.elapsedMs.toFixed(2)}ms ` +
+        `(${settlement.pending} pending, ${settlement.rejected} rejected, ` +
+        `${settlement.codeRenderables} code renderables)\n`
+    )
+    process.stdout.write(`highlight stage(ms): ${(postHighlightFlushAt - layoutFlushedAt).toFixed(2)}\n`)
+    process.stdout.write(`total component(ms): ${(postHighlightFlushAt - hydrateStartedAt).toFixed(2)}\n`)
+    if (!settlement.complete) {
+      throw new Error(`resume highlighting failed (${settlement.pending} pending, ${settlement.rejected} rejected)`)
+    }
+  } finally {
+    setup.renderer.destroy()
   }
-
-  // Tear down the live push tree BEFORE the resume path so its mounted nodes don't
-  // pollute the process-wide RSS the resume sample reads. (The renderable COUNT is
-  // already isolated per-renderer-root, but RSS is process-global.)
-  store.clearTranscript()
-  setup.renderer.destroy()
-  forceGc()
-
-  // ── RESUME PATH: build the full settled fixture and commitSnapshot it (the
-  // resume hydrate path). Verifies the slice-before-set fix bounds resume mounting
-  // to ≤ cap — mounting 8000 settled msgs at cap=1500 should mount ~1500-worth of
-  // rows, NOT 8000-worth. Done on a FRESH store + renderer so the live-push history
-  // above doesn't skew the count.
-  const resumeStore = createSessionStore()
-  resumeStore.apply({ type: 'gateway.ready' })
-  const resumeSetup = await testRender(
-    () => (
-      <ThemeProvider theme={() => resumeStore.state.theme}>
-        <App store={resumeStore} />
-      </ThemeProvider>
-    ),
-    { width: 100, height: 40, exitOnCtrlC: false }
-  )
-  await resumeSetup.renderOnce()
-  await resumeSetup.flush()
-
-  const fullFixture = materialize(TOTAL)
-  resumeStore.beginBuffer()
-  resumeStore.commitSnapshot(fullFixture)
-  await resumeSetup.renderOnce()
-  await resumeSetup.flush()
-  forceGc()
-  const rm = process.memoryUsage()
-  const ralloc = lib.getAllocatorStats()
-  const rrenderables = descendantCount(resumeSetup.renderer.root)
-  process.stdout.write('\n--- resume path (commitSnapshot of the full fixture) ---\n')
-  process.stdout.write(`fixture msgs built : ${fullFixture.length}\n`)
-  process.stdout.write(`mounted msgs (cap) : ${resumeStore.state.messages.length}\n`)
-  process.stdout.write(`mounted renderables: ${rrenderables}\n`)
-  process.stdout.write(`activeAllocations  : ${ralloc.activeAllocations}\n`)
-  process.stdout.write(`rss(MB)            : ${MB(rm.rss)}\n`)
-
-  resumeSetup.renderer.destroy()
 }
 
 await main()

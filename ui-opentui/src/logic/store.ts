@@ -1607,6 +1607,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
   }
 
   return {
+    /** Effective retained-message cap after the production windowing ceiling. */
+    messageCap: MESSAGE_CAP,
     state,
     apply,
     pushUser,

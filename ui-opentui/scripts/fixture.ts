@@ -264,8 +264,10 @@ export function drive(
  * action stream into a FRESH, EFFECTIVELY-UNCAPPED store and snapshot its rows.
  * This guarantees the resume fixture is byte-identical to what the live push
  * path produces (minus the rolling cap), so `commitSnapshot` mounts the real shape.
+ * `turnOffset` creates a deterministic but distinct session for warm-switch
+ * measurements, avoiding an unrealistically identical old/new transcript.
  */
-export function materialize(total: number): Message[] {
+export function materialize(total: number, turnOffset = 0): Message[] {
   // `uncappedFixture` bypasses the store's handle-safe cap CLAMP (an env value
   // can no longer raise the cap past logic/store.ts HANDLE_SAFE_MAX_ROWS — the
   // old env=MAX_SAFE_INTEGER trick would now silently truncate to 1000 rows).
@@ -275,8 +277,9 @@ export function materialize(total: number): Message[] {
   let pushed = 0
   let turn = 0
   while (pushed < total) {
-    applyTurn(store, turn)
-    pushed += rowsPerTurn(turn)
+    const fixtureTurn = turn + turnOffset
+    applyTurn(store, fixtureTurn)
+    pushed += rowsPerTurn(fixtureTurn)
     turn++
   }
   // Deep-copy out of the solid store proxy into plain objects (the resume path

@@ -658,6 +658,7 @@ describe('session store — rolling message cap (bounds the Yoga node high-water
   test('caps the message array at the env-tuned MESSAGE_CAP, dropping the oldest (head)', () => {
     process.env[ENV_KEY] = '5'
     const store = createSessionStore()
+    expect(store.messageCap).toBe(5)
     // push more than the cap; each distinct so we can tell which survived
     for (let i = 0; i < 55; i++) store.pushUser(`msg ${i}`)
     expect(store.state.messages).toHaveLength(5)
@@ -727,6 +728,7 @@ describe('session store — rolling message cap (bounds the Yoga node high-water
     delete process.env[ENV_KEY]
     delete process.env[WINDOWING_KEY]
     const store = createSessionStore()
+    expect(store.messageCap).toBe(3000)
     for (let i = 0; i < 3050; i++) store.pushUser(`m${i}`)
     expect(store.state.messages).toHaveLength(3000)
     expect(store.state.messages[0]!.text).toBe('m50') // oldest 50 dropped
@@ -736,6 +738,7 @@ describe('session store — rolling message cap (bounds the Yoga node high-water
     delete process.env[ENV_KEY]
     process.env[WINDOWING_KEY] = '0'
     const store = createSessionStore()
+    expect(store.messageCap).toBe(1000)
     for (let i = 0; i < 1050; i++) store.pushUser(`m${i}`)
     expect(store.state.messages).toHaveLength(1000)
     expect(store.state.messages[0]!.text).toBe('m50')
