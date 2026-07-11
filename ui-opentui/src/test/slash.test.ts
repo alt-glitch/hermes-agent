@@ -105,16 +105,26 @@ describe('mapCompletions', () => {
 })
 
 describe('catalogCommandItems (slash-highlight boot seed — glitch 2026-06-14)', () => {
-  test('extracts the /name from each commands.catalog pair', () => {
+  test('extracts canonical pairs plus de-duplicated alias keys from commands.catalog', () => {
     expect(
       catalogCommandItems({
+        canon: { '/h': '/help', '/help': '/help', '/mod': '/model', '/q': '/queue' },
         pairs: [
           ['/handoff', 'compact the conversation'],
           ['/model', 'switch model'],
+          ['/help', 'show help'],
           ['/clear', '']
         ]
       })
-    ).toEqual([{ text: '/handoff' }, { text: '/model' }, { text: '/clear' }])
+    ).toEqual([
+      { text: '/handoff' },
+      { text: '/model' },
+      { text: '/help' },
+      { text: '/clear' },
+      { text: '/h' },
+      { text: '/mod' },
+      { text: '/q' }
+    ])
   })
   test('shape-defensive: junk / missing pairs → []', () => {
     expect(catalogCommandItems(null)).toEqual([])
@@ -272,6 +282,9 @@ interface Probe {
   newSessions: Array<[string | undefined, string | undefined]>
   toolsResets: Array<{ readonly [key: string]: unknown }>
   toolsConfiguring: { begins: number; ends: number; value: boolean }
+  hasConversation: { value: boolean }
+  sessionTitle: { value: string | undefined }
+  commandCatalogs: Array<{ catalog: unknown; removedSkills: readonly string[] }>
   session: { value: string | undefined }
   busy: { value: boolean }
   dashboard: { value: boolean }
@@ -303,6 +316,9 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const newSessions: Probe['newSessions'] = []
   const toolsResets: Probe['toolsResets'] = []
   const toolsConfiguring: Probe['toolsConfiguring'] = { begins: 0, ends: 0, value: false }
+  const hasConversation = { value: true }
+  const sessionTitle: Probe['sessionTitle'] = { value: undefined }
+  const commandCatalogs: Probe['commandCatalogs'] = []
   const session: Probe['session'] = { value: 'sid-1' }
   const busy = { value: false }
   const dashboard = { value: false }
@@ -325,6 +341,9 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       toolsConfiguring.value = false
     },
     resetAfterToolsConfigure: info => toolsResets.push(info),
+    hasConversation: () => hasConversation.value,
+    setSessionTitle: title => (sessionTitle.value = title),
+    refreshCommandCatalog: (catalog, removedSkills) => commandCatalogs.push({ catalog, removedSkills }),
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,
@@ -365,6 +384,9 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     newSessions,
     toolsResets,
     toolsConfiguring,
+    hasConversation,
+    sessionTitle,
+    commandCatalogs,
     session,
     busy,
     compactFlag,
@@ -857,13 +879,224 @@ describe('dispatchSlash — client commands', () => {
     expect(p.system).toEqual(['web: enabled'])
     expect(p.paged).toEqual([])
   })
+
+  test('registers the five live maintenance commands and the reload-skills alias', () => {
+    const names = clientCommandNames()
+    for (const name of ['status', 'title', 'save', 'reload', 'reload-skills', 'reload_skills']) {
+      expect(names).toContain(name)
+    }
+  })
+
+  test('/status reads the authoritative live session and always opens the status pager', async () => {
+    const p = makeCtx(async method =>
+      method === 'session.status' ? { output: 'Hermes TUI Status\n\nSession ID: sid-1' } : {}
+    )
+    await dispatchSlash('/status', p.ctx)
+    expect(p.calls).toEqual([{ method: 'session.status', params: { session_id: 'sid-1' } }])
+    expect(p.paged).toEqual([{ title: 'Status', text: 'Hermes TUI Status\n\nSession ID: sid-1' }])
+    expect(p.system).toEqual([])
+  })
+
+  test('/status handles no session, malformed data, and a stale response without worker fallback', async () => {
+    const noSession = makeCtx(async () => ({}))
+    noSession.session.value = undefined
+    await dispatchSlash('/status', noSession.ctx)
+    expect(noSession.calls).toEqual([])
+    expect(noSession.system).toEqual(['no active session'])
+
+    const malformed = makeCtx(async () => ({ output: 42 }))
+    await dispatchSlash('/status', malformed.ctx)
+    expect(malformed.system).toEqual(['/status: invalid session.status response'])
+
+    let resolve!: (value: unknown) => void
+    const pending = new Promise<unknown>(done => (resolve = done))
+    const stale = makeCtx(async () => pending)
+    const run = dispatchSlash('/status', stale.ctx)
+    stale.session.value = 'sid-2'
+    resolve({ output: 'old session' })
+    await run
+    expect(stale.system).toEqual([])
+    expect(stale.paged).toEqual([])
+  })
+
+  test('/status drops a late same-session reply after a newer slash command', async () => {
+    let resolveStatus!: (value: unknown) => void
+    const pendingStatus = new Promise<unknown>(done => (resolveStatus = done))
+    const p = makeCtx(async (method, params) => {
+      if (method === 'session.status') return pendingStatus
+      if (method === 'session.title') return { title: params.title }
+      return {}
+    })
+
+    const old = dispatchSlash('/status', p.ctx)
+    await Promise.resolve()
+    await dispatchSlash('/title Current title', p.ctx)
+    resolveStatus({ output: 'stale status' })
+    await old
+
+    expect(p.session.value).toBe('sid-1')
+    expect(p.paged).toEqual([])
+    expect(p.system).toEqual(['session title set: Current title'])
+  })
+
+  test('/title queries and renames the live session, including queued-title feedback and chrome refresh', async () => {
+    const p = makeCtx(async (method, params) => {
+      if (method !== 'session.title') return {}
+      return 'title' in params ? { pending: true, title: params.title } : { session_key: 'db-1', title: 'Old title' }
+    })
+
+    await dispatchSlash('/title', p.ctx)
+    await dispatchSlash('/title   Release candidate   ', p.ctx)
+
+    expect(p.calls).toEqual([
+      { method: 'session.title', params: { session_id: 'sid-1' } },
+      { method: 'session.title', params: { session_id: 'sid-1', title: 'Release candidate' } }
+    ])
+    expect(p.system).toEqual([
+      'title: Old title',
+      'session title set: Release candidate (queued while session initializes)'
+    ])
+    expect(p.sessionTitle.value).toBe('Release candidate')
+  })
+
+  test('/title reports empty/malformed/error cases without mutating successor chrome', async () => {
+    const empty = makeCtx(async () => ({ title: '' }))
+    await dispatchSlash('/title', empty.ctx)
+    expect(empty.system).toEqual(['no title set'])
+
+    const malformed = makeCtx(async () => ({ pending: false }))
+    await dispatchSlash('/title New', malformed.ctx)
+    expect(malformed.system).toEqual(['/title: invalid session.title response'])
+    expect(malformed.sessionTitle.value).toBeUndefined()
+
+    const failed = makeCtx(async () => {
+      throw new Error('duplicate title')
+    })
+    await dispatchSlash('/title New', failed.ctx)
+    expect(failed.system).toEqual(['/title: duplicate title'])
+
+    let resolve!: (value: unknown) => void
+    const pending = new Promise<unknown>(done => (resolve = done))
+    const stale = makeCtx(async () => pending)
+    const run = dispatchSlash('/title Old session title', stale.ctx)
+    stale.session.value = 'sid-2'
+    resolve({ pending: false, title: 'Old session title' })
+    await run
+    expect(stale.sessionTitle.value).toBeUndefined()
+    expect(stale.system).toEqual([])
+  })
+
+  test('/save exports active gateway history and surfaces empty/no-session/error cases', async () => {
+    const saved = makeCtx(async method =>
+      method === 'session.save' ? { file: '/tmp/hermes_conversation_20260711.json' } : {}
+    )
+    await dispatchSlash('/save', saved.ctx)
+    expect(saved.calls).toEqual([{ method: 'session.save', params: { session_id: 'sid-1' } }])
+    expect(saved.system).toEqual(['conversation saved to: /tmp/hermes_conversation_20260711.json'])
+
+    const empty = makeCtx(async () => ({}))
+    empty.hasConversation.value = false
+    await dispatchSlash('/save', empty.ctx)
+    expect(empty.calls).toEqual([])
+    expect(empty.system).toEqual(['no conversation yet'])
+
+    const detached = makeCtx(async () => ({}))
+    detached.session.value = undefined
+    await dispatchSlash('/save', detached.ctx)
+    expect(detached.calls).toEqual([])
+    expect(detached.system).toEqual(['no active session — nothing to save'])
+
+    const malformed = makeCtx(async () => ({ file: 42 }))
+    await dispatchSlash('/save', malformed.ctx)
+    expect(malformed.system).toEqual(['/save: invalid session.save response'])
+
+    const failed = makeCtx(async () => {
+      throw new Error('disk full')
+    })
+    await dispatchSlash('/save', failed.ctx)
+    expect(failed.system).toEqual(['/save: disk full'])
+  })
+
+  test('/reload re-reads env in the running gateway with singular/plural copy and validation', async () => {
+    const one = makeCtx(async method => (method === 'reload.env' ? { updated: 1 } : {}))
+    await dispatchSlash('/reload', one.ctx)
+    expect(one.calls).toEqual([{ method: 'reload.env', params: {} }])
+    expect(one.system).toEqual(['reloaded .env (1 var updated)'])
+
+    const many = makeCtx(async () => ({ updated: 3 }))
+    await dispatchSlash('/reload', many.ctx)
+    expect(many.system).toEqual(['reloaded .env (3 vars updated)'])
+
+    for (const raw of [{ updated: -1 }, { updated: 1.5 }, { updated: '1' }]) {
+      const malformed = makeCtx(async () => raw)
+      await dispatchSlash('/reload', malformed.ctx)
+      expect(malformed.system).toEqual(['/reload: invalid reload.env response'])
+    }
+  })
+
+  test('/reload-skills reloads live skills, pages output, then replaces the decoded command catalog', async () => {
+    const catalog = {
+      canon: { '/new-skill': '/new-skill', '/q': '/queue' },
+      pairs: [['/new-skill', 'New skill']]
+    }
+    const p = makeCtx(async method => {
+      if (method === 'skills.reload')
+        return {
+          output:
+            'Reloading skills...\nAdded skills:\n  - new-skill\nRemoved skills:\n  - old-skill\n1 skill(s) available',
+          result: {
+            added: [{ description: 'New skill', name: 'new-skill' }],
+            removed: [{ description: 'Old skill', name: 'old-skill' }],
+            total: 1
+          }
+        }
+      if (method === 'commands.catalog') return catalog
+      return {}
+    })
+    await dispatchSlash('/reload_skills', p.ctx)
+    expect(p.calls).toEqual([
+      { method: 'skills.reload', params: {} },
+      { method: 'commands.catalog', params: {} }
+    ])
+    expect(p.paged).toEqual([
+      {
+        title: 'Reload Skills',
+        text: 'Reloading skills...\nAdded skills:\n  - new-skill\nRemoved skills:\n  - old-skill\n1 skill(s) available'
+      }
+    ])
+    expect(p.commandCatalogs).toEqual([
+      { catalog: undefined, removedSkills: ['old-skill'] },
+      { catalog, removedSkills: [] }
+    ])
+    expect(p.system).toEqual([])
+  })
+
+  test('/reload-skills fails closed on malformed responses and reports catalog refresh failure', async () => {
+    const badReload = makeCtx(async () => ({ output: 42 }))
+    await dispatchSlash('/reload-skills', badReload.ctx)
+    expect(badReload.calls.map(call => call.method)).toEqual(['skills.reload'])
+    expect(badReload.system).toEqual(['/reload-skills: invalid skills.reload response'])
+
+    const badCatalog = makeCtx(async method =>
+      method === 'skills.reload'
+        ? {
+            output: 'skills reloaded',
+            result: { added: [], removed: [{ name: 'removed-skill' }], total: 0 }
+          }
+        : { pairs: [['/broken', 42]] }
+    )
+    await dispatchSlash('/reload-skills', badCatalog.ctx)
+    expect(badCatalog.paged).toEqual([{ title: 'Reload Skills', text: 'skills reloaded' }])
+    expect(badCatalog.commandCatalogs).toEqual([{ catalog: undefined, removedSkills: ['removed-skill'] }])
+    expect(badCatalog.system).toEqual(['warning: skills reloaded, but the command catalog response was invalid'])
+  })
 })
 
 describe('dispatchSlash — server ladder', () => {
   test('unknown command → slash.exec; SHORT output shown as a system line', async () => {
     const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'all good' } : {}))
-    await dispatchSlash('/status', p.ctx)
-    expect(p.calls[0]).toEqual({ method: 'slash.exec', params: { command: 'status', session_id: 'sid-1' } })
+    await dispatchSlash('/health', p.ctx)
+    expect(p.calls[0]).toEqual({ method: 'slash.exec', params: { command: 'health', session_id: 'sid-1' } })
     expect(p.system).toContain('all good')
     expect(p.paged).toHaveLength(0)
   })
@@ -871,11 +1104,28 @@ describe('dispatchSlash — server ladder', () => {
   test('LONG slash.exec output opens the pager (titled by command)', async () => {
     const longText = Array.from({ length: 6 }, (_, i) => `output line ${i}`).join('\n')
     const p = makeCtx(async method => (method === 'slash.exec' ? { output: longText } : {}))
-    await dispatchSlash('/status', p.ctx)
+    await dispatchSlash('/health', p.ctx)
     expect(p.paged).toHaveLength(1)
-    expect(p.paged[0]?.title).toBe('Status')
+    expect(p.paged[0]?.title).toBe('Health')
     expect(p.paged[0]?.text).toContain('output line 5')
     expect(p.system).toHaveLength(0)
+  })
+
+  test('a newer slash command suppresses late same-session slash.exec output', async () => {
+    let resolveSlow!: (value: unknown) => void
+    const slow = new Promise<unknown>(done => (resolveSlow = done))
+    const p = makeCtx(async (method, params) => {
+      if (method !== 'slash.exec') return {}
+      return params.command === 'slow' ? slow : { output: 'fresh output' }
+    })
+
+    const old = dispatchSlash('/slow', p.ctx)
+    await Promise.resolve()
+    await dispatchSlash('/fast', p.ctx)
+    resolveSlow({ output: 'stale output' })
+    await old
+
+    expect(p.system).toEqual(['fresh output'])
   })
 
   test('slash.exec rejects → command.dispatch; send result submits a user turn', async () => {

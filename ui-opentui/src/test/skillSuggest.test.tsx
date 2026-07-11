@@ -23,7 +23,7 @@ import { createPromptHistory } from '../logic/history.ts'
 import { planCompletion } from '../logic/slash.ts'
 import { createSessionStore, type CompletionItem, type SessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
-import { resetLearnedNames, seedLearnedNames } from '../view/composer.tsx'
+import { refreshLearnedNames, resetLearnedNames, seedLearnedNames } from '../view/composer.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
@@ -271,6 +271,57 @@ describe('exact-match token highlight (native editBuffer ranges)', () => {
       expect(span!.fg.toInts().slice(0, 3)).toEqual(accent.slice(0, 3))
     } finally {
       h.probe.destroy()
+    }
+  })
+
+  test('a live catalog refresh removes deleted skills', async () => {
+    seedLearnedNames([{ text: '/removed-skill' }])
+    refreshLearnedNames([{ text: '/current-skill' }, { text: '/queue' }], ['removed-skill'])
+    const h = await mountComposer()
+    try {
+      await h.probe.keys.typeText('/removed-skill')
+      await h.probe.settle()
+      await h.probe.waitForFrame(f => f.includes('/removed-skill'))
+      const span = findSpan(h, '/removed-skill')
+      expect(span).toBeDefined()
+      const accent = RGBA.fromHex(h.store.state.theme.color.accent).toInts()
+      expect(span!.fg.toInts().slice(0, 3)).not.toEqual(accent.slice(0, 3))
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('a live catalog refresh preserves a dynamically learned alias', async () => {
+    seedLearnedNames([{ text: '/learning' }])
+    refreshLearnedNames([{ text: '/queue' }], ['removed-skill'])
+    const alias = await mountComposer()
+    try {
+      await alias.probe.keys.typeText('/learning')
+      await alias.probe.settle()
+      await alias.probe.waitForFrame(f => f.includes('/learning'))
+      const accent = RGBA.fromHex(alias.store.state.theme.color.accent).toInts()
+      const span = findSpan(alias, '/learning')
+      expect(span).toBeDefined()
+      expect(span!.fg.toInts().slice(0, 3)).toEqual(accent.slice(0, 3))
+    } finally {
+      alias.probe.destroy()
+    }
+  })
+
+  test('a live catalog refresh preserves a dynamically learned plugin command', async () => {
+    seedLearnedNames([{ text: '/plugin-command' }])
+    refreshLearnedNames([{ text: '/queue' }], ['removed-skill'])
+    const plugin = await mountComposer()
+    try {
+      await plugin.probe.keys.typeText('/plugin-command')
+      await plugin.probe.settle()
+      await plugin.probe.waitForFrame(f => f.includes('/plugin-command'))
+      const accent = RGBA.fromHex(plugin.store.state.theme.color.accent).toInts()
+      const span = findSpan(plugin, '/plugin-command')
+      expect(span).toBeDefined()
+      expect(span!.fg.toInts().slice(0, 3)).toEqual(accent.slice(0, 3))
+    } finally {
+      plugin.probe.destroy()
     }
   })
 })

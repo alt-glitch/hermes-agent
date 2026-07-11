@@ -20,7 +20,7 @@ Status meanings:
 - **In progress** — actively being implemented; never counts as shipped.
 - **Intentional skip** — an explicit supported-platform/product decision.
 
-Current slash tally: **8 Covered, 27 Thinner, 22 Missing, 0 In progress, 1
+Current slash tally: **13 Covered, 25 Thinner, 19 Missing, 0 In progress, 1
 Intentional skip**.
 
 ## Slash commands
@@ -33,8 +33,8 @@ Intentional skip**.
 | 4 | `/mouse`, `/scroll` | Missing | Hot-swap renderer tracking modes and persist them; launch-time mouse config alone is insufficient. |
 | 5 | `/clear`, `/new [title]` | Covered | Busy guard and Ink-equivalent confirmation feed a transactional `setup.status → session.close → session.create`; adoption resets all session-owned state, preserves process-global presentation, supports titles, fences old live SIDs, and safely drains submissions queued during the switch. |
 | 6 | `/redraw` | Missing | Invoke the supported native repaint primitive and verify recovery in a real TTY. |
-| 7 | `/status` | Thinner | Use direct `session.status`; the slash worker is not authoritative for current live state. |
-| 8 | `/title` | Thinner | Direct `session.title`, pending/error feedback, and immediate header refresh. |
+| 7 | `/status` | Covered | Decoded direct `session.status` uses the active SID, always pages the authoritative live snapshot, and drops late old-SID or superseded same-SID replies. |
+| 8 | `/title` | Covered | Decoded direct query/rename preserves pending/error feedback, refreshes title chrome immediately, and fences late responses by SID plus slash flight. |
 | 9 | `/compact` | Covered | `logic/slash.ts::compactCmd` updates live display state and persistence. |
 | 10 | `/details`, `/detail` | Thinner | Global modes work; add per-section thinking/tools/subagents/activity modes. |
 | 11 | `/fortune` | Missing | Port the local random/daily helper with deterministic daily tests. |
@@ -44,7 +44,7 @@ Intentional skip**.
 | 15 | `/terminal-setup` | Missing | Port the external terminal-keybinding setup handoff. |
 | 16 | `/logs [n]` | Thinner | Honor the requested count and reconcile gateway-log vs OpenTUI-ring semantics. |
 | 17 | `/history [preview]` | Missing | Render the current client transcript; a detached worker has stale history. |
-| 18 | `/save` | Missing | Call `session.save` for the active SID and surface no-SID/error cases. |
+| 18 | `/save` | Covered | Decoded direct `session.save` exports uncapped gateway history, preserves Ink's no-conversation/no-SID UX, reports the path/errors, and fences late replies. |
 | 19 | `/statusbar`, `/sb` | Missing | Live off/top/bottom/toggle state plus persistence and responsive frame tests. |
 | 20 | `/queue`, `/q` | Thinner | Bare count/preview, enqueue while idle, visible edit/remove/send UX, and reset behavior. |
 | 21 | `/steer` | Thinner | Direct live steer; idle must enqueue rather than submit immediately. |
@@ -71,14 +71,14 @@ Intentional skip**.
 | 42 | `/usage` | Thinner | Use `session.usage` and render structured token/context/compression/credit data. |
 | 43 | `/stop` | Thinner | Direct `process.stop` and exact killed-count/error feedback. |
 | 44 | `/reload-mcp` | Thinner | Live reload exists; restore busy guard, cache warning/confirmation, aliases, and detailed result copy. |
-| 45 | `/reload` | Missing | Call `reload.env` in the running gateway, not the worker subprocess. |
+| 45 | `/reload` | Covered | Decoded direct `reload.env` runs in the live gateway, validates its update count, renders exact singular/plural feedback, and drops superseded results. |
 | 46 | `/browser` | Missing | Direct `browser.manage`, progress presentation, and live CDP indicator. |
 | 47 | `/rollback` | Thinner | Use structured list/diff/restore RPCs and reconcile visible transcript state. |
 | 48 | `/agents`, `/tasks` | Thinner | Dashboard exists; add pause/resume/status/interrupt/history/replay controls. |
 | 49 | `/journey`, `/learning`, `/memory-graph` | Missing | Target gateway `learning.*` exists; port the timeline/detail/edit/delete overlay. |
 | 50 | `/replay` | Thinner | Disk list/load pager exists; add in-memory history/navigation and dashboard integration. |
 | 51 | `/replay-diff` | Missing | Add pair selection, diff state, and native dashboard view. |
-| 52 | `/reload-skills` | Missing | Direct `skills.reload` and refresh `commands.catalog` in the active client. |
+| 52 | `/reload-skills` | Covered | Decoded direct `skills.reload` removes confirmed-deleted names immediately, refreshes `commands.catalog` aliases/canonical names, preserves dynamically learned plugin commands, reports refresh failure, and is SID/flight fenced. |
 | 53 | `/skills` | Thinner | List/inspect picker works; preserve explicit search/install/browse/manage subcommands. |
 | 54 | `/plugins` | Thinner | Text worker path exists; port the bare interactive user/bundled enable/disable hub. |
 | 55 | `/tools` | Covered | List/status retains Ink's worker presentation; enable/disable uses decoded live `tools.configure`, busy/transition guards, atomic gateway mutation/close coordination, same-SID state replacement, catalog/model refresh, nullable detached feedback, and bounded post-reset submission drain. |

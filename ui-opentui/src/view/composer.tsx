@@ -88,6 +88,23 @@ export function seedLearnedNames(items: ReadonlyArray<{ text: string }>): void {
   for (const name of learnableNames('/', items)) LEARNED_NAMES.add(name)
 }
 
+/** Incrementally refresh after a live skill reload. Only names the gateway
+ *  explicitly reports as removed are deleted; aliases, plugin commands, and
+ *  other dynamically learned extensions are preserved. */
+export function refreshLearnedNames(
+  items: ReadonlyArray<{ text: string }>,
+  removedSkills: readonly string[] = []
+): void {
+  for (const raw of removedSkills) {
+    const canonical = raw.trim().replace(/^\/+/, '')
+    if (!canonical) continue
+    LEARNED_NAMES.delete(canonical)
+    LEARNED_NAMES.delete(canonical.replaceAll('_', '-'))
+    LEARNED_NAMES.delete(canonical.replaceAll('-', '_'))
+  }
+  seedLearnedNames(items)
+}
+
 /** Keys that must NOT steal focus back to the composer (scroll/edit/nav). */
 const NAV_KEYS = new Set([
   'return',

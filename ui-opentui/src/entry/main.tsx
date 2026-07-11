@@ -61,6 +61,7 @@ import {
 import {
   classifySubmit,
   catalogCommandItems,
+  clientCommandNames,
   createCompletionGate,
   dispatchSlash,
   mapCompletions,
@@ -72,7 +73,7 @@ import {
 } from '../logic/slash.ts'
 import { createSessionStore, type SessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
-import { seedLearnedNames } from '../view/composer.tsx'
+import { refreshLearnedNames, seedLearnedNames } from '../view/composer.tsx'
 import { TerminalChrome } from '../view/terminalChrome.tsx'
 
 // Syntax-highlighting language expansion: register the remote tree-sitter
@@ -997,6 +998,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             )
           )
         },
+        hasConversation: () =>
+          store.state.messages.some(message => message.role === 'user' || message.role === 'assistant'),
+        setSessionTitle: title => store.applyInfo({ title }),
+        refreshCommandCatalog: (catalog, removedSkills) =>
+          refreshLearnedNames(
+            [...catalogCommandItems(catalog), ...clientCommandNames().map(name => ({ text: `/${name}` }))],
+            removedSkills
+          ),
         compact: () => store.state.compact,
         setCompact: on => store.setCompact(on),
         details: () => store.state.details,

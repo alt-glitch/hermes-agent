@@ -18,6 +18,14 @@ import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './re
 import { mapSessionRows, parseSessionTabArg, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
 import type { CompletionItem, ConfirmRequest, PickerItem, PickerState } from './store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
+import {
+  decodeCommandsCatalogResponse,
+  decodeReloadEnvResponse,
+  decodeSessionSaveResponse,
+  decodeSessionStatusResponse,
+  decodeSessionTitleResponse,
+  decodeSkillsReloadResponse
+} from '../boundary/schema/SessionCommandResponses.ts'
 import { decodeToolsConfigureResponse } from '../boundary/schema/ToolsConfigureResponse.ts'
 import { buildBillingCtx } from './billing.ts'
 
@@ -78,6 +86,14 @@ export interface SlashContext {
    *  prompts typed while the RPC runs are replayed after adoption, not erased. */
   readonly beginToolsConfigure: () => void
   readonly endToolsConfigure: () => void
+  /** Whether the visible transcript contains a user/assistant exchange. */
+  readonly hasConversation: () => boolean
+  /** Apply a successful live rename immediately; the gateway event remains the
+   *  authoritative eventual refresh. */
+  readonly setSessionTitle: (title: string) => void
+  /** Refresh the active command-name cache after `skills.reload`, removing only
+   *  skills the gateway confirmed disappeared. */
+  readonly refreshCommandCatalog: (catalog: unknown, removedSkills: readonly string[]) => void
   /** Copy the n-th newest assistant response to the clipboard; returns whether something was copied. */
   readonly copyResponse: (n: number) => boolean
   readonly quit: () => void
@@ -214,18 +230,30 @@ export function mapCompletions(result: unknown): CompletionItem[] {
   return out
 }
 
-/** Extract `{text}` items from a `commands.catalog` result ({pairs:[["/name",
- *  "desc"],…]}) for seeding the composer's slash-highlight catalog at boot
- *  (glitch 2026-06-14). Each pair's first element is the `/name`; non-string or
- *  empty entries are skipped. Shape-defensive — any junk → []. */
+/** Extract `{text}` items from a `commands.catalog` result for seeding the
+ *  composer's slash-highlight catalog. Canonical rows come from `pairs`; aliases
+ *  come from `canon` keys. Shape-defensive and de-duplicated. */
 export function catalogCommandItems(result: unknown): { text: string }[] {
   if (!result || typeof result !== 'object') return []
   const pairs = (result as { pairs?: unknown }).pairs
   if (!Array.isArray(pairs)) return []
   const out: { text: string }[] = []
+  const seen = new Set<string>()
   for (const pair of pairs as unknown[]) {
     const name = Array.isArray(pair) ? (pair as unknown[])[0] : undefined
-    if (typeof name === 'string' && name) out.push({ text: name })
+    if (typeof name === 'string' && name && !seen.has(name)) {
+      seen.add(name)
+      out.push({ text: name })
+    }
+  }
+  const canon = (result as { canon?: unknown }).canon
+  if (canon && typeof canon === 'object' && !Array.isArray(canon)) {
+    for (const name of Object.keys(canon)) {
+      if (name && !seen.has(name)) {
+        seen.add(name)
+        out.push({ text: name })
+      }
+    }
   }
   return out
 }
@@ -282,6 +310,11 @@ const CLIENT_HELP_LINES = [
   '/sessions [cron|gateways|all] — browse/resume sessions (tabbed picker)',
   '/resume [id|name] — resume directly, or open the picker',
   '/clear, /new [title] — start a new session (confirm)',
+  '/status — show live session info',
+  '/title [name] — show or rename the live session',
+  '/save — save the current transcript to JSON',
+  '/reload — re-read ~/.hermes/.env in the running gateway',
+  '/reload-skills — re-scan skills and refresh slash commands',
   '/compact [on|off|toggle] — compact transcript spacing',
   '/details [hidden|collapsed|expanded|cycle] — tool/reasoning detail',
   '/reasoning [full|clamp] — expand/collapse all thinking',
@@ -301,7 +334,23 @@ function clientHelp(): string {
   return lines.join('\n')
 }
 
-type ClientHandler = (arg: string, ctx: SlashContext) => void | Promise<void>
+type ClientHandler = (arg: string, ctx: SlashContext, flight: number) => void | Promise<void>
+
+/** Ink's `slashFlightRef`, kept per injected context so concurrent test/app
+ *  instances cannot invalidate each other. Every new slash supersedes older
+ *  same-session replies. */
+const SLASH_FLIGHTS = new WeakMap<SlashContext, number>()
+
+const claimSlashFlight = (ctx: SlashContext): number => {
+  const flight = (SLASH_FLIGHTS.get(ctx) ?? 0) + 1
+  SLASH_FLIGHTS.set(ctx, flight)
+  return flight
+}
+
+const slashFlightIsCurrent = (ctx: SlashContext, flight: number): boolean => SLASH_FLIGHTS.get(ctx) === flight
+
+const currentSessionIs = (ctx: SlashContext, expected: string | undefined, flight: number) =>
+  slashFlightIsCurrent(ctx, flight) && ctx.sessionId() === expected
 
 /** `/sessions [recent|cron|gateways|all]` — open the tabbed resume picker,
  *  pre-selecting the named tab (shared by /sessions, /switch, /session). */
@@ -833,6 +882,160 @@ const memCmd: ClientHandler = (_arg, ctx) => {
   ctx.pushSystem(memReport(process.memoryUsage(), process.uptime(), ctx.renderableCount()))
 }
 
+/** `/status` — the detached slash worker cannot observe the live agent, so use
+ *  the session-scoped RPC and always page the authoritative snapshot (Ink
+ *  `core.ts` parity). */
+const statusCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('no active session')
+    return
+  }
+
+  try {
+    const raw = await ctx.request('session.status', { session_id: sid })
+    if (!currentSessionIs(ctx, sid, flight)) return
+    const response = decodeSessionStatusResponse(raw)
+    if (!response) {
+      ctx.pushSystem('/status: invalid session.status response')
+      return
+    }
+    ctx.openPager('Status', response.output || '(no status)')
+  } catch (error) {
+    if (currentSessionIs(ctx, sid, flight)) {
+      ctx.pushSystem(`/status: ${error instanceof Error ? error.message : 'session.status failed'}`)
+    }
+  }
+}
+
+/** `/title [name]` — query/rename the active DB session directly, SID-fenced so
+ *  a late response cannot rename successor chrome. */
+const titleCmd: ClientHandler = async (arg, ctx, flight) => {
+  const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('no active session')
+    return
+  }
+
+  const title = arg.trim()
+  try {
+    const raw = await ctx.request('session.title', title ? { session_id: sid, title } : { session_id: sid })
+    if (!currentSessionIs(ctx, sid, flight)) return
+    const response = decodeSessionTitleResponse(raw)
+    if (!response) {
+      ctx.pushSystem('/title: invalid session.title response')
+      return
+    }
+
+    const resolved = response.title.trim()
+    if (!title) {
+      ctx.pushSystem(resolved ? `title: ${resolved}` : 'no title set')
+      return
+    }
+
+    const next = resolved || title
+    ctx.setSessionTitle(next)
+    ctx.pushSystem(`session title set: ${next}${response.pending ? ' (queued while session initializes)' : ''}`)
+  } catch (error) {
+    if (currentSessionIs(ctx, sid, flight)) {
+      ctx.pushSystem(`/title: ${error instanceof Error ? error.message : 'session.title failed'}`)
+    }
+  }
+}
+
+/** `/save` — export the live gateway history rather than the view's capped
+ *  transcript. The local check preserves Ink's no-empty-export UX. */
+const saveCmd: ClientHandler = async (_arg, ctx, flight) => {
+  if (!ctx.hasConversation()) {
+    ctx.pushSystem('no conversation yet')
+    return
+  }
+
+  const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('no active session — nothing to save')
+    return
+  }
+
+  try {
+    const raw = await ctx.request('session.save', { session_id: sid })
+    if (!currentSessionIs(ctx, sid, flight)) return
+    const response = decodeSessionSaveResponse(raw)
+    if (!response) {
+      ctx.pushSystem('/save: invalid session.save response')
+      return
+    }
+    ctx.pushSystem(response.file ? `conversation saved to: ${response.file}` : 'failed to save')
+  } catch (error) {
+    if (currentSessionIs(ctx, sid, flight)) {
+      ctx.pushSystem(`/save: ${error instanceof Error ? error.message : 'session.save failed'}`)
+    }
+  }
+}
+
+/** `/reload` — reload credentials in THIS gateway process, not the detached
+ *  slash worker. */
+const reloadCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const expectedSid = ctx.sessionId()
+  try {
+    const raw = await ctx.request('reload.env', {})
+    if (!currentSessionIs(ctx, expectedSid, flight)) return
+    const response = decodeReloadEnvResponse(raw)
+    if (!response || !Number.isSafeInteger(response.updated) || response.updated < 0) {
+      ctx.pushSystem('/reload: invalid reload.env response')
+      return
+    }
+    ctx.pushSystem(`reloaded .env (${response.updated} ${response.updated === 1 ? 'var' : 'vars'} updated)`)
+  } catch (error) {
+    if (currentSessionIs(ctx, expectedSid, flight)) {
+      ctx.pushSystem(`/reload: ${error instanceof Error ? error.message : 'reload.env failed'}`)
+    }
+  }
+}
+
+/** `/reload-skills` — re-scan in the live gateway, remove confirmed-deleted
+ *  skill names immediately, then hydrate aliases/canonical names without
+ *  dropping dynamically learned plugin commands. */
+const reloadSkillsCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const expectedSid = ctx.sessionId()
+  try {
+    const raw = await ctx.request('skills.reload', {})
+    if (!currentSessionIs(ctx, expectedSid, flight)) return
+    const response = decodeSkillsReloadResponse(raw)
+    if (!response) {
+      ctx.pushSystem('/reload-skills: invalid skills.reload response')
+      return
+    }
+    ctx.openPager('Reload Skills', response.output || 'skills reloaded')
+    const removedSkills = (response.result.removed ?? []).map(skill => skill.name)
+    // Removal is authoritative as soon as skills.reload succeeds. Do not leave
+    // deleted commands highlighted merely because the follow-up catalog refresh
+    // fails; the second call below only adds the refreshed catalog.
+    ctx.refreshCommandCatalog(undefined, removedSkills)
+
+    try {
+      const catalogRaw = await ctx.request('commands.catalog', {})
+      if (!currentSessionIs(ctx, expectedSid, flight)) return
+      const catalog = decodeCommandsCatalogResponse(catalogRaw)
+      if (!catalog) {
+        ctx.pushSystem('warning: skills reloaded, but the command catalog response was invalid')
+        return
+      }
+      ctx.refreshCommandCatalog(catalog, [])
+    } catch (error) {
+      if (currentSessionIs(ctx, expectedSid, flight)) {
+        ctx.pushSystem(
+          `warning: skills reloaded, but command catalog refresh failed: ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    }
+  } catch (error) {
+    if (currentSessionIs(ctx, expectedSid, flight)) {
+      ctx.pushSystem(`/reload-skills: ${error instanceof Error ? error.message : 'skills.reload failed'}`)
+    }
+  }
+}
+
 /**
  * `/tools` — list/status stays on the slash worker; enable/disable must hit the
  * live gateway directly because it resets the active agent. The returned info
@@ -985,8 +1188,12 @@ const CLIENT: Record<string, ClientHandler> = {
   procs: (_arg, ctx) => ctx.openBackgroundPanel(),
   model: modelCmd,
   reasoning: reasoningCmd,
+  reload: reloadCmd,
+  'reload-skills': reloadSkillsCmd,
+  reload_skills: reloadSkillsCmd,
   replay: replayCmd,
   resume: resumeCmd,
+  save: saveCmd,
   session: sessionsCmd,
   sessions: sessionsCmd,
   skills: skillsCmd,
@@ -994,8 +1201,10 @@ const CLIENT: Record<string, ClientHandler> = {
   switch: sessionsCmd,
   tasks: (_arg, ctx) => ctx.openDashboard(),
   timestamps: timestampsCmd,
+  title: titleCmd,
   ts: timestampsCmd,
   tools: toolsCmd,
+  status: statusCmd,
   help: async (_arg, ctx) => {
     // Prefer the live catalog; fall back to the client list if it's unavailable.
     try {
@@ -1083,6 +1292,7 @@ function handleDispatchResult(parsed: ParsedSlash, raw: unknown, ctx: SlashConte
 export async function dispatchSlash(input: string, ctx: SlashContext): Promise<void> {
   const parsed = parseSlash(input)
   if (!parsed) return
+  const flight = claimSlashFlight(ctx)
 
   if (DIAGNOSTIC_COMMANDS.has(parsed.name) && !diagnosticsEnabled()) {
     // Not a secret — an enable switch. Tell the user exactly how to get it.
@@ -1092,13 +1302,14 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
 
   const client = CLIENT[parsed.name]
   if (client) {
-    await client(parsed.arg, ctx)
+    await client(parsed.arg, ctx, flight)
     return
   }
 
   const sid = ctx.sessionId()
   try {
     const result = await ctx.request('slash.exec', { command: input.slice(1), session_id: sid })
+    if (!currentSessionIs(ctx, sid, flight)) return
     // The server's slash.exec routes _PENDING_INPUT_COMMANDS (goal/queue/steer/
     // retry/plan/undo — server.py:10483) to command.dispatch and returns its
     // result DIRECTLY: a {type: 'send'|'exec'|'prefill'|'alias'|...} payload, NOT
@@ -1117,11 +1328,15 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
     // Long output → pager (Ink: >180 chars or >2 non-empty lines), else a system line.
     present(ctx, titleCase(parsed.name), text)
   } catch {
+    if (!currentSessionIs(ctx, sid, flight)) return
     try {
       const raw = await ctx.request('command.dispatch', { arg: parsed.arg, name: parsed.name, session_id: sid })
+      if (!currentSessionIs(ctx, sid, flight)) return
       handleDispatchResult(parsed, raw, ctx)
     } catch (error) {
-      ctx.pushSystem(`error: ${error instanceof Error ? error.message : String(error)}`)
+      if (currentSessionIs(ctx, sid, flight)) {
+        ctx.pushSystem(`error: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
   }
 }
