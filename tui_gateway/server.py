@@ -136,6 +136,15 @@ _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
+# Lock order for process-global MCP mutation is registry transition -> reload
+# admission -> sessions/history. Agent construction and tool reconfiguration
+# take only the first lock, so unrelated live sessions remain responsive while
+# a new agent snapshots the registry.
+_mcp_registry_transition_lock = threading.RLock()
+# Serializes MCP mutation against every transition that claims a session turn.
+# If reload wins, the turn starts after discovery; if a turn wins, the RPC
+# observes running=True and returns 4009 before mutation.
+_mcp_reload_admission_lock = threading.RLock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
@@ -213,6 +222,10 @@ _LONG_HANDLERS = frozenset(
         "learning.frames",
         "plugins.manage",
         "process.list",
+        # Reload tears down and rediscovers process-global MCP transports and
+        # can block on network/process shutdown for seconds. Keep the reader
+        # thread free for interrupt/approval and fast rejection paths.
+        "reload.mcp",
         "projects.discover_repos",
         "projects.record_repos",
         "projects.for_cwd",
@@ -235,6 +248,15 @@ _LONG_HANDLERS = frozenset(
         "shell.exec",
         "skills.manage",
         "slash.exec",
+        # May wait behind an in-flight MCP reload or agent registry snapshot,
+        # then persists config and rebuilds the session agent. Never make the
+        # stdio reader own that latency.
+        "tools.configure",
+        # The startup panel must reflect the active agent's actual callable
+        # schemas, not the global toolset registry. Fresh sessions build that
+        # agent just after session.create returns, so wait on the RPC pool while
+        # keeping the stdio reader free for input/interrupts.
+        "startup.catalog",
     }
 )
 
@@ -407,7 +429,11 @@ def _load_busy_input_mode() -> str:
     if not isinstance(display, dict):
         display = {}
     raw = str(display.get("busy_input_mode", "") or "").strip().lower()
-    return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
+    # Native TUI parity: missing/invalid config queues busy input. The classic
+    # CLI keeps its own interrupt default; applying that here makes a prompt
+    # arriving during a background internal-turn start unexpectedly cancel
+    # the turn before OpenTUI has observed its busy event.
+    return raw if raw in {"queue", "steer", "interrupt"} else "queue"
 
 
 def _notify_session_boundary(
@@ -1246,6 +1272,46 @@ def method(name: str):
     return dec
 
 
+def _serialize_mcp_registry_transition(fn):
+    """Keep config/agent transitions out of process-global MCP mutation."""
+
+    def locked(rid, params):
+        with _mcp_registry_transition_lock:
+            return fn(rid, params)
+
+    return locked
+
+
+def _serialize_mcp_reload(fn):
+    """Hold both registry and turn-admission fences for a complete reload."""
+
+    def locked(rid, params):
+        with _mcp_registry_transition_lock, _mcp_reload_admission_lock:
+            return fn(rid, params)
+
+    return locked
+
+
+@contextlib.contextmanager
+def _try_mcp_turn_admission(session: dict):
+    """Nonblocking prompt claim against the process-global MCP reload fence.
+
+    The prompt RPC runs on the reader thread, so it must never wait behind MCP
+    shutdown/discovery. Internal queue drains may use the blocking lock because
+    they do not own input dispatch responsiveness.
+    """
+
+    acquired = _mcp_reload_admission_lock.acquire(blocking=False)
+    if not acquired:
+        yield False
+        return
+    try:
+        with session["history_lock"]:
+            yield True
+    finally:
+        _mcp_reload_admission_lock.release()
+
+
 def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     """Validate a JSON-RPC request enough for safe local dispatch."""
     if not isinstance(req, dict):
@@ -1408,7 +1474,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
-                agent = _make_agent(sid, key, **kw)
+                agent = _make_agent_with_mcp_registry_fence(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
 
@@ -4470,7 +4536,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             old_reasoning = session.get("create_reasoning_override")
         if isinstance(old_reasoning, dict):
             reset_kw["reasoning_config_override"] = old_reasoning
-        new_agent = _make_agent(
+        new_agent = _make_agent_with_mcp_registry_fence(
             sid,
             session["session_key"],
             session_id=session["session_key"],
@@ -4535,7 +4601,7 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
         # genuinely slow/dead; the user can /reload-mcp once it recovers.
         if not join_mcp_discovery(timeout=30.0):
             return
-        with _sessions_lock:
+        with _mcp_registry_transition_lock, _mcp_reload_admission_lock, _sessions_lock:
             session = _sessions.get(sid)
             # Session may have been closed/reset while we waited.
             if session is None or session.get("agent") is not agent:
@@ -4543,7 +4609,8 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
             # Cache safety: never rebuild the tool list once the conversation
             # has started — that would invalidate the cached prompt prefix.
             if (
-                int(getattr(agent, "_user_turn_count", 0) or 0) > 0
+                session.get("running")
+                or int(getattr(agent, "_user_turn_count", 0) or 0) > 0
                 or int(getattr(agent, "_api_call_count", 0) or 0) > 0
             ):
                 return
@@ -4778,6 +4845,13 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+
+
+def _make_agent_with_mcp_registry_fence(*args, **kwargs):
+    """Build an agent from a stable process-global MCP tool registry."""
+
+    with _mcp_registry_transition_lock:
+        return _make_agent(*args, **kwargs)
 
 
 def _init_session(
@@ -5183,6 +5257,85 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
+_MAX_PENDING_INPUT_CHARS = 4 * 1024 * 1024
+
+
+def _pending_steer_chars(session: dict) -> int:
+    try:
+        return max(0, int(session.get("pending_steer_chars") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pending_input_chars(
+    session: dict,
+    *,
+    extra_queue_text: Any = None,
+    extra_steer_text: Any = None,
+) -> int:
+    """Worst-case queued text if every accepted steer misses the turn."""
+
+    queued = session.get("queued_prompt")
+    queued_text = (
+        queued.get("text")
+        if isinstance(queued, dict) and isinstance(queued.get("text"), str)
+        else ""
+    )
+    total = len(queued_text)
+    if extra_queue_text is not None:
+        incoming = (
+            extra_queue_text
+            if isinstance(extra_queue_text, str)
+            else str(extra_queue_text)
+        )
+        total += len(incoming)
+        if queued_text and incoming:
+            total += 2
+
+    steer_chars = _pending_steer_chars(session)
+    if extra_steer_text is not None:
+        incoming = (
+            extra_steer_text
+            if isinstance(extra_steer_text, str)
+            else str(extra_steer_text)
+        )
+        steer_chars += len(incoming) + (1 if steer_chars and incoming else 0)
+    if steer_chars:
+        total += steer_chars + (2 if total else 0)
+    return total
+
+
+def _pending_input_capacity_allows(
+    session: dict,
+    *,
+    extra_queue_text: Any = None,
+    extra_steer_text: Any = None,
+) -> bool:
+    return (
+        _pending_input_chars(
+            session,
+            extra_queue_text=extra_queue_text,
+            extra_steer_text=extra_steer_text,
+        )
+        <= _MAX_PENDING_INPUT_CHARS
+    )
+
+
+def _accept_steer_locked(session: dict, agent: Any, text: Any) -> bool:
+    """Best-effort steer admission; caller holds the history lock."""
+
+    steer_text = text if isinstance(text, str) else str(text)
+    if not _pending_input_capacity_allows(session, extra_steer_text=steer_text):
+        return False
+    accepted = bool(agent.steer(text))
+    if accepted:
+        existing_chars = _pending_steer_chars(session)
+        session["pending_steer_chars"] = (
+            existing_chars + (1 if existing_chars else 0) + len(steer_text)
+        )
+    return accepted
+
+
 def _start_inflight_turn(session: dict, text: Any) -> None:
     now = time.time()
     session["inflight_turn"] = {
@@ -5211,73 +5364,137 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    front: bool = False,
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
-    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
+    Used when a prompt arrives mid-turn (see _handle_busy_submit). A single
     slot is kept; a second arrival is merged (lossless, mirroring the
-    consecutive-user merge in ``repair_message_sequence``) so nothing the user
-    typed is dropped. ``transport`` is pinned so the drained turn streams back to
-    the client that sent it even if the session transport is rebound meanwhile.
+    consecutive-user merge in repair_message_sequence) so nothing the user
+    typed is dropped. The transport is pinned so the drained turn streams back
+    to the client that sent it even if the session transport is rebound.
     """
+
     existing = session.get("queued_prompt")
+    existing_text = (
+        existing.get("text")
+        if isinstance(existing, dict) and isinstance(existing.get("text"), str)
+        else ""
+    )
+    incoming_text = text if isinstance(text, str) else str(text)
+    merged_chars = len(existing_text) + len(incoming_text)
+    if existing_text and incoming_text:
+        merged_chars += 2
+    if merged_chars > _MAX_PENDING_INPUT_CHARS:
+        # Check before allocating the concatenated string: malformed/legacy
+        # callers must not turn the safety assertion itself into a memory spike.
+        raise OverflowError("queued input text capacity invariant exceeded")
     if (
         existing
         and isinstance(existing.get("text"), str)
         and isinstance(text, str)
     ):
         prev = existing["text"]
-        text = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        if front:
+            text = f"{text}\n\n{prev}" if prev and text else (text or prev)
+        else:
+            text = f"{prev}\n\n{text}" if prev and text else (prev or text)
     session["queued_prompt"] = {"text": text, "transport": transport}
 
 
-def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
-    """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
-    a turn is in flight, instead of rejecting it with ``session busy``.
+def _promote_leftover_steer(
+    session: dict,
+    agent: Any,
+    text: str,
+) -> bool:
+    """Queue a closed-turn steer or restore it to the agent on overflow."""
 
-    The old rejection forced clients into a deadline-bounded busy-retry that
-    silently dropped the send when turn teardown outlived the deadline (e.g. a
-    slow, non-interruptible tool like ``web_search`` running when the user hits
-    stop). The message is instead queued to run as the next turn — and, for the
-    default ``interrupt`` policy, the live turn is interrupted so it winds down
-    promptly. Drained in ``run``'s tail (see ``_run_prompt_submit``).
+    try:
+        _enqueue_prompt(
+            session,
+            text,
+            session.get("transport"),
+            front=True,
+        )
+        return True
+    except OverflowError:
+        lock = getattr(agent, "_pending_steer_lock", None)
+        if lock is not None:
+            with lock:
+                existing = getattr(agent, "_pending_steer", None)
+                agent._pending_steer = f"{text}\n{existing}" if existing else text
+        else:
+            existing = getattr(agent, "_pending_steer", None)
+            agent._pending_steer = f"{text}\n{existing}" if existing else text
+        return False
 
-    Modes: ``interrupt`` (default) → interrupt + queue; ``queue`` → queue
-    without interrupting; ``steer`` → inject into the live turn if accepted,
-    else queue.
+
+def _handle_busy_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+) -> dict:
+    """Apply the busy-input policy to a prompt that lands mid-turn.
+
+    The old rejection forced clients into a deadline-bounded busy retry that
+    silently dropped the send when turn teardown outlived the deadline. The
+    message is queued as the next turn. Explicit interrupt mode interrupts the
+    live turn first; steer mode injects when accepted and otherwise queues.
     """
+
     mode = _load_busy_input_mode()
     agent = session.get("agent")
+    queue_capacity = _pending_input_capacity_allows(
+        session,
+        extra_queue_text=text if isinstance(text, str) else str(text),
+    )
+    steer_capacity = _pending_input_capacity_allows(
+        session,
+        extra_steer_text=text if isinstance(text, str) else str(text),
+    )
+    if not queue_capacity or (mode == "steer" and not steer_capacity):
+        return _err(
+            rid,
+            4009,
+            "pending input text capacity reached — retry after the current turn",
+        )
     if mode == "steer" and agent is not None and hasattr(agent, "steer"):
         try:
-            if agent.steer(text):
+            if _accept_steer_locked(session, agent, text):
                 session["last_active"] = time.time()
                 return _ok(rid, {"status": "steered"})
         except Exception:
-            pass  # fall through to queue
+            pass
     if mode != "queue" and agent is not None and hasattr(agent, "interrupt"):
         try:
             agent.interrupt()
         except Exception:
             pass
-    _enqueue_prompt(session, text, transport)
+    try:
+        _enqueue_prompt(session, text, transport)
+    except OverflowError as exc:
+        return _err(rid, 4009, str(exc))
     session["last_active"] = time.time()
     return _ok(rid, {"status": "queued"})
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
-    """Fire a queued next-turn prompt if one is waiting and the session is idle.
+    """Fire a queued next-turn prompt if one is waiting and the session is idle."""
 
-    Returns True if a queued prompt was dispatched (the caller should then skip
-    lower-priority follow-ups this cycle — the user's message wins). Mirrors the
-    claim-under-lock pattern used by the goal-continuation re-fire.
-    """
-    with session["history_lock"]:
+    with _mcp_reload_admission_lock, session["history_lock"]:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False
         session["queued_prompt"] = None
         session["running"] = True
+        session["_turn_cancel_requested"] = False
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     try:
@@ -5290,6 +5507,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+            _clear_inflight_turn(session)
     return True
 
 
@@ -6171,7 +6389,7 @@ def _(rid, params: dict) -> dict:
             # stored session row so switching chats does not inherit whatever
             # global model another chat last selected.
             stored_runtime_overrides = _stored_session_runtime_overrides(found)
-            agent = _make_agent(
+            agent = _make_agent_with_mcp_registry_fence(
                 sid,
                 target,
                 session_id=target,
@@ -8459,7 +8677,7 @@ def _(rid, params: dict) -> dict:
     try:
         tokens = _set_session_context(new_key)
         try:
-            agent = _make_agent(
+            agent = _make_agent_with_mcp_registry_fence(
                 new_sid,
                 new_key,
                 session_id=new_key,
@@ -8498,12 +8716,12 @@ def _(rid, params: dict) -> dict:
     # entry. This keeps a stale/missing thread handle from making Stop a no-op.
     run_thread = session.get("_run_thread")
     run_thread_alive = run_thread is not None and run_thread.is_alive()
-    should_interrupt = bool(session.get("running"))
-    if should_interrupt and hasattr(session["agent"], "interrupt"):
-        session["agent"].interrupt()
     with session["history_lock"]:
+        should_interrupt = bool(session.get("running"))
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
+    if should_interrupt and hasattr(session["agent"], "interrupt"):
+        session["agent"].interrupt()
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):
@@ -8774,13 +8992,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.steer")
 def _(rid, params: dict) -> dict:
-    """Inject a user message into the next tool result without interrupting.
+    """Inject a user message into the next tool result without interrupting."""
 
-    Mirrors AIAgent.steer(). Safe to call while a turn is running — the text
-    lands on the last tool result of the next tool batch and the model sees
-    it on its next iteration. No interrupt, no new user turn, no role
-    alternation violation.
-    """
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
@@ -8791,7 +9004,8 @@ def _(rid, params: dict) -> dict:
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
     try:
-        accepted = agent.steer(text)
+        with session["history_lock"]:
+            accepted = _accept_steer_locked(session, agent, text)
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
     return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
@@ -8821,7 +9035,13 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
-    with session["history_lock"]:
+    with _try_mcp_turn_admission(session) as admitted:
+        if not admitted:
+            return _err(
+                rid,
+                4009,
+                "MCP reload in progress — retry the prompt when it finishes",
+            )
         if session.get("_tools_configuring"):
             return _err(
                 rid,
@@ -8833,7 +9053,13 @@ def _(rid, params: dict) -> dict:
             # interrupt the live turn) so it runs as the next turn. See
             # _handle_busy_submit for why the old "session busy" rejection
             # dropped messages when teardown outlived the client's retry window.
-            return _handle_busy_submit(rid, sid, session, text, t or session.get("transport"))
+            return _handle_busy_submit(
+                rid,
+                sid,
+                session,
+                text,
+                t or session.get("transport"),
+            )
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -8878,6 +9104,16 @@ def _(rid, params: dict) -> dict:
     def run_after_agent_ready() -> None:
         err = _wait_agent(session, rid)
         if err:
+            # Settle server state BEFORE publishing the error. The full-screen
+            # clients may immediately drain one locally queued prompt when they
+            # receive this terminal event; emitting first races that submit
+            # against running=True and leaves the queue stranded. Do not emit a
+            # trailing session.info(false): the client may already have started its next
+            # queued turn from the terminal error, and a stale idle snapshot
+            # would clear that new optimistic busy flag before message.start.
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
             _emit(
                 "error",
                 sid,
@@ -8887,9 +9123,6 @@ def _(rid, params: dict) -> dict:
                     )
                 },
             )
-            with session["history_lock"]:
-                session["running"] = False
-                _clear_inflight_turn(session)
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
@@ -9176,7 +9409,7 @@ def _notification_poller_loop(
             _emitted.add(_dedup_key)
 
         _requeued = False
-        with session["history_lock"]:
+        with _mcp_reload_admission_lock, session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
@@ -9242,7 +9475,7 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        with session["history_lock"]:
+        with _mcp_reload_admission_lock, session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
@@ -9332,20 +9565,29 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 
 
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+    agent = session["agent"]
     with session["history_lock"]:
+        # Claim start atomically against session.interrupt. The start event is
+        # written while holding the same lock, so the interrupt response can
+        # never overtake it on the wire; clients flush start events before
+        # resolving a later interrupt response.
+        if session.get("_turn_cancel_requested") or not session.get("running"):
+            session["_turn_cancel_requested"] = False
+            session["running"] = False
+            _clear_inflight_turn(session)
+            return
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
         session["attached_images"] = []
         if not isinstance(session.get("inflight_turn"), dict):
             _start_inflight_turn(session, text)
-    agent = session["agent"]
-    if hasattr(agent, "clear_interrupt"):
-        try:
-            agent.clear_interrupt()
-        except Exception:
-            pass
-    _emit("message.start", sid)
+        if hasattr(agent, "clear_interrupt"):
+            try:
+                agent.clear_interrupt()
+            except Exception:
+                pass
+        _emit("message.start", sid)
 
     def run():
         approval_token = None
@@ -9538,14 +9780,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
                         else:
-                            # History mutated externally during the turn
-                            # (undo/compress/retry/rollback now guard on
-                            # session.running, but this is the defensive
-                            # backstop for any path that slips past).
-                            # Surface the desync rather than silently
-                            # dropping the agent's output — the UI can
-                            # show the response and warn that it was
-                            # not persisted.
+                            # History mutated externally during the turn. Surface
+                            # the desync rather than silently dropping the output.
                             print(
                                 f"[tui_gateway] prompt.submit: history_version mismatch "
                                 f"(expected={history_version} current={current_version}) — "
@@ -9600,10 +9836,39 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
+            leftover_steer = (
+                result.get("pending_steer")
+                if isinstance(result, dict)
+                and isinstance(result.get("pending_steer"), str)
+                else None
+            )
+            leftover_steer_retained = False
             with session["history_lock"]:
                 _clear_inflight_turn(session)
+                if leftover_steer:
+                    # The atomic core close proved this text arrived after the
+                    # last injectable tool boundary.  Preserve its earlier user
+                    # ordering ahead of any later queued prompt and let the
+                    # normal post-finally drain deliver one strict user turn.
+                    leftover_steer_retained = not _promote_leftover_steer(
+                        session,
+                        agent,
+                        leftover_steer,
+                    )
+                if not leftover_steer_retained:
+                    session["pending_steer_chars"] = 0
+            if leftover_steer_retained:
+                _emit(
+                    "error",
+                    sid,
+                    {
+                        "message": (
+                            "accepted steer retained in the agent because the "
+                            "next-turn queue is at its 4 MiB safety limit"
+                        )
+                    },
+                )
             _emit("message.complete", sid, payload)
-
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
             # whether the goal is done and — if not and we're still under
@@ -9755,7 +10020,40 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
-            _emit("error", sid, {"message": str(e)})
+            # AIAgent's outer steer phase closes even when run_conversation
+            # raises and leaves the claimed text in its closed pending slot.
+            # Promote it before clearing running so the normal drain owns it.
+            try:
+                drain_steer = getattr(agent, "_drain_pending_steer", None)
+                leftover_steer = drain_steer() if callable(drain_steer) else None
+            except Exception:
+                leftover_steer = None
+            leftover_steer_retained = False
+            with session["history_lock"]:
+                if leftover_steer:
+                    leftover_steer_retained = not _promote_leftover_steer(
+                        session,
+                        agent,
+                        leftover_steer,
+                    )
+                if not leftover_steer_retained:
+                    session["pending_steer_chars"] = 0
+            if leftover_steer_retained:
+                _emit(
+                    "error",
+                    sid,
+                    {
+                        "message": (
+                            "accepted steer retained after the turn crash because "
+                            "the next-turn queue is at its 4 MiB safety limit"
+                        )
+                    },
+                )
+            _emit(
+                "error",
+                sid,
+                {"message": str(e)},
+            )
         finally:
             try:
                 if approval_token is not None:
@@ -9784,7 +10082,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
         if goal_followup:
-            with session["history_lock"]:
+            with _mcp_reload_admission_lock, session["history_lock"]:
                 if session.get("running"):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
@@ -9818,7 +10116,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session_key=session.get("session_key", ""),
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
             ):
-                with session["history_lock"]:
+                with _mcp_reload_admission_lock, session["history_lock"]:
                     if session.get("running"):
                         process_registry.completion_queue.put(_evt)
                         break
@@ -11949,8 +12247,24 @@ def _(rid, params: dict) -> dict:
 
 
 @method("reload.mcp")
+@_serialize_mcp_reload
 def _(rid, params: dict) -> dict:
-    session = _sessions.get(params.get("session_id", ""))
+    requested_sid = str(params.get("session_id", "") or "")
+    with _sessions_lock:
+        session = _sessions.get(requested_sid)
+        busy_sid = next(
+            (sid for sid, live in _sessions.items() if live.get("running")), None
+        )
+    if busy_sid is not None:
+        # MCP transports and the tool registry are process-global. Even an idle
+        # requesting session must not tear them down while another live turn is
+        # reading its cached tool snapshot. Keep this guard before confirmation
+        # config reads and, critically, before shutdown/discovery mutate globals.
+        return _err(
+            rid,
+            4009,
+            "session busy — wait for every live turn to finish before reloading MCP",
+        )
     try:
         # Gate: /reload-mcp invalidates the prompt cache for this session.
         # Respect the ``approvals.mcp_reload_confirm`` config toggle — if
@@ -12019,7 +12333,7 @@ def _(rid, params: dict) -> dict:
                 )
             _emit(
                 "session.info",
-                params.get("session_id", ""),
+                requested_sid,
                 _session_info(agent, session),
             )
 
@@ -13458,19 +13772,11 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     # with the session.compress / session.undo guards and the gateway
     # runner's running-agent /model guard.
     #
-    # reload-mcp belongs here too: the branch mirrors the reload.mcp RPC's
-    # FULL sequence — shutdown_mcp_servers() → discover_mcp_tools() →
-    # refresh_agent_mcp_tools() — which mutates the process-global tool
-    # registry and then rebuilds agent.tools (+ valid_tool_names) from it.
-    # That tools[] array IS the request prefix the worker thread is sending
-    # mid-turn.  Mutating it while a turn is in flight both races the
-    # worker's snapshot read and invalidates the cached prompt prefix (see
-    # AGENTS.md / the MCP tool-snapshot architecture: tool schemas ride in
-    # `tools=`, which is part of the cached request prefix).  The dedicated
-    # reload.mcp RPC gates the same hazard behind explicit user consent + a
-    # prompt-cache warning; the slash mirror gates it via the busy guard
-    # (which also guarantees the shutdown/discover/rebuild only runs at idle).
-    _MUTATES_WHILE_RUNNING = {"model", "personality", "prompt", "compress", "reload-mcp"}
+    # reload-mcp is handled separately below because its mutation is
+    # process-global, not session-local. Its busy check must happen while
+    # holding _mcp_reload_admission_lock and must inspect every live session;
+    # checking only this session here leaves a TOCTOU race with prompt.submit.
+    _MUTATES_WHILE_RUNNING = {"model", "personality", "prompt", "compress"}
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return f"session busy — /interrupt the current turn before running /{name}"
 
@@ -13606,10 +13912,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             # Mirrors the reload.mcp RPC at ~L8957-8978.
             #
             # Local try/except + logger.warning (like the RPC) so a failure here
-            # doesn't abort other mirrored side effects.  Note: the
-            # _MUTATES_WHILE_RUNNING guard above already rejected this command
-            # mid-turn, so the shutdown/discover/rebuild here only ever runs at
-            # an idle (cache-safe) moment.
+            # doesn't abort other mirrored side effects.
             #
             # CONFIRM-GATE DIVERGENCE (intentional, flagged for review): the
             # reload.mcp RPC gates the reload behind a confirm prompt
@@ -13618,26 +13921,58 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             # mirror does NOT round-trip a second confirm.  Rationale: this path
             # is the slash.exec fallback and the user explicitly typed
             # /reload-mcp, so proceeding is acceptable for now — and the
-            # _MUTATES_WHILE_RUNNING busy-guard is the fork's equivalent gate
-            # for the mid-turn cache hazard.  Flagged so a controller/human can
-            # decide whether to add a full confirm round-trip here later.
+            # shared admission fence + all-session busy guard still protect the
+            # mid-turn cache hazard. Flagged so a controller/human can decide
+            # whether to add a full confirm round-trip here later.
             try:
-                from tools.mcp_tool import (
-                    discover_mcp_tools,
-                    refresh_agent_mcp_tools,
-                    shutdown_mcp_servers,
-                )
+                # Use the same admission fence as reload.mcp. Whichever side
+                # wins is deterministic:
+                #   * a prompt that claims a turn first sets running=True, so
+                #     this path returns busy before touching global MCP state;
+                #   * a reload that claims the fence first makes a concurrent
+                #     prompt fail fast with the explicit MCP-reload 4009.
+                # Re-check ALL sessions after acquiring the fence. MCP
+                # transports and the tool registry are process-global, so an
+                # idle slash session cannot reload around another session's
+                # active turn.
+                with _mcp_registry_transition_lock, _mcp_reload_admission_lock:
+                    with _sessions_lock:
+                        busy_sid = next(
+                            (
+                                live_sid
+                                for live_sid, live in _sessions.items()
+                                if live.get("running")
+                            ),
+                            None,
+                        )
+                        # Direct unit callers can supply a detached session;
+                        # keep the same safety invariant for that case too.
+                        detached_request_busy = (
+                            session.get("running")
+                            and _sessions.get(sid) is not session
+                        )
+                    if busy_sid is not None or detached_request_busy:
+                        return (
+                            "session busy — wait for every live turn to finish "
+                            "before reloading MCP"
+                        )
 
-                # Mutate the gateway-process registry FIRST (RPC L8959-8960)...
-                shutdown_mcp_servers()
-                discover_mcp_tools()
-                # ...then rebuild the live agent's snapshot from it.
-                refresh_agent_mcp_tools(
-                    agent,
-                    enabled_override=_load_enabled_toolsets(),
-                    quiet_mode=True,
-                )
-                _emit("session.info", sid, _session_info(agent, session))
+                    from tools.mcp_tool import (
+                        discover_mcp_tools,
+                        refresh_agent_mcp_tools,
+                        shutdown_mcp_servers,
+                    )
+
+                    # Mutate the gateway-process registry FIRST, then rebuild
+                    # the requesting live agent's frozen snapshot from it.
+                    shutdown_mcp_servers()
+                    discover_mcp_tools()
+                    refresh_agent_mcp_tools(
+                        agent,
+                        enabled_override=_load_enabled_toolsets(),
+                        quiet_mode=True,
+                    )
+                    _emit("session.info", sid, _session_info(agent, session))
             except Exception as _exc:
                 logger.warning(
                     "Failed to refresh live agent tools after /reload-mcp: %s",
@@ -14472,37 +14807,126 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5031, str(e))
 
 
+def _startup_tool_catalog(definitions) -> dict:
+    """Group actual callable schemas for the native startup panel.
+
+    A tool may be referenced by several convenience toolsets, so summing
+    get_all_toolsets() metadata double-counts it and can expose disabled
+    families when an agent's configured toolset list is empty. Ink renders
+    agent.tools instead; keep the OpenTUI producer on that same authority and
+    deduplicate defensively by callable name.
+    """
+    from model_tools import get_toolset_for_tool
+
+    grouped: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for definition in definitions or []:
+        if not isinstance(definition, dict):
+            continue
+        function = definition.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        group = str(get_toolset_for_tool(name) or "other")
+        grouped.setdefault(group, []).append(name)
+
+    return {
+        "total": len(seen),
+        "toolsets": [
+            {
+                "name": group,
+                "count": len(names),
+                "enabled": True,
+                "tools": sorted(names),
+            }
+            for group, names in sorted(grouped.items())
+        ],
+    }
+
+
 @method("startup.catalog")
 def _(rid, params: dict) -> dict:
     # Aggregate tools / skills / MCP servers for the native engine's startup panel
     # (item 9). Opt-in RPC — only the opentui home screen calls it, so the Ink path
-    # is untouched. Each section is best-effort: a failing source yields an empty
-    # section rather than erroring the whole call.
+    # is untouched. Skills/MCP remain best-effort, but active-agent readiness is
+    # authoritative: a timeout/failure must be distinguishable from a real
+    # zero-tool agent so the client can warn and retry only the still-pending case.
     tools: dict = {"total": 0, "toolsets": []}
+    readiness: dict = {"status": "ready"}
     try:
-        from toolsets import get_all_toolsets, get_toolset_info
+        session_id = str(params.get("session_id") or "")
+        session = _sessions.get(session_id)
+        if session is not None:
+            # Fresh create/resume is intentionally deferred. Join that one
+            # authoritative build here (this method runs in _LONG_HANDLERS) so
+            # the panel cannot race an empty agent then fall back to every
+            # globally registered toolset.
+            active_session = session
+            session, err = _sess({"session_id": session_id}, rid)
+            if err:
+                error = err.get("error") if isinstance(err, dict) else None
+                error = error if isinstance(error, dict) else {}
+                message = str(error.get("message") or "agent initialization failed")
+                ready = active_session.get("agent_ready")
+                agent = active_session.get("agent")
+                # Close the timeout-boundary race: the build can settle between
+                # _wait_agent's timed wait and this worker inspecting the result.
+                if (
+                    ready is not None
+                    and ready.is_set()
+                    and agent is not None
+                    and not active_session.get("agent_error")
+                ):
+                    definitions = getattr(agent, "tools", [])
+                    err = None
+                still_pending = (
+                    err is not None
+                    and error.get("code") == 5032
+                    and ready is not None
+                    and not ready.is_set()
+                    and not active_session.get("agent_error")
+                )
+                if err is not None:
+                    readiness = {
+                        "status": "pending" if still_pending else "failed",
+                        "warning": (
+                            f"tool catalog pending: {message}; retrying after agent readiness"
+                            if still_pending
+                            else f"tool catalog unavailable: {message}"
+                        ),
+                    }
+                    if still_pending:
+                        readiness["retry_after_ms"] = 1000
+                    definitions = []
+            else:
+                agent = session.get("agent") if session is not None else None
+                if agent is None:
+                    readiness = {
+                        "status": "failed",
+                        "warning": "tool catalog unavailable: agent initialization returned no agent",
+                    }
+                    definitions = []
+                else:
+                    definitions = getattr(agent, "tools", [])
+        else:
+            # Isolated/demo callers without a live session still receive the
+            # configured, availability-filtered tool schemas. This is the only
+            # fallback: an active session never substitutes global state for its
+            # own agent/profile authority.
+            from model_tools import get_tool_definitions
 
-        # enabled toolsets for THIS session (or the config default), mirroring tools.list
-        session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            set(getattr(session["agent"], "enabled_toolsets", []) or [])
-            if session
-            else set(_load_enabled_toolsets() or [])
-        )
-        for name in sorted(get_all_toolsets().keys()):
-            info = get_toolset_info(name)
-            if not info:
-                continue
-            is_on = name in enabled if enabled else True
-            # the startup panel lists ENABLED toolsets with their tools (Ink parity)
-            tool_names = [str(t) for t in (info.get("resolved_tools") or [])]
-            tools["toolsets"].append(
-                {"name": name, "count": int(info["tool_count"]), "enabled": is_on, "tools": tool_names}
+            definitions = get_tool_definitions(
+                enabled_toolsets=_load_enabled_toolsets(), quiet_mode=True
             )
-            if is_on:
-                tools["total"] += int(info["tool_count"])
-    except Exception:
-        pass
+        tools = _startup_tool_catalog(definitions)
+    except Exception as exc:
+        readiness = {
+            "status": "failed",
+            "warning": f"tool catalog unavailable: {exc}",
+        }
 
     skills: dict = {"total": 0, "categories": []}
     try:
@@ -14530,7 +14954,15 @@ def _(rid, params: dict) -> dict:
     except Exception:
         pass
 
-    return _ok(rid, {"tools": tools, "skills": skills, "mcp": {"servers": sorted(mcp_servers)}})
+    return _ok(
+        rid,
+        {
+            "tools": tools,
+            "skills": skills,
+            "mcp": {"servers": sorted(mcp_servers)},
+            "readiness": readiness,
+        },
+    )
 
 
 @method("tools.show")
@@ -14574,6 +15006,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("tools.configure")
+@_serialize_mcp_registry_transition
 def _(rid, params: dict) -> dict:
     action = str(params.get("action", "") or "").strip().lower()
     targets = [

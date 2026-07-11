@@ -7,7 +7,6 @@ import time
 import types
 from datetime import datetime
 from pathlib import Path
-import pytest
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +15,364 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
+
+
+def test_exact_once_recovery_rpcs_are_not_registered():
+    assert "prompt.status" not in server._methods
+    assert "session.retry" not in server._methods
+
+
+def _startup_tool_schema(name: str) -> dict:
+    return {"type": "function", "function": {"name": name}}
+
+
+def test_startup_catalog_uses_actual_active_agent_tools(monkeypatch):
+    import model_tools
+
+    sid = "catalog-active-tools"
+    ready = threading.Event()
+    ready.set()
+    previous = server._sessions.get(sid)
+    server._sessions[sid] = {
+        "agent": types.SimpleNamespace(
+            enabled_toolsets=[],
+            tools=[
+                _startup_tool_schema("beta"),
+                _startup_tool_schema("alpha"),
+                _startup_tool_schema("alpha"),
+                {"function": {}},
+                None,
+            ],
+        ),
+        "agent_error": None,
+        "agent_ready": ready,
+        "session_key": "catalog-active-key",
+    }
+    monkeypatch.setattr(
+        model_tools,
+        "get_toolset_for_tool",
+        lambda name: {"alpha": "core", "beta": "file"}[name],
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: pytest.fail(
+            "an active session must not substitute configured/global definitions"
+        ),
+    )
+
+    try:
+        result = server._methods["startup.catalog"](
+            "catalog-active", {"session_id": sid}
+        )["result"]["tools"]
+    finally:
+        if previous is None:
+            server._sessions.pop(sid, None)
+        else:
+            server._sessions[sid] = previous
+
+    assert result == {
+        "total": 2,
+        "toolsets": [
+            {
+                "name": "core",
+                "count": 1,
+                "enabled": True,
+                "tools": ["alpha"],
+            },
+            {
+                "name": "file",
+                "count": 1,
+                "enabled": True,
+                "tools": ["beta"],
+            },
+        ],
+    }
+
+
+def test_startup_catalog_joins_deferred_active_agent_build(monkeypatch):
+    import model_tools
+
+    sid = "catalog-deferred-tools"
+    ready = threading.Event()
+    previous = server._sessions.get(sid)
+    session = {
+        "agent": None,
+        "agent_error": None,
+        "agent_ready": ready,
+        "session_key": "catalog-deferred-key",
+    }
+    server._sessions[sid] = session
+
+    def build(request_sid, current):
+        assert request_sid == sid
+        assert current is session
+        current["agent"] = types.SimpleNamespace(
+            tools=[_startup_tool_schema("terminal")]
+        )
+        ready.set()
+
+    monkeypatch.setattr(server, "_start_agent_build", build)
+    monkeypatch.setattr(
+        model_tools, "get_toolset_for_tool", lambda _name: "terminal"
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: pytest.fail(
+            "a deferred active session must join its own agent build"
+        ),
+    )
+
+    try:
+        result = server._methods["startup.catalog"](
+            "catalog-deferred", {"session_id": sid}
+        )["result"]["tools"]
+    finally:
+        if previous is None:
+            server._sessions.pop(sid, None)
+        else:
+            server._sessions[sid] = previous
+
+    assert "startup.catalog" in server._LONG_HANDLERS
+    assert result == {
+        "total": 1,
+        "toolsets": [
+            {
+                "name": "terminal",
+                "count": 1,
+                "enabled": True,
+                "tools": ["terminal"],
+            }
+        ],
+    }
+
+
+def test_startup_catalog_no_session_uses_configured_available_definitions(
+    monkeypatch,
+):
+    import model_tools
+
+    calls = []
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["terminal"])
+
+    def definitions(*, enabled_toolsets, quiet_mode):
+        calls.append((enabled_toolsets, quiet_mode))
+        return [
+            _startup_tool_schema("zeta"),
+            _startup_tool_schema("alpha"),
+            _startup_tool_schema("zeta"),
+        ]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", definitions)
+    monkeypatch.setattr(
+        model_tools, "get_toolset_for_tool", lambda _name: "terminal"
+    )
+
+    result = server._methods["startup.catalog"](
+        "catalog-fallback", {"session_id": "not-a-live-session"}
+    )["result"]["tools"]
+
+    assert calls == [(["terminal"], True)]
+    assert result == {
+        "total": 2,
+        "toolsets": [
+            {
+                "name": "terminal",
+                "count": 2,
+                "enabled": True,
+                "tools": ["alpha", "zeta"],
+            }
+        ],
+    }
+
+
+def test_startup_catalog_marks_timeout_pending_then_refreshes_from_ready_agent(
+    monkeypatch,
+):
+    import model_tools
+
+    sid = "catalog-late-agent"
+    ready = threading.Event()
+    previous = server._sessions.get(sid)
+    session = {
+        "agent": None,
+        "agent_error": None,
+        "agent_ready": ready,
+        "session_key": "catalog-late-key",
+    }
+    server._sessions[sid] = session
+    calls = 0
+
+    def deferred_then_ready(_params, rid):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return session, server._err(rid, 5032, "agent initialization timed out")
+        session["agent"] = types.SimpleNamespace(
+            tools=[_startup_tool_schema("terminal")]
+        )
+        ready.set()
+        return session, None
+
+    monkeypatch.setattr(server, "_sess", deferred_then_ready)
+    monkeypatch.setattr(
+        model_tools, "get_toolset_for_tool", lambda _name: "terminal"
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: pytest.fail(
+            "an active session must not substitute configured/global definitions"
+        ),
+    )
+
+    try:
+        pending = server._methods["startup.catalog"](
+            "catalog-pending", {"session_id": sid}
+        )["result"]
+        refreshed = server._methods["startup.catalog"](
+            "catalog-refreshed", {"session_id": sid}
+        )["result"]
+    finally:
+        if previous is None:
+            server._sessions.pop(sid, None)
+        else:
+            server._sessions[sid] = previous
+
+    assert pending["tools"] == {"total": 0, "toolsets": []}
+    assert pending["readiness"] == {
+        "status": "pending",
+        "warning": (
+            "tool catalog pending: agent initialization timed out; "
+            "retrying after agent readiness"
+        ),
+        "retry_after_ms": 1000,
+    }
+    assert refreshed["readiness"] == {"status": "ready"}
+    assert refreshed["tools"] == {
+        "total": 1,
+        "toolsets": [
+            {
+                "name": "terminal",
+                "count": 1,
+                "enabled": True,
+                "tools": ["terminal"],
+            }
+        ],
+    }
+
+
+def test_startup_catalog_marks_agent_failure_non_retryable(monkeypatch):
+    import model_tools
+
+    sid = "catalog-failed-agent"
+    ready = threading.Event()
+    ready.set()
+    previous = server._sessions.get(sid)
+    session = {
+        "agent": None,
+        "agent_error": "provider configuration invalid",
+        "agent_ready": ready,
+        "session_key": "catalog-failed-key",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_sess",
+        lambda _params, rid: (
+            session,
+            server._err(rid, 5032, "provider configuration invalid"),
+        ),
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: pytest.fail(
+            "a failed active session must not substitute global definitions"
+        ),
+    )
+
+    try:
+        result = server._methods["startup.catalog"](
+            "catalog-failed", {"session_id": sid}
+        )["result"]
+    finally:
+        if previous is None:
+            server._sessions.pop(sid, None)
+        else:
+            server._sessions[sid] = previous
+
+    assert result["tools"] == {"total": 0, "toolsets": []}
+    assert result["readiness"] == {
+        "status": "failed",
+        "warning": "tool catalog unavailable: provider configuration invalid",
+    }
+
+
+def test_startup_catalog_recovers_when_agent_settles_at_timeout_boundary(monkeypatch):
+    import model_tools
+
+    sid = "catalog-timeout-boundary"
+    ready = threading.Event()
+    ready.set()
+    previous = server._sessions.get(sid)
+    session = {
+        "agent": types.SimpleNamespace(tools=[_startup_tool_schema("terminal")]),
+        "agent_error": None,
+        "agent_ready": ready,
+        "session_key": "catalog-boundary-key",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_sess",
+        lambda _params, rid: (
+            session,
+            server._err(rid, 5032, "agent initialization timed out"),
+        ),
+    )
+    monkeypatch.setattr(
+        model_tools, "get_toolset_for_tool", lambda _name: "terminal"
+    )
+
+    try:
+        result = server._methods["startup.catalog"](
+            "catalog-boundary", {"session_id": sid}
+        )["result"]
+    finally:
+        if previous is None:
+            server._sessions.pop(sid, None)
+        else:
+            server._sessions[sid] = previous
+
+    assert result["readiness"] == {"status": "ready"}
+    assert result["tools"]["total"] == 1
+
+
+def test_session_create_retry_is_best_effort_not_idempotent(monkeypatch):
+    previous_sessions = dict(server._sessions)
+    server._sessions.clear()
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot",
+        lambda *_args, **_kwargs: (None, None),
+    )
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    params = {"cols": 80, "idempotency_key": "legacy-recovery-token"}
+    try:
+        first = server._methods["session.create"]("r1", params)
+        retry = server._methods["session.create"]("r2", params)
+    finally:
+        created = list(server._sessions.values())
+        server._sessions.clear()
+        server._sessions.update(previous_sessions)
+        for session in created:
+            server._teardown_session(session)
+
+    assert first["result"]["session_id"] != retry["result"]["session_id"]
 
 
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
@@ -60,6 +417,8 @@ def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
         server._cfg_mtime = None
         server._cfg_path = None
         reset_hermes_home_override(token)
+
+
 
 
 def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
@@ -2051,6 +2410,10 @@ def _session(agent=None, **extra):
     }
 
 
+
+
+
+
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     calls = {"hooks": []}
 
@@ -3206,7 +3569,9 @@ def test_config_get_busy_survives_non_dict_display(monkeypatch):
         {"id": "1", "method": "config.get", "params": {"key": "busy"}}
     )
 
-    assert resp["result"]["value"] == "interrupt"
+    # Full-screen TUI parity deliberately defaults malformed/missing display
+    # config to queue; classic CLI keeps its separate interrupt default.
+    assert resp["result"]["value"] == "queue"
 
 
 def test_config_set_statusbar_survives_non_dict_display(tmp_path, monkeypatch):
@@ -4979,6 +5344,7 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
     assert "interrupt_called" not in calls  # must NOT interrupt
 
 
+
 def test_session_steer_rejects_empty_text():
     server._sessions["sid"] = _session(
         agent=types.SimpleNamespace(steer=lambda t: True)
@@ -4998,8 +5364,10 @@ def test_session_steer_rejects_empty_text():
     assert resp["error"]["code"] == 4002
 
 
+
+
 def test_session_steer_errors_when_agent_has_no_steer_method():
-    server._sessions["sid"] = _session(agent=types.SimpleNamespace())  # no steer()
+    server._sessions["sid"] = _session(agent=types.SimpleNamespace(), running=True)  # no steer()
     try:
         resp = server.handle_request(
             {
@@ -5013,6 +5381,10 @@ def test_session_steer_errors_when_agent_has_no_steer_method():
 
     assert "error" in resp, resp
     assert resp["error"]["code"] == 4010
+
+
+
+
 
 
 def test_session_info_includes_mcp_servers(monkeypatch):
@@ -6577,7 +6949,10 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
             {
                 "id": "1",
                 "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "Tell me about Rome"},
+                "params": {
+                    "session_id": "sid",
+                    "text": "Tell me about Rome",
+                },
             }
         )
 
@@ -6589,6 +6964,7 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     callback = mock_title.call_args.kwargs["title_callback"]
     callback("Rome in Brief")
     assert refreshed == ["sid"]
+    assert ("message.start", "sid") in emitted
     assert (
         "session.title",
         "sid",
@@ -6704,6 +7080,205 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     assert payload.get("status") == "error"
     assert payload.get("text", "").startswith("Error:")
     assert "kimi-k2.6" in payload.get("text", "")
+
+
+def test_prompt_submit_clears_running_before_deferred_init_error(monkeypatch):
+    """A pre-message.start init failure is a terminal settle event.
+
+    The server must clear running before publishing ``error`` so a TUI can
+    safely drain its bounded local queue from that event. A trailing stale
+    ``session.info(false)`` would race the next optimistic submission, so this
+    path intentionally emits no such snapshot.
+    """
+
+    session = _session(agent=None)
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        server,
+        "_wait_agent",
+        lambda *_a, **_kw: {"error": {"message": "agent init failed"}},
+    )
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a, **_kw: None)
+
+    emitted: list[tuple[str, bool, dict]] = []
+
+    def _capture(event, _sid, payload=None):
+        emitted.append((event, bool(session.get("running")), payload or {}))
+
+    monkeypatch.setattr(server, "_emit", _capture)
+    response = server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {
+                "session_id": "sid",
+                "text": "hello",
+            },
+        }
+    )
+
+    assert response.get("result", {}).get("status") == "streaming"
+    assert ("error", False, {"message": "agent init failed"}) in emitted
+    assert not any(event == "session.info" for event, _running, _payload in emitted)
+    assert session["running"] is False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_prompt_submit_promotes_leftover_steer_into_fallback_slot(monkeypatch):
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "done",
+                "messages": [],
+                "pending_steer": "arrived after final tool",
+            }
+
+    session = _session(agent=_Agent())
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    drained = []
+    monkeypatch.setattr(
+        server,
+        "_drain_queued_prompt",
+        lambda _rid, _sid, current: drained.append(current.get("queued_prompt"))
+        or True,
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "active turn"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert drained == [
+        {"text": "arrived after final tool", "transport": None}
+    ]
+
+
+def test_prompt_submit_exception_promotes_pending_steer(monkeypatch):
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            raise RuntimeError("child crashed after steer admission")
+
+        def _drain_pending_steer(self):
+            return "accepted before crash"
+
+    session = _session(agent=_Agent())
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    drained = []
+    monkeypatch.setattr(
+        server,
+        "_drain_queued_prompt",
+        lambda _rid, _sid, current: drained.append(current.get("queued_prompt"))
+        or True,
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "active turn"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert drained == [
+        {"text": "accepted before crash", "transport": None}
+    ]
+
+
+def test_prompt_submit_reports_leftover_retained_when_queue_is_full(monkeypatch):
+    class _Agent:
+        def __init__(self):
+            self._pending_steer = None
+            self._pending_steer_lock = threading.Lock()
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "done",
+                "messages": [],
+                "pending_steer": "late",
+            }
+
+    monkeypatch.setattr(server, "_MAX_PENDING_INPUT_CHARS", 16)
+    agent = _Agent()
+    session = _session(
+        agent=agent,
+        queued_prompt={"text": "x" * 16, "transport": None},
+    )
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args: True)
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "active turn"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    retained_error = next(
+        payload
+        for event, _sid, payload in emitted
+        if event == "error" and "accepted steer retained" in payload.get("message", "")
+    )
+    assert retained_error["message"].startswith("accepted steer retained")
+    assert agent._pending_steer == "late"
+    assert session["queued_prompt"]["text"] == "x" * 16
 
 
 def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):

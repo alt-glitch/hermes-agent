@@ -5,12 +5,14 @@ forcing clients into a deadline-bounded busy-retry. When turn teardown outlived
 the deadline — e.g. a slow, non-interruptible tool (``web_search``) still
 running when the user hit stop — the resubmitted message was silently dropped
 ("it just doesn't listen"). The gateway now applies the ``busy_input_mode``
-policy: interrupt the live turn (default) and queue the message to run as the
-next turn, drained in ``run``'s tail.
+policy: queue the message by default, with explicit interrupt and steer modes,
+then drain the fallback slot in the run tail.
 """
 
 import threading
 import types
+
+import pytest
 
 from tui_gateway import server
 
@@ -46,7 +48,78 @@ def test_enqueue_merges_second_arrival_losslessly():
     assert session["queued_prompt"]["transport"] == "ws-2"
 
 
+def test_enqueue_front_preserves_leftover_steer_before_later_prompt():
+    session = _session()
+    server._enqueue_prompt(session, "later prompt", "ws-later")
+    server._enqueue_prompt(session, "leftover steer", "ws-live", front=True)
+
+    queued = session["queued_prompt"]
+    assert queued["text"].splitlines() == [
+        "leftover steer",
+        "",
+        "later prompt",
+    ]
+    assert queued["transport"] == "ws-live"
+
+
+def test_busy_retry_is_best_effort_and_can_queue_duplicate(monkeypatch):
+    """A lost ACK is ambiguous: retrying may enqueue the body twice."""
+
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    session = _session(running=True)
+
+    first = server._handle_busy_submit("r1", "sid", session, "same", "ws-1")
+    retry = server._handle_busy_submit("r2", "sid", session, "same", "ws-1")
+
+    assert first["result"]["status"] == "queued"
+    assert retry["result"]["status"] == "queued"
+    assert session["queued_prompt"]["text"].count("same") == 2
+
+
+def test_enqueue_text_capacity_rejects_overflow_without_mutation():
+    session = _session()
+    exact = "x" * server._MAX_PENDING_INPUT_CHARS
+    server._enqueue_prompt(session, exact, "ws-1")
+
+    before = dict(session["queued_prompt"])
+    with pytest.raises(OverflowError, match="capacity"):
+        server._enqueue_prompt(session, "y", "ws-2")
+
+    assert session["queued_prompt"] == before
+
+
+def test_leftover_promotion_restores_agent_when_queue_is_full():
+    session = _session(
+        queued_prompt={
+            "text": "x" * server._MAX_PENDING_INPUT_CHARS,
+            "transport": "ws-old",
+        }
+    )
+    agent = types.SimpleNamespace(
+        _pending_steer=None,
+        _pending_steer_lock=threading.Lock(),
+    )
+
+    assert server._promote_leftover_steer(session, agent, "leftover") is False
+    assert agent._pending_steer == "leftover"
+    assert len(session["queued_prompt"]["text"]) == server._MAX_PENDING_INPUT_CHARS
+
+
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
+
+def test_tui_gateway_busy_mode_defaults_to_queue_but_honors_explicit_modes(
+    monkeypatch,
+):
+    for configured, expected in [
+        ({}, "queue"),
+        ({"display": {}}, "queue"),
+        ({"display": {"busy_input_mode": "bogus"}}, "queue"),
+        ({"display": {"busy_input_mode": "interrupt"}}, "interrupt"),
+        ({"display": {"busy_input_mode": "steer"}}, "steer"),
+    ]:
+        monkeypatch.setattr(server, "_load_cfg", lambda value=configured: value)
+        assert server._load_busy_input_mode() == expected
+
 
 def test_busy_interrupt_mode_interrupts_and_queues(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
