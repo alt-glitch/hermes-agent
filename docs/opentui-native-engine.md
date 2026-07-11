@@ -1,15 +1,13 @@
-# OpenTUI native engine — PR documentation
+# OpenTUI native engine — historical PR documentation
 
 **Branch:** `feat/opentui-native-engine` · **Base:** `origin/main` (merged in; HEAD is at `~main`)
 **New engine root:** `ui-opentui/` (Node 26 + `@opentui/core` 0.4.1 + `@opentui/solid`, Effect at the boundary)
 **Legacy engine root:** `ui-tui/` (React + the `@hermes/ink` fork at `ui-tui/packages/hermes-ink/`)
 
-> This is the canonical in-repo doc for the PR. The companion interactive HTML
-> write-up (`~/projects/opentui-perf-writeup/index.html`) is the case/benchmark
-> deep-dive; this doc is the reviewable text version + the four things review
-> actually needs: **(1) the LoC reduction math, (2) the measured perf deltas,
-> (3) the real UI divergence (with screenshots), (4) the non-core / kitchen-sink
-> change audit.**
+> This is a historical PR/benchmark snapshot. Its LoC, screenshots, and frozen
+> performance results remain useful, but it is **not** the current parity or
+> release ledger. Use `docs/opentui-parity-matrix.md` for current status; where
+> this document once claimed “full parity,” the canonical ledger wins.
 
 This PR adds a from-scratch native terminal UI built on OpenTUI, intended to
 replace the React/Ink TUI **and the Ink fork we maintain alone**. It currently
@@ -330,12 +328,13 @@ caching and strict role alternation are preserved.**
 
 ## 5. What this does and does NOT fix
 
-**Fixes (structurally, by replacing the rendering substrate):** the renderer bug
-class — layout/scroll/input/copy/mouse/markdown/resize — plus the
-hand-maintained memory-eviction problem (windowing + Solid keyed `<For>`
-unmount→`destroy()`→`free()`), and several long-open feature requests (mouse,
-collapsible tool calls, session title/status bar, double-ESC, chronological
-thinking/tool ordering).
+**Provides native replacements for:** layout, scroll, input, copy, mouse,
+markdown, resize, and transcript-memory surfaces. This does **not** mean every
+Ink behavior on those surfaces is Covered: live-mode switches, command UX,
+packaging, and PTY fidelity are tracked row-by-row in the canonical parity
+matrix. Windowing + Solid keyed `<For>` unmount→`destroy()`→`free()` addresses
+the mounted-renderable memory class without proving the rest of the renderer
+bug class closed.
 
 **Does NOT fix:** the gateway is unchanged — the biggest single hotspot file in
 triage is `tui_gateway/server.py`, and whole bug clusters are gateway/Python-side
@@ -347,40 +346,33 @@ events → system lines instead of a frozen spinner) and the TUI auto-heals
 
 ---
 
-## 6. Feature parity matrix (vs the Ink TUI)
+## 6. Feature parity status (canonical ledger, not this PR snapshot)
 
-Verbatim, detailed, surface-by-surface with `file:line` evidence:
-**`docs/plans/opentui-ink-parity-matrix.md`** (interactive/filterable version in
-the HTML write-up). Headline state:
+The maintained, surface-by-surface ledger is
+**`docs/opentui-parity-matrix.md`**. Do not derive release readiness or totals
+from the historical claims that used to live in this section.
 
-| Surface | State |
-|---|---|
-| Transcript rendering (scrollbox, markdown, code, diffs, collapsible tools, reasoning, chronological order, windowing) | **full parity (9/9)** |
-| Blocking prompts (approval/clarify/sudo/secret/confirm) | **full parity (5/5)** |
-| Theming (skins, light/dark, ANSI-256 norm) | **full parity** |
-| Mouse / copy (tracking, selection, multi-click, OSC52, click-to-expand, wheel accel) | **full parity** |
-| Resilience (crash auto-heal + resume) | **parity++ (exponential backoff)** |
-| Composer / input | near parity — **missing: external editor (Ctrl+G → `$EDITOR`)**; ghost-text autosuggest partial |
-| Slash commands | core parity — **missing: `/setup`, `/redraw`, `/plugins`, `/voice`**; `/undo` prefill + `/image` partial |
-| Status bar / header chrome | almost all closed — **missing: MCP-servers panel, profile-in-prompt** |
-| Agent surfaces | most shipped — **missing: voice indicators, browser/CDP indicator** |
-| Utility commands | **missing: `/redraw`, `/setup`**; rest present |
+The current f7c9 busy-input batch is deliberately recorded as follows until a
+real-PTY Ink/OpenTUI comparison passes:
 
-> The original PR-draft gap list was **substantially stale** — the WIP since
-> shipped context %/token bar, cost, compressions, duration, update banner, todos
-> panel, activity feed, notifications, background-task indicator, **and per-tool
-> renderers** (the "every tool renders the same" claim is false:
-> `view/tools/registry.tsx` has dedicated renderers).
+| Surface | State | Current contract / remaining gap |
+|---|---|---|
+| `/queue`, `/q` | **Thinner** | Count/enqueue, three-row view, edit/remove/send, confirmed `--clear`, and bounded recovery exist; typed queue provenance does not. |
+| `/steer` | **Thinner** | Direct live injection and lossless bounded fallback exist; real child/PTY timing and UX still need comparison. |
+| `/busy` | **Thinner** | `queue`, `steer`, `interrupt`, and `status`, plus `config.yaml` persistence, immediate local application, and five-second mtime refresh exist; real-PTY parity is pending. |
+| `/undo` | **Thinner** | Direct `session.undo`, visible exchange trim, busy/SID/history-mutation guards, and feedback exist. Ink does not prefill `/undo`; the old prefill claim was false. |
+| `/retry` | **Thinner** | Captures the last user body, rewinds, trims visible state, resubmits once, and restores rejected input; live PTY validation remains. |
+| Busy Queue UX | **Thinner** | Explicit row Enter and double-empty Enter send while Ctrl/Cmd+K remains delete-to-line-end; uncertain delivery halts automatic drain; the queue is capped at 100 rows / 4,194,304 UTF-16 code units, mounts three rows, and limits native edit/history to 16,384 code units. |
 
-### Genuinely-remaining parity gaps
+The queue's one intentional safety divergence is also a parity gap: every
+queued row is currently sent as a model prompt. Ink can reinterpret a drained
+`!command` or other syntax; OpenTUI refuses surprising local execution until a
+typed prompt/skill/slash/shell queue-item model exists.
 
-- [ ] **External editor (Ctrl+G → `$EDITOR`)** — highest-impact missing composer affordance
-- [ ] MCP-servers detail panel; profile-in-prompt marker
-- [ ] Voice indicators (listening/transcribing/REC/STT) + `/voice`
-- [ ] Browser/CDP connection indicator + `/browser`
-- [ ] `/setup` wizard handoff, `/redraw`, `/plugins` hub
-- [ ] Draggable scrollbar; sticky-prompt line
-- [ ] `/undo` prefill into composer; model-picker persist-global toggle; skills-hub install/manage
+Focused evidence for this uncommitted batch is 302 TypeScript tests plus 9
+targeted gateway tests. The full `npm run check` total and the real-PTY parity
+run are still pending, so none of the rows above is a production-complete or
+Covered claim.
 
 ---
 
@@ -411,7 +403,7 @@ HERMES_TUI_ENGINE=ink hermes        # force the legacy Ink engine
 cd ui-opentui && npm install
 node scripts/build.mjs scripts/demo.tsx .demo
 DEMO_TOTAL=120 HERMES_TUI_MAX_MESSAGES=80 \
-  node --experimental-ffi --no-warnings .demo/demo.js   # inside a TTY
+  node --experimental-ffi --no-warnings ./.demo/demo.js   # inside a TTY
 ```
 
 Requires Node 26.3+. On older Node / Windows / Termux it auto-falls-back to Ink.
@@ -423,7 +415,7 @@ Requires Node 26.3+. On older Node / Windows / Termux it auto-falls-back to Ink.
 | Topic | File |
 |---|---|
 | Non-core change audit (full) | `docs/research/opentui-noncore-change-audit.md` |
-| Feature parity matrix (verbatim) | `docs/plans/opentui-ink-parity-matrix.md` |
+| Feature parity matrix (canonical) | `docs/opentui-parity-matrix.md` |
 | Benchmark report | `docs/plans/opentui-endgame-benchmark-report.md` |
 | Gut-check verification | `docs/plans/opentui-gutcheck-verification.md` |
 | Ink↔OpenTUI capture asymmetry | `docs/plans/opentui-ink-asymmetry-note.md` |

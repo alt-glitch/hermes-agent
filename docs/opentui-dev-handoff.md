@@ -61,7 +61,7 @@ run benches SEQUENTIALLY (the harness already wraps SUTs in `systemd-run … Mem
    parallelize freely.
 4. **Live smoke catches what headless can't** — tmux + the `tmux-pane-screenshot` skill for real
    colored frames. The demo: `node scripts/build.mjs scripts/demo.tsx .demo` then
-   `DEMO_TOTAL=2000 … node --experimental-ffi --no-warnings .demo/demo.js`.
+   `DEMO_TOTAL=2000 … node --experimental-ffi --no-warnings ./.demo/demo.js`.
 5. Commit format `opentui(v6): …`, **NO attribution lines**. The user's standing instruction is
    "commit + push as you land things" — honor it; otherwise don't push without asking. Edit large
    load-bearing files (the Python launcher, `store.ts`) DIRECTLY, never via subagent.

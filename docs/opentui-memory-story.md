@@ -188,6 +188,65 @@ the pre-windowing TUI literally could not do.
 
 ## 5. What's honestly still open
 
+### The busy-input queue has its own bounded memory contract
+
+The f7c9 parity batch adds an explicit renderer-side envelope for input authored
+while a turn is running. It is separate from transcript windowing, but follows
+the same rule: retain the user's data without letting the mounted native tree or
+the renderer heap grow without a ceiling.
+
+- The client queue accepts at most **100 rows** and **4,194,304 UTF-16 code
+  units** in total (`String.length`, so astral characters consume two code
+  units). Rejected or definitely failed steer attempts return to that same
+  bounded queue; they cannot silently overbook it.
+- The contract intentionally matches f7c9 Ink's best-effort delivery. A steer
+  ACK means only that the live process accepted the text in memory. Ambiguous
+  prompt or steer delivery is reported as uncertain after recovery and is never
+  auto-replayed; unsent queue rows and the composer draft remain client-owned.
+- Only **three queue rows** mount. The preview reads a bounded prefix, and the
+  active edit row is kept inside that three-row window. A 100-row queue therefore
+  adds strings to the store, not 100 native row trees.
+- Native textarea work is capped separately at **16,384 UTF-16 code units**.
+  Larger queued rows remain selectable, sendable, and deletable, but show “too
+  large to edit” instead of being copied into the native buffer. Local
+  Up-history also omits bodies above this ceiling; the authoritative
+  transcript/session still keeps the submitted body.
+- Two empty Enter presses within 450 ms interrupt a busy turn or send the next
+  queued row while idle. Up/Down
+  selects rows, Enter sends an edit, Ctrl+X deletes, Esc cancels, and confirmed
+  `/queue --clear` provides a bulk-discard path.
+- `display.busy_input_mode` lives in `config.yaml`, defaults to `queue` for the
+  full-screen TUI, and is rehydrated after the existing five-second config-mtime
+  poll detects a change. The poll is an Effect-scoped fiber, not a render loop.
+
+One safety divergence is deliberate for this milestone: a queued row is always
+sent as a **model prompt**. Ink may reinterpret a queued `!command` or other
+syntax when it drains; OpenTUI will not do that until the queue stores typed
+provenance for prompt, skill, slash, and shell entries. This prevents surprising
+local execution, but it means `/queue`, `/steer`, `/busy`, `/undo`, `/retry`, and
+the aggregate Busy Queue UX remain **Thinner** pending a real-PTY parity pass.
+
+The repeatable component benchmark is `ui-opentui/scripts/queue-bench.tsx`.
+Three fresh Node 26.3 runs on the target device measured:
+
+- 100-row mount/update: **7.791 / 7.987 / 8.067 ms**, while the native tree stayed
+  exactly **41 → 41 renderables**; active native allocations moved 258 → 278 and
+  retained JS heap moved only 16.3 → 16.6 MiB while adding the 97 stored strings;
+- selection of a **4,194,303-code-unit** row: **5.067 / 5.136 / 5.275 ms**,
+  leaving external memory at **5.3 MiB**; retained JS heap rose from 16.6 to
+  24.8 MiB because the store intentionally owns the full two-byte Unicode body;
+- 20 key-driven edit/cancel cycles at 16,384 code units: per-run p95
+  **59.522 / 62.335 / 64.015 ms**, with post-GC external memory back at
+  **5.3 MiB**;
+- whole fresh-process peak RSS: **126,300 / 127,148 / 127,500 KiB**, zero swaps,
+  and 1.64–1.66 s wall time.
+
+Focused tests cover fixed three-row mounting, constant renderable growth at 100
+rows, overflow rejection, reservation accounting, queue edit/send/delete,
+double-empty Enter, and deferred agent-build failure recovery. The full
+`npm run check` total is recorded only after the complete batch gate, so this is
+not a release-complete claim.
+
 - The remaining ~60–120MB over Ink is mostly the **store's JS strings** and
   process baseline — the view is no longer the problem. The structural fix is
   the **thin renderer** (W1): bodies live in the Python gateway (which already
