@@ -23,6 +23,7 @@ import { createDefaultOpenTuiKeymap } from '@opentui/keymap/opentui'
 import { KeymapProvider } from '@opentui/keymap/solid'
 import { render } from '@opentui/solid'
 import { Cause, Deferred, Duration, Effect } from 'effect'
+import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import type { KeyEvent } from '@opentui/core'
 
@@ -105,6 +106,7 @@ import {
   createQueueEditDrainGate,
   deliveryFailureIsUncertain,
   pendingPromptAfterBoundary,
+  pendingPromptBoundaryMatches,
   pendingPromptDecision,
   runningAfterPreStartFence,
   steerRetentionOrder,
@@ -154,6 +156,7 @@ const PENDING_STEER_MAX_CHARS = 4 * 1024 * 1024
 
 interface PendingPrompt {
   readonly clientMessageId: string
+  readonly submissionId: string
   readonly sessionId: string
   readonly text: string
 }
@@ -577,9 +580,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       store.registerCommittedEventHandler(event => {
         if (event.type === 'billing.step_up.verification') {
           presentBillingVerification(event.payload, { pushSystem: text => store.pushSystem(text) })
-        } else if (pendingPrompt && (event.type === 'message.start' || event.type === 'message.complete')) {
+        } else if (
+          pendingPrompt &&
+          (event.type === 'message.start' || event.type === 'message.complete') &&
+          pendingPromptBoundaryMatches(pendingPrompt.submissionId, event.type, event.payload)
+        ) {
           pendingPrompt = pendingPromptAfterBoundary(pendingPrompt, event.type)
-        } else if (event.type === 'error' && pendingPrompt) {
+        } else if (
+          event.type === 'error' &&
+          pendingPrompt &&
+          pendingPromptBoundaryMatches(pendingPrompt.submissionId, event.type, event.payload)
+        ) {
           if (pendingPromptDecision(event.type) === 'retain') {
             retainPendingPromptForRetry(
               pendingPrompt,
@@ -900,21 +911,30 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                 // boundary; discard the local optimistic row without inventing
                 // correlation/proof fields the Ink client does not use.
                 if (
-                  interruptedBeforeStart &&
                   pendingPrompt === interruptedPrompt &&
                   interruptedPrompt?.sessionId === sid &&
-                  gateway.sessionId() === sid &&
-                  !store.isTurnInFlight()
+                  gateway.sessionId() === sid
                 ) {
-                  preStartCancellationSessionId = sid
-                  pendingPrompt = pendingPromptAfterBoundary(interruptedPrompt, 'interrupt.success')
-                  store.removeClientMessage(interruptedPrompt.clientMessageId)
-                  store.pushSystem(
-                    store.queuedCount() > 0
-                      ? 'prompt cancelled before it started — queued messages retained; send one explicitly when ready'
-                      : 'prompt cancelled before it started'
-                  )
-                  store.applyInfo({ running: false })
+                  if (interruptedBeforeStart && !store.isTurnInFlight()) {
+                    preStartCancellationSessionId = sid
+                    pendingPrompt = pendingPromptAfterBoundary(interruptedPrompt, 'interrupt.success')
+                    store.removeClientMessage(interruptedPrompt.clientMessageId)
+                    store.pushSystem(
+                      store.queuedCount() > 0
+                        ? 'prompt cancelled before it started — queued messages retained; send one explicitly when ready'
+                        : 'prompt cancelled before it started'
+                    )
+                    store.applyInfo({ running: false })
+                  } else {
+                    // A correlated prompt still pending while some other turn
+                    // runs is in the gateway's queued slot. session.interrupt
+                    // deliberately clears that slot, so restore the body to the
+                    // explicit-only local queue instead of leaving it stranded.
+                    retainPendingPromptForRetry(
+                      interruptedPrompt,
+                      'queued prompt cancelled with the interrupted turn — message retained; send it explicitly to retry'
+                    )
+                  }
                 }
               })
             ),
@@ -1247,12 +1267,12 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           return false
         }
         const clientMessageId = skillCommand ? store.pushSkill(skillCommand, text) : store.pushUser(text)
-        const current: PendingPrompt = { clientMessageId, sessionId: sid, text }
+        const current: PendingPrompt = { clientMessageId, submissionId: randomUUID(), sessionId: sid, text }
         pendingPrompt = current
         store.applyInfo({ running: true })
 
         Effect.runFork(
-          gateway.request('prompt.submit', { session_id: sid, text }).pipe(
+          gateway.request('prompt.submit', { client_submission_id: current.submissionId, session_id: sid, text }).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
                 // An ACK only means the request handler spawned deferred startup.

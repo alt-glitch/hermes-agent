@@ -20,6 +20,23 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
+  test('preserves correlated prompt lifecycle ids', () => {
+    for (const wire of [
+      { type: 'message.start', payload: { client_submission_ids: ['send-1'] } },
+      { type: 'message.complete', payload: { client_submission_ids: ['send-1'], text: 'done' } },
+      { type: 'error', payload: { client_submission_ids: ['send-1'], message: 'failed' } }
+    ]) {
+      const ev = decode(wire)
+      expect(Option.isSome(ev)).toBe(true)
+      if (
+        Option.isSome(ev) &&
+        (ev.value.type === 'message.start' || ev.value.type === 'message.complete' || ev.value.type === 'error')
+      ) {
+        expect(ev.value.payload?.client_submission_ids).toEqual(['send-1'])
+      }
+    }
+  })
+
   test('decodes gateway.ready carrying a skin', () => {
     const ev = decode({ type: 'gateway.ready', payload: { skin: { colors: { ui_primary: '#abc123' } } } })
     expect(Option.isSome(ev)).toBe(true)

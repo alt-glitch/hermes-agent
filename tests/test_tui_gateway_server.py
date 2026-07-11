@@ -7091,7 +7091,10 @@ def test_prompt_submit_clears_running_before_deferred_init_error(monkeypatch):
     path intentionally emits no such snapshot.
     """
 
-    session = _session(agent=None)
+    session = _session(
+        agent=None,
+        _pending_steer_submission_ids=["steer-send"],
+    )
     server._sessions["sid"] = session
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_kw: None)
@@ -7114,6 +7117,7 @@ def test_prompt_submit_clears_running_before_deferred_init_error(monkeypatch):
             "id": "1",
             "method": "prompt.submit",
             "params": {
+                "client_submission_id": "direct-send",
                 "session_id": "sid",
                 "text": "hello",
             },
@@ -7121,8 +7125,88 @@ def test_prompt_submit_clears_running_before_deferred_init_error(monkeypatch):
     )
 
     assert response.get("result", {}).get("status") == "streaming"
-    assert ("error", False, {"message": "agent init failed"}) in emitted
+    assert (
+        "error",
+        False,
+        {
+            "client_submission_ids": ["direct-send", "steer-send"],
+            "message": "agent init failed",
+        },
+    ) in emitted
     assert not any(event == "session.info" for event, _running, _payload in emitted)
+    assert session["running"] is False
+    assert session["_pending_steer_submission_ids"] == []
+
+
+def test_deferred_init_error_settles_correlated_busy_queue(monkeypatch):
+    threads = []
+
+    class _DeferredThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    session = _session(agent=None)
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _DeferredThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        server,
+        "_wait_agent",
+        lambda *_a, **_kw: {"error": {"message": "agent init failed"}},
+    )
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+
+    try:
+        first = server.handle_request(
+            {
+                "id": "first",
+                "method": "prompt.submit",
+                "params": {
+                    "client_submission_id": "direct-send",
+                    "session_id": "sid",
+                    "text": "build the agent",
+                },
+            }
+        )
+        second = server.handle_request(
+            {
+                "id": "second",
+                "method": "prompt.submit",
+                "params": {
+                    "client_submission_id": "queued-send",
+                    "session_id": "sid",
+                    "text": "wait behind build",
+                },
+            }
+        )
+
+        assert first["result"]["status"] == "streaming"
+        assert second["result"]["status"] == "queued"
+        assert session["queued_prompt"]["client_submission_ids"] == [
+            "queued-send"
+        ]
+        threads[0].target()
+    finally:
+        server._sessions.pop("sid", None)
+
+    error = next(payload for event, _sid, payload in emitted if event == "error")
+    assert error["client_submission_ids"] == ["direct-send", "queued-send"]
+    assert session["queued_prompt"] is None
     assert session["running"] is False
 
 
@@ -7142,20 +7226,71 @@ def test_prompt_submit_clears_running_before_deferred_init_error(monkeypatch):
 
 def test_prompt_submit_promotes_leftover_steer_into_fallback_slot(monkeypatch):
     class _Agent:
+        def __init__(self):
+            self._pending_steer = None
+            self._pending_steer_lock = threading.Lock()
+            self.calls = 0
+            self.consumed = []
+
+        def clear_interrupt(self):
+            # Match AIAgent.clear_interrupt's hard-interrupt behavior: it drops
+            # pending steer unless the gateway's overflow-preservation wrapper
+            # snapshots and restores it.
+            with self._pending_steer_lock:
+                self._pending_steer = None
+
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None
         ):
+            self.calls += 1
+            if self.calls > 1:
+                with self._pending_steer_lock:
+                    self.consumed.append(self._pending_steer)
+                    self._pending_steer = None
+                return {"final_response": "second done", "messages": []}
             return {
                 "final_response": "done",
                 "messages": [],
                 "pending_steer": "arrived after final tool",
             }
 
-    session = _session(agent=_Agent())
+        def steer(self, text):
+            with self._pending_steer_lock:
+                self._pending_steer = text
+            return True
+
+        def _drain_pending_steer(self):
+            with self._pending_steer_lock:
+                text = self._pending_steer
+                self._pending_steer = None
+            return text
+
+    session = _session(
+        agent=_Agent(),
+        _pending_steer_submission_ids=["steer-a"],
+    )
     server._sessions["sid"] = session
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
-    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    injected = False
+
+    def inject_after_core_finalizer(_raw, _cols):
+        nonlocal injected
+        if not injected:
+            injected = True
+            response = server._handle_busy_submit(
+                "late-b",
+                "sid",
+                session,
+                "arrived in the finalizer gap",
+                None,
+                ["steer-b"],
+            )
+            assert response["result"]["status"] == "steered"
+        return None
+
+    monkeypatch.setattr(server, "render_message", inject_after_core_finalizer)
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
     drained = []
@@ -7165,22 +7300,126 @@ def test_prompt_submit_promotes_leftover_steer_into_fallback_slot(monkeypatch):
         lambda _rid, _sid, current: drained.append(current.get("queued_prompt"))
         or True,
     )
-    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append(
+            (event, sid, payload or {})
+        ),
+    )
 
     try:
         server.handle_request(
             {
                 "id": "1",
                 "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "active turn"},
+                "params": {
+                    "client_submission_id": "direct-send",
+                    "session_id": "sid",
+                    "text": "active turn",
+                },
             }
         )
     finally:
         server._sessions.pop("sid", None)
 
     assert drained == [
-        {"text": "arrived after final tool", "transport": None}
+        {
+            "client_submission_ids": ["steer-a", "steer-b"],
+            "text": "arrived after final tool\narrived in the finalizer gap",
+            "transport": None,
+        }
     ]
+    complete = next(
+        payload for event, _sid, payload in emitted if event == "message.complete"
+    )
+    assert complete["client_submission_ids"] == ["direct-send"]
+
+
+def test_prompt_submit_promotes_only_post_finalizer_steer(monkeypatch):
+    class _Agent:
+        def __init__(self):
+            self._pending_steer = None
+            self._pending_steer_lock = threading.Lock()
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {"final_response": "done", "messages": []}
+
+        def steer(self, text):
+            with self._pending_steer_lock:
+                self._pending_steer = text
+            return True
+
+        def _drain_pending_steer(self):
+            with self._pending_steer_lock:
+                text = self._pending_steer
+                self._pending_steer = None
+            return text
+
+    session = _session(agent=_Agent())
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+
+    def inject_after_core_finalizer(_raw, _cols):
+        response = server._handle_busy_submit(
+            "late-only",
+            "sid",
+            session,
+            "only late steer",
+            None,
+            ["late-only-id"],
+        )
+        assert response["result"]["status"] == "steered"
+        return None
+
+    monkeypatch.setattr(server, "render_message", inject_after_core_finalizer)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    drained = []
+    monkeypatch.setattr(
+        server,
+        "_drain_queued_prompt",
+        lambda _rid, _sid, current: drained.append(current.get("queued_prompt"))
+        or True,
+    )
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "client_submission_id": "direct-only",
+                    "session_id": "sid",
+                    "text": "active turn",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert drained == [
+        {
+            "client_submission_ids": ["late-only-id"],
+            "text": "only late steer",
+            "transport": None,
+        }
+    ]
+    complete = next(
+        payload for event, _sid, payload in emitted if event == "message.complete"
+    )
+    assert complete["client_submission_ids"] == ["direct-only"]
 
 
 def test_prompt_submit_exception_promotes_pending_steer(monkeypatch):
@@ -7230,10 +7469,24 @@ def test_prompt_submit_reports_leftover_retained_when_queue_is_full(monkeypatch)
         def __init__(self):
             self._pending_steer = None
             self._pending_steer_lock = threading.Lock()
+            self.calls = 0
+            self.consumed = []
+
+        def clear_interrupt(self):
+            # Match AIAgent.clear_interrupt: only the gateway preservation
+            # wrapper keeps an overflow-restored steer across turn start.
+            with self._pending_steer_lock:
+                self._pending_steer = None
 
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None
         ):
+            self.calls += 1
+            if self.calls > 1:
+                with self._pending_steer_lock:
+                    self.consumed.append(self._pending_steer)
+                    self._pending_steer = None
+                return {"final_response": "second done", "messages": []}
             return {
                 "final_response": "done",
                 "messages": [],
@@ -7245,6 +7498,7 @@ def test_prompt_submit_reports_leftover_retained_when_queue_is_full(monkeypatch)
     session = _session(
         agent=agent,
         queued_prompt={"text": "x" * 16, "transport": None},
+        _pending_steer_submission_ids=["steer-overflow"],
     )
     server._sessions["sid"] = session
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
@@ -7265,7 +7519,30 @@ def test_prompt_submit_reports_leftover_retained_when_queue_is_full(monkeypatch)
             {
                 "id": "1",
                 "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "active turn"},
+                "params": {
+                    "client_submission_id": "first-direct",
+                    "session_id": "sid",
+                    "text": "active turn",
+                },
+            }
+        )
+        assert agent._pending_steer == "late"
+        assert session["_pending_steer_submission_ids"] == [
+            "steer-overflow"
+        ]
+
+        # Free the unrelated full queue, then prove the retained steer survives
+        # the next turn's AIAgent.clear_interrupt() and is actually consumed.
+        session["queued_prompt"] = None
+        server.handle_request(
+            {
+                "id": "2",
+                "method": "prompt.submit",
+                "params": {
+                    "client_submission_id": "second-direct",
+                    "session_id": "sid",
+                    "text": "next turn",
+                },
             }
         )
     finally:
@@ -7277,8 +7554,17 @@ def test_prompt_submit_reports_leftover_retained_when_queue_is_full(monkeypatch)
         if event == "error" and "accepted steer retained" in payload.get("message", "")
     )
     assert retained_error["message"].startswith("accepted steer retained")
-    assert agent._pending_steer == "late"
-    assert session["queued_prompt"]["text"] == "x" * 16
+    assert agent.consumed == ["late"]
+    assert agent._pending_steer is None
+    assert session["_pending_steer_submission_ids"] == []
+    completes = [
+        payload for event, _sid, payload in emitted if event == "message.complete"
+    ]
+    assert completes[0]["client_submission_ids"] == ["first-direct"]
+    assert completes[1]["client_submission_ids"] == [
+        "second-direct",
+        "steer-overflow",
+    ]
 
 
 def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):

@@ -53,10 +53,13 @@ const SessionInfoEvent = Schema.Struct({
   payload: Schema.Record(Str, Schema.Unknown)
 })
 
+const ClientSubmissionIds = opt(Schema.Array(Str))
+
 // streaming text
 const MessageStart = Schema.Struct({
   type: Schema.Literal('message.start'),
-  session_id: opt(Str)
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ client_submission_ids: ClientSubmissionIds }))
 })
 const MessageDelta = Schema.Struct({
   type: Schema.Literal('message.delta'),
@@ -70,6 +73,7 @@ const MessageComplete = Schema.Struct({
   // (item 14). Kept loose (Record) — the chrome reader narrows what it needs.
   payload: opt(
     Schema.Struct({
+      client_submission_ids: ClientSubmissionIds,
       text: opt(Str),
       rendered: opt(Str),
       usage: opt(Schema.Record(Str, Schema.Unknown))
@@ -201,7 +205,7 @@ const SubagentText = Schema.Struct({ type: Schema.Literal('subagent.text'), ...S
 const ErrorEvent = Schema.Struct({
   type: Schema.Literal('error'),
   session_id: opt(Str),
-  payload: opt(Schema.Struct({ message: opt(Str) }))
+  payload: opt(Schema.Struct({ client_submission_ids: ClientSubmissionIds, message: opt(Str) }))
 })
 const GatewayStderr = Schema.Struct({
   type: Schema.Literal('gateway.stderr'),

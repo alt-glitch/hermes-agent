@@ -5258,6 +5258,8 @@ def _inflight_text(value: Any) -> str:
 
 
 _MAX_PENDING_INPUT_CHARS = 4 * 1024 * 1024
+_MAX_CLIENT_SUBMISSION_ID_CHARS = 128
+_MAX_QUEUED_SUBMISSION_IDS = 1024
 
 
 def _pending_steer_chars(session: dict) -> int:
@@ -5324,6 +5326,8 @@ def _pending_input_capacity_allows(
 def _accept_steer_locked(session: dict, agent: Any, text: Any) -> bool:
     """Best-effort steer admission; caller holds the history lock."""
 
+    if session.get("_steer_admission_closed"):
+        return False
     steer_text = text if isinstance(text, str) else str(text)
     if not _pending_input_capacity_allows(session, extra_steer_text=steer_text):
         return False
@@ -5370,6 +5374,7 @@ def _enqueue_prompt(
     transport: Any,
     *,
     front: bool = False,
+    client_submission_ids: list[str] | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -5390,6 +5395,21 @@ def _enqueue_prompt(
     merged_chars = len(existing_text) + len(incoming_text)
     if existing_text and incoming_text:
         merged_chars += 2
+    existing_ids = (
+        list(existing.get("client_submission_ids") or [])
+        if isinstance(existing, dict)
+        else []
+    )
+    incoming_ids = list(client_submission_ids or [])
+    if len(existing_ids) + len(incoming_ids) > _MAX_QUEUED_SUBMISSION_IDS:
+        raise OverflowError("queued input submission count capacity invariant exceeded")
+    if front:
+        merged_ids = [*incoming_ids, *existing_ids]
+    else:
+        merged_ids = [*existing_ids, *incoming_ids]
+    # Retries can repeat an id after an ambiguous ACK. Preserve text verbatim
+    # but correlate the merged lifecycle with each logical client send once.
+    merged_ids = list(dict.fromkeys(merged_ids))
     if merged_chars > _MAX_PENDING_INPUT_CHARS:
         # Check before allocating the concatenated string: malformed/legacy
         # callers must not turn the safety assertion itself into a memory spike.
@@ -5404,13 +5424,17 @@ def _enqueue_prompt(
             text = f"{text}\n\n{prev}" if prev and text else (text or prev)
         else:
             text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    queued = {"text": text, "transport": transport}
+    if merged_ids:
+        queued["client_submission_ids"] = merged_ids
+    session["queued_prompt"] = queued
 
 
 def _promote_leftover_steer(
     session: dict,
     agent: Any,
     text: str,
+    client_submission_ids: list[str] | None = None,
 ) -> bool:
     """Queue a closed-turn steer or restore it to the agent on overflow."""
 
@@ -5420,6 +5444,7 @@ def _promote_leftover_steer(
             text,
             session.get("transport"),
             front=True,
+            client_submission_ids=client_submission_ids,
         )
         return True
     except OverflowError:
@@ -5434,12 +5459,51 @@ def _promote_leftover_steer(
         return False
 
 
+def _clear_agent_interrupt_for_turn(session: dict, agent: Any) -> None:
+    """Clear stale hard-interrupt bits without dropping a retained steer.
+
+    ``AIAgent.clear_interrupt`` intentionally discards ``_pending_steer`` after
+    a user interrupt. A steer restored because the next-turn queue overflowed
+    has different provenance: it was never delivered and must survive into the
+    next turn. The session correlation ids are the positive proof for that
+    narrow case. ``session.interrupt`` clears those ids before the next start,
+    preserving the core hard-interrupt contract.
+    """
+
+    preserve = bool(session.get("_pending_steer_submission_ids"))
+    if not preserve:
+        agent.clear_interrupt()
+        return
+
+    lock = getattr(agent, "_pending_steer_lock", None)
+    if lock is not None:
+        with lock:
+            retained = getattr(agent, "_pending_steer", None)
+    else:
+        retained = getattr(agent, "_pending_steer", None)
+
+    agent.clear_interrupt()
+    if not retained:
+        return
+
+    if lock is not None:
+        with lock:
+            newer = getattr(agent, "_pending_steer", None)
+            agent._pending_steer = (
+                f"{retained}\n{newer}" if newer else retained
+            )
+    else:
+        newer = getattr(agent, "_pending_steer", None)
+        agent._pending_steer = f"{retained}\n{newer}" if newer else retained
+
+
 def _handle_busy_submit(
     rid,
     sid: str,
     session: dict,
     text: Any,
     transport: Any,
+    client_submission_ids: list[str] | None = None,
 ) -> dict:
     """Apply the busy-input policy to a prompt that lands mid-turn.
 
@@ -5451,6 +5515,7 @@ def _handle_busy_submit(
 
     mode = _load_busy_input_mode()
     agent = session.get("agent")
+    steer_admission_closed = bool(session.get("_steer_admission_closed"))
     queue_capacity = _pending_input_capacity_allows(
         session,
         extra_queue_text=text if isinstance(text, str) else str(text),
@@ -5465,20 +5530,69 @@ def _handle_busy_submit(
             4009,
             "pending input text capacity reached — retry after the current turn",
         )
-    if mode == "steer" and agent is not None and hasattr(agent, "steer"):
+    if (
+        mode == "steer"
+        and not steer_admission_closed
+        and agent is not None
+        and hasattr(agent, "steer")
+    ):
         try:
-            if _accept_steer_locked(session, agent, text):
+            # prompt.submit reaches this helper while _try_mcp_turn_admission
+            # already owns history_lock. Do not reacquire that non-reentrant
+            # lock here; direct helper tests intentionally exercise the same
+            # lock-owned contract without wrapping it.
+            if client_submission_ids:
+                correlated_ids = list(
+                    dict.fromkeys(
+                        [
+                            *list(
+                                session.get("_active_client_submission_ids")
+                                or []
+                            ),
+                            *list(
+                                session.get("_pending_steer_submission_ids")
+                                or []
+                            ),
+                            *client_submission_ids,
+                        ]
+                    )
+                )
+                if len(correlated_ids) > _MAX_QUEUED_SUBMISSION_IDS:
+                    return _err(
+                        rid,
+                        4009,
+                        "pending input submission count reached — retry after the current turn",
+                    )
+            accepted = _accept_steer_locked(session, agent, text)
+            if accepted and client_submission_ids:
+                pending_ids = list(
+                    session.get("_pending_steer_submission_ids") or []
+                )
+                session["_pending_steer_submission_ids"] = list(
+                    dict.fromkeys([*pending_ids, *client_submission_ids])
+                )
+            if accepted:
                 session["last_active"] = time.time()
                 return _ok(rid, {"status": "steered"})
         except Exception:
             pass
-    if mode != "queue" and agent is not None and hasattr(agent, "interrupt"):
+    if (
+        mode != "queue"
+        and not steer_admission_closed
+        and agent is not None
+        and hasattr(agent, "interrupt")
+    ):
         try:
             agent.interrupt()
         except Exception:
             pass
     try:
-        _enqueue_prompt(session, text, transport)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            client_submission_ids=client_submission_ids,
+        )
     except OverflowError as exc:
         return _err(rid, 4009, str(exc))
     session["last_active"] = time.time()
@@ -5498,7 +5612,17 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     try:
-        _run_prompt_submit(rid, sid, session, queued["text"])
+        client_submission_ids = list(queued.get("client_submission_ids") or [])
+        if client_submission_ids:
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                client_submission_ids=client_submission_ids,
+            )
+        else:
+            _run_prompt_submit(rid, sid, session, queued["text"])
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -8720,6 +8844,10 @@ def _(rid, params: dict) -> dict:
         should_interrupt = bool(session.get("running"))
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
+        # Hard interrupt supersedes pending steer text in AIAgent. Clear its
+        # correlations too, so turn start never restores an intentionally
+        # cancelled steer after clear_interrupt() drops it.
+        session["_pending_steer_submission_ids"] = []
     if should_interrupt and hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
     if not run_thread_alive:
@@ -9026,6 +9154,17 @@ def _(rid, params: dict) -> dict:
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
+    client_submission_id = params.get("client_submission_id")
+    if client_submission_id is None:
+        client_submission_ids = []
+    elif (
+        not isinstance(client_submission_id, str)
+        or not client_submission_id
+        or len(client_submission_id) > _MAX_CLIENT_SUBMISSION_ID_CHARS
+    ):
+        return _err(rid, 4004, "invalid client_submission_id")
+    else:
+        client_submission_ids = [client_submission_id]
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     session, err = _sess_nowait(params, rid)
     if err:
@@ -9059,6 +9198,7 @@ def _(rid, params: dict) -> dict:
                 session,
                 text,
                 t or session.get("transport"),
+                client_submission_ids,
             )
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
@@ -9114,13 +9254,47 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 _clear_inflight_turn(session)
+                queued = session.get("queued_prompt")
+                queued_submission_ids = (
+                    list(queued.get("client_submission_ids") or [])
+                    if isinstance(queued, dict)
+                    else []
+                )
+                if queued_submission_ids:
+                    # These clients retain a process-local recovery copy until
+                    # their own correlated start. Settle that copy explicitly;
+                    # there is no agent turn available to drain this slot.
+                    session["queued_prompt"] = None
+                failed_submission_ids = list(
+                    dict.fromkeys(
+                        [
+                            *client_submission_ids,
+                            *queued_submission_ids,
+                            *list(
+                                session.get("_pending_steer_submission_ids")
+                                or []
+                            ),
+                            *list(
+                                session.get("_active_client_submission_ids")
+                                or []
+                            ),
+                        ]
+                    )
+                )
+                session["_active_client_submission_ids"] = []
+                session["_pending_steer_submission_ids"] = []
             _emit(
                 "error",
                 sid,
                 {
                     "message": err.get("error", {}).get(
                         "message", "agent initialization failed"
-                    )
+                    ),
+                    **(
+                        {"client_submission_ids": failed_submission_ids}
+                        if failed_submission_ids
+                        else {}
+                    ),
                 },
             )
             return
@@ -9129,7 +9303,10 @@ def _(rid, params: dict) -> dict:
                 session["running"] = False
                 _clear_inflight_turn(session)
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        if client_submission_ids:
+            _run_prompt_submit(rid, sid, session, text, client_submission_ids=client_submission_ids)
+        else:
+            _run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -9564,7 +9741,15 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    client_submission_ids: list[str] | None = None,
+) -> None:
+    client_submission_ids = list(client_submission_ids or [])
     agent = session["agent"]
     with session["history_lock"]:
         # Claim start atomically against session.interrupt. The start event is
@@ -9574,8 +9759,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         if session.get("_turn_cancel_requested") or not session.get("running"):
             session["_turn_cancel_requested"] = False
             session["running"] = False
+            session["_active_client_submission_ids"] = []
             _clear_inflight_turn(session)
             return
+        session["_steer_admission_closed"] = False
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
@@ -9584,10 +9771,26 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _start_inflight_turn(session, text)
         if hasattr(agent, "clear_interrupt"):
             try:
-                agent.clear_interrupt()
+                _clear_agent_interrupt_for_turn(session, agent)
             except Exception:
                 pass
-        _emit("message.start", sid)
+        active_ids = list(session.get("_active_client_submission_ids") or [])
+        session["_active_client_submission_ids"] = list(
+            dict.fromkeys([*active_ids, *client_submission_ids])
+        )
+        turn_start_submission_ids = list(
+            session["_active_client_submission_ids"]
+        )
+        if turn_start_submission_ids:
+            _emit(
+                "message.start",
+                sid,
+                {"client_submission_ids": turn_start_submission_ids},
+            )
+        else:
+            # Preserve the shared Ink/desktop gateway call shape for legacy
+            # clients and tests; the wire frame is identical to payload=None.
+            _emit("message.start", sid)
 
     def run():
         approval_token = None
@@ -9844,7 +10047,33 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             )
             leftover_steer_retained = False
             with session["history_lock"]:
+                # Core iteration/finalization is over. Close admission before
+                # the second drain so every later prompt under this same lock
+                # queues for the next turn rather than entering an orphan steer
+                # slot between message.complete and finally(running=false).
+                session["_steer_admission_closed"] = True
                 _clear_inflight_turn(session)
+                # A steer can land after AIAgent's turn finalizer drains its
+                # pending slot into result.pending_steer but before the gateway
+                # acquires this lock. Drain once more while prompt.submit /
+                # session.steer admission is fenced, then pair the complete
+                # text with the complete correlation-id set.
+                try:
+                    drain_steer = getattr(agent, "_drain_pending_steer", None)
+                    post_finalizer_steer = (
+                        drain_steer() if callable(drain_steer) else None
+                    )
+                except Exception:
+                    post_finalizer_steer = None
+                if post_finalizer_steer:
+                    leftover_steer = (
+                        f"{leftover_steer}\n{post_finalizer_steer}"
+                        if leftover_steer
+                        else post_finalizer_steer
+                    )
+                steer_submission_ids = list(
+                    session.get("_pending_steer_submission_ids") or []
+                )
                 if leftover_steer:
                     # The atomic core close proved this text arrived after the
                     # last injectable tool boundary.  Preserve its earlier user
@@ -9854,9 +10083,22 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         session,
                         agent,
                         leftover_steer,
+                        steer_submission_ids,
                     )
                 if not leftover_steer_retained:
                     session["pending_steer_chars"] = 0
+                    session["_pending_steer_submission_ids"] = []
+                completed_submission_ids = list(
+                    dict.fromkeys(
+                        [
+                            *list(
+                                session.get("_active_client_submission_ids")
+                                or []
+                            ),
+                            *([] if leftover_steer else steer_submission_ids),
+                        ]
+                    )
+                )
             if leftover_steer_retained:
                 _emit(
                     "error",
@@ -9868,6 +10110,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         )
                     },
                 )
+            if completed_submission_ids:
+                payload["client_submission_ids"] = completed_submission_ids
             _emit("message.complete", sid, payload)
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -10023,21 +10267,40 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # AIAgent's outer steer phase closes even when run_conversation
             # raises and leaves the claimed text in its closed pending slot.
             # Promote it before clearing running so the normal drain owns it.
-            try:
-                drain_steer = getattr(agent, "_drain_pending_steer", None)
-                leftover_steer = drain_steer() if callable(drain_steer) else None
-            except Exception:
-                leftover_steer = None
             leftover_steer_retained = False
             with session["history_lock"]:
+                session["_steer_admission_closed"] = True
+                try:
+                    drain_steer = getattr(agent, "_drain_pending_steer", None)
+                    leftover_steer = (
+                        drain_steer() if callable(drain_steer) else None
+                    )
+                except Exception:
+                    leftover_steer = None
+                steer_submission_ids = list(
+                    session.get("_pending_steer_submission_ids") or []
+                )
                 if leftover_steer:
                     leftover_steer_retained = not _promote_leftover_steer(
                         session,
                         agent,
                         leftover_steer,
+                        steer_submission_ids,
                     )
                 if not leftover_steer_retained:
                     session["pending_steer_chars"] = 0
+                    session["_pending_steer_submission_ids"] = []
+                failed_submission_ids = list(
+                    dict.fromkeys(
+                        [
+                            *list(
+                                session.get("_active_client_submission_ids")
+                                or []
+                            ),
+                            *([] if leftover_steer else steer_submission_ids),
+                        ]
+                    )
+                )
             if leftover_steer_retained:
                 _emit(
                     "error",
@@ -10052,7 +10315,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _emit(
                 "error",
                 sid,
-                {"message": str(e)},
+                {
+                    "message": str(e),
+                    **(
+                        {"client_submission_ids": failed_submission_ids}
+                        if failed_submission_ids
+                        else {}
+                    ),
+                },
             )
         finally:
             try:
@@ -10066,6 +10336,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+                session["_active_client_submission_ids"] = []
                 _clear_inflight_turn(session)
             _emit("session.info", sid, _session_info(agent, session))
 

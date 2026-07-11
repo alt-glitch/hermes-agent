@@ -8,6 +8,8 @@ import {
   createQueueEditDrainGate,
   deliveryFailureIsUncertain,
   pendingPromptAfterBoundary,
+  pendingPromptBoundaryMatches,
+  promptLifecycleMatchesSubmission,
   pendingPromptDecision,
   runningAfterPreStartFence,
   steerRetentionOrder,
@@ -103,6 +105,30 @@ describe('busy submit policy', () => {
     expect(pendingPromptAfterBoundary(afterAck, 'interrupt.success')).toBeUndefined()
     expect(cancelledPreStartInfoIsStale('s1', 's1', 's1', true)).toBe(true)
     expect(cancelledPreStartInfoIsStale('s1', 's2', 's1', true)).toBe(false)
+
+    // A background turn may start before this prompt's RPC returns `queued`.
+    // Its lifecycle must not discard the sole crash-recovery copy.
+    expect(promptLifecycleMatchesSubmission('user-send', { client_submission_ids: ['background'] })).toBe(false)
+    expect(pendingPromptBoundaryMatches('user-send', 'message.start', undefined)).toBe(false)
+    expect(
+      pendingPromptBoundaryMatches('user-send', 'message.complete', {
+        client_submission_ids: ['background']
+      })
+    ).toBe(false)
+    expect(pendingPromptAfterBoundary(attempt, 'rpc-ack')).toBe(attempt)
+    expect(pendingPromptDecision('gateway.exited')).toBe('retain')
+
+    // The queued turn's own correlated start is the first acceptance proof.
+    expect(
+      pendingPromptBoundaryMatches('user-send', 'message.start', {
+        client_submission_ids: ['first-merged-send', 'user-send']
+      })
+    ).toBe(true)
+    expect(
+      pendingPromptBoundaryMatches('user-send', 'error', {
+        client_submission_ids: ['user-send']
+      })
+    ).toBe(true)
     expect(cancelledPreStartInfoIsStale('s1', 's1', 's1', false)).toBe(false)
 
     const staleInfo = advancePreStartCancellationFence('s1', 's1', 's1', 'session.info', true)

@@ -48,6 +48,25 @@ def test_enqueue_merges_second_arrival_losslessly():
     assert session["queued_prompt"]["transport"] == "ws-2"
 
 
+def test_enqueue_preserves_correlations_until_the_merged_turn_starts(monkeypatch):
+    session = _session()
+    server._enqueue_prompt(session, "first", "ws-1", client_submission_ids=["send-1"])
+    server._enqueue_prompt(session, "second", "ws-2", client_submission_ids=["send-2"])
+    fired = {}
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda rid, sid, current, text, **kwargs: fired.update(
+            rid=rid, sid=sid, text=text, **kwargs
+        ),
+    )
+
+    assert server._drain_queued_prompt("r1", "sid", session) is True
+    assert fired["text"] == "first\n\nsecond"
+    assert fired["client_submission_ids"] == ["send-1", "send-2"]
+    assert session["queued_prompt"] is None
+
+
 def test_enqueue_front_preserves_leftover_steer_before_later_prompt():
     session = _session()
     server._enqueue_prompt(session, "later prompt", "ws-later")
@@ -158,6 +177,153 @@ def test_busy_steer_mode_injects_when_accepted(monkeypatch):
     assert session.get("queued_prompt") is None
 
 
+def test_busy_steer_correlates_the_current_turn_until_completion(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    agent = types.SimpleNamespace(
+        steer=lambda text: True,
+        interrupt=lambda *a, **k: None,
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        _active_client_submission_ids=["turn-owner"],
+    )
+
+    response = server._handle_busy_submit(
+        "r1",
+        "sid",
+        session,
+        "nudge",
+        "ws-1",
+        ["steer-send"],
+    )
+
+    assert response["result"]["status"] == "steered"
+    assert session["_active_client_submission_ids"] == ["turn-owner"]
+    assert session["_pending_steer_submission_ids"] == ["steer-send"]
+
+
+def test_busy_prompt_rpc_reuses_the_admission_lock_without_deadlock(monkeypatch):
+    """prompt.submit already owns history_lock when it enters busy policy."""
+
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    session = _session(
+        agent=types.SimpleNamespace(
+            steer=lambda text: True,
+            interrupt=lambda *a, **k: None,
+        ),
+        running=True,
+    )
+    server._sessions["sid"] = session
+    response = {}
+
+    def submit():
+        response.update(
+            server.handle_request(
+                {
+                    "id": "r-lock",
+                    "method": "prompt.submit",
+                    "params": {
+                        "client_submission_id": "send-lock",
+                        "session_id": "sid",
+                        "text": "nudge",
+                    },
+                }
+            )
+        )
+
+    worker = threading.Thread(target=submit, daemon=True)
+    try:
+        worker.start()
+        worker.join(timeout=1)
+        assert not worker.is_alive(), "prompt.submit reacquired its history lock"
+        assert response["result"]["status"] == "steered"
+        assert session["_pending_steer_submission_ids"] == ["send-lock"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_busy_steer_rejects_before_correlation_id_capacity(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    monkeypatch.setattr(server, "_MAX_QUEUED_SUBMISSION_IDS", 3)
+    steers = []
+    session = _session(
+        agent=types.SimpleNamespace(
+            steer=lambda text: steers.append(text) or True,
+            interrupt=lambda *a, **k: None,
+        ),
+        running=True,
+        _active_client_submission_ids=["turn"],
+        _pending_steer_submission_ids=["first-steer"],
+    )
+
+    accepted = server._handle_busy_submit(
+        "r1", "sid", session, "second", "ws-1", ["second-steer"]
+    )
+    rejected = server._handle_busy_submit(
+        "r2", "sid", session, "third", "ws-1", ["third-steer"]
+    )
+
+    assert accepted["result"]["status"] == "steered"
+    assert rejected["error"]["code"] == 4009
+    assert steers == ["second"]
+    assert session["_pending_steer_submission_ids"] == [
+        "first-steer",
+        "second-steer",
+    ]
+
+
+def test_terminal_gap_routes_steer_mode_to_queue_without_interrupt(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    calls = {"interrupt": 0, "steer": 0}
+    session = _session(
+        agent=types.SimpleNamespace(
+            interrupt=lambda: calls.__setitem__(
+                "interrupt", calls["interrupt"] + 1
+            ),
+            steer=lambda _text: calls.__setitem__("steer", calls["steer"] + 1)
+            or True,
+        ),
+        running=True,
+        _steer_admission_closed=True,
+    )
+
+    response = server._handle_busy_submit(
+        "r1", "sid", session, "next turn", "ws-1", ["next-send"]
+    )
+
+    assert response["result"]["status"] == "queued"
+    assert calls == {"interrupt": 0, "steer": 0}
+    assert session["queued_prompt"] == {
+        "client_submission_ids": ["next-send"],
+        "text": "next turn",
+        "transport": "ws-1",
+    }
+
+
+def test_terminal_gap_rejects_direct_session_steer():
+    calls = []
+    session = _session(
+        agent=types.SimpleNamespace(steer=lambda text: calls.append(text) or True),
+        running=True,
+        _steer_admission_closed=True,
+    )
+    server._sessions["sid"] = session
+    try:
+        response = server.handle_request(
+            {
+                "id": "r1",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "too late"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["result"]["status"] == "rejected"
+    assert calls == []
+
+
 def test_busy_steer_mode_falls_back_to_queue_when_rejected(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
     agent = types.SimpleNamespace(steer=lambda text: False, interrupt=lambda *a, **k: None)
@@ -200,6 +366,31 @@ def test_drain_noop_when_session_already_running(monkeypatch):
     session = _session(running=True, queued_prompt={"text": "go", "transport": None})
     assert server._drain_queued_prompt("r1", "sid", session) is False
     assert session["queued_prompt"]["text"] == "go"
+
+
+def test_unrelated_turn_then_queued_ack_keeps_client_correlation_until_drain(monkeypatch):
+    """The queued ACK is not durable; its own later start is acceptance proof."""
+
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    session = _session(running=True)
+    response = server._handle_busy_submit(
+        "r-user",
+        "sid",
+        session,
+        "recover me",
+        "ws-user",
+        ["send-user"],
+    )
+
+    assert response["result"]["status"] == "queued"
+    assert session["queued_prompt"]["client_submission_ids"] == ["send-user"]
+    # A gateway exit here loses only server memory; the client still owns the
+    # body because the unrelated turn carried no matching correlation id.
+    fired = {}
+    session["running"] = False
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *args, **kwargs: fired.update(kwargs))
+    assert server._drain_queued_prompt("r-user", "sid", session) is True
+    assert fired["client_submission_ids"] == ["send-user"]
 
 
 def test_drain_releases_running_on_dispatch_failure(monkeypatch):

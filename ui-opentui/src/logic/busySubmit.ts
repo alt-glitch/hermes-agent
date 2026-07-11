@@ -86,6 +86,34 @@ export function pendingPromptDecision(boundary: PendingPromptBoundary): PendingP
   return 'cancel'
 }
 
+/** True only when a turn lifecycle event names this exact client submission.
+ *
+ * Same-session lifecycle events are not sufficient proof: a background/goal
+ * turn can win the gateway lock immediately before `prompt.submit`, causing
+ * the user's request to be acknowledged as queued. Retain the recovery copy
+ * through those unrelated events and release it only when the queued turn
+ * itself starts (or completes). Legacy/uncorrelated events deliberately fail
+ * closed; a gateway exit then offers an explicit retry instead of losing text.
+ */
+export function promptLifecycleMatchesSubmission(submissionId: string, payload: unknown): boolean {
+  if (payload === null || typeof payload !== 'object') return false
+  const ids = (payload as { readonly client_submission_ids?: unknown }).client_submission_ids
+  return Array.isArray(ids) && ids.some(value => value === submissionId)
+}
+
+/** Whether this boundary is allowed to settle the pending body. Transport and
+ * user-cancel boundaries are inherently local; turn/error events need proof. */
+export function pendingPromptBoundaryMatches(
+  submissionId: string,
+  boundary: PendingPromptBoundary,
+  payload?: unknown
+): boolean {
+  if (boundary === 'message.start' || boundary === 'message.complete' || boundary === 'error') {
+    return promptLifecycleMatchesSubmission(submissionId, payload)
+  }
+  return true
+}
+
 /** Apply only non-retention boundaries to the process-local pending body.
  * Retention needs the caller to move the body into its bounded queue first. */
 export function pendingPromptAfterBoundary<T>(current: T | undefined, boundary: PendingPromptBoundary): T | undefined {
