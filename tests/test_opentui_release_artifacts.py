@@ -9,13 +9,10 @@ archives and a clean-venv install; metadata checks run in the normal suite.
 
 from __future__ import annotations
 
-import base64
-import json
 import os
 import subprocess
 import sys
 import tarfile
-import textwrap
 import tomllib
 import venv
 import zipfile
@@ -124,19 +121,21 @@ def bounded_runner(cmd, cwd, *, idle_timeout_seconds=180, env=None):
         )
 
 with refresh_lock(location.runtime_dir):
-    success, result = refresh_packaged_runtime(
+    success, result, promotion = refresh_packaged_runtime(
         location,
         identity=identity,
         npm=npm,
         env=build_environment(node),
         runner=bounded_runner,
     )
-assert success, f"{result.stdout}\n{result.stderr}"
-assert packaged_runtime_current(location)
-assert (location.runtime_dir / "dist" / "main.js").stat().st_size > 0
-assert runtime_payload_present(location.runtime_dir, identity)
-assert runtime_sentinels_current(location.runtime_dir, identity)
-assert dependencies_current(location.runtime_dir, identity)
+    assert success, f"{result.stdout}\n{result.stderr}"
+    assert promotion is not None
+    assert packaged_runtime_current(location)
+    assert (location.runtime_dir / "dist" / "main.js").stat().st_size > 0
+    assert runtime_payload_present(location.runtime_dir, identity)
+    assert runtime_sentinels_current(location.runtime_dir, identity)
+    assert dependencies_current(location.runtime_dir, identity)
+    promotion.commit()
 assert not (seed_dir / "node_modules").exists()
 assert packaged_seed(seed_dir) == seed
 
@@ -271,78 +270,58 @@ def test_packaging_metadata_declares_portable_opentui_seed() -> None:
         assert required in manifest
 
 
-def test_publish_workflow_preserves_exact_tag_and_draft_release_contract() -> None:
+def _job_names(workflow: str) -> list[str]:
+    jobs = workflow.split("\njobs:\n", 1)[1]
+    return [
+        line[2:-1]
+        for line in jobs.splitlines()
+        if line.startswith("  ")
+        and not line.startswith("    ")
+        and line.endswith(":")
+    ]
+
+
+def _job_section(workflow: str, name: str, next_name: str | None) -> str:
+    section = workflow.split(f"\n  {name}:", 1)[1]
+    if next_name is not None:
+        section = section.split(f"\n  {next_name}:", 1)[0]
+    return section
+
+
+def _trigger_block(workflow: str) -> str:
+    return workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+
+
+def test_publish_workflow_keeps_upstream_flow_with_one_native_gate() -> None:
     publish = (
         REPO_ROOT / ".github" / "workflows" / "upload_to_pypi.yml"
     ).read_text(encoding="utf-8")
     docker = (REPO_ROOT / ".github" / "workflows" / "docker.yml").read_text(
         encoding="utf-8"
     )
-    site = (REPO_ROOT / ".github" / "workflows" / "deploy-site.yml").read_text(
-        encoding="utf-8"
-    )
+    site = (
+        REPO_ROOT / ".github" / "workflows" / "deploy-site.yml"
+    ).read_text(encoding="utf-8")
 
-    def between(name: str, next_name: str | None) -> str:
-        section = publish.split(f"\n  {name}:", 1)[1]
-        if next_name is not None:
-            section = section.split(f"\n  {next_name}:", 1)[0]
-        return section
+    assert _job_names(publish) == ["build", "verify-opentui", "publish", "sign"]
+    build = _job_section(publish, "build", "verify-opentui")
+    verify = _job_section(publish, "verify-opentui", "publish")
+    publish_job = _job_section(publish, "publish", "sign")
+    sign = _job_section(publish, "sign", None)
 
-    validate_job = between("validate-source", "build")
-    build_job = between("build", "stage-release-assets")
-    stage_job = between("stage-release-assets", "verify-opentui")
-    verify_job = between("verify-opentui", "sign")
-    sign_job = between("sign", "publish")
-    pypi_job = between("publish", "docker-release")
-    docker_caller = between("docker-release", "site-release")
-    site_caller = between("site-release", "publish-github-release")
-    final_job = between("publish-github-release", "request-vercel-deploy")
-    vercel_job = between("request-vercel-deploy", None)
-
-    assert "skip_sign" not in publish
-    assert (
-        "ref: ${{ inputs.confirm_tag != '' && "
-        "format('refs/tags/{0}', inputs.confirm_tag) || github.ref }}"
-    ) in validate_job
-    assert "datetime.date(year, month, day)" in validate_job
-    assert 'git rev-parse "refs/tags/$RELEASE_TAG^{commit}"' in validate_job
-    assert "release_sha=$release_sha" in validate_job
-    assert "release_tag=$RELEASE_TAG" in validate_job
-
-    assert "needs: validate-source" in build_job
-    assert "ref: ${{ needs.validate-source.outputs.release_sha }}" in build_job
-    assert "SOURCE_DATE_EPOCH=" in build_job
-    for required in (
+    for step in (
         "Build web dashboard",
         "Build TUI bundle",
         "Build portable OpenTUI seed",
         "Bundle install scripts into wheel",
-        "Verify complete portable artifacts in a clean venv",
-        "candidate-python-package-distributions",
+        "Build wheel and sdist",
+        "Verify portable OpenTUI seed in both archives",
     ):
-        assert required in build_job
-    assert "overwrite: true" in build_job
-
-    assert "needs: [validate-source, build]" in stage_job
-    assert "Wait for unpublished GitHub Release" in stage_job
-    assert 'if [ "$release_state" = "false" ]' in stage_job
-    assert '"commit": os.environ["RELEASE_SHA"]' in stage_job
-    assert '"sha256": hashlib.sha256(payload).hexdigest()' in stage_job
-    assert "manifest_count" in stage_job
-    distribution_upload = next(
-        line
-        for line in stage_job.splitlines()
-        if 'gh release upload "$RELEASE_TAG" "${wheels[0]}"' in line
-    )
-    assert "--clobber" not in distribution_upload
-    assert stage_job.index(distribution_upload) < stage_job.index(
-        'gh release upload "$RELEASE_TAG" "candidate-meta/$manifest_name"'
-    )
-    assert "canonical manifest commit mismatch" in stage_job
-    assert "canonical digest mismatch" in stage_job
-    assert "unexpected distribution assets" in stage_job
-    assert "canonical-python-package-distributions" in stage_job
-    assert "overwrite: true" in stage_job
+        assert step in build
+    assert 'node-version: "22"' in build
+    assert 'node-version: "26.3.0"' in build
+    assert "validate_opentui_release_artifacts" in build
+    assert "name: python-package-distributions" in build
 
     for runner, platform, arch in (
         ("ubuntu-24.04", "linux", "x64"),
@@ -350,169 +329,59 @@ def test_publish_workflow_preserves_exact_tag_and_draft_release_contract() -> No
         ("macos-15-intel", "darwin", "x64"),
         ("macos-15", "darwin", "arm64"),
     ):
-        matrix_row = (
+        assert (
             f"runner: {runner}\n"
             f"            platform: {platform}\n"
             f"            arch: {arch}"
-        )
-        assert matrix_row in verify_job
-    assert "needs: stage-release-assets" in verify_job
-    assert "canonical-python-package-distributions" in verify_job
-    assert "test_clean_venv_install_places_seed_beside_hermes_cli" in verify_job
+        ) in verify
+    assert "needs: build" in verify
+    assert "name: python-package-distributions" in verify
+    assert "HERMES_RELEASE_HYDRATE_OPENTUI" in verify
+    assert "test_clean_venv_install_places_seed_beside_hermes_cli" in verify
 
-    assert "needs: [stage-release-assets, verify-opentui]" in sign_job
-    assert "Verify release remains a draft" in sign_job
-    assert "Sign with Sigstore" in sign_job
-    assert "dist/*.sigstore.json" in sign_job
-    assert '"${wheels[0]}"' not in sign_job
+    assert "needs: [build, verify-opentui]" in publish_job
+    assert "name: python-package-distributions" in publish_job
+    assert "skip-existing: true" in publish_job
+    assert "needs: publish" in sign
+    assert "Wait for GitHub Release to exist" in sign
+    assert "skip_sign=true" in sign
+    assert "Sign with Sigstore" in sign
 
-    assert "needs: [stage-release-assets, sign]" in pypi_job
-    assert "Revalidate release tag before first public upload" in pypi_job
-    assert 'if [ "$current_tag_sha" != "$RELEASE_SHA" ]' in pypi_job
-    assert "skip-existing: true" in pypi_job
-    assert "Verify PyPI serves the canonical SHA256 values" in pypi_job
-    assert "PyPI digest mismatch" in pypi_job
-
-    for caller, workflow in (
-        (docker_caller, "docker.yml"),
-        (site_caller, "deploy-site.yml"),
+    for removed_job in (
+        "validate-source:",
+        "stage-release-assets:",
+        "docker-release:",
+        "site-release:",
+        "publish-github-release:",
     ):
-        assert "publish" in caller.split("needs:", 1)[1].splitlines()[0]
-        assert f"uses: ./.github/workflows/{workflow}" in caller
-        assert "release_tag: ${{ needs.stage-release-assets.outputs.release_tag }}" in caller
-        assert "release_sha: ${{ needs.stage-release-assets.outputs.release_sha }}" in caller
+        assert removed_job not in publish
+    assert "uses: ./.github/workflows/docker.yml" not in publish
+    assert "uses: ./.github/workflows/deploy-site.yml" not in publish
 
-    assert "needs: [stage-release-assets, docker-release, site-release]" in final_job
-    assert 'git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"' in final_job
-    assert 'if [ "$current_tag_sha" != "$RELEASE_SHA" ]' in final_job
-    assert "Reconcile canonical bytes with current draft assets" in final_job
-    assert 'verify_directory("Actions canonical", Path("canonical"))' in final_job
-    assert 'verify_directory("draft release", Path("draft"))' in final_job
-    assert "final release manifest commit mismatch" in final_job
-    assert "Sigstore subject digest mismatch" in final_job
-    assert 'gh release edit "$RELEASE_TAG"' in final_job
-    assert "--draft=false --verify-tag" in final_job
-    assert "needs: publish-github-release" in vercel_job
-    assert "branch-bound" in vercel_job
-    assert "curl --fail-with-body" in vercel_job
+    docker_triggers = _trigger_block(docker)
+    assert "  release:\n    types: [published]" in docker_triggers
+    assert "  workflow_call:" in docker_triggers
+    assert "release_sha:" not in docker
+    assert "release_tag:" not in docker
 
-    assert "workflow_call:" in docker
-    assert "release_sha:" in docker
-    assert "ref: ${{ inputs.release_sha || github.sha }}" in docker
-    assert "Tag $RELEASE_TAG moved from $RELEASE_SHA" in docker
-    assert "HERMES_GIT_SHA=${{ steps.source.outputs.sha }}" in docker
-    assert "org.opencontainers.image.revision=${{ steps.source.outputs.sha }}" in docker
-    assert "overwrite: true" in docker
-    assert docker.index("Run docker integration tests") < docker.index(
-        "Push ${{ matrix.arch }} by digest"
-    )
-    assert docker.index("Revalidate release tag before manifest publication") < docker.index(
-        "Create manifest list and push"
-    )
-
-    assert "workflow_call:" in site
-    assert "release_sha:" in site
-    assert "release_publish:" not in site
-    assert "ref: ${{ inputs.release_sha || github.sha }}" in site
-    assert "Tag $RELEASE_TAG moved from $RELEASE_SHA" in site
-    assert "inputs.release_sha == ''" in site
-    assert "github-pages-${{ github.run_attempt }}" in site
-    assert "artifact_name: github-pages-${{ github.run_attempt }}" in site
-    assert "Revalidate release tag before Pages deployment" in site
+    site_triggers = _trigger_block(site)
+    assert "  release:\n    types: [published]" in site_triggers
+    assert "  push:" in site_triggers
+    assert "  workflow_dispatch:" in site_triggers
+    assert "  workflow_call:" not in site_triggers
+    assert "release_sha:" not in site
+    assert "release_tag:" not in site
 
 
-def test_final_release_reconciliation_executes_against_real_bytes(
-    tmp_path: Path,
-) -> None:
-    workflow = (
-        REPO_ROOT / ".github" / "workflows" / "upload_to_pypi.yml"
-    ).read_text(encoding="utf-8")
-    final_job = workflow.split("\n  publish-github-release:", 1)[1].split(
-        "\n  request-vercel-deploy:", 1
-    )[0]
-    embedded = final_job.split("python3 - <<'PY'", 1)[1].split(
-        "\n          PY", 1
-    )[0]
-    validator = textwrap.dedent(embedded).strip() + "\n"
+def test_release_script_keeps_upstream_tag_and_public_release_behavior() -> None:
+    source = (REPO_ROOT / "scripts" / "release.py").read_text(encoding="utf-8")
+    main = source.split("def main():", 1)[1]
 
-    canonical = tmp_path / "canonical"
-    draft = tmp_path / "draft"
-    canonical.mkdir()
-    draft.mkdir()
-    payloads = {
-        "hermes_agent-1.2.3-py3-none-any.whl": b"portable-wheel",
-        "hermes_agent-1.2.3.tar.gz": b"portable-sdist",
-    }
-    rows = []
-    for name, payload in payloads.items():
-        (canonical / name).write_bytes(payload)
-        (draft / name).write_bytes(payload)
-        rows.append(
-            {
-                "name": name,
-                "size": len(payload),
-                "sha256": __import__("hashlib").sha256(payload).hexdigest(),
-            }
-        )
-
-    release_tag = "v2026.7.11"
-    release_sha = "a" * 40
-    manifest_name = "hermes-release-2026.7.11-manifest.json"
-    (draft / manifest_name).write_text(
-        json.dumps(
-            {
-                "schema": 1,
-                "tag": release_tag,
-                "commit": release_sha,
-                "assets": rows,
-            }
-        ),
-        encoding="utf-8",
-    )
-    for row in rows:
-        name = row["name"]
-        digest = bytes.fromhex(row["sha256"])
-        bundle = {
-            "messageSignature": {
-                "messageDigest": {
-                    "algorithm": "SHA2_256",
-                    "digest": base64.b64encode(digest).decode("ascii"),
-                }
-            }
-        }
-        (draft / f"{name}.sigstore.json").write_text(
-            json.dumps(bundle),
-            encoding="utf-8",
-        )
-    environment = {
-        **os.environ,
-        "MANIFEST_NAME": manifest_name,
-        "RELEASE_SHA": release_sha,
-        "RELEASE_TAG": release_tag,
-    }
-
-    valid = subprocess.run(
-        [sys.executable, "-c", validator],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert valid.returncode == 0, valid.stdout + valid.stderr
-
-    (draft / "hermes_agent-1.2.3-py3-none-any.whl").write_bytes(b"mutated")
-    mutated = subprocess.run(
-        [sys.executable, "-c", validator],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert mutated.returncode != 0
-    assert "draft release" in mutated.stdout + mutated.stderr
-    assert "mismatch" in mutated.stdout + mutated.stderr
+    assert 'push_result = git_result("push", "origin", "HEAD", "--tags")' in main
+    assert '"gh", "release", "create", tag_name,' in main
+    assert "gh_cmd.extend(str(path) for path in artifacts)" in main
+    assert '"--draft"' not in main
+    assert '"--verify-tag"' not in main
 
 
 def test_built_wheel_and_sdist_contain_only_portable_opentui_payload() -> None:
@@ -645,5 +514,4 @@ def test_clean_venv_install_places_seed_beside_hermes_cli(tmp_path: Path) -> Non
             env=clean_env,
         )
         assert hydrated.returncode == 0, hydrated.stdout + hydrated.stderr
-
 
