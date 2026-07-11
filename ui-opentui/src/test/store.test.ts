@@ -436,11 +436,11 @@ describe('session store — subagents (Phase 5e agents dashboard)', () => {
     expect(store.state.subagents[0]).toMatchObject({ id: 'a1', goal: 'research X', status: 'running', depth: 1 })
 
     store.apply({ type: 'subagent.tool', payload: { subagent_id: 'a1', tool_name: 'web_search' } })
-    expect(store.state.subagents[0]).toMatchObject({ status: 'tool', lastTool: 'web_search' })
+    expect(store.state.subagents[0]).toMatchObject({ status: 'running', lastTool: 'web_search' })
 
     store.apply({ type: 'subagent.complete', payload: { subagent_id: 'a1', summary: 'found it' } })
     expect(store.state.subagents).toHaveLength(1) // updated in place
-    expect(store.state.subagents[0]).toMatchObject({ status: 'complete', summary: 'found it' })
+    expect(store.state.subagents[0]).toMatchObject({ status: 'completed', summary: 'found it' })
   })
 
   test('accumulates a live trace per subagent (item 15) + transient thought', () => {
@@ -455,7 +455,7 @@ describe('session store — subagents (Phase 5e agents dashboard)', () => {
     expect(sa.thought).toBe('considering options')
     expect(sa.trace).toEqual([
       { kind: 'start', text: 'crunch data' },
-      { kind: 'tool', text: 'web_search — opentui' },
+      { kind: 'tool', text: 'Web Search("opentui")' },
       { kind: 'progress', text: 'found 3 hits' },
       { kind: 'summary', text: 'done crunching' }
     ])
@@ -471,7 +471,7 @@ describe('session store — subagents (Phase 5e agents dashboard)', () => {
     // grows by ONE (the reply), not two — the start entry + one coalesced reply
     expect(sa.trace).toHaveLength(2)
     expect(sa.trace![1]).toEqual({ kind: 'reply', text: 'Hello, world' })
-    expect(sa.status).toBe('replying')
+    expect(sa.status).toBe('running')
     // a non-reply entry between two text frames breaks coalescing → a fresh reply line
     store.apply({ type: 'subagent.progress', payload: { subagent_id: 'a1', text: 'mid' } })
     store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'again' } })

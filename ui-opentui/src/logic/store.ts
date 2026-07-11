@@ -18,12 +18,31 @@ import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/Gatewa
 import type { BillingOverlayState } from '../boundary/billing.ts'
 import type { CommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
 import {
+  decodeDelegationPauseResponse,
+  decodeDelegationStatusResponse,
+  decodeSpawnTreeLoadResponse,
+  type SpawnTreeSubagent
+} from '../boundary/schema/Delegation.ts'
+import {
   decodeCatalog,
   decodeSessionInfoPatch,
   type CatalogDecoded,
   type SessionInfoPatchDecoded
 } from '../boundary/schema/SessionInfo.ts'
 import type { DetailsMode } from './details.ts'
+import {
+  applyDelegationState,
+  clearAgentsNudgeTurn,
+  configureAgentsNudge as configureAgentsNudgeState,
+  considerAgentsNudge,
+  createAgentsNudgeState,
+  createDelegationState,
+  resolveActiveSubagentCount,
+  startAgentsNudgeTurn,
+  type ActiveSubagentCount,
+  type AgentsNudgeState,
+  type DelegationState
+} from './agentStatus.ts'
 import { diffStats, type DiffStats } from './diff.ts'
 import { DEFAULT_BUSY_INPUT_MODE, queueAccepts, type BusyInputMode } from './busyQueue.ts'
 import type { SessionTabId } from './sessionPicker.ts'
@@ -37,6 +56,21 @@ import {
 } from './backgroundActivity.ts'
 import { stripAnsi, stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
 import { DEFAULT_THEME, type Theme, themeFromSkin } from './theme.ts'
+import {
+  captureLiveSpawnTree,
+  emptySpawnHistory,
+  loadSpawnTree,
+  SPAWN_HISTORY_LIMIT,
+  type SpawnAgentRecord,
+  type SpawnHistoryState,
+  type SpawnSnapshot
+} from './spawnHistory.ts'
+import {
+  isTerminalStatus,
+  keepTerminalElseRunning,
+  normalizeTerminalStatus,
+  type SubagentStatus
+} from './subagentTree.ts'
 
 /** A tool call inside an assistant turn (matched start↔complete by `id`=tool_id). */
 export interface ToolPartState {
@@ -197,15 +231,45 @@ export interface TraceEntry {
   text: string
 }
 
-/** A delegated subagent, tracked from the `subagent.*` event stream (agents dashboard). */
+export interface SubagentOutputEntry {
+  isError: boolean
+  preview: string
+  tool: string
+}
+
+/**
+ * A delegated subagent in the canonical f7 Ink shape. The gateway speaks
+ * snake_case; the reducer maps every known field once into this camelCase
+ * model. Trace/thought/lastTool remain as compatibility projections for the
+ * existing OpenTUI detail view while the richer dashboard consumes the arrays.
+ */
 export interface SubagentInfo {
-  id: string
-  goal: string
-  status: string
+  apiCalls?: number
+  childSessionId?: string
+  costUsd?: number
   depth: number
+  durationSeconds?: number
+  filesRead?: string[]
+  filesWritten?: string[]
+  goal: string
+  id: string
+  index?: number
+  inputTokens?: number
+  iteration?: number
   model?: string
-  parentId?: string
+  notes?: string[]
+  outputTail?: SubagentOutputEntry[]
+  outputTokens?: number
+  parentId?: null | string
+  reasoningTokens?: number
+  startedAt?: number
+  status: string
   summary?: string
+  taskCount?: number
+  thinking?: string[]
+  toolCount?: number
+  tools?: string[]
+  toolsets?: string[]
   lastTool?: string
   /** Live activity trace (item 15) — typed entries, newest last; rendered by kind. */
   trace?: TraceEntry[]
@@ -215,6 +279,103 @@ export interface SubagentInfo {
 
 /** Cap on a subagent's retained trace lines. */
 const SUBAGENT_TRACE_LIMIT = 200
+const SUBAGENT_THINKING_LIMIT = 6
+const SUBAGENT_NOTES_LIMIT = 6
+const SUBAGENT_TOOLS_LIMIT = 8
+
+/** Transport-free persistence request emitted alongside an in-memory archive.
+ * The entry layer drains this bounded FIFO and performs `spawn_tree.save`; the
+ * reducer itself never owns or awaits a gateway. Times match that RPC (seconds). */
+export interface SpawnTreeSaveIntent {
+  readonly snapshotId: string
+  readonly request: {
+    readonly finished_at: number
+    readonly label: string
+    readonly session_id: string
+    readonly started_at: null | number
+    readonly subagents: readonly SpawnAgentRecord[]
+  }
+}
+
+function epochMilliseconds(value: number): number {
+  return Math.abs(value) < 100_000_000_000 ? value * 1000 : value
+}
+
+function pushUniqueBounded(values: string[], value: string, limit: number): void {
+  if (!value || values.at(-1) === value) return
+  values.push(value)
+  if (values.length > limit) values.splice(0, values.length - limit)
+}
+
+function formatSubagentTool(name: string, preview: string): string {
+  const label =
+    name
+      .split('_')
+      .filter(Boolean)
+      .map(part => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+      .join(' ') || name
+  const compact = preview.replace(/\s+/g, ' ').trim()
+  const bounded = compact.length > 64 ? `${compact.slice(0, 63)}…` : compact
+  return bounded ? `${label}("${bounded}")` : label
+}
+
+function makeSubagent(payload: SpawnTreeSubagent, id: string, status: SubagentStatus): SubagentInfo {
+  const subagent: SubagentInfo = {
+    depth: payload.depth ?? 0,
+    goal: payload.goal ?? '',
+    id,
+    index: payload.task_index ?? 0,
+    notes: [],
+    parentId: payload.parent_id ?? null,
+    startedAt: payload.started_at === undefined ? Date.now() : epochMilliseconds(payload.started_at),
+    status,
+    taskCount: payload.task_count ?? 1,
+    thinking: [],
+    toolCount: payload.tool_count ?? 0,
+    tools: [],
+    trace: []
+  }
+  mergeSubagentPayload(subagent, payload)
+  return subagent
+}
+
+/** Map every known rich snake_case field without erasing values omitted by a
+ * partial streaming event. Event-specific activity/status changes are applied
+ * after this shared projection. */
+function mergeSubagentPayload(subagent: SubagentInfo, payload: SpawnTreeSubagent): void {
+  if (payload.api_calls !== undefined) subagent.apiCalls = payload.api_calls
+  if (payload.child_session_id !== undefined) subagent.childSessionId = payload.child_session_id
+  if (payload.cost_usd !== undefined) subagent.costUsd = payload.cost_usd
+  if (payload.depth !== undefined) subagent.depth = payload.depth
+  if (payload.duration_seconds !== undefined) subagent.durationSeconds = payload.duration_seconds
+  if (payload.files_read !== undefined) subagent.filesRead = [...payload.files_read]
+  if (payload.files_written !== undefined) subagent.filesWritten = [...payload.files_written]
+  if (payload.goal) subagent.goal = payload.goal
+  if (payload.input_tokens !== undefined) subagent.inputTokens = payload.input_tokens
+  if (payload.iteration !== undefined) subagent.iteration = payload.iteration
+  if (typeof payload.model === 'string') subagent.model = payload.model
+  if (payload.notes !== undefined) subagent.notes = [...payload.notes].slice(-SUBAGENT_NOTES_LIMIT)
+  if (payload.output_tail !== undefined) {
+    subagent.outputTail = payload.output_tail.map(entry => ({
+      isError: entry.is_error === true,
+      preview: entry.preview ?? '',
+      tool: entry.tool ?? 'tool'
+    }))
+  }
+  if (payload.output_tokens !== undefined) subagent.outputTokens = payload.output_tokens
+  if (payload.parent_id !== undefined) subagent.parentId = payload.parent_id
+  if (payload.reasoning_tokens !== undefined) subagent.reasoningTokens = payload.reasoning_tokens
+  if (payload.started_at !== undefined) subagent.startedAt = epochMilliseconds(payload.started_at)
+  if (payload.summary !== undefined) subagent.summary = payload.summary
+  if (payload.task_count !== undefined) subagent.taskCount = payload.task_count
+  if (payload.task_index !== undefined) subagent.index = payload.task_index
+  if (payload.thinking !== undefined) subagent.thinking = [...payload.thinking].slice(-SUBAGENT_THINKING_LIMIT)
+  if (payload.tool_count !== undefined) subagent.toolCount = payload.tool_count
+  if (payload.tools !== undefined) subagent.tools = [...payload.tools].slice(-SUBAGENT_TOOLS_LIMIT)
+  if (payload.toolsets !== undefined) subagent.toolsets = [...payload.toolsets]
+  const lastTool = payload.last_tool ?? payload.tool_name
+  if (lastTool !== undefined) subagent.lastTool = lastTool
+}
 
 /**
  * Live session chrome (the status bar — item 14). Sourced from the `session.info`
@@ -267,6 +428,9 @@ export interface SessionInfo {
   /** Estimated session cost in USD (`usage.cost_usd` — only when the gateway's
    *  pricing estimate succeeds; absent otherwise). */
   costUsd?: number
+  /** Registry-backed background delegation count. Presence is authoritative,
+   *  including zero; local live rows are only a compatibility fallback. */
+  activeSubagents?: number
   /** Commits behind the remote (`update_behind`) — null/absent until the async
    *  update check resolves; >0 drives the transient update notice in the bar. */
   updateBehind?: number
@@ -346,6 +510,16 @@ export interface StoreState {
   completionFrom: number
   /** Delegated subagents (from `subagent.*`), shown in the agents dashboard. */
   subagents: SubagentInfo[]
+  /** Process-global newest-first in-memory archives (Ink `/replay` parity). */
+  spawnHistory: SpawnHistoryState
+  /** Process-global bounded persistence FIFO; drained outside the reducer and
+   *  retained across adoption until a definitive ACK/failure settles it. */
+  spawnTreeSaveIntents: SpawnTreeSaveIntent[]
+  /** Once-per-turn `/agents` discovery state + pending render decision. */
+  agentsNudge: AgentsNudgeState
+  agentsNudgePending: boolean
+  /** Process-global delegation pause/cap state hydrated from control RPCs. */
+  delegation: DelegationState
   /** Whether the agents dashboard overlay is open (/agents). */
   dashboard: boolean
   /** Subagent id the dashboard should preselect on open (tray Enter — Epic 2.7). */
@@ -430,12 +604,6 @@ function readStr(payload: { readonly [k: string]: unknown }, key: string): strin
   return typeof v === 'string' ? v : undefined
 }
 
-/** Read a number field off an unknown payload record. */
-function readNum(payload: { readonly [k: string]: unknown }, key: string): number {
-  const v = payload[key]
-  return typeof v === 'number' ? v : 0
-}
-
 /** Read an optional number (undefined when absent) — distinguishes "0" from "missing". */
 function readOptNum(payload: { readonly [k: string]: unknown }, key: string): number | undefined {
   const v = payload[key]
@@ -489,6 +657,8 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   const comp = d.usage?.compressions ?? d.compressions
   if (comp !== undefined) patch.compressions = comp
   if (d.usage?.cost_usd !== undefined) patch.costUsd = d.usage.cost_usd
+  const activeSubagents = d.usage?.active_subagents ?? d.active_subagents
+  if (activeSubagents !== undefined) patch.activeSubagents = activeSubagents
   // null = "update check not resolved yet" — leave the prior value alone.
   if (typeof d.update_behind === 'number') patch.updateBehind = d.update_behind
   if (d.update_command) patch.updateCommand = d.update_command
@@ -577,16 +747,6 @@ function catalogFrom(d: CatalogDecoded): Catalog {
   }
 }
 
-/** The subagent status implied by an event type (an explicit payload `status` wins). */
-function subagentStatusFor(type: string): string {
-  if (type === 'subagent.complete') return 'complete'
-  if (type === 'subagent.thinking') return 'thinking'
-  if (type === 'subagent.tool') return 'tool'
-  if (type === 'subagent.progress') return 'working'
-  if (type === 'subagent.text') return 'replying'
-  return 'running'
-}
-
 export interface SessionStoreOptions {
   /** Fixture/diagnostic harnesses ONLY (scripts/fixture.ts `materialize`): bypass
    *  the handle-safe cap for a store that is never mounted into a renderer.
@@ -655,6 +815,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
     completions: undefined,
     completionFrom: 0,
     subagents: [],
+    spawnHistory: emptySpawnHistory(),
+    spawnTreeSaveIntents: [],
+    agentsNudge: createAgentsNudgeState(),
+    agentsNudgePending: false,
+    delegation: createDelegationState(),
     dashboard: false,
     dashboardAgent: undefined,
     backgroundPanel: false,
@@ -1028,6 +1193,90 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // after EVERY turn (success/error/interrupt), so the drain always fires once.
   let turnInFlight = false
 
+  // Separate from `turnInFlight`: message.complete optimistically settles the
+  // UI before the authoritative session.info(false), so a child exit in that
+  // gap must not archive the same turn twice. message.start re-opens the slot.
+  let agentsTurnArchived = true
+
+  function saveIntentFor(snapshot: SpawnSnapshot): SpawnTreeSaveIntent {
+    return {
+      snapshotId: snapshot.id,
+      request: {
+        finished_at: snapshot.finishedAtMs / 1000,
+        label: snapshot.label.slice(0, 120),
+        session_id: snapshot.sessionId ?? 'default',
+        started_at: snapshot.startedAtMs / 1000,
+        subagents: snapshot.subagents
+      }
+    }
+  }
+
+  /** Archive synchronously before clearing. Persistence remains a bounded
+   * process-global delivery intent so a same-tick session adoption cannot drop
+   * the old session's tree before the entry layer drains it. */
+  function archiveAndClearSubagents(capture: boolean): SpawnSnapshot | null {
+    let snapshot: SpawnSnapshot | null = null
+    if (capture && state.subagents.length > 0) {
+      const captured = captureLiveSpawnTree(state.spawnHistory, state.subagents, {
+        sessionId: state.sessionId ?? null
+      })
+      snapshot = captured.snapshot
+      if (snapshot) {
+        setState('spawnHistory', captured.state)
+        const intent = saveIntentFor(snapshot)
+        setState('spawnTreeSaveIntents', previous => [...previous, intent].slice(-SPAWN_HISTORY_LIMIT))
+      }
+    }
+    if (state.subagents.length > 0) setState('subagents', [])
+    setState('agentsNudge', current => clearAgentsNudgeTurn(current))
+    setState('agentsNudgePending', false)
+    return snapshot
+  }
+
+  function maybeQueueAgentsNudge(): void {
+    const turnId = state.agentsNudge.activeTurnId
+    if (turnId === null) return
+    const decision = considerAgentsNudge(state.agentsNudge, { overlayOpen: state.dashboard, turnId })
+    if (decision.state !== state.agentsNudge) setState('agentsNudge', decision.state)
+    if (decision.shouldNudge) setState('agentsNudgePending', true)
+  }
+
+  function configureAgentsNudge(value: unknown): void {
+    setState('agentsNudge', current => configureAgentsNudgeState(current, value))
+    if (value === false) setState('agentsNudgePending', false)
+  }
+
+  function consumeAgentsNudge(): boolean {
+    if (!state.agentsNudgePending) return false
+    setState('agentsNudgePending', false)
+    return true
+  }
+
+  function activeSubagentCount(): ActiveSubagentCount {
+    return resolveActiveSubagentCount(state.info.activeSubagents, state.subagents)
+  }
+
+  function nextSpawnTreeSaveIntent(): SpawnTreeSaveIntent | undefined {
+    return state.spawnTreeSaveIntents[0]
+  }
+
+  /** Remove an intent only after the entry layer has a definitive outcome.
+   * Ambiguous transport failures leave it queued for an explicit retry. */
+  function settleSpawnTreeSaveIntent(snapshotId: string): boolean {
+    if (!state.spawnTreeSaveIntents.some(intent => intent.snapshotId === snapshotId)) return false
+    setState('spawnTreeSaveIntents', previous => previous.filter(intent => intent.snapshotId !== snapshotId))
+    return true
+  }
+
+  /** Decode and ingest one `spawn_tree.load` result without touching live rows. */
+  function loadSpawnTreeSnapshot(payload: unknown, path?: string): SpawnSnapshot | null {
+    const decoded = decodeSpawnTreeLoadResponse(payload)
+    if (Option.isNone(decoded)) return null
+    const loaded = loadSpawnTree(state.spawnHistory, decoded.value, path === undefined ? {} : { path })
+    if (loaded.snapshot) setState('spawnHistory', loaded.state)
+    return loaded.snapshot
+  }
+
   /** Register the drain callback the entry runs once per server-confirmed
    *  turn-completion (the entry owns the gateway; the store stays transport-free). */
   function registerTurnCompleteHandler(fn: () => void): void {
@@ -1100,7 +1349,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
   /** Clear the transcript (e.g. /clear, /new) and any tracked subagents. */
   function clearTranscript() {
     setState('messages', [])
-    setState('subagents', [])
+    archiveAndClearSubagents(false)
+    agentsTurnArchived = true
     setState('dropped', 0)
     // A fresh session has no plan — drop the pinned todo panel's snapshot.
     setState('latestTodos', undefined)
@@ -1129,6 +1379,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         delete info.contextPercent
         delete info.costUsd
         delete info.compressions
+        delete info.activeSubagents
       })
     )
   }
@@ -1151,6 +1402,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     applied.clear()
     buffering = null
     turnInFlight = false
+    agentsTurnArchived = true
     const info: SessionInfo = { startedAt: Date.now(), ...(rawInfo ? readInfoPatch(rawInfo) : {}) }
     const capped = snapshot.length > MESSAGE_CAP ? snapshot.slice(-MESSAGE_CAP) : snapshot
 
@@ -1169,6 +1421,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.completions = undefined
         draft.completionFrom = 0
         draft.subagents = []
+        draft.agentsNudge = clearAgentsNudgeTurn(draft.agentsNudge)
+        draft.agentsNudgePending = false
         draft.dashboard = false
         draft.dashboardAgent = undefined
         draft.backgroundPanel = false
@@ -1242,6 +1496,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function openDashboard(agentId?: string) {
     setState('dashboardAgent', agentId)
     setState('dashboard', true)
+    setState('agentsNudgePending', false)
   }
   function closeDashboard() {
     setState('dashboard', false)
@@ -1369,6 +1624,22 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('reasoningFull', on)
   }
 
+  /** Decode and merge a successful delegation.status response. */
+  function applyDelegationStatusResponse(raw: unknown, updatedAtMs = Date.now()): boolean {
+    const decoded = decodeDelegationStatusResponse(raw)
+    if (Option.isNone(decoded)) return false
+    setState('delegation', current => applyDelegationState(current, decoded.value, updatedAtMs))
+    return true
+  }
+
+  /** Decode and merge a successful delegation.pause response. */
+  function applyDelegationPauseResponse(raw: unknown, updatedAtMs = Date.now()): boolean {
+    const decoded = decodeDelegationPauseResponse(raw)
+    if (Option.isNone(decoded)) return false
+    setState('delegation', current => applyDelegationState(current, decoded.value, updatedAtMs))
+    return true
+  }
+
   /** Merge a session-info patch into the chrome state (status bar — item 14).
    *  Also the SOLE drain trigger for the busy queue: on a server-confirmed
    *  running true→false edge it fires onTurnComplete (once per turn). See the
@@ -1432,6 +1703,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
         applyInfo(event.payload)
         break
       case 'message.start':
+        // A fresh turn owns a fresh live spawn tree and one discovery credit.
+        // Any prior late spawn/start row is stale and is cleared without
+        // becoming a second archive for the preceding turn.
+        archiveAndClearSubagents(false)
+        agentsTurnArchived = false
+        setState('agentsNudge', current => startAgentsNudgeTurn(current))
         setState('status', undefined)
         // Flash-and-yield: a credits usage/grant notice yields to the live turn it
         // precedes (it's stale the moment the user sends), so clear it before the
@@ -1473,6 +1750,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'message.complete':
+        // Archive BEFORE the normal turn clear. A child exit can still arrive
+        // before session.info(false); `agentsTurnArchived` prevents a duplicate.
+        archiveAndClearSubagents(!agentsTurnArchived)
+        agentsTurnArchived = true
         setState(
           produce(draft => {
             // complete-only gateways may send `message.complete{text}` with no prior
@@ -1742,48 +2023,71 @@ export function createSessionStore(options?: SessionStoreOptions) {
       case 'subagent.progress':
       case 'subagent.complete':
       case 'subagent.text': {
-        const id = readStr(event.payload, 'subagent_id')
+        const id =
+          event.payload.subagent_id ??
+          (event.payload.task_index !== undefined || event.payload.goal
+            ? `sa:${String(event.payload.task_index ?? 0)}:${event.payload.goal || 'subagent'}`
+            : undefined)
         if (!id) break
+        const mayCreate = event.type === 'subagent.spawn_requested' || event.type === 'subagent.start'
         setState(
           produce(draft => {
             let sa = draft.subagents.find(s => s.id === id)
             if (!sa) {
-              sa = { depth: readNum(event.payload, 'depth'), goal: '', id, status: 'running' }
+              if (!mayCreate) return
+              sa = makeSubagent(event.payload, id, event.type === 'subagent.spawn_requested' ? 'queued' : 'running')
               draft.subagents.push(sa)
+              draft.subagents.sort((left, right) => left.depth - right.depth || (left.index ?? 0) - (right.index ?? 0))
+            } else {
+              mergeSubagentPayload(sa, event.payload)
             }
-            const goal = readStr(event.payload, 'goal')
-            if (goal) sa.goal = goal
-            const model = readStr(event.payload, 'model')
-            if (model) sa.model = model
-            const parent = readStr(event.payload, 'parent_id')
-            if (parent) sa.parentId = parent
-            const summary = readStr(event.payload, 'summary')
-            if (summary) sa.summary = summary
-            const tool = readStr(event.payload, 'tool_name')
-            if (tool) sa.lastTool = tool
-            sa.status = readStr(event.payload, 'status') ?? subagentStatusFor(event.type)
 
-            // Live trace (item 15): a concise per-subagent activity log. Thinking
-            // deltas update a transient `thought` (not appended — they'd flood).
-            const text = readStr(event.payload, 'text')
+            const rawText = event.payload.text ?? ''
+            const text = rawText.trim()
+            const tool = event.payload.tool_name
             const trace = (sa.trace ??= [])
-            if (event.type === 'subagent.start') trace.push({ kind: 'start', text: goal ?? sa.goal ?? 'started' })
-            else if (event.type === 'subagent.tool' && tool)
-              trace.push({ kind: 'tool', text: text ? `${tool} — ${text}` : tool })
-            else if (event.type === 'subagent.progress' && text) trace.push({ kind: 'progress', text })
-            else if (event.type === 'subagent.complete') trace.push({ kind: 'summary', text: summary ?? 'done' })
-            else if (event.type === 'subagent.thinking' && text) sa.thought = text
+            if (event.type === 'subagent.spawn_requested') {
+              if (!isTerminalStatus(sa.status)) sa.status = 'queued'
+            } else if (event.type === 'subagent.start') {
+              if (!isTerminalStatus(sa.status)) sa.status = 'running'
+              trace.push({ kind: 'start', text: sa.goal || 'started' })
+            } else if (event.type === 'subagent.thinking') {
+              sa.status = keepTerminalElseRunning(sa.status)
+              if (text) {
+                sa.thought = text
+                pushUniqueBounded((sa.thinking ??= []), text, SUBAGENT_THINKING_LIMIT)
+              }
+            } else if (event.type === 'subagent.tool') {
+              sa.status = keepTerminalElseRunning(sa.status)
+              if (tool) {
+                const line = formatSubagentTool(tool, event.payload.tool_preview ?? text)
+                pushUniqueBounded((sa.tools ??= []), line, SUBAGENT_TOOLS_LIMIT)
+                trace.push({ kind: 'tool', text: line })
+              }
+            } else if (event.type === 'subagent.progress') {
+              sa.status = keepTerminalElseRunning(sa.status)
+              if (text) {
+                pushUniqueBounded((sa.notes ??= []), text, SUBAGENT_NOTES_LIMIT)
+                trace.push({ kind: 'progress', text })
+              }
+            } else if (event.type === 'subagent.complete') {
+              sa.status = normalizeTerminalStatus(event.payload.status)
+              const summary = event.payload.summary || text || sa.summary
+              if (summary) sa.summary = summary
+              trace.push({ kind: 'summary', text: summary || 'done' })
+            }
             // Per-token reply text (subagent.text): COALESCE into one growing
-            // 'reply' line. The server mirrors this once per token, so appending
-            // to the last reply entry (vs pushing) keeps the trace from flooding.
-            else if (event.type === 'subagent.text' && text) {
+            // line. It is update-only like every other post-start variant.
+            else if (rawText) {
+              sa.status = keepTerminalElseRunning(sa.status)
               const last = trace[trace.length - 1]
-              if (last && last.kind === 'reply') last.text += text
-              else trace.push({ kind: 'reply', text })
+              if (last && last.kind === 'reply') last.text += rawText
+              else trace.push({ kind: 'reply', text: rawText })
             }
             if (trace.length > SUBAGENT_TRACE_LIMIT) trace.splice(0, trace.length - SUBAGENT_TRACE_LIMIT)
           })
         )
+        if (mayCreate) maybeQueueAgentsNudge()
         break
       }
       // ── gateway lifecycle / transport errors (auto-heal foundations) ──
@@ -1791,6 +2095,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
       // spinner (no message.complete will ever arrive for the lost reply), tell
       // the user their in-flight reply was lost, and show a recovering status.
       case 'gateway.exited': {
+        // Only an actually-open turn owns an exit archive. A post-complete
+        // transport exit happens while turnInFlight is still latched, but the
+        // archived bit keeps it from duplicating the normal snapshot.
+        archiveAndClearSubagents(turnInFlight && !agentsTurnArchived)
+        agentsTurnArchived = true
         setState('info', prev => ({ ...prev, running: false }))
         setState(produce(settleFailedAssistant))
         // The authoritative settle event can no longer arrive from a dead
@@ -1833,6 +2142,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'error': {
+        const actualTurnBoundary = (turnInFlight || state.info.running === true) && !agentsTurnArchived
+        archiveAndClearSubagents(actualTurnBoundary)
+        agentsTurnArchived = true
         // `message.start` may be followed by a terminal error with no
         // message.complete. Settle the newest streaming assistant before the
         // system error row is appended: remove a wholly empty caret row, or
@@ -1945,6 +2257,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   /** Replace history with the resume snapshot, then replay events buffered meanwhile. */
   function commitSnapshot(snapshot: Message[]): void {
+    archiveAndClearSubagents(false)
+    agentsTurnArchived = true
     // Resume replaces session context — a prior session's notice/timer must not
     // bleed in; mirrors Ink reset(). Deliberate tradeoff: a same-session
     // auto-heal reconnect momentarily drops a standing sticky banner, which the
@@ -1960,6 +2274,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
     // not inherit the prior session's plan. The resumed session re-emits its own
     // `todo` snapshot if it has one (mirrors clearTranscript's reset).
     setState('latestTodos', undefined)
+    // `usage.active_subagents` belongs to the prior adopted session. The
+    // resumed session's next info/complete payload re-establishes it.
+    setState(
+      'info',
+      produce(info => {
+        delete info.activeSubagents
+      })
+    )
     // Slice to the cap BEFORE the first setState, not after. Yoga (WASM) layout
     // memory is grow-only, so even a TRANSIENT mount of an over-cap resume
     // snapshot would permanently ratchet the high-water mark — a set-then-trim
@@ -2034,6 +2356,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
     queuedCount,
     registerTurnCompleteHandler,
     registerCommittedEventHandler,
+    nextSpawnTreeSaveIntent,
+    settleSpawnTreeSaveIntent,
+    loadSpawnTreeSnapshot,
+    configureAgentsNudge,
+    consumeAgentsNudge,
+    activeSubagentCount,
+    applyDelegationStatusResponse,
+    applyDelegationPauseResponse,
     setCatalog,
     setCommandCatalog,
     setSessionId,

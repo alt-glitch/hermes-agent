@@ -32,6 +32,7 @@ const Str = Schema.String
 const Num = Schema.Number
 const Bool = Schema.Boolean
 const opt = Schema.optionalKey
+const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 
 // ── session.info / session.create.info ────────────────────────────────
 // Context/usage numbers arrive nested under `usage`; the same names may also
@@ -39,6 +40,7 @@ const opt = Schema.optionalKey
 // `usage.context_*`, then the top-level fallback). All keys are optional — a
 // `session.info` patch only carries the fields that actually changed.
 const UsageSchema = Schema.Struct({
+  active_subagents: opt(NonNegativeInt),
   context_used: opt(Num),
   context_max: opt(Num),
   context_percent: opt(Num),
@@ -65,6 +67,9 @@ export const SessionInfoPatchSchema = Schema.Struct({
   update_command: opt(Str),
   profile_name: opt(Str),
   mcp_servers: opt(Schema.Array(Schema.Unknown)),
+  // Compatibility fallback for RPC paths that flatten usage fields. The
+  // canonical gateway path is `usage.active_subagents`.
+  active_subagents: opt(NonNegativeInt),
   // top-level context fallback (used when there's no nested `usage`)
   context_used: opt(Num),
   context_max: opt(Num),

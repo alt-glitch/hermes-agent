@@ -14,6 +14,8 @@
  */
 import { Schema } from 'effect'
 
+import { SpawnTreeSubagentSchema } from './Delegation.ts'
+
 const Str = Schema.String
 const opt = Schema.optionalKey
 
@@ -189,7 +191,10 @@ const ReviewSummary = Schema.Struct({
   session_id: opt(Str),
   payload: opt(Schema.Struct({ text: opt(Str) }))
 })
-const SubagentShape = { session_id: opt(Str), payload: Schema.Record(Str, Schema.Unknown) }
+// Reuse the same additive, future-field-preserving record as spawn-tree
+// persistence.  Live events are partial projections of that rich f7 shape;
+// known snake_case fields are decoded once while unknown future fields survive.
+const SubagentShape = { session_id: opt(Str), payload: SpawnTreeSubagentSchema }
 const SubagentSpawnRequested = Schema.Struct({ type: Schema.Literal('subagent.spawn_requested'), ...SubagentShape })
 const SubagentStart = Schema.Struct({ type: Schema.Literal('subagent.start'), ...SubagentShape })
 const SubagentThinking = Schema.Struct({ type: Schema.Literal('subagent.thinking'), ...SubagentShape })
