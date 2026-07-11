@@ -57,7 +57,7 @@ else
     INSTALL_DIR_EXPLICIT=false
 fi
 PYTHON_VERSION="3.11"
-NODE_VERSION="22"
+NODE_VERSION="26"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
 #   code at /usr/local/lib/hermes-agent, command at /usr/local/bin/hermes,
@@ -829,12 +829,9 @@ check_git() {
     exit 1
 }
 
-# The desktop build runs Vite ^8, which refuses to start on Node outside
-# `^20.19 || >=22.12` — older Node lacks `node:util.styleText`, so `vite build`
-# crashes with a SyntaxError that surfaces only as the opaque "Build desktop
-# app … exit code 1" install failure. Returns 0 when the given `node --version`
-# string clears that floor; anything below it is replaced with the Hermes-
-# managed Node $NODE_VERSION LTS.
+# The browser/Ink/desktop stack can still run on ^20.19 or >=22.12. Keep that
+# as the graceful-fallback floor when Node 26 provisioning fails or OpenTUI is
+# unsupported on this host.
 node_satisfies_build() {
     local ver="${1#v}"
     local major="${ver%%.*}"
@@ -846,6 +843,23 @@ node_satisfies_build() {
     return 1
 }
 
+node_satisfies_opentui() {
+    local ver="${1#v}"
+    local major="${ver%%.*}"
+    local minor="${ver#*.}"; minor="${minor%%.*}"
+    case "$major" in ''|*[!0-9]*) return 1 ;; esac
+    case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
+    if [ "$major" -gt 26 ]; then return 0; fi
+    if [ "$major" -eq 26 ] && [ "$minor" -ge 3 ]; then return 0; fi
+    return 1
+}
+
+opentui_host_supported() {
+    [ "${OS:-}" != "windows" ] \
+        && [ "${OS:-}" != "android" ] \
+        && [ "${DISTRO:-}" != "termux" ]
+}
+
 check_node() {
     log_info "Checking Node.js (for browser tools)..."
 
@@ -854,28 +868,83 @@ check_node() {
     # every install — including re-runs that skip the Node (re)install below.
     configure_managed_node_npm_prefix
 
-    if command -v node &> /dev/null && node_satisfies_build "$(node --version)"; then
-        log_success "Node.js $(node --version) found"
-        HAS_NODE=true
-        return 0
+    local env_node=""
+    local path_node=""
+    local managed_node="$HERMES_HOME/node/bin/node"
+    local fallback_node=""
+    if [ -n "${HERMES_NODE:-}" ] && [ -x "$HERMES_NODE" ]; then
+        env_node="$HERMES_NODE"
+    fi
+    path_node="$(command -v node 2>/dev/null || true)"
+
+    # Preserve a renderer-safe fallback before attempting the Node 26 upgrade.
+    if [ -n "$env_node" ] && node_satisfies_build "$("$env_node" --version 2>/dev/null)"; then
+        fallback_node="$env_node"
+    elif [ -n "$path_node" ] && node_satisfies_build "$("$path_node" --version 2>/dev/null)"; then
+        fallback_node="$path_node"
+    elif [ -x "$managed_node" ] && node_satisfies_build "$("$managed_node" --version 2>/dev/null)"; then
+        fallback_node="$managed_node"
     fi
 
-    # Prefer a Hermes-managed Node from a previous run over a too-old system one.
-    if [ -x "$HERMES_HOME/node/bin/node" ] && node_satisfies_build "$("$HERMES_HOME/node/bin/node" --version)"; then
-        export PATH="$HERMES_HOME/node/bin:$PATH"
-        log_success "Node.js $("$HERMES_HOME/node/bin/node" --version) found (Hermes-managed)"
-        HAS_NODE=true
-        return 0
+    if opentui_host_supported; then
+        if [ -n "$env_node" ] && node_satisfies_opentui "$("$env_node" --version 2>/dev/null)"; then
+            export PATH="$(dirname "$env_node"):$PATH"
+            log_success "Node.js $("$env_node" --version) found (HERMES_NODE, OpenTUI ready)"
+            HAS_NODE=true
+            return 0
+        fi
+        if [ -n "$path_node" ] && node_satisfies_opentui "$("$path_node" --version 2>/dev/null)"; then
+            log_success "Node.js $("$path_node" --version) found (OpenTUI ready)"
+            HAS_NODE=true
+            return 0
+        fi
+        if [ -x "$managed_node" ] && node_satisfies_opentui "$("$managed_node" --version 2>/dev/null)"; then
+            export PATH="$HERMES_HOME/node/bin:$PATH"
+            log_success "Node.js $("$managed_node" --version) found (Hermes-managed, OpenTUI ready)"
+            HAS_NODE=true
+            return 0
+        fi
+    else
+        if [ -n "$env_node" ] && node_satisfies_build "$("$env_node" --version 2>/dev/null)"; then
+            export PATH="$(dirname "$env_node"):$PATH"
+            log_success "Node.js $("$env_node" --version) found (HERMES_NODE)"
+            HAS_NODE=true
+            return 0
+        fi
+        if [ -n "$path_node" ] && node_satisfies_build "$("$path_node" --version 2>/dev/null)"; then
+            log_success "Node.js $("$path_node" --version) found"
+            HAS_NODE=true
+            return 0
+        fi
+        if [ -x "$managed_node" ] && node_satisfies_build "$("$managed_node" --version 2>/dev/null)"; then
+            export PATH="$HERMES_HOME/node/bin:$PATH"
+            log_success "Node.js $("$managed_node" --version) found (Hermes-managed)"
+            HAS_NODE=true
+            return 0
+        fi
     fi
 
-    if command -v node &> /dev/null; then
-        log_warn "Node.js $(node --version) is too old for the desktop build (need ^20.19 or >=22.12) — installing Hermes-managed Node $NODE_VERSION LTS..."
+    local existing_node="${env_node:-$path_node}"
+    if [ -n "$existing_node" ] && opentui_host_supported; then
+        log_warn "Node.js $("$existing_node" --version 2>/dev/null || echo unknown) is below the OpenTUI floor (need >=26.3) — installing Hermes-managed Node $NODE_VERSION..."
+    elif [ -n "$existing_node" ]; then
+        log_warn "Node.js $("$existing_node" --version 2>/dev/null || echo unknown) is too old for the desktop build (need ^20.19 or >=22.12) — installing Hermes-managed Node $NODE_VERSION..."
     elif [ "$DISTRO" = "termux" ]; then
         log_info "Node.js not found — installing Node.js via pkg..."
     else
-        log_info "Node.js not found — installing Node.js $NODE_VERSION LTS..."
+        log_info "Node.js not found — installing Node.js $NODE_VERSION (OpenTUI requires >=26.3)..."
     fi
     install_node
+
+    if [ "$HAS_NODE" = true ]; then
+        return 0
+    fi
+    if [ -n "$fallback_node" ] && [ -x "$fallback_node" ]; then
+        export PATH="$(dirname "$fallback_node"):$PATH"
+        log_warn "Node 26 provisioning failed; keeping $("$fallback_node" --version 2>/dev/null || echo existing-node) for the Ink/browser fallback."
+        HAS_NODE=true
+    fi
+    return 0
 }
 
 install_node() {
@@ -918,7 +987,8 @@ install_node() {
             ;;
     esac
 
-    # Resolve the latest v22.x.x tarball name from the index page
+    # Resolve the latest v26.x.x tarball name from the index page. The latest
+    # 26.x release is above the native engine's Node 26.3 floor.
     local index_url="https://nodejs.org/dist/latest-v${NODE_VERSION}.x/"
     local tarball_name
     tarball_name=$(curl -fsSL "$index_url" \
@@ -2298,7 +2368,44 @@ install_node_deps() {
     restore_dirty_lockfiles "$INSTALL_DIR"
 }
 
-# Provision the native OpenTUI engine on NODE 26.3+ (no Bun): `npm install` +
+# Pick an interpreter that can import the just-installed Hermes source. Stage
+# subcommands run in fresh shells, so do not assume setup_venv's exports remain.
+opentui_python_for_runtime() {
+    local candidate=""
+    local resolved=""
+    local seen=""
+    local source_pythonpath="$INSTALL_DIR"
+    if [ -n "${PYTHONPATH:-}" ]; then
+        source_pythonpath="$INSTALL_DIR:$PYTHONPATH"
+    fi
+
+    for candidate in \
+        "$INSTALL_DIR/venv/bin/python" \
+        "${PYTHON_PATH:-}" \
+        "$(command -v python3 2>/dev/null || true)" \
+        "$(command -v python 2>/dev/null || true)"; do
+        [ -n "$candidate" ] || continue
+        if [ -x "$candidate" ]; then
+            resolved="$candidate"
+        else
+            resolved="$(command -v "$candidate" 2>/dev/null || true)"
+        fi
+        [ -n "$resolved" ] && [ -x "$resolved" ] || continue
+        case ":$seen:" in *":$resolved:"*) continue ;; esac
+        seen="${seen:+$seen:}$resolved"
+        if (
+            cd "$INSTALL_DIR" \
+                && PYTHONPATH="$source_pythonpath" "$resolved" \
+                    -c 'import hermes_cli.main' >/dev/null 2>&1
+        ); then
+            printf '%s\n' "$resolved"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Provision the native OpenTUI engine on NODE 26.3+ (no Bun): `npm ci` +
 # `npm run build` (esbuild → dist/main.js) in ui-opentui. The engine's
 # renderer loads via the experimental `node:ffi` API that only exists on Node
 # 26.3+. The launcher (hermes_cli/main.py:_opentui_available) only uses OpenTUI
@@ -2323,11 +2430,15 @@ install_opentui() {
 
     log_info "Setting up OpenTUI engine (native TUI, Node 26.3+ / node:ffi)..."
 
-    # Resolve a Node >= 26.3.0 (the node:ffi floor): HERMES_NODE > node on PATH,
-    # version-checked. We do NOT install Node here — if one new enough isn't
-    # available the launcher cleanly falls back to Ink.
+    # Match the launcher's Node precedence exactly: HERMES_NODE > node on PATH
+    # > the Hermes-managed fallback, with every candidate version-checked. A
+    # freshly provisioned managed Node is already first on PATH; the explicit
+    # fallback also covers repaired/reused installs.
     local node_bin=""
-    for cand in "${HERMES_NODE:-}" "$(command -v node 2>/dev/null || true)"; do
+    for cand in \
+        "${HERMES_NODE:-}" \
+        "$(command -v node 2>/dev/null || true)" \
+        "$HERMES_HOME/node/bin/node"; do
         [ -n "$cand" ] && [ -x "$cand" ] || continue
         if "$cand" -e 'const p=process.versions.node.split(".").map(Number); process.exit(p[0]>26||(p[0]===26&&p[1]>=3)?0:1)' 2>/dev/null; then
             node_bin="$cand"
@@ -2340,31 +2451,35 @@ install_opentui() {
     fi
     log_success "Node found ($("$node_bin" --version 2>/dev/null || echo "unknown"))"
 
-    # npm ships with Node; the build (`node scripts/build.mjs`) runs fine on any
-    # recent Node — only the runtime needs 26.3, which the launcher re-checks.
-    local npm_bin
-    npm_bin="$(command -v npm 2>/dev/null || true)"
-    if [ -z "$npm_bin" ]; then
-        log_warn "OpenTUI engine setup skipped (npm not found) — using the Ink engine."
+    local python_bin
+    python_bin="$(opentui_python_for_runtime || true)"
+    if [ -z "$python_bin" ]; then
+        log_warn "OpenTUI engine setup skipped (no Python can import the installed Hermes runtime) — using the Ink engine."
         return 0
     fi
 
-    cd "$INSTALL_DIR/ui-opentui" || { log_warn "OpenTUI engine setup skipped (cd failed) — using Ink."; return 0; }
-
-    # Pull deps (fetches the per-arch @opentui/core-<arch> native lib) then build
-    # the Node bundle (dist/main.js). Both idempotent.
-    log_info "Installing OpenTUI dependencies (npm install)..."
-    if ! "$npm_bin" install --no-audit --no-fund >/dev/null 2>&1; then
-        log_warn "OpenTUI engine setup skipped (npm install failed) — the Ink engine will be used."
-        return 0
-    fi
-    log_info "Building OpenTUI engine (npm run build)..."
-    if ! "$npm_bin" run build >/dev/null 2>&1; then
-        log_warn "OpenTUI engine setup skipped (build failed) — the Ink engine will be used."
-        return 0
+    local source_pythonpath="$INSTALL_DIR"
+    if [ -n "${PYTHONPATH:-}" ]; then
+        source_pythonpath="$INSTALL_DIR:$PYTHONPATH"
     fi
 
-    log_success "OpenTUI engine ready (opt-in: HERMES_TUI_ENGINE=opentui; default is Ink)."
+    # Reuse the launcher's production transaction instead of mutating the live
+    # node_modules and dist directories in shell. It owns paired npm selection,
+    # dev-dependency env scrubbing, locking, staged build/native validation,
+    # atomic promotion, and coherent fallback to a previously validated pair.
+    log_info "Hydrating and building OpenTUI through the production runtime transaction..."
+    if ! run_with_timeout "$NODE_DEPS_TIMEOUT" \
+        env HERMES_NODE="$node_bin" HERMES_TUI_ENGINE=opentui \
+            HERMES_TUI_FORCE_BUILD=1 HERMES_QUIET=1 \
+            PYTHONPATH="$source_pythonpath" \
+            "$python_bin" -c \
+            'from hermes_cli.main import _make_opentui_argv; argv, cwd = _make_opentui_argv(False); assert argv and cwd' \
+        >/dev/null 2>&1; then
+        log_warn "OpenTUI engine setup skipped (transactional runtime preparation failed or timed out) — the Ink engine will be used."
+        return 0
+    fi
+
+    log_success "OpenTUI engine ready (auto-selected on supported hosts; Ink remains the fallback)."
     return 0
 }
 

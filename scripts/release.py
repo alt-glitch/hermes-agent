@@ -21,11 +21,15 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import zipfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +42,9 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 # tests/acp/test_registry_manifest.py enforces this lockstep so the release
 # bump touches both files atomically.
 ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+
+RELEASE_STATE_SCHEMA = 2
+RELEASE_STATE_FILENAME = ".release_state.json"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -1974,11 +1981,223 @@ def git_result(*args, cwd=None):
     )
 
 
-def get_last_tag():
+def _release_worktree_is_clean(
+    *, phase: str, allowed_untracked: frozenset[str] = frozenset()
+) -> bool:
+    """Fail closed when release artifacts would not match the tagged tree."""
+    result = git_result("status", "--porcelain=v1", "--untracked-files=normal")
+    if result.returncode != 0:
+        print(
+            f"  ✗ Could not verify a clean worktree {phase}: "
+            f"{result.stderr.strip() or 'git status failed'}"
+        )
+        return False
+
+    dirty = [
+        line
+        for line in (result.stdout or "").splitlines()
+        if line.strip() and not (line.startswith("?? ") and line[3:] in allowed_untracked)
+    ]
+    if not dirty:
+        return True
+
+    print(f"  ✗ Refusing to publish: worktree is dirty {phase}.")
+    for line in dirty[:20]:
+        print(f"    {line}")
+    if len(dirty) > 20:
+        print(f"    … and {len(dirty) - 20} more paths")
+    print("    Commit or stash every release input, then retry.")
+    return False
+
+
+def _release_state_path() -> Path:
+    return REPO_ROOT / RELEASE_STATE_FILENAME
+
+
+def _current_release_head() -> str | None:
+    result = git_result("rev-parse", "--verify", "HEAD")
+    head = (result.stdout or "").strip().lower()
+    if result.returncode != 0 or re.fullmatch(r"[0-9a-f]{40,64}", head) is None:
+        print(
+            "  ✗ Could not resolve the exact release HEAD: "
+            f"{result.stderr.strip() or 'git rev-parse returned an invalid id'}"
+        )
+        return None
+    return head
+
+
+def _load_no_bump_release_state(
+    *, requested_date: str, current_version: str, first_release: bool
+) -> tuple[bool, dict | None]:
+    """Load a no-bump retry state, failing closed on any ambiguity."""
+    path = _release_state_path()
+    temp_path = path.with_name(f"{path.name}.tmp")
+    if not path.exists() and not path.is_symlink():
+        if temp_path.exists() or temp_path.is_symlink():
+            print(
+                "  ✗ Refusing release recovery: an interrupted temporary state "
+                f"exists at {temp_path}."
+            )
+            return True, None
+        return False, None
+    tracked = git_result(
+        "ls-files", "--error-unmatch", "--", RELEASE_STATE_FILENAME
+    )
+    if tracked.returncode == 0:
+        print(f"  ✗ Refusing release recovery: {path} must remain untracked.")
+        return True, None
+    if tracked.returncode != 1:
+        print(f"  ✗ Refusing release recovery: could not verify {path} is untracked.")
+        return True, None
+    if path.is_symlink() or not path.is_file():
+        print(
+            f"  ✗ Refusing release recovery: {path} is not a regular state file."
+        )
+        return True, None
+    try:
+        encoded = path.read_text(encoding="utf-8")
+        payload = json.loads(encoded)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"  ✗ Refusing release recovery: could not read {path}: {exc}")
+        return True, None
+
+    expected_keys = {
+        "schema",
+        "tag",
+        "calver",
+        "version",
+        "head",
+        "first_release",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        print(
+            f"  ✗ Refusing release recovery: {path} has an unknown or incomplete schema."
+        )
+        return True, None
+    calver = payload.get("calver")
+    tag_name = payload.get("tag")
+    version = payload.get("version")
+    saved_head = payload.get("head")
+    saved_first_release = payload.get("first_release")
+    if (
+        payload.get("schema") != RELEASE_STATE_SCHEMA
+        or not isinstance(calver, str)
+        or re.fullmatch(
+            rf"{re.escape(requested_date)}(?:\.(?:[2-9]|[1-9]\d+))?", calver
+        )
+        is None
+        or tag_name != f"v{calver}"
+        or version != current_version
+        or not isinstance(saved_head, str)
+        or not isinstance(saved_first_release, bool)
+        or saved_first_release != first_release
+    ):
+        print(
+            f"  ✗ Refusing release recovery: {path} does not match the requested "
+            "date, current version, and first-release mode."
+        )
+        return True, None
+
+    current_head = _current_release_head()
+    if current_head is None or saved_head != current_head:
+        print(
+            f"  ✗ Refusing release recovery: {path} does not point at the exact "
+            "current HEAD."
+        )
+        return True, None
+    canonical = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if encoded != canonical:
+        print(
+            f"  ✗ Refusing release recovery: {path} is not the exact canonical state."
+        )
+        return True, None
+    return True, payload
+
+
+def _write_no_bump_release_state(
+    *, tag_name: str, calver_date: str, current_version: str, first_release: bool
+) -> dict | None:
+    """Atomically persist the no-bump attempt before creating its tag."""
+    path = _release_state_path()
+    temp_path = path.with_name(f"{path.name}.tmp")
+    if path.exists() or path.is_symlink() or temp_path.exists() or temp_path.is_symlink():
+        print(
+            "  ✗ Refusing to create release state because a state or temporary "
+            f"file already exists ({path})."
+        )
+        return None
+    head = _current_release_head()
+    if head is None:
+        return None
+    payload = {
+        "schema": RELEASE_STATE_SCHEMA,
+        "tag": tag_name,
+        "calver": calver_date,
+        "version": current_version,
+        "head": head,
+        "first_release": first_release,
+    }
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    try:
+        with temp_path.open("x", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        if os.name != "nt":
+            directory_fd = os.open(REPO_ROOT, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except OSError as exc:
+        try:
+            if temp_path.is_file() and not temp_path.is_symlink():
+                temp_path.unlink()
+        except OSError:
+            pass
+        print(f"  ✗ Could not persist release attempt state: {exc}")
+        return None
+    return payload
+
+
+def _print_no_bump_release_recovery(
+    *, requested_date: str, first_release: bool
+) -> None:
+    retry_command = f"python scripts/release.py --publish --date {requested_date}"
+    if first_release:
+        retry_command += " --first-release"
+    print(f"    Release attempt state kept at: {_release_state_path()}")
+    print("    Retry with the exact same checkout and command:")
+    print(f"    {retry_command}")
+    print(
+        "    Remove the state file only when intentionally abandoning this "
+        "release attempt."
+    )
+
+
+def parse_release_date(value: str) -> str:
+    """Validate a 20xx calendar date and return canonical CalVer spelling."""
+    match = re.fullmatch(r"(20\d{2})\.(\d{1,2})\.(\d{1,2})", value)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "date must be a real 20xx calendar date in YYYY.M.D format"
+        )
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        datetime(year, month, day)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "date must be a real 20xx calendar date in YYYY.M.D format"
+        ) from exc
+    return f"{year}.{month}.{day}"
+
+
+def get_last_tag(*, exclude: str | None = None):
     """Get the most recent CalVer tag."""
     tags = git("tag", "--list", "v20*", "--sort=-v:refname")
     if tags:
-        return tags.split("\n")[0]
+        return next((tag for tag in tags.splitlines() if tag != exclude), None)
     return None
 
 
@@ -2025,6 +2244,20 @@ def bump_version(current: str, part: str) -> str:
 
 def update_version_files(semver: str, calver_date: str):
     """Update version strings in source files."""
+    desktop_pkg = REPO_ROOT / "apps" / "desktop" / "package.json"
+    root_lock = REPO_ROOT / "package-lock.json"
+    lock = None
+    desktop_lock = None
+    if desktop_pkg.exists() and root_lock.exists():
+        # Validate the workspace row before touching any source file. A broken
+        # lock must fail without leaving a half-applied release bump behind.
+        lock = json.loads(root_lock.read_text(encoding="utf-8"))
+        desktop_lock = lock.get("packages", {}).get("apps/desktop")
+        if not isinstance(desktop_lock, dict):
+            raise ValueError(
+                "package-lock.json is missing packages['apps/desktop']"
+            )
+
     # Update __init__.py
     content = VERSION_FILE.read_text()
     content = re.sub(
@@ -2053,7 +2286,6 @@ def update_version_files(semver: str, calver_date: str):
     # Python package version. The desktop About panel reads the live Hermes
     # version at runtime, but app.getVersion()/packaging metadata still come
     # from this field, so it must track pyproject to avoid drift.
-    desktop_pkg = REPO_ROOT / "apps" / "desktop" / "package.json"
     if desktop_pkg.exists():
         pkg_text = desktop_pkg.read_text(encoding="utf-8")
         pkg_text = re.sub(
@@ -2063,6 +2295,12 @@ def update_version_files(semver: str, calver_date: str):
             count=1,
         )
         desktop_pkg.write_text(pkg_text, encoding="utf-8")
+
+        if lock is not None and desktop_lock is not None:
+            desktop_lock["version"] = semver
+            root_lock.write_text(
+                json.dumps(lock, indent=2) + "\n", encoding="utf-8"
+            )
 
     # Update ACP Registry manifest + npm launcher (must stay version-locked
     # with pyproject — enforced by tests/acp/test_registry_manifest.py).
@@ -2088,28 +2326,508 @@ def _update_acp_registry_versions(semver: str) -> None:
         )
 
 
-def build_release_artifacts(semver: str) -> list[Path]:
-    """Build sdist/wheel artifacts for the current release.
+def _version_bump_files() -> list[Path]:
+    """Return every version file changed by ``update_version_files``."""
+    files = [VERSION_FILE, PYPROJECT_FILE]
+    if ACP_REGISTRY_MANIFEST.exists():
+        files.append(ACP_REGISTRY_MANIFEST)
+    desktop_package = REPO_ROOT / "apps" / "desktop" / "package.json"
+    if desktop_package.exists():
+        files.append(desktop_package)
+        root_lock = REPO_ROOT / "package-lock.json"
+        if root_lock.exists():
+            files.append(root_lock)
+    return files
+
+
+def _release_files_match(semver: str, calver_date: str) -> bool:
+    """Prove the checked-out version metadata is one coherent release bump."""
+    try:
+        version_text = VERSION_FILE.read_text(encoding="utf-8")
+        version_match = re.search(r'__version__\s*=\s*"([^"]+)"', version_text)
+        date_match = re.search(
+            r'__release_date__\s*=\s*"([^"]+)"', version_text
+        )
+        if (
+            version_match is None
+            or version_match.group(1) != semver
+            or date_match is None
+            or date_match.group(1) != calver_date
+        ):
+            return False
+
+        pyproject_text = PYPROJECT_FILE.read_text(encoding="utf-8")
+        project_version = re.search(
+            r'^version\s*=\s*"([^"]+)"', pyproject_text, flags=re.MULTILINE
+        )
+        if project_version is None or project_version.group(1) != semver:
+            return False
+
+        desktop_package = REPO_ROOT / "apps" / "desktop" / "package.json"
+        if desktop_package.exists():
+            package = json.loads(desktop_package.read_text(encoding="utf-8"))
+            if package.get("version") != semver:
+                return False
+            root_lock = REPO_ROOT / "package-lock.json"
+            if root_lock.exists():
+                lock = json.loads(root_lock.read_text(encoding="utf-8"))
+                desktop_lock = lock.get("packages", {}).get("apps/desktop")
+                if (
+                    not isinstance(desktop_lock, dict)
+                    or desktop_lock.get("version") != semver
+                ):
+                    return False
+
+        if ACP_REGISTRY_MANIFEST.exists():
+            manifest = json.loads(
+                ACP_REGISTRY_MANIFEST.read_text(encoding="utf-8")
+            )
+            if manifest.get("version") != semver:
+                return False
+            package_pin = (
+                manifest.get("distribution", {}).get("uvx", {}).get("package")
+            )
+            if package_pin != f"hermes-agent[acp]=={semver}":
+                return False
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _resumable_release_bump(
+    *, current_version: str, requested_date: str, bump: str | None
+) -> str | None:
+    """Return the prior bump's CalVer when HEAD is exactly our bump commit."""
+    if bump is None:
+        return None
+    try:
+        version_text = VERSION_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    date_match = re.search(
+        r'__release_date__\s*=\s*"([^"]+)"', version_text
+    )
+    if date_match is None:
+        return None
+    calver_date = date_match.group(1)
+    if re.fullmatch(
+        rf"{re.escape(requested_date)}(?:\.(?:[2-9]|[1-9]\d+))?", calver_date
+    ) is None:
+        return None
+
+    expected_subject = (
+        f"chore: bump version to v{current_version} ({calver_date})"
+    )
+    subject = git_result("show", "-s", "--format=%s", "HEAD")
+    if subject.returncode != 0 or subject.stdout.strip() != expected_subject:
+        return None
+
+    try:
+        version_path = VERSION_FILE.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return None
+    parent_version_file = git_result("show", f"HEAD^:{version_path}")
+    if parent_version_file.returncode != 0:
+        return None
+    parent_match = re.search(
+        r'__version__\s*=\s*"([^"]+)"', parent_version_file.stdout
+    )
+    if parent_match is None:
+        return None
+    try:
+        if bump_version(parent_match.group(1), bump) != current_version:
+            return None
+    except (ValueError, TypeError):
+        return None
+
+    changed = git_result(
+        "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"
+    )
+    if changed.returncode != 0:
+        return None
+    try:
+        expected_paths = {
+            path.relative_to(REPO_ROOT).as_posix() for path in _version_bump_files()
+        }
+    except ValueError:
+        return None
+    changed_paths = {line for line in changed.stdout.splitlines() if line}
+    if changed_paths != expected_paths:
+        return None
+    if not _release_files_match(current_version, calver_date):
+        return None
+    return calver_date
+
+
+def _matching_annotated_tag_at_head(tag_name: str) -> bool | None:
+    """Return True for a matching annotated tag, False if absent, None if unsafe."""
+    target_ref = f"refs/tags/{tag_name}"
+    exists = git_result("show-ref", "--verify", "--quiet", target_ref)
+    if exists.returncode == 1:
+        return False
+    if exists.returncode != 0:
+        print(f"  ✗ Could not inspect existing tag {tag_name}.")
+        return None
+    object_type = git_result("cat-file", "-t", target_ref)
+    tag_commit = git_result("rev-parse", "--verify", f"{target_ref}^{{commit}}")
+    head_commit = git_result("rev-parse", "--verify", "HEAD")
+    if (
+        object_type.returncode != 0
+        or object_type.stdout.strip() != "tag"
+        or tag_commit.returncode != 0
+        or head_commit.returncode != 0
+        or tag_commit.stdout.strip() != head_commit.stdout.strip()
+    ):
+        print(
+            f"  ✗ Refusing to reuse {tag_name}: it is not an annotated tag "
+            "pointing at the exact release commit."
+        )
+        return None
+    return True
+
+
+def _matching_remote_annotated_tag_at_head(tag_name: str) -> bool | None:
+    """Return True for the exact remote tag, False if absent, None if unsafe.
+
+    A resumed release may run after another commit advanced the remote branch.
+    Re-pushing the older release HEAD then fails as non-fast-forward even when
+    the first attempt already published the exact annotated tag.  A peeled
+    ``ls-remote`` pair is sufficient immutable proof: only that exact remote
+    tag permits skipping the branch/tag push.  Lightweight, malformed,
+    mismatched, or unreadable remote state fails closed.
+    """
+    target_ref = f"refs/tags/{tag_name}"
+    peeled_ref = f"{target_ref}^{{}}"
+    result = git_result(
+        "ls-remote",
+        "--tags",
+        "origin",
+        target_ref,
+        peeled_ref,
+    )
+    if result.returncode != 0:
+        print(
+            f"  ✗ Could not inspect remote tag {tag_name}: "
+            f"{result.stderr.strip() or 'git ls-remote failed'}"
+        )
+        return None
+
+    rows: dict[str, str] = {}
+    for line in (result.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            print(f"  ✗ Refusing to reuse remote tag {tag_name}: malformed remote response.")
+            return None
+        object_id, ref = fields
+        normalized = object_id.lower()
+        if (
+            ref not in {target_ref, peeled_ref}
+            or re.fullmatch(r"[0-9a-f]{40,64}", normalized) is None
+            or ref in rows
+        ):
+            print(f"  ✗ Refusing to reuse remote tag {tag_name}: malformed remote response.")
+            return None
+        rows[ref] = normalized
+
+    if not rows:
+        return False
+
+    if set(rows) != {target_ref, peeled_ref}:
+        print(
+            f"  ✗ Refusing to reuse remote tag {tag_name}: it is not an "
+            "annotated tag pointing at the exact release commit."
+        )
+        return None
+
+    local_tag = git_result("rev-parse", "--verify", target_ref)
+    local_tag_id = (local_tag.stdout or "").strip().lower()
+    head = _current_release_head()
+    if (
+        local_tag.returncode != 0
+        or re.fullmatch(r"[0-9a-f]{40,64}", local_tag_id) is None
+        or head is None
+        or rows[target_ref] != local_tag_id
+        or rows[peeled_ref] != head
+    ):
+        print(
+            f"  ✗ Refusing to reuse remote tag {tag_name}: it is not an "
+            "annotated tag pointing at the exact release commit."
+        )
+        return None
+    return True
+
+
+def _load_opentui_release_helpers():
+    """Load OpenTUI release helpers lazily.
+
+    ``scripts/release.py`` is also used for changelog-only invocations. Keep the
+    CLI's heavier imports off that path while sharing the exact Node selector,
+    npm pairing, transactional builder, and subprocess runner used at launch and
+    update time.
+    """
+    from hermes_cli import main as hermes_main
+    from hermes_cli import opentui_runtime
+
+    return opentui_runtime, hermes_main
+
+
+def _clear_release_dist() -> bool:
+    """Remove prior Python artifacts and prove the output path is empty."""
+    dist_dir = REPO_ROOT / "dist"
+    if dist_dir.is_symlink():
+        print("  ⚠ Refusing to build release artifacts through a dist symlink.")
+        return False
+    try:
+        shutil.rmtree(dist_dir)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"  ⚠ Could not clear prior release artifacts: {exc}")
+        return False
+    if dist_dir.exists() or dist_dir.is_symlink():
+        print("  ⚠ Prior release artifacts remain after dist cleanup; refusing build.")
+        return False
+    return True
+
+
+def _with_prepared_opentui_release_bundle(action):
+    """Force-build the source OpenTUI seed, then run *action* under its lock.
+
+    Release artifacts are allowed to contain only an immutable seed (not the
+    host-specific ``node_modules`` tree), so ``dist/main.js`` must be rebuilt
+    from the checked-in inputs before the Python build snapshots the tree. The
+    selected Node, paired npm CLI, native dependency validation, and staged
+    promotion all come from the production runtime helpers. Keeping the lock
+    through *action* makes the validated bundle and the packaged bundle one
+    coherent snapshot.
+    """
+    app_dir = REPO_ROOT / "ui-opentui"
+    try:
+        runtime, hermes_main = _load_opentui_release_helpers()
+    except Exception as exc:
+        print(f"  ⚠ Could not load OpenTUI release build helpers: {exc}")
+        return None
+
+    node = hermes_main._node26_bin_or_none()
+    if node is None:
+        print(
+            "  ⚠ Node.js >= 26.3.0 is required to build release artifacts "
+            "with the OpenTUI bundle."
+        )
+        return None
+
+    identity = hermes_main._opentui_node_identity(node, report_error=False)
+    if identity is None:
+        print(
+            "  ⚠ Could not verify the selected Node 26 runtime identity; "
+            "refusing to build release artifacts."
+        )
+        return None
+
+    npm = runtime.npm_command(node)
+    if npm is None:
+        print(
+            "  ⚠ npm paired with the selected Node 26 installation was not "
+            "found; refusing to build release artifacts."
+        )
+        return None
+
+    env = runtime.build_environment(node)
+    action_started = False
+    try:
+        with runtime.refresh_lock(app_dir):
+            # Serialize cleanup and packaging as well as the JS promotion. A
+            # concurrent release must not delete or replace dist/ between the
+            # seed validation and the archive payload check.
+            if not _clear_release_dist():
+                return None
+
+            # Re-probe under the same lock that protects promotion. This mirrors
+            # launch/update and prevents a replaced Node binary from authorizing
+            # a bundle for the wrong native package.
+            locked_identity = hermes_main._opentui_node_identity(
+                node, report_error=False
+            )
+            if locked_identity is None or locked_identity != identity:
+                print(
+                    "  ⚠ The selected Node 26 runtime changed while preparing "
+                    "the OpenTUI release bundle."
+                )
+                return None
+            identity = locked_identity
+
+            runtime.recover_interrupted_promotion(app_dir)
+            inspection = runtime.inspect_runtime(
+                app_dir,
+                identity,
+                rebuild_requested=True,
+                env=env,
+            )
+            if inspection.dependency_refresh_required:
+                success, result = runtime.refresh_runtime(
+                    app_dir,
+                    identity=identity,
+                    npm=npm,
+                    env=env,
+                    runner=hermes_main._run_with_idle_timeout,
+                )
+            else:
+                success, result = runtime.build_bundle(
+                    app_dir,
+                    npm=npm,
+                    env=env,
+                    runner=hermes_main._run_with_idle_timeout,
+                )
+
+            if not success:
+                print("  ⚠ OpenTUI release bundle build failed.")
+                preview = runtime.failure_preview(result)
+                if preview:
+                    print(preview)
+                return None
+
+            bundle = app_dir / "dist" / "main.js"
+            try:
+                bundle_is_nonempty = bundle.is_file() and bundle.stat().st_size > 0
+            except OSError:
+                bundle_is_nonempty = False
+            seed = runtime.packaged_seed(app_dir) if bundle_is_nonempty else None
+            if seed is None or not runtime.runtime_sentinels_current(
+                app_dir, identity
+            ):
+                print(
+                    "  ⚠ Built OpenTUI seed or selected native runtime failed "
+                    "validation; refusing to build release artifacts."
+                )
+                return None
+
+            print("  ✓ OpenTUI production bundle rebuilt and validated")
+            action_started = True
+            return action(hermes_main._run_with_idle_timeout, seed.bundle_digest)
+    except Exception as exc:
+        if action_started:
+            raise
+        print(f"  ⚠ OpenTUI release bundle preparation failed: {exc}")
+        return None
+
+
+def _archive_payload_digest(handle, expected_size: int) -> str | None:
+    """Stream one archive member to EOF and return its SHA-256 digest."""
+    if expected_size <= 0:
+        return None
+    digest = hashlib.sha256()
+    remaining = expected_size
+    while remaining:
+        chunk = handle.read(min(1024 * 1024, remaining))
+        if not chunk:
+            return None
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if handle.read(1) != b"":
+        return None
+    return digest.hexdigest()
+
+
+def _artifact_has_opentui_bundle(
+    artifact: Path, expected_bundle_digest: str
+) -> bool:
+    """Whether a wheel/sdist contains the exact validated OpenTUI bundle."""
+    member_suffix = "ui-opentui/dist/main.js"
+    try:
+        if artifact.suffix == ".whl":
+            with zipfile.ZipFile(artifact) as archive:
+                info = archive.getinfo(member_suffix)
+                with archive.open(info) as handle:
+                    return (
+                        _archive_payload_digest(handle, info.file_size)
+                        == expected_bundle_digest
+                    )
+        if artifact.name.endswith(".tar.gz"):
+            with tarfile.open(artifact, mode="r:gz") as archive:
+                for member in archive.getmembers():
+                    normalized = member.name.replace("\\", "/")
+                    if normalized.endswith(f"/{member_suffix}"):
+                        handle = archive.extractfile(member) if member.isfile() else None
+                        if handle is None:
+                            return False
+                        with handle:
+                            return (
+                                _archive_payload_digest(handle, member.size)
+                                == expected_bundle_digest
+                            )
+    except (
+        EOFError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        tarfile.TarError,
+        zipfile.BadZipFile,
+    ):
+        return False
+    return False
+
+
+def _release_artifacts_have_opentui_bundle(
+    artifacts: list[Path], expected_bundle_digest: str
+) -> bool:
+    """Require one wheel + one sdist containing the locked source bundle."""
+    wheels = [artifact for artifact in artifacts if artifact.suffix == ".whl"]
+    sdists = [artifact for artifact in artifacts if artifact.name.endswith(".tar.gz")]
+    return (
+        len(artifacts) == 2
+        and len(wheels) == 1
+        and len(sdists) == 1
+        and all(
+            _artifact_has_opentui_bundle(artifact, expected_bundle_digest)
+            for artifact in artifacts
+        )
+    )
+
+
+def _is_target_release_wheel(name: str, semver: str) -> bool:
+    """Match PEP 427's optional build tag plus three required wheel tags."""
+    pattern = re.compile(
+        rf"^hermes_agent-{re.escape(semver)}-"
+        rf"(?:[0-9][^-]*-)?[^-]+-[^-]+-[^-]+\.whl$"
+    )
+    return pattern.fullmatch(name) is not None
+
+
+def _build_python_release_artifacts(
+    semver: str,
+    *,
+    runner,
+    expected_bundle_digest: str,
+) -> list[Path]:
+    """Build and validate sdist/wheel artifacts for the current release.
 
     Tries ``uv build`` first (matching the CI workflow), falls back to
     ``python -m build`` if uv is unavailable.
     """
     dist_dir = REPO_ROOT / "dist"
-    shutil.rmtree(dist_dir, ignore_errors=True)
 
     # Prefer uv build (matches CI workflow), fall back to python -m build.
     uv_bin = shutil.which("uv")
     if uv_bin:
-        cmd = [uv_bin, "build", "--sdist", "--wheel"]
+        cmd = [
+            uv_bin,
+            "build",
+            "--sdist",
+            "--wheel",
+            "--clear",
+            "--no-build-logs",
+            "--no-create-gitignore",
+        ]
     else:
         cmd = [sys.executable, "-m", "build", "--sdist", "--wheel"]
 
-    result = subprocess.run(
-        cmd,
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = runner(cmd, cwd=REPO_ROOT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"  ⚠ Python release artifact build could not complete: {exc}")
+        _clear_release_dist()
+        return []
     if result.returncode != 0:
         print("  ⚠ Could not build Python release artifacts.")
         stderr = result.stderr.strip()
@@ -2119,14 +2837,61 @@ def build_release_artifacts(semver: str) -> list[Path]:
         elif stdout:
             print(f"    {stdout.splitlines()[-1]}")
         print("    Install uv or the 'build' package to attach sdist/wheel assets.")
+        _clear_release_dist()
         return []
 
-    artifacts = sorted(p for p in dist_dir.iterdir() if p.is_file())
-    matching = [p for p in artifacts if semver in p.name]
-    if not matching:
-        print("  ⚠ Built artifacts did not match the expected release version.")
+    try:
+        artifacts = sorted(p for p in dist_dir.iterdir() if p.is_file())
+    except OSError as exc:
+        print(f"  ⚠ Could not inspect built release artifacts: {exc}")
+        _clear_release_dist()
+        return []
+    wheels = [
+        artifact
+        for artifact in artifacts
+        if _is_target_release_wheel(artifact.name, semver)
+    ]
+    sdists = [
+        artifact
+        for artifact in artifacts
+        if artifact.name == f"hermes_agent-{semver}.tar.gz"
+    ]
+    matching = [*wheels, *sdists]
+    if len(artifacts) != 2 or len(wheels) != 1 or len(sdists) != 1:
+        print(
+            "  ⚠ Build did not produce exactly one target-version wheel and sdist; "
+            "discarding release artifacts."
+        )
+        _clear_release_dist()
+        return []
+    if not _release_artifacts_have_opentui_bundle(
+        matching, expected_bundle_digest
+    ):
+        print(
+            "  ⚠ Built wheel/sdist did not both contain the validated "
+            "ui-opentui/dist/main.js; discarding release artifacts."
+        )
+        _clear_release_dist()
         return []
     return matching
+
+
+def build_release_artifacts(semver: str) -> list[Path]:
+    """Build artifacts from one locked, validated OpenTUI seed snapshot."""
+    artifacts = _with_prepared_opentui_release_bundle(
+        lambda runner, bundle_digest: _build_python_release_artifacts(
+            semver,
+            runner=runner,
+            expected_bundle_digest=bundle_digest,
+        )
+    )
+    if artifacts is None:
+        print(
+            "  ⚠ Python release artifacts were not built because the required "
+            "OpenTUI bundle could not be verified."
+        )
+        return []
+    return artifacts
 
 
 def resolve_author(name: str, email: str) -> str:
@@ -2218,12 +2983,12 @@ def parse_coauthors(body: str) -> list:
     return results
 
 
-def get_commits(since_tag=None):
-    """Get commits since a tag (or all commits if None)."""
+def get_commits(since_tag=None, *, until_ref="HEAD"):
+    """Get commits through ``until_ref`` since a tag (or from repository root)."""
     if since_tag:
-        range_spec = f"{since_tag}..HEAD"
+        range_spec = f"{since_tag}..{until_ref}"
     else:
-        range_spec = "HEAD"
+        range_spec = until_ref
 
     # Format: hash<US>author_name<US>author_email<US>subject\0body
     # Using %x1f (unit separator) to avoid conflict with | in author names
@@ -2382,14 +3147,45 @@ def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/N
     return "\n".join(lines)
 
 
-def main():
+def _github_release_state(tag_name: str) -> tuple[bool, str] | None:
+    """Return ``(is_draft, url)`` when GitHub already has this release."""
+    command = [
+        "gh",
+        "release",
+        "view",
+        tag_name,
+        "--json",
+        "isDraft,url",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            timeout=60,
+        )
+        if result.returncode != 0:
+            return None
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    if not isinstance(payload.get("isDraft"), bool):
+        return None
+    url = payload.get("url")
+    if not isinstance(url, str) or not url:
+        return None
+    return payload["isDraft"], url
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Hermes Agent Release Tool")
     parser.add_argument("--bump", choices=["major", "minor", "patch"],
                         help="Which semver component to bump")
     parser.add_argument("--publish", action="store_true",
                         help="Actually create the tag and GitHub release (otherwise dry run)")
-    parser.add_argument("--date", type=str,
-                        help="Override CalVer date (format: YYYY.M.D)")
+    parser.add_argument("--date", type=parse_release_date,
+                        help="Override CalVer date (real 20xx date: YYYY.M.D)")
     parser.add_argument("--first-release", action="store_true",
                         help="Mark as first release (no previous tag expected)")
     parser.add_argument("--output", type=str,
@@ -2398,37 +3194,80 @@ def main():
 
     # Determine CalVer date
     if args.date:
-        calver_date = args.date
+        requested_date = args.date
     else:
         now = datetime.now()
-        calver_date = f"{now.year}.{now.month}.{now.day}"
-
-    base_tag = f"v{calver_date}"
-    tag_name, calver_date = next_available_tag(base_tag)
-    if tag_name != base_tag:
-        print(f"Note: Tag {base_tag} already exists, using {tag_name}")
+        requested_date = f"{now.year}.{now.month}.{now.day}"
 
     # Determine semver
     current_version = get_current_version()
-    if args.bump:
-        new_version = bump_version(current_version, args.bump)
+    resumed_calver = None
+    no_bump_state = None
+    state_present = False
+    if args.publish and args.bump is None:
+        state_present, no_bump_state = _load_no_bump_release_state(
+            requested_date=requested_date,
+            current_version=current_version,
+            first_release=args.first_release,
+        )
+        if state_present and no_bump_state is None:
+            print(
+                f"    Inspect {_release_state_path()} and remove it only if you "
+                "are intentionally abandoning that release attempt."
+            )
+            return 1
+    if args.publish and args.bump is not None:
+        resumed_calver = _resumable_release_bump(
+            current_version=current_version,
+            requested_date=requested_date,
+            bump=args.bump,
+        )
+    if no_bump_state is not None:
+        calver_date = no_bump_state["calver"]
+        tag_name = no_bump_state["tag"]
+        new_version = current_version
+        print(
+            f"Note: Resuming exact no-bump release v{new_version} "
+            f"({calver_date}) at {no_bump_state['head'][:12]}."
+        )
+    elif resumed_calver is not None:
+        calver_date = resumed_calver
+        tag_name = f"v{calver_date}"
+        new_version = current_version
+        print(
+            f"Note: Resuming exact release bump v{new_version} ({calver_date}) "
+            "from HEAD."
+        )
     else:
+        base_tag = f"v{requested_date}"
+        tag_name, calver_date = next_available_tag(base_tag)
+        if tag_name != base_tag:
+            print(f"Note: Tag {base_tag} already exists, using {tag_name}")
+
+    if resumed_calver is None and args.bump:
+        new_version = bump_version(current_version, args.bump)
+    elif resumed_calver is None:
         new_version = current_version
 
+    resumed_attempt = resumed_calver is not None or no_bump_state is not None
+
     # Get previous tag
-    prev_tag = get_last_tag()
+    prev_tag = get_last_tag(exclude=tag_name if resumed_attempt else None)
     if not prev_tag and not args.first_release:
         print("No previous tags found. Use --first-release for the initial release.")
         print(f"Would create tag: {tag_name}")
         print(f"Would set version: {new_version}")
-        return
+        return 1 if args.publish else 0
 
     # Get commits
-    commits = get_commits(since_tag=prev_tag)
+    # A retry runs on the generated bump commit. Keep that mechanical commit
+    # out of the notes so a retained first-attempt .release_notes.md stays exact.
+    changelog_tip = "HEAD^" if resumed_calver is not None else "HEAD"
+    commits = get_commits(since_tag=prev_tag, until_ref=changelog_tip)
     if not commits:
         print("No new commits since last tag.")
         if not args.first_release:
-            return
+            return 1 if args.publish else 0
 
     print(f"{'='*60}")
     print("  Hermes Agent Release Preview")
@@ -2460,98 +3299,264 @@ def main():
         print("  Publishing release...")
         print(f"{'='*60}")
 
+        retry_scratch = frozenset()
+        changelog_file = REPO_ROOT / ".release_notes.md"
+        if no_bump_state is not None:
+            retry_scratch = frozenset({RELEASE_STATE_FILENAME})
+        if resumed_attempt and not changelog_file.is_symlink():
+            try:
+                notes_are_exact = (
+                    changelog_file.is_file()
+                    and changelog_file.read_text(encoding="utf-8") == changelog
+                )
+            except OSError:
+                notes_are_exact = False
+            if notes_are_exact:
+                retry_scratch = retry_scratch | {".release_notes.md"}
+
+        if not _release_worktree_is_clean(
+            phase="before release preparation", allowed_untracked=retry_scratch
+        ):
+            if no_bump_state is not None:
+                _print_no_bump_release_recovery(
+                    requested_date=requested_date, first_release=args.first_release
+                )
+            return 1
+
         # Update version files
-        if args.bump:
+        if args.bump and resumed_calver is None:
             update_version_files(new_version, calver_date)
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
 
             # Commit version bump
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
-            if ACP_REGISTRY_MANIFEST.exists():
-                add_files.append(str(ACP_REGISTRY_MANIFEST))
+            add_files = [str(path) for path in _version_bump_files()]
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
-                return
+                return 1
 
             commit_result = git_result(
                 "commit", "-m", f"chore: bump version to v{new_version} ({calver_date})"
             )
             if commit_result.returncode != 0:
                 print(f"  ✗ Failed to commit version bump: {commit_result.stderr.strip()}")
-                return
+                return 1
             print("  ✓ Committed version bump")
 
-        # Create annotated tag
-        tag_result = git_result(
-            "tag", "-a", tag_name, "-m",
-            f"Hermes Agent v{new_version} ({calver_date})\n\nWeekly release"
-        )
-        if tag_result.returncode != 0:
-            print(f"  ✗ Failed to create tag {tag_name}: {tag_result.stderr.strip()}")
-            return
-        print(f"  ✓ Created tag {tag_name}")
-
-        # Push
-        push_result = git_result("push", "origin", "HEAD", "--tags")
-        if push_result.returncode == 0:
-            print("  ✓ Pushed to origin")
-        else:
-            print(f"  ✗ Failed to push to origin: {push_result.stderr.strip()}")
-            print("    Continue manually after fixing access:")
-            print("    git push origin HEAD --tags")
-
-        # Build semver-named Python artifacts so downstream packagers
-        # (e.g. Homebrew) can target them without relying on CalVer tag names.
+        # Build semver-named Python artifacts before creating/pushing the tag so
+        # a missing Node/native bundle cannot leave an orphaned public release.
+        # Downstream packagers (e.g. Homebrew) rely on these exact assets.
         artifacts = build_release_artifacts(new_version)
         if artifacts:
             print("  ✓ Built release artifacts:")
             for artifact in artifacts:
                 print(f"    - {artifact.relative_to(REPO_ROOT)}")
+        else:
+            print(
+                "  ✗ Refusing to publish: OpenTUI-bundled wheel/sdist "
+                "could not be produced."
+            )
+            if no_bump_state is not None:
+                _print_no_bump_release_recovery(
+                    requested_date=requested_date, first_release=args.first_release
+                )
+            return 1
 
-        # Create GitHub release
-        changelog_file = REPO_ROOT / ".release_notes.md"
+        if not _release_worktree_is_clean(
+            phase="after artifact preflight", allowed_untracked=retry_scratch
+        ):
+            if no_bump_state is not None:
+                _print_no_bump_release_recovery(
+                    requested_date=requested_date, first_release=args.first_release
+                )
+            return 1
+
+        if args.bump is None and no_bump_state is None:
+            no_bump_state = _write_no_bump_release_state(
+                tag_name=tag_name,
+                calver_date=calver_date,
+                current_version=current_version,
+                first_release=args.first_release,
+            )
+            if no_bump_state is None:
+                return 1
+        elif no_bump_state is not None:
+            state_still_present, refreshed_state = _load_no_bump_release_state(
+                requested_date=requested_date,
+                current_version=current_version,
+                first_release=args.first_release,
+            )
+            if not state_still_present or refreshed_state != no_bump_state:
+                print("  ✗ Release attempt state changed during artifact preparation.")
+                _print_no_bump_release_recovery(
+                    requested_date=requested_date, first_release=args.first_release
+                )
+                return 1
+            no_bump_state = refreshed_state
+
+        # Create annotated tag
+        existing_tag = False
+        if resumed_attempt:
+            existing_tag = _matching_annotated_tag_at_head(tag_name)
+            if existing_tag is None:
+                if no_bump_state is not None:
+                    _print_no_bump_release_recovery(
+                        requested_date=requested_date, first_release=args.first_release
+                    )
+                return 1
+        if existing_tag:
+            print(f"  ✓ Reusing annotated tag {tag_name} at HEAD")
+        else:
+            tag_result = git_result(
+                "tag", "-a", tag_name, "-m",
+                f"Hermes Agent v{new_version} ({calver_date})\n\nWeekly release"
+            )
+            if tag_result.returncode != 0:
+                print(
+                    f"  ✗ Failed to create tag {tag_name}: "
+                    f"{tag_result.stderr.strip()}"
+                )
+                if no_bump_state is not None:
+                    _print_no_bump_release_recovery(
+                        requested_date=requested_date, first_release=args.first_release
+                    )
+                return 1
+            print(f"  ✓ Created tag {tag_name}")
+
+        target_ref = f"refs/tags/{tag_name}"
+        remote_tag_at_head = False
+        if resumed_attempt:
+            remote_tag_at_head = _matching_remote_annotated_tag_at_head(tag_name)
+            if remote_tag_at_head is None:
+                if no_bump_state is not None:
+                    _print_no_bump_release_recovery(
+                        requested_date=requested_date,
+                        first_release=args.first_release,
+                    )
+                return 1
+
+        if remote_tag_at_head:
+            print(f"  ✓ Remote annotated tag {tag_name} already points at HEAD")
+        else:
+            # Publish exactly the release commit and target tag as one
+            # transaction. A broad --tags push can leak unrelated local tags; a
+            # non-atomic push can start CI for the tag even when the branch
+            # update was rejected. A resumed attempt reaches this path only when
+            # the remote tag is absent, so remote branch divergence still fails
+            # closed through Git's normal non-fast-forward rejection.
+            push_result = git_result("push", "--atomic", "origin", "HEAD", target_ref)
+            if push_result.returncode == 0:
+                print("  ✓ Pushed to origin")
+            else:
+                print(f"  ✗ Failed to push to origin: {push_result.stderr.strip()}")
+                print("    Continue manually after fixing access:")
+                print(f"    git push --atomic origin HEAD {target_ref}")
+                # `gh release create <tag>` can create a missing remote tag at
+                # the repository's default branch. Never continue after the
+                # exact release commit/tag failed to reach origin, or the public
+                # release may point at a different commit than the artifacts.
+                if no_bump_state is not None:
+                    _print_no_bump_release_recovery(
+                        requested_date=requested_date,
+                        first_release=args.first_release,
+                    )
+                return 1
+
+        # Create an unpublished shell only. CI attaches the exact wheel/sdist
+        # that passed every host-native gate, signs them, then publishes the
+        # draft. Local preflight artifacts are never exposed to users.
         changelog_file.write_text(changelog, encoding="utf-8")
 
         gh_cmd = [
             "gh", "release", "create", tag_name,
             "--title", f"Hermes Agent v{new_version} ({calver_date})",
             "--notes-file", str(changelog_file),
+            "--draft",
+            "--verify-tag",
         ]
-        gh_cmd.extend(str(path) for path in artifacts)
-
         gh_bin = shutil.which("gh")
-        if gh_bin:
-            result = subprocess.run(
-                gh_cmd,
-                capture_output=True, text=True,
-                cwd=str(REPO_ROOT),
-            )
+        gh_error = None
+        existing_release = (
+            _github_release_state(tag_name)
+            if gh_bin and resumed_attempt
+            else None
+        )
+        result = None
+        if gh_bin and existing_release is None:
+            try:
+                result = subprocess.run(
+                    gh_cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(REPO_ROOT),
+                    timeout=120,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                result = None
+                gh_error = str(exc)
         else:
             result = None
 
-        if result and result.returncode == 0:
-            changelog_file.unlink(missing_ok=True)
-            print(f"  ✓ GitHub release created: {result.stdout.strip()}")
-            print(f"\n  🎉 Release v{new_version} ({tag_name}) published!")
+        if existing_release is None and result is None and gh_bin:
+            existing_release = _github_release_state(tag_name)
+        elif existing_release is None and result and result.returncode != 0:
+            existing_release = _github_release_state(tag_name)
+
+        if existing_release is not None or (result and result.returncode == 0):
+            try:
+                changelog_file.unlink(missing_ok=True)
+                if args.bump is None:
+                    _release_state_path().unlink(missing_ok=True)
+            except OSError as exc:
+                print(
+                    "  ✗ Release exists, but local recovery scratch could not "
+                    f"be removed: {exc}. Retry the same command to reconcile."
+                )
+                return 1
+            release_url = existing_release[1] if existing_release else result.stdout.strip()
+            action = "reused" if existing_release else "created"
+            print(f"  ✓ GitHub release {action}: {release_url}")
+            if existing_release is not None and not existing_release[0]:
+                print(
+                    f"\n  ✓ Release v{new_version} ({tag_name}) was already published."
+                )
+            else:
+                print(
+                    f"\n  ✓ Release v{new_version} ({tag_name}) is awaiting "
+                    "CI verification."
+                )
+                if resumed_attempt:
+                    print("    If the original tag workflow already timed out, restart it:")
+                    print(
+                        f"    gh workflow run upload_to_pypi.yml -f confirm_tag={tag_name}"
+                    )
+            return 0
         else:
             if result is None:
-                print("  ✗ GitHub release skipped: `gh` CLI not found.")
+                if gh_error:
+                    print(f"  ✗ GitHub draft release failed: {gh_error}")
+                else:
+                    print("  ✗ GitHub draft release skipped: `gh` CLI not found.")
             else:
-                print(f"  ✗ GitHub release failed: {result.stderr.strip()}")
+                print(f"  ✗ GitHub draft release failed: {result.stderr.strip()}")
             print(f"    Release notes kept at: {changelog_file}")
-            print("    Tag was created locally. Create the release manually:")
+            if args.bump is None:
+                _print_no_bump_release_recovery(
+                    requested_date=requested_date, first_release=args.first_release
+                )
+            print("    Tag was pushed. Create the draft release manually:")
             print(
                 f"    gh release create {tag_name} --title 'Hermes Agent v{new_version} ({calver_date})' "
-                f"--notes-file .release_notes.md {' '.join(str(path) for path in artifacts)}"
+                "--notes-file .release_notes.md --draft --verify-tag"
             )
-            print(f"\n  ✓ Release artifacts prepared for manual publish: v{new_version} ({tag_name})")
+            return 1
     else:
         print(f"\n{'='*60}")
         print("  Dry run complete. To publish, add --publish")
         print("  Example: python scripts/release.py --bump minor --publish")
         print(f"{'='*60}")
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

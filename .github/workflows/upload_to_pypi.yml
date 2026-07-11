@@ -1,11 +1,11 @@
 name: Publish to PyPI
 
-# Triggered by CalVer tag pushes from scripts/release.py (e.g. v2026.5.15)
-# Can also be triggered manually from the Actions tab as an escape hatch.
+# Triggered by CalVer tag pushes from scripts/release.py (e.g. v2026.5.15).
+# A manual dispatch is an escape hatch, but it must name an existing tag.
 on:
   push:
     tags:
-      - "v20*" # CalVer tags: v2026.5.15, v2026.5.15.2, etc.
+      - "v20*"
   workflow_dispatch:
     inputs:
       confirm_tag:
@@ -13,34 +13,80 @@ on:
         required: true
         type: string
 
-# Restrict default token to read-only; each job escalates as needed.
 permissions:
   contents: read
 
-# Prevent overlapping publishes (e.g. two same-day tags pushed quickly).
 concurrency:
   group: pypi-publish
   cancel-in-progress: false
 
 jobs:
+  validate-source:
+    name: Validate immutable release source
+    runs-on: ubuntu-latest
+    outputs:
+      release_sha: ${{ steps.source.outputs.release_sha }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ inputs.confirm_tag != '' && format('refs/tags/{0}', inputs.confirm_tag) || github.ref }}
+
+      - name: Validate CalVer tag and dereferenced commit
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.confirm_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v20[0-9]{2}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$ ]]; then
+            echo "::error::Tag '$RELEASE_TAG' is not a valid Hermes CalVer tag"
+            exit 1
+          fi
+          python3 - "$RELEASE_TAG" <<'PY'
+          import datetime
+          import sys
+
+          tag = sys.argv[1]
+          try:
+              year, month, day = map(int, tag.removeprefix("v").split(".")[:3])
+              datetime.date(year, month, day)
+          except (TypeError, ValueError):
+              print(f"::error::Tag '{tag}' is not a real calendar date", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]; then
+            echo "::error::Release push ref '$GITHUB_REF' does not match tag '$RELEASE_TAG'"
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "::error::Tag '$RELEASE_TAG' is not present in the checkout"
+            exit 1
+          fi
+          release_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          checkout_sha="$(git rev-parse HEAD)"
+          if [ "$release_sha" != "$checkout_sha" ]; then
+            echo "::error::Checked-out source $checkout_sha does not match $RELEASE_TAG ($release_sha)"
+            exit 1
+          fi
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
+
   build:
-    name: Build distribution 📦
+    name: Build distribution
+    needs: validate-source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          # On workflow_dispatch, check out the confirmed tag.
-          ref: ${{ inputs.confirm_tag || github.ref }}
-          fetch-tags: true
+          ref: ${{ needs.validate-source.outputs.release_sha }}
 
-      - name: Validate tag exists
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          if ! git tag -l "${{ inputs.confirm_tag }}" | grep -q .; then
-            echo "::error::Tag '${{ inputs.confirm_tag }}' does not exist in the repo"
-            exit 1
-          fi
+      - name: Pin reproducible build epoch to release commit
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -50,16 +96,26 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
 
-      - name: Set up Node.js
+      - name: Set up Node.js 26.3
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          node-version: "26.3.0"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui-opentui/package-lock.json
 
       - name: Build web dashboard
         run: cd web && npm ci && npm run build
 
       - name: Build TUI bundle
         run: cd ui-tui && npm ci && npm run build
+
+      - name: Build portable OpenTUI seed
+        run: |
+          cd ui-opentui
+          npm ci --include=dev --no-audit --no-fund --progress=false
+          npm run build
 
       - name: Bundle TUI into hermes_cli
         run: |
@@ -70,6 +126,18 @@ jobs:
         run: |
           test -f hermes_cli/web_dist/index.html || { echo "ERROR: web_dist not built"; exit 1; }
           test -f hermes_cli/tui_dist/entry.js || { echo "ERROR: tui_dist not built"; exit 1; }
+          test -s ui-opentui/dist/main.js || { echo "ERROR: OpenTUI dist/main.js not built"; exit 1; }
+          PYTHONPATH=. python - <<'PY'
+          import shutil
+          from pathlib import Path
+          from hermes_cli.opentui_runtime import probe_node_identity, runtime_payload_present
+
+          node = shutil.which("node")
+          assert node is not None
+          identity = probe_node_identity(node)
+          assert identity is not None
+          assert runtime_payload_present(Path("ui-opentui"), identity)
+          PY
 
       - name: Bundle install scripts into wheel
         run: |
@@ -80,85 +148,632 @@ jobs:
       - name: Build wheel and sdist
         run: uv build --sdist --wheel
 
-      - name: Upload distribution artifacts
+      - name: Verify complete portable artifacts in a clean venv
+        timeout-minutes: 10
+        env:
+          HERMES_RELEASE_ARTIFACT_DIR: ${{ github.workspace }}/dist
+        run: >-
+          uv run --isolated --no-project --with pytest==9.0.2
+          python -m pytest -q tests/test_opentui_release_artifacts.py
+
+      - name: Upload candidate distribution artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: python-package-distributions
+          name: candidate-python-package-distributions
           path: dist/
+          overwrite: true
 
-  publish:
-    name: Publish to PyPI
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/hermes-agent
-    permissions:
-      id-token: write # OIDC trusted publishing
-
-    steps:
-      - name: Download distribution artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: python-package-distributions
-          path: dist/
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
-        with:
-          skip-existing: true
-
-  sign:
-    name: Sign and attach to GitHub Release
-    # Only runs on tag pushes — release.py creates the GitHub Release,
-    # and workflow_dispatch won't have a matching release to attach to.
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: publish
+  stage-release-assets:
+    name: Establish immutable draft artifacts
+    needs: [validate-source, build]
     runs-on: ubuntu-latest
     permissions:
-      contents: write # attach assets to the existing release
-      id-token: write # sigstore signing
-
+      contents: write
+    outputs:
+      release_sha: ${{ steps.canonical.outputs.release_sha }}
+      release_tag: ${{ steps.canonical.outputs.release_tag }}
+    env:
+      RELEASE_SHA: ${{ needs.validate-source.outputs.release_sha }}
+      RELEASE_TAG: ${{ needs.validate-source.outputs.release_tag }}
     steps:
-      - name: Download distribution artifacts
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ needs.validate-source.outputs.release_sha }}
+
+      - name: Download candidate artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: python-package-distributions
-          path: dist/
+          name: candidate-python-package-distributions
+          path: candidate/
 
-      - name: Wait for GitHub Release to exist
+      - name: Wait for unpublished GitHub Release
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        # release.py creates the GitHub Release after pushing the tag,
-        # but this workflow starts from the tag push — wait for it.
         run: |
+          set -euo pipefail
           for i in $(seq 1 30); do
-            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "Release $GITHUB_REF_NAME found"
+            release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)"
+            if [ "$release_state" = "true" ]; then
+              echo "Draft release $RELEASE_TAG found"
               exit 0
             fi
-            echo "Waiting for release... ($i/30)"
+            if [ "$release_state" = "false" ]; then
+              echo "::error::Release $RELEASE_TAG was published before verification"
+              exit 1
+            fi
+            echo "Waiting for draft release... ($i/30)"
             sleep 10
           done
-          echo "::warning::Release $GITHUB_REF_NAME not found after 5 minutes — skipping signature upload"
-          echo "skip_sign=true" >> "$GITHUB_ENV"
+          echo "::error::Draft release $RELEASE_TAG not found after 5 minutes"
+          exit 1
+
+      - name: Freeze or recover canonical draft assets
+        id: canonical
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          current_tag_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          if [ "$current_tag_sha" != "$RELEASE_SHA" ]; then
+            echo "::error::Tag moved from $RELEASE_SHA to $current_tag_sha before asset staging"
+            exit 1
+          fi
+
+          wheels=(candidate/*.whl)
+          sdists=(candidate/*.tar.gz)
+          if [ "${#wheels[@]}" -ne 1 ] || [ "${#sdists[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one candidate wheel and one sdist"
+            exit 1
+          fi
+          wheel_name="$(basename "${wheels[0]}")"
+          sdist_name="$(basename "${sdists[0]}")"
+          manifest_name="hermes-release-${RELEASE_TAG#v}-manifest.json"
+          export MANIFEST_NAME="$manifest_name"
+          mkdir -p candidate-meta canonical-meta canonical/dist
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          files = sorted([*Path("candidate").glob("*.whl"), *Path("candidate").glob("*.tar.gz")])
+          if len(files) != 2:
+              raise SystemExit("expected exactly two candidate distributions")
+          assets = []
+          for path in files:
+              payload = path.read_bytes()
+              if not payload:
+                  raise SystemExit(f"empty candidate artifact: {path.name}")
+              assets.append({
+                  "name": path.name,
+                  "size": len(payload),
+                  "sha256": hashlib.sha256(payload).hexdigest(),
+              })
+          manifest = {
+              "schema": 1,
+              "tag": os.environ["RELEASE_TAG"],
+              "commit": os.environ["RELEASE_SHA"],
+              "assets": assets,
+          }
+          Path("candidate-meta", os.environ["MANIFEST_NAME"]).write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.id')"
+          assets_tsv="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" --jq '.[] | [.id, .name] | @tsv')"
+          manifest_count="$(printf '%s\n' "$assets_tsv" | awk -F '\t' -v name="$manifest_name" '$2 == name { count += 1 } END { print count + 0 }')"
+          if [ "$manifest_count" -gt 1 ]; then
+            echo "::error::Draft contains duplicate canonical manifests"
+            exit 1
+          fi
+
+          if [ "$manifest_count" -eq 1 ]; then
+            unexpected_distributions="$(printf '%s\n' "$assets_tsv" | awk -F '\t' -v wheel="$wheel_name" -v sdist="$sdist_name" '($2 ~ /\.whl$/ || $2 ~ /\.tar\.gz$/) && $2 != wheel && $2 != sdist { print $2 }')"
+            if [ -n "$unexpected_distributions" ]; then
+              echo "::error::Canonical draft contains unexpected distribution assets:"
+              printf '%s\n' "$unexpected_distributions"
+              exit 1
+            fi
+          fi
+
+          if [ "$manifest_count" -eq 0 ]; then
+            # Without a manifest no artifact pair is canonical yet. Clean any
+            # interrupted private upload, upload both distributions, then
+            # commit their identity by uploading the manifest last.
+            while IFS=$'\t' read -r asset_id asset_name; do
+              case "$asset_name" in
+                *.whl|*.tar.gz|*.sigstore.json)
+                  gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+                  ;;
+              esac
+            done <<< "$assets_tsv"
+            gh release upload "$RELEASE_TAG" "${wheels[0]}" "${sdists[0]}" --repo "$GITHUB_REPOSITORY"
+            gh release upload "$RELEASE_TAG" "candidate-meta/$manifest_name" --repo "$GITHUB_REPOSITORY"
+          fi
+
+          download_asset() {
+            local pattern="$1"
+            local destination="$2"
+            for attempt in $(seq 1 6); do
+              if gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$pattern" --dir "$destination" --clobber; then
+                return 0
+              fi
+              echo "Waiting for draft asset $pattern... ($attempt/6)"
+              sleep 5
+            done
+            return 1
+          }
+
+          download_asset "$manifest_name" canonical-meta
+          download_asset "$wheel_name" canonical/dist
+          download_asset "$sdist_name" canonical/dist
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(
+              Path("canonical-meta", os.environ["MANIFEST_NAME"]).read_text(encoding="utf-8")
+          )
+          if manifest.get("schema") != 1:
+              raise SystemExit("unsupported release manifest schema")
+          if manifest.get("tag") != os.environ["RELEASE_TAG"]:
+              raise SystemExit("canonical manifest tag mismatch")
+          if manifest.get("commit") != os.environ["RELEASE_SHA"]:
+              raise SystemExit("canonical manifest commit mismatch")
+
+          candidate_names = {
+              path.name
+              for pattern in ("*.whl", "*.tar.gz")
+              for path in Path("candidate").glob(pattern)
+          }
+          rows = manifest.get("assets")
+          if not isinstance(rows, list) or len(rows) != 2:
+              raise SystemExit("canonical manifest must contain two assets")
+          manifest_names = {row.get("name") for row in rows if isinstance(row, dict)}
+          if manifest_names != candidate_names:
+              raise SystemExit("canonical manifest filenames do not match this release")
+
+          canonical = {
+              path.name: path
+              for pattern in ("*.whl", "*.tar.gz")
+              for path in Path("canonical/dist").glob(pattern)
+          }
+          if set(canonical) != manifest_names:
+              raise SystemExit("downloaded canonical artifact set is incomplete")
+          for row in rows:
+              path = canonical[row["name"]]
+              payload = path.read_bytes()
+              if len(payload) != row.get("size"):
+                  raise SystemExit(f"canonical size mismatch: {path.name}")
+              if hashlib.sha256(payload).hexdigest() != row.get("sha256"):
+                  raise SystemExit(f"canonical digest mismatch: {path.name}")
+          PY
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload canonical distribution artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: canonical-python-package-distributions
+          path: canonical/dist/
+          overwrite: true
+
+  verify-opentui:
+    name: Verify canonical wheel (${{ matrix.platform }}-${{ matrix.arch }})
+    needs: stage-release-assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+          - runner: macos-15-intel
+            platform: darwin
+            arch: x64
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.stage-release-assets.outputs.release_sha }}
+
+      - name: Download canonical distribution artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: canonical-python-package-distributions
+          path: dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js 26.3
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "26.3.0"
+          cache: npm
+          cache-dependency-path: ui-opentui/package-lock.json
+
+      - name: Install artifact-test dependency
+        run: python -m pip install --disable-pip-version-check pytest==9.0.2
+
+      - name: Hydrate exact wheel and verify native launch contract
+        timeout-minutes: 10
+        env:
+          HERMES_RELEASE_ARTIFACT_DIR: ${{ github.workspace }}/dist
+          HERMES_RELEASE_HYDRATE_OPENTUI: "1"
+          EXPECTED_NODE_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_NODE_ARCH: ${{ matrix.arch }}
+        run: >-
+          python -m pytest -q
+          tests/test_opentui_release_artifacts.py::test_clean_venv_install_places_seed_beside_hermes_cli
+
+  sign:
+    name: Sign canonical artifacts on the draft
+    needs: [stage-release-assets, verify-opentui]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ needs.stage-release-assets.outputs.release_tag }}
+    steps:
+      - name: Download canonical distribution artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: canonical-python-package-distributions
+          path: dist/
+
+      - name: Verify release remains a draft
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.stage-release-assets.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+          if [ "$release_state" != "true" ]; then
+            echo "::error::Release $RELEASE_TAG is no longer an unpublished draft"
+            exit 1
+          fi
 
       - name: Sign with Sigstore
-        if: env.skip_sign != 'true'
         uses: sigstore/gh-action-sigstore-python@04cffa1d795717b140764e8b640de88853c92acc # v3.3.0
         with:
           inputs: >-
             ./dist/*.tar.gz
             ./dist/*.whl
 
-      - name: Attach signed artifacts to GitHub Release
-        if: env.skip_sign != 'true'
+      - name: Attach signatures without replacing canonical distributions
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        # release.py already created the GitHub Release — just upload
-        # the Sigstore signatures alongside the existing assets.
+          RELEASE_TAG: ${{ needs.stage-release-assets.outputs.release_tag }}
         run: >-
           gh release upload
-          "$GITHUB_REF_NAME" dist/*.sigstore.json
+          "$RELEASE_TAG"
+          dist/*.sigstore.json
           --repo "$GITHUB_REPOSITORY"
           --clobber
+
+  publish:
+    name: Publish canonical bytes to PyPI
+    needs: [stage-release-assets, sign]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hermes-agent
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ needs.stage-release-assets.outputs.release_sha }}
+
+      - name: Revalidate release tag before first public upload
+        env:
+          RELEASE_SHA: ${{ needs.stage-release-assets.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.stage-release-assets.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          current_tag_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          if [ "$current_tag_sha" != "$RELEASE_SHA" ]; then
+            echo "::error::Tag moved from $RELEASE_SHA to $current_tag_sha before PyPI publication"
+            exit 1
+          fi
+
+      - name: Download canonical distribution artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: canonical-python-package-distributions
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: dist/
+          skip-existing: true
+
+      - name: Verify PyPI serves the canonical SHA256 values
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          files = sorted([*Path("dist").glob("*.whl"), *Path("dist").glob("*.tar.gz")])
+          if len(files) != 2:
+              raise SystemExit("expected exactly two canonical distributions")
+          wheel = next((path for path in files if path.suffix == ".whl"), None)
+          match = re.match(r"^hermes_agent-([^-]+)-", wheel.name if wheel else "")
+          if match is None:
+              raise SystemExit("could not derive release version from wheel filename")
+          version = match.group(1)
+          expected = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files
+          }
+          url = f"https://pypi.org/pypi/hermes-agent/{version}/json"
+          for attempt in range(30):
+              try:
+                  with urllib.request.urlopen(url, timeout=15) as response:
+                      payload = json.load(response)
+              except (OSError, urllib.error.URLError, json.JSONDecodeError):
+                  payload = {}
+              published = {
+                  row.get("filename"): row.get("digests", {}).get("sha256")
+                  for row in payload.get("urls", [])
+                  if isinstance(row, dict)
+              }
+              present = set(expected) & set(published)
+              mismatched = {
+                  name: (expected[name], published[name])
+                  for name in present
+                  if published[name] != expected[name]
+              }
+              if mismatched:
+                  raise SystemExit(f"PyPI digest mismatch: {mismatched}")
+              if all(published.get(name) == digest for name, digest in expected.items()):
+                  print("PyPI serves the exact canonical wheel and sdist")
+                  break
+              if attempt == 29:
+                  raise SystemExit("PyPI did not expose both canonical assets within 5 minutes")
+              time.sleep(10)
+          PY
+
+  docker-release:
+    name: Build and publish release containers
+    needs: [stage-release-assets, publish]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker.yml
+    with:
+      release_tag: ${{ needs.stage-release-assets.outputs.release_tag }}
+      release_sha: ${{ needs.stage-release-assets.outputs.release_sha }}
+    secrets: inherit
+
+  site-release:
+    name: Deploy exact release docs
+    needs: [stage-release-assets, publish]
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/deploy-site.yml
+    with:
+      release_tag: ${{ needs.stage-release-assets.outputs.release_tag }}
+      release_sha: ${{ needs.stage-release-assets.outputs.release_sha }}
+    secrets: inherit
+
+  publish-github-release:
+    name: Publish verified GitHub Release
+    needs: [stage-release-assets, docker-release, site-release]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      RELEASE_SHA: ${{ needs.stage-release-assets.outputs.release_sha }}
+      RELEASE_TAG: ${{ needs.stage-release-assets.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ needs.stage-release-assets.outputs.release_sha }}
+
+      - name: Download canonical Actions artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: canonical-python-package-distributions
+          path: canonical/
+
+      - name: Revalidate remote tag before publication
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          current_tag_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          if [ "$current_tag_sha" != "$RELEASE_SHA" ]; then
+            echo "::error::Tag moved from $RELEASE_SHA to $current_tag_sha during release"
+            exit 1
+          fi
+
+      - name: Reconcile canonical bytes with current draft assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+          if [ "$release_state" != "true" ]; then
+            echo "::error::Release $RELEASE_TAG is not an unpublished draft"
+            exit 1
+          fi
+          manifest_name="hermes-release-${RELEASE_TAG#v}-manifest.json"
+          mkdir -p draft
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$manifest_name" \
+            --pattern '*.whl' \
+            --pattern '*.tar.gz' \
+            --pattern '*.sigstore.json' \
+            --dir draft
+
+          export MANIFEST_NAME="$manifest_name"
+          python3 - <<'PY'
+          import base64
+          import binascii
+
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          manifest_path = Path("draft", os.environ["MANIFEST_NAME"])
+          if not manifest_path.is_file() or manifest_path.is_symlink():
+              raise SystemExit("canonical draft manifest is missing or unsafe")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if manifest.get("schema") != 1:
+              raise SystemExit("unsupported release manifest schema")
+          if manifest.get("tag") != os.environ["RELEASE_TAG"]:
+              raise SystemExit("final release manifest tag mismatch")
+          if manifest.get("commit") != os.environ["RELEASE_SHA"]:
+              raise SystemExit("final release manifest commit mismatch")
+
+          rows = manifest.get("assets")
+          if not isinstance(rows, list) or len(rows) != 2:
+              raise SystemExit("release manifest must contain one wheel and one sdist")
+          expected = {}
+          for row in rows:
+              if not isinstance(row, dict):
+                  raise SystemExit("malformed release manifest asset")
+              name = row.get("name")
+              size = row.get("size")
+              digest = row.get("sha256")
+              if (
+                  not isinstance(name, str)
+                  or Path(name).name != name
+                  or not isinstance(size, int)
+                  or size <= 0
+                  or not isinstance(digest, str)
+                  or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                  or name in expected
+              ):
+                  raise SystemExit("malformed release manifest asset identity")
+              expected[name] = (size, digest)
+          if sum(name.endswith(".whl") for name in expected) != 1:
+              raise SystemExit("release manifest must contain exactly one wheel")
+          if sum(name.endswith(".tar.gz") for name in expected) != 1:
+              raise SystemExit("release manifest must contain exactly one sdist")
+
+          def verify_directory(label: str, root: Path) -> None:
+              files = sorted([*root.glob("*.whl"), *root.glob("*.tar.gz")])
+              actual_names = {path.name for path in files}
+              if actual_names != set(expected) or len(files) != len(expected):
+                  raise SystemExit(f"{label} distribution set mismatch: {sorted(actual_names)}")
+              for path in files:
+                  if not path.is_file() or path.is_symlink():
+                      raise SystemExit(f"{label} artifact is unsafe: {path.name}")
+                  payload = path.read_bytes()
+                  size, digest = expected[path.name]
+                  if len(payload) != size:
+                      raise SystemExit(f"{label} size mismatch: {path.name}")
+                  if hashlib.sha256(payload).hexdigest() != digest:
+                      raise SystemExit(f"{label} digest mismatch: {path.name}")
+
+          verify_directory("Actions canonical", Path("canonical"))
+          verify_directory("draft release", Path("draft"))
+          signature_paths = sorted(Path("draft").glob("*.sigstore.json"))
+          expected_signature_names = {
+              f"{name}.sigstore.json" for name in expected
+          }
+          if {path.name for path in signature_paths} != expected_signature_names:
+              raise SystemExit("draft signature bundle set does not match distributions")
+          for name, (_, digest) in expected.items():
+              bundle_path = Path("draft", f"{name}.sigstore.json")
+              if not bundle_path.is_file() or bundle_path.is_symlink():
+                  raise SystemExit(f"draft signature bundle is unsafe: {bundle_path.name}")
+              try:
+                  bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+                  message_signature = bundle["messageSignature"]
+                  message_digest = message_signature["messageDigest"]
+                  algorithm = message_digest["algorithm"]
+                  encoded_digest = message_digest["digest"]
+                  subject_digest = base64.b64decode(
+                      encoded_digest, validate=True
+                  ).hex()
+              except (
+                  binascii.Error,
+                  json.JSONDecodeError,
+                  KeyError,
+                  TypeError,
+                  ValueError,
+              ) as exc:
+                  raise SystemExit(
+                      f"invalid Sigstore bundle: {bundle_path.name}: {exc}"
+                  ) from exc
+              if algorithm != "SHA2_256":
+                  raise SystemExit(
+                      f"unexpected Sigstore digest algorithm: {bundle_path.name}"
+                  )
+              if subject_digest != digest:
+                  raise SystemExit(
+                      f"Sigstore subject digest mismatch: {bundle_path.name}"
+                  )
+          print("Current draft assets exactly match the canonical Actions artifact")
+          PY
+
+      - name: Publish draft after every exact-source surface succeeds
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+          if [ "$release_state" != "true" ]; then
+            echo "::error::Release $RELEASE_TAG is not an unpublished draft"
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --verify-tag
+
+  request-vercel-deploy:
+    name: Request branch-bound Vercel deployment
+    needs: publish-github-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger asynchronous Vercel deploy hook
+        # Deploy hooks are branch-bound and return before the deployment
+        # finishes. Keep this legacy surface explicit and outside the exact-SHA
+        # release barrier; GitHub Pages above is the verified site deployment.
+        run: >-
+          curl --fail-with-body --silent --show-error
+          --retry 3 --retry-all-errors
+          -X POST "${{ secrets.VERCEL_DEPLOY_HOOK }}"

@@ -9,5 +9,16 @@ graft locales
 recursive-include plugins plugin.yaml plugin.yml
 # Gateway assets include images plus YAML catalogs such as status_phrases.yaml.
 recursive-include gateway/assets *
+# Portable OpenTUI seed. Keep this explicit: `graft ui-opentui` would also
+# capture a developer's 200+ MB node_modules tree and one host's native .so.
+include ui-opentui/.node-version
+include ui-opentui/README.md
+include ui-opentui/package.json
+include ui-opentui/package-lock.json
+include ui-opentui/tsconfig.json
+include ui-opentui/scripts/build.mjs
+include ui-opentui/dist/main.js
+recursive-include ui-opentui/src *.json *.ts *.tsx
+prune ui-opentui/src/test
 global-exclude __pycache__
 global-exclude *.py[cod]
