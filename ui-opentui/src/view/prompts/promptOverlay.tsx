@@ -11,6 +11,7 @@
  */
 import { Match, Switch } from 'solid-js'
 
+import { secureApprovalChoice } from '../../logic/approval.ts'
 import { deferClose } from '../../logic/defer.ts'
 import type { ActivePrompt, SessionStore } from '../../logic/store.ts'
 import { ApprovalPrompt } from './approvalPrompt.tsx'
@@ -55,9 +56,15 @@ export function PromptOverlay(props: PromptOverlayProps) {
       <Match when={asApproval()}>
         {p => (
           <ApprovalPrompt
+            allowPermanent={p().allowPermanent}
             command={p().command}
             description={p().description}
-            onChoose={choice => respond('approval.respond', { choice, session_id: props.sessionId() })}
+            onChoose={choice =>
+              respond('approval.respond', {
+                choice: secureApprovalChoice(choice, p().allowPermanent),
+                session_id: props.sessionId()
+              })
+            }
             onCancel={() => respond('approval.respond', { choice: 'deny', session_id: props.sessionId() })}
           />
         )}

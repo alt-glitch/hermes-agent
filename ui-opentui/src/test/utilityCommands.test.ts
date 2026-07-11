@@ -63,6 +63,9 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const ctx: SlashContext = {
     guardBusySessionSwitch: () => false,
     newSession: () => {},
+    beginToolsConfigure: () => {},
+    endToolsConfigure: () => {},
+    resetAfterToolsConfigure: () => {},
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,

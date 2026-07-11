@@ -117,7 +117,7 @@ const ClarifyRequest = Schema.Struct({
 const ApprovalRequest = Schema.Struct({
   type: Schema.Literal('approval.request'),
   session_id: opt(Str),
-  payload: Schema.Struct({ command: Str, description: Str })
+  payload: Schema.Struct({ allow_permanent: opt(Schema.Boolean), command: Str, description: Str })
 })
 const SudoRequest = Schema.Struct({
   type: Schema.Literal('sudo.request'),
@@ -145,6 +145,11 @@ const NotificationClear = Schema.Struct({
   type: Schema.Literal('notification.clear'),
   session_id: opt(Str),
   payload: opt(Schema.Struct({ key: opt(Str) }))
+})
+const BillingStepUpVerification = Schema.Struct({
+  type: Schema.Literal('billing.step_up.verification'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ user_code: opt(Str), verification_url: Str })
 })
 const VoiceStatus = Schema.Struct({
   type: Schema.Literal('voice.status'),
@@ -240,6 +245,7 @@ export const GatewayEventSchema = Schema.Union([
   StatusUpdate,
   NotificationShow,
   NotificationClear,
+  BillingStepUpVerification,
   VoiceStatus,
   VoiceTranscript,
   BrowserProgress,

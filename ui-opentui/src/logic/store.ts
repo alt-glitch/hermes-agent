@@ -121,7 +121,7 @@ export type ConfirmRequest = string | ConfirmSpec
  */
 export type ActivePrompt =
   | { kind: 'clarify'; question: string; choices: string[] | null; requestId: string }
-  | { kind: 'approval'; command: string; description: string }
+  | { kind: 'approval'; allowPermanent: boolean; command: string; description: string }
   | { kind: 'sudo'; requestId: string }
   | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
@@ -656,6 +656,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // Hydrate-while-buffering (resume): while a snapshot is loading, live events
   // queue here and replay after the snapshot is reconciled (opencode sync-v2).
   let buffering: GatewayEvent[] | null = null
+
+  // External side effects (currently the billing device-flow browser opener)
+  // must happen only after an event is COMMITTED to the active session. Calling
+  // this from applyNow means buffered resume events wait for commit/abort
+  // filtering; a rejected stale-SID event can never open a URL or print copy.
+  let onCommittedEvent: ((event: GatewayEvent) => void) | undefined
+
+  function registerCommittedEventHandler(handler: (event: GatewayEvent) => void): void {
+    onCommittedEvent = handler
+  }
 
   // Chrome-notice TTL timer (NOT store state — a transient handle, not reactive
   // data). At most ONE armed at a time: every applyNotice clears the prior before
@@ -1530,7 +1540,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
         })
         break
       case 'approval.request':
-        setState('prompt', { kind: 'approval', command: event.payload.command, description: event.payload.description })
+        setState('prompt', {
+          kind: 'approval',
+          // Only an explicit false removes the permanent option. Older gateway
+          // versions omit the field and retain the historical default.
+          allowPermanent: event.payload.allow_permanent !== false,
+          command: event.payload.command,
+          description: event.payload.description
+        })
         break
       case 'sudo.request':
         setState('prompt', { kind: 'sudo', requestId: event.payload.request_id })
@@ -1648,6 +1665,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
       // Other event types (chrome) are reduced in later phases; unhandled members
       // are intentionally ignored here.
     }
+    onCommittedEvent?.(event)
   }
 
   /** Clear the active blocking prompt (after it's answered/cancelled). */
@@ -1748,6 +1766,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     clearQueue,
     queuedCount,
     registerTurnCompleteHandler,
+    registerCommittedEventHandler,
     setCatalog,
     setSessionId,
     setResumeId,

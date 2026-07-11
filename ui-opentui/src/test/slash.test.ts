@@ -270,6 +270,9 @@ interface Probe {
   billed: BillingOverlayState[]
   quit: { value: boolean }
   newSessions: Array<[string | undefined, string | undefined]>
+  toolsResets: Array<{ readonly [key: string]: unknown }>
+  toolsConfiguring: { begins: number; ends: number; value: boolean }
+  session: { value: string | undefined }
   busy: { value: boolean }
   dashboard: { value: boolean }
   copied: number[]
@@ -298,6 +301,9 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const billed: Probe['billed'] = []
   const quit = { value: false }
   const newSessions: Probe['newSessions'] = []
+  const toolsResets: Probe['toolsResets'] = []
+  const toolsConfiguring: Probe['toolsConfiguring'] = { begins: 0, ends: 0, value: false }
+  const session: Probe['session'] = { value: 'sid-1' }
   const busy = { value: false }
   const dashboard = { value: false }
   const copied: number[] = []
@@ -310,6 +316,15 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const ctx: SlashContext = {
     guardBusySessionSwitch: () => busy.value,
     newSession: (message, title) => newSessions.push([message, title]),
+    beginToolsConfigure: () => {
+      toolsConfiguring.begins += 1
+      toolsConfiguring.value = true
+    },
+    endToolsConfigure: () => {
+      toolsConfiguring.ends += 1
+      toolsConfiguring.value = false
+    },
+    resetAfterToolsConfigure: info => toolsResets.push(info),
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,
@@ -341,13 +356,16 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       calls.push({ method, params })
       return request(method, params)
     },
-    sessionId: () => 'sid-1',
+    sessionId: () => session.value,
     submit: text => submitted.push(text),
     submitSkill: (command, body) => skillSubmitted.push({ command, body })
   }
   return {
     calls,
     newSessions,
+    toolsResets,
+    toolsConfiguring,
+    session,
     busy,
     compactFlag,
     confirmed,
@@ -748,6 +766,96 @@ describe('dispatchSlash — client commands', () => {
     await dispatchSlash('/billing', p.ctx)
     expect(p.billed).toHaveLength(0)
     expect(p.system.join('\n')).toContain('/billing: gateway down')
+  })
+
+  test('/tools enable uses the live configure RPC, resets same-SID state, and reports every result class', async () => {
+    const info = { model: 'claude-sonnet', running: false }
+    const p = makeCtx(async method =>
+      method === 'tools.configure'
+        ? {
+            changed: ['web', 'github:create_issue'],
+            enabled_toolsets: ['terminal', 'web'],
+            info,
+            missing_servers: ['missing'],
+            reset: true,
+            unknown: ['bogus']
+          }
+        : {}
+    )
+    await dispatchSlash('/tools enable web github:create_issue bogus missing:tool', p.ctx)
+    expect(p.calls).toEqual([
+      {
+        method: 'tools.configure',
+        params: {
+          action: 'enable',
+          names: ['web', 'github:create_issue', 'bogus', 'missing:tool'],
+          session_id: 'sid-1'
+        }
+      }
+    ])
+    expect(p.toolsResets).toEqual([info])
+    expect(p.toolsConfiguring).toEqual({ begins: 1, ends: 1, value: false })
+    expect(p.system).toEqual([
+      'enabled: web, github:create_issue',
+      'unknown toolsets: bogus',
+      'missing MCP servers: missing',
+      'session reset. new tool configuration is active.'
+    ])
+  })
+
+  test('/tools disable without names prints usage and never calls the gateway', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/tools disable', p.ctx)
+    expect(p.calls).toHaveLength(0)
+    expect(p.system).toEqual([
+      'usage: /tools disable <name> [name ...]',
+      'built-in toolset: /tools disable web',
+      'MCP tool: /tools disable github:create_issue'
+    ])
+  })
+
+  test('/tools refuses to reset the agent while a turn or session transition is active', async () => {
+    const p = makeCtx(async () => ({ changed: ['web'], reset: true }))
+    p.busy.value = true
+    await dispatchSlash('/tools disable web', p.ctx)
+    expect(p.calls).toHaveLength(0)
+    expect(p.toolsResets).toEqual([])
+    expect(p.toolsConfiguring).toEqual({ begins: 0, ends: 0, value: false })
+  })
+
+  test('/tools drops an old-session configure response before reset or feedback', async () => {
+    let resolve!: (value: unknown) => void
+    const pending = new Promise<unknown>(done => (resolve = done))
+    const p = makeCtx(async () => pending)
+    const run = dispatchSlash('/tools disable web', p.ctx)
+    p.session.value = 'sid-2'
+    resolve({ changed: ['web'], info: { model: 'other' }, reset: true })
+    await run
+    expect(p.toolsResets).toEqual([])
+    expect(p.system).toEqual([])
+    expect(p.toolsConfiguring).toEqual({ begins: 1, ends: 1, value: false })
+  })
+
+  test('/tools rejects a malformed configure response instead of casting it into state', async () => {
+    const p = makeCtx(async () => ({ changed: 'web', info: [] }))
+    await dispatchSlash('/tools enable web', p.ctx)
+    expect(p.toolsResets).toEqual([])
+    expect(p.system).toEqual(['/tools: invalid tools.configure response'])
+  })
+
+  test('/tools accepts the gateway detached-session info:null response and keeps feedback', async () => {
+    const p = makeCtx(async () => ({ changed: ['web'], info: null, reset: false, unknown: [] }))
+    await dispatchSlash('/tools enable web', p.ctx)
+    expect(p.toolsResets).toEqual([])
+    expect(p.system).toEqual(['enabled: web'])
+  })
+
+  test('/tools list/status keeps the slash-worker output path and short-output presentation', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'web: enabled' } : {}))
+    await dispatchSlash('/tools', p.ctx)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'tools', session_id: 'sid-1' } }])
+    expect(p.system).toEqual(['web: enabled'])
+    expect(p.paged).toEqual([])
   })
 })
 

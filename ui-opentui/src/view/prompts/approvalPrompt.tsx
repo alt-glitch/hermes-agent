@@ -6,20 +6,26 @@
  */
 import type { BoxRenderable } from '@opentui/core'
 
+import { approvalChoices, type ApprovalChoice } from '../../logic/approval.ts'
 import { useCloseLayer } from '../keymap.tsx'
 import { useTheme } from '../theme.tsx'
 
-const OPTIONS = [
-  { description: 'Run this command this one time', name: 'Approve once', value: 'once' },
-  { description: 'Allow for the rest of this session', name: 'Approve for session', value: 'session' },
-  { description: 'Always allow this command', name: 'Always approve', value: 'always' },
-  { description: 'Reject this command', name: 'Deny', value: 'deny' }
-]
+const COPY: Record<ApprovalChoice, { description: string; name: string }> = {
+  once: { description: 'Run this command this one time', name: 'Approve once' },
+  session: { description: 'Allow for the rest of this session', name: 'Approve for session' },
+  always: { description: 'Always allow this command', name: 'Always approve' },
+  deny: { description: 'Reject this command', name: 'Deny' }
+}
+
+export function approvalOptions(allowPermanent: boolean) {
+  return approvalChoices(allowPermanent).map(value => ({ ...COPY[value], value }))
+}
 
 export function ApprovalPrompt(props: {
+  allowPermanent: boolean
   command: string
   description: string
-  onChoose: (choice: string) => void
+  onChoose: (choice: ApprovalChoice) => void
   onCancel: () => void
 }) {
   const theme = useTheme()
@@ -44,9 +50,9 @@ export function ApprovalPrompt(props: {
       {props.description ? <text fg={theme().color.muted}>{props.description}</text> : null}
       <select
         focused
-        options={OPTIONS}
+        options={approvalOptions(props.allowPermanent)}
         onSelect={(_index, option) => {
-          if (option) props.onChoose(String(option.value))
+          if (option) props.onChoose(option.value as ApprovalChoice)
         }}
         backgroundColor={theme().color.statusBg}
         selectedBackgroundColor={theme().color.selectionBg}

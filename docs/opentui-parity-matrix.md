@@ -20,7 +20,7 @@ Status meanings:
 - **In progress** — actively being implemented; never counts as shipped.
 - **Intentional skip** — an explicit supported-platform/product decision.
 
-Current slash tally: **7 Covered, 27 Thinner, 22 Missing, 1 In progress, 1
+Current slash tally: **8 Covered, 27 Thinner, 22 Missing, 0 In progress, 1
 Intentional skip**.
 
 ## Slash commands
@@ -81,7 +81,7 @@ Intentional skip**.
 | 52 | `/reload-skills` | Missing | Direct `skills.reload` and refresh `commands.catalog` in the active client. |
 | 53 | `/skills` | Thinner | List/inspect picker works; preserve explicit search/install/browse/manage subcommands. |
 | 54 | `/plugins` | Thinner | Text worker path exists; port the bare interactive user/bundled enable/disable hub. |
-| 55 | `/tools` | In progress | Keep list/status text path; route enable/disable to `tools.configure`, reset same-SID history, and refresh catalog. |
+| 55 | `/tools` | Covered | List/status retains Ink's worker presentation; enable/disable uses decoded live `tools.configure`, busy/transition guards, atomic gateway mutation/close coordination, same-SID state replacement, catalog/model refresh, nullable detached feedback, and bounded post-reset submission drain. |
 | 56 | `/setup` | Missing | Suspend OpenTUI, run the full external setup wizard, and restore the renderer. |
 | 57 | `/heapdump` | Thinner | Native snapshot works but is diagnostics-gated and lacks Ink's diagnostics sidecar contract. |
 | 58 | `/mem` | Thinner | Native panel adds renderable count but is diagnostics-gated; settle the shipping visibility policy. |
@@ -111,11 +111,11 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | New/clear session adoption | Covered | `sessionLifecycle` performs decoded create/replace/resume transactions; the store atomically replaces sparse info and every session-owned slice without replaying launch prompt/images, while a bounded transition queue preserves submissions safely. |
 | Session event scope | Covered | `eventMayEnterStore` gates reducer and side effects by the active ephemeral SID; resume buffering admits events only into a transaction buffer whose commit/abort filters against the adopted/restored live SID. |
 | Session picker/live siblings | Thinner | Cold browse/search/peek/resume works; add active switching/close/delete/new-model flows. |
-| Approval permanence security | In progress | Preserve explicit `allow_permanent=false` through Effect Schema/store/view and never emit `always`. |
+| Approval permanence security | Covered | Effect Schema preserves explicit `allow_permanent=false`; store/view remove the option and the response seam fail-closes any stale/invalid `always` choice to `deny`. |
 | Clarify/confirm polish | Thinner | Add numeric quick-picks, wrapped long commands, and Esc-back from custom input. |
 | Masked sudo/secret editing | Thinner | Use native full editing/paste/grapheme behavior rather than append-only input. |
 | Billing overlay | Covered | Buy/auto-reload/limits and error funnels are native. |
-| Billing verification event | In progress | Decode, display, and safely open `billing.step_up.verification`; reject stale-SID events. |
+| Billing verification event | Covered | `billing.step_up.verification` is decoded, committed only after transactional SID filtering, rendered with code/link, and opened through the http(s)-only external-URL boundary. |
 | MoA events | Missing | Decode/render `moa.reference` and aggregating/progress state. |
 | Voice events | Missing | Consume listening/transcribing/transcript events and expose status/record key. |
 | Browser progress | Missing | Consume progress events and show current CDP state. |
@@ -137,11 +137,11 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | OpenTUI CI | Missing | Node 26 `npm ci`, `npm run check`, production build, native launch smoke on relevant paths. |
 | Packaged runtime matrix | Missing | Linux x64/arm64 clean install and launch; Windows/Termux intentionally fall back to Ink. |
 | Release metadata/docs | Missing | Replace experimental/0.0.0/Ink-default claims with accurate v1 support and rollback policy. |
-| Startup benchmark | Thinner | Target-pinned PTY result exists locally; version and retain raw evidence in the release report. |
-| Cold hydration benchmark | In progress | Actual `commitSessionSnapshot` path is measured at 100 messages (three-run median: 65.19 ms adoption, 195.03 ms through highlight, 197.1 MB RSS); pair it with real `session.resume` RPC→stable-paint timing. |
-| Warm-switch benchmark | In progress | Same-renderer replacement is measured (three-run median: 37.25 ms adoption, 71.55 ms through highlight, 179.8 MB RSS; 847 renderables); add real RPC timing and repeated-switch release proof. |
-| Fixture memory/renderables | In progress | The bounded 100-message fixture settles at 903 renderables and 1,367 native allocations after highlight (204.9 MB process RSS); retain raw release evidence and add repeated-cycle leak assertions. |
-| Resource ceiling | Thinner | Record duration/CPU/peak RSS and run native gates sequentially on constrained hosts. |
+| Startup benchmark | Thinner | Same-host parent/current PTY A/B medians are 123→126 ms first byte, 177→176 ms session-create, and +0.7 MB VmHWM (loop lag ≤2 ms, zero swaps); version and retain raw evidence in the release report. |
+| Cold hydration benchmark | In progress | Actual `commitSessionSnapshot` path is measured at 100 messages (latest three-run median: 64.88 ms adoption, 207.69 ms through highlight, 177.6 MB RSS; allocation/renderable counts unchanged); pair it with real `session.resume` RPC→stable-paint timing. |
+| Warm-switch benchmark | In progress | Same-renderer replacement is measured (latest three-run median: 34.84 ms adoption, 63.70 ms through highlight, 172.6 MB RSS; 847 renderables); add real RPC timing and repeated-switch release proof. |
+| Fixture memory/renderables | In progress | The bounded 100-message fixture settles at 903 renderables and 1,367 native allocations after highlight (206.4 MB process RSS); retain raw release evidence and add repeated-cycle leak assertions. |
+| Resource ceiling | Thinner | Latest full OpenTUI gate: 17.90 s wall, 313% CPU, 1,117,504 KB peak RSS, zero swaps; continue recording every native/release gate sequentially on constrained hosts. |
 | Memory architecture docs | Missing | Replace Yoga-WASM/current claims with the actual 0.4.1 native-layout runtime; label historical results. |
 | Upstream alignment docs | Missing | Update dependency/test counts, shim ledger, and upgrade gates. |
 | Env flags docs | Missing | Classify dashboard attachment as required internal plumbing and keep user config in `config.yaml`. |

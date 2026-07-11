@@ -4,6 +4,29 @@ import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { createSessionStore, type Message } from '../logic/store.ts'
 
 describe('session-store replacement boundary', () => {
+  test('committed-event side effects wait for buffer filtering and reject stale SIDs', () => {
+    const store = createSessionStore()
+    const committed: string[] = []
+    store.registerCommittedEventHandler(event => committed.push(`${event.type}:${event.session_id ?? ''}`))
+    store.adoptFreshSession('old-live', {}, 'persisted-old')
+
+    store.beginBuffer()
+    store.apply({
+      type: 'billing.step_up.verification',
+      session_id: 'old-live',
+      payload: { verification_url: 'https://old.example/device' }
+    })
+    store.apply({
+      type: 'billing.step_up.verification',
+      session_id: 'new-live',
+      payload: { verification_url: 'https://new.example/device' }
+    })
+    expect(committed).toEqual([])
+
+    store.commitSessionSnapshot('new-live', [], {}, event => eventBelongsToSession(event, 'new-live'), 'persisted-new')
+    expect(committed).toEqual(['billing.step_up.verification:new-live'])
+  })
+
   test('fresh adoption replaces all session slices and preserves process/global preferences', () => {
     const store = createSessionStore()
     store.apply({

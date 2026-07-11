@@ -18,6 +18,7 @@ import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './re
 import { mapSessionRows, parseSessionTabArg, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
 import type { CompletionItem, ConfirmRequest, PickerItem, PickerState } from './store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
+import { decodeToolsConfigureResponse } from '../boundary/schema/ToolsConfigureResponse.ts'
 import { buildBillingCtx } from './billing.ts'
 
 export interface ParsedSlash {
@@ -66,10 +67,17 @@ export interface SlashContext {
   readonly submitSkill: (command: string, body: string) => void
   /** Open a local Y/N confirm; `onConfirm` runs on Yes. */
   readonly confirm: (request: ConfirmRequest, onConfirm: () => void) => void
-  /** Refuse a session transition while a turn/transition is active. */
+  /** Refuse a session-destructive mutation while a turn/transition is active. */
   readonly guardBusySessionSwitch: (what?: string) => boolean
   /** Close the current live session and create/adopt a replacement. */
   readonly newSession: (message?: string, title?: string) => void
+  /** Adopt the same-SID agent reset returned by `tools.configure`, then refresh
+   *  session catalogs asynchronously. */
+  readonly resetAfterToolsConfigure: (info: { readonly [key: string]: unknown }) => void
+  /** Hold/release the entry transition queue across a live tools reset so
+   *  prompts typed while the RPC runs are replayed after adoption, not erased. */
+  readonly beginToolsConfigure: () => void
+  readonly endToolsConfigure: () => void
   /** Copy the n-th newest assistant response to the clipboard; returns whether something was copied. */
   readonly copyResponse: (n: number) => boolean
   readonly quit: () => void
@@ -825,12 +833,62 @@ const memCmd: ClientHandler = (_arg, ctx) => {
   ctx.pushSystem(memReport(process.memoryUsage(), process.uptime(), ctx.renderableCount()))
 }
 
-/** `/tools` — fetch the tool roster from the gateway and show it in the pager (navigable). */
+/**
+ * `/tools` — list/status stays on the slash worker; enable/disable must hit the
+ * live gateway directly because it resets the active agent. The returned info
+ * replaces the same-SID visible session so old history/tool state cannot imply
+ * the prior tool configuration is still in force.
+ */
 const toolsCmd: ClientHandler = async (arg, ctx) => {
+  const [subcommand, ...names] = arg.trim().split(/\s+/).filter(Boolean)
+  if (subcommand === 'enable' || subcommand === 'disable') {
+    if (!names.length) {
+      ctx.pushSystem(`usage: /tools ${subcommand} <name> [name ...]`)
+      ctx.pushSystem(`built-in toolset: /tools ${subcommand} web`)
+      ctx.pushSystem(`MCP tool: /tools ${subcommand} github:create_issue`)
+      return
+    }
+
+    if (ctx.guardBusySessionSwitch('change tools')) return
+
+    ctx.beginToolsConfigure()
+    const expectedSid = ctx.sessionId()
+    try {
+      const raw = await ctx.request('tools.configure', { action: subcommand, names, session_id: expectedSid })
+      // Match Ink's guarded promise: a response from the prior session cannot
+      // reset or print into a successor session.
+      if (ctx.sessionId() !== expectedSid) return
+      const response = decodeToolsConfigureResponse(raw)
+      if (!response) {
+        ctx.pushSystem('/tools: invalid tools.configure response')
+        return
+      }
+
+      if (response.info && expectedSid) ctx.resetAfterToolsConfigure(response.info)
+      if (response.changed?.length) {
+        ctx.pushSystem(`${subcommand === 'disable' ? 'disabled' : 'enabled'}: ${response.changed.join(', ')}`)
+      }
+      if (response.unknown?.length) ctx.pushSystem(`unknown toolsets: ${response.unknown.join(', ')}`)
+      if (response.missing_servers?.length) {
+        ctx.pushSystem(`missing MCP servers: ${response.missing_servers.join(', ')}`)
+      }
+      if (response.reset) ctx.pushSystem('session reset. new tool configuration is active.')
+    } catch (error) {
+      if (ctx.sessionId() === expectedSid) {
+        ctx.pushSystem(`/tools: ${error instanceof Error ? error.message : 'failed'}`)
+      }
+    } finally {
+      ctx.endToolsConfigure()
+    }
+    return
+  }
+
   const command = arg.trim() ? `tools ${arg.trim()}` : 'tools'
   try {
     const r = await ctx.request('slash.exec', { command, session_id: ctx.sessionId() })
-    ctx.openPager('Tools', readStr(r, 'output') || '(no tool info)')
+    const output = readStr(r, 'output') || '/tools: no output'
+    const warning = readStr(r, 'warning')
+    present(ctx, 'Tools', warning ? `warning: ${warning}\n${output}` : output)
   } catch (error) {
     ctx.pushSystem(`/tools: ${error instanceof Error ? error.message : 'failed'}`)
   }

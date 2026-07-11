@@ -735,6 +735,20 @@ def _attach_worker(sid: str, session: dict, worker) -> None:
     worker.close()
 
 
+def _session_mutation_lock(session: dict):
+    """Return the per-session lock for destructive agent/lifecycle mutations.
+
+    Some tests and legacy deferred records predate the field, so install it
+    lazily under ``_sessions_lock``. An RLock keeps teardown helpers safe if a
+    same-thread callback re-enters a lifecycle path.
+    """
+    lock = session.get("_mutation_lock")
+    if lock is not None:
+        return lock
+    with _sessions_lock:
+        return session.setdefault("_mutation_lock", threading.RLock())
+
+
 def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
     """Single idempotent teardown for one session: pop it under the sessions
     lock, then finalize, unregister notify, close agent + slash worker via the
@@ -742,15 +756,24 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
     session. The ``_finalized`` / worker ``_closed`` guards make concurrent or
     repeat calls (e.g. session.close racing the WS-orphan reaper) harmless."""
     with _sessions_lock:
-        session = _sessions.pop(sid, None)
+        session = _sessions.get(sid)
     if session is None:
         return False
-    # The session is already out of _sessions here, so downstream teardown
-    # (e.g. _finalize_session's per-session async-delegation interrupt) can't
-    # recover its live id by scanning the dict — stamp it on the record.
-    session["_sid"] = sid
-    _teardown_session(session, end_reason=end_reason)
-    return True
+    # Serialize close against tools.configure's agent rebuild. Re-check identity
+    # after acquiring: another closer may have popped this record while we
+    # waited. Pop BEFORE teardown as before, but never tear down a replacement
+    # record that reused the same live SID.
+    with _session_mutation_lock(session):
+        with _sessions_lock:
+            if _sessions.get(sid) is not session:
+                return False
+            _sessions.pop(sid, None)
+        # The session is already out of _sessions here, so downstream teardown
+        # (e.g. _finalize_session's per-session async-delegation interrupt) can't
+        # recover its live id by scanning the dict — stamp it on the record.
+        session["_sid"] = sid
+        _teardown_session(session, end_reason=end_reason)
+        return True
 
 
 
@@ -8780,6 +8803,12 @@ def _(rid, params: dict) -> dict:
     if (t := current_transport()) is not None:
         session["transport"] = t
     with session["history_lock"]:
+        if session.get("_tools_configuring"):
+            return _err(
+                rid,
+                4009,
+                "session tools are being reconfigured — wait for it to finish",
+            )
         if session.get("running"):
             # Don't reject a mid-turn prompt — queue it (and, by default,
             # interrupt the live turn) so it runs as the next turn. See
@@ -14531,62 +14560,102 @@ def _(rid, params: dict) -> dict:
     if not targets:
         return _err(rid, 4018, "names required")
 
-    try:
-        from hermes_cli.config import load_config, save_config
-        from hermes_cli.tools_config import (
-            CONFIGURABLE_TOOLSETS,
-            _apply_mcp_change,
-            _apply_toolset_change,
-            _get_platform_tools,
-            _get_plugin_toolset_keys,
-        )
+    # Rebuilding an agent clears its history and running flag. Serialize the
+    # WHOLE check/config/rebuild transaction against session.close, and claim
+    # `_tools_configuring` under history_lock so prompt.submit either wins first
+    # (we see running=True and reject) or observes the claim and rejects. This
+    # closes the multi-WebSocket check-then-reset race.
+    sid = params.get("session_id", "")
+    original_session = _sessions.get(sid)
+    mutation_guard = (
+        _session_mutation_lock(original_session)
+        if original_session is not None
+        else contextlib.nullcontext()
+    )
+    with mutation_guard:
+        with _sessions_lock:
+            session = (
+                original_session
+                if original_session is not None
+                and _sessions.get(sid) is original_session
+                else None
+            )
 
-        cfg = load_config()
-        valid_toolsets = {
-            ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS
-        } | _get_plugin_toolset_keys()
-        toolset_targets = [name for name in targets if ":" not in name]
-        mcp_targets = [name for name in targets if ":" in name]
-        unknown = [name for name in toolset_targets if name not in valid_toolsets]
-        toolset_targets = [name for name in toolset_targets if name in valid_toolsets]
+        history_lock = None
+        if session is not None:
+            history_lock = session.setdefault("history_lock", threading.Lock())
+            with history_lock:
+                if session.get("running"):
+                    return _err(
+                        rid,
+                        4009,
+                        "session busy — interrupt the current turn before changing tools",
+                    )
+                if session.get("_tools_configuring"):
+                    return _err(
+                        rid, 4009, "session tools are already being reconfigured"
+                    )
+                session["_tools_configuring"] = True
 
-        if toolset_targets:
-            _apply_toolset_change(cfg, "cli", toolset_targets, action)
+        try:
+            from hermes_cli.config import load_config, save_config
+            from hermes_cli.tools_config import (
+                CONFIGURABLE_TOOLSETS,
+                _apply_mcp_change,
+                _apply_toolset_change,
+                _get_platform_tools,
+                _get_plugin_toolset_keys,
+            )
 
-        missing_servers = (
-            _apply_mcp_change(cfg, mcp_targets, action) if mcp_targets else set()
-        )
-        save_config(cfg)
+            cfg = load_config()
+            valid_toolsets = {
+                ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS
+            } | _get_plugin_toolset_keys()
+            toolset_targets = [name for name in targets if ":" not in name]
+            mcp_targets = [name for name in targets if ":" in name]
+            unknown = [name for name in toolset_targets if name not in valid_toolsets]
+            toolset_targets = [
+                name for name in toolset_targets if name in valid_toolsets
+            ]
 
-        session = _sessions.get(params.get("session_id", ""))
-        info = (
-            _reset_session_agent(params.get("session_id", ""), session)
-            if session
-            else None
-        )
-        enabled = sorted(
-            _get_platform_tools(load_config(), "cli", include_default_mcp_servers=False)
-        )
-        changed = [
-            name
-            for name in targets
-            if name not in unknown
-            and (":" not in name or name.split(":", 1)[0] not in missing_servers)
-        ]
+            if toolset_targets:
+                _apply_toolset_change(cfg, "cli", toolset_targets, action)
 
-        return _ok(
-            rid,
-            {
-                "changed": changed,
-                "enabled_toolsets": enabled,
-                "info": info,
-                "missing_servers": sorted(missing_servers),
-                "reset": bool(session),
-                "unknown": unknown,
-            },
-        )
-    except Exception as e:
-        return _err(rid, 5035, str(e))
+            missing_servers = (
+                _apply_mcp_change(cfg, mcp_targets, action) if mcp_targets else set()
+            )
+            save_config(cfg)
+
+            info = _reset_session_agent(sid, session) if session else None
+            enabled = sorted(
+                _get_platform_tools(
+                    load_config(), "cli", include_default_mcp_servers=False
+                )
+            )
+            changed = [
+                name
+                for name in targets
+                if name not in unknown
+                and (":" not in name or name.split(":", 1)[0] not in missing_servers)
+            ]
+
+            return _ok(
+                rid,
+                {
+                    "changed": changed,
+                    "enabled_toolsets": enabled,
+                    "info": info,
+                    "missing_servers": sorted(missing_servers),
+                    "reset": bool(session),
+                    "unknown": unknown,
+                },
+            )
+        except Exception as e:
+            return _err(rid, 5035, str(e))
+        finally:
+            if session is not None and history_lock is not None:
+                with history_lock:
+                    session.pop("_tools_configuring", None)
 
 
 @method("toolsets.list")

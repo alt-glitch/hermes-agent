@@ -37,6 +37,7 @@ import { acquireRenderer } from '../boundary/renderer.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
 import { createSession, replaceSession, resumeSession } from '../boundary/sessionLifecycle.ts'
 import { nthAssistantResponse } from '../logic/copy.ts'
+import { presentBillingVerification } from '../logic/billingVerification.ts'
 import { performHeapdump } from '../logic/diagnostics.ts'
 import {
   envFlag,
@@ -350,6 +351,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // the session so the transcript continues. The INITIAL gateway.ready has
       // `recoverSid === undefined`, so the normal bootstrap path is untouched.
       const gateway = yield* GatewayService
+
+      // Side effects run only when the store actually commits an event. In
+      // particular, a billing verification received during resume buffering is
+      // delayed until SID filtering accepts it; stale-session events never open
+      // a browser or leak their code into the successor transcript.
+      store.registerCommittedEventHandler(event => {
+        if (event.type === 'billing.step_up.verification') {
+          presentBillingVerification(event.payload, { pushSystem: text => store.pushSystem(text) })
+        }
+      })
+
       let sessionTransitionInFlight = false
       const isSessionTransitioning = () => sessionTransitionInFlight
       let imageAttachInFlight = false
@@ -963,6 +975,28 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const slashCtx: SlashContext = {
         guardBusySessionSwitch,
         newSession: startNewSession,
+        beginToolsConfigure: () => {
+          sessionTransitionInFlight = true
+          store.setHint('changing tools…')
+        },
+        endToolsConfigure: () => {
+          sessionTransitionInFlight = false
+          if (store.state.hint === 'changing tools…') store.setHint(undefined)
+          if (gateway.sessionId() && store.state.sessionId) drainTransitionSubmissions()
+          else reportFailedTransitionSubmissions()
+        },
+        resetAfterToolsConfigure: info => {
+          const sid = gateway.sessionId()
+          if (!sid || store.state.sessionId !== sid) return
+          store.adoptFreshSession(sid, info, store.state.resumeId ?? sid)
+          Effect.runFork(
+            postSessionSetup(gateway, store, sid).pipe(
+              Effect.catchCause(cause =>
+                Effect.sync(() => getLog().warn('tools', 'post-configure setup failed', { cause: String(cause) }))
+              )
+            )
+          )
+        },
         compact: () => store.state.compact,
         setCompact: on => store.setCompact(on),
         details: () => store.state.details,

