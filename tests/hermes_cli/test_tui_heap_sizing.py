@@ -148,6 +148,7 @@ class TestExposeGcOnOpenTuiArgv:
     global.gc() is a real call, not a no-op."""
 
     def test_opentui_argv_has_expose_gc(self, tmp_path):
+        (tmp_path / ".git").mkdir()
         app_dir = tmp_path / "ui-opentui"
         (app_dir / "src" / "entry").mkdir(parents=True)
         (app_dir / "src" / "entry" / "main.tsx").write_text("// entry")
@@ -155,7 +156,26 @@ class TestExposeGcOnOpenTuiArgv:
         (app_dir / "dist").mkdir()
         (app_dir / "dist" / "main.js").write_text("// built")
         with mock.patch.object(m, "PROJECT_ROOT", tmp_path), \
-             mock.patch.object(m, "_node26_bin", return_value="/usr/bin/node"):
+             mock.patch.object(m, "_node26_bin", return_value="/usr/bin/node"), \
+             mock.patch.object(
+                 m,
+                 "_opentui_node_identity",
+                 return_value=m._opentui_runtime.NodeIdentity(
+                     executable="/usr/bin/node",
+                     version="v26.3.0",
+                     platform="linux",
+                     arch="x64",
+                 ),
+             ), \
+             mock.patch.object(
+                 m._opentui_runtime, "runtime_sentinels_current", return_value=True
+             ), \
+             mock.patch.object(
+                 m._opentui_runtime, "dependencies_current", return_value=True
+             ), \
+             mock.patch.object(
+                 m._opentui_runtime, "bundle_needs_rebuild", return_value=False
+             ):
             argv, cwd = m._make_opentui_argv(tui_dev=False)
         assert "--expose-gc" in argv
         assert argv[0] == "/usr/bin/node"

@@ -14556,20 +14556,54 @@ def _resolve_chat_argv(
     dashboard's in-memory gateway runs under the dashboard's own profile,
     so a profile-scoped chat must spawn its own gateway subprocess.
     """
-    from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
+    from hermes_cli.main import (
+        PROJECT_ROOT,
+        _apply_opentui_native_env,
+        _apply_tui_heap_env,
+        _make_tui_argv,
+    )
 
     profile_dir: Optional[Path] = None
     requested = (profile or "").strip()
     if requested and requested.lower() != "current":
         profile_dir = _resolve_profile_dir(requested)
 
-    argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
-    env = os.environ.copy()
+    profile_token = None
+    if profile_dir is not None:
+        from hermes_constants import set_hermes_home_override
+
+        profile_token = set_hermes_home_override(profile_dir)
     try:
-        from hermes_cli.config import apply_terminal_config_to_env
-        apply_terminal_config_to_env(env=env)
-    except Exception:
-        _log.debug("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
+        if profile_dir is None:
+            argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
+        else:
+            argv, cwd = _make_tui_argv(
+                PROJECT_ROOT / "ui-tui",
+                tui_dev=False,
+                opentui_runtime_state_dir=(
+                    profile_dir / "cache" / "opentui-runtime"
+                ),
+            )
+        env = os.environ.copy()
+        if profile_dir is not None:
+            env["HERMES_HOME"] = str(profile_dir)
+        try:
+            from hermes_cli.config import apply_terminal_config_to_env
+
+            apply_terminal_config_to_env(env=env)
+        except Exception:
+            _log.debug(
+                "Failed to apply terminal config bridge for dashboard chat",
+                exc_info=True,
+            )
+        _apply_tui_heap_env(env)
+    finally:
+        if profile_token is not None:
+            from hermes_constants import reset_hermes_home_override
+
+            reset_hermes_home_override(profile_token)
+
+    _apply_opentui_native_env(argv, cwd, env)
     env.setdefault("NODE_ENV", "production")
     # Browser-embedded chat should prefer stable wheel-based scrollback over
     # native terminal mouse tracking. When mouse tracking is enabled, wheel
@@ -14591,9 +14625,6 @@ def _resolve_chat_argv(
     # setdefault so an explicit operator value still wins.
     env.setdefault("COLORTERM", "truecolor")
     env["HERMES_TUI_DASHBOARD"] = "1"
-
-    if profile_dir is not None:
-        env["HERMES_HOME"] = str(profile_dir)
 
     if resume:
         _resume_db = _open_session_db_for_profile(

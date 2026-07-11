@@ -272,6 +272,7 @@ if _try_termux_ultrafast_version():
 import argparse
 import hashlib
 import json
+import signal
 import shlex
 import shutil
 import stat
@@ -280,6 +281,7 @@ from pathlib import Path
 from typing import Optional
 
 
+from hermes_cli import opentui_runtime as _opentui_runtime
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
 from hermes_cli.subcommands.cron import build_cron_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
@@ -1702,13 +1704,8 @@ def _config_tui_engine_early() -> str | None:
     :func:`_config_default_interface_early`.
     """
     try:
-        home = os.environ.get("HERMES_HOME")
-        cfg_path = (
-            os.path.join(home, "config.yaml")
-            if home
-            else os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
-        )
-        if os.path.exists(cfg_path):
+        cfg_path = get_hermes_home() / "config.yaml"
+        if cfg_path.exists():
             import yaml as _yaml_eng
 
             with open(cfg_path, encoding="utf-8") as _f:
@@ -1723,7 +1720,9 @@ def _config_tui_engine_early() -> str | None:
     return None
 
 
-def _resolve_tui_engine() -> str:
+def _resolve_tui_engine(
+    *, opentui_runtime_state_dir: Path | None = None
+) -> str:
     """Which TUI engine to launch: "ink" (default) or "opentui".
 
     Precedence: ``HERMES_TUI_ENGINE`` env > ``display.tui_engine`` config >
@@ -1736,7 +1735,11 @@ def _resolve_tui_engine() -> str:
     env = (os.environ.get("HERMES_TUI_ENGINE") or "").strip().lower()
     # Explicit choice (env > config) wins; otherwise default to OpenTUI when this
     # host is genuinely set up for it (Node >= 26.3 + the built bundle), else Ink.
-    engine = env or _config_tui_engine_early() or ("opentui" if _opentui_available() else "ink")
+    engine = env or _config_tui_engine_early() or (
+        "opentui"
+        if _opentui_available(runtime_state_dir=opentui_runtime_state_dir)
+        else "ink"
+    )
     if engine != "opentui":
         return "ink"
 
@@ -1865,20 +1868,103 @@ def _node26_bin() -> str:
     sys.exit(1)
 
 
-def _opentui_npm() -> str:
-    """Resolve npm (ships with Node) to build the OpenTUI bundle, or exit."""
-    npm = shutil.which("npm")
-    if npm:
-        return npm
-    print(
-        "npm not found — needed to build the OpenTUI engine bundle.\n"
-        "Install Node 26.3+ (it ships npm), or unset HERMES_TUI_ENGINE for Ink.",
-        file=sys.stderr,
+def _opentui_runtime_state_dir() -> Path:
+    """Writable internal cache for refresh backoff state (not user config)."""
+    return get_hermes_home() / "cache" / "opentui-runtime"
+
+
+def _opentui_runtime_location(
+    *, report_error: bool, state_dir: Path | None = None
+) -> _opentui_runtime.RuntimeLocation | None:
+    location = _opentui_runtime.select_runtime_location(
+        PROJECT_ROOT, state_dir or _opentui_runtime_state_dir()
     )
-    sys.exit(1)
+    if location is None and report_error:
+        seed = PROJECT_ROOT / "ui-opentui"
+        print(
+            "The installed OpenTUI runtime seed is incomplete at "
+            f"{seed}. Reinstall Hermes so package.json, package-lock.json, "
+            "tsconfig.json, scripts/build.mjs, src/, and dist/main.js are present.",
+            file=sys.stderr,
+        )
+    return location
 
 
-def _opentui_available() -> bool:
+def _opentui_node_identity(
+    node: str, *, report_error: bool
+) -> _opentui_runtime.NodeIdentity | None:
+    identity = _opentui_runtime.probe_node_identity(node)
+    if identity is None and report_error:
+        print(
+            "Could not query process.platform/process.arch from the selected "
+            "Node 26 executable; refusing to guess the OpenTUI native package.",
+            file=sys.stderr,
+        )
+    return identity
+
+
+def _prune_validated_opentui_backups(
+    location: _opentui_runtime.RuntimeLocation,
+    inspection: _opentui_runtime.RuntimeInspection,
+    *,
+    packaged_current: bool,
+) -> bool:
+    """Discard crash predecessors only after validating their replacement."""
+    if location.is_packaged:
+        full_root_current = packaged_current and inspection.dependencies_current
+        runtime_dirs_current = False
+    else:
+        full_root_current = False
+        runtime_dirs_current = (
+            inspection.dependencies_current
+            and not _opentui_runtime.bundle_needs_rebuild(
+                location.runtime_dir, env={}
+            )
+        )
+    return _opentui_runtime.prune_obsolete_promotion_backups(
+        location.runtime_dir,
+        full_root_current=full_root_current,
+        runtime_dirs_current=runtime_dirs_current,
+    )
+
+
+def _opentui_refresh_failure_key(
+    location: _opentui_runtime.RuntimeLocation,
+    identity: _opentui_runtime.NodeIdentity,
+) -> str | None:
+    """Key retry state to one installation, generation, Node, and host ABI."""
+    digest = (
+        location.packaged_seed.fingerprint
+        if location.packaged_seed is not None
+        else _opentui_runtime.refresh_digest(location.runtime_dir)
+    )
+    if digest is None:
+        return None
+    return _opentui_runtime.refresh_failure_key(
+        location.runtime_dir, digest, identity
+    )
+
+
+def _completed_opentui_refresh(
+    location: _opentui_runtime.RuntimeLocation,
+    identity: _opentui_runtime.NodeIdentity,
+) -> tuple[bool, _opentui_runtime.RuntimeInspection, bool]:
+    """Validate the exact generation a successful refresh would launch."""
+    inspection = _opentui_runtime.inspect_runtime(
+        location.runtime_dir, identity, env={}
+    )
+    packaged_current = _opentui_runtime.packaged_runtime_current(location)
+    current = (
+        packaged_current
+        and not inspection.refresh_required
+        and _opentui_runtime.bundle_payload_present(location.runtime_dir)
+    )
+    return current, inspection, packaged_current
+
+
+def _opentui_available(
+    *, runtime_state_dir: Path | None = None
+) -> bool:
     """Whether the OpenTUI engine can actually launch on this host.
 
     True only when the platform is supported (not Windows/Termux), a Node >= 26.3
@@ -1890,19 +1976,37 @@ def _opentui_available() -> bool:
     """
     if sys.platform.startswith("win") or _is_termux_startup_environment():
         return False
-    if _node26_bin_or_none() is None:
+    location = _opentui_runtime_location(
+        report_error=False, state_dir=runtime_state_dir
+    )
+    if location is None:
         return False
-    pkg = PROJECT_ROOT / "ui-opentui"
-    built = pkg / "dist" / "main.js"
-    return built.is_file() and (pkg / "node_modules" / "@opentui").is_dir()
+    node = _node26_bin_or_none()
+    if node is None:
+        return False
+    identity = _opentui_node_identity(node, report_error=False)
+    if identity is None:
+        return False
+    if _opentui_runtime.packaged_prebuilt_runtime_current(location, identity):
+        pkg = location.seed_dir
+    elif _opentui_runtime.packaged_runtime_current(location):
+        pkg = location.runtime_dir
+    else:
+        return False
+    return _opentui_runtime.bundle_payload_present(
+        pkg
+    ) and _opentui_runtime.runtime_payload_present(pkg, identity)
 
 
-def _make_opentui_argv(tui_dev: bool) -> tuple[list[str], Path]:
+def _make_opentui_argv(
+    tui_dev: bool, *, runtime_state_dir: Path | None = None
+) -> tuple[list[str], Path]:
     """Argv for the native OpenTUI engine under Node 26 (no Bun).
 
     Builds the Solid + Effect-at-boundary engine (``ui-opentui``) with esbuild
-    (``npm run build`` → ``dist/main.js``) when the bundle is missing (or always, in
-    ``--dev``), then launches it on Node with the experimental FFI flag:
+    when its production inputs are stale (or always in ``--dev``). Dependency
+    graph changes use a staged ``npm ci``; source-only changes stage just the
+    bundle. It then launches on Node with the experimental FFI flag:
 
         node --experimental-ffi --no-warnings dist/main.js
 
@@ -1913,8 +2017,12 @@ def _make_opentui_argv(tui_dev: bool) -> tuple[list[str], Path]:
     (the caller sets it to ``PROJECT_ROOT``); the built bundle's own fallback also
     walks up to the checkout root, so the gateway resolves correctly either way.
     """
-    app_dir = PROJECT_ROOT / "ui-opentui"
-    entry_src = app_dir / "src" / "entry" / "main.tsx"
+    state_dir = runtime_state_dir or _opentui_runtime_state_dir()
+    location = _opentui_runtime_location(report_error=True, state_dir=state_dir)
+    if location is None:
+        sys.exit(1)
+    app_dir = location.runtime_dir
+    entry_src = location.seed_dir / "src" / "entry" / "main.tsx"
     if not entry_src.is_file():
         print(
             f"OpenTUI v2 engine entry not found at {entry_src}.\n"
@@ -1924,42 +2032,221 @@ def _make_opentui_argv(tui_dev: bool) -> tuple[list[str], Path]:
         sys.exit(1)
 
     node = _node26_bin()
-
-    # The esbuild build needs the package's node_modules (esbuild + the @opentui
-    # packages + the native blob). Without them the build/launch dies cryptically.
-    if not (app_dir / "node_modules" / "@opentui").is_dir():
-        print(
-            f"OpenTUI engine dependencies are not installed in {app_dir}.\n"
-            f"Run:  (cd {app_dir} && npm install)\n"
-            f"Or unset HERMES_TUI_ENGINE to use the default Ink engine.",
-            file=sys.stderr,
-        )
+    identity = _opentui_node_identity(node, report_error=True)
+    if identity is None:
         sys.exit(1)
 
+    # Docker and other immutable installs may bake a host-native, production-
+    # only dependency graph beside the bundle. Validate it without writing and
+    # launch it in place: copying hundreds of MB into HERMES_HOME on every
+    # ephemeral container start would add latency and duplicate image data.
+    # Wheels intentionally ship no node_modules, so they continue into the
+    # transactional writable-cache hydration path below.
+    if (
+        not tui_dev
+        and not _opentui_runtime.force_build_requested()
+        and _opentui_runtime.packaged_prebuilt_runtime_current(location, identity)
+    ):
+        app_dir = location.seed_dir
+        return _opentui_runtime.launch_argv(node, app_dir), app_dir
+
     built = app_dir / "dist" / "main.js"
-    if tui_dev or not built.is_file():
-        npm = _opentui_npm()
-        if not os.environ.get("HERMES_QUIET"):
-            print("Building the OpenTUI engine…", file=sys.stderr)
-        result = subprocess.run(
-            [npm, "run", "build"],
-            cwd=str(app_dir),
-            capture_output=True,
-            text=True,
+    packaged_current = _opentui_runtime.packaged_runtime_current(location)
+    initial = _opentui_runtime.inspect_runtime(
+        app_dir, identity, rebuild_requested=tui_dev
+    )
+    if (
+        not packaged_current
+        or initial.refresh_required
+        or _opentui_runtime.promotion_debris_present(app_dir)
+    ):
+        initial_usable = (
+            packaged_current
+            and _opentui_runtime.bundle_payload_present(app_dir)
+            and initial.payload_present
         )
-        if result.returncode != 0:
-            combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
-            preview = "\n".join(combined.splitlines()[-30:])
-            print("OpenTUI engine build failed.", file=sys.stderr)
-            if preview:
-                print(preview, file=sys.stderr)
+        try:
+            with _opentui_runtime.refresh_lock(app_dir):
+                # Another launcher/update may have completed while we waited.
+                # Probe and inspect again under the same lock that protects
+                # promotion; this is the decision that authorizes mutation.
+                locked_identity = _opentui_node_identity(node, report_error=True)
+                if locked_identity is None:
+                    if tui_dev or not initial_usable:
+                        sys.exit(1)
+                    print("Using the previous OpenTUI runtime.", file=sys.stderr)
+                else:
+                    identity = locked_identity
+                    _opentui_runtime.recover_interrupted_promotion(app_dir)
+                    _opentui_runtime.prune_abandoned_staging(app_dir)
+                    inspection = _opentui_runtime.inspect_runtime(
+                        app_dir, identity, rebuild_requested=tui_dev
+                    )
+                    packaged_current = _opentui_runtime.packaged_runtime_current(
+                        location
+                    )
+                    _prune_validated_opentui_backups(
+                        location,
+                        inspection,
+                        packaged_current=packaged_current,
+                    )
+                    usable_previous = (
+                        packaged_current
+                        and _opentui_runtime.bundle_payload_present(app_dir)
+                        and inspection.payload_present
+                    )
+                    failure_key = _opentui_refresh_failure_key(location, identity)
+                    if packaged_current and not inspection.refresh_required:
+                        _opentui_runtime.clear_refresh_failure(
+                            state_dir, failure_key
+                        )
+                    else:
+                        bypass_backoff = (
+                            tui_dev or _opentui_runtime.force_build_requested()
+                        )
+                        remaining = (
+                            _opentui_runtime.refresh_backoff_remaining(
+                                state_dir, failure_key
+                            )
+                            if failure_key is not None and not bypass_backoff
+                            else 0.0
+                        )
+                        if remaining > 0:
+                            print(
+                                "OpenTUI refresh is temporarily backed off after a "
+                                f"recent failure for these inputs (retry in "
+                                f"{int(remaining) + 1}s).",
+                                file=sys.stderr,
+                            )
+                            if not usable_previous:
+                                sys.exit(1)
+                            print(
+                                "Using the previous OpenTUI runtime.", file=sys.stderr
+                            )
+                        else:
+                            npm_command = _opentui_runtime.npm_command(node)
+                            if npm_command is None:
+                                print(
+                                    "npm from the selected Node 26 installation was "
+                                    "not found — needed to build the OpenTUI engine.",
+                                    file=sys.stderr,
+                                )
+                                if failure_key is not None:
+                                    _opentui_runtime.record_refresh_failure(
+                                        state_dir, failure_key
+                                    )
+                                if tui_dev or not usable_previous:
+                                    sys.exit(1)
+                                print(
+                                    "Using the previous OpenTUI runtime.",
+                                    file=sys.stderr,
+                                )
+                            else:
+                                if not os.environ.get("HERMES_QUIET"):
+                                    if location.is_packaged:
+                                        action = "Hydrating + building"
+                                    else:
+                                        action = (
+                                            "Installing + building"
+                                            if inspection.dependency_refresh_required
+                                            else "Building"
+                                        )
+                                    print(
+                                        f"{action} the OpenTUI engine…",
+                                        file=sys.stderr,
+                                    )
+                                build_env = _opentui_runtime.build_environment(node)
+                                if location.is_packaged:
+                                    success, result = (
+                                        _opentui_runtime.refresh_packaged_runtime(
+                                            location,
+                                            identity=identity,
+                                            npm=npm_command,
+                                            env=build_env,
+                                            runner=_run_with_idle_timeout,
+                                        )
+                                    )
+                                elif not inspection.dependency_refresh_required:
+                                    success, result = _opentui_runtime.build_bundle(
+                                        app_dir,
+                                        npm=npm_command,
+                                        env=build_env,
+                                        runner=_run_with_idle_timeout,
+                                    )
+                                else:
+                                    success, result = _opentui_runtime.refresh_runtime(
+                                        app_dir,
+                                        identity=identity,
+                                        npm=npm_command,
+                                        env=build_env,
+                                        runner=_run_with_idle_timeout,
+                                    )
+                                if success:
+                                    (
+                                        refresh_current,
+                                        completed,
+                                        completed_packaged_current,
+                                    ) = _completed_opentui_refresh(
+                                        location, identity
+                                    )
+                                    if not refresh_current:
+                                        success = False
+                                        usable_previous = False
+                                        result = subprocess.CompletedProcess(
+                                            getattr(
+                                                result,
+                                                "args",
+                                                ["opentui-refresh"],
+                                            ),
+                                            1,
+                                            stdout=getattr(result, "stdout", ""),
+                                            stderr=(
+                                                "OpenTUI refresh completed but the "
+                                                "promoted runtime is not current"
+                                            ),
+                                        )
+                                if success:
+                                    _opentui_runtime.clear_refresh_failure(
+                                        state_dir, failure_key
+                                    )
+                                    _prune_validated_opentui_backups(
+                                        location,
+                                        completed,
+                                        packaged_current=completed_packaged_current,
+                                    )
+                                else:
+                                    if failure_key is not None:
+                                        _opentui_runtime.record_refresh_failure(
+                                            state_dir, failure_key
+                                        )
+                                    print(
+                                        "OpenTUI engine refresh failed.",
+                                        file=sys.stderr,
+                                    )
+                                    preview = _opentui_runtime.failure_preview(result)
+                                    if preview:
+                                        print(preview, file=sys.stderr)
+                                    if tui_dev or not usable_previous:
+                                        sys.exit(1)
+                                    print(
+                                        "The previous OpenTUI runtime is still intact "
+                                        "and will be used. Run `hermes update` to retry "
+                                        "the transactional rebuild.",
+                                        file=sys.stderr,
+                                    )
+        except OSError as exc:
+            print(f"OpenTUI refresh lock failed: {exc}", file=sys.stderr)
+            print(
+                "Refusing to launch while runtime coherence cannot be established.",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
     # --expose-gc (parity with Ink, main.py ~1909): makes `global.gc()` a real
     # callable so the OpenTUI engine's GC hooks (W2 proactive idle GC; /heapdump)
     # work instead of being silent no-ops. MUST be an argv flag — Node rejects
     # --expose-gc in NODE_OPTIONS (see the heap-cap injection below).
-    return [node, "--experimental-ffi", "--no-warnings", "--expose-gc", str(built)], app_dir
+    return _opentui_runtime.launch_argv(node, app_dir), app_dir
 
 
 def _restore_tui_workspace(tui_dir: Path) -> bool:
@@ -2020,7 +2307,12 @@ def _ensure_tui_workspace(tui_dir: Path) -> None:
     sys.exit(1)
 
 
-def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
+def _make_tui_argv(
+    tui_dir: Path,
+    tui_dev: bool,
+    *,
+    opentui_runtime_state_dir: Path | None = None,
+) -> tuple[list[str], Path]:
     """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild).
 
     Dual-engine: when ``HERMES_TUI_ENGINE``/``display.tui_engine`` selects the
@@ -2029,8 +2321,17 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     own Node >= 26.3 and builds its own bundle, so it must not be routed through
     ``_ensure_tui_node`` / the Ink prebuilt-dir logic.
     """
-    if _resolve_tui_engine() == "opentui":
-        return _make_opentui_argv(tui_dev)
+    engine = (
+        _resolve_tui_engine()
+        if opentui_runtime_state_dir is None
+        else _resolve_tui_engine(
+            opentui_runtime_state_dir=opentui_runtime_state_dir
+        )
+    )
+    if engine == "opentui":
+        return _make_opentui_argv(
+            tui_dev, runtime_state_dir=opentui_runtime_state_dir
+        )
 
     _ensure_tui_node()
 
@@ -2280,13 +2581,8 @@ def _config_tui_heap_mb_early() -> int | None:
     override on top of this.
     """
     try:
-        home = os.environ.get("HERMES_HOME")
-        cfg_path = (
-            os.path.join(home, "config.yaml")
-            if home
-            else os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
-        )
-        if os.path.exists(cfg_path):
+        cfg_path = get_hermes_home() / "config.yaml"
+        if cfg_path.exists():
             import yaml as _yaml_heap
 
             with open(cfg_path, encoding="utf-8") as _f:
@@ -2307,7 +2603,9 @@ def _config_tui_heap_mb_early() -> int | None:
     return None
 
 
-def _resolve_tui_heap_override() -> int | None:
+def _resolve_tui_heap_override(
+    *, env: dict[str, str] | None = None
+) -> int | None:
     """The user's explicit V8 heap cap (MB), or ``None`` for the default path.
 
     Precedence: ``HERMES_TUI_HEAP_MB`` env > ``display.tui_heap_mb`` config
@@ -2315,13 +2613,16 @@ def _resolve_tui_heap_override() -> int | None:
     via the shared ``NODE_OPTIONS`` injection. A positive integer wins; anything
     else (unset/garbage/non-positive) falls through to the cgroup-aware default.
     """
-    env_val = os.environ.get("HERMES_TUI_HEAP_MB", "").strip()
+    current_env = os.environ if env is None else env
+    env_val = current_env.get("HERMES_TUI_HEAP_MB", "").strip()
     if env_val.isdigit() and int(env_val) > 0:
         return int(env_val)
     return _config_tui_heap_mb_early()
 
 
-def _resolve_tui_heap_mb(default_mb: int = 8192) -> int:
+def _resolve_tui_heap_mb(
+    default_mb: int = 8192, *, env: dict[str, str] | None = None
+) -> int:
     """Pick a V8 ``--max-old-space-size`` (MB) that fits the container.
 
     Returns ``default_mb`` (8192) when unconstrained or when the box is large
@@ -2336,7 +2637,7 @@ def _resolve_tui_heap_mb(default_mb: int = 8192) -> int:
     so an override never exceeds what the container can hold — a low override is
     honored as-is, a too-high one is still trimmed to ~75% of the cgroup limit.
     """
-    override = _resolve_tui_heap_override()
+    override = _resolve_tui_heap_override(env=env)
     if override is not None:
         default_mb = override
     limit = _read_cgroup_memory_limit()
@@ -2352,6 +2653,31 @@ def _resolve_tui_heap_mb(default_mb: int = 8192) -> int:
     # is smaller than the floor, honor the limit-derived value anyway (better a
     # graceful V8 exit than a silent cgroup kill).
     return max(1536, sized) if limit_mb > 2048 else sized
+
+
+def _apply_tui_heap_env(env: dict[str, str]) -> None:
+    """Merge the cgroup/profile-aware V8 heap cap into a TUI child env."""
+    tokens = env.get("NODE_OPTIONS", "").split()
+    if not any(token.startswith("--max-old-space-size=") for token in tokens):
+        tokens.append(f"--max-old-space-size={_resolve_tui_heap_mb(env=env)}")
+    env["NODE_OPTIONS"] = " ".join(tokens)
+
+
+def _apply_opentui_native_env(
+    argv: list[str], cwd: Path | str | None, env: dict[str, str]
+) -> None:
+    """Make child native-package selection match the selected Node identity."""
+    if not argv or cwd is None or "--experimental-ffi" not in argv:
+        return
+    identity = _opentui_node_identity(argv[0], report_error=False)
+    if identity is None or identity.platform != "linux":
+        return
+    # Current OpenTUI releases accept OPENTUI_LIBC as an explicit native
+    # package selector. Set it on musl so older loaders that predate their own
+    # auto-detection choose the same payload the packaging guard validated.
+    libc = _opentui_runtime.linux_libc_name(env=env)
+    if libc == "musl" and not env.get("OPENTUI_LIBC"):
+        env["OPENTUI_LIBC"] = "musl"
 
 
 def _launch_tui(
@@ -2502,10 +2828,7 @@ def _launch_tui(
     # (Node 26 + node:ffi). So --max-old-space-size (a V8/Node flag) applies to
     # both. (Pre-Node-26 the OpenTUI engine ran on Bun/JavaScriptCore, which has
     # no such flag; that gate is gone now that the engine is Node.)
-    _tokens = env.get("NODE_OPTIONS", "").split()
-    if not any(t.startswith("--max-old-space-size=") for t in _tokens):
-        _tokens.append(f"--max-old-space-size={_resolve_tui_heap_mb()}")
-    env["NODE_OPTIONS"] = " ".join(_tokens)
+    _apply_tui_heap_env(env)
     # HERMES_TUI_RESUME is an internal hand-off from the Python wrapper to the
     # Ink app.  Because we start from os.environ.copy(), an exported/stale value
     # in the user's shell would otherwise make a plain `hermes --tui` try to
@@ -2522,6 +2845,7 @@ def _launch_tui(
         env["HERMES_TUI_RESUME"] = resume_session_id
 
     argv, cwd = _make_tui_argv(tui_dir, tui_dev)
+    _apply_opentui_native_env(argv, cwd, env)
     code: Optional[int] = None
     try:
         try:
@@ -5050,6 +5374,59 @@ def _web_ui_build_needed(web_dir: Path) -> bool:
     return False
 
 
+def _terminate_subprocess_tree(proc: subprocess.Popen) -> int:
+    """Terminate then force-kill the isolated subprocess tree."""
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return proc.wait()
+        try:
+            rc = proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return proc.wait()
+        # The session leader may exit before a child that ignored SIGTERM.
+        # Kill any remaining member of the isolated group before returning.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return rc
+
+    if os.name == "nt":
+        # CREATE_NEW_PROCESS_GROUP below lets taskkill address the full tree.
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            if result.returncode == 0:
+                return proc.wait()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    proc.terminate()
+    try:
+        return proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return proc.wait()
+
+
+class _BuildParentTermination(BaseException):
+    """Internal control flow for default TERM/HUP during an isolated build."""
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
 def _run_with_idle_timeout(
     cmd: list[str],
     cwd: Path,
@@ -5081,6 +5458,12 @@ def _run_with_idle_timeout(
     last_output_ts = _time.monotonic()
     lock = threading.Lock()
 
+    popen_options = {}
+    if os.name == "posix":
+        popen_options["start_new_session"] = True
+    elif os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -5092,6 +5475,7 @@ def _run_with_idle_timeout(
             errors="replace",
             bufsize=1,
             env=env,
+            **popen_options,
         )
     except OSError as exc:
         # E.g. npm not on PATH between the which() check and now.
@@ -5115,26 +5499,64 @@ def _run_with_idle_timeout(
     reader_thread = threading.Thread(target=_reader, daemon=True)
     reader_thread.start()
 
+    previous_termination_handlers: dict[int, object] = {}
+
+    def _raise_parent_termination(signum, _frame) -> None:
+        raise _BuildParentTermination(signum)
+
+    # setsid protects the caller from descendants and enables reliable group
+    # cleanup, but it also shields a silent child from terminal HUP when the
+    # Python parent receives its default TERM/HUP disposition. Temporarily turn
+    # only those default dispositions into Python control flow so the process
+    # group is reaped first. Respect daemon/custom handlers, and signal APIs are
+    # only legal from Python's main thread.
+    if os.name == "posix" and threading.current_thread() is threading.main_thread():
+        for termination_signal in (signal.SIGTERM, signal.SIGHUP):
+            previous = signal.getsignal(termination_signal)
+            if previous == signal.SIG_DFL:
+                signal.signal(termination_signal, _raise_parent_termination)
+                previous_termination_handlers[termination_signal] = previous
+
+    def _restore_termination_handlers() -> None:
+        while previous_termination_handlers:
+            signum, previous = previous_termination_handlers.popitem()
+            signal.signal(signum, previous)
+
     idle_killed = False
-    while True:
-        try:
-            rc = proc.wait(timeout=5)
-            break
-        except subprocess.TimeoutExpired:
-            with lock:
-                idle = _time.monotonic() - last_output_ts
-            if idle > idle_timeout_seconds:
-                idle_killed = True
-                proc.terminate()
-                try:
-                    rc = proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    rc = proc.wait()
+    parent_termination_signal: int | None = None
+    wait_poll_seconds = min(5.0, max(0.05, idle_timeout_seconds / 4))
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=wait_poll_seconds)
                 break
+            except subprocess.TimeoutExpired:
+                with lock:
+                    idle = _time.monotonic() - last_output_ts
+                if idle > idle_timeout_seconds:
+                    idle_killed = True
+                    rc = _terminate_subprocess_tree(proc)
+                    break
+    except _BuildParentTermination as exc:
+        rc = _terminate_subprocess_tree(proc)
+        parent_termination_signal = exc.signum
+    except BaseException:
+        _terminate_subprocess_tree(proc)
+        reader_thread.join(timeout=2)
+        raise
+    finally:
+        _restore_termination_handlers()
 
     # Drain reader so we don't leak the stdout file descriptor.
     reader_thread.join(timeout=2)
+
+    if parent_termination_signal is not None:
+        # Re-deliver with the original default disposition so callers and
+        # supervisors observe the same signal exit status as without this
+        # cleanup fence. The SystemExit is a defensive fallback for platforms
+        # that unexpectedly decline self-delivery.
+        os.kill(os.getpid(), parent_termination_signal)
+        raise SystemExit(128 + parent_termination_signal)
 
     combined = "".join(merged_chunks)
     if idle_killed:
@@ -8513,7 +8935,161 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     return resolve_uv() or shutil.which("uv")
 
 
-def _update_node_dependencies() -> None:
+def _update_opentui_package() -> bool:
+    """Refresh the standalone OpenTUI package during ``hermes update``.
+
+    Dependency-graph changes run npm ci + build in a sibling staging tree and
+    promote node_modules + dist only after both succeed. Source/config-only
+    changes use the cheaper transactional dist build. Either failure leaves the
+    previously launchable runtime intact. This is deliberately best-effort so
+    unsupported hosts keep Ink or their prior OpenTUI runtime.
+    """
+    if sys.platform.startswith("win") or _is_termux_startup_environment():
+        return True
+
+    seed_dir = PROJECT_ROOT / "ui-opentui"
+    if not (seed_dir / "package.json").is_file():
+        return True
+    location = _opentui_runtime_location(report_error=False)
+    if location is None:
+        print(
+            "  ⚠ OpenTUI update skipped: the packaged runtime seed is incomplete; "
+            "reinstall Hermes to restore its build inputs."
+        )
+        return False
+    app_dir = location.runtime_dir
+
+    node = _node26_bin_or_none()
+    if node is None:
+        print(
+            "  ⚠ OpenTUI update skipped: Node.js >= 26.3.0 is unavailable; "
+            "the previous bundle/Ink fallback is unchanged."
+        )
+        return False
+    identity = _opentui_node_identity(node, report_error=False)
+    if identity is None:
+        print(
+            "  ⚠ OpenTUI update skipped: the selected Node 26 runtime identity "
+            "could not be queried; the previous runtime is unchanged."
+        )
+        return False
+
+    packaged_current = _opentui_runtime.packaged_runtime_current(location)
+    initial = _opentui_runtime.inspect_runtime(app_dir, identity)
+    state_dir = _opentui_runtime_state_dir()
+    if (
+        packaged_current
+        and not initial.refresh_required
+        and not _opentui_runtime.promotion_debris_present(app_dir)
+    ):
+        _opentui_runtime.clear_refresh_failure(
+            state_dir, _opentui_refresh_failure_key(location, identity)
+        )
+        return True
+
+    try:
+        with _opentui_runtime.refresh_lock(app_dir):
+            locked_identity = _opentui_node_identity(node, report_error=False)
+            if locked_identity is None:
+                print(
+                    "  ⚠ OpenTUI update skipped: the selected Node 26 runtime "
+                    "identity changed or became unavailable."
+                )
+                return False
+            identity = locked_identity
+            _opentui_runtime.recover_interrupted_promotion(app_dir)
+            _opentui_runtime.prune_abandoned_staging(app_dir)
+            inspection = _opentui_runtime.inspect_runtime(app_dir, identity)
+            packaged_current = _opentui_runtime.packaged_runtime_current(location)
+            _prune_validated_opentui_backups(
+                location,
+                inspection,
+                packaged_current=packaged_current,
+            )
+            failure_key = _opentui_refresh_failure_key(location, identity)
+            if packaged_current and not inspection.refresh_required:
+                _opentui_runtime.clear_refresh_failure(state_dir, failure_key)
+                return True
+            npm_command = _opentui_runtime.npm_command(node)
+            if npm_command is None:
+                if failure_key is not None:
+                    _opentui_runtime.record_refresh_failure(state_dir, failure_key)
+                print(
+                    "  ⚠ OpenTUI update skipped: npm paired with the selected "
+                    "Node 26 installation was not found; the previous runtime "
+                    "is unchanged."
+                )
+                return False
+
+            print("→ Updating the OpenTUI engine transactionally…")
+            env = _opentui_runtime.build_environment(node)
+            if location.is_packaged:
+                success, result = _opentui_runtime.refresh_packaged_runtime(
+                    location,
+                    identity=identity,
+                    npm=npm_command,
+                    env=env,
+                    runner=_run_with_idle_timeout,
+                )
+                success_message = (
+                    "  ✓ OpenTUI writable runtime hydrated + production bundle updated"
+                )
+            elif not inspection.dependency_refresh_required:
+                success, result = _opentui_runtime.build_bundle(
+                    app_dir,
+                    npm=npm_command,
+                    env=env,
+                    runner=_run_with_idle_timeout,
+                )
+                success_message = "  ✓ OpenTUI production bundle updated"
+            else:
+                success, result = _opentui_runtime.refresh_runtime(
+                    app_dir,
+                    identity=identity,
+                    npm=npm_command,
+                    env=env,
+                    runner=_run_with_idle_timeout,
+                )
+                success_message = (
+                    "  ✓ OpenTUI dependencies + production bundle updated"
+                )
+            if not success:
+                if failure_key is not None:
+                    _opentui_runtime.record_refresh_failure(state_dir, failure_key)
+                preview = _opentui_runtime.failure_preview(result)
+                print("  ⚠ OpenTUI refresh failed; the previous runtime is unchanged.")
+                if preview:
+                    print(preview)
+                return False
+
+            (
+                refresh_current,
+                completed,
+                completed_packaged_current,
+            ) = _completed_opentui_refresh(location, identity)
+            if not refresh_current:
+                if failure_key is not None:
+                    _opentui_runtime.record_refresh_failure(state_dir, failure_key)
+                print(
+                    "  ⚠ OpenTUI refresh produced a non-current runtime; "
+                    "refusing to launch it."
+                )
+                return False
+
+            _opentui_runtime.clear_refresh_failure(state_dir, failure_key)
+            _prune_validated_opentui_backups(
+                location,
+                completed,
+                packaged_current=completed_packaged_current,
+            )
+            print(success_message)
+            return True
+    except Exception as exc:
+        print(f"  ⚠ OpenTUI update failed; the previous runtime is unchanged: {exc}")
+        return False
+
+
+def _update_workspace_node_dependencies() -> None:
     from hermes_constants import find_node_executable, with_hermes_node_path
 
     npm = find_node_executable("npm")
@@ -8573,6 +9149,12 @@ def _update_node_dependencies() -> None:
         stderr = (ws_result.stderr or "").strip() if ws_result.stderr else ""
         if stderr:
             print(f"    {stderr.splitlines()[-1]}")
+
+
+def _update_node_dependencies() -> None:
+    """Update root workspaces, then the standalone Node-26 OpenTUI package."""
+    _update_workspace_node_dependencies()
+    _update_opentui_package()
 
 
 class _UpdateOutputStream:

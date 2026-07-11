@@ -580,17 +580,111 @@ class TestProfileScopedTelegramOnboarding:
 
 
 class TestProfileScopedChatPty:
+    def test_real_engine_and_heap_resolution_uses_target_profile(
+        self, isolated_profiles, monkeypatch
+    ):
+        import hermes_cli.main as main_mod
+        import hermes_cli.web_server as web_server
+        from hermes_constants import get_hermes_home
+
+        (isolated_profiles["default"] / "config.yaml").write_text(
+            "display:\n  tui_engine: ink\n  tui_heap_mb: 2048\n",
+            encoding="utf-8",
+        )
+        (isolated_profiles["worker_beta"] / "config.yaml").write_text(
+            "display:\n  tui_engine: opentui\n  tui_heap_mb: 777\n",
+            encoding="utf-8",
+        )
+        observed = {}
+
+        def make_opentui_argv(tui_dev, *, runtime_state_dir=None):
+            observed["state_dir"] = runtime_state_dir
+            return ["profile-opentui"], isolated_profiles["worker_beta"]
+
+        monkeypatch.setattr(main_mod, "_make_opentui_argv", make_opentui_argv)
+        monkeypatch.setattr(main_mod, "_read_cgroup_memory_limit", lambda: None)
+        for name in (
+            "HERMES_TUI_ENGINE",
+            "HERMES_TUI_HEAP_MB",
+            "NODE_OPTIONS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        argv, _cwd, env = web_server._resolve_chat_argv(profile="worker_beta")
+
+        assert argv == ["profile-opentui"]
+        assert observed["state_dir"] == (
+            isolated_profiles["worker_beta"] / "cache" / "opentui-runtime"
+        )
+        assert env["NODE_OPTIONS"] == "--max-old-space-size=777"
+        assert env["HERMES_HOME"] == str(isolated_profiles["worker_beta"])
+        assert get_hermes_home() == isolated_profiles["default"]
+
+    def test_default_engine_availability_receives_target_profile_cache(
+        self, tmp_path, isolated_profiles, monkeypatch
+    ):
+        import hermes_cli.main as main_mod
+        import hermes_cli.web_server as web_server
+
+        (isolated_profiles["default"] / "config.yaml").write_text(
+            "display:\n  tui_engine: opentui\n",
+            encoding="utf-8",
+        )
+        (isolated_profiles["worker_beta"] / "config.yaml").write_text(
+            "display:\n  tui_heap_mb: 888\n",
+            encoding="utf-8",
+        )
+        prebuilt = tmp_path / "ink-prebuilt"
+        (prebuilt / "dist").mkdir(parents=True)
+        (prebuilt / "dist" / "entry.js").write_text("// fixture")
+        observed = []
+
+        def opentui_available(*, runtime_state_dir=None):
+            observed.append(runtime_state_dir)
+            return False
+
+        monkeypatch.setattr(main_mod, "_opentui_available", opentui_available)
+        monkeypatch.setattr(main_mod, "_ensure_tui_node", lambda: None)
+        monkeypatch.setattr(main_mod, "_read_cgroup_memory_limit", lambda: None)
+        monkeypatch.setenv("HERMES_TUI_DIR", str(prebuilt))
+        monkeypatch.setenv("HERMES_NODE", main_mod.sys.executable)
+        for name in (
+            "HERMES_TUI_ENGINE",
+            "HERMES_TUI_HEAP_MB",
+            "NODE_OPTIONS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        argv, cwd, env = web_server._resolve_chat_argv(profile="worker_beta")
+
+        expected_state = (
+            isolated_profiles["worker_beta"] / "cache" / "opentui-runtime"
+        )
+        assert observed == [expected_state]
+        assert argv[-1] == str(prebuilt / "dist" / "entry.js")
+        assert cwd == str(prebuilt)
+        assert env["NODE_OPTIONS"] == "--max-old-space-size=888"
+
     def test_chat_argv_scopes_hermes_home(self, isolated_profiles, monkeypatch):
         import hermes_cli.web_server as web_server
 
+        observed = {}
+
+        def make_tui_argv(root, tui_dev=False, **kwargs):
+            observed.update(kwargs)
+            return ["cat"], None
+
         monkeypatch.setattr(
             "hermes_cli.main._make_tui_argv",
-            lambda root, tui_dev=False: (["cat"], None),
+            make_tui_argv,
             raising=False,
         )
         argv, cwd, env = web_server._resolve_chat_argv(profile="worker_beta")
         assert env is not None
         assert env["HERMES_HOME"] == str(isolated_profiles["worker_beta"])
+        assert observed["opentui_runtime_state_dir"] == (
+            isolated_profiles["worker_beta"] / "cache" / "opentui-runtime"
+        )
         # Scoped chat must NOT attach to the dashboard's in-memory gateway.
         assert "HERMES_TUI_GATEWAY_URL" not in env
 
@@ -599,7 +693,7 @@ class TestProfileScopedChatPty:
 
         monkeypatch.setattr(
             "hermes_cli.main._make_tui_argv",
-            lambda root, tui_dev=False: (["cat"], None),
+            lambda root, tui_dev=False, **_kwargs: (["cat"], None),
             raising=False,
         )
         argv, cwd, env = web_server._resolve_chat_argv()
@@ -611,7 +705,7 @@ class TestProfileScopedChatPty:
 
         monkeypatch.setattr(
             "hermes_cli.main._make_tui_argv",
-            lambda root, tui_dev=False: (["cat"], None),
+            lambda root, tui_dev=False, **_kwargs: (["cat"], None),
             raising=False,
         )
         # Reuse the HTTPException class web_server itself raises — avoids a

@@ -6474,6 +6474,31 @@ class TestPtyWebSocket:
         assert env["HERMES_TUI_INLINE"] == "1"
         assert env["HERMES_TUI_DISABLE_MOUSE"] == "1"
 
+    def test_resolve_chat_argv_applies_opentui_native_env(self, monkeypatch):
+        """Dashboard launches get the same selected-Node native env as CLI launches."""
+        import hermes_cli.main as main_mod
+
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (
+                ["/opt/node-arm64/bin/node", "dist/main.js"],
+                "/tmp/ui-opentui",
+            ),
+        )
+        observed = []
+
+        def apply_native_env(argv, cwd, env):
+            observed.append((argv, cwd))
+            env["OPENTUI_LIBC"] = "musl"
+
+        monkeypatch.setattr(main_mod, "_apply_opentui_native_env", apply_native_env)
+
+        argv, cwd, env = self.ws_module._resolve_chat_argv()
+
+        assert observed == [(argv, cwd)]
+        assert env["OPENTUI_LIBC"] == "musl"
+
     def test_resolve_chat_argv_backfills_colorterm_truecolor(self, monkeypatch):
         """Headless servers (cloud/systemd) have no COLORTERM, which made
         chalk in the TUI child degrade skin hex colors to the xterm 256
