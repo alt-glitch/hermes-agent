@@ -107,6 +107,91 @@ class RuntimeLocation:
         return self.packaged_seed is not None
 
 
+@dataclass(frozen=True)
+class _PromotionEntry:
+    """One live destination and its retained predecessor."""
+
+    destination: Path
+    backup: Path
+    had_previous: bool
+
+
+class PromotionTransaction:
+    """A promoted runtime generation awaiting caller validation.
+
+    Promotion is intentionally two-phase: filesystem swaps make the candidate
+    live, but its predecessor remains beside it until the caller validates the
+    complete generation. ``commit`` discards that predecessor; ``rollback``
+    restores it (or removes a first-install destination that had no predecessor).
+    """
+
+    def __init__(self, entries: tuple[_PromotionEntry, ...]) -> None:
+        self._entries = tuple(entries)
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def commit(self) -> None:
+        """Accept the promoted generation and discard retained predecessors."""
+        if not self._active:
+            return
+        for entry in self._entries:
+            try:
+                _remove_path(entry.backup)
+            except (OSError, shutil.Error):
+                # The live generation is already validated. Leaving a backup is
+                # safe: the next locked launch prunes it as promotion debris.
+                logger.debug(
+                    "Could not remove committed OpenTUI predecessor %s", entry.backup
+                )
+        self._active = False
+
+    def rollback(self) -> None:
+        """Restore every predecessor as one coherent generation."""
+        if not self._active:
+            return
+
+        # Validate every required predecessor before touching the candidate. A
+        # damaged transaction must fail without deleting its only runnable copy.
+        for entry in self._entries:
+            if entry.had_previous and not (
+                entry.backup.exists() or entry.backup.is_symlink()
+            ):
+                raise FileNotFoundError(
+                    f"OpenTUI promotion predecessor is missing: {entry.backup}"
+                )
+
+        # Remove the candidate generation first. If removal fails, all retained
+        # predecessors remain available to crash recovery.
+        for entry in self._entries:
+            _remove_path(entry.destination)
+
+        restored: list[_PromotionEntry] = []
+        try:
+            for entry in self._entries:
+                if not entry.had_previous:
+                    continue
+                if not (entry.backup.exists() or entry.backup.is_symlink()):
+                    raise FileNotFoundError(
+                        f"OpenTUI promotion predecessor is missing: {entry.backup}"
+                    )
+                os.replace(entry.backup, entry.destination)
+                restored.append(entry)
+        except BaseException:
+            # Keep the on-disk state recoverable as a set of backups rather than
+            # exposing a partially restored paired generation.
+            for entry in reversed(restored):
+                if entry.destination.exists() or entry.destination.is_symlink():
+                    os.replace(entry.destination, entry.backup)
+            raise
+        self._active = False
+
+
+PromotionResult = tuple[bool, subprocess.CompletedProcess, PromotionTransaction | None]
+
+
 def probe_node_identity(node_bin: str) -> NodeIdentity | None:
     """Ask the selected Node process for its platform, architecture, and version.
 
@@ -1274,8 +1359,8 @@ def prune_obsolete_promotion_backups(
     return removed
 
 
-def _promote_directory(staged: Path, destination: Path) -> None:
-    """Atomically replace one directory, restoring its predecessor on error."""
+def _promote_directory(staged: Path, destination: Path) -> PromotionTransaction:
+    """Swap one directory while retaining its predecessor for validation."""
     backup = destination.parent / f".{destination.name}.previous-{staged.name}"
     _remove_path(backup)
     had_previous = destination.exists() or destination.is_symlink()
@@ -1287,10 +1372,12 @@ def _promote_directory(staged: Path, destination: Path) -> None:
         if had_previous and (backup.exists() or backup.is_symlink()):
             os.replace(backup, destination)
         raise
-    try:
-        _remove_path(backup)
-    except (OSError, shutil.Error):
-        logger.debug("Could not remove old OpenTUI bundle backup %s", backup)
+    entry = _PromotionEntry(
+        destination=destination,
+        backup=backup,
+        had_previous=had_previous,
+    )
+    return PromotionTransaction((entry,))
 
 
 def build_bundle(
@@ -1299,25 +1386,33 @@ def build_bundle(
     npm: list[str],
     env: dict[str, str],
     runner: Runner,
-) -> tuple[bool, subprocess.CompletedProcess]:
+) -> PromotionResult:
     """Build into a staging directory and promote only a complete bundle."""
     base_command = [*npm, "run", "build"]
     source_digest = refresh_digest(app_dir)
     if source_digest is None:
-        return False, subprocess.CompletedProcess(
-            base_command,
-            1,
-            stdout="",
-            stderr="could not fingerprint OpenTUI build inputs",
+        return (
+            False,
+            subprocess.CompletedProcess(
+                base_command,
+                1,
+                stdout="",
+                stderr="could not fingerprint OpenTUI build inputs",
+            ),
+            None,
         )
     try:
         staged_dist = Path(tempfile.mkdtemp(prefix=".dist-next-", dir=str(app_dir)))
     except OSError as exc:
-        return False, subprocess.CompletedProcess(
-            base_command,
-            1,
-            stdout="",
-            stderr=f"could not create bundle staging: {exc}",
+        return (
+            False,
+            subprocess.CompletedProcess(
+                base_command,
+                1,
+                stdout="",
+                stderr=f"could not create bundle staging: {exc}",
+            ),
+            None,
         )
     command = [
         *base_command,
@@ -1334,38 +1429,54 @@ def build_bundle(
                 env=env,
             )
         except Exception as exc:
-            return False, subprocess.CompletedProcess(
-                command,
-                1,
-                stdout="",
-                stderr=f"build command failed: {exc}",
+            return (
+                False,
+                subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout="",
+                    stderr=f"build command failed: {exc}",
+                ),
+                None,
             )
         if result.returncode != 0:
-            return False, result
+            return False, result, None
         if not _nonempty_file(staged_dist / "main.js"):
-            return False, subprocess.CompletedProcess(
-                command,
-                1,
-                stdout=result.stdout,
-                stderr="build completed without a non-empty dist/main.js",
+            return (
+                False,
+                subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout=result.stdout,
+                    stderr="build completed without a non-empty dist/main.js",
+                ),
+                None,
             )
         if refresh_digest(app_dir) != source_digest:
-            return False, subprocess.CompletedProcess(
-                command,
-                1,
-                stdout=result.stdout,
-                stderr="OpenTUI build inputs changed during compilation; retrying is safe",
+            return (
+                False,
+                subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout=result.stdout,
+                    stderr="OpenTUI build inputs changed during compilation; retrying is safe",
+                ),
+                None,
             )
         try:
-            _promote_directory(staged_dist, app_dir / "dist")
+            promotion = _promote_directory(staged_dist, app_dir / "dist")
         except (OSError, shutil.Error) as exc:
-            return False, subprocess.CompletedProcess(
-                command,
-                1,
-                stdout=result.stdout,
-                stderr=f"could not promote OpenTUI bundle: {exc}",
+            return (
+                False,
+                subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout=result.stdout,
+                    stderr=f"could not promote OpenTUI bundle: {exc}",
+                ),
+                None,
             )
-        return True, result
+        return True, result, promotion
     finally:
         try:
             _remove_path(staged_dist)
@@ -1399,21 +1510,25 @@ def _copy_update_tree(app_dir: Path, staging: Path) -> None:
         shutil.copy2(npmrc, staging / ".npmrc")
 
 
-def promote_runtime(app_dir: Path, staging: Path) -> None:
-    """Promote node_modules + dist together, rolling both back on error."""
+def promote_runtime(app_dir: Path, staging: Path) -> PromotionTransaction:
+    """Promote a paired runtime while retaining both predecessors."""
     names = ("node_modules", "dist")
     for name in names:
         if not (staging / name).is_dir():
             raise FileNotFoundError(f"staged OpenTUI runtime is missing {name}")
 
     backups = {name: app_dir / f".{name}.previous-{staging.name}" for name in names}
+    had_previous = {
+        name: (app_dir / name).exists() or (app_dir / name).is_symlink()
+        for name in names
+    }
     promoted: list[str] = []
     try:
         for name in names:
             destination = app_dir / name
             backup = backups[name]
             _remove_path(backup)
-            if destination.exists() or destination.is_symlink():
+            if had_previous[name]:
                 os.replace(destination, backup)
 
         for name in names:
@@ -1430,12 +1545,16 @@ def promote_runtime(app_dir: Path, staging: Path) -> None:
                 os.replace(backup, destination)
         raise
 
-    for backup in backups.values():
-        try:
-            _remove_path(backup)
-        except (OSError, shutil.Error):
-            logger.debug("Could not remove old OpenTUI runtime backup %s", backup)
-    prune_obsolete_promotion_backups(app_dir, runtime_dirs_current=True)
+    return PromotionTransaction(
+        tuple(
+            _PromotionEntry(
+                destination=app_dir / name,
+                backup=backups[name],
+                had_previous=had_previous[name],
+            )
+            for name in names
+        )
+    )
 
 
 def _npm_ci_command(npm: list[str]) -> list[str]:
@@ -1484,7 +1603,14 @@ def _install_and_build(
             stderr="could not hash staged OpenTUI dependency inputs",
         )
     _write_dependency_stamp(staging, digest)
-    return build_bundle(staging, npm=npm, env=env, runner=runner)
+    success, result, promotion = build_bundle(staging, npm=npm, env=env, runner=runner)
+    if success:
+        if promotion is None:
+            raise RuntimeError("successful staged OpenTUI build has no promotion")
+        # This is an isolated staging root with no caller-visible predecessor.
+        # Its complete runtime is validated again before the live-root swap.
+        promotion.commit()
+    return success, result
 
 
 def refresh_packaged_runtime(
@@ -1494,7 +1620,7 @@ def refresh_packaged_runtime(
     npm: list[str],
     env: dict[str, str],
     runner: Runner,
-) -> tuple[bool, subprocess.CompletedProcess]:
+) -> PromotionResult:
     """Hydrate and build an installed runtime off-tree, then swap one root."""
     seed = location.packaged_seed
     if seed is None:
@@ -1514,11 +1640,15 @@ def refresh_packaged_runtime(
             tempfile.mkdtemp(prefix=".runtime-next-", dir=str(runtime_parent))
         )
     except OSError as exc:
-        return False, subprocess.CompletedProcess(
-            install_command,
-            1,
-            stdout="",
-            stderr=f"could not create packaged runtime staging: {exc}",
+        return (
+            False,
+            subprocess.CompletedProcess(
+                install_command,
+                1,
+                stdout="",
+                stderr=f"could not create packaged runtime staging: {exc}",
+            ),
+            None,
         )
 
     try:
@@ -1531,7 +1661,7 @@ def refresh_packaged_runtime(
             runner=runner,
         )
         if not success:
-            return False, build_result
+            return False, build_result, None
 
         _write_packaged_runtime_stamp(staging, seed)
         staged_location = RuntimeLocation(
@@ -1540,23 +1670,28 @@ def refresh_packaged_runtime(
             packaged_seed=seed,
         )
         if not packaged_runtime_current(staged_location):
-            return False, subprocess.CompletedProcess(
+            return (
+                False,
+                subprocess.CompletedProcess(
+                    install_command,
+                    1,
+                    stdout=build_result.stdout,
+                    stderr="staged OpenTUI runtime fingerprint validation failed",
+                ),
+                None,
+            )
+        promotion = _promote_directory(staging, location.runtime_dir)
+        return True, build_result, promotion
+    except Exception as exc:
+        return (
+            False,
+            subprocess.CompletedProcess(
                 install_command,
                 1,
-                stdout=build_result.stdout,
-                stderr="staged OpenTUI runtime fingerprint validation failed",
-            )
-        _promote_directory(staging, location.runtime_dir)
-        prune_obsolete_promotion_backups(
-            location.runtime_dir, full_root_current=True
-        )
-        return True, build_result
-    except Exception as exc:
-        return False, subprocess.CompletedProcess(
-            install_command,
-            1,
-            stdout="",
-            stderr=f"packaged runtime transaction failed: {exc}",
+                stdout="",
+                stderr=f"packaged runtime transaction failed: {exc}",
+            ),
+            None,
         )
     finally:
         try:
@@ -1572,27 +1707,35 @@ def refresh_runtime(
     npm: list[str],
     env: dict[str, str],
     runner: Runner,
-) -> tuple[bool, subprocess.CompletedProcess]:
+) -> PromotionResult:
     """Run npm ci + build off to the side, then promote both runtime dirs."""
     install_command = _npm_ci_command(npm)
     source_digest = refresh_digest(app_dir)
     if source_digest is None:
-        return False, subprocess.CompletedProcess(
-            install_command,
-            1,
-            stdout="",
-            stderr="could not fingerprint OpenTUI update inputs",
+        return (
+            False,
+            subprocess.CompletedProcess(
+                install_command,
+                1,
+                stdout="",
+                stderr="could not fingerprint OpenTUI update inputs",
+            ),
+            None,
         )
     try:
         staging = Path(
             tempfile.mkdtemp(prefix=".ui-opentui-update-", dir=str(app_dir.parent))
         )
     except OSError as exc:
-        return False, subprocess.CompletedProcess(
-            install_command,
-            1,
-            stdout="",
-            stderr=f"could not create staging: {exc}",
+        return (
+            False,
+            subprocess.CompletedProcess(
+                install_command,
+                1,
+                stdout="",
+                stderr=f"could not create staging: {exc}",
+            ),
+            None,
         )
 
     try:
@@ -1605,24 +1748,32 @@ def refresh_runtime(
             runner=runner,
         )
         if not success:
-            return False, build_result
+            return False, build_result, None
 
         if refresh_digest(app_dir) != source_digest:
-            return False, subprocess.CompletedProcess(
-                install_command,
-                1,
-                stdout=build_result.stdout,
-                stderr="OpenTUI update inputs changed during staging; retrying is safe",
+            return (
+                False,
+                subprocess.CompletedProcess(
+                    install_command,
+                    1,
+                    stdout=build_result.stdout,
+                    stderr="OpenTUI update inputs changed during staging; retrying is safe",
+                ),
+                None,
             )
 
-        promote_runtime(app_dir, staging)
-        return True, build_result
+        promotion = promote_runtime(app_dir, staging)
+        return True, build_result, promotion
     except Exception as exc:
-        return False, subprocess.CompletedProcess(
-            install_command,
-            1,
-            stdout="",
-            stderr=f"transaction failed: {exc}",
+        return (
+            False,
+            subprocess.CompletedProcess(
+                install_command,
+                1,
+                stdout="",
+                stderr=f"transaction failed: {exc}",
+            ),
+            None,
         )
     finally:
         try:

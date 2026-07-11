@@ -282,6 +282,7 @@ from typing import Optional
 
 
 from hermes_cli import opentui_runtime as _opentui_runtime
+from hermes_cli import subprocess_lifecycle as _subprocess_lifecycle
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
 from hermes_cli.subcommands.cron import build_cron_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
@@ -2157,7 +2158,7 @@ def _make_opentui_argv(
                                     )
                                 build_env = _opentui_runtime.build_environment(node)
                                 if location.is_packaged:
-                                    success, result = (
+                                    success, result, promotion = (
                                         _opentui_runtime.refresh_packaged_runtime(
                                             location,
                                             identity=identity,
@@ -2167,31 +2168,44 @@ def _make_opentui_argv(
                                         )
                                     )
                                 elif not inspection.dependency_refresh_required:
-                                    success, result = _opentui_runtime.build_bundle(
-                                        app_dir,
-                                        npm=npm_command,
-                                        env=build_env,
-                                        runner=_run_with_idle_timeout,
+                                    success, result, promotion = (
+                                        _opentui_runtime.build_bundle(
+                                            app_dir,
+                                            npm=npm_command,
+                                            env=build_env,
+                                            runner=_run_with_idle_timeout,
+                                        )
                                     )
                                 else:
-                                    success, result = _opentui_runtime.refresh_runtime(
-                                        app_dir,
-                                        identity=identity,
-                                        npm=npm_command,
-                                        env=build_env,
-                                        runner=_run_with_idle_timeout,
+                                    success, result, promotion = (
+                                        _opentui_runtime.refresh_runtime(
+                                            app_dir,
+                                            identity=identity,
+                                            npm=npm_command,
+                                            env=build_env,
+                                            runner=_run_with_idle_timeout,
+                                        )
                                     )
                                 if success:
-                                    (
-                                        refresh_current,
-                                        completed,
-                                        completed_packaged_current,
-                                    ) = _completed_opentui_refresh(
-                                        location, identity
-                                    )
+                                    if promotion is None:
+                                        raise RuntimeError(
+                                            "successful OpenTUI refresh has no "
+                                            "promotion transaction"
+                                        )
+                                    try:
+                                        (
+                                            refresh_current,
+                                            completed,
+                                            completed_packaged_current,
+                                        ) = _completed_opentui_refresh(
+                                            location, identity
+                                        )
+                                    except BaseException:
+                                        promotion.rollback()
+                                        raise
                                     if not refresh_current:
+                                        promotion.rollback()
                                         success = False
-                                        usable_previous = False
                                         result = subprocess.CompletedProcess(
                                             getattr(
                                                 result,
@@ -2206,6 +2220,7 @@ def _make_opentui_argv(
                                             ),
                                         )
                                 if success:
+                                    promotion.commit()
                                     _opentui_runtime.clear_refresh_failure(
                                         state_dir, failure_key
                                     )
@@ -5481,6 +5496,13 @@ def _run_with_idle_timeout(
         # E.g. npm not on PATH between the which() check and now.
         return subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(exc))
 
+    # Register immediately after Popen: dashboard hydration runs this helper
+    # in a worker thread, so its main event-loop task and TERM/HUP handler need
+    # a thread-safe way to own the isolated process group.
+    managed_proc = _subprocess_lifecycle.register_isolated_subprocess(
+        proc, _terminate_subprocess_tree
+    )
+
     def _reader() -> None:
         nonlocal last_output_ts
         assert proc.stdout is not None
@@ -5497,12 +5519,22 @@ def _run_with_idle_timeout(
                 last_output_ts = _time.monotonic()
 
     reader_thread = threading.Thread(target=_reader, daemon=True)
-    reader_thread.start()
+    try:
+        reader_thread.start()
+    except BaseException:
+        managed_proc.terminate()
+        managed_proc.close()
+        raise
 
     previous_termination_handlers: dict[int, object] = {}
 
     def _raise_parent_termination(signum, _frame) -> None:
         raise _BuildParentTermination(signum)
+
+    def _restore_termination_handlers() -> None:
+        while previous_termination_handlers:
+            signum, previous = previous_termination_handlers.popitem()
+            signal.signal(signum, previous)
 
     # setsid protects the caller from descendants and enables reliable group
     # cleanup, but it also shields a silent child from terminal HUP when the
@@ -5510,42 +5542,56 @@ def _run_with_idle_timeout(
     # only those default dispositions into Python control flow so the process
     # group is reaped first. Respect daemon/custom handlers, and signal APIs are
     # only legal from Python's main thread.
-    if os.name == "posix" and threading.current_thread() is threading.main_thread():
-        for termination_signal in (signal.SIGTERM, signal.SIGHUP):
-            previous = signal.getsignal(termination_signal)
-            if previous == signal.SIG_DFL:
-                signal.signal(termination_signal, _raise_parent_termination)
-                previous_termination_handlers[termination_signal] = previous
-
-    def _restore_termination_handlers() -> None:
-        while previous_termination_handlers:
-            signum, previous = previous_termination_handlers.popitem()
-            signal.signal(signum, previous)
+    try:
+        if os.name == "posix" and threading.current_thread() is threading.main_thread():
+            for termination_signal in (signal.SIGTERM, signal.SIGHUP):
+                previous = signal.getsignal(termination_signal)
+                if previous == signal.SIG_DFL:
+                    signal.signal(termination_signal, _raise_parent_termination)
+                    previous_termination_handlers[termination_signal] = previous
+    except BaseException:
+        try:
+            managed_proc.terminate()
+        finally:
+            managed_proc.close()
+            _restore_termination_handlers()
+        raise
 
     idle_killed = False
     parent_termination_signal: int | None = None
+    leader_reaped = False
     wait_poll_seconds = min(5.0, max(0.05, idle_timeout_seconds / 4))
     try:
         while True:
             try:
                 rc = proc.wait(timeout=wait_poll_seconds)
+                leader_reaped = True
                 break
             except subprocess.TimeoutExpired:
                 with lock:
                     idle = _time.monotonic() - last_output_ts
                 if idle > idle_timeout_seconds:
                     idle_killed = True
-                    rc = _terminate_subprocess_tree(proc)
+                    rc = managed_proc.terminate()
                     break
     except _BuildParentTermination as exc:
-        rc = _terminate_subprocess_tree(proc)
+        rc = managed_proc.terminate()
         parent_termination_signal = exc.signum
     except BaseException:
-        _terminate_subprocess_tree(proc)
+        managed_proc.terminate()
         reader_thread.join(timeout=2)
         raise
     finally:
         _restore_termination_handlers()
+        try:
+            if leader_reaped and os.name == "posix":
+                # A successful process-group leader may have backgrounded a
+                # descendant that still owns stdout. Drain the isolated group
+                # before unregistering it; otherwise dashboard shutdown can no
+                # longer find the child and the daemon reader remains blocked.
+                managed_proc.terminate()
+        finally:
+            managed_proc.close()
 
     # Drain reader so we don't leak the stdout file descriptor.
     reader_thread.join(timeout=2)
@@ -9024,18 +9070,20 @@ def _update_opentui_package() -> bool:
             print("→ Updating the OpenTUI engine transactionally…")
             env = _opentui_runtime.build_environment(node)
             if location.is_packaged:
-                success, result = _opentui_runtime.refresh_packaged_runtime(
-                    location,
-                    identity=identity,
-                    npm=npm_command,
-                    env=env,
-                    runner=_run_with_idle_timeout,
+                success, result, promotion = (
+                    _opentui_runtime.refresh_packaged_runtime(
+                        location,
+                        identity=identity,
+                        npm=npm_command,
+                        env=env,
+                        runner=_run_with_idle_timeout,
+                    )
                 )
                 success_message = (
                     "  ✓ OpenTUI writable runtime hydrated + production bundle updated"
                 )
             elif not inspection.dependency_refresh_required:
-                success, result = _opentui_runtime.build_bundle(
+                success, result, promotion = _opentui_runtime.build_bundle(
                     app_dir,
                     npm=npm_command,
                     env=env,
@@ -9043,7 +9091,7 @@ def _update_opentui_package() -> bool:
                 )
                 success_message = "  ✓ OpenTUI production bundle updated"
             else:
-                success, result = _opentui_runtime.refresh_runtime(
+                success, result, promotion = _opentui_runtime.refresh_runtime(
                     app_dir,
                     identity=identity,
                     npm=npm_command,
@@ -9062,12 +9110,21 @@ def _update_opentui_package() -> bool:
                     print(preview)
                 return False
 
-            (
-                refresh_current,
-                completed,
-                completed_packaged_current,
-            ) = _completed_opentui_refresh(location, identity)
+            if promotion is None:
+                raise RuntimeError(
+                    "successful OpenTUI refresh has no promotion transaction"
+                )
+            try:
+                (
+                    refresh_current,
+                    completed,
+                    completed_packaged_current,
+                ) = _completed_opentui_refresh(location, identity)
+            except BaseException:
+                promotion.rollback()
+                raise
             if not refresh_current:
+                promotion.rollback()
                 if failure_key is not None:
                     _opentui_runtime.record_refresh_failure(state_dir, failure_key)
                 print(
@@ -9076,6 +9133,7 @@ def _update_opentui_package() -> bool:
                 )
                 return False
 
+            promotion.commit()
             _opentui_runtime.clear_refresh_failure(state_dir, failure_key)
             _prune_validated_opentui_backups(
                 location,

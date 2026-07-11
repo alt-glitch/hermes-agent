@@ -42,6 +42,7 @@ import urllib.parse
 import zipfile
 
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
+from hermes_cli import subprocess_lifecycle as _subprocess_lifecycle
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -181,6 +182,12 @@ async def _lifespan(app: "FastAPI"):
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
 
+    # Hydration can spawn npm/Node from an asyncio worker thread. The signal
+    # fence runs on the dashboard's main thread and chains uvicorn's existing
+    # TERM/HUP handler after every registered process group is reaped.
+    app.state.chat_argv_scopes = set()
+    subprocess_signal_cleanup = _subprocess_lifecycle.install_signal_cleanup()
+
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
     # On a cold Windows install the module chain triggers .pyc compilation
@@ -210,6 +217,14 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        # Mark request scopes cancelled before taking the global snapshot.
+        # This closes the race where a worker reaches Popen during shutdown:
+        # registration into a cancelled scope terminates it immediately.
+        for scope in tuple(_get_chat_argv_scopes(app)):
+            scope.terminate()
+        _subprocess_lifecycle.terminate_active_subprocesses()
+        subprocess_signal_cleanup.restore()
+
         pty_reaper_task.cancel()
         await PTY_REGISTRY.close_all()
         if cron_stop is not None:
@@ -245,6 +260,72 @@ def _get_chat_argv_lock(app: "FastAPI") -> asyncio.Lock:
     except AttributeError:
         app.state.chat_argv_lock = asyncio.Lock()
         return app.state.chat_argv_lock
+
+
+def _get_chat_argv_scopes(app: "FastAPI") -> set[_subprocess_lifecycle.ProcessScope]:
+    """Return active dashboard hydration scopes.
+
+    Like the lock getter, this lazy path supports tests that use the FastAPI
+    app without entering its lifespan context.
+    """
+    try:
+        return app.state.chat_argv_scopes
+    except AttributeError:
+        app.state.chat_argv_scopes = set()
+        return app.state.chat_argv_scopes
+
+
+async def _terminate_chat_argv_scope(
+    scope: _subprocess_lifecycle.ProcessScope,
+) -> None:
+    """Reap one hydration scope without depending on the default executor.
+
+    ``_resolve_chat_argv`` itself occupies a default-executor worker. Queueing
+    its cancellation cleanup onto that same executor deadlocks when the pool is
+    saturated: the worker cannot return until the cleanup terminates its child,
+    while the cleanup cannot start until the worker returns. A short-lived
+    dedicated daemon thread breaks that dependency. The scope is marked first
+    so any subprocess registered during thread startup is killed immediately.
+    """
+    scope.cancel()
+    loop = asyncio.get_running_loop()
+    completed = loop.create_future()
+
+    def _complete(error: BaseException | None) -> None:
+        if completed.done():
+            return
+        if error is None:
+            completed.set_result(None)
+        else:
+            completed.set_exception(error)
+
+    def _reap() -> None:
+        try:
+            scope.terminate()
+        except BaseException as exc:
+            loop.call_soon_threadsafe(_complete, exc)
+        else:
+            loop.call_soon_threadsafe(_complete, None)
+
+    reaper = threading.Thread(
+        target=_reap,
+        daemon=True,
+        name="dashboard-chat-argv-cleanup",
+    )
+    try:
+        reaper.start()
+    except BaseException:
+        # Thread creation failure is exceptional and rare; preserve the
+        # no-orphan invariant even if that means briefly blocking this loop.
+        scope.terminate()
+        return
+
+    while not completed.done():
+        try:
+            await asyncio.shield(completed)
+        except asyncio.CancelledError:
+            continue
+    completed.result()
 
 
 def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
@@ -14750,11 +14831,24 @@ async def _resolve_chat_argv_async(
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
 
-    async with _get_chat_argv_lock(app):
-        return await asyncio.to_thread(
-            _resolve_chat_argv,
-            **kwargs,
-        )
+    scope = _subprocess_lifecycle.ProcessScope()
+    scopes = _get_chat_argv_scopes(app)
+    scopes.add(scope)
+    try:
+        async with _get_chat_argv_lock(app):
+            # asyncio.to_thread copies ContextVars while this call is awaited,
+            # so the worker's build subprocesses attach to the request scope.
+            # Await directly (rather than in a child Task) so SystemExit from
+            # launcher resolution remains catchable by the WebSocket handler.
+            with _subprocess_lifecycle.bind_process_scope(scope):
+                return await asyncio.to_thread(_resolve_chat_argv, **kwargs)
+    except asyncio.CancelledError:
+        # Do not queue the reaper behind the worker it must terminate. The
+        # helper also survives repeated cancellation until cleanup completes.
+        await _terminate_chat_argv_scope(scope)
+        raise
+    finally:
+        scopes.discard(scope)
 
 
 def _build_sidecar_url(channel: str) -> Optional[str]:

@@ -103,6 +103,51 @@ def test_idle_timeout_kills_the_whole_process_tree(tmp_path):
     assert "produced no output" in result.stdout
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group contract")
+def test_normal_leader_exit_reaps_background_descendant(tmp_path):
+    """A successful group leader must not orphan a child holding stdout."""
+    grandchild_pid = tmp_path / "background-grandchild.pid"
+    script = tmp_path / "background-tree.py"
+    script.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        "'import os, signal, sys, time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)', "
+        "sys.argv[1]])\n"
+        "while not __import__('pathlib').Path(sys.argv[1]).exists(): time.sleep(0.01)\n"
+    )
+
+    pid = None
+    try:
+        result = _run_with_idle_timeout(
+            [_sys.executable, str(script), str(grandchild_pid)],
+            cwd=tmp_path,
+            idle_timeout_seconds=10,
+        )
+        pid = int(grandchild_pid.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            proc_status = Path(f"/proc/{pid}/status")
+            if proc_status.is_file() and "State:\tZ" in proc_status.read_text():
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"background descendant {pid} survived successful leader exit")
+
+        assert result.returncode == 0
+    finally:
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal/process-group contract")
 @pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGHUP])
 def test_parent_termination_reaps_silent_isolated_tree(
@@ -180,6 +225,153 @@ def test_parent_termination_reaps_silent_isolated_tree(
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal/process-group contract")
+@pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGHUP])
+def test_signal_fence_reaps_tree_started_from_worker_thread(
+    tmp_path, termination_signal
+):
+    """Dashboard TERM/HUP cleanup owns builds started by asyncio workers."""
+    grandchild_pid = tmp_path / "worker-grandchild.pid"
+    tree_script = tmp_path / "worker-silent-tree.py"
+    tree_script.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        "'import os, signal, sys, time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)', "
+        "sys.argv[1]])\n"
+        "while not __import__('pathlib').Path(sys.argv[1]).exists(): time.sleep(0.01)\n"
+        "time.sleep(30)\n"
+    )
+    parent_script = tmp_path / "dashboard-build-parent.py"
+    parent_script.write_text(
+        "import sys, threading\n"
+        "from pathlib import Path\n"
+        "from hermes_cli.main import _run_with_idle_timeout\n"
+        "from hermes_cli.subprocess_lifecycle import install_signal_cleanup\n"
+        "cleanup = install_signal_cleanup()\n"
+        "thread = threading.Thread(target=_run_with_idle_timeout, "
+        "args=([sys.executable, sys.argv[1], sys.argv[2]], Path(sys.argv[3])), "
+        "kwargs={'idle_timeout_seconds': 30})\n"
+        "thread.start()\n"
+        "thread.join()\n"
+        "cleanup.restore()\n"
+    )
+    env = os.environ.copy()
+    repo_root = Path(__file__).resolve().parents[2]
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(repo_root), env.get("PYTHONPATH", "")))
+    )
+    parent = subprocess.Popen(
+        [
+            _sys.executable,
+            str(parent_script),
+            str(tree_script),
+            str(grandchild_pid),
+            str(tmp_path),
+        ],
+        cwd=tmp_path,
+        env=env,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not grandchild_pid.is_file():
+            if parent.poll() is not None:
+                pytest.fail(f"dashboard parent exited early with {parent.returncode}")
+            time.sleep(0.01)
+        assert grandchild_pid.is_file()
+        child_pid = int(grandchild_pid.read_text())
+
+        os.kill(parent.pid, termination_signal)
+        assert parent.wait(timeout=10) == -termination_signal
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            proc_status = Path(f"/proc/{child_pid}/status")
+            if proc_status.is_file() and "State:\tZ" in proc_status.read_text():
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(
+                f"worker grandchild {child_pid} survived dashboard signal "
+                f"{termination_signal}"
+            )
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=3)
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_registered_termination_retries_after_transient_failure():
+    from hermes_cli import subprocess_lifecycle
+
+    attempts = []
+
+    class FakeProcess:
+        pid = 444444
+
+        @staticmethod
+        def poll():
+            return None
+
+    def terminate(_proc):
+        attempts.append("terminate")
+        if len(attempts) == 1:
+            raise OSError("transient process lookup failure")
+        return -signal.SIGKILL
+
+    managed = subprocess_lifecycle.register_isolated_subprocess(
+        FakeProcess(), terminate
+    )
+    try:
+        with pytest.raises(OSError, match="transient process lookup failure"):
+            managed.terminate()
+        assert managed.terminate() == -signal.SIGKILL
+        assert attempts == ["terminate", "terminate"]
+    finally:
+        managed.close()
+
+    assert subprocess_lifecycle.active_subprocess_count() == 0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal-handler contract")
+def test_signal_fence_chains_and_restores_existing_handler():
+    from hermes_cli import subprocess_lifecycle
+
+    received = []
+    original = signal.getsignal(signal.SIGTERM)
+
+    def existing_handler(signum, _frame):
+        received.append(signum)
+
+    signal.signal(signal.SIGTERM, existing_handler)
+    cleanup = None
+    try:
+        cleanup = subprocess_lifecycle.install_signal_cleanup()
+        installed = signal.getsignal(signal.SIGTERM)
+        assert callable(installed)
+
+        installed(signal.SIGTERM, None)
+
+        assert received == [signal.SIGTERM]
+        cleanup.restore()
+        assert signal.getsignal(signal.SIGTERM) is existing_handler
+    finally:
+        if cleanup is not None:
+            cleanup.restore()
+        signal.signal(signal.SIGTERM, original)
 
 
 def test_returns_127_when_binary_missing(tmp_path):

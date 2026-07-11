@@ -753,7 +753,7 @@ class TestPackagedRuntimeCache:
                 _write(Path(command[-1]) / "main.js", "first cached bundle")
             return _ok(command)
 
-        success, _result = runtime.refresh_packaged_runtime(
+        success, _result, promotion = runtime.refresh_packaged_runtime(
             first,
             identity=TEST_IDENTITY,
             npm=["/node-26", "/npm-cli.js"],
@@ -761,6 +761,8 @@ class TestPackagedRuntimeCache:
             runner=successful_runner,
         )
         assert success
+        assert promotion is not None
+        promotion.commit()
         assert runtime.packaged_runtime_current(first)
 
         _write(seed / "src" / "runtime" / "old.ts", "new wheel source")
@@ -774,7 +776,7 @@ class TestPackagedRuntimeCache:
                 command, 1, stdout="", stderr="registry offline"
             )
 
-        success, _result = runtime.refresh_packaged_runtime(
+        success, _result, promotion = runtime.refresh_packaged_runtime(
             upgraded,
             identity=TEST_IDENTITY,
             npm=["/node-26", "/npm-cli.js"],
@@ -783,11 +785,79 @@ class TestPackagedRuntimeCache:
         )
 
         assert not success
+        assert promotion is None
         assert (first.runtime_dir / "dist" / "main.js").read_text() == (
             "first cached bundle"
         )
         assert runtime.packaged_runtime_current(first)
         assert not runtime.packaged_runtime_current(upgraded)
+
+    def test_rejected_packaged_upgrade_restores_prior_full_root(
+        self, tmp_path, monkeypatch
+    ):
+        seed, fixture_dependencies = _make_packaged_seed(tmp_path)
+        state_dir = tmp_path / "profile-cache"
+        first = runtime.select_runtime_location(tmp_path, state_dir)
+        assert first is not None
+
+        def runner(command, **kwargs):
+            if "ci" in command:
+                shutil.copytree(
+                    fixture_dependencies,
+                    Path(kwargs["cwd"]) / "node_modules",
+                )
+            else:
+                _write(Path(command[-1]) / "main.js", "first cached bundle")
+            return _ok(command)
+
+        success, _result, promotion = runtime.refresh_packaged_runtime(
+            first,
+            identity=TEST_IDENTITY,
+            npm=["/node-26", "/npm-cli.js"],
+            env={"PATH": "/node-26"},
+            runner=runner,
+        )
+        assert success
+        assert promotion is not None
+        promotion.commit()
+
+        _write(seed / "src" / "runtime" / "upgrade.ts", "new wheel source")
+        upgraded = runtime.select_runtime_location(tmp_path, state_dir)
+        assert upgraded is not None
+        assert upgraded.runtime_dir == first.runtime_dir
+        assert not runtime.packaged_runtime_current(upgraded)
+
+        monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(
+            main_mod._opentui_runtime,
+            "npm_command",
+            lambda _node: ["/node-26", "/npm-cli.js"],
+        )
+        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+
+        def reject_completed(location, identity):
+            inspection = runtime.inspect_runtime(
+                location.runtime_dir, identity, env={}
+            )
+            return False, inspection, True
+
+        monkeypatch.setattr(
+            main_mod, "_completed_opentui_refresh", reject_completed
+        )
+
+        with pytest.raises(SystemExit):
+            main_mod._make_opentui_argv(
+                tui_dev=False, runtime_state_dir=state_dir
+            )
+
+        assert runtime.packaged_runtime_current(first)
+        assert not runtime.packaged_runtime_current(upgraded)
+        assert (first.runtime_dir / "dist" / "main.js").read_text() == (
+            "first cached bundle"
+        )
+        assert not list(first.runtime_dir.parent.glob(".runtime.previous-*"))
+        assert not list(first.runtime_dir.parent.glob(".runtime-next-*"))
 
     def test_next_packaged_launch_prunes_completed_full_root_backup(
         self, tmp_path, monkeypatch
@@ -807,7 +877,7 @@ class TestPackagedRuntimeCache:
                 _write(Path(command[-1]) / "main.js", "cached production bundle")
             return _ok(command)
 
-        success, _result = runtime.refresh_packaged_runtime(
+        success, _result, promotion = runtime.refresh_packaged_runtime(
             location,
             identity=TEST_IDENTITY,
             npm=["/node-26", "/npm-cli.js"],
@@ -815,6 +885,8 @@ class TestPackagedRuntimeCache:
             runner=runner,
         )
         assert success
+        assert promotion is not None
+        promotion.commit()
         backup = location.runtime_dir.parent / ".runtime.previous-crashed"
         shutil.copytree(location.runtime_dir, backup)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
@@ -966,7 +1038,7 @@ class TestRuntimeTransactions:
             _write(Path(command[-1]) / "main.js", "new bundle")
             return _ok(command)
 
-        success, _result = runtime.build_bundle(
+        success, _result, promotion = runtime.build_bundle(
             app,
             npm=["/node-26", "/npm-cli.js"],
             env={"PATH": "/node-26"},
@@ -974,7 +1046,11 @@ class TestRuntimeTransactions:
         )
 
         assert success
+        assert promotion is not None
         assert (app / "dist" / "main.js").read_text() == "new bundle"
+        assert list(app.glob(".dist.previous-*"))
+        promotion.commit()
+        assert not list(app.glob(".dist.previous-*"))
         assert (app / "node_modules" / "old-runtime.txt").read_text() == (
             "old dependencies"
         )
@@ -998,7 +1074,7 @@ class TestRuntimeTransactions:
             _write(Path(command[-1]) / "main.js", "")
             return _ok(command)
 
-        success, result = runtime.build_bundle(
+        success, result, promotion = runtime.build_bundle(
             app,
             npm=["/node-26", "/npm-cli.js"],
             env={"PATH": "/node-26"},
@@ -1006,6 +1082,7 @@ class TestRuntimeTransactions:
         )
 
         assert not success
+        assert promotion is None
         assert "non-empty" in result.stderr
         assert (app / "dist" / "main.js").read_text() == "old bundle"
 
@@ -1018,7 +1095,7 @@ class TestRuntimeTransactions:
             _write(app / "src" / "runtime" / "raced.ts", "changed during build")
             return _ok(command)
 
-        success, result = runtime.build_bundle(
+        success, result, promotion = runtime.build_bundle(
             app,
             npm=["/node-26", "/npm-cli.js"],
             env={"PATH": "/node-26"},
@@ -1026,6 +1103,7 @@ class TestRuntimeTransactions:
         )
 
         assert not success
+        assert promotion is None
         assert "inputs changed" in result.stderr
         assert (app / "dist" / "main.js").read_text() == "old bundle"
 
@@ -1043,7 +1121,7 @@ class TestRuntimeTransactions:
                 _write(Path(command[-1]) / "main.js", "new bundle")
             return _ok(command)
 
-        success, _result = runtime.refresh_runtime(
+        success, _result, promotion = runtime.refresh_runtime(
             app,
             identity=TEST_IDENTITY,
             npm=["/node-26", "/npm-cli.js"],
@@ -1052,6 +1130,7 @@ class TestRuntimeTransactions:
         )
 
         assert success
+        assert promotion is not None
         assert "ci" in calls[0][0]
         assert "--include=dev" in calls[0][0]
         assert "run" in calls[1][0]
@@ -1060,6 +1139,11 @@ class TestRuntimeTransactions:
         assert (app / "node_modules" / "new.txt").read_text() == "new deps"
         assert (app / "dist" / "main.js").read_text() == "new bundle"
         assert runtime.dependencies_current(app, TEST_IDENTITY)
+        assert list(app.glob(".node_modules.previous-*"))
+        assert list(app.glob(".dist.previous-*"))
+        promotion.commit()
+        assert not list(app.glob(".node_modules.previous-*"))
+        assert not list(app.glob(".dist.previous-*"))
 
     def test_source_change_during_dependency_staging_preserves_live_runtime(
         self, tmp_path
@@ -1075,7 +1159,7 @@ class TestRuntimeTransactions:
                 _write(app / "src" / "runtime" / "raced.ts", "changed")
             return _ok(command)
 
-        success, result = runtime.refresh_runtime(
+        success, result, promotion = runtime.refresh_runtime(
             app,
             identity=TEST_IDENTITY,
             npm=["/node-26", "/npm-cli.js"],
@@ -1084,6 +1168,7 @@ class TestRuntimeTransactions:
         )
 
         assert not success
+        assert promotion is None
         assert "inputs changed" in result.stderr
         assert (app / "node_modules" / "old-runtime.txt").is_file()
         assert (app / "dist" / "main.js").read_text() == "old bundle"
@@ -1094,7 +1179,7 @@ class TestRuntimeTransactions:
         def runner(*_args, **_kwargs):
             raise OSError("spawn failed")
 
-        success, result = runtime.build_bundle(
+        success, result, promotion = runtime.build_bundle(
             app,
             npm=["/node-26", "/npm-cli.js"],
             env={"PATH": "/node-26"},
@@ -1102,6 +1187,7 @@ class TestRuntimeTransactions:
         )
 
         assert not success
+        assert promotion is None
         assert "spawn failed" in result.stderr
         assert (app / "dist" / "main.js").read_text() == "old bundle"
 
@@ -1124,7 +1210,7 @@ class TestRuntimeTransactions:
                 command, 1, stdout="", stderr="compiler failed"
             )
 
-        success, _result = runtime.refresh_runtime(
+        success, _result, promotion = runtime.refresh_runtime(
             app,
             identity=TEST_IDENTITY,
             npm=["/node-26", "/npm-cli.js"],
@@ -1133,6 +1219,7 @@ class TestRuntimeTransactions:
         )
 
         assert not success
+        assert promotion is None
         assert (app / "dist" / "main.js").read_text() == "old bundle"
         assert (app / "node_modules" / "old-runtime.txt").read_text() == (
             "old dependencies"
@@ -1389,7 +1476,7 @@ class TestMainIntegration:
         self, tmp_path, monkeypatch
     ):
         app = _make_runtime(tmp_path)
-        os.utime(app / "src" / "runtime" / "old.ts", (300, 300))
+        _change_dependency_lock(app)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
@@ -1398,8 +1485,12 @@ class TestMainIntegration:
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
 
-        def runner(command, **_kwargs):
-            _write(Path(command[-1]) / "main.js", "compiled")
+        def runner(command, **kwargs):
+            if "ci" in command:
+                _install_fixture_dependencies(app, Path(kwargs["cwd"]))
+                _write(Path(kwargs["cwd"]) / "node_modules" / "new.txt", "new")
+            else:
+                _write(Path(command[-1]) / "main.js", "compiled")
             return _ok(command)
 
         def reject_completed(location, identity):
@@ -1413,8 +1504,18 @@ class TestMainIntegration:
             main_mod, "_completed_opentui_refresh", reject_completed
         )
 
-        with pytest.raises(SystemExit):
-            main_mod._make_opentui_argv(tui_dev=False)
+        argv, cwd = main_mod._make_opentui_argv(tui_dev=False)
+
+        assert cwd == app
+        assert argv[-1] == str(app / "dist" / "main.js")
+        assert (app / "dist" / "main.js").read_text() == "old bundle"
+        assert (app / "node_modules" / "old-runtime.txt").read_text() == (
+            "old dependencies"
+        )
+        assert not (app / "node_modules" / "new.txt").exists()
+        assert not list(app.glob(".node_modules.previous-*"))
+        assert not list(app.glob(".dist.previous-*"))
+        assert not list(tmp_path.glob(".ui-opentui-update-*"))
 
     def test_failed_refresh_backoff_retries_for_changed_digest_or_node(
         self, tmp_path, monkeypatch
@@ -1551,6 +1652,49 @@ class TestMainIntegration:
         assert "NPM_CONFIG_OMIT" not in install_kwargs["env"]
         assert install_kwargs["env"]["npm_config_include"] == "dev"
         assert install_kwargs["env"]["PATH"].split(os.pathsep)[0] == "/"
+
+    def test_update_rejects_noncurrent_pair_and_restores_predecessor(
+        self, tmp_path, monkeypatch
+    ):
+        app = _make_runtime(tmp_path)
+        _change_dependency_lock(app)
+        monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: False)
+        monkeypatch.setattr(main_mod, "_node26_bin_or_none", lambda: "/node-26")
+        monkeypatch.setattr(
+            main_mod._opentui_runtime,
+            "npm_command",
+            lambda _node: ["/node-26", "/npm-cli.js"],
+        )
+
+        def runner(command, **kwargs):
+            if "ci" in command:
+                _install_fixture_dependencies(app, Path(kwargs["cwd"]))
+                _write(Path(kwargs["cwd"]) / "node_modules" / "new.txt", "new")
+            else:
+                _write(Path(command[-1]) / "main.js", "updated")
+            return _ok(command)
+
+        def reject_completed(location, identity):
+            inspection = runtime.inspect_runtime(
+                location.runtime_dir, identity, env={}
+            )
+            return False, inspection, True
+
+        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(
+            main_mod, "_completed_opentui_refresh", reject_completed
+        )
+
+        assert not main_mod._update_opentui_package()
+        assert (app / "dist" / "main.js").read_text() == "old bundle"
+        assert (app / "node_modules" / "old-runtime.txt").read_text() == (
+            "old dependencies"
+        )
+        assert not (app / "node_modules" / "new.txt").exists()
+        assert not list(app.glob(".node_modules.previous-*"))
+        assert not list(app.glob(".dist.previous-*"))
+        assert not list(tmp_path.glob(".ui-opentui-update-*"))
 
     def test_update_source_change_builds_bundle_without_npm_ci(
         self, tmp_path, monkeypatch

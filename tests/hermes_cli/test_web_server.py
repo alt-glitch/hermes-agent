@@ -1,10 +1,13 @@
 """Tests for hermes_cli.web_server and related config utilities."""
 
 import asyncio
+import concurrent.futures
 import os
 import json
+import signal
 import shutil
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -6639,6 +6642,164 @@ class TestPtyWebSocket:
         assert captured["resume"] == "sess-42"
         assert captured["sidecar_url"] == "ws://127.0.0.1:9119/api/pub?channel=abc"
         assert captured["profile"] == "worker"
+
+    def test_resolve_chat_argv_async_cancellation_reaps_scoped_worker(self, monkeypatch):
+        """Cancelling dashboard hydration terminates its worker-owned child."""
+        from hermes_cli import subprocess_lifecycle
+
+        entered = threading.Event()
+        released = threading.Event()
+        terminated = threading.Event()
+        finished = threading.Event()
+        captured: dict = {}
+
+        class FakeProcess:
+            pid = 424242
+
+            @staticmethod
+            def poll():
+                return -signal.SIGTERM if terminated.is_set() else None
+
+        def terminate(_proc):
+            terminated.set()
+            released.set()
+            return -signal.SIGTERM
+
+        def fake_resolve(resume=None, sidecar_url=None, profile=None):
+            captured["scope"] = subprocess_lifecycle.current_process_scope()
+            managed = subprocess_lifecycle.register_isolated_subprocess(
+                FakeProcess(), terminate
+            )
+            entered.set()
+            try:
+                released.wait(timeout=5)
+                return (["node", "dist/entry.js"], None, None)
+            finally:
+                managed.close()
+                finished.set()
+
+        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
+
+        async def run_cancel():
+            self.ws_module.app.state.chat_argv_lock = asyncio.Lock()
+            self.ws_module.app.state.chat_argv_scopes = set()
+            task = asyncio.create_task(self.ws_module._resolve_chat_argv_async())
+            try:
+                assert await asyncio.to_thread(entered.wait, 3)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                released.set()
+                if not task.done():
+                    task.cancel()
+
+        asyncio.run(run_cancel())
+
+        assert captured["scope"] is not None
+        assert terminated.is_set()
+        assert finished.wait(timeout=3)
+        assert self.ws_module.app.state.chat_argv_scopes == set()
+        assert subprocess_lifecycle.active_subprocess_count() == 0
+
+    def test_resolve_cancellation_reaper_bypasses_saturated_default_executor(
+        self, monkeypatch
+    ):
+        """The worker must not occupy the only thread needed to cancel it."""
+        from hermes_cli import subprocess_lifecycle
+
+        entered = threading.Event()
+        released = threading.Event()
+        terminated = threading.Event()
+        finished = threading.Event()
+
+        class FakeProcess:
+            pid = 424243
+
+            @staticmethod
+            def poll():
+                return -signal.SIGTERM if terminated.is_set() else None
+
+        def terminate(_proc):
+            terminated.set()
+            released.set()
+            return -signal.SIGTERM
+
+        def fake_resolve(resume=None, sidecar_url=None, profile=None):
+            managed = subprocess_lifecycle.register_isolated_subprocess(
+                FakeProcess(), terminate
+            )
+            entered.set()
+            try:
+                released.wait(timeout=5)
+                return (["node", "dist/entry.js"], None, None)
+            finally:
+                managed.close()
+                finished.set()
+
+        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
+
+        async def run_cancel():
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(
+                concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            )
+            self.ws_module.app.state.chat_argv_lock = asyncio.Lock()
+            self.ws_module.app.state.chat_argv_scopes = set()
+            task = asyncio.create_task(self.ws_module._resolve_chat_argv_async())
+            try:
+                deadline = loop.time() + 3
+                while not entered.is_set() and loop.time() < deadline:
+                    await asyncio.sleep(0.01)
+                assert entered.is_set()
+
+                task.cancel()
+                deadline = loop.time() + 2
+                while not task.done() and loop.time() < deadline:
+                    await asyncio.sleep(0.01)
+                assert task.done(), "cancellation cleanup deadlocked behind its worker"
+                assert terminated.is_set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                released.set()
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        asyncio.run(run_cancel())
+
+        assert finished.wait(timeout=3)
+        assert self.ws_module.app.state.chat_argv_scopes == set()
+        assert subprocess_lifecycle.active_subprocess_count() == 0
+
+    def test_resolve_chat_argv_async_cancel_before_spawn_closes_race(self):
+        """A process registered after cancellation is killed immediately."""
+        from hermes_cli import subprocess_lifecycle
+
+        scope = subprocess_lifecycle.ProcessScope()
+        scope.terminate()
+        terminated = []
+
+        class FakeProcess:
+            pid = 434343
+
+            @staticmethod
+            def poll():
+                return None
+
+        with subprocess_lifecycle.bind_process_scope(scope):
+            managed = subprocess_lifecycle.register_isolated_subprocess(
+                FakeProcess(),
+                lambda proc: terminated.append(proc.pid) or -signal.SIGTERM,
+            )
+        try:
+            assert terminated == [434343]
+        finally:
+            managed.close()
 
     def test_pty_ws_resolves_argv_through_async_wrapper(self, monkeypatch):
         captured: dict = {}
