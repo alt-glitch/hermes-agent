@@ -68,6 +68,9 @@ const MAX_ROWS = 8
 const MAX_ROWS_PREVIEW = 4
 /** One-line cap for preview message excerpts. */
 const PEEK_EXCERPT = 110
+/** Stable-width fallback when a skin does not provide waiting faces. */
+const LOADING_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+const LOADING_TICK_MS = 90
 
 /** First line of a message, capped — preview rows must stay one line each. */
 function excerpt(text: string): string {
@@ -223,6 +226,26 @@ export function SessionPicker(props: {
     }
   }
 
+  // One bounded activity timer for list + preview I/O. It is armed only while
+  // something is actually loading and disposed as soon as both paths settle or
+  // the overlay unmounts — no permanent animation fighting idle GC.
+  const [loadingFrame, setLoadingFrame] = createSignal(0)
+  const activityRunning = () => loading() || (previewOpen() && peekState() === 'loading')
+  createEffect(() => {
+    if (!activityRunning()) {
+      setLoadingFrame(0)
+      return
+    }
+    const timer = setInterval(() => setLoadingFrame(frame => frame + 1), LOADING_TICK_MS)
+    onCleanup(() => clearInterval(timer))
+  })
+  const activityGlyph = () => {
+    const frames = theme().spinner.waitingFaces
+    const activeFrames = frames.length > 0 ? frames : LOADING_FRAMES
+    return activeFrames[loadingFrame() % activeFrames.length] ?? LOADING_FRAMES[0]
+  }
+  const activeTabLabel = () => SESSION_TABS.find(item => item.id === tab())?.label ?? 'sessions'
+
   // ── inline rename (Ctrl+R → session.title) ──────────────────────────────
   const [renaming, setRenaming] = createSignal(false)
   const startRename = () => {
@@ -351,10 +374,19 @@ export function SessionPicker(props: {
           style={{ flexGrow: 1, minWidth: 0 }}
         />
         <Show when={loading()}>
-          <text fg={theme().color.muted}>loading…</text>
+          <text selectable={false}>
+            <span style={{ fg: theme().color.accent }}>{activityGlyph()}</span>
+            <span style={{ fg: theme().color.muted }}>{' loading'}</span>
+          </text>
         </Show>
       </box>
       <TabChips labels={SESSION_TABS.map(t => t.label)} active={SESSION_TABS.findIndex(t => t.id === tab())} />
+      <Show when={loading() && rows().length === 0}>
+        <text selectable={false}>
+          <span style={{ fg: theme().color.accent }}>{activityGlyph()}</span>
+          <span style={{ fg: theme().color.text }}>{` Loading ${activeTabLabel()} sessions…`}</span>
+        </text>
+      </Show>
       {/* inline rename line (Ctrl+R) — its input takes focus while open */}
       <Show when={renaming()}>
         <box style={{ flexDirection: 'row' }}>
@@ -403,7 +435,7 @@ export function SessionPicker(props: {
                 {row.kind === 'item' && row.index === sel() ? '❯ ' : '  '}
               </span>
               <span style={{ fg: theme().color.muted }}>
-                {loading() ? 'loading…' : `↓ load more (${rows().length} loaded)`}
+                {loading() ? `${activityGlyph()} Loading more sessions…` : `↓ load more (${rows().length} loaded)`}
               </span>
             </text>
           )
@@ -425,7 +457,10 @@ export function SessionPicker(props: {
           title="preview (Space)"
         >
           <Show when={peekState() === 'loading'}>
-            <text fg={theme().color.muted}>loading preview…</text>
+            <text selectable={false}>
+              <span style={{ fg: theme().color.accent }}>{activityGlyph()}</span>
+              <span style={{ fg: theme().color.muted }}>{' Loading preview…'}</span>
+            </text>
           </Show>
           <Show when={peekState() === 'error'}>
             <text fg={theme().color.muted}>preview unavailable</text>

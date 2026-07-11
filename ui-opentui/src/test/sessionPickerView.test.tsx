@@ -9,7 +9,7 @@
  * `truncated: true` renders the honesty row; a full page offers "load more"
  * which fetches the next offset; Esc closes (but only cancels an open rename).
  */
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 
 import { INTERACTIVE_SOURCES, PLATFORM_SOURCES } from '../logic/sessionPicker.ts'
 import { DEFAULT_THEME } from '../logic/theme.ts'
@@ -18,6 +18,17 @@ import { ThemeProvider } from '../view/theme.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
 const NOW_S = Math.floor(Date.now() / 1000)
+
+const countDescendants = (node: { getChildren(): unknown[] }): number => {
+  let count = 0
+  for (const child of node.getChildren()) {
+    count += 1
+    if (child && typeof child === 'object' && 'getChildren' in child) {
+      count += countDescendants(child as { getChildren(): unknown[] })
+    }
+  }
+  return count
+}
 
 interface FakeSession {
   id: string
@@ -80,6 +91,10 @@ interface MountOptions {
   peekDelay?: (id: string) => number
   /** Paged list: serve `sessions` windowed by offset/limit instead of whole. */
   paged?: boolean
+  /** Delay session.list so the visible loading state can be asserted. */
+  listDelay?: number
+  /** Test seam: return before the initial list settles. */
+  waitForInitial?: boolean
 }
 
 async function mountPicker(options: MountOptions = {}): Promise<Harness> {
@@ -95,7 +110,10 @@ async function mountPicker(options: MountOptions = {}): Promise<Harness> {
       const offset = typeof params.offset === 'number' ? params.offset : 0
       const limit = typeof params.limit === 'number' ? params.limit : sessions.length
       const page = options.paged ? sessions.slice(offset, offset + limit) : sessions
-      return Promise.resolve({ sessions: page, truncated: options.truncated ?? false })
+      const payload = { sessions: page, truncated: options.truncated ?? false }
+      return options.listDelay
+        ? new Promise(resolve => setTimeout(() => resolve(payload), options.listDelay))
+        : Promise.resolve(payload)
     },
     peek: id => {
       peekCalls.push(id)
@@ -132,13 +150,44 @@ async function mountPicker(options: MountOptions = {}): Promise<Harness> {
   )
   // the initial session.list resolves async — wait for the rows (or the empty
   // state) to paint before handing the probe to the test.
-  await probe.waitForFrame(f => !f.includes('loading…'))
+  if (options.waitForInitial !== false) {
+    await probe.waitForFrame(f => !f.includes('Loading ') && !f.includes(' loading'))
+  }
   return { closed, listCalls, peekCalls, probe, renameCalls, resumed }
 }
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 describe('SessionPicker — open + rows', () => {
+  test('shows an animated in-body loading state instead of only a remote static label', async () => {
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval')
+    const h = await mountPicker({ listDelay: 220, waitForInitial: false })
+    try {
+      await h.probe.settle()
+      const first = await h.probe.waitForFrame(frame => frame.includes('Loading Recent sessions…'))
+      expect(first).toContain(' loading')
+      const firstRenderableCount = countDescendants(h.probe.renderer.root)
+      const armedWhileLoading = setIntervalSpy.mock.calls.length
+      expect(armedWhileLoading).toBeGreaterThan(0)
+      const clearedBeforeSettle = clearIntervalSpy.mock.calls.length
+      await wait(110)
+      await h.probe.settle()
+      const second = h.probe.frame()
+      expect(second).toContain('Loading Recent sessions…')
+      expect(second).not.toBe(first)
+      expect(countDescendants(h.probe.renderer.root)).toBe(firstRenderableCount)
+      await wait(140)
+      await h.probe.settle()
+      await h.probe.waitForFrame(frame => frame.includes('Adopt OpenTUI paradigm'))
+      expect(h.probe.frame()).not.toContain('Loading Recent sessions…')
+      expect(clearIntervalSpy.mock.calls.length).toBeGreaterThan(clearedBeforeSettle)
+    } finally {
+      h.probe.destroy()
+      vi.restoreAllMocks()
+    }
+  })
+
   test('opens on the Recent tab, queries the interactive sources, renders title + meta rows', async () => {
     const h = await mountPicker()
     try {
