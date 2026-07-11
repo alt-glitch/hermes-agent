@@ -10,7 +10,7 @@
  */
 import { type BoxRenderable, type ScrollBoxRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
-import { For, onMount } from 'solid-js'
+import { onMount } from 'solid-js'
 
 import { useCloseLayer } from '../keymap.tsx'
 import { useTheme } from '../theme.tsx'
@@ -21,7 +21,6 @@ export function Pager(props: { title: string; text: string; onClose: () => void 
   const theme = useTheme()
   let rootRef: BoxRenderable | undefined
   let box: ScrollBoxRenderable | undefined
-  const lines = () => props.text.split('\n')
 
   // Close (Esc/Ctrl+C) is the native keymap; scroll keys stay in the raw global
   // handler below. Focus the root box on mount so the focus-within close layer is
@@ -37,12 +36,16 @@ export function Pager(props: { title: string; text: string; onClose: () => void 
     // keymap layer above. Scroll stays raw (not focus-gated).
     if (key.name === 'q') return props.onClose()
     if (!box) return
-    if (key.name === 'up') box.scrollBy(-1)
-    else if (key.name === 'down') box.scrollBy(1)
-    else if (key.name === 'pageup') box.scrollBy(-PAGE)
-    else if (key.name === 'pagedown') box.scrollBy(PAGE)
-    else if (key.name === 'home') box.scrollTo(0)
-    else if (key.name === 'end') box.scrollTo({ x: 0, y: box.scrollHeight })
+    if (key.name === 'up' || key.name === 'k') box.scrollBy(-1)
+    else if (key.name === 'down' || key.name === 'j') box.scrollBy(1)
+    else if (key.name === 'pageup' || key.name === 'b') box.scrollBy(-PAGE)
+    else if (key.name === 'pagedown' || key.name === 'f' || key.name === 'space' || key.name === 'return') {
+      key.preventDefault()
+      const maxScrollTop = Math.max(0, box.scrollHeight - box.viewport.height)
+      if (box.scrollTop >= maxScrollTop) props.onClose()
+      else box.scrollBy(PAGE)
+    } else if (key.name === 'home' || (key.name === 'g' && !key.shift)) box.scrollTo(0)
+    else if (key.name === 'end' || (key.name === 'g' && key.shift)) box.scrollTo({ x: 0, y: box.scrollHeight })
   })
 
   return (
@@ -59,11 +62,15 @@ export function Pager(props: { title: string; text: string; onClose: () => void 
       </box>
       <box style={{ flexGrow: 1, minHeight: 0 }}>
         <scrollbox ref={el => (box = el)} style={{ flexGrow: 1, minHeight: 0 }}>
-          <For each={lines()}>{line => <text fg={theme().color.text}>{line}</text>}</For>
+          {/* One multiline native text buffer, not one renderable per line. A
+              3k-message /history can contain tens of thousands of explicit
+              lines; mapping each line to <text> exhausts OpenTUI's process-wide
+              65k native-handle table and bypasses transcript windowing. */}
+          <text fg={theme().color.text}>{props.text}</text>
         </scrollbox>
       </box>
       <box style={{ flexShrink: 0, paddingLeft: 1 }}>
-        <text fg={theme().color.muted}>Esc/q close · ↑↓/PgUp/PgDn/Home/End scroll</text>
+        <text fg={theme().color.muted}>Esc/q close · ↑↓/jk · Enter/Space/PgDn · g/G scroll</text>
       </box>
     </box>
   )

@@ -46,7 +46,7 @@ function selectionCopyText(selection: Selection): string {
 export interface RendererOptions {
   /** Mouse tracking on/off (from decoded display config). */
   readonly mouse: boolean
-  /** When true, a blocking prompt owns Ctrl+C (cancel) — the global quit is suppressed (gotcha §8 #6). */
+  /** When true, an overlay/prompt owns Ctrl+C — global interrupt/quit is suppressed. */
   readonly isBlocked?: () => boolean
   /**
    * Ctrl+C handler (item 11). When set, it OWNS Ctrl+C while not blocked — the
@@ -60,6 +60,9 @@ export interface RendererOptions {
    * key precedence (`app.tsx:388`). Receives the rendered text the user highlighted.
    */
   readonly onCopySelection?: (text: string) => void
+  /** Hosted dashboard PTYs have no in-page restart path. Keep a raw SIGINT
+   *  from destroying the renderer if terminal raw mode briefly drops. */
+  readonly ignoreSigint?: boolean
 }
 
 /**
@@ -98,7 +101,9 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
           // spawning xclip/wl-copy that dies) raises SIGPIPE and QUITS THE TUI on
           // copy. SIGPIPE/SIGBUS are not shutdown intents; restrict to the genuine
           // termination signals so a stray pipe error can never tear down the UI.
-          exitSignals: ['SIGINT', 'SIGTERM', 'SIGQUIT', 'SIGHUP'],
+          exitSignals: options.ignoreSigint
+            ? ['SIGTERM', 'SIGQUIT', 'SIGHUP']
+            : ['SIGINT', 'SIGTERM', 'SIGQUIT', 'SIGHUP'],
           useKittyKeyboard: {},
           useMouse: options.mouse
         })
@@ -117,6 +122,16 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
   renderer.once('destroy', () => {
     Deferred.doneUnsafe(shutdown, Effect.void)
   })
+
+  // Removing SIGINT from OpenTUI's exitSignals is not sufficient on its own:
+  // with zero process listeners Node restores the OS default (terminate). Keep
+  // one scoped no-op listener in hosted mode, exactly like Ink's ignoredSignals
+  // lifecycle, and remove it with the renderer scope.
+  if (options.ignoreSigint) {
+    const ignoreSigint = () => {}
+    process.on('SIGINT', ignoreSigint)
+    yield* Effect.addFinalizer(() => Effect.sync(() => process.off('SIGINT', ignoreSigint)))
+  }
 
   // Global quit on Ctrl+C. `exitOnCtrlC:false` hands Ctrl+C to us as a key event
   // (not SIGINT), so destroying here fires 'destroy' → resolves `shutdown` → the
@@ -138,7 +153,7 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
         return
       }
     }
-    if (isBlocked()) return // a blocking prompt owns Ctrl+C (→ deny/cancel)
+    if (isBlocked()) return // an overlay/prompt owns Ctrl+C (close/cancel)
     if (options.onCtrlC) options.onCtrlC()
     else renderer.destroy()
   })
@@ -160,6 +175,51 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
 
   return { renderer, shutdown } as const
 })
+
+const CLEAR_SCREEN_AND_HOME = '\u001b[2J\u001b[H'
+
+/**
+ * Force a full OpenTUI repaint without suspending the renderer. `requestRender()`
+ * alone can emit no bytes when the native diff still believes the old frame is
+ * current. Invalidating both public frame buffers and clearing the terminal
+ * forces the next scheduled frame to repaint every cell while preserving the
+ * input parser (suspend/resume can drop later bytes from the same stdin chunk).
+ */
+export function redrawRenderer(
+  renderer: CliRenderer,
+  options: {
+    readonly clearSelection?: boolean
+    readonly output?: Pick<NodeJS.WriteStream, 'write'>
+  } = {}
+): void {
+  if (renderer.isDestroyed) return
+  if (options.clearSelection) {
+    try {
+      renderer.clearSelection()
+    } catch {
+      // Selection cleanup is cosmetic; repaint must continue.
+    }
+  }
+  try {
+    // Invalidate BOTH public frame buffers. Clearing only the terminal and
+    // calling requestRender can emit no bytes when OpenTUI's native diff still
+    // believes the old frame is current.
+    renderer.currentRenderBuffer.clear()
+    renderer.nextRenderBuffer.clear()
+  } catch {
+    // A concurrently-destroyed native buffer must not break input handling.
+  }
+  try {
+    ;(options.output ?? process.stdout).write(CLEAR_SCREEN_AND_HOME)
+  } catch {
+    // A closed output stream still leaves requestRender as best effort.
+  }
+  try {
+    renderer.requestRender()
+  } catch {
+    // Ignore a renderer that was concurrently destroyed.
+  }
+}
 
 /** Best-effort renderer teardown; never throws out of the finalizer. */
 function destroyRenderer(renderer: CliRenderer): void {

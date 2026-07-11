@@ -19,6 +19,7 @@ import { mapSessionRows, parseSessionTabArg, resolveSessionArg, type SessionTabI
 import type { CompletionItem, ConfirmRequest, PickerItem, PickerState } from './store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
 import {
+  type CommandsCatalogResponse,
   decodeCommandsCatalogResponse,
   decodeReloadEnvResponse,
   decodeSessionSaveResponse,
@@ -28,6 +29,9 @@ import {
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { decodeToolsConfigureResponse } from '../boundary/schema/ToolsConfigureResponse.ts'
 import { buildBillingCtx } from './billing.ts'
+import { dailyFortune, randomFortune } from './fortunes.ts'
+import { formatHelp } from './help.ts'
+import type { Message } from './store.ts'
 
 export interface ParsedSlash {
   name: string
@@ -37,10 +41,9 @@ export interface ParsedSlash {
 /** Parse `/name rest…` → {name, arg}; null if not a slash command. */
 export function parseSlash(input: string): ParsedSlash | null {
   if (!input.startsWith('/')) return null
-  const body = input.slice(1).trimStart()
-  if (!body) return null
-  const sp = body.indexOf(' ')
-  return sp === -1 ? { arg: '', name: body } : { arg: body.slice(sp + 1).trim(), name: body.slice(0, sp) }
+  const [name = '', ...rest] = input.slice(1).split(/\s+/)
+  if (!name && rest.length === 0) return null
+  return { arg: rest.join(' '), name: name.toLowerCase() }
 }
 
 /** How a submitted composer line is routed (F9 + slash ladder): a `!cmd` runs a
@@ -94,11 +97,22 @@ export interface SlashContext {
   /** Refresh the active command-name cache after `skills.reload`, removing only
    *  skills the gateway confirmed disappeared. */
   readonly refreshCommandCatalog: (catalog: unknown, removedSkills: readonly string[]) => void
+  /** Effect-decoded command catalog cached during post-session setup. */
+  readonly commandCatalog: () => CommandsCatalogResponse | undefined
+  /** Current retained transcript rows for the local `/history` viewer. */
+  readonly historyItems: () => readonly Message[]
+  /** Skin-provided title for the categorized help pager. */
+  readonly helpHeader: () => string
+  /** The single hosted-dashboard contract (`HERMES_TUI_DASHBOARD`). */
+  readonly dashboardMode: () => boolean
   /** Copy the n-th newest assistant response to the clipboard; returns whether something was copied. */
   readonly copyResponse: (n: number) => boolean
-  readonly quit: () => void
-  /** Recent log lines for `/logs` (the ring buffer). */
-  readonly logTail: () => string[]
+  /** Request cleanup-safe renderer shutdown; code 42 asks the Python wrapper to update. */
+  readonly quit: (code?: number) => void
+  /** Force a renderer-native full repaint. */
+  readonly redraw: () => void
+  /** Recent gateway transport log lines for `/logs` (the bounded ring). */
+  readonly logTail: (limit: number) => string[]
   /** Open the tabbed resume picker on the given tab (/sessions, bare /resume). */
   readonly openSessionPicker: (tab: SessionTabId) => void
   /** Resume a session directly by id (`/resume <id|name>` — no picker). */
@@ -300,39 +314,6 @@ function present(ctx: SlashContext, title: string, text: string): void {
  *  them — adding a server command with one of these names requires gating it
  *  gateway-side too (the early return below would shadow, not hide, it). */
 const DIAGNOSTIC_COMMANDS = new Set(['mem', 'heapdump'])
-
-const CLIENT_HELP_LINES = [
-  '/help — list commands',
-  '/model [name] — switch model (picker if bare)',
-  '/copy [n] — copy the last (or n-th) response',
-  '/skills — browse skills',
-  '/skin [name] — switch theme skin (live)',
-  '/sessions [cron|gateways|all] — browse/resume sessions (tabbed picker)',
-  '/resume [id|name] — resume directly, or open the picker',
-  '/clear, /new [title] — start a new session (confirm)',
-  '/status — show live session info',
-  '/title [name] — show or rename the live session',
-  '/save — save the current transcript to JSON',
-  '/reload — re-read ~/.hermes/.env in the running gateway',
-  '/reload-skills — re-scan skills and refresh slash commands',
-  '/compact [on|off|toggle] — compact transcript spacing',
-  '/details [hidden|collapsed|expanded|cycle] — tool/reasoning detail',
-  '/reasoning [full|clamp] — expand/collapse all thinking',
-  '/timestamps [on|off|status] — show [HH:MM] on messages (alias /ts)',
-  '/bg <prompt> — launch a background prompt',
-  '/processes — OS background processes (list + stop all)',
-  '/replay [n|path] — inspect an archived spawn tree',
-  '/mem — live memory stats (diag)',
-  '/heapdump — write a V8 heap snapshot (diag)',
-  '/logs — recent engine log lines',
-  '/quit, /exit — quit',
-  '(other /commands run on the gateway)'
-]
-
-function clientHelp(): string {
-  const lines = diagnosticsEnabled() ? CLIENT_HELP_LINES : CLIENT_HELP_LINES.filter(l => !l.includes('(diag)'))
-  return lines.join('\n')
-}
 
 type ClientHandler = (arg: string, ctx: SlashContext, flight: number) => void | Promise<void>
 
@@ -1022,6 +1003,8 @@ const reloadSkillsCmd: ClientHandler = async (_arg, ctx, flight) => {
         return
       }
       ctx.refreshCommandCatalog(catalog, [])
+      const warning = catalog.warning?.trim()
+      if (warning) ctx.pushSystem(`command catalog warning: ${warning}`)
     } catch (error) {
       if (currentSessionIs(ctx, expectedSid, flight)) {
         ctx.pushSystem(
@@ -1166,6 +1149,244 @@ const freshSessionCmd =
     )
   }
 
+export const DASHBOARD_EXIT_DISABLED_MESSAGE =
+  'exit is disabled in hosted dashboard chat — use /new to start a fresh session'
+
+export const DASHBOARD_UPDATE_DISABLED_MESSAGE =
+  'update is disabled in hosted dashboard chat — the hosted environment is managed separately'
+
+const quitCmd: ClientHandler = (_arg, ctx) => {
+  if (ctx.dashboardMode()) {
+    ctx.pushSystem(DASHBOARD_EXIT_DISABLED_MESSAGE)
+    return
+  }
+  ctx.quit(0)
+}
+
+const updateCmd: ClientHandler = (_arg, ctx) => {
+  if (ctx.dashboardMode()) {
+    ctx.pushSystem(DASHBOARD_UPDATE_DISABLED_MESSAGE)
+    return
+  }
+  ctx.pushSystem('exiting TUI to run update...')
+  // Give the notice one frame before cleanup-safe renderer destruction. Exit
+  // code 42 is interpreted by the existing Python launcher after finalizers.
+  setTimeout(() => ctx.quit(42), 100)
+}
+
+const redrawCmd: ClientHandler = (_arg, ctx) => {
+  ctx.redraw()
+  ctx.pushSystem('ui redrawn')
+}
+
+const fortuneCmd: ClientHandler = (arg, ctx) => {
+  const key = arg.trim().toLowerCase()
+  if (!arg || key === 'random') {
+    ctx.pushSystem(randomFortune())
+    return
+  }
+  if (key === 'daily' || key === 'stable' || key === 'today') {
+    ctx.pushSystem(dailyFortune(ctx.sessionId()))
+    return
+  }
+  ctx.pushSystem('usage: /fortune [random|daily]')
+}
+
+/** Ink keeps at most 800 transcript rows (`config/limits.ts::MAX_HISTORY`).
+ * OpenTUI retains up to 3,000 rows for windowed scrolling, so `/history` must
+ * apply the Ink ceiling explicitly instead of building one giant pager buffer. */
+export const HISTORY_MAX_MESSAGES = 800
+export const HISTORY_DEFAULT_PREVIEW = 400
+export const HISTORY_MIN_PREVIEW = 80
+/** A user may ask for a larger preview, but a per-row ceiling prevents one
+ * pathological message/ordered-parts array from dominating the pager. */
+export const HISTORY_MAX_PREVIEW = 4_000
+/** One native TextBuffer owns the pager body. Keep its source below 512 Ki
+ * UTF-16 code units (roughly 1 MiB of JS string storage, before native layout). */
+export const HISTORY_MAX_PAGER_CHARS = 512 * 1_024
+const HISTORY_NOTE_RESERVE = 512
+
+interface BoundedMessageText {
+  readonly text: string
+  readonly truncated: boolean
+}
+
+/** Find the first non-whitespace code unit without slicing the potentially huge
+ * source string. The regexp's `lastIndex` lets V8 scan in place. */
+function firstNonWhitespace(text: string, from = 0): number {
+  const nonWhitespace = /\S/gu
+  nonWhitespace.lastIndex = from
+  return nonWhitespace.exec(text)?.index ?? -1
+}
+
+/** Extract at most `limit` characters from the answer-bearing text parts.
+ * Unlike `messageText()`, this never joins the full ordered-parts payload before
+ * clipping. Leading/trailing whitespace matches Ink's `m.text.trim()` behavior,
+ * including the edge case where an omitted suffix contains only whitespace. */
+function boundedHistoryMessageText(message: Message, limit: number): BoundedMessageText {
+  const parts = message.parts?.length ? message.parts : undefined
+  const sourceCount = parts?.length ?? 1
+  const sourceAt = (index: number): string | undefined => {
+    if (!parts) return index === 0 ? message.text : undefined
+    const part = parts[index]
+    return part?.type === 'text' ? part.text : undefined
+  }
+  const chunks: string[] = []
+  let remaining = limit
+  let started = false
+  let truncated = false
+
+  for (let sourceIndex = 0; sourceIndex < sourceCount; sourceIndex++) {
+    const source = sourceAt(sourceIndex)
+    if (source === undefined) continue
+    let offset = 0
+    if (!started) {
+      offset = firstNonWhitespace(source)
+      if (offset < 0) continue
+      started = true
+    }
+
+    if (remaining > 0) {
+      let take = Math.min(remaining, source.length - offset)
+      let splitSurrogate = false
+      const end = offset + take
+      if (
+        take > 0 &&
+        end < source.length &&
+        source.charCodeAt(end - 1) >= 0xd800 &&
+        source.charCodeAt(end - 1) <= 0xdbff &&
+        source.charCodeAt(end) >= 0xdc00 &&
+        source.charCodeAt(end) <= 0xdfff
+      ) {
+        take--
+        splitSurrogate = true
+      }
+      if (take > 0) {
+        chunks.push(source.slice(offset, offset + take))
+        remaining -= take
+        offset += take
+      }
+      if (splitSurrogate) {
+        truncated = true
+        break
+      }
+    }
+
+    // Reaching the budget is truncation only when the omitted suffix (or a
+    // later text part) contains visible content. Whitespace-only tails vanish
+    // under Ink's trim and must not manufacture an ellipsis.
+    if (remaining === 0) {
+      truncated = firstNonWhitespace(source, offset) >= 0
+      for (let rest = sourceIndex + 1; !truncated && rest < sourceCount; rest++) {
+        const later = sourceAt(rest)
+        if (later !== undefined && firstNonWhitespace(later) >= 0) truncated = true
+      }
+      break
+    }
+  }
+
+  return { text: chunks.join('').trimEnd(), truncated }
+}
+
+function requestedHistoryPreview(arg: string): { readonly limited: boolean; readonly preview: number } {
+  const requested = Math.max(HISTORY_MIN_PREVIEW, Number.parseInt(arg, 10) || HISTORY_DEFAULT_PREVIEW)
+  return { limited: requested > HISTORY_MAX_PREVIEW, preview: Math.min(requested, HISTORY_MAX_PREVIEW) }
+}
+
+function historyRow(message: Message, index: number, preview: number): string {
+  const tag = message.role === 'user' ? `You #${index + 1}` : `Hermes #${index + 1}`
+  let toolCount = 0
+  for (const part of message.parts ?? []) if (part.type === 'tool') toolCount++
+  const extracted = boundedHistoryMessageText(message, preview)
+  const body = extracted.text || (toolCount ? `(${toolCount} tool calls)` : '(empty)')
+  return `[${tag}]\n${body}${extracted.truncated ? '…' : ''}`
+}
+
+/** Format the current local transcript for `/history` under deterministic row,
+ * per-message, and total-buffer ceilings. Newest rows win when the total pager
+ * budget binds; output remains chronological and carries explicit omission
+ * notes. `undefined` means there is no committed conversation yet. */
+export function formatHistory(messages: readonly Message[], arg: string): string | undefined {
+  // Ink's live assistant is outside `historyItems`, so remove OpenTUI's in-store
+  // streaming row before applying the shared 800-row retained-history ceiling.
+  const committed = messages.filter(message => message.role !== 'assistant' || message.streaming !== true)
+  const conversation = committed.filter(message => message.role === 'user' || message.role === 'assistant')
+  if (conversation.length === 0) return undefined
+
+  // Ink caps the WHOLE transcript before `/history` filters user/assistant
+  // rows, so system/notification rows inside the latest 800 consume slots too.
+  const retained = committed
+    .slice(-HISTORY_MAX_MESSAGES)
+    .filter(message => message.role === 'user' || message.role === 'assistant')
+  if (retained.length === 0) return undefined
+  const { limited: previewLimited, preview } = requestedHistoryPreview(arg)
+  const contentBudget = HISTORY_MAX_PAGER_CHARS - HISTORY_NOTE_RESERVE
+  const rowsNewestFirst: string[] = []
+  let used = 0
+
+  for (let index = retained.length - 1; index >= 0; index--) {
+    const message = retained[index]
+    if (!message) continue
+    const row = historyRow(message, index, preview)
+    const separator = rowsNewestFirst.length === 0 ? 0 : 2
+    if (used + separator + row.length > contentBudget) break
+    rowsNewestFirst.push(row)
+    used += separator + row.length
+  }
+
+  const notes: string[] = []
+  if (conversation.length > retained.length) {
+    notes.push(`history truncated: showing latest ${retained.length} of ${conversation.length} messages`)
+  }
+  if (previewLimited) notes.push(`preview limited to ${HISTORY_MAX_PREVIEW} characters per message`)
+  if (rowsNewestFirst.length < retained.length) {
+    notes.push(
+      `pager limit: showing latest ${rowsNewestFirst.length} of ${retained.length} retained messages ` +
+        `(${HISTORY_MAX_PAGER_CHARS} characters maximum)`
+    )
+  }
+
+  const header = notes.map(note => `[${note}]`).join('\n')
+  const rows = rowsNewestFirst.reverse().join('\n\n')
+  return header ? `${header}\n\n${rows}` : rows
+}
+
+const historyCmd: ClientHandler = (arg, ctx) => {
+  const text = formatHistory(ctx.historyItems(), arg)
+  if (!text) {
+    ctx.pushSystem('no conversation yet')
+    return
+  }
+  ctx.openPager('History', text)
+}
+
+const logsCmd: ClientHandler = (arg, ctx) => {
+  const limit = Math.min(80, Math.max(1, Number.parseInt(arg, 10) || 20))
+  const text = ctx.logTail(limit).join('\n')
+  if (text) ctx.openPager('Logs', text)
+  else ctx.pushSystem('no gateway logs')
+}
+
+const helpCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const show = (catalog: CommandsCatalogResponse | undefined) => ctx.openPager(ctx.helpHeader(), formatHelp(catalog))
+  const cached = ctx.commandCatalog()
+  if (cached) {
+    show(cached)
+    return
+  }
+
+  const sid = ctx.sessionId()
+  try {
+    const raw = await ctx.request('commands.catalog', {})
+    if (!currentSessionIs(ctx, sid, flight)) return
+    const catalog = decodeCommandsCatalogResponse(raw)
+    if (catalog) ctx.refreshCommandCatalog(catalog, [])
+    show(catalog)
+  } catch {
+    if (currentSessionIs(ctx, sid, flight)) show(undefined)
+  }
+}
+
 /** The TUI-only client commands (run in-process, never hit the gateway). */
 const CLIENT: Record<string, ClientHandler> = {
   agents: (_arg, ctx) => ctx.openDashboard(),
@@ -1181,7 +1402,8 @@ const CLIENT: Record<string, ClientHandler> = {
   },
   detail: detailsCmd,
   details: detailsCmd,
-  exit: (_arg, ctx) => ctx.quit(),
+  exit: quitCmd,
+  fortune: fortuneCmd,
   heapdump: heapdumpCmd,
   mem: memCmd,
   processes: (_arg, ctx) => ctx.openBackgroundPanel(),
@@ -1205,41 +1427,19 @@ const CLIENT: Record<string, ClientHandler> = {
   ts: timestampsCmd,
   tools: toolsCmd,
   status: statusCmd,
-  help: async (_arg, ctx) => {
-    // Prefer the live catalog; fall back to the client list if it's unavailable.
-    try {
-      const cat = await ctx.request('commands.catalog', {})
-      ctx.pushSystem(renderCatalog(cat) || clientHelp())
-    } catch {
-      ctx.pushSystem(clientHelp())
-    }
-  },
-  logs: (_arg, ctx) => ctx.openPager('Logs', ctx.logTail().join('\n') || '(log empty)'),
+  help: helpCmd,
+  history: historyCmd,
+  logs: logsCmd,
   new: freshSessionCmd(true),
-  quit: (_arg, ctx) => ctx.quit()
+  quit: quitCmd,
+  redraw: redrawCmd,
+  update: updateCmd
 }
 
 /** The registered client-command names (catalog introspection — tests/menus). */
 export function clientCommandNames(): string[] {
   const names = Object.keys(CLIENT)
   return (diagnosticsEnabled() ? names : names.filter(n => !DIAGNOSTIC_COMMANDS.has(n))).sort()
-}
-
-/** Render the gateway `commands.catalog` into a help block (loose-typed read).
- *  The TUI catalog shape is `{ pairs: [["/name","desc"], …], canon, categories }`
- *  (tui_gateway/server.py `commands.catalog`). */
-function renderCatalog(cat: unknown): string {
-  if (!cat || typeof cat !== 'object') return ''
-  const pairs = (cat as { pairs?: unknown }).pairs
-  if (!Array.isArray(pairs)) return ''
-  const lines = pairs
-    .map(pair => {
-      if (!Array.isArray(pair) || typeof pair[0] !== 'string') return null
-      const desc = typeof pair[1] === 'string' ? pair[1] : ''
-      return desc ? `${pair[0]} — ${desc}` : pair[0]
-    })
-    .filter((l): l is string => l !== null)
-  return lines.length ? lines.join('\n') : ''
 }
 
 function handleDispatchResult(parsed: ParsedSlash, raw: unknown, ctx: SlashContext): void {

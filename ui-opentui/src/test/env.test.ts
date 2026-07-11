@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest'
 
 import {
+  dashboardTuiMode,
   envFlag,
   envOutputLines,
   envOutputUnlimited,
@@ -13,6 +14,16 @@ import {
   startupImage,
   startupPrompt
 } from '../logic/env.ts'
+
+describe('dashboardTuiMode (hosted PTY contract)', () => {
+  test('reads only HERMES_TUI_DASHBOARD with the shared boolean grammar', () => {
+    expect(dashboardTuiMode({})).toBe(false)
+    expect(dashboardTuiMode({ HERMES_TUI_DASHBOARD: '1' })).toBe(true)
+    expect(dashboardTuiMode({ HERMES_TUI_DASHBOARD: ' yes ' })).toBe(true)
+    expect(dashboardTuiMode({ HERMES_TUI_DASHBOARD: 'off' })).toBe(false)
+    expect(dashboardTuiMode({ HERMES_TUI_INLINE: '1' })).toBe(false)
+  })
+})
 
 describe('envFlag', () => {
   test('recognizes truthy values regardless of case/whitespace', () => {

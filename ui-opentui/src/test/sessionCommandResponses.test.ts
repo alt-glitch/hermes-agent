@@ -43,18 +43,23 @@ describe('session-maintenance RPC Effect boundaries', () => {
     expect(
       decodeCommandsCatalogResponse({
         canon: { '/rs': '/reload-skills' },
+        categories: [{ name: 'Session', pairs: [['/status', 'Show status']] }],
         pairs: [
           ['/reload-skills', 'Reload skills'],
           ['/dogfood', 'Run dogfood skill']
         ],
-        skill_count: 1
+        skill_count: 1,
+        warning: ''
       })
     ).toEqual({
       canon: { '/rs': '/reload-skills' },
+      categories: [{ name: 'Session', pairs: [['/status', 'Show status']] }],
       pairs: [
         ['/reload-skills', 'Reload skills'],
         ['/dogfood', 'Run dogfood skill']
-      ]
+      ],
+      skill_count: 1,
+      warning: ''
     })
   })
 
@@ -66,5 +71,8 @@ describe('session-maintenance RPC Effect boundaries', () => {
     expect(decodeSkillsReloadResponse({ output: ['nope'], result: {} })).toBeUndefined()
     expect(decodeSkillsReloadResponse({ output: 'ok' })).toBeUndefined()
     expect(decodeCommandsCatalogResponse({ pairs: [['/bad', 1]] })).toBeUndefined()
+    expect(
+      decodeCommandsCatalogResponse({ categories: [{ name: 'Bad', pairs: [['/ok', 1]] }], pairs: [] })
+    ).toBeUndefined()
   })
 })

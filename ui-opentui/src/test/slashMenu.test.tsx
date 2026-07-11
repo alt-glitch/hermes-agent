@@ -18,7 +18,13 @@
  */
 import { describe, expect, test } from 'vitest'
 
-import { MENU_MAX, acceptChangesToken, routeMenuKey, type MenuKeyContext } from '../logic/completionMenu.ts'
+import {
+  MENU_MAX,
+  acceptChangesToken,
+  applyCompletion,
+  routeMenuKey,
+  type MenuKeyContext
+} from '../logic/completionMenu.ts'
 import { createPromptHistory } from '../logic/history.ts'
 import { planCompletion } from '../logic/slash.ts'
 import { createSessionStore, type CompletionItem } from '../logic/store.ts'
@@ -82,6 +88,10 @@ describe('routeMenuKey — key-routing precedence table', () => {
 })
 
 describe('acceptChangesToken — Enter-accept vs. submit (trailing-space guard)', () => {
+  test('normalizes a live TUI extra carrying its own slash at replace_from=1', () => {
+    expect(applyCompletion('/f', '/fortune', 1)).toBe('/fortune ')
+    expect(acceptChangesToken('/f', '/fortune', 1)).toBe(true)
+  })
   // Mirrors Ink domain/slash.ts completionApply tests: the engine's
   // acceptCompletion writes `before + itemText + ' '`, so the predicate is
   // computed against that exact shape (replace_from = token start).

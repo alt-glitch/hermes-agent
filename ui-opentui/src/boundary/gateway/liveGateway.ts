@@ -178,7 +178,8 @@ function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
         )
       ),
 
-    sessionId: () => sessionId
+    sessionId: () => sessionId,
+    logTail: limit => client.getLogTail(limit)
   }
 
   // Clear a pending coalesce timer on teardown so a queued flush() can't fire

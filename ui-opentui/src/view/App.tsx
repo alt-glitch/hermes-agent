@@ -165,6 +165,7 @@ export function App(props: AppProps) {
                         registerFocus={fn => (focusComposer = fn)}
                         onDoubleEsc={openPromptHistory}
                         initialDraft={() => props.store.state.composerDraft}
+                        clearVersion={() => props.store.state.composerClearVersion}
                         onDraftChange={text => props.store.setComposerDraft(text)}
                       />
                     }

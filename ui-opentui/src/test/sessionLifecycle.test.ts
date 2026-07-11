@@ -24,6 +24,7 @@ function fakeGateway(
         return handler(method, params) as Effect.Effect<A, GatewayError>
       },
       sessionId: () => sessionId,
+      logTail: () => [],
       subscribe: () => Effect.succeed(() => {})
     }
   }
@@ -188,6 +189,7 @@ describe('resumeSession', () => {
           return { closed: true } as A
         }),
       sessionId: () => current,
+      logTail: () => [],
       subscribe: () => Effect.succeed(() => {})
     }
 
@@ -226,6 +228,7 @@ describe('resumeSession', () => {
         }) as Effect.Effect<A, GatewayError>
       },
       sessionId: () => 'old-live',
+      logTail: () => [],
       subscribe: () => Effect.succeed(() => {})
     }
 
@@ -244,6 +247,7 @@ describe('resumeSession', () => {
     const service: GatewayServiceShape = {
       request: <A>() => Effect.succeed({ session_id: ' ' } as A),
       sessionId: () => 'old-live',
+      logTail: () => [],
       subscribe: () => Effect.succeed(() => {})
     }
     return Effect.gen(function* () {
@@ -262,6 +266,7 @@ describe('resumeSession', () => {
     const service: GatewayServiceShape = {
       request: <A>() => Effect.succeed(null as A),
       sessionId: () => 'old-live',
+      logTail: () => [],
       subscribe: () => Effect.succeed(() => {})
     }
     return Effect.gen(function* () {

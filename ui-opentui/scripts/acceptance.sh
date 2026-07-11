@@ -11,8 +11,10 @@
 #      live-SID tracking.
 #      (Skipped if no Hermes venv resolves — CI parity.)
 #   4. selection/markdown smoke in a real tmux TTY — asserts the native <markdown>
-#      (Tree-sitter) PAINTS under node --experimental-ffi and that a selection
-#      copies the RAW markdown source. (Skipped if tmux is unavailable.)
+#      (Tree-sitter) PAINTS under node --experimental-ffi, native programmatic
+#      selection extracts the rendered highlighted text, and the `/copy` source
+#      helper preserves the full Markdown source. Mouse routing is covered by
+#      the Vitest multi-click suite. (Skipped if tmux is unavailable.)
 #
 # Run:  cd ui-opentui && HERMES_PYTHON_SRC_ROOT=<checkout-root> bash scripts/acceptance.sh
 set -uo pipefail
@@ -62,7 +64,7 @@ if command -v tmux >/dev/null 2>&1; then
   tmux wait-for "$S" 2>/dev/null || sleep 6
   tmux kill-session -t "$S" 2>/dev/null
   if node -e 'process.exit(require("/tmp/accept-sel.json").pass===true?0:1)' 2>/dev/null; then
-    ok "markdown painted + selection copied source (tree-sitter under node FFI)"
+    ok "markdown painted + native selection extracted + /copy source helper preserved (tree-sitter under node FFI)"
   else
     bad "selection/markdown smoke failed — see /tmp/accept-sel.json"; cat /tmp/accept-sel.json 2>/dev/null
   fi

@@ -16,6 +16,7 @@ import { createStore, produce } from 'solid-js/store'
 
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
 import type { BillingOverlayState } from '../boundary/billing.ts'
+import type { CommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
 import {
   decodeCatalog,
   decodeSessionInfoPatch,
@@ -298,6 +299,9 @@ export interface StoreState {
    *  composer unmounting when a blocking prompt (clarify/approval) replaces it
    *  in the <Switch>. Restored on the next composer mount; cleared on submit. */
   composerDraft: string
+  /** Monotonic imperative-clear signal for Ctrl+C. The native textarea is
+   * uncontrolled, so changing only composerDraft would leave visible bytes. */
+  composerClearVersion: number
   /** The latest todo-tool snapshot, captured from every `todo` tool.complete
    *  REGARDLESS of HERMES_TUI_TOOL_OUTPUTS (the pinned TodoPanel is a live
    *  tracker, not a tool body). undefined until the agent first calls `todo`. */
@@ -356,6 +360,10 @@ export interface StoreState {
   hint: string | undefined
   /** Startup tools/skills/MCP catalog (from `startup.catalog`) for the home panel (item 9). */
   catalog: Catalog | undefined
+  /** Cached, Effect-decoded slash catalog. `/help` reads this synchronously,
+   *  matching Ink's post-ready catalog hydration instead of refetching on every
+   *  invocation. Process-global command metadata survives session switches. */
+  commandCatalog: CommandsCatalogResponse | undefined
   /** Cached `/model` picker rows (mapped `model.options`). Prefetched at session
    *  bootstrap and refreshed after a switch, so `/model` opens INSTANTLY from
    *  memory instead of awaiting the slow RPC (it does network calls: pricing
@@ -602,6 +610,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     theme: DEFAULT_THEME,
     prompt: undefined,
     composerDraft: '',
+    composerClearVersion: 0,
     latestTodos: undefined,
     pager: undefined,
     sessionPicker: undefined,
@@ -626,6 +635,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     info: { startedAt: Date.now() },
     hint: undefined,
     catalog: undefined,
+    commandCatalog: undefined,
     modelItems: undefined,
     sessionId: undefined,
     resumeId: undefined,
@@ -673,14 +683,22 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // Ink turnController's single `noticeTimer` handle.
   let noticeTimer: ReturnType<typeof setTimeout> | undefined
 
-  // Anti-flood for `gateway.stderr`: a crashing child can emit a torrent of
-  // stderr lines, so we do NOT push each to the transcript. Instead we keep a
-  // small ring of the most-recent lines and only surface a TAIL of it when a
-  // failure event (start_timeout / exited) actually needs the diagnostic
-  // context — so a healthy-but-chatty gateway never spams the chat.
+  // Anti-flood for gateway.stderr. `/logs` reads the authoritative transport
+  // ring from GatewayService; the store retains only a short startup-failure
+  // tail so stderr never floods the transcript or holds an unbounded line.
   const STDERR_RING_LIMIT = 20
+  const STDERR_LINE_LIMIT = 4096
+  const STDERR_TRUNCATED_SUFFIX = '… [truncated]'
   const STDERR_TAIL = 5
   const stderrRing: string[] = []
+  function pushStderr(line: string): void {
+    const bounded =
+      line.length <= STDERR_LINE_LIMIT
+        ? line
+        : `${line.slice(0, STDERR_LINE_LIMIT - STDERR_TRUNCATED_SUFFIX.length)}${STDERR_TRUNCATED_SUFFIX}`
+    stderrRing.push(bounded)
+    if (stderrRing.length > STDERR_RING_LIMIT) stderrRing.splice(0, stderrRing.length - STDERR_RING_LIMIT)
+  }
   function stderrTail(): string {
     return stderrRing.slice(-STDERR_TAIL).join('\n')
   }
@@ -1636,10 +1654,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         setState('status', attempt ? `gateway recovering (attempt ${attempt})…` : 'gateway recovering…')
         break
       }
-      // Collect stderr into a bounded ring (NOT the transcript) — see stderrRing.
+      // Collect stderr into a bounded ring (NOT the transcript).
       case 'gateway.stderr': {
-        stderrRing.push(event.payload.line)
-        if (stderrRing.length > STDERR_RING_LIMIT) stderrRing.splice(0, stderrRing.length - STDERR_RING_LIMIT)
+        pushStderr(event.payload.line)
         break
       }
       // The gateway never reached `gateway.ready` — surface the failure with any
@@ -1677,6 +1694,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
    *  blocking prompt replaces it). Cleared on submit. */
   function setComposerDraft(text: string): void {
     setState('composerDraft', text)
+  }
+
+  /** Clear both persisted state and the mounted native textarea via its
+   * monotonic signal (Composer observes composerClearVersion). */
+  function clearComposerDraft(): void {
+    setState('composerDraft', '')
+    setState('composerClearVersion', version => version + 1)
   }
 
   // ── resume hydrate (opencode sync-v2): buffer live events while the snapshot
@@ -1742,6 +1766,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('catalog', catalogFrom(decoded.value))
   }
 
+  function setCommandCatalog(catalog: CommandsCatalogResponse | undefined): void {
+    setState('commandCatalog', catalog)
+  }
+
   function setSessionId(sid: string | undefined): void {
     setState('sessionId', sid)
   }
@@ -1768,6 +1796,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     registerTurnCompleteHandler,
     registerCommittedEventHandler,
     setCatalog,
+    setCommandCatalog,
     setSessionId,
     setResumeId,
     detachSession,
@@ -1810,7 +1839,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     commitSnapshot,
     duplicate,
     clearPrompt,
-    setComposerDraft
+    setComposerDraft,
+    clearComposerDraft
   } as const
 }
 

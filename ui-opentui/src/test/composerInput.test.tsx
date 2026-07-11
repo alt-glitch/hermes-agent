@@ -26,6 +26,7 @@ import { renderProbe, type RenderProbe } from './lib/render.ts'
 
 interface Harness {
   probe: RenderProbe
+  store: ReturnType<typeof createSessionStore>
   submitted: string[]
 }
 
@@ -42,7 +43,7 @@ async function mountComposer(opts?: { kitty?: boolean; history?: string[] }): Pr
     ),
     { height: 30, kittyKeyboard: opts?.kitty ?? false, width: 70 }
   )
-  return { probe, submitted }
+  return { probe, store, submitted }
 }
 
 /** Row index of the first frame line containing `text` (-1 when absent). */
@@ -108,6 +109,37 @@ describe('shift+enter — kitty protocol inserts a newline', () => {
       h.probe.keys.pressEnter()
       await h.probe.settle()
       expect(h.submitted).toEqual(['one\ntwo'])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+})
+
+describe('external draft clear', () => {
+  test('clears the mounted uncontrolled textarea as well as persisted state', async () => {
+    const h = await mountComposer({ history: ['older prompt', 'newest prompt'], kitty: true })
+    try {
+      await h.probe.keys.typeText('discard me')
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('discard me')
+      expect(h.probe.frame()).toContain('discard me')
+
+      h.probe.keys.pressArrow('up')
+      await h.probe.settle()
+      expect(h.probe.frame()).toContain('newest prompt')
+
+      h.store.clearComposerDraft()
+      await h.probe.settle()
+
+      expect(h.store.state.composerDraft).toBe('')
+      expect(h.probe.frame()).not.toContain('discard me')
+
+      // The clear also resets history navigation. Without that reset the next
+      // Up would continue from the recalled cursor and show "older prompt".
+      h.probe.keys.pressArrow('up')
+      await h.probe.settle()
+      expect(h.probe.frame()).toContain('newest prompt')
+      expect(h.probe.frame()).not.toContain('older prompt')
     } finally {
       h.probe.destroy()
     }

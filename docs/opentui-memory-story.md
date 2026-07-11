@@ -1,7 +1,11 @@
 # How the OpenTUI transcript got from 686MB to ~300MB — the full story
 
 *For: glitch. Branch: `feat/opentui-memory-window`. Everything here is measured,
-not vibes; every number has a result JSON in the **tui-bench** repo's `results/` (`github.com/NousResearch/tui-bench`).*
+not vibes; every number has a result JSON in the **tui-bench** repo's `results/`
+(`github.com/NousResearch/tui-bench`). The 686→300MB campaign predates the
+current `@opentui/core@0.4.1` native-Yoga runtime. WASM-ratchet explanations
+below are retained as historical root-cause context, not as a claim about the
+currently pinned 0.4.1 allocator.*
 
 ---
 
@@ -30,16 +34,13 @@ markdown, code blocks, copy chips) is a *tree* of these: **~16 text renderables
 drives everything. 1,400 mounted rows × 47 handles = table full = the crash we
 root-caused last week.
 
-**Yoga (the layout engine, WASM).** Every renderable also has a Yoga node —
-Yoga is the flexbox calculator that decides where boxes go. OpenTUI ships it
-compiled to **WebAssembly**, and WASM has a brutal property: its memory can
-**grow but never shrink** back to the OS. So the peak number of
-*simultaneously-mounted* renderables sets a high-water mark you pay **forever**,
-even after everything is destroyed. (Fun fact from this week's forensics: we
-spent two days believing Ink had this disease. It doesn't — our Ink fork swapped
-Yoga-WASM for a plain TypeScript port at fork creation. **We** are the ones
-running layout in WASM. The accusation was true; we just had the defendant
-wrong.)
+**Yoga (the layout engine).** Every renderable also has a Yoga node — the
+flexbox calculator that decides where boxes go. During the original campaign,
+OpenTUI used **WebAssembly** Yoga: its linear memory could grow but never shrink
+back to the OS, so transient mounted peaks permanently raised the floor. In
+0.4.1 Yoga nodes are native Zig/FFI allocations and can be released. Windowing
+still matters because mounted renderables retain native handles, text buffers,
+and layout work even without the old WASM ratchet.
 
 **Solid (the view framework).** Renders each store message into a row via
 `<For>`. The property we exploit: Solid mounts/unmounts *surgically* — remove a
@@ -118,9 +119,9 @@ S1 alone got 686 → 518MB. Why not more? Because of *when* windowing decided.
 S1 re-decided the window when you **scrolled**. But during a streaming burst —
 an agent turn dumping hundreds of rows — you don't scroll; rows arrive, each
 mounting fully, and only get demoted later. That transient pile-up is mostly
-invisible in steady-state numbers… except for Yoga-WASM, where **the transient
-peak is permanent** (memory never shrinks). The burst was quietly ratcheting
-the floor.
+invisible in steady-state numbers. On the historical Yoga-WASM runtime the
+transient peak was permanent; on 0.4.1 it is releasable but still creates
+avoidable RSS, handle pressure, and layout latency.
 
 S2 makes the window recompute on **transcript growth**: while you're pinned at
 the bottom, the window anchors to the content *bottom*, so a row that falls
@@ -157,13 +158,15 @@ everything again) keeps the safe 1,000.
 ### Decision 6 (measured, not yet shipped as default): right-size the V8 heap
 
 Running the windowed TUI with a 512MB heap ceiling instead of 8GB forced V8 to
-actually collect: another −90MB with zero latency cost. That's queued as a
-launcher default change (~1GB), for both engines.
+actually collect: another −90MB with zero latency cost. That lower default
+remains unshipped backlog; the current launcher still defaults to 8,192MB when
+no tighter config/cgroup ceiling applies.
 
 ## 4. The scoreboard
 
-At 2,000 messages (your real p99 session size — yes, we checked your DB:
-median session is 20 messages, p99 is 1,941):
+These measurements were taken during the windowing campaign, before the 0.4.1
+native-Yoga upgrade. At 2,000 messages (your real p99 session size — yes, we
+checked your DB: median session is 20 messages, p99 is 1,941):
 
 | | peak memory | scroll p99 (slowest 1-in-100) |
 |---|---|---|

@@ -622,6 +622,13 @@ describe('session store — gateway lifecycle / transport errors (auto-heal foun
     expect(sys.map(m => m.text)).toEqual(['gateway protocol error: <garbled>', 'error: boom'])
   })
 
+  test('gateway stderr startup tail marks pathological lines as truncated', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.stderr', payload: { line: 'x'.repeat(5000) } })
+    store.apply({ type: 'gateway.start_timeout', payload: {} })
+    expect(store.state.messages.at(-1)?.text).toMatch(/… \[truncated\]$/)
+  })
+
   test('review.summary surfaces the self-improvement digest as a system line', () => {
     const store = createSessionStore()
     store.apply({
@@ -863,6 +870,17 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     expect(store.state.composerDraft).toBe('half-typed message')
     store.setComposerDraft('')
     expect(store.state.composerDraft).toBe('')
+  })
+
+  test('clearComposerDraft advances the native-textarea clear signal', () => {
+    const store = createSessionStore()
+    store.setComposerDraft('half-typed message')
+    const before = store.state.composerClearVersion
+
+    store.clearComposerDraft()
+
+    expect(store.state.composerDraft).toBe('')
+    expect(store.state.composerClearVersion).toBe(before + 1)
   })
 
   test('clearTranscript zeroes the usage gauges but keeps session identity', () => {

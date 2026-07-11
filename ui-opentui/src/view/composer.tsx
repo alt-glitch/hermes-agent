@@ -53,7 +53,7 @@ import { SyntaxStyle, type PasteEvent, type TextareaRenderable } from '@opentui/
 import { useKeyboard, useRenderer } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
-import { MENU_MAX, acceptChangesToken, routeMenuKey } from '../logic/completionMenu.ts'
+import { MENU_MAX, acceptChangesToken, applyCompletion, routeMenuKey } from '../logic/completionMenu.ts'
 import { envComposerRows } from '../logic/env.ts'
 import { createDoublePress } from '../logic/promptHistory.ts'
 import { analyzeSlash, learnableNames, nativeCharOffset } from '../logic/skillMatch.ts'
@@ -170,6 +170,8 @@ export function Composer(props: {
   /** The persisted draft to seed the buffer with on mount (survives the
    *  composer unmounting when a blocking prompt replaces it). */
   initialDraft?: (() => string) | undefined
+  /** Monotonic signal used to clear the mounted uncontrolled textarea. */
+  clearVersion?: (() => number) | undefined
   /** Called with the live draft text on every edit (persist) and '' on submit
    *  (clear) — lets the parent stash it so it outlives a composer unmount. */
   onDraftChange?: ((text: string) => void) | undefined
@@ -333,6 +335,22 @@ export function Composer(props: {
     ta.cursorOffset = text.length
   }
 
+  // Ctrl+C clears a non-empty idle draft before it exits/requests a dashboard
+  // session. The store owns the command, but this mounted native textarea owns
+  // its uncontrolled edit buffer; bridge the monotonic signal explicitly.
+  let seenClearVersion = props.clearVersion?.() ?? 0
+  createEffect(() => {
+    const version = props.clearVersion?.() ?? 0
+    if (version === seenClearVersion) return
+    seenClearVersion = version
+    if (!ta || ta.isDestroyed) return
+    ta.clear()
+    setBufText('')
+    props.history?.reset()
+    props.onDraftChange?.('')
+    props.onDismiss?.()
+  })
+
   /** Splice the n-th candidate into the buffer (Tab/Enter accept). Only the token
    *  being completed is replaced — `completionFrom` is the gateway's
    *  `replace_from` / token start — then the trailing space lets arg-completion
@@ -344,8 +362,7 @@ export function Composer(props: {
     // the `/` (its own `from`); gateway rows keep the store's replace_from.
     const synthetic = storeItems().length === 0
     const from = synthetic ? (suggested()?.from ?? 1) : (props.completionFrom?.() ?? 0)
-    const before = ta.plainText.slice(0, Math.min(Math.max(0, from), ta.plainText.length))
-    setBuffer(before + item.text + ' ')
+    setBuffer(applyCompletion(ta.plainText, item.text, from))
     props.onDismiss?.()
   }
 

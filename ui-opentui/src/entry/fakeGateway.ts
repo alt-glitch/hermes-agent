@@ -38,7 +38,8 @@ export function makeFakeGateway(initialSessionId = 'fake-session'): FakeGatewayC
         calls.push({ method, params })
         return undefined as A
       }),
-    sessionId: () => initialSessionId
+    sessionId: () => initialSessionId,
+    logTail: () => []
   }
 
   return {

@@ -39,9 +39,16 @@ export const SkillsReloadResponseSchema = Schema.Struct({
 export type SkillsReloadResponse = typeof SkillsReloadResponseSchema.Type
 
 const CommandPairSchema = Schema.Tuple([Str, Str])
+const CommandCategorySchema = Schema.Struct({
+  name: Str,
+  pairs: Schema.Array(CommandPairSchema)
+})
 export const CommandsCatalogResponseSchema = Schema.Struct({
   canon: opt(Schema.Record(Str, Str)),
-  pairs: Schema.Array(CommandPairSchema)
+  categories: opt(Schema.Array(CommandCategorySchema)),
+  pairs: Schema.Array(CommandPairSchema),
+  skill_count: opt(Num),
+  warning: opt(Str)
 })
 export type CommandsCatalogResponse = typeof CommandsCatalogResponseSchema.Type
 

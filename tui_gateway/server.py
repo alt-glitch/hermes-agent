@@ -8528,6 +8528,25 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "interrupted"})
 
 
+@method("dashboard.new_session_requested")
+def _(rid, params: dict) -> dict:
+    """Publish a hosted TUI's idle-exit request through the active transport.
+
+    The dashboard owns the embedded PTY lifecycle, so hosted clients request a
+    fresh chat instead of terminating themselves.  Keeping this event-only lets
+    the existing transport multiplexer route the frame to a session-bound sink
+    or, when no session id is available yet, to the request's current sink.
+    """
+    session_id = str(params.get("session_id") or "").strip()
+    reason = str(params.get("reason") or "").strip() or "idle_exit_hotkey"
+    _emit(
+        "dashboard.new_session_requested",
+        session_id,
+        {"reason": reason},
+    )
+    return _ok(rid, {"ok": True})
+
+
 # ── Delegation: subagent tree observability + controls ───────────────
 # Powers the TUI's /agents overlay (see ui-tui/src/components/agentsOverlay).
 # The registry lives in tools/delegate_tool — these handlers are thin
@@ -13207,6 +13226,11 @@ def _(rid, params: dict) -> dict:
                 "text": "/details",
                 "display": "/details",
                 "meta": "Control agent detail visibility",
+            },
+            {
+                "text": "/fortune",
+                "display": "/fortune",
+                "meta": "Show a random or daily local fortune",
             },
             {
                 "text": "/logs",

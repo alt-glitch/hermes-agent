@@ -20,30 +20,30 @@ Status meanings:
 - **In progress** — actively being implemented; never counts as shipped.
 - **Intentional skip** — an explicit supported-platform/product decision.
 
-Current slash tally: **13 Covered, 25 Thinner, 19 Missing, 0 In progress, 1
+Current slash tally: **19 Covered, 23 Thinner, 15 Missing, 0 In progress, 1
 Intentional skip**.
 
 ## Slash commands
 
 | # | Command | Status | Contract still required / evidence |
 |---:|---|---|---|
-| 1 | `/help` | Thinner | Add Ink categories, skill count, TUI-only commands, and hotkeys to `logic/slash.ts::CLIENT.help`. |
-| 2 | `/quit`, `/exit` | Thinner | Refuse to destroy a hosted dashboard chat; verify the dashboard PTY path. |
-| 3 | `/update` | Missing | Exit the renderer with code 42 so the Python launcher performs the update. |
+| 1 | `/help` | Covered | Effect-decoded catalog caching renders Ink categories, skill count, discovery warnings, TUI-only rows, platform-aware implemented hotkeys, and the skin `helpHeader`; malformed/offline fallback and stale-flight fencing are tested. |
+| 2 | `/quit`, `/exit` | Covered | Local shutdown runs renderer/Effect finalizers; hosted dashboard chat returns Ink's exact refusal. Idle Ctrl+C/action+D instead publishes the sidecar new-session event, while overlays retain input ownership. |
+| 3 | `/update` | Covered | Local mode reports the handoff and exits cleanly with code 42 for the unchanged Python launcher; hosted mode returns Ink's exact managed-environment refusal. |
 | 4 | `/mouse`, `/scroll` | Missing | Hot-swap renderer tracking modes and persist them; launch-time mouse config alone is insufficient. |
 | 5 | `/clear`, `/new [title]` | Covered | Busy guard and Ink-equivalent confirmation feed a transactional `setup.status → session.close → session.create`; adoption resets all session-owned state, preserves process-global presentation, supports titles, fences old live SIDs, and safely drains submissions queued during the switch. |
-| 6 | `/redraw` | Missing | Invoke the supported native repaint primitive and verify recovery in a real TTY. |
+| 6 | `/redraw` | Covered | Public frame buffers are invalidated and the terminal is repainted without suspend/resume; slash redraw preserves selection while action+L clears it, a same-stdin-chunk regression proves later key bytes survive, and real PTY smoke passes. |
 | 7 | `/status` | Covered | Decoded direct `session.status` uses the active SID, always pages the authoritative live snapshot, and drops late old-SID or superseded same-SID replies. |
 | 8 | `/title` | Covered | Decoded direct query/rename preserves pending/error feedback, refreshes title chrome immediately, and fences late responses by SID plus slash flight. |
 | 9 | `/compact` | Covered | `logic/slash.ts::compactCmd` updates live display state and persistence. |
 | 10 | `/details`, `/detail` | Thinner | Global modes work; add per-section thinking/tools/subagents/activity modes. |
-| 11 | `/fortune` | Missing | Port the local random/daily helper with deterministic daily tests. |
+| 11 | `/fortune` | Covered | Ink's corpus, random mode, SID+local-date deterministic daily aliases, help row, and live `/f` completion are local and tested. |
 | 12 | `/copy [n]` | Thinner | Prefer current terminal selection, then match Ink response indexing and feedback. |
 | 13 | `/paste` | Missing | Route through the existing clipboard-image and `image.attach` boundary. |
 | 14 | `/prompt`, `/compose` | Missing | Suspend the renderer, edit the draft in `$EDITOR`, and restore safely on success/failure/signals. |
 | 15 | `/terminal-setup` | Missing | Port the external terminal-keybinding setup handoff. |
-| 16 | `/logs [n]` | Thinner | Honor the requested count and reconcile gateway-log vs OpenTUI-ring semantics. |
-| 17 | `/history [preview]` | Missing | Render the current client transcript; a detached worker has stale history. |
+| 16 | `/logs [n]` | Covered | Reads the real transport-owned 200-line ring (spawn/readiness/stderr/protocol/RPC error, timeout, and write failures), clamps 1..80, marks 4,096-character truncation, and renders the requested tail in the native pager. |
+| 17 | `/history [preview]` | Thinner | Live rows, Ink labels/tool fallback, and latest-800-row semantics are covered, but production safety deliberately caps previews at 4,000 characters and the pager at 512 Ki. Approve this exception or add a lazy/chunked viewer that exposes every byte without OOM risk. |
 | 18 | `/save` | Covered | Decoded direct `session.save` exports uncapped gateway history, preserves Ink's no-conversation/no-SID UX, reports the path/errors, and fences late replies. |
 | 19 | `/statusbar`, `/sb` | Missing | Live off/top/bottom/toggle state plus persistence and responsive frame tests. |
 | 20 | `/queue`, `/q` | Thinner | Bare count/preview, enqueue while idle, visible edit/remove/send UX, and reset behavior. |
@@ -123,6 +123,8 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | Status core/profile/MCP | Covered | Model/context/cost/duration/cwd/branch/profile/MCP are present and responsive. |
 | Status voice/browser/live sessions | Missing | Add only after their underlying live state is real. |
 | Theme/skins and terminal chrome | Covered | Reactive skins, OSC title, and native notifications; require live repaint smoke. |
+| Local help/history/logs UX | Covered | Client-local commands use current store/transport state; categorized help, bounded one-renderable history, transport diagnostics, pager keyboard behavior, and real PTY presentation are verified. |
+| Hosted dashboard exit contract | Covered | `HERMES_TUI_DASHBOARD` refuses destructive slash exits/updates, keeps raw SIGINT alive, clears drafts before idle exit, and mirrors `dashboard.new_session_requested` through the existing Python publisher; overlays retain Ctrl+C/action+D. |
 | Gateway crash recovery | Covered | Bounded respawn/backoff re-resumes by persisted SID, clears dead ephemeral tracking before recovery, and respawns a detached gateway so `/new` and `/resume` remain usable; real-child and crash-loop contracts are tested. |
 | Launcher engine selection | Thinner | Precedence/fallback works; close Node/npm and freshness rows below. |
 | OpenTUI bundle freshness | Missing | Rebuild when source, lockfile, or build inputs are newer; test stale installed bundles. |
@@ -137,14 +139,15 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | OpenTUI CI | Missing | Node 26 `npm ci`, `npm run check`, production build, native launch smoke on relevant paths. |
 | Packaged runtime matrix | Missing | Linux x64/arm64 clean install and launch; Windows/Termux intentionally fall back to Ink. |
 | Release metadata/docs | Missing | Replace experimental/0.0.0/Ink-default claims with accurate v1 support and rollback policy. |
-| Startup benchmark | Thinner | Same-host parent/current PTY A/B medians are 123→126 ms first byte, 177→176 ms session-create, and +0.7 MB VmHWM (loop lag ≤2 ms, zero swaps); version and retain raw evidence in the release report. |
+| Startup benchmark | Thinner | Latest same-host three-run current results are 124/125/126 ms first byte (median 125), 175/177/177 ms session-create (median 177), and 102,916/102,988/103,056 KB VmHWM (loop lag ≤2 ms, zero violations); version and retain raw evidence in the release report. |
 | Cold hydration benchmark | In progress | Actual `commitSessionSnapshot` path is measured at 100 messages (latest three-run median: 64.88 ms adoption, 207.69 ms through highlight, 177.6 MB RSS; allocation/renderable counts unchanged); pair it with real `session.resume` RPC→stable-paint timing. |
 | Warm-switch benchmark | In progress | Same-renderer replacement is measured (latest three-run median: 34.84 ms adoption, 63.70 ms through highlight, 172.6 MB RSS; 847 renderables); add real RPC timing and repeated-switch release proof. |
 | Fixture memory/renderables | In progress | The bounded 100-message fixture settles at 903 renderables and 1,367 native allocations after highlight (206.4 MB process RSS); retain raw release evidence and add repeated-cycle leak assertions. |
-| Resource ceiling | Thinner | Latest full OpenTUI gate: 17.90 s wall, 313% CPU, 1,117,504 KB peak RSS, zero swaps; continue recording every native/release gate sequentially on constrained hosts. |
-| Memory architecture docs | Missing | Replace Yoga-WASM/current claims with the actual 0.4.1 native-layout runtime; label historical results. |
-| Upstream alignment docs | Missing | Update dependency/test counts, shim ledger, and upgrade gates. |
-| Env flags docs | Missing | Classify dashboard attachment as required internal plumbing and keep user config in `config.yaml`. |
+| History pager fixture | Covered | Realistic `materialize(3000)` is clipped to 244,295 characters; three opens hold 12 renderables, format in 3.4–6.0 ms, open in 45.7–50.0 ms, remount in 205–216 ms, peak at 294,208 KB RSS, and use zero swaps. |
+| Resource ceiling | Thinner | Latest full OpenTUI gate: 19.88 s wall, 308% CPU, 1,160,436 KB peak RSS, zero swaps; continue recording every native/release gate sequentially on constrained hosts. |
+| Memory architecture docs | Covered | Historical Yoga-WASM results are labeled; the current 0.4.1 native-layout allocator and still-binding handle/windowing constraints are explicit. |
+| Upstream alignment docs | Thinner | Dependency/test counts, native-Yoga state, and renderer shim ledger match the f7c9 baseline; establish versioned 0.4.1 mem3000/scroll baselines before treating the historical 0.4.0 figures as an upgrade gate. |
+| Env flags docs | Covered | Hosted dashboard and sidecar variables are classified as internal plumbing; unsupported remote-gateway overrides remain explicit and user config stays in `config.yaml`. |
 
 ## Verification policy
 

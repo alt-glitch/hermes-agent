@@ -553,6 +553,98 @@ def test_dispatch_rejects_non_object_params():
     }
 
 
+@pytest.mark.parametrize(
+    ("params", "expected_session_id", "expected_reason"),
+    [
+        (
+            {"session_id": "  sid-hosted  ", "reason": "  keyboard_shortcut  "},
+            "sid-hosted",
+            "keyboard_shortcut",
+        ),
+        ({"reason": "   "}, "", "idle_exit_hotkey"),
+    ],
+)
+def test_dashboard_new_session_request_emits_on_bound_transport(
+    params,
+    expected_session_id,
+    expected_reason,
+):
+    frames = []
+
+    class _CaptureTransport:
+        def write(self, obj):
+            frames.append(obj)
+            return True
+
+        def close(self):
+            return None
+
+    resp = server.dispatch(
+        {
+            "id": "dashboard-new",
+            "method": "dashboard.new_session_requested",
+            "params": params,
+        },
+        transport=_CaptureTransport(),
+    )
+
+    assert resp == {
+        "jsonrpc": "2.0",
+        "id": "dashboard-new",
+        "result": {"ok": True},
+    }
+    assert frames == [
+        {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "dashboard.new_session_requested",
+                "session_id": expected_session_id,
+                "payload": {"reason": expected_reason},
+            },
+        }
+    ]
+
+
+def test_dashboard_new_session_request_uses_trimmed_session_transport(monkeypatch):
+    request_frames = []
+    session_frames = []
+
+    class _CaptureTransport:
+        def __init__(self, frames):
+            self.frames = frames
+
+        def write(self, obj):
+            self.frames.append(obj)
+            return True
+
+        def close(self):
+            return None
+
+    monkeypatch.setitem(
+        server._sessions,
+        "sid-multiplexed",
+        {"transport": _CaptureTransport(session_frames)},
+    )
+
+    resp = server.dispatch(
+        {
+            "id": "dashboard-multiplex",
+            "method": "dashboard.new_session_requested",
+            "params": {"session_id": "  sid-multiplexed  "},
+        },
+        transport=_CaptureTransport(request_frames),
+    )
+
+    assert resp["result"] == {"ok": True}
+    assert request_frames == []
+    assert session_frames[0]["params"] == {
+        "type": "dashboard.new_session_requested",
+        "session_id": "sid-multiplexed",
+        "payload": {"reason": "idle_exit_hotkey"},
+    }
+
+
 def test_voice_toggle_returns_configured_record_key(monkeypatch):
     monkeypatch.setattr(
         server,
@@ -3466,6 +3558,20 @@ def test_complete_slash_includes_tui_mouse_command():
     )
 
     assert any(item["text"] == "/mouse" for item in resp["result"]["items"])
+
+
+def test_complete_slash_includes_local_tui_fortune_command():
+    resp = server.handle_request(
+        {"id": "1", "method": "complete.slash", "params": {"text": "/for"}}
+    )
+
+    fortune = next(
+        (item for item in resp["result"]["items"] if item["text"] == "/fortune"),
+        None,
+    )
+    assert fortune is not None
+    assert fortune["display"] == "/fortune"
+    assert "random or daily" in fortune["meta"]
 
 
 def test_complete_slash_details_args():

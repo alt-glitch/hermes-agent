@@ -85,8 +85,16 @@ export function routeMenuKey(name: string, modified: boolean, ctx: MenuKeyContex
  * splices from; the composer appends a single space on accept (matched here).
  */
 export function acceptChangesToken(bufText: string, itemText: string, from: number): boolean {
+  const next = applyCompletion(bufText, itemText, from)
+  return next !== bufText && next.trimEnd() !== bufText.trimEnd()
+}
+
+/** Apply the gateway's replacement shape. Some TUI-local completion extras are
+ * returned as `/fortune` while replace_from=1 (just after the buffer's leading
+ * slash); strip that duplicate delimiter exactly as Ink does. */
+export function applyCompletion(bufText: string, itemText: string, from: number): string {
   const at = Math.min(Math.max(0, from), bufText.length)
   const before = bufText.slice(0, at)
-  const next = `${before}${itemText} ` // the composer's acceptCompletion shape (trailing space)
-  return next !== bufText && next.trimEnd() !== bufText.trimEnd()
+  const replacement = before.endsWith('/') && itemText.startsWith('/') ? itemText.slice(1) : itemText
+  return `${before}${replacement} `
 }

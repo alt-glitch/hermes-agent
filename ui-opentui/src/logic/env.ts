@@ -28,6 +28,17 @@ export function envToggle(value: string | undefined): boolean | null {
 }
 
 /**
+ * Whether the TUI is embedded in the dashboard PTY.
+ *
+ * This is intentionally the same single internal hand-off as Ink. A locally
+ * selected inline/main-screen mode is not hosted, and must not disable normal
+ * exits or `/update`.
+ */
+export function dashboardTuiMode(env: { readonly [k: string]: string | undefined } = process.env): boolean {
+  return envFlag(env.HERMES_TUI_DASHBOARD, false)
+}
+
+/**
  * Resolve whether mouse tracking is ON at boot, deferring to Ink's env surface
  * (`ui-tui/src/config/env.ts`) so muscle memory + docs + support scripts carry
  * over. Precedence (highest first):

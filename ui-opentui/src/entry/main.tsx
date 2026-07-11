@@ -24,6 +24,7 @@ import { KeymapProvider } from '@opentui/keymap/solid'
 import { render } from '@opentui/solid'
 import { Cause, Deferred, Duration, Effect } from 'effect'
 import { writeFileSync } from 'node:fs'
+import type { KeyEvent } from '@opentui/core'
 
 import { readClipboardImage, writeClipboard } from '../boundary/clipboard.ts'
 import { GatewayService, type GatewayServiceShape } from '../boundary/gateway/GatewayService.ts'
@@ -33,13 +34,15 @@ import { startMemlog } from '../boundary/memlog.ts'
 import { startMemoryMonitor } from '../boundary/memoryMonitor.ts'
 import { startProactiveGc } from '../boundary/proactiveGc.ts'
 import { registerRemoteParsers } from '../boundary/parsers.ts'
-import { acquireRenderer } from '../boundary/renderer.ts'
+import { acquireRenderer, redrawRenderer } from '../boundary/renderer.ts'
+import { decodeCommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
 import { createSession, replaceSession, resumeSession } from '../boundary/sessionLifecycle.ts'
 import { nthAssistantResponse } from '../logic/copy.ts'
 import { presentBillingVerification } from '../logic/billingVerification.ts'
 import { performHeapdump } from '../logic/diagnostics.ts'
 import {
+  dashboardTuiMode,
   envFlag,
   heapdumpOnStart,
   launchCwd,
@@ -50,6 +53,7 @@ import {
   STARTUP_IMAGE_DEFAULT_PROMPT
 } from '../logic/env.ts'
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
+import { actionExitBlocked, DASHBOARD_NEW_SESSION_MESSAGE, isExitHotkey, isRedrawHotkey } from '../logic/hotkeys.ts'
 import { parseProcessList } from '../logic/backgroundActivity.ts'
 import { eventMayEnterStore } from '../logic/eventScope.ts'
 import { createPasteStore } from '../logic/pastes.ts'
@@ -208,7 +212,16 @@ const postSessionSetup = (
     const cmdCatalog = yield* gateway
       .request<unknown>('commands.catalog', {})
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-    if (isActive()) seedLearnedNames(catalogCommandItems(cmdCatalog))
+    const decodedCommandCatalog = decodeCommandsCatalogResponse(cmdCatalog)
+    if (isActive() && decodedCommandCatalog) {
+      store.setCommandCatalog(decodedCommandCatalog)
+      seedLearnedNames([
+        ...catalogCommandItems(decodedCommandCatalog),
+        ...clientCommandNames().map(name => ({ text: `/${name}` }))
+      ])
+      const warning = decodedCommandCatalog.warning?.trim()
+      if (warning) store.pushSystem(`command catalog warning: ${warning}`)
+    }
 
     // A session switch may have completed while either best-effort catalog RPC
     // was in flight. Never attach an image, submit a prompt, or publish a cache
@@ -478,7 +491,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // double-press model; the user's preferred behaviour).
       let quitArmed = false
       let quitTimer: ReturnType<typeof setTimeout> | undefined
-      let doQuit = () => {} // assigned once the renderer exists
+      let doQuit = (_code = 0) => {} // assigned once the renderer exists
+      const hostedDashboard = dashboardTuiMode()
       const disarmQuit = () => {
         quitArmed = false
         if (quitTimer) clearTimeout(quitTimer)
@@ -504,18 +518,52 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             )
         )
       }
+      const requestDashboardNewSession = () => {
+        const sid = gateway.sessionId()
+        store.pushSystem(DASHBOARD_NEW_SESSION_MESSAGE)
+        Effect.runFork(
+          gateway
+            .request('dashboard.new_session_requested', {
+              reason: 'idle_exit_hotkey',
+              session_id: sid ?? ''
+            })
+            .pipe(
+              Effect.catchCause(cause =>
+                Effect.sync(() => {
+                  getLog().warn('dashboard', 'new-session request failed', { cause: String(cause) })
+                  store.pushSystem('dashboard new-session request failed — use /new to retry')
+                })
+              )
+            )
+        )
+      }
       const onCtrlC = () => {
-        if (quitArmed) {
-          disarmQuit()
-          doQuit()
-          return
-        }
+        // Busy Ctrl+C ONLY interrupts (Ink parity). It must not leave a sticky
+        // hosted hint that masks subsequent status lines.
         if (store.state.info.running) {
           interruptTurn()
-          armQuit('⏹ stopped — Ctrl+C again to quit')
-        } else {
-          armQuit('Ctrl+C again to quit')
+          if (!hostedDashboard) armQuit('⏹ stopped — Ctrl+C again to quit')
+          return
         }
+        // An idle non-empty composer clears before any exit gesture, matching
+        // Ink's input-first Ctrl+C precedence.
+        if (store.state.composerDraft) {
+          store.clearComposerDraft()
+          disarmQuit()
+          return
+        }
+        // Dashboard PTYs cannot be destroyed and restarted in-page. Publish the
+        // same sidecar-mirrored event as Ink so the browser forges a fresh PTY.
+        if (hostedDashboard) {
+          requestDashboardNewSession()
+          return
+        }
+        if (quitArmed) {
+          disarmQuit()
+          doQuit(0)
+          return
+        }
+        armQuit('Ctrl+C again to quit')
       }
 
       // Transient hint that auto-clears (used by copy/image-paste feedback).
@@ -577,7 +625,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // A blocking prompt owns Ctrl+C (→ cancel); otherwise the state machine above runs.
       const { renderer, shutdown } = yield* acquireRenderer({
         mouse: input.mouse,
-        isBlocked: () => store.state.prompt !== undefined,
+        ignoreSigint: hostedDashboard,
+        isBlocked: () => actionExitBlocked(store.state),
         onCtrlC,
         onCopySelection
       })
@@ -614,9 +663,31 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           getLog().warn('bootstrap', 'heapdump-on-start failed', { cause: String(cause) })
         }
       }
-      doQuit = () => {
+      doQuit = (code = 0) => {
+        process.exitCode = code
         if (!renderer.isDestroyed) renderer.destroy()
       }
+
+      // Global action hotkeys consume their bytes before the textarea can
+      // interpret them. Redraw invalidates buffers without resetting the input
+      // parser; action+D shares Ink's local-exit / hosted-new-chat contract.
+      const onGlobalAction = (key: KeyEvent) => {
+        if (isRedrawHotkey(key)) {
+          key.preventDefault()
+          redrawRenderer(renderer, { clearSelection: true })
+          return
+        }
+        if (!isExitHotkey(key) || actionExitBlocked(store.state)) return
+        key.preventDefault()
+        if (hostedDashboard) requestDashboardNewSession()
+        else doQuit(0)
+      }
+      renderer.keyInput.on('keypress', onGlobalAction)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          renderer.keyInput.off('keypress', onGlobalAction)
+        })
+      )
 
       // Native keymap host (Phase 3): one keymap bound to this renderer, provided
       // to the whole Solid tree via <KeymapProvider>. Overlays/prompts register
@@ -1001,11 +1072,18 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         hasConversation: () =>
           store.state.messages.some(message => message.role === 'user' || message.role === 'assistant'),
         setSessionTitle: title => store.applyInfo({ title }),
-        refreshCommandCatalog: (catalog, removedSkills) =>
+        refreshCommandCatalog: (catalog, removedSkills) => {
+          const decoded = catalog === undefined ? undefined : decodeCommandsCatalogResponse(catalog)
+          store.setCommandCatalog(decoded)
           refreshLearnedNames(
-            [...catalogCommandItems(catalog), ...clientCommandNames().map(name => ({ text: `/${name}` }))],
+            [...catalogCommandItems(decoded), ...clientCommandNames().map(name => ({ text: `/${name}` }))],
             removedSkills
-          ),
+          )
+        },
+        commandCatalog: () => store.state.commandCatalog,
+        historyItems: () => store.state.messages,
+        helpHeader: () => store.state.theme.brand.helpHeader,
+        dashboardMode: () => hostedDashboard,
         compact: () => store.state.compact,
         setCompact: on => store.setCompact(on),
         details: () => store.state.details,
@@ -1034,10 +1112,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         },
         modelItems: () => store.state.modelItems,
         setModelItems: items => store.setModelItems(items),
-        logTail: () =>
-          getLog()
-            .tail(200)
-            .map(e => `${e.scope}: ${e.msg}`),
+        logTail: limit => gateway.logTail(limit),
         openDashboard: () => store.openDashboard(),
         openBackgroundPanel: () => store.openBackgroundPanel(),
         openBilling: overlay => store.openBilling(overlay),
@@ -1047,9 +1122,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         openSessionPicker: tab => store.openSessionPicker(tab),
         resumeSession: onResume,
         pushSystem: text => store.pushSystem(text),
-        quit: () => {
-          if (!renderer.isDestroyed) renderer.destroy()
-        },
+        quit: code => doQuit(code),
+        // Ink keeps a mouse selection for `/redraw`; only action+L explicitly
+        // clears it (the global hotkey path above passes clearSelection:true).
+        redraw: () => redrawRenderer(renderer),
         request: (method, params) => Effect.runPromise(gateway.request(method, params)),
         sessionId: () => gateway.sessionId(),
         submit: submitPrompt,

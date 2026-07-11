@@ -1,7 +1,9 @@
 # ui-opentui — native OpenTUI engine for Hermes
 
-Solid + `@opentui/core` over Node FFI. Ink (`ui-tui/`) is the shipping default;
-this is the experimental engine (draft PR #42922).
+Solid + `@opentui/core@0.4.1` over Node FFI, with Effect 4 only at transport and
+resource boundaries. Ink (`ui-tui/`) remains the fallback while the canonical
+f7c9 parity ledger is closed; current status and release blockers live in
+`../docs/opentui-parity-matrix.md`.
 
 ## Node 26 setup (required; will not touch your other projects)
 
@@ -48,6 +50,25 @@ node scripts/build.mjs
 HERMES_TUI_MOUSE=1 node --experimental-ffi --no-warnings dist/main.js
 ```
 
-Gates: `npm run check` (typecheck + lint + tests). Memory/perf benchmarks live
-in the **tui-bench** repo (`github.com/NousResearch/tui-bench`; see its README). Transcript windowing (memory architecture) is
-documented in `../docs/plans/opentui-transcript-windowing.md`.
+Gates: `npm run check` (Prettier + typecheck + lint + 1,003 tests at the f7c9
+local-UX milestone), then `npm run build` and `bash scripts/acceptance.sh` for
+real Python-gateway and tmux/native smoke. Memory/perf benchmarks live in the
+**tui-bench** repo (`github.com/NousResearch/tui-bench`; see its README).
+Transcript windowing is documented in
+`../docs/plans/opentui-transcript-windowing.md`.
+
+## Local UX contracts
+
+- `/help`, `/quit`/`/exit`, `/update`, `/redraw`, `/history`, `/fortune`, and
+  `/logs` run in the client from live state rather than a detached slash worker.
+  The parity matrix records the deliberate `/history` safety divergence below.
+- `/history` retains Ink's latest-800-row view, clips each preview to
+  80–4,000 characters (400 default), and caps the native pager source at
+  512 Ki UTF-16 code units with explicit truncation notices. The pager is one
+  native text renderable, not one handle tree per line.
+- `/logs [n]` reads a bounded gateway-transport ring with lifecycle, stderr,
+  protocol, and RPC error/timeout/write diagnostics; oversized lines carry a
+  truncation marker.
+- Hosted dashboard mode is internal launcher plumbing
+  (`HERMES_TUI_DASHBOARD=1`): exits/updates are refused and idle Ctrl+C or
+  action+D requests a fresh browser chat through the existing event sidecar.

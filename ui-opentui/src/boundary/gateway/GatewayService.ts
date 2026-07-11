@@ -22,6 +22,8 @@ export interface GatewayServiceShape {
   readonly request: <A>(method: string, params: unknown) => Effect.Effect<A, GatewayError>
   /** The active session id (for `approval.respond {session_id}`); undefined before a session exists. */
   readonly sessionId: () => string | undefined
+  /** Bounded low-level transport diagnostics used by the local `/logs` pager. */
+  readonly logTail: (limit: number) => string[]
 }
 
 export class GatewayService extends Context.Service<GatewayService, GatewayServiceShape>()(

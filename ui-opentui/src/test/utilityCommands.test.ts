@@ -69,6 +69,10 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     hasConversation: () => true,
     setSessionTitle: () => {},
     refreshCommandCatalog: () => {},
+    commandCatalog: () => undefined,
+    historyItems: () => [],
+    helpHeader: () => 'Commands',
+    dashboardMode: () => false,
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,
@@ -93,6 +97,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     resumeSession: () => {},
     pushSystem: text => system.push(text),
     quit: () => {},
+    redraw: () => {},
     request: (method, params) => {
       calls.push({ method, params })
       return request(method, params)

@@ -2,7 +2,7 @@
  * Slash dispatch test (spec §5 Layer 3/4). Pure logic: parse + the dispatch
  * ladder (client → slash.exec → command.dispatch) against a fake SlashContext.
  */
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import type { DetailsMode } from '../logic/details.ts'
 import {
@@ -11,7 +11,13 @@ import {
   clientCommandNames,
   catalogCommandItems,
   createCompletionGate,
+  DASHBOARD_EXIT_DISABLED_MESSAGE,
+  DASHBOARD_UPDATE_DISABLED_MESSAGE,
   dispatchSlash,
+  formatHistory,
+  HISTORY_MAX_MESSAGES,
+  HISTORY_MAX_PAGER_CHARS,
+  HISTORY_MAX_PREVIEW,
   mapCompletions,
   parseSlash,
   pickerTabs,
@@ -24,11 +30,12 @@ import {
   type SlashContext
 } from '../logic/slash.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
-import type { ConfirmRequest, PickerItem } from '../logic/store.ts'
+import type { ConfirmRequest, Message, PickerItem } from '../logic/store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
 
 // the picker-refresh/tabs/prefetch seams are module-level state — never leak them across tests
 afterEach(() => {
+  vi.useRealTimers()
   registerPickerRefresh(undefined)
   registerPickerTabs(undefined)
   registerModelPrefetch(undefined)
@@ -260,6 +267,14 @@ describe('parseSlash', () => {
   test('splits name + arg; rejects non-slash / empty', () => {
     expect(parseSlash('/help')).toEqual({ name: 'help', arg: '' })
     expect(parseSlash('/model anthropic/claude')).toEqual({ name: 'model', arg: 'anthropic/claude' })
+    expect(parseSlash('/HELP')).toEqual({ name: 'help', arg: '' })
+    expect(parseSlash('/model   anthropic/claude\tfast')).toEqual({
+      name: 'model',
+      arg: 'anthropic/claude fast'
+    })
+    // Ink does not silently reinterpret whitespace immediately after `/` as a
+    // local command name; preserve that distinction for the server fallback.
+    expect(parseSlash('/ help')).toEqual({ name: '', arg: 'help' })
     expect(parseSlash('hello')).toBeNull()
     expect(parseSlash('/')).toBeNull()
   })
@@ -279,6 +294,13 @@ interface Probe {
   pickers: Array<{ title: string; items: PickerItem[]; onPick: (value: string) => void }>
   billed: BillingOverlayState[]
   quit: { value: boolean }
+  exitCodes: Array<number | undefined>
+  redraws: { value: number }
+  dashboardMode: { value: boolean }
+  history: { value: Message[] }
+  cachedCatalog: { value: ReturnType<SlashContext['commandCatalog']> }
+  logLines: { value: string[] }
+  logLimits: number[]
   newSessions: Array<[string | undefined, string | undefined]>
   toolsResets: Array<{ readonly [key: string]: unknown }>
   toolsConfiguring: { begins: number; ends: number; value: boolean }
@@ -313,6 +335,13 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const pickers: Probe['pickers'] = []
   const billed: Probe['billed'] = []
   const quit = { value: false }
+  const exitCodes: Array<number | undefined> = []
+  const redraws = { value: 0 }
+  const dashboardMode = { value: false }
+  const history = { value: [] as Message[] }
+  const cachedCatalog: Probe['cachedCatalog'] = { value: undefined }
+  const logLines = { value: ['gateway: spawned', 'bootstrap: session created'] }
+  const logLimits: number[] = []
   const newSessions: Probe['newSessions'] = []
   const toolsResets: Probe['toolsResets'] = []
   const toolsConfiguring: Probe['toolsConfiguring'] = { begins: 0, ends: 0, value: false }
@@ -343,7 +372,16 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     resetAfterToolsConfigure: info => toolsResets.push(info),
     hasConversation: () => hasConversation.value,
     setSessionTitle: title => (sessionTitle.value = title),
-    refreshCommandCatalog: (catalog, removedSkills) => commandCatalogs.push({ catalog, removedSkills }),
+    refreshCommandCatalog: (catalog, removedSkills) => {
+      commandCatalogs.push({ catalog, removedSkills })
+      if (catalog && typeof catalog === 'object' && 'pairs' in catalog) {
+        cachedCatalog.value = catalog as NonNullable<Probe['cachedCatalog']['value']>
+      } else cachedCatalog.value = undefined
+    },
+    commandCatalog: () => cachedCatalog.value,
+    historyItems: () => history.value,
+    helpHeader: () => '(^_^)? Commands',
+    dashboardMode: () => dashboardMode.value,
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,
@@ -358,7 +396,10 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       copied.push(n)
       return copyN.value(n)
     },
-    logTail: () => ['gateway: spawned', 'bootstrap: session created'],
+    logTail: limit => {
+      logLimits.push(limit)
+      return logLines.value.slice(-limit)
+    },
     modelItems: () => modelCache.value,
     setModelItems: items => (modelCache.value = items),
     openDashboard: () => (dashboard.value = true),
@@ -370,7 +411,13 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     openSessionPicker: tab => sessionPickers.push(tab),
     resumeSession: id => resumed.push(id),
     pushSystem: text => system.push(text),
-    quit: () => (quit.value = true),
+    quit: code => {
+      quit.value = true
+      exitCodes.push(code)
+    },
+    redraw: () => {
+      redraws.value += 1
+    },
     request: (method, params) => {
       calls.push({ method, params })
       return request(method, params)
@@ -402,7 +449,14 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     paged,
     pickers,
     billed,
+    cachedCatalog,
+    dashboardMode,
+    exitCodes,
+    history,
+    logLines,
+    logLimits,
     quit,
+    redraws,
     resumed,
     skillSubmitted,
     sessionPickers,
@@ -412,10 +466,56 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
 }
 
 describe('dispatchSlash — client commands', () => {
-  test('/quit quits without hitting the gateway', async () => {
+  test('/quit and /exit request a cleanup-safe zero exit without hitting the gateway', async () => {
     const p = makeCtx(async () => ({}))
     await dispatchSlash('/quit', p.ctx)
     expect(p.quit.value).toBe(true)
+    expect(p.exitCodes).toEqual([0])
+    expect(p.calls).toHaveLength(0)
+
+    const exit = makeCtx(async () => ({}))
+    await dispatchSlash('/EXIT --delete', exit.ctx)
+    expect(exit.exitCodes).toEqual([0])
+    expect(exit.calls).toHaveLength(0)
+  })
+
+  test('/quit and /exit refuse to destroy a hosted dashboard PTY', async () => {
+    for (const command of ['/quit', '/exit']) {
+      const p = makeCtx(async () => ({}))
+      p.dashboardMode.value = true
+      await dispatchSlash(command, p.ctx)
+      expect(p.exitCodes).toEqual([])
+      expect(p.system).toEqual([DASHBOARD_EXIT_DISABLED_MESSAGE])
+      expect(p.calls).toHaveLength(0)
+    }
+  })
+
+  test('/update paints a notice, then exits 42 after 100ms; hosted mode refuses', async () => {
+    vi.useFakeTimers()
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/update ignored', p.ctx)
+    expect(p.system).toEqual(['exiting TUI to run update...'])
+    expect(p.exitCodes).toEqual([])
+    expect(vi.getTimerCount()).toBe(1)
+    vi.advanceTimersByTime(99)
+    expect(p.exitCodes).toEqual([])
+    vi.advanceTimersByTime(1)
+    expect(p.exitCodes).toEqual([42])
+    expect(p.calls).toHaveLength(0)
+
+    const hosted = makeCtx(async () => ({}))
+    hosted.dashboardMode.value = true
+    await dispatchSlash('/update', hosted.ctx)
+    expect(hosted.system).toEqual([DASHBOARD_UPDATE_DISABLED_MESSAGE])
+    expect(hosted.exitCodes).toEqual([])
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('/redraw uses the renderer-native repaint capability and reports success', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/redraw', p.ctx)
+    expect(p.redraws.value).toBe(1)
+    expect(p.system).toEqual(['ui redrawn'])
     expect(p.calls).toHaveLength(0)
   })
 
@@ -751,13 +851,217 @@ describe('dispatchSlash — client commands', () => {
     expect(p.pickers[0]!.items.map(i => i.value).sort()).toEqual(['ffmpeg', 'firecrawl', 'whisper'])
   })
 
-  test('/help renders the gateway catalog', async () => {
-    const p = makeCtx(async method =>
-      method === 'commands.catalog' ? { pairs: [['/model', 'switch model']], canon: {} } : {}
-    )
+  test('/help renders the cached categorized catalog, skill count, TUI rows, and hotkeys', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('cached help must not refetch')
+    })
+    p.cachedCatalog.value = {
+      canon: { '/m': '/model' },
+      categories: [{ name: 'Session', pairs: [['/model', 'switch model']] }],
+      pairs: [['/model', 'switch model']],
+      skill_count: 3,
+      warning: 'skill discovery unavailable: fixture failure'
+    }
     await dispatchSlash('/help', p.ctx)
-    expect(p.calls[0]?.method).toBe('commands.catalog')
-    expect(p.system.join('\n')).toContain('/model — switch model')
+    expect(p.calls).toHaveLength(0)
+    expect(p.paged).toHaveLength(1)
+    expect(p.paged[0]?.title).toBe('(^_^)? Commands')
+    expect(p.paged[0]?.text).toContain('Session\n  /model  switch model')
+    expect(p.paged[0]?.text).toContain('3 skill commands available — /skills to browse')
+    expect(p.paged[0]?.text).toContain('Warning\n  skill discovery unavailable: fixture failure')
+    expect(p.paged[0]?.text).toContain('/fortune [random|daily]')
+    expect(p.paged[0]?.text.match(/\/fortune/g)).toHaveLength(1)
+    expect(p.paged[0]?.text).toContain('Hotkeys')
+    expect(p.paged[0]?.text).toContain('Ctrl+L')
+  })
+
+  test('/help hydrates once when the cache is absent and falls back locally on malformed/error', async () => {
+    const p = makeCtx(async method =>
+      method === 'commands.catalog'
+        ? {
+            categories: [{ name: 'Info', pairs: [['/status', 'show status']] }],
+            pairs: [['/status', 'show status']]
+          }
+        : {}
+    )
+    await dispatchSlash('/HELP', p.ctx)
+    expect(p.calls.map(call => call.method)).toEqual(['commands.catalog'])
+    expect(p.commandCatalogs).toHaveLength(1)
+    expect(p.paged[0]?.text).toContain('Info\n  /status  show status')
+
+    for (const request of [
+      async () => ({ pairs: [['/bad', 1]] }),
+      async () => {
+        throw new Error('offline')
+      }
+    ]) {
+      const fallback = makeCtx(request)
+      await dispatchSlash('/help', fallback.ctx)
+      expect(fallback.paged[0]?.text).toContain('TUI')
+      expect(fallback.paged[0]?.text).toContain('Hotkeys')
+    }
+  })
+
+  test('/help drops a late catalog after a newer same-session slash command', async () => {
+    let resolveCatalog!: (value: unknown) => void
+    const pending = new Promise<unknown>(resolve => (resolveCatalog = resolve))
+    const p = makeCtx(async method => (method === 'commands.catalog' ? pending : {}))
+    const help = dispatchSlash('/help', p.ctx)
+    await dispatchSlash('/fortune invalid', p.ctx)
+    resolveCatalog({ categories: [], pairs: [['/late', 'stale']] })
+    await help
+    expect(p.paged).toEqual([])
+    expect(p.commandCatalogs).toEqual([])
+    expect(p.system).toEqual(['usage: /fortune [random|daily]'])
+  })
+
+  test('/history renders the live committed user/assistant transcript with Ink labels and tool fallback', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('local history must not RPC')
+    })
+    p.history.value = [
+      { role: 'system', text: 'hidden system row' },
+      { role: 'user', text: 'question' },
+      {
+        role: 'assistant',
+        text: '',
+        parts: [{ id: 'answer-1', text: 'answer from ordered parts', type: 'text' }]
+      },
+      {
+        role: 'assistant',
+        text: '',
+        parts: [{ id: 'tool-1', name: 'terminal', state: 'complete', type: 'tool' }]
+      },
+      { role: 'assistant', text: 'still streaming', streaming: true },
+      { role: 'notification', text: 'hidden notification' }
+    ]
+    await dispatchSlash('/history', p.ctx)
+    expect(p.calls).toHaveLength(0)
+    expect(p.paged).toEqual([
+      {
+        title: 'History',
+        text: '[You #1]\nquestion\n\n[Hermes #2]\nanswer from ordered parts\n\n[Hermes #3]\n(1 tool calls)'
+      }
+    ])
+  })
+
+  test('/history applies the 400 default / 80 minimum preview and handles empty state', async () => {
+    const long = 'x'.repeat(500)
+    const defaults = makeCtx(async () => ({}))
+    defaults.history.value = [{ role: 'assistant', text: long }]
+    await dispatchSlash('/history', defaults.ctx)
+    expect(defaults.paged[0]?.text).toBe(`[Hermes #1]\n${'x'.repeat(400)}…`)
+
+    const minimum = makeCtx(async () => ({}))
+    minimum.history.value = [{ role: 'assistant', text: long }]
+    await dispatchSlash('/history 1', minimum.ctx)
+    expect(minimum.paged[0]?.text).toBe(`[Hermes #1]\n${'x'.repeat(80)}…`)
+
+    const empty = makeCtx(async () => ({}))
+    empty.history.value = [{ role: 'system', text: 'only system' }]
+    await dispatchSlash('/history', empty.ctx)
+    expect(empty.system).toEqual(['no conversation yet'])
+    expect(empty.paged).toHaveLength(0)
+  })
+
+  test("/history applies Ink's 800-row cap and explicitly reports omitted older messages", () => {
+    const messages: Message[] = Array.from({ length: HISTORY_MAX_MESSAGES + 5 }, (_, index) => ({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      text: `message-${index}`
+    }))
+    const text = formatHistory(messages, '')
+    expect(text).toContain(
+      `[history truncated: showing latest ${HISTORY_MAX_MESSAGES} of ${HISTORY_MAX_MESSAGES + 5} messages]`
+    )
+    expect(text).not.toContain('message-0\n')
+    expect(text).toContain(`message-${HISTORY_MAX_MESSAGES + 4}`)
+  })
+
+  test('/history bounds ordered-part extraction before joining and explains a clamped preview', () => {
+    const text = formatHistory(
+      [
+        {
+          role: 'assistant',
+          text: '',
+          parts: [
+            { id: 'lead', text: `  ${'a'.repeat(HISTORY_MAX_PREVIEW)}`, type: 'text' },
+            { id: 'reasoning', text: 'private'.repeat(100_000), type: 'reasoning' },
+            { id: 'tail', text: 'b'.repeat(1_000_000), type: 'text' }
+          ]
+        }
+      ],
+      '999999999'
+    )
+    expect(text).toContain(`[preview limited to ${HISTORY_MAX_PREVIEW} characters per message]`)
+    expect(text).toContain(`${'a'.repeat(HISTORY_MAX_PREVIEW)}…`)
+    expect(text).not.toContain('bbbb')
+    expect(text?.length).toBeLessThan(HISTORY_MAX_PREVIEW + 200)
+
+    // Whitespace-only overflow is trimmed, not presented as lost content.
+    expect(formatHistory([{ role: 'assistant', text: `ok${' '.repeat(10_000)}` }], '80')).toBe('[Hermes #1]\nok')
+    // Never hand OpenTUI a lone surrogate when the preview boundary bisects an emoji.
+    expect(formatHistory([{ role: 'assistant', text: `${'a'.repeat(79)}🔮tail` }], '80')).toBe(
+      `[Hermes #1]\n${'a'.repeat(79)}…`
+    )
+  })
+
+  test('/history keeps the native pager buffer under 512 Ki chars and gives newest rows priority', () => {
+    const messages: Message[] = Array.from({ length: HISTORY_MAX_MESSAGES }, (_, index) => ({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      text: `message-${index}:${'x'.repeat(HISTORY_MAX_PREVIEW)}`
+    }))
+    const text = formatHistory(messages, String(HISTORY_MAX_PREVIEW))
+    expect(text?.length).toBeLessThanOrEqual(HISTORY_MAX_PAGER_CHARS)
+    expect(text).toContain(`[pager limit: showing latest `)
+    expect(text).toContain(
+      `of ${HISTORY_MAX_MESSAGES} retained messages (${HISTORY_MAX_PAGER_CHARS} characters maximum)]`
+    )
+    expect(text).not.toContain('message-0:')
+    expect(text).toContain(`message-${HISTORY_MAX_MESSAGES - 1}:`)
+  })
+
+  test('/logs honors the default/count clamp and empty gateway-log copy', async () => {
+    const defaultCount = makeCtx(async () => ({}))
+    defaultCount.logLines.value = Array.from({ length: 30 }, (_, index) => `line-${index + 1}`)
+    await dispatchSlash('/logs', defaultCount.ctx)
+    expect(defaultCount.logLimits).toEqual([20])
+    expect(defaultCount.paged[0]?.text.split('\n')).toHaveLength(20)
+    expect(defaultCount.paged[0]?.text).toContain('line-30')
+
+    const capped = makeCtx(async () => ({}))
+    capped.logLines.value = Array.from({ length: 100 }, (_, index) => `line-${index + 1}`)
+    await dispatchSlash('/logs 999', capped.ctx)
+    expect(capped.logLimits).toEqual([80])
+    expect(capped.paged[0]?.text.split('\n')).toHaveLength(80)
+
+    const negative = makeCtx(async () => ({}))
+    await dispatchSlash('/logs -9', negative.ctx)
+    expect(negative.logLimits).toEqual([1])
+
+    const zero = makeCtx(async () => ({}))
+    await dispatchSlash('/logs 0', zero.ctx)
+    expect(zero.logLimits).toEqual([20])
+
+    const empty = makeCtx(async () => ({}))
+    empty.logLines.value = []
+    await dispatchSlash('/logs', empty.ctx)
+    expect(empty.system).toEqual(['no gateway logs'])
+    expect(empty.paged).toHaveLength(0)
+  })
+
+  test('/fortune is entirely local and accepts Ink daily synonyms', async () => {
+    for (const command of ['/fortune', '/fortune random', '/fortune daily', '/fortune stable', '/fortune today']) {
+      const p = makeCtx(async () => {
+        throw new Error('fortune must not RPC')
+      })
+      await dispatchSlash(command, p.ctx)
+      expect(p.system[0]).toMatch(/^(?:🔮|🌟) /u)
+      expect(p.calls).toHaveLength(0)
+    }
+
+    const invalid = makeCtx(async () => ({}))
+    await dispatchSlash('/fortune tomorrow', invalid.ctx)
+    expect(invalid.system).toEqual(['usage: /fortune [random|daily]'])
   })
 
   test('/billing fetches billing.state and opens the overlay on overview', async () => {
@@ -885,6 +1189,14 @@ describe('dispatchSlash — client commands', () => {
     for (const name of ['status', 'title', 'save', 'reload', 'reload-skills', 'reload_skills']) {
       expect(names).toContain(name)
     }
+  })
+
+  test('registers every local UX command (with exit as the only quit alias)', () => {
+    const names = clientCommandNames()
+    for (const name of ['help', 'quit', 'exit', 'update', 'redraw', 'history', 'fortune', 'logs']) {
+      expect(names).toContain(name)
+    }
+    expect(names).not.toContain('q')
   })
 
   test('/status reads the authoritative live session and always opens the status pager', async () => {
@@ -1089,6 +1401,43 @@ describe('dispatchSlash — client commands', () => {
     expect(badCatalog.paged).toEqual([{ title: 'Reload Skills', text: 'skills reloaded' }])
     expect(badCatalog.commandCatalogs).toEqual([{ catalog: undefined, removedSkills: ['removed-skill'] }])
     expect(badCatalog.system).toEqual(['warning: skills reloaded, but the command catalog response was invalid'])
+  })
+
+  test('/reload-skills clears stale help on refresh failure, then /help retries the catalog', async () => {
+    let catalogAttempt = 0
+    const fresh = { categories: [{ name: 'Info', pairs: [['/fresh', 'Fresh']] }], pairs: [['/fresh', 'Fresh']] }
+    const p = makeCtx(async method => {
+      if (method === 'skills.reload') {
+        return { output: 'skills reloaded', result: { added: [], removed: [{ name: 'old' }], total: 0 } }
+      }
+      if (method === 'commands.catalog') {
+        catalogAttempt += 1
+        if (catalogAttempt === 1) throw new Error('temporary discovery failure')
+        return fresh
+      }
+      return {}
+    })
+    p.cachedCatalog.value = { categories: [], pairs: [['/old', 'Stale']] }
+
+    await dispatchSlash('/reload-skills', p.ctx)
+    expect(p.cachedCatalog.value).toBeUndefined()
+    await dispatchSlash('/help', p.ctx)
+
+    expect(catalogAttempt).toBe(2)
+    expect(p.paged.at(-1)?.text).toContain('/fresh  Fresh')
+    expect(p.paged.at(-1)?.text).not.toContain('/old')
+  })
+
+  test('/reload-skills surfaces a valid but incomplete catalog warning', async () => {
+    const p = makeCtx(async method =>
+      method === 'skills.reload'
+        ? { output: 'skills reloaded', result: { added: [], removed: [], total: 0 } }
+        : { pairs: [], warning: 'skill discovery unavailable: permission denied' }
+    )
+
+    await dispatchSlash('/reload-skills', p.ctx)
+
+    expect(p.system).toEqual(['command catalog warning: skill discovery unavailable: permission denied'])
   })
 })
 
