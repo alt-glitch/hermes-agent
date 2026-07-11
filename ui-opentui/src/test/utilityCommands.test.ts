@@ -18,6 +18,7 @@ import {
   type DetailsMode
 } from '../logic/details.ts'
 import { formatBytes, heapSnapshotPath, memReport } from '../logic/diagnostics.ts'
+import type { BusyInputMode } from '../logic/busyQueue.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from '../logic/replay.ts'
 import { clientCommandNames, dispatchSlash, type SlashContext } from '../logic/slash.ts'
 import type { Part } from '../logic/store.ts'
@@ -59,6 +60,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
   const timestampsFlag = { value: false }
   const reasoningFullFlag = { value: false }
+  const busyMode: { value: BusyInputMode } = { value: 'queue' }
+  const queue: string[] = []
   const renderables: Probe['renderables'] = { value: undefined }
   const ctx: SlashContext = {
     guardBusySessionSwitch: () => false,
@@ -81,6 +84,23 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     setTimestamps: on => (timestampsFlag.value = on),
     reasoningFull: () => reasoningFullFlag.value,
     setReasoningFull: on => (reasoningFullFlag.value = on),
+    isBusy: () => false,
+    isSessionTransitioning: () => false,
+    beginHistoryMutation: () => true,
+    endHistoryMutation: () => {},
+    busyInputMode: () => busyMode.value,
+    setBusyInputMode: mode => (busyMode.value = mode),
+    queueCount: () => queue.length,
+    enqueueQueued: (text, front = false) => {
+      if (front) queue.unshift(text)
+      else queue.push(text)
+      return true
+    },
+    clearQueued: () => queue.splice(0).length,
+    steer: async () => 'queued',
+    lastUserMessage: () => undefined,
+    trimLastExchange: () => 0,
+    prefillComposer: () => {},
     renderableCount: () => renderables.value,
     confirm: () => {},
     copyResponse: () => false,
@@ -103,6 +123,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       return request(method, params)
     },
     sessionId: () => 'sid-1',
+    sessionOwnerId: () => 'sid-1',
     submit: () => {},
     submitSkill: () => {}
   }

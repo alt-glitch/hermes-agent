@@ -210,6 +210,57 @@ describe('resumeSession', () => {
     })
   })
 
+  it.effect('preserves the latest draft typed while an ordinary resume RPC is in flight', () => {
+    const store = createSessionStore()
+    store.setSessionId('old-live')
+    const service: GatewayServiceShape = {
+      request: <A>() =>
+        Effect.sync(() => {
+          store.setComposerDraft('typed after resume started')
+          return { messages: [], resumed: 'target-key', session_id: 'new-live' } as A
+        }),
+      sessionId: () => 'old-live',
+      logTail: () => [],
+      subscribe: () => Effect.succeed(() => {})
+    }
+    return Effect.gen(function* () {
+      yield* resumeSession(service, store, {
+        cols: 80,
+        preserveLocalInput: 'draft',
+        targetSessionId: 'target-key'
+      })
+      assert.strictEqual(store.state.composerDraft, 'typed after resume started')
+      assert.strictEqual(store.state.sessionId, 'new-live')
+    })
+  })
+
+  it.effect('same-session recovery snapshots the latest queue/edit/draft at commit time', () => {
+    const store = createSessionStore()
+    store.setSessionId('dead-live')
+    const service: GatewayServiceShape = {
+      request: <A>() =>
+        Effect.sync(() => {
+          store.enqueuePrompt('queued during recovery')
+          store.setQueueEditIndex(0)
+          store.setComposerDraft('edited after recovery started')
+          return { messages: [], resumed: 'durable-key', session_id: 'replacement-live' } as A
+        }),
+      sessionId: () => 'dead-live',
+      logTail: () => [],
+      subscribe: () => Effect.succeed(() => {})
+    }
+    return Effect.gen(function* () {
+      yield* resumeSession(service, store, {
+        cols: 80,
+        preserveLocalInput: 'same-session',
+        targetSessionId: 'durable-key'
+      })
+      assert.deepStrictEqual(store.state.queuedPrompts, ['queued during recovery'])
+      assert.strictEqual(store.state.queueEditIndex, 0)
+      assert.strictEqual(store.state.composerDraft, 'edited after recovery started')
+    })
+  })
+
   it.effect('failed resume aborts the buffer and preserves the prior live session', () => {
     const store = createSessionStore()
     store.setSessionId('old-live')

@@ -15,6 +15,7 @@
 import { describe, expect, test, vi } from 'vitest'
 
 import { createSessionStore } from '../logic/store.ts'
+import { BUSY_QUEUE_MAX_CHARS, BUSY_QUEUE_MAX_ITEMS } from '../logic/busyQueue.ts'
 
 describe('busy queue — FIFO enqueue/dequeue', () => {
   test('dequeue returns enqueued prompts in FIFO order, then undefined', () => {
@@ -49,6 +50,34 @@ describe('busy queue — FIFO enqueue/dequeue', () => {
     store.dequeuePrompt()
     expect(store.queuedCount()).toBe(1)
   })
+
+  test('front insertion, edit-safe remove, and replacement preserve order', () => {
+    const store = createSessionStore()
+    expect(store.enqueuePrompt('b')).toBe(true)
+    expect(store.enqueuePrompt('c')).toBe(true)
+    store.setQueueEditIndex(1)
+    expect(store.enqueuePrompt('a', true)).toBe(true)
+    expect(store.state.queuedPrompts).toEqual(['a', 'b', 'c'])
+    expect(store.state.queueEditIndex).toBe(2)
+    expect(store.replaceQueuedPrompt(2, 'C')).toBe(true)
+    expect(store.removeQueuedPrompt(1)).toBe('b')
+    expect(store.state.queuedPrompts).toEqual(['a', 'C'])
+    expect(store.state.queueEditIndex).toBe(1)
+    expect(store.removeQueuedPrompt(1)).toBe('C')
+    expect(store.state.queueEditIndex).toBeUndefined()
+  })
+
+  test('explicit count/character ceilings reject without mutating the queue', () => {
+    const byCount = createSessionStore()
+    for (let i = 0; i < BUSY_QUEUE_MAX_ITEMS; i++) expect(byCount.enqueuePrompt(`q${i}`)).toBe(true)
+    expect(byCount.enqueuePrompt('overflow')).toBe(false)
+    expect(byCount.queuedCount()).toBe(BUSY_QUEUE_MAX_ITEMS)
+
+    const byChars = createSessionStore()
+    expect(byChars.enqueuePrompt('x'.repeat(BUSY_QUEUE_MAX_CHARS))).toBe(true)
+    expect(byChars.enqueuePrompt('overflow')).toBe(false)
+    expect(byChars.state.queuedPrompts).toEqual(['x'.repeat(BUSY_QUEUE_MAX_CHARS)])
+  })
 })
 
 describe('busy queue — clearQueue', () => {
@@ -62,6 +91,7 @@ describe('busy queue — clearQueue', () => {
     expect(store.queuedCount()).toBe(0)
     expect(store.state.queuedPrompts).toEqual([])
     expect(store.dequeuePrompt()).toBeUndefined()
+    expect(store.state.queueEditIndex).toBeUndefined()
   })
 
   test('/clear (clearTranscript) drops queued prompts — no cross-session bleed', () => {

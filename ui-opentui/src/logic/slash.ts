@@ -20,11 +20,14 @@ import type { CompletionItem, ConfirmRequest, PickerItem, PickerState } from './
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
 import {
   type CommandsCatalogResponse,
+  type SessionUndoResponse,
+  decodeConfigValueResponse,
   decodeCommandsCatalogResponse,
   decodeReloadEnvResponse,
   decodeSessionSaveResponse,
   decodeSessionStatusResponse,
   decodeSessionTitleResponse,
+  decodeSessionUndoResponse,
   decodeSkillsReloadResponse
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { decodeToolsConfigureResponse } from '../boundary/schema/ToolsConfigureResponse.ts'
@@ -32,6 +35,7 @@ import { buildBillingCtx } from './billing.ts'
 import { dailyFortune, randomFortune } from './fortunes.ts'
 import { formatHelp } from './help.ts'
 import type { Message } from './store.ts'
+import { normalizeBusyInputMode, type BusyInputMode } from './busyQueue.ts'
 
 export interface ParsedSlash {
   name: string
@@ -66,20 +70,22 @@ export interface SlashContext {
   /** Server RPC (resolves with the result, rejects on GatewayError). */
   readonly request: (method: string, params: Record<string, unknown>) => Promise<unknown>
   readonly sessionId: () => string | undefined
+  /** Stable durable conversation id (unlike the gateway's ephemeral live SID). */
+  readonly sessionOwnerId: () => string | undefined
   readonly pushSystem: (text: string) => void
   /** Open the full-screen pager (long output: /status, /logs, …). */
   readonly openPager: (title: string, text: string) => void
   /** Submit a user turn (skill/send dispatch results). */
-  readonly submit: (text: string) => void
+  readonly submit: (text: string) => boolean | void
   /** Submit a SKILL invocation: the full body goes to the model, but the
    *  transcript renders a COLLAPSED `▶ /name · N lines` row instead of dumping
    *  the whole skill body. `command` is the slash invocation as typed (incl.
    *  args). (glitch 2026-06-23) */
-  readonly submitSkill: (command: string, body: string) => void
+  readonly submitSkill: (command: string, body: string) => boolean | void
   /** Open a local Y/N confirm; `onConfirm` runs on Yes. */
   readonly confirm: (request: ConfirmRequest, onConfirm: () => void) => void
   /** Refuse a session-destructive mutation while a turn/transition is active. */
-  readonly guardBusySessionSwitch: (what?: string) => boolean
+  readonly guardBusySessionSwitch: (what?: string, requestedOwner?: string) => boolean
   /** Close the current live session and create/adopt a replacement. */
   readonly newSession: (message?: string, title?: string) => void
   /** Adopt the same-SID agent reset returned by `tools.configure`, then refresh
@@ -143,6 +149,28 @@ export interface SlashContext {
   /** Read / set the expand-all-thinking display flag (/reasoning full|clamp). */
   readonly reasoningFull: () => boolean
   readonly setReasoningFull: (on: boolean) => void
+  /** Live busy-input policy + client queue controls. */
+  readonly isBusy: () => boolean
+  readonly isSessionTransitioning: () => boolean
+  /** Serialize history-mutating `/undo` and `/retry` independently of the
+   * global reply-flight fence (a later `/status` must not suppress mutation
+   * reconciliation). */
+  readonly beginHistoryMutation: () => boolean
+  readonly endHistoryMutation: () => void
+  readonly busyInputMode: () => BusyInputMode
+  readonly setBusyInputMode: (mode: BusyInputMode) => void
+  readonly queueCount: () => number
+  readonly enqueueQueued: (text: string, front?: boolean) => boolean
+  readonly clearQueued: () => number
+  /** Shared bounded, best-effort session.steer control plane. */
+  readonly steer: (
+    sessionId: string,
+    text: string
+  ) => Promise<'fallback' | 'queued' | 'retained' | 'saturated' | 'uncertain'>
+  /** Conversation rewind/retry + generic dispatch-prefill capabilities. */
+  readonly lastUserMessage: () => string | undefined
+  readonly trimLastExchange: () => number
+  readonly prefillComposer: (text: string) => void
   /** Mounted-renderable count under the live renderer root (a /mem diagnostic);
    *  undefined when no renderer is reachable (tests). */
   readonly renderableCount: () => number | undefined
@@ -538,17 +566,42 @@ export function pickerTabs(items: readonly PickerItem[]): string[] {
  * prefetch only delays the picker by the bound — `/model` then opens via its
  * own fetch as before.
  */
-let modelPrefetch: { promise: Promise<unknown>; waitMs: number } | undefined
+let modelPrefetch: { promise: Promise<unknown>; sessionId: string; waitMs: number } | undefined
 
-/** Register (or clear, with `undefined`) the in-flight bootstrap prefetch. */
-export function registerModelPrefetch(promise: Promise<unknown> | undefined, waitMs = 2000): void {
-  modelPrefetch = promise ? { promise, waitMs } : undefined
+/** Clear prefetch ownership whenever the live session is detached or replaced. */
+export function clearModelPrefetch(): void {
+  modelPrefetch = undefined
 }
 
-/** Await the registered prefetch (bounded); resolves immediately when none. */
-function awaitModelPrefetch(): Promise<void> {
+/** Register an in-flight bootstrap prefetch for exactly one live session. */
+export function registerModelPrefetch(sessionId: string, promise: Promise<unknown>, waitMs = 2000): void {
+  modelPrefetch = { promise, sessionId, waitMs }
+}
+
+/**
+ * Start and register bootstrap model hydration without exposing a completion
+ * promise to the session-transition Effect. `/model` owns the bounded wait;
+ * bootstrap remains interactive while the catalog finishes in the background.
+ * This is best-effort hydration, so terminate rejection here instead of leaving
+ * a detached promise that Node can promote to an unhandled-rejection crash.
+ */
+export function startModelPrefetch<T>(
+  sessionId: string,
+  promise: Promise<T>,
+  apply: (value: T) => void,
+  waitMs = 2000
+): void {
+  registerModelPrefetch(
+    sessionId,
+    promise.then(apply).catch(() => undefined),
+    waitMs
+  )
+}
+
+/** Await only this session's registered prefetch (bounded). */
+function awaitModelPrefetch(sessionId: string | undefined): Promise<void> {
   const pending = modelPrefetch
-  if (!pending) return Promise.resolve()
+  if (!pending || pending.sessionId !== sessionId) return Promise.resolve()
   return Promise.race([pending.promise, new Promise(resolve => setTimeout(resolve, pending.waitMs))]).then(
     () => undefined
   )
@@ -590,7 +643,7 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
   }
   // Cache empty but the bootstrap prefetch may be in flight — await it
   // (bounded) and re-check instead of racing a SECOND model.options RPC.
-  await awaitModelPrefetch()
+  await awaitModelPrefetch(ctx.sessionId())
   const prefetched = ctx.modelItems()
   if (prefetched?.length) {
     open(prefetched)
@@ -1035,7 +1088,7 @@ const toolsCmd: ClientHandler = async (arg, ctx) => {
       return
     }
 
-    if (ctx.guardBusySessionSwitch('change tools')) return
+    if (ctx.guardBusySessionSwitch('change tools', `tools:${ctx.sessionOwnerId() ?? 'detached'}`)) return
 
     ctx.beginToolsConfigure()
     const expectedSid = ctx.sessionId()
@@ -1132,10 +1185,259 @@ const backgroundCmd: ClientHandler = async (arg, ctx) => {
   }
 }
 
+export const BUSY_QUEUE_FULL_MESSAGE =
+  'queue full (100 messages / 4M characters) — send or delete a queued message first'
+
+const enqueueForLater = (ctx: SlashContext, text: string, front = false): boolean => {
+  if (ctx.isSessionTransitioning()) {
+    ctx.pushSystem('session switch in progress — retry the queue command when it finishes')
+    return false
+  }
+  const accepted = ctx.enqueueQueued(text, front)
+  if (!accepted) ctx.pushSystem(BUSY_QUEUE_FULL_MESSAGE)
+  return accepted
+}
+
+/** `/queue [prompt]` (alias `/q`) — local queue inspection/enqueue. */
+const queueCmd: ClientHandler = (arg, ctx) => {
+  const text = arg.trim()
+  if (!text) {
+    ctx.pushSystem(`${ctx.queueCount()} queued message(s)`)
+    return
+  }
+  if (text === '--clear') {
+    const count = ctx.queueCount()
+    if (count === 0) {
+      ctx.pushSystem('queue already empty')
+      return
+    }
+    ctx.confirm(
+      {
+        cancelLabel: 'Keep queued messages',
+        confirmLabel: `Discard ${count} queued message(s)`,
+        danger: true,
+        detail: 'Queued input is not in the conversation history and cannot be recovered after discard.',
+        title: 'Clear the pending queue?'
+      },
+      () => ctx.pushSystem(`discarded ${ctx.clearQueued()} queued message(s)`)
+    )
+    return
+  }
+  if (!enqueueForLater(ctx, text)) {
+    ctx.prefillComposer(`/queue ${text}`)
+    return
+  }
+  ctx.pushSystem(`queued: "${text.slice(0, 50)}${text.length > 50 ? '…' : ''}"`)
+}
+
+/** `/steer <prompt>` — direct injection while busy; idle preserves the text in
+ * the local queue rather than starting a surprise turn. */
+const preserveDirectSteer = (ctx: SlashContext, text: string, note: string): void => {
+  if (enqueueForLater(ctx, text)) ctx.pushSystem(note)
+  else {
+    ctx.prefillComposer(`/steer ${text}`)
+    ctx.pushSystem('steer could not be queued — command restored to composer')
+  }
+}
+
+const steerCmd: ClientHandler = async (arg, ctx) => {
+  const text = arg.trim()
+  if (!text) {
+    ctx.pushSystem('usage: /steer <prompt>')
+    return
+  }
+  if (ctx.isSessionTransitioning()) {
+    ctx.pushSystem('session switch in progress — retry /steer when it finishes')
+    ctx.prefillComposer(`/steer ${text}`)
+    return
+  }
+  const sid = ctx.sessionId()
+  if (!ctx.isBusy() || !sid) {
+    if (enqueueForLater(ctx, text)) {
+      ctx.pushSystem(`no active turn — queued for next: "${text.slice(0, 50)}${text.length > 50 ? '…' : ''}"`)
+    } else {
+      ctx.prefillComposer(`/steer ${text}`)
+    }
+    return
+  }
+  try {
+    const status = await ctx.steer(sid, text)
+    if (status === 'uncertain') {
+      ctx.pushSystem('steer delivery uncertain — message retained; send it explicitly to retry')
+      return
+    }
+    if (status === 'fallback') {
+      ctx.pushSystem('steer rejected — message queued for next turn')
+      return
+    }
+    if (status === 'saturated') {
+      if (enqueueForLater(ctx, text)) {
+        ctx.pushSystem('steer backlog full — message queued for next turn')
+      } else {
+        ctx.prefillComposer(`/steer ${text}`)
+        ctx.pushSystem('steer backlog and queue full — message restored to composer')
+      }
+      return
+    }
+    if (status === 'retained') {
+      ctx.prefillComposer(`/steer ${text}`)
+      ctx.pushSystem('steer fallback queue is full — command restored to composer')
+      return
+    }
+    if (ctx.sessionId() !== sid) return
+    ctx.pushSystem(`steer queued — arrives after next tool call: "${text.slice(0, 50)}${text.length > 50 ? '…' : ''}"`)
+  } catch (error) {
+    if (ctx.sessionId() === sid) {
+      const detail = error instanceof Error ? error.message : 'session.steer failed'
+      preserveDirectSteer(ctx, text, `/steer: ${detail} — message queued for next turn`)
+    }
+  }
+}
+
+/** `/busy [queue|steer|interrupt|status]` — persist and immediately apply the
+ * active full-screen TUI policy. */
+const busyCmd: ClientHandler = async (arg, ctx, flight) => {
+  const requested = arg.trim().toLowerCase()
+  if (!['', 'status', 'queue', 'steer', 'interrupt'].includes(requested)) {
+    ctx.pushSystem('usage: /busy [queue|steer|interrupt|status]')
+    return
+  }
+  if (!requested || requested === 'status') {
+    ctx.pushSystem(`busy input mode: ${ctx.busyInputMode()}`)
+    return
+  }
+  const sid = ctx.sessionId()
+  try {
+    const raw = await ctx.request('config.set', {
+      key: 'busy',
+      value: requested
+    })
+    if (!currentSessionIs(ctx, sid, flight)) return
+    const response = decodeConfigValueResponse(raw)
+    if (!response) {
+      ctx.pushSystem('/busy: invalid config response')
+      return
+    }
+    const next = normalizeBusyInputMode(response.value)
+    ctx.setBusyInputMode(next)
+    ctx.pushSystem(`busy input mode: ${next}`)
+  } catch (error) {
+    if (currentSessionIs(ctx, sid, flight)) {
+      ctx.pushSystem(`/busy: ${error instanceof Error ? error.message : 'config request failed'}`)
+    }
+  }
+}
+
+const requestRewind = async (
+  ctx: SlashContext,
+  sid: string,
+  command: '/retry' | '/undo'
+): Promise<SessionUndoResponse | undefined> => {
+  const raw = await ctx.request('session.undo', { session_id: sid })
+  if (ctx.sessionId() !== sid) return undefined
+  const response = decodeSessionUndoResponse(raw)
+  if (!response || !Number.isSafeInteger(response.removed) || response.removed < 0) {
+    ctx.pushSystem(`${command}: invalid session.undo response`)
+    return undefined
+  }
+  return response
+}
+
+/** `/undo` — rewind the gateway and the retained visible exchange together. */
+const undoCmd: ClientHandler = async (_arg, ctx) => {
+  const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('nothing to undo')
+    return
+  }
+  if (ctx.isSessionTransitioning()) {
+    ctx.pushSystem('session switch in progress — retry /undo when it finishes')
+    return
+  }
+  if (ctx.isBusy()) {
+    ctx.pushSystem('session busy — /interrupt the current turn before /undo')
+    return
+  }
+  if (!ctx.beginHistoryMutation()) {
+    ctx.pushSystem('history update already in progress — wait before /undo')
+    return
+  }
+  try {
+    const response = await requestRewind(ctx, sid, '/undo')
+    if (response === undefined) return
+    if (response.removed <= 0) {
+      ctx.pushSystem('nothing to undo')
+      return
+    }
+    ctx.trimLastExchange()
+    ctx.pushSystem(`undid ${response.removed} messages`)
+  } catch (error) {
+    if (ctx.sessionId() === sid) {
+      ctx.pushSystem(`/undo: ${error instanceof Error ? error.message : 'session.undo failed'}`)
+    }
+  } finally {
+    ctx.endHistoryMutation()
+  }
+}
+
+/** `/retry` — capture the last user body, rewind, then resubmit exactly once. */
+const retryCmd: ClientHandler = async (_arg, ctx) => {
+  const visibleFallback = ctx.lastUserMessage()
+  if (ctx.isSessionTransitioning()) {
+    ctx.pushSystem('session switch in progress — retry /retry when it finishes')
+    return
+  }
+  if (!visibleFallback) {
+    ctx.pushSystem('nothing to retry')
+    return
+  }
+  const sid = ctx.sessionId()
+  if (!sid) {
+    if (ctx.submit(visibleFallback) === false) {
+      ctx.prefillComposer(visibleFallback)
+      ctx.pushSystem('retry could not submit — message restored to composer')
+    }
+    return
+  }
+  if (ctx.isBusy()) {
+    ctx.pushSystem('session busy — /interrupt the current turn before /retry')
+    return
+  }
+  if (!ctx.beginHistoryMutation()) {
+    ctx.pushSystem('history update already in progress — wait before /retry')
+    return
+  }
+  let mutationHeld = true
+  try {
+    const response = await requestRewind(ctx, sid, '/retry')
+    if (response === undefined) return
+    if (response.removed <= 0) {
+      ctx.pushSystem('nothing to retry')
+      return
+    }
+    ctx.trimLastExchange()
+    // Release the mutation barrier before resubmitting; otherwise the entry
+    // correctly queues behind its own lock and a full queue can strand the
+    // already-rewound retry body.
+    ctx.endHistoryMutation()
+    mutationHeld = false
+    if (ctx.submit(visibleFallback) === false) {
+      ctx.prefillComposer(visibleFallback)
+      ctx.pushSystem('retry could not submit — message restored to composer')
+    }
+  } catch (error) {
+    if (ctx.sessionId() === sid) {
+      ctx.pushSystem(`/retry: ${error instanceof Error ? error.message : 'session.undo failed'}`)
+    }
+  } finally {
+    if (mutationHeld) ctx.endHistoryMutation()
+  }
+}
+
 const freshSessionCmd =
   (isNew: boolean): ClientHandler =>
   (arg, ctx) => {
-    if (ctx.guardBusySessionSwitch('switch sessions')) return
+    if (ctx.guardBusySessionSwitch('switch sessions', 'new')) return
     const requestedTitle = isNew ? arg.trim() : ''
     ctx.confirm(
       {
@@ -1393,6 +1695,7 @@ const CLIENT: Record<string, ClientHandler> = {
   background: backgroundCmd,
   bg: backgroundCmd,
   billing: billingCmd,
+  busy: busyCmd,
   btw: backgroundCmd,
   clear: freshSessionCmd(false),
   compact: compactCmd,
@@ -1432,7 +1735,12 @@ const CLIENT: Record<string, ClientHandler> = {
   logs: logsCmd,
   new: freshSessionCmd(true),
   quit: quitCmd,
+  q: queueCmd,
+  queue: queueCmd,
   redraw: redrawCmd,
+  retry: retryCmd,
+  steer: steerCmd,
+  undo: undoCmd,
   update: updateCmd
 }
 
@@ -1452,7 +1760,11 @@ function handleDispatchResult(parsed: ParsedSlash, raw: unknown, ctx: SlashConte
       return
     case 'alias': {
       const target = readStr(raw, 'target')
-      if (target) void dispatchSlash(`/${target}${argTail}`, ctx)
+      if (target) {
+        void dispatchSlash(`/${target}${argTail}`, ctx).catch(error => {
+          ctx.pushSystem(`/${target}: ${error instanceof Error ? error.message : String(error)}`)
+        })
+      }
       return
     }
     case 'skill': {
@@ -1465,7 +1777,11 @@ function handleDispatchResult(parsed: ParsedSlash, raw: unknown, ctx: SlashConte
       const message = readStr(raw, 'message')
       if (message?.trim()) {
         const skillName = readStr(raw, 'name') || parsed.name
-        ctx.submitSkill(`/${skillName}${argTail}`, message)
+        const command = `/${skillName}${argTail}`
+        if (ctx.submitSkill(command, message) === false) {
+          ctx.prefillComposer(command)
+          ctx.pushSystem('skill submission could not be queued — command restored to composer')
+        }
       } else ctx.pushSystem(`/${parsed.name}: empty message`)
       return
     }
@@ -1473,14 +1789,21 @@ function handleDispatchResult(parsed: ParsedSlash, raw: unknown, ctx: SlashConte
       const notice = readStr(raw, 'notice')
       if (notice) ctx.pushSystem(notice)
       const message = readStr(raw, 'message')
-      if (message?.trim()) ctx.submit(message)
-      else ctx.pushSystem(`/${parsed.name}: empty message`)
+      if (message?.trim()) {
+        if (ctx.submit(message) === false) {
+          ctx.prefillComposer(message)
+          ctx.pushSystem('generated prompt could not be queued — message restored to composer')
+        }
+      } else ctx.pushSystem(`/${parsed.name}: empty message`)
       return
     }
     case 'prefill': {
-      // /undo etc. — composer prefill lands with the composer-ref plumbing; show it for now.
+      // `/undo N` and extension commands can return editable composer content.
+      const notice = readStr(raw, 'notice')
+      if (notice) ctx.pushSystem(notice)
       const message = readStr(raw, 'message')
-      ctx.pushSystem(message ? `(edit & resubmit) ${message}` : `/${parsed.name}: nothing to prefill`)
+      if (message) ctx.prefillComposer(message)
+      else ctx.pushSystem(`/${parsed.name}: nothing to prefill`)
       return
     }
     default:
@@ -1493,6 +1816,7 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
   const parsed = parseSlash(input)
   if (!parsed) return
   const flight = claimSlashFlight(ctx)
+  const sid = ctx.sessionId()
 
   if (DIAGNOSTIC_COMMANDS.has(parsed.name) && !diagnosticsEnabled()) {
     // Not a secret — an enable switch. Tell the user exactly how to get it.
@@ -1502,11 +1826,16 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
 
   const client = CLIENT[parsed.name]
   if (client) {
-    await client(parsed.arg, ctx, flight)
+    try {
+      await client(parsed.arg, ctx, flight)
+    } catch (error) {
+      if (currentSessionIs(ctx, sid, flight)) {
+        ctx.pushSystem(`/${parsed.name}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
     return
   }
 
-  const sid = ctx.sessionId()
   try {
     const result = await ctx.request('slash.exec', { command: input.slice(1), session_id: sid })
     if (!currentSessionIs(ctx, sid, flight)) return

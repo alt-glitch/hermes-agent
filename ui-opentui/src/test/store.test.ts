@@ -4,10 +4,10 @@
  * `parts[]` model — text/tool interleave in one turn, tool start↔complete matched
  * by id and updated IN PLACE, `{output,exit_code}` envelope stripped.
  */
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { DEFAULT_THEME } from '../logic/theme.ts'
-import { createSessionStore, type Message } from '../logic/store.ts'
+import { createSessionStore, startupCatalogRetryDelay, type Message } from '../logic/store.ts'
 
 describe('session store — theming / dedup / hydrate (Phase 1)', () => {
   test('gateway.ready{skin} re-themes; default before', () => {
@@ -125,6 +125,42 @@ describe('session store — ordered parts (Phase 2b)', () => {
     } else {
       throw new Error('expected a tool part at index 1')
     }
+  })
+
+  test('keeps one live assistant across mid-turn shell and notification rows', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'before ' } })
+
+    // Local activity is visible transcript chrome, but it does not end or own
+    // the model turn that started above.
+    store.pushLocalUser('!pwd', 'shell')
+    store.pushSystem('/tmp/hermes-shell-output')
+    store.apply({
+      type: 'notification.show',
+      payload: {
+        id: 'bg-mid-turn',
+        key: 'bg-mid-turn',
+        kind: 'process.complete',
+        level: 'info',
+        text: 'background-mid-turn-finished'
+      }
+    })
+
+    store.apply({ type: 'tool.start', payload: { tool_id: 't-mid', name: 'terminal' } })
+    store.apply({ type: 'tool.complete', payload: { tool_id: 't-mid', result_text: 'tool finished' } })
+    store.apply({ type: 'message.delta', payload: { text: 'after' } })
+    store.apply({ type: 'message.complete' })
+
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.streaming).toBe(false)
+    expect(assistants[0]?.parts?.map(part => part.type)).toEqual(['text', 'tool', 'text'])
+    expect(assistants[0]?.parts?.[0]).toMatchObject({ type: 'text', text: 'before ' })
+    expect(assistants[0]?.parts?.[1]).toMatchObject({ type: 'tool', id: 't-mid', state: 'complete' })
+    expect(assistants[0]?.parts?.[2]).toMatchObject({ type: 'text', text: 'after' })
+    expect(store.state.messages.some(message => message.role === 'assistant' && message.streaming)).toBe(false)
+    expect(store.state.messages.map(message => message.role)).toEqual(['assistant', 'user', 'system', 'notification'])
   })
 
   test('message.complete with text but NO prior start creates the turn (complete-only gateway; no drop)', () => {
@@ -259,6 +295,7 @@ describe('session store — ordered parts (Phase 2b)', () => {
     ]) // nameless entry dropped
     expect(c.skills.total).toBe(7)
     expect(c.mcp.servers).toEqual(['railway', 'beeper']) // non-string dropped
+    expect(c.readiness).toEqual({ status: 'ready', retryAfterMs: undefined, warning: undefined })
   })
 
   test('setCatalog leaves the catalog unset on garbage / non-object input (decode → none)', () => {
@@ -280,6 +317,35 @@ describe('session store — ordered parts (Phase 2b)', () => {
     expect(c.tools.toolsets).toEqual([{ name: 'core', count: 3, enabled: true, tools: ['a'] }]) // enabled defaults on
     expect(c.skills).toEqual({ total: 0, categories: [] }) // absent section → empty
     expect(c.mcp.servers).toEqual([])
+  })
+
+  test('startup catalog pending metadata retries boundedly; ready/failed stop', () => {
+    const store = createSessionStore()
+    const pending = store.setCatalog({
+      tools: { total: 0, toolsets: [] },
+      readiness: {
+        status: 'pending',
+        warning: '  tool catalog still loading  ',
+        retry_after_ms: 1000
+      }
+    })
+    expect(pending?.readiness).toEqual({
+      status: 'pending',
+      retryAfterMs: 1000,
+      warning: 'tool catalog still loading'
+    })
+    expect(startupCatalogRetryDelay(pending)).toBe(1000)
+
+    const tooFast = store.setCatalog({ readiness: { status: 'pending', retry_after_ms: 1 } })
+    expect(startupCatalogRetryDelay(tooFast)).toBe(250)
+    const tooSlow = store.setCatalog({ readiness: { status: 'pending', retry_after_ms: 60_000 } })
+    expect(startupCatalogRetryDelay(tooSlow)).toBe(30_000)
+    expect(startupCatalogRetryDelay(store.setCatalog({ readiness: { status: 'ready' } }))).toBeUndefined()
+    expect(
+      startupCatalogRetryDelay(
+        store.setCatalog({ readiness: { status: 'failed', warning: 'agent init failed', retry_after_ms: 1000 } })
+      )
+    ).toBeUndefined()
   })
 
   test('reasoning.delta accumulates into a reasoning part', () => {
@@ -580,11 +646,88 @@ describe('session store — gateway lifecycle / transport errors (auto-heal foun
     store.apply({ type: 'gateway.exited' })
     // THE key bug fix: the spinner is cleared even though no message.complete arrived.
     expect(store.state.info.running).toBe(false)
+    expect(store.isTurnInFlight()).toBe(false)
     // Neutral status — "recovering…" now comes from gateway.recovering only.
     expect(store.state.status).toBe('gateway exited')
     const sys = store.state.messages.filter(m => m.role === 'system')
     expect(sys).toHaveLength(1)
     expect(sys[0]!.text).toContain('in-flight reply was lost')
+    expect(store.state.messages.some(message => message.role === 'assistant')).toBe(false)
+  })
+
+  test('gateway.exited retains a partial assistant as settled even if recovery exhausts', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'partial before crash' } })
+
+    store.apply({ type: 'gateway.exited', payload: { reason: 'signal' } })
+
+    const assistant = store.state.messages.find(message => message.role === 'assistant')
+    expect(assistant).toMatchObject({ role: 'assistant', streaming: false })
+    expect(assistant?.parts).toEqual([expect.objectContaining({ type: 'text', text: 'partial before crash' })])
+    expect(store.isTurnInFlight()).toBe(false)
+  })
+
+  test('a pre-message.start error settles optimistic busy and releases the queue hook once', () => {
+    const store = createSessionStore()
+    const settled = vi.fn()
+    store.registerTurnCompleteHandler(settled)
+    store.applyInfo({ running: true })
+    store.apply({ type: 'error', payload: { message: 'agent init failed' } })
+    expect(store.state.info.running).toBe(false)
+    expect(store.isTurnInFlight()).toBe(false)
+    expect(settled).toHaveBeenCalledTimes(1)
+  })
+
+  test('removes only the exact optimistic user row on pre-start rejection', () => {
+    const store = createSessionStore()
+    const committed = store.pushUser('committed')
+    const optimistic = store.pushUser('not committed')
+    store.pushSystem('local chrome after send')
+
+    expect(store.removeClientMessage(optimistic)).toBe(true)
+    expect(store.removeClientMessage(optimistic)).toBe(false)
+    expect(store.state.messages.map(message => message.text)).toEqual(['committed', 'local chrome after send'])
+    expect(store.state.messages[0]?.clientId).toBe(committed)
+  })
+
+  test('an error after message.start waits for authoritative session.info before draining', () => {
+    const store = createSessionStore()
+    const settled = vi.fn()
+    store.registerTurnCompleteHandler(settled)
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'error', payload: { message: 'turn failed' } })
+    expect(store.state.info.running).toBe(false)
+    expect(store.isTurnInFlight()).toBe(true)
+    expect(settled).not.toHaveBeenCalled()
+    store.apply({ type: 'session.info', payload: { running: false } })
+    expect(store.isTurnInFlight()).toBe(false)
+    expect(settled).toHaveBeenCalledTimes(1)
+  })
+
+  test('an error after start removes an empty streaming assistant row', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'assistant', streaming: true, text: '' })
+
+    store.apply({ type: 'error', payload: { message: 'preflight failed' } })
+
+    expect(store.state.messages.some(message => message.role === 'assistant')).toBe(false)
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: preflight failed' })
+  })
+
+  test('an error after a partial delta retains a settled non-streaming assistant row', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'partial answer' } })
+
+    store.apply({ type: 'error', payload: { message: 'stream failed' } })
+
+    const assistant = store.state.messages.find(message => message.role === 'assistant')
+    expect(assistant).toMatchObject({ role: 'assistant', streaming: false })
+    expect(assistant?.parts).toEqual([expect.objectContaining({ type: 'text', text: 'partial answer' })])
+    store.apply({ type: 'session.info', payload: { running: false } })
+    expect(store.isTurnInFlight()).toBe(false)
   })
 
   test('gateway.exited enriches the notice with payload.reason when present', () => {
@@ -718,6 +861,25 @@ describe('session store — rolling message cap (bounds the Yoga node high-water
     expect(live.role).toBe('assistant')
     expect(live.streaming).toBe(true)
     expect(live.parts?.[0]).toMatchObject({ type: 'text', text: 'in flight' })
+  })
+
+  test('mid-turn local-row overflow cannot evict the active assistant identity', () => {
+    process.env[ENV_KEY] = '3'
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'before ' } })
+
+    for (let i = 0; i < 6; i++) store.pushSystem(`local ${i}`)
+    store.apply({ type: 'message.delta', payload: { text: 'after' } })
+    store.apply({ type: 'message.complete' })
+
+    expect(store.state.messages).toHaveLength(3)
+    expect(store.state.dropped).toBe(4)
+    expect(store.state.messages.map(message => message.text)).toEqual(['', 'local 4', 'local 5'])
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.streaming).toBe(false)
+    expect(assistants[0]?.parts).toEqual([expect.objectContaining({ type: 'text', text: 'before after' })])
   })
 
   test('message.start is capped: opening a turn beyond the cap drops the oldest', () => {
@@ -881,6 +1043,95 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
 
     expect(store.state.composerDraft).toBe('')
     expect(store.state.composerClearVersion).toBe(before + 1)
+  })
+
+  test('replaceComposerDraft advances the native-textarea replacement signal', () => {
+    const store = createSessionStore()
+    const before = store.state.composerReplaceVersion
+    store.replaceComposerDraft('edit and resubmit')
+    expect(store.state.composerDraft).toBe('edit and resubmit')
+    expect(store.state.composerReplaceVersion).toBe(before + 1)
+  })
+
+  test('prefill cancels queue edit without deleting the queued row', () => {
+    const store = createSessionStore()
+    store.enqueuePrompt('/queued command')
+    store.setQueueEditIndex(0)
+    store.replaceComposerDraft('extension prefill')
+    expect(store.state.queueEditIndex).toBeUndefined()
+    expect(store.state.queuedPrompts).toEqual(['/queued command'])
+    expect(store.state.composerDraft).toBe('extension prefill')
+  })
+
+  test('session adoption advances the native clear signal', () => {
+    const store = createSessionStore()
+    store.setComposerDraft('old-session draft')
+    const before = store.state.composerClearVersion
+    store.adoptFreshSession('sid-2')
+    expect(store.state.composerDraft).toBe('')
+    expect(store.state.composerClearVersion).toBe(before + 1)
+  })
+
+  test('busy-input mode mirrors config and survives session-owned reset', () => {
+    const store = createSessionStore()
+    expect(store.state.busyInputMode).toBe('queue')
+    store.setBusyInputMode('steer')
+    store.adoptFreshSession('sid-2', {}, 'db-2')
+    expect(store.state.busyInputMode).toBe('steer')
+  })
+
+  test('late config hydration cannot overwrite a newer /busy command', () => {
+    const store = createSessionStore()
+    const revision = store.getBusyInputModeRevision()
+    store.setBusyInputMode('queue')
+    expect(store.hydrateBusyInputMode('interrupt', revision)).toBe(false)
+    expect(store.state.busyInputMode).toBe('queue')
+
+    const current = store.getBusyInputModeRevision()
+    expect(store.hydrateBusyInputMode('steer', current)).toBe(true)
+    expect(store.state.busyInputMode).toBe('steer')
+  })
+
+  test('lastUserMessage + trimLastExchange mirror Ink trailing-exchange semantics', () => {
+    const store = createSessionStore()
+    store.pushSystem('intro')
+    store.pushUser('first')
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { text: 'answer' } })
+    expect(store.lastUserMessage()).toBe('first')
+    expect(store.trimLastExchange()).toBe(2)
+    expect(store.state.messages).toEqual([{ role: 'system', text: 'intro' }])
+    expect(store.trimLastExchange()).toBe(0)
+  })
+
+  test('trimLastExchange removes the exchange through trailing local chrome', () => {
+    const store = createSessionStore()
+    store.pushUser('retry me')
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { text: 'old answer' } })
+    store.pushSystem('fortune output')
+    store.pushNotification({ id: 'n1', kind: 'background', level: 'info', text: 'background complete' })
+    expect(store.trimLastExchange()).toBe(2)
+    expect(store.state.messages.map(message => [message.role, message.text])).toEqual([
+      ['system', 'fortune output'],
+      ['notification', 'background complete']
+    ])
+  })
+
+  test('durable undo/retry ignore trailing local shell activity', () => {
+    const store = createSessionStore()
+    store.pushUser('model prompt')
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { text: 'model answer' } })
+    store.pushLocalUser('!ls', 'shell')
+    store.pushSystem('file.txt')
+
+    expect(store.lastUserMessage()).toBe('model prompt')
+    expect(store.trimLastExchange()).toBe(2)
+    expect(store.state.messages.map(message => [message.role, message.text, message.localOnly])).toEqual([
+      ['user', '!ls', 'shell'],
+      ['system', 'file.txt', undefined]
+    ])
   })
 
   test('clearTranscript zeroes the usage gauges but keeps session identity', () => {

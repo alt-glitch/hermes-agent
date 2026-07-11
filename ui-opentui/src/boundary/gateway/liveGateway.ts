@@ -20,11 +20,40 @@ import { GatewayError } from '../errors.ts'
 import { getLog } from '../log.ts'
 import { GatewayEventSchema, type GatewayEvent } from '../schema/GatewayEvent.ts'
 import { GatewayService, type GatewayServiceShape } from './GatewayService.ts'
-import { RawGatewayClient } from './client.ts'
+import { RawGatewayClient, RawGatewayRequestError } from './client.ts'
 
 const COALESCE_MS = 16
 
 const decodeEvent = Schema.decodeUnknownOption(GatewayEventSchema)
+
+/** Events that change delivery/session ownership must commit before a later
+ * JSON-RPC response continuation runs. In particular, Python writes
+ * `message.start` while holding the same lock that services interrupt; keeping
+ * start in a 16ms repaint queue would let the interrupt ACK overtake it. */
+export function gatewayEventRequiresImmediateFlush(event: GatewayEvent): boolean {
+  return (
+    event.type === 'message.start' ||
+    event.type === 'message.complete' ||
+    event.type === 'error' ||
+    event.type === 'session.info' ||
+    event.type === 'gateway.ready' ||
+    event.type === 'gateway.exited'
+  )
+}
+
+export type GatewayFlushPlan = 'flush-now' | 'schedule' | 'wait'
+
+/** Pure scheduling decision used by the live coalescer and ordering tests. */
+export function planGatewayEventFlush(
+  event: GatewayEvent,
+  now: number,
+  lastFlush: number,
+  timerActive: boolean
+): GatewayFlushPlan {
+  if (gatewayEventRequiresImmediateFlush(event)) return 'flush-now'
+  if (timerActive) return 'wait'
+  return now - lastFlush < COALESCE_MS ? 'schedule' : 'flush-now'
+}
 
 /**
  * Advance the transport's authoritative live-session id after a successful RPC.
@@ -49,6 +78,15 @@ export function trackedSessionIdAfterRequest(
   return current
 }
 
+/** Convert the raw Promise boundary into the typed Effect error without
+ * guessing from copy. Unknown failures are conservative transport ambiguity;
+ * the raw client marks explicit JSON-RPC rejections as `rpc-error`. */
+export function gatewayErrorFromRawFailure(method: string, cause: unknown): GatewayError {
+  const message = cause instanceof Error ? cause.message : String(cause)
+  const reason = cause instanceof RawGatewayRequestError ? cause.reason : 'transport-down'
+  return new GatewayError({ method, reason, message })
+}
+
 function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
   const log = getLog()
   const handlers = new Set<(event: GatewayEvent) => void>()
@@ -68,6 +106,7 @@ function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
   let last = 0
 
   const flush = () => {
+    if (timer) clearTimeout(timer)
     timer = undefined
     if (queue.length === 0) return
     const events = queue
@@ -82,12 +121,13 @@ function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
 
   const enqueue = (event: GatewayEvent) => {
     queue.push(event)
-    if (timer) return
-    // If we flushed recently (<16ms ago) batch with near-future events; else flush now.
-    if (Date.now() - last < COALESCE_MS) {
-      timer = setTimeout(flush, COALESCE_MS)
-    } else {
+    const plan = planGatewayEventFlush(event, Date.now(), last, timer !== undefined)
+    if (plan === 'flush-now') {
       flush()
+      return
+    }
+    if (plan === 'schedule') {
+      timer = setTimeout(flush, COALESCE_MS)
     }
   }
 
@@ -109,8 +149,11 @@ function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
   // `client` is assigned by the time onExit ever fires at runtime.
   function onExit(reason: string): void {
     log.warn('gateway', 'transport exited', { reason })
-    // Clears the frozen spinner + shows status (store handles gateway.exited).
+    // Establish transport-down state synchronously before RawGatewayClient
+    // rejects pending RPCs. The entry can then classify their prompt/steer
+    // delivery as uncertain and retain the text for an explicit user retry.
     enqueue({ type: 'gateway.exited', payload: { reason } })
+    flush()
     const exitedSessionId = sessionId
     // The ephemeral id belonged to the dead Python process. Recovery resumes by
     // the store's persisted key; retaining this id makes the new gateway waste a
@@ -153,15 +196,7 @@ function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
     request: <A>(method: string, params: unknown) =>
       Effect.tryPromise({
         try: () => client.request<A>(method, params),
-        catch: cause => {
-          const message = cause instanceof Error ? cause.message : String(cause)
-          const reason = message.startsWith('timeout:')
-            ? ('timeout' as const)
-            : message.includes('not running') || message.includes('stopping')
-              ? ('transport-down' as const)
-              : ('rpc-error' as const)
-          return new GatewayError({ method, reason, message })
-        }
+        catch: cause => gatewayErrorFromRawFailure(method, cause)
       }).pipe(
         // Keep the live routing id aligned with create/resume/close so prompts,
         // approvals, interrupts, and crash recovery never target a closed SID.

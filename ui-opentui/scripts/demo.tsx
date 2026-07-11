@@ -47,7 +47,11 @@ const renderer = await createCliRenderer({
 // double-click word / triple-click line / drag-extend too.
 installMultiClickSelection(renderer)
 
-void render(
+// `render()` is async in @opentui/solid: awaiting it lets the renderer attach
+// and start its native render loop before this gateway-free script reaches
+// the end of the module.  A fire-and-forget call exits 0 without painting,
+// which makes PTY/termctrl smoke tests report an empty screen.
+await render(
   () => (
     <ThemeProvider theme={() => store.state.theme}>
       <App store={store} />

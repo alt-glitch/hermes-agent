@@ -39,15 +39,18 @@ export function actionModifier(platform: NodeJS.Platform = process.platform): 'C
   return platform === 'darwin' ? 'Cmd' : 'Ctrl'
 }
 
-export function isRedrawHotkey(key: ActionKey, platform: NodeJS.Platform = process.platform): boolean {
+export function isActionHotkey(key: ActionKey, name: string, platform: NodeJS.Platform = process.platform): boolean {
   const action = platform === 'darwin' ? key.meta || key.super === true : key.ctrl
-  return key.eventType !== 'release' && action && key.name === 'l'
+  return key.eventType !== 'release' && action && key.name === name
+}
+
+export function isRedrawHotkey(key: ActionKey, platform: NodeJS.Platform = process.platform): boolean {
+  return isActionHotkey(key, 'l', platform)
 }
 
 /** Ink's action+D exit gesture: Cmd+D on macOS, Ctrl+D everywhere else. */
 export function isExitHotkey(key: ActionKey, platform: NodeJS.Platform = process.platform): boolean {
-  const action = platform === 'darwin' ? key.meta || key.super === true : key.ctrl
-  return key.eventType !== 'release' && action && key.name === 'd'
+  return isActionHotkey(key, 'd', platform)
 }
 
 /** OpenTUI-native shortcuts actually implemented by this engine. */
@@ -58,7 +61,9 @@ export function openTuiHotkeys(platform: NodeJS.Platform = process.platform): re
     [`${action}+D`, 'exit'],
     [`${action}+L`, 'redraw / repaint'],
     ['Tab', 'apply completion'],
-    ['↑/↓', 'completions / input history / cursor'],
+    ['↑/↓', 'completions / queued edit / input history / cursor'],
+    ['Ctrl+X', 'delete queued message while editing'],
+    ['Enter Enter (empty)', 'stop the turn / force the next queued message'],
     ['Esc Esc', 'open session prompt history'],
     ['Shift+Enter / Alt+Enter', 'insert newline'],
     ['Home/End', 'start / end of line'],

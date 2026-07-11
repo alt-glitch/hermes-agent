@@ -1,11 +1,17 @@
 import { describe, expect, test } from 'vitest'
 
 import {
+  classifySessionSteerResponse,
+  decodeConfigValueResponse,
+  decodeConfigFullResponse,
+  decodeConfigMtimeResponse,
   decodeCommandsCatalogResponse,
   decodeReloadEnvResponse,
   decodeSessionSaveResponse,
+  decodeSessionSteerResponse,
   decodeSessionStatusResponse,
   decodeSessionTitleResponse,
+  decodeSessionUndoResponse,
   decodeSkillsReloadResponse
 } from '../boundary/schema/SessionCommandResponses.ts'
 
@@ -19,6 +25,19 @@ describe('session-maintenance RPC Effect boundaries', () => {
     })
     expect(decodeSessionSaveResponse({ file: '/tmp/session.json' })).toEqual({ file: '/tmp/session.json' })
     expect(decodeReloadEnvResponse({ updated: 2 })).toEqual({ updated: 2 })
+    expect(decodeConfigValueResponse({ value: 'queue' })).toEqual({ value: 'queue' })
+    expect(decodeConfigFullResponse({ config: { display: { busy_input_mode: 'steer' } } })).toEqual({
+      config: { display: { busy_input_mode: 'steer' } }
+    })
+    expect(decodeConfigMtimeResponse({ mtime: 123.5 })).toEqual({ mtime: 123.5 })
+    expect(decodeSessionSteerResponse({ status: 'queued', text: 'next' })).toEqual({
+      status: 'queued',
+      text: 'next'
+    })
+    expect(decodeSessionUndoResponse({ removed: 2, target_text: 'retry me' })).toEqual({
+      removed: 2,
+      target_text: 'retry me'
+    })
     expect(
       decodeSkillsReloadResponse({
         output: 'skills reloaded',
@@ -68,11 +87,24 @@ describe('session-maintenance RPC Effect boundaries', () => {
     expect(decodeSessionTitleResponse({ pending: false })).toBeUndefined()
     expect(decodeSessionSaveResponse({ file: null })).toBeUndefined()
     expect(decodeReloadEnvResponse({ updated: '2' })).toBeUndefined()
+    expect(decodeConfigValueResponse({ value: 1 })).toBeUndefined()
+    expect(decodeConfigFullResponse({ config: null })).toBeUndefined()
+    expect(decodeConfigMtimeResponse({ mtime: 'now' })).toBeUndefined()
+    expect(decodeSessionSteerResponse({ status: 'accepted' })).toBeUndefined()
+    expect(decodeSessionUndoResponse({ removed: '2' })).toBeUndefined()
     expect(decodeSkillsReloadResponse({ output: ['nope'], result: {} })).toBeUndefined()
     expect(decodeSkillsReloadResponse({ output: 'ok' })).toBeUndefined()
     expect(decodeCommandsCatalogResponse({ pairs: [['/bad', 1]] })).toBeUndefined()
     expect(
       decodeCommandsCatalogResponse({ categories: [{ name: 'Bad', pairs: [['/ok', 1]] }], pairs: [] })
     ).toBeUndefined()
+  })
+
+  test('only an explicit steer rejection proves non-admission', () => {
+    expect(classifySessionSteerResponse({ status: 'queued' })).toBe('accepted')
+    expect(classifySessionSteerResponse({ status: 'rejected' })).toBe('rejected')
+    expect(classifySessionSteerResponse({ status: 'accepted' })).toBe('uncertain')
+    expect(classifySessionSteerResponse({})).toBe('uncertain')
+    expect(classifySessionSteerResponse(null)).toBe('uncertain')
   })
 })

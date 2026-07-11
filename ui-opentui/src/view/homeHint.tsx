@@ -130,6 +130,13 @@ export function HomeHint(props: { store: SessionStore }) {
         <Show when={cat()}>
           {c => (
             <box style={{ flexDirection: 'column' }}>
+              <Show when={c().readiness.warning}>
+                {warning => (
+                  <text selectable={false}>
+                    <span style={{ fg: theme().color.warn }}>{warning()}</span>
+                  </text>
+                )}
+              </Show>
               <Section title="Available Tools" open>
                 <For each={enabledToolsets().slice(0, TOOLSETS_MAX)}>
                   {ts => (

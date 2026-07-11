@@ -62,7 +62,7 @@ async function mount(prompts: string[] = []): Promise<Harness> {
   const probe = await renderProbe(
     () => (
       <ThemeProvider theme={() => store.state.theme}>
-        <App store={store} onSubmit={t => submitted.push(t)} onType={onType} />
+        <App store={store} onSubmit={t => void submitted.push(t)} onType={onType} />
       </ThemeProvider>
     ),
     { height: 30, kittyKeyboard: true, width: 80 }

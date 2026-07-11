@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'vitest'
 
-import { trackedSessionIdAfterRequest } from '../boundary/gateway/liveGateway.ts'
+import { RawGatewayRequestError } from '../boundary/gateway/client.ts'
+import {
+  gatewayErrorFromRawFailure,
+  gatewayEventRequiresImmediateFlush,
+  planGatewayEventFlush,
+  trackedSessionIdAfterRequest
+} from '../boundary/gateway/liveGateway.ts'
 
 describe('live gateway session tracking', () => {
   test('create/resume adopt the returned live id', () => {
@@ -24,5 +30,36 @@ describe('live gateway session tracking', () => {
   test('malformed create/resume responses never replace a valid id', () => {
     expect(trackedSessionIdAfterRequest('live-1', 'session.create', {}, {})).toBe('live-1')
     expect(trackedSessionIdAfterRequest('live-1', 'session.resume', {}, { session_id: '  ' })).toBe('live-1')
+  })
+
+  test('raw failure provenance maps without string heuristics', () => {
+    expect(
+      gatewayErrorFromRawFailure('session.steer', new RawGatewayRequestError('rpc-error', 'server busy')).reason
+    ).toBe('rpc-error')
+    expect(gatewayErrorFromRawFailure('session.steer', new RawGatewayRequestError('timeout', 'anything')).reason).toBe(
+      'timeout'
+    )
+    expect(
+      gatewayErrorFromRawFailure('session.steer', new RawGatewayRequestError('transport-down', 'gateway closed')).reason
+    ).toBe('transport-down')
+    expect(gatewayErrorFromRawFailure('session.steer', new Error('unclassified boundary failure')).reason).toBe(
+      'transport-down'
+    )
+  })
+
+  test('delivery lifecycle boundaries cannot remain behind the repaint debounce', () => {
+    expect(gatewayEventRequiresImmediateFlush({ type: 'message.start' })).toBe(true)
+    expect(gatewayEventRequiresImmediateFlush({ type: 'message.complete' })).toBe(true)
+    expect(gatewayEventRequiresImmediateFlush({ type: 'error' })).toBe(true)
+    expect(gatewayEventRequiresImmediateFlush({ type: 'session.info', payload: { running: true } })).toBe(true)
+    expect(gatewayEventRequiresImmediateFlush({ type: 'gateway.ready' })).toBe(true)
+    expect(gatewayEventRequiresImmediateFlush({ type: 'gateway.exited' })).toBe(true)
+    expect(gatewayEventRequiresImmediateFlush({ type: 'message.delta', payload: { text: 'coalesce me' } })).toBe(false)
+
+    // A prior flush at t=100 would normally hold repaint traffic until t=116.
+    // Start must flush the already queued traffic synchronously so a later
+    // interrupt response continuation observes turnInFlight=true.
+    expect(planGatewayEventFlush({ type: 'message.start' }, 105, 100, true)).toBe('flush-now')
+    expect(planGatewayEventFlush({ type: 'message.delta', payload: { text: 'later' } }, 105, 100, true)).toBe('wait')
   })
 })

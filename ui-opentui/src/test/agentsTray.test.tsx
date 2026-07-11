@@ -62,7 +62,7 @@ async function mountApp(historyEntries: string[] = []): Promise<Harness> {
   const probe = await renderProbe(
     () => (
       <ThemeProvider theme={() => store.state.theme}>
-        <App store={store} onSubmit={t => submitted.push(t)} onType={onType} history={history} />
+        <App store={store} onSubmit={t => void submitted.push(t)} onType={onType} history={history} />
       </ThemeProvider>
     ),
     // kitty keyboard: a SIMULATED lone ESC never parses under legacy input, and

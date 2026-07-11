@@ -90,6 +90,11 @@ const CategorySchema = Schema.Struct({
   name: opt(Str),
   count: opt(Num)
 })
+const CatalogReadinessSchema = Schema.Struct({
+  status: opt(Schema.Literals(['ready', 'pending', 'failed'])),
+  warning: opt(Str),
+  retry_after_ms: opt(Num)
+})
 
 export const CatalogSchema = Schema.Struct({
   tools: opt(
@@ -108,7 +113,8 @@ export const CatalogSchema = Schema.Struct({
     Schema.Struct({
       servers: opt(Schema.Array(Schema.Unknown))
     })
-  )
+  ),
+  readiness: opt(CatalogReadinessSchema)
 })
 export type CatalogDecoded = typeof CatalogSchema.Type
 

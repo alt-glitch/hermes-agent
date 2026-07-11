@@ -21,6 +21,27 @@ export type SessionSaveResponse = typeof SessionSaveResponseSchema.Type
 export const ReloadEnvResponseSchema = Schema.Struct({ updated: Num })
 export type ReloadEnvResponse = typeof ReloadEnvResponseSchema.Type
 
+export const ConfigValueResponseSchema = Schema.Struct({ value: Str })
+export type ConfigValueResponse = typeof ConfigValueResponseSchema.Type
+
+export const ConfigFullResponseSchema = Schema.Struct({
+  config: Schema.Record(Str, Schema.Unknown)
+})
+export type ConfigFullResponse = typeof ConfigFullResponseSchema.Type
+
+export const ConfigMtimeResponseSchema = Schema.Struct({ mtime: Num })
+export type ConfigMtimeResponse = typeof ConfigMtimeResponseSchema.Type
+
+export const SessionSteerResponseSchema = Schema.Struct({
+  status: Schema.Literals(['queued', 'rejected']),
+  text: opt(Str)
+})
+export type SessionSteerResponse = typeof SessionSteerResponseSchema.Type
+export type SessionSteerDisposition = 'accepted' | 'rejected' | 'uncertain'
+
+export const SessionUndoResponseSchema = Schema.Struct({ removed: Num, target_text: opt(Str) })
+export type SessionUndoResponse = typeof SessionUndoResponseSchema.Type
+
 const SkillChangeSchema = Schema.Struct({
   description: opt(Str),
   name: Str
@@ -56,6 +77,11 @@ const decodeStatus = Schema.decodeUnknownOption(SessionStatusResponseSchema)
 const decodeTitle = Schema.decodeUnknownOption(SessionTitleResponseSchema)
 const decodeSave = Schema.decodeUnknownOption(SessionSaveResponseSchema)
 const decodeReloadEnv = Schema.decodeUnknownOption(ReloadEnvResponseSchema)
+const decodeConfigValue = Schema.decodeUnknownOption(ConfigValueResponseSchema)
+const decodeConfigFull = Schema.decodeUnknownOption(ConfigFullResponseSchema)
+const decodeConfigMtime = Schema.decodeUnknownOption(ConfigMtimeResponseSchema)
+const decodeSessionSteer = Schema.decodeUnknownOption(SessionSteerResponseSchema)
+const decodeSessionUndo = Schema.decodeUnknownOption(SessionUndoResponseSchema)
 const decodeSkillsReload = Schema.decodeUnknownOption(SkillsReloadResponseSchema)
 const decodeCommandsCatalog = Schema.decodeUnknownOption(CommandsCatalogResponseSchema)
 
@@ -71,6 +97,30 @@ export const decodeSessionTitleResponse = (value: unknown): SessionTitleResponse
 export const decodeSessionSaveResponse = (value: unknown): SessionSaveResponse | undefined => some(decodeSave(value))
 
 export const decodeReloadEnvResponse = (value: unknown): ReloadEnvResponse | undefined => some(decodeReloadEnv(value))
+
+export const decodeConfigValueResponse = (value: unknown): ConfigValueResponse | undefined =>
+  some(decodeConfigValue(value))
+
+export const decodeConfigFullResponse = (value: unknown): ConfigFullResponse | undefined =>
+  some(decodeConfigFull(value))
+
+export const decodeConfigMtimeResponse = (value: unknown): ConfigMtimeResponse | undefined =>
+  some(decodeConfigMtime(value))
+
+export const decodeSessionSteerResponse = (value: unknown): SessionSteerResponse | undefined =>
+  some(decodeSessionSteer(value))
+
+/** A documented `rejected` response proves non-admission. Malformed or
+ * version-skewed successful responses prove nothing and therefore stay
+ * ambiguous; treating them as rejection would permit an automatic duplicate. */
+export const classifySessionSteerResponse = (value: unknown): SessionSteerDisposition => {
+  const decoded = decodeSessionSteerResponse(value)
+  if (!decoded) return 'uncertain'
+  return decoded.status === 'queued' ? 'accepted' : 'rejected'
+}
+
+export const decodeSessionUndoResponse = (value: unknown): SessionUndoResponse | undefined =>
+  some(decodeSessionUndo(value))
 
 export const decodeSkillsReloadResponse = (value: unknown): SkillsReloadResponse | undefined =>
   some(decodeSkillsReload(value))

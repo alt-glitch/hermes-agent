@@ -125,6 +125,10 @@ export const replaceSession = Effect.fn('SessionLifecycle.replace')(function* (
 
 export interface ResumeSessionOptions {
   readonly cols: number
+  /** Preserve input authored after the async transition began. Ordinary user
+   * switches retain only the draft intended for the target session; crash
+   * recovery retains the same durable session's bounded queue/editor too. */
+  readonly preserveLocalInput?: 'draft' | 'same-session'
   readonly targetSessionId: string
 }
 
@@ -178,6 +182,12 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
     const t1 = Date.now()
     const snapshot = mapResumeHistory(response.messages)
     const resumedId = response.resumed?.trim() || options.targetSessionId
+    // Capture at the COMMIT boundary, not before the RPC: the composer remains
+    // editable while session.resume is in flight and those latest bytes own the
+    // target session. Crash recovery additionally owns the same-session queue.
+    const preservedDraft = options.preserveLocalInput ? store.state.composerDraft : ''
+    const preservedQueue = options.preserveLocalInput === 'same-session' ? [...store.state.queuedPrompts] : []
+    const preservedEditIndex = options.preserveLocalInput === 'same-session' ? store.state.queueEditIndex : undefined
     store.commitSessionSnapshot(
       liveSessionId,
       snapshot,
@@ -185,6 +195,11 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
       event => eventBelongsToSession(event, liveSessionId),
       resumedId
     )
+    for (const text of preservedQueue) store.enqueuePrompt(text)
+    if (preservedDraft) store.replaceComposerDraft(preservedDraft)
+    if (preservedEditIndex !== undefined && preservedEditIndex < store.queuedCount()) {
+      store.setQueueEditIndex(preservedEditIndex)
+    }
     committed = true
     const t2 = Date.now()
 

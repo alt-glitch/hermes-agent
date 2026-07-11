@@ -5,8 +5,11 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import type { DetailsMode } from '../logic/details.ts'
+import type { BusyInputMode } from '../logic/busyQueue.ts'
 import {
   buildModelTabs,
+  BUSY_QUEUE_FULL_MESSAGE,
+  clearModelPrefetch,
   classifySubmit,
   clientCommandNames,
   catalogCommandItems,
@@ -27,6 +30,7 @@ import {
   registerPickerRefresh,
   registerPickerTabs,
   runPickerRefresh,
+  startModelPrefetch,
   type SlashContext
 } from '../logic/slash.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
@@ -38,7 +42,7 @@ afterEach(() => {
   vi.useRealTimers()
   registerPickerRefresh(undefined)
   registerPickerTabs(undefined)
-  registerModelPrefetch(undefined)
+  clearModelPrefetch()
 })
 
 /** A minimal billing.state snapshot for the /billing dispatch tests. */
@@ -309,6 +313,7 @@ interface Probe {
   commandCatalogs: Array<{ catalog: unknown; removedSkills: readonly string[] }>
   session: { value: string | undefined }
   busy: { value: boolean }
+  transitioning: { value: boolean }
   dashboard: { value: boolean }
   copied: number[]
   copyN: { value: (n: number) => boolean }
@@ -321,6 +326,13 @@ interface Probe {
   timestampsFlag: { value: boolean }
   /** /reasoning full|clamp display flag — expand all thinking. */
   reasoningFullFlag: { value: boolean }
+  busyMode: { value: BusyInputMode }
+  queued: string[]
+  queueAccept: { value: boolean }
+  prefills: string[]
+  trimCalls: { value: number }
+  historyMutation: { begins: number; ends: number; value: boolean }
+  submitAccept: { value: boolean }
 }
 
 function makeCtx(request: (method: string, params: Record<string, unknown>) => Promise<unknown>): Probe {
@@ -350,6 +362,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const commandCatalogs: Probe['commandCatalogs'] = []
   const session: Probe['session'] = { value: 'sid-1' }
   const busy = { value: false }
+  const transitioning = { value: false }
   const dashboard = { value: false }
   const copied: number[] = []
   const copyN: Probe['copyN'] = { value: () => false }
@@ -358,6 +371,13 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
   const timestampsFlag: Probe['timestampsFlag'] = { value: false }
   const reasoningFullFlag: Probe['reasoningFullFlag'] = { value: false }
+  const busyMode: Probe['busyMode'] = { value: 'queue' }
+  const queued: string[] = []
+  const queueAccept = { value: true }
+  const prefills: string[] = []
+  const trimCalls = { value: 0 }
+  const historyMutation = { begins: 0, ends: 0, value: false }
+  const submitAccept = { value: true }
   const ctx: SlashContext = {
     guardBusySessionSwitch: () => busy.value,
     newSession: (message, title) => newSessions.push([message, title]),
@@ -390,6 +410,50 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     setTimestamps: on => (timestampsFlag.value = on),
     reasoningFull: () => reasoningFullFlag.value,
     setReasoningFull: on => (reasoningFullFlag.value = on),
+    isBusy: () => busy.value,
+    isSessionTransitioning: () => transitioning.value,
+    beginHistoryMutation: () => {
+      if (historyMutation.value) return false
+      historyMutation.value = true
+      historyMutation.begins += 1
+      return true
+    },
+    endHistoryMutation: () => {
+      historyMutation.value = false
+      historyMutation.ends += 1
+    },
+    busyInputMode: () => busyMode.value,
+    setBusyInputMode: mode => (busyMode.value = mode),
+    queueCount: () => queued.length,
+    enqueueQueued: (text, front = false) => {
+      if (!queueAccept.value) return false
+      if (front) queued.unshift(text)
+      else queued.push(text)
+      return true
+    },
+    clearQueued: () => queued.splice(0).length,
+    steer: async (sid, text) => {
+      const params = { session_id: sid, text }
+      calls.push({ method: 'session.steer', params })
+      const raw = await request('session.steer', params)
+      const status = raw && typeof raw === 'object' && 'status' in raw ? raw.status : undefined
+      if (status === 'queued') return 'queued'
+      if (status === 'retained') return 'retained'
+      if (status === 'uncertain') {
+        queued.push(text)
+        return 'uncertain'
+      }
+      // The production entry decodes every non-queued success as a definite
+      // rejection and retains the body before returning `fallback`.
+      queued.push(text)
+      return 'fallback'
+    },
+    lastUserMessage: () => [...history.value].reverse().find(message => message.role === 'user')?.text,
+    trimLastExchange: () => {
+      trimCalls.value += 1
+      return 2
+    },
+    prefillComposer: text => prefills.push(text),
     renderableCount: () => undefined,
     confirm: (request, onConfirm) => confirmed.push({ request, onConfirm }),
     copyResponse: n => {
@@ -423,8 +487,12 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       return request(method, params)
     },
     sessionId: () => session.value,
-    submit: text => submitted.push(text),
-    submitSkill: (command, body) => skillSubmitted.push({ command, body })
+    sessionOwnerId: () => session.value,
+    submit: text => {
+      submitted.push(text)
+      return submitAccept.value
+    },
+    submitSkill: (command, body) => void skillSubmitted.push({ command, body })
   }
   return {
     calls,
@@ -436,6 +504,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     commandCatalogs,
     session,
     busy,
+    transitioning,
     compactFlag,
     confirmed,
     copied,
@@ -445,6 +514,11 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     detailsFlag,
     timestampsFlag,
     reasoningFullFlag,
+    busyMode,
+    queued,
+    queueAccept,
+    prefills,
+    trimCalls,
     modelCache,
     paged,
     pickers,
@@ -453,6 +527,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     dashboardMode,
     exitCodes,
     history,
+    historyMutation,
     logLines,
     logLimits,
     quit,
@@ -461,6 +536,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     skillSubmitted,
     sessionPickers,
     submitted,
+    submitAccept,
     system
   }
 }
@@ -550,6 +626,252 @@ describe('dispatchSlash — client commands', () => {
     await dispatchSlash('/clear', blocked.ctx)
     expect(blocked.confirmed).toHaveLength(0)
     expect(blocked.newSessions).toHaveLength(0)
+  })
+
+  test('/queue and /q inspect/enqueue locally, with explicit bounded-queue failure', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('queue must stay local')
+    })
+    await dispatchSlash('/queue', p.ctx)
+    await dispatchSlash('/q first queued prompt', p.ctx)
+    await dispatchSlash(`/queue ${'x'.repeat(70)}`, p.ctx)
+    expect(p.calls).toEqual([])
+    expect(p.queued).toEqual(['first queued prompt', 'x'.repeat(70)])
+    expect(p.system[0]).toBe('0 queued message(s)')
+    expect(p.system[1]).toBe('queued: "first queued prompt"')
+    expect(p.system[2]).toBe(`queued: "${'x'.repeat(50)}…"`)
+
+    p.queueAccept.value = false
+    await dispatchSlash('/queue rejected', p.ctx)
+    expect(p.queued).toHaveLength(2)
+    expect(p.system.at(-1)).toBe(BUSY_QUEUE_FULL_MESSAGE)
+    expect(p.prefills).toEqual(['/queue rejected'])
+  })
+
+  test('/queue --clear requires explicit confirmation and bulk-discards', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/queue first', p.ctx)
+    await dispatchSlash('/queue second', p.ctx)
+    await dispatchSlash('/queue --clear', p.ctx)
+    expect(p.queued).toEqual(['first', 'second'])
+    expect(p.confirmed).toHaveLength(1)
+    expect(p.confirmed[0]?.request).toMatchObject({ danger: true, title: 'Clear the pending queue?' })
+    p.confirmed[0]?.onConfirm()
+    expect(p.queued).toEqual([])
+    expect(p.system.at(-1)).toBe('discarded 2 queued message(s)')
+  })
+
+  test('/steer queues while idle and uses the active session RPC while busy', async () => {
+    const idle = makeCtx(async () => {
+      throw new Error('idle steer must stay local')
+    })
+    await dispatchSlash('/steer later', idle.ctx)
+    expect(idle.queued).toEqual(['later'])
+    expect(idle.system).toEqual(['no active turn — queued for next: "later"'])
+
+    const live = makeCtx(async method => (method === 'session.steer' ? { status: 'queued', text: 'now' } : {}))
+    live.busy.value = true
+    await dispatchSlash('/steer now', live.ctx)
+    expect(live.calls).toEqual([{ method: 'session.steer', params: { session_id: 'sid-1', text: 'now' } }])
+    expect(live.system).toEqual(['steer queued — arrives after next tool call: "now"'])
+
+    const uncertain = makeCtx(async method => (method === 'session.steer' ? { status: 'uncertain' } : {}))
+    uncertain.busy.value = true
+    await dispatchSlash('/steer retry explicitly', uncertain.ctx)
+    expect(uncertain.queued).toEqual(['retry explicitly'])
+    expect(uncertain.system).toEqual(['steer delivery uncertain — message retained; send it explicitly to retry'])
+
+    const fallback = makeCtx(async method => (method === 'session.steer' ? { status: 'fallback' } : {}))
+    fallback.busy.value = true
+    await dispatchSlash('/steer queued atomically', fallback.ctx)
+    expect(fallback.queued).toEqual(['queued atomically'])
+    expect(fallback.system).toEqual(['steer rejected — message queued for next turn'])
+
+    const invalid = makeCtx(async () => ({ status: 'accepted' }))
+    invalid.busy.value = true
+    await dispatchSlash('/steer malformed', invalid.ctx)
+    expect(invalid.queued).toEqual(['malformed'])
+    expect(invalid.system).toEqual(['steer rejected — message queued for next turn'])
+  })
+
+  test('/steer preserves rejected, failed, and globally-superseded input', async () => {
+    const rejected = makeCtx(async () => ({ status: 'rejected' }))
+    rejected.busy.value = true
+    await dispatchSlash('/steer rejected text', rejected.ctx)
+    expect(rejected.queued).toEqual(['rejected text'])
+    expect(rejected.system).toEqual(['steer rejected — message queued for next turn'])
+
+    const failed = makeCtx(async () => {
+      throw new Error('transport failed')
+    })
+    failed.busy.value = true
+    await dispatchSlash('/steer failed text', failed.ctx)
+    expect(failed.queued).toEqual(['failed text'])
+    expect(failed.system).toEqual(['/steer: transport failed — message queued for next turn'])
+
+    let resolveSteer!: (value: unknown) => void
+    const pending = new Promise<unknown>(resolve => (resolveSteer = resolve))
+    const superseded = makeCtx(async method =>
+      method === 'session.steer' ? pending : method === 'session.status' ? { output: 'ready' } : {}
+    )
+    superseded.busy.value = true
+    const steer = dispatchSlash('/steer keep me', superseded.ctx)
+    await Promise.resolve()
+    await dispatchSlash('/status', superseded.ctx)
+    resolveSteer({ status: 'rejected' })
+    await steer
+    expect(superseded.queued).toEqual(['keep me'])
+  })
+
+  test('/busy reads or persists the live mode, rejects garbage, and decodes responses', async () => {
+    const p = makeCtx(async (method, params) => {
+      if (method === 'config.get') return { value: 'steer' }
+      if (method === 'config.set') return { value: params.value }
+      return {}
+    })
+    await dispatchSlash('/busy status', p.ctx)
+    expect(p.busyMode.value).toBe('queue') // status reports; it does not change the live policy
+    await dispatchSlash('/busy interrupt', p.ctx)
+    expect(p.busyMode.value).toBe('interrupt')
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'busy', value: 'interrupt' } }])
+    expect(p.system).toEqual(['busy input mode: queue', 'busy input mode: interrupt'])
+
+    await dispatchSlash('/busy drop', p.ctx)
+    expect(p.system.at(-1)).toBe('usage: /busy [queue|steer|interrupt|status]')
+    expect(p.calls).toHaveLength(1)
+
+    const malformed = makeCtx(async () => ({ value: 42 }))
+    await dispatchSlash('/busy steer', malformed.ctx)
+    expect(malformed.system).toEqual(['/busy: invalid config response'])
+  })
+
+  test('/undo rewinds gateway + visible exchange and guards no-session/busy/malformed cases', async () => {
+    const p = makeCtx(async method => (method === 'session.undo' ? { removed: 2 } : {}))
+    await dispatchSlash('/undo', p.ctx)
+    expect(p.calls).toEqual([{ method: 'session.undo', params: { session_id: 'sid-1' } }])
+    expect(p.trimCalls.value).toBe(1)
+    expect(p.system).toEqual(['undid 2 messages'])
+
+    const none = makeCtx(async () => ({}))
+    none.session.value = undefined
+    await dispatchSlash('/undo', none.ctx)
+    expect(none.system).toEqual(['nothing to undo'])
+    expect(none.calls).toEqual([])
+
+    const busy = makeCtx(async () => ({}))
+    busy.busy.value = true
+    await dispatchSlash('/undo', busy.ctx)
+    expect(busy.system).toEqual(['session busy — /interrupt the current turn before /undo'])
+    expect(busy.calls).toEqual([])
+
+    const malformed = makeCtx(async () => ({ removed: -1 }))
+    await dispatchSlash('/undo', malformed.ctx)
+    expect(malformed.system).toEqual(['/undo: invalid session.undo response'])
+    expect(malformed.trimCalls.value).toBe(0)
+  })
+
+  test('/retry captures the last user body, rewinds once, and resubmits once', async () => {
+    const p = makeCtx(async method => (method === 'session.undo' ? { removed: 2 } : {}))
+    p.history.value = [
+      { role: 'user', text: 'try this' },
+      { role: 'assistant', text: 'failed response' }
+    ]
+    await dispatchSlash('/retry', p.ctx)
+    expect(p.calls).toEqual([{ method: 'session.undo', params: { session_id: 'sid-1' } }])
+    expect(p.trimCalls.value).toBe(1)
+    expect(p.submitted).toEqual(['try this'])
+
+    const empty = makeCtx(async () => ({}))
+    await dispatchSlash('/retry', empty.ctx)
+    expect(empty.system).toEqual(['nothing to retry'])
+
+    const busy = makeCtx(async () => ({}))
+    busy.history.value = [{ role: 'user', text: 'blocked' }]
+    busy.busy.value = true
+    await dispatchSlash('/retry', busy.ctx)
+    expect(busy.system).toEqual(['session busy — /interrupt the current turn before /retry'])
+    expect(busy.calls).toEqual([])
+  })
+
+  test('/queue, /steer, /undo, and /retry reject cleanly during a session transition', async () => {
+    const p = makeCtx(async () => ({}))
+    p.transitioning.value = true
+    p.history.value = [{ role: 'user', text: 'last prompt' }]
+    await dispatchSlash('/queue later', p.ctx)
+    await dispatchSlash('/steer correction', p.ctx)
+    await dispatchSlash('/undo', p.ctx)
+    await dispatchSlash('/retry', p.ctx)
+    expect(p.calls).toEqual([])
+    expect(p.queued).toEqual([])
+    expect(p.trimCalls.value).toBe(0)
+    expect(p.submitted).toEqual([])
+    expect(p.prefills).toEqual(['/queue later', '/steer correction'])
+    expect(p.system).toEqual([
+      'session switch in progress — retry the queue command when it finishes',
+      'session switch in progress — retry /steer when it finishes',
+      'session switch in progress — retry /undo when it finishes',
+      'session switch in progress — retry /retry when it finishes'
+    ])
+  })
+
+  test('history mutation lock serializes rapid retries without global-flight suppression', async () => {
+    let resolveUndo!: (value: unknown) => void
+    const pendingUndo = new Promise<unknown>(resolve => (resolveUndo = resolve))
+    const p = makeCtx(async method => (method === 'session.undo' ? pendingUndo : { output: 'ok' }))
+    p.history.value = [
+      { role: 'user', text: 'retry exactly once' },
+      { role: 'assistant', text: 'old answer' }
+    ]
+
+    const first = dispatchSlash('/retry', p.ctx)
+    await Promise.resolve()
+    const second = dispatchSlash('/retry', p.ctx)
+    await second
+    expect(p.calls.filter(call => call.method === 'session.undo')).toHaveLength(1)
+    expect(p.system).toContain('history update already in progress — wait before /retry')
+
+    resolveUndo({ removed: 2 })
+    await first
+    expect(p.trimCalls.value).toBe(1)
+    expect(p.submitted).toEqual(['retry exactly once'])
+    expect(p.historyMutation).toEqual({ begins: 1, ends: 1, value: false })
+  })
+
+  test('a later read-only slash command cannot suppress undo reconciliation', async () => {
+    let resolveUndo!: (value: unknown) => void
+    const pendingUndo = new Promise<unknown>(resolve => (resolveUndo = resolve))
+    const p = makeCtx(async method =>
+      method === 'session.undo' ? pendingUndo : method === 'session.status' ? { output: 'ready' } : {}
+    )
+    const undo = dispatchSlash('/undo', p.ctx)
+    await Promise.resolve()
+    await dispatchSlash('/status', p.ctx)
+    resolveUndo({ removed: 2 })
+    await undo
+    expect(p.trimCalls.value).toBe(1)
+    expect(p.system).toContain('undid 2 messages')
+  })
+
+  test('retry restores the body to the composer when resubmit is rejected', async () => {
+    const p = makeCtx(async method => (method === 'session.undo' ? { removed: 2 } : {}))
+    p.history.value = [
+      { role: 'user', text: 'do not lose this' },
+      { role: 'assistant', text: 'old answer' }
+    ]
+    p.submitAccept.value = false
+    await dispatchSlash('/retry', p.ctx)
+    expect(p.prefills).toEqual(['do not lose this'])
+    expect(p.system).toContain('retry could not submit — message restored to composer')
+    expect(p.historyMutation.value).toBe(false)
+  })
+
+  test('a command.dispatch prefill writes the native composer draft instead of printing its body', async () => {
+    const p = makeCtx(async method =>
+      method === 'slash.exec' ? { message: 'editable prompt', notice: 'edit and resubmit', type: 'prefill' } : {}
+    )
+    await dispatchSlash('/extension-undo', p.ctx)
+    expect(p.prefills).toEqual(['editable prompt'])
+    expect(p.system).toEqual(['edit and resubmit'])
   })
 
   test('/logs opens the pager with the recent ring lines', async () => {
@@ -767,25 +1089,25 @@ describe('dispatchSlash — client commands', () => {
     expect(pickerTabs(p.pickers[0]!.items)).toEqual([])
   })
 
-  test('/model during an in-flight bootstrap prefetch performs ZERO additional model.options RPCs', async () => {
+  test('bootstrap model prefetch is non-blocking and early /model performs ZERO additional RPCs', async () => {
     const p = makeCtx(async () => {
       throw new Error('no RPC expected — the prefetch owns model.options')
     })
     // a slow prefetch (entry/main.tsx shape): resolving it fills the cache
-    let finish: () => void = () => {}
-    registerModelPrefetch(
-      new Promise<void>(resolve => {
-        finish = () => {
-          p.modelCache.value = [
-            { group: 'Anthropic', haystacks: ['anthropic'], label: 'claude-sonnet-4.6', value: 'a' }
-          ]
-          resolve()
-        }
+    let finish: (items: PickerItem[]) => void = () => {}
+    const started = startModelPrefetch(
+      p.session.value!,
+      new Promise<PickerItem[]>(resolve => {
+        finish = resolve
       }),
+      items => {
+        p.modelCache.value = items
+      },
       5000
     )
+    expect(started).toBeUndefined() // session setup never receives a promise to await
     const dispatched = dispatchSlash('/model', p.ctx)
-    finish() // prefetch lands while /model awaits it
+    finish([{ group: 'Anthropic', haystacks: ['anthropic'], label: 'claude-sonnet-4.6', value: 'a' }])
     await dispatched
     expect(p.pickers).toHaveLength(1) // opened from the prefetched cache
     expect(p.pickers[0]!.items).toHaveLength(1)
@@ -794,10 +1116,38 @@ describe('dispatchSlash — client commands', () => {
 
   test('/model with a HUNG prefetch still opens via its own fetch after the bound', async () => {
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
-    registerModelPrefetch(new Promise(() => {}), 10) // never settles; tiny test bound
+    registerModelPrefetch(p.session.value!, new Promise(() => {}), 10) // never settles; tiny test bound
     await dispatchSlash('/model', p.ctx)
     expect(p.pickers).toHaveLength(1) // fell back to fetching itself
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(1)
+  })
+
+  test('/model after a REJECTED background prefetch falls back to one fetch', async () => {
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    startModelPrefetch(p.session.value!, Promise.reject(new Error('background hydration failed')), () => {})
+    await dispatchSlash('/model', p.ctx)
+    expect(p.pickers).toHaveLength(1)
+    expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(1)
+  })
+
+  test('/model never waits on the predecessor session prefetch', async () => {
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    startModelPrefetch('sid-old', new Promise(() => {}), () => {}, 5000)
+    p.session.value = 'sid-new'
+
+    await dispatchSlash('/model', p.ctx)
+
+    expect(p.pickers).toHaveLength(1)
+    expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(1)
+  })
+
+  test('client slash RPC failures resolve with a user-visible error', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('gateway unavailable')
+    })
+
+    await expect(dispatchSlash('/skills', p.ctx)).resolves.toBeUndefined()
+    expect(p.system).toEqual(['/skills: gateway unavailable'])
   })
 
   test('/model <name> switches directly without opening the picker', async () => {
@@ -1191,12 +1541,12 @@ describe('dispatchSlash — client commands', () => {
     }
   })
 
-  test('registers every local UX command (with exit as the only quit alias)', () => {
+  test('registers local UX commands and keeps /q on queue rather than quit', () => {
     const names = clientCommandNames()
     for (const name of ['help', 'quit', 'exit', 'update', 'redraw', 'history', 'fortune', 'logs']) {
       expect(names).toContain(name)
     }
-    expect(names).not.toContain('q')
+    expect(names).toContain('q')
   })
 
   test('/status reads the authoritative live session and always opens the status pager', async () => {
@@ -1517,6 +1867,14 @@ describe('dispatchSlash — server ladder', () => {
     expect(p.submitted).toEqual(['do the goal'])
     // …and the bogus "/goal: no output" line is NOT present.
     expect(p.system).not.toContain('/goal: no output')
+  })
+
+  test('a rejected {type:send} result restores the generated body instead of dropping it', async () => {
+    const p = makeCtx(async () => ({ type: 'send', message: 'release-critical generated prompt' }))
+    const ctx = { ...p.ctx, submit: () => false }
+    await dispatchSlash('/extension', ctx)
+    expect(p.prefills).toEqual(['release-critical generated prompt'])
+    expect(p.system.at(-1)).toBe('generated prompt could not be queued — message restored to composer')
   })
 
   test('slash.exec returns a {type:exec} dispatch payload → exec output (no "no output")', async () => {

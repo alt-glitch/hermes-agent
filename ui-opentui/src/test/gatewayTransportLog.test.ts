@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest'
 import {
   boundTransportLogLine,
   formatRpcErrorLog,
+  notifyTransportExit,
   TRANSPORT_LOG_LINE_LIMIT,
   TRANSPORT_LOG_RING_LIMIT,
   TransportLogRing
@@ -43,5 +44,29 @@ describe('bounded gateway transport log', () => {
     expect(formatRpcErrorLog('commands.catalog', { code: 'bad', message: 42 })).toBe(
       '[rpc] commands.catalog failed: rpc error'
     )
+  })
+
+  test('publishes transport-down provenance before pending RPCs reject', () => {
+    const order: string[] = []
+    notifyTransportExit(
+      'child exited',
+      reason => order.push(`exit:${reason}`),
+      reason => order.push(`reject:${reason}`)
+    )
+    expect(order).toEqual(['exit:child exited', 'reject:child exited'])
+  })
+
+  test('pending RPCs still reject when an exit observer throws', () => {
+    const rejected: string[] = []
+    expect(() =>
+      notifyTransportExit(
+        'child exited',
+        () => {
+          throw new Error('observer failed')
+        },
+        reason => rejected.push(reason)
+      )
+    ).toThrow('observer failed')
+    expect(rejected).toEqual(['child exited'])
   })
 })

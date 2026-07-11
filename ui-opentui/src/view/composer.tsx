@@ -54,6 +54,7 @@ import { useKeyboard, useRenderer } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
 import { MENU_MAX, acceptChangesToken, applyCompletion, routeMenuKey } from '../logic/completionMenu.ts'
+import { BUSY_QUEUE_MAX_CHARS, BUSY_QUEUE_MAX_EDIT_CHARS } from '../logic/busyQueue.ts'
 import { envComposerRows } from '../logic/env.ts'
 import { createDoublePress } from '../logic/promptHistory.ts'
 import { analyzeSlash, learnableNames, nativeCharOffset } from '../logic/skillMatch.ts'
@@ -150,7 +151,12 @@ function isPrintableKey(k: {
 }
 
 export function Composer(props: {
-  onSubmit: (text: string) => void
+  onSubmit: (text: string) => boolean | void
+  onSubmitQueued?: ((index: number, text: string) => boolean | void) | undefined
+  onSendQueuedIndex?: ((index: number) => boolean | void) | undefined
+  /** Ink's second empty Enter within 450ms: stop a live turn or force one
+   * queued row while idle. The entry owns the session/transport decision. */
+  onDoubleEmptySubmit?: (() => void) | undefined
   onType?: ((text: string, cursor: number) => void) | undefined
   completions?: (() => CompletionItem[]) | undefined
   completionFrom?: (() => number) | undefined
@@ -158,6 +164,10 @@ export function Composer(props: {
   history?: PromptHistory | undefined
   onImagePaste?: (() => void) | undefined
   pasteStore?: PasteStore | undefined
+  /** A paste/programmatic prefill exceeded the bounded retained-input store.
+   * The body is not inserted into the native textarea; the host surfaces a
+   * visible retry/split hint while the user's clipboard remains untouched. */
+  onPasteLimitExceeded?: ((maxBytes: number) => void) | undefined
   /** Down on an EMPTY focused composer with no dropdown open (Epic 2.7 tray
    *  handoff): return true to consume the key (the tray took focus). */
   onFocusDown?: (() => boolean) | undefined
@@ -172,9 +182,15 @@ export function Composer(props: {
   initialDraft?: (() => string) | undefined
   /** Monotonic signal used to clear the mounted uncontrolled textarea. */
   clearVersion?: (() => number) | undefined
+  /** Monotonic signal used to replace it with initialDraft (`/undo` prefill). */
+  replaceVersion?: (() => number) | undefined
   /** Called with the live draft text on every edit (persist) and '' on submit
    *  (clear) — lets the parent stash it so it outlives a composer unmount. */
   onDraftChange?: ((text: string) => void) | undefined
+  queued?: (() => readonly string[]) | undefined
+  queueEditIndex?: (() => number | undefined) | undefined
+  onQueueEdit?: ((index: number | undefined) => void) | undefined
+  onQueueRemove?: ((index: number) => void) | undefined
 }) {
   const theme = useTheme()
   const dims = useDimensions()
@@ -187,6 +203,12 @@ export function Composer(props: {
   let ta: TextareaRenderable | undefined
   let submitting = false
   const completions = () => props.completions?.() ?? []
+  const queued = () => props.queued?.() ?? []
+  const queueEditIndex = () => props.queueEditIndex?.()
+  const queueEditOversized = () => {
+    const index = queueEditIndex()
+    return index !== undefined && (queued()[index]?.length ?? 0) > BUSY_QUEUE_MAX_EDIT_CHARS
+  }
   /** The gateway's dropdown rows (capped; selection wraps within them). */
   const storeItems = () => completions().slice(0, MENU_MAX)
 
@@ -328,11 +350,86 @@ export function Composer(props: {
   // signal so the dropdown hint stays reactive; the key handler re-checks
   // `ta.plainText` directly.
 
+  // Reconcile retained paste bodies against the LIVE buffer after native edits.
+  // Reading in a microtask is deliberate: a session transition may clear and
+  // restore the same draft token in one synchronous turn. The latest buffer wins,
+  // so the transient clear cannot release a body that is immediately restored.
+  let pasteReconcileVersion = 0
+  const reconcilePastesSoon = (): void => {
+    const version = ++pasteReconcileVersion
+    queueMicrotask(() => {
+      if (version !== pasteReconcileVersion || !ta || ta.isDestroyed) return
+      props.pasteStore?.retainOnly(ta.plainText)
+    })
+  }
+
   /** Replace the textarea content and park the cursor at the end (history recall). */
-  const setBuffer = (text: string) => {
-    if (!ta) return
+  const setBuffer = (text: string): boolean => {
+    if (!ta || text.length > BUSY_QUEUE_MAX_EDIT_CHARS) return false
     ta.setText(text)
     ta.cursorOffset = text.length
+    // Programmatic replacement/history recall abandons every retained paste
+    // token not reachable from the new buffer. Restoring the same token across
+    // a session clear→restore keeps it live.
+    props.pasteStore?.retainOnly(text)
+    return true
+  }
+
+  /** Programmatic prefill/history restoration must never copy an oversized body
+   * into the native textarea. When the shared PasteStore is available, retain
+   * the full source behind its small expandable token. Without one, leave the
+   * source in parent state instead of clearing/destroying it. */
+  const editableProgrammaticText = (text: string): string | undefined => {
+    if (text.length <= BUSY_QUEUE_MAX_EDIT_CHARS) return text
+    if (!props.pasteStore) return undefined
+    const token = props.pasteStore.replace(text)
+    if (token === undefined) {
+      props.onPasteLimitExceeded?.(props.pasteStore.stats().maxBytes)
+      // Keep parent state aligned with the still-visible native draft instead
+      // of retaining the rejected multi-megabyte replacement there.
+      props.onDraftChange?.(ta?.plainText ?? '')
+      return undefined
+    }
+    props.onDraftChange?.(token)
+    return token
+  }
+
+  const clearBuffer = (discardPastes = false) => {
+    if (!ta || ta.isDestroyed) return
+    if (discardPastes) props.pasteStore?.discard(ta.plainText)
+    // OpenTUI's `clear()` is an edit operation and may retain the prior native
+    // rope in undo history. This path is a hard ownership boundary (submit,
+    // queue-edit cancel, explicit draft clear), so use the documented reset
+    // API: it clears history and replaces the reusable mem buffer in place.
+    ta.setText('')
+    setBufText('')
+    props.history?.reset()
+    props.onDraftChange?.('')
+    props.onDismiss?.()
+  }
+
+  /** Ink queue navigation: Up starts at row 1 and advances; Down starts at the
+   * tail and walks backward. The selected body is loaded for edit/send. */
+  const cycleQueue = (direction: 1 | -1): boolean => {
+    const items = queued()
+    if (items.length === 0) return false
+    const current = queueEditIndex()
+    const index =
+      current === undefined
+        ? direction > 0
+          ? 0
+          : items.length - 1
+        : (current + direction + items.length) % items.length
+    const text = items[index]
+    if (text === undefined) return false
+    props.onQueueEdit?.(index)
+    props.history?.reset()
+    // A multi-megabyte row is still selectable/sendable/deletable, but copying
+    // it into the native textarea can freeze the renderer. Keep the buffer
+    // empty and let Enter route the retained store row directly.
+    if (text.length > BUSY_QUEUE_MAX_EDIT_CHARS) clearBuffer(true)
+    else setBuffer(text)
+    return true
   }
 
   // Ctrl+C clears a non-empty idle draft before it exits/requests a dashboard
@@ -343,12 +440,24 @@ export function Composer(props: {
     const version = props.clearVersion?.() ?? 0
     if (version === seenClearVersion) return
     seenClearVersion = version
+    clearBuffer()
+    if (queueEditIndex() !== undefined) props.onQueueEdit?.(undefined)
+  })
+
+  // `/undo` and command-dispatch prefill replace a mounted uncontrolled
+  // textarea without remounting it (cursor lands at the end for immediate edit).
+  let seenReplaceVersion = props.replaceVersion?.() ?? 0
+  createEffect(() => {
+    const version = props.replaceVersion?.() ?? 0
+    if (version === seenReplaceVersion) return
+    seenReplaceVersion = version
     if (!ta || ta.isDestroyed) return
-    ta.clear()
-    setBufText('')
+    const text = props.initialDraft?.() ?? ''
+    const editable = editableProgrammaticText(text)
+    if (editable !== undefined && setBuffer(editable)) setBufText(editable)
     props.history?.reset()
-    props.onDraftChange?.('')
     props.onDismiss?.()
+    ta.focus()
   })
 
   /** Splice the n-th candidate into the buffer (Tab/Enter accept). Only the token
@@ -385,17 +494,43 @@ export function Composer(props: {
   // returns before press() is reached (so a dismissing Esc never arms), and any
   // other key resets the window (intervening keys disarm).
   const doubleEsc = createDoublePress()
+  const doubleEmptyEnter = createDoublePress(450)
 
   const submit = () => {
     if (submitting || !ta) return
     // Expand any `[Pasted text #N]` placeholders back to their full content before
     // sending (item: pasted-text). No-op when nothing was placeheld.
-    const text = (props.pasteStore?.expand(ta.plainText) ?? ta.plainText).trim()
-    if (!text) return
+    const expanded = props.pasteStore
+      ? props.pasteStore.expand(ta.plainText, BUSY_QUEUE_MAX_CHARS)
+      : ta.plainText.length <= BUSY_QUEUE_MAX_CHARS
+        ? ta.plainText
+        : undefined
+    if (expanded === undefined) {
+      // Consume the submit gesture but retain the exact visible draft + bodies;
+      // the user can remove duplicate tokens or split the prompt safely.
+      props.onPasteLimitExceeded?.(BUSY_QUEUE_MAX_CHARS * 2)
+      return
+    }
+    const text = expanded.trim()
+    if (!text) {
+      if (doubleEmptyEnter.press()) props.onDoubleEmptySubmit?.()
+      return
+    }
+    doubleEmptyEnter.reset()
     submitting = true
-    props.onSubmit(text)
-    props.history?.push(text)
-    ta.clear()
+    const editIndex = queueEditIndex()
+    const accepted =
+      editIndex !== undefined && props.onSubmitQueued ? props.onSubmitQueued(editIndex, text) : props.onSubmit(text)
+    if (accepted === false) {
+      submitting = false
+      return
+    }
+    // Never persist a body that cannot be recalled into the native textarea
+    // without violating the measured edit-latency ceiling. Large paste bodies
+    // remain in the transcript/session; only local Up-history omits them.
+    if (editIndex === undefined && text.length <= BUSY_QUEUE_MAX_EDIT_CHARS) props.history?.push(text)
+    clearBuffer()
+    if (editIndex !== undefined) props.onQueueEdit?.(undefined)
     props.onDraftChange?.('') // submitted → drop the persisted draft (explicit; don't rely on clear()'s onContentChange)
     props.pasteStore?.clear()
     props.onDismiss?.()
@@ -418,7 +553,17 @@ export function Composer(props: {
     // A large paste becomes a compact `[Pasted text #N +M lines]` chip instead
     // of flooding the input; the real text is expanded back on submit.
     if (props.pasteStore && shouldPlaceholder(text)) {
-      ta?.insertText(props.pasteStore.add(text))
+      const token = props.pasteStore.add(text)
+      if (token === undefined) {
+        props.onPasteLimitExceeded?.(props.pasteStore.stats().maxBytes)
+        return true
+      }
+      if (!ta || ta.isDestroyed) {
+        props.pasteStore.discard(token)
+        return true
+      }
+      ta.insertText(token)
+      reconcilePastesSoon()
       return true
     }
     // Small paste: the focused textarea inserts it natively; the global path
@@ -463,7 +608,56 @@ export function Composer(props: {
     // 0) double-Esc bookkeeping: any non-Esc press is an intervening key and
     // disarms the pending Esc (free-code resets on every other input).
     if (key.eventType !== 'release' && key.name !== 'escape') doubleEsc.reset()
-    // 1) completion-menu keys while the dropdown is open (Epic 8): Tab accept /
+    // 1) Queue edit owns Esc/Ctrl+X before completion dismissal. Ink's queue
+    // header promises one-press "Esc cancel", including slash-like rows whose
+    // body opened a completion menu.
+    const editIndex = queueEditIndex()
+    if (
+      editIndex !== undefined &&
+      key.name === 'escape' &&
+      key.eventType !== 'release' &&
+      !key.ctrl &&
+      !key.meta &&
+      !key.option
+    ) {
+      key.preventDefault()
+      props.onQueueEdit?.(undefined)
+      clearBuffer(true)
+      doubleEsc.reset()
+      return
+    }
+    if (editIndex !== undefined && key.ctrl && key.name === 'x' && key.eventType !== 'release') {
+      key.preventDefault()
+      props.onQueueRemove?.(editIndex)
+      props.onQueueEdit?.(undefined)
+      clearBuffer(true)
+      return
+    }
+    // Oversized rows stay in the string store instead of entering the native
+    // textarea. Enter sends the selected row; typing starts a fresh draft.
+    if (
+      editIndex !== undefined &&
+      queueEditOversized() &&
+      (key.name === 'return' || key.name === 'kpenter') &&
+      key.eventType !== 'release' &&
+      !key.shift &&
+      !key.ctrl &&
+      !key.meta &&
+      !key.option
+    ) {
+      key.preventDefault()
+      const accepted = props.onSendQueuedIndex?.(editIndex)
+      if (accepted !== false) {
+        props.onQueueEdit?.(undefined)
+        clearBuffer(true)
+      }
+      return
+    }
+    if (editIndex !== undefined && queueEditOversized() && isPrintableKey(key)) {
+      props.onQueueEdit?.(undefined)
+    }
+
+    // 2) completion-menu keys while the dropdown is open (Epic 8): Tab accept /
     // Esc dismiss for ANY menu (the pre-existing semantics — Esc stays exactly
     // "dismiss if open, else fall through"), plus Up/Down/Enter for the SLASH
     // menu only (routeMenuKey's precedence table). preventDefault keeps a
@@ -502,6 +696,18 @@ export function Composer(props: {
         props.onDismiss?.()
         // a CONSUMED Esc never counts toward the Esc+Esc viewer (Epic 5).
         doubleEsc.reset()
+        return
+      }
+    }
+    // Queue navigation precedes tray focus and prompt history. It only takes
+    // single-line unmodified arrows; multiline textarea cursor movement wins.
+    if (ta?.focused && ta.lineCount <= 1 && !key.ctrl && !key.meta && !key.option && !key.shift) {
+      if (key.name === 'up' && cycleQueue(1)) {
+        key.preventDefault()
+        return
+      }
+      if (key.name === 'down' && cycleQueue(-1)) {
+        key.preventDefault()
         return
       }
     }
@@ -578,9 +784,10 @@ export function Composer(props: {
     // Restore a persisted draft (e.g. typed before a clarify prompt replaced
     // the composer in the <Switch>, which unmounts it + its native buffer).
     const draft = props.initialDraft?.() ?? ''
+    props.pasteStore?.retainOnly(draft)
     if (draft) {
-      setBuffer(draft)
-      setBufText(draft)
+      const editable = editableProgrammaticText(draft)
+      if (editable !== undefined && setBuffer(editable)) setBufText(editable)
     }
     ta?.focus()
     props.registerFocus?.(() => ta?.focus())
@@ -690,6 +897,7 @@ export function Composer(props: {
             const text = ta?.plainText ?? ''
             setBufText(text) // drives the token analysis (highlight + suggestion)
             props.onDraftChange?.(text) // persist so it survives a clarify-prompt unmount
+            reconcilePastesSoon()
             syncCursorLine()
             props.onType?.(text, ta?.cursorOffset ?? text.length)
           }}

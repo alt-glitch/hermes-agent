@@ -89,6 +89,46 @@ describe('App render (Phase 1, themed)', () => {
     expect(parts.some(p => p.type === 'text' && p.text === 'Listing files:')).toBe(true)
   })
 
+  test('mid-turn local rows render without splitting the streaming assistant', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'answer-before ' } })
+    store.pushLocalUser('!pwd', 'shell')
+    store.pushSystem('/tmp/rendered-shell-output')
+    store.apply({
+      type: 'notification.show',
+      payload: {
+        id: 'render-mid-turn',
+        key: 'render-mid-turn',
+        kind: 'process.complete',
+        level: 'info',
+        text: 'rendered-background-finished'
+      }
+    })
+    store.apply({ type: 'message.delta', payload: { text: 'answer-after' } })
+    store.apply({ type: 'message.complete' })
+
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { until: 'rendered-background-finished', width: 72, height: 20 }
+    )
+
+    expect(frame).toContain('!pwd')
+    expect(frame).toContain('/tmp/rendered-shell-output')
+    expect(frame).toContain('rendered-background-finished')
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.streaming).toBe(false)
+    expect(assistants[0]?.parts).toEqual([
+      expect.objectContaining({ type: 'text', text: 'answer-before answer-after' })
+    ])
+  })
+
   test('a tool part shows its primary-arg preview + duration in the collapsed header (item 2)', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
@@ -306,6 +346,32 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).toContain('42 tools')
     expect(frame).toContain('7 skills')
     expect(frame).toContain('2 MCP') // mcp.servers.length
+  })
+
+  test('the home screen distinguishes a pending tool catalog from zero tools', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.setCatalog({
+      tools: { total: 0, toolsets: [] },
+      readiness: {
+        status: 'pending',
+        warning: 'tool catalog pending: agent initialization timed out; retrying after agent readiness',
+        retry_after_ms: 1000
+      }
+    })
+
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { until: 'tool catalog pending', width: 72, height: 22 }
+    )
+
+    expect(frame).toContain('tool catalog pending')
+    expect(store.state.catalog?.readiness.status).toBe('pending')
+    expect(store.state.catalog?.tools.total).toBe(0)
   })
 
   test('the status bar renders model · context% · cwd (item 14)', async () => {

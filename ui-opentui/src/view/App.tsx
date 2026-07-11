@@ -27,6 +27,7 @@ import { Composer } from './composer.tsx'
 import { DimensionsProvider } from './dimensions.tsx'
 import { Header } from './header.tsx'
 import { NoticeBanner } from './noticeBanner.tsx'
+import { QueuedMessages } from './queuedMessages.tsx'
 import { AgentsDashboard } from './overlays/agentsDashboard.tsx'
 import { BackgroundPanel } from './overlays/backgroundPanel.tsx'
 import { BillingOverlay } from './overlays/billing.tsx'
@@ -44,7 +45,15 @@ import { Transcript } from './transcript.tsx'
 
 export interface AppProps {
   readonly store: SessionStore
-  readonly onSubmit?: (text: string) => void
+  readonly onSubmit?: (text: string) => boolean | void
+  /** Send an edited queued row now; false keeps the editor/draft intact. */
+  readonly onSubmitQueued?: (index: number, text: string) => boolean | void
+  /** Enter sends a selected oversized row without loading its full body into
+   * the native textarea. */
+  readonly onSendQueuedIndex?: (index: number) => boolean | void
+  readonly onDoubleEmptySubmit?: () => void
+  /** Entry observes edit end so a queue held across turn-settle can drain. */
+  readonly onQueueEditChange?: (index: number | undefined) => void
   readonly onType?: (text: string, cursor: number) => void
   readonly onRespond?: (method: string, params: Record<string, unknown>) => void
   readonly onResume?: (sessionId: string) => void
@@ -57,6 +66,7 @@ export interface AppProps {
   readonly history?: ComposerHistory
   readonly onImagePaste?: () => void
   readonly pasteStore?: PasteStore
+  readonly onPasteLimitExceeded?: (maxBytes: number) => void
   /** Gateway calls for the background-process panel (agents.list + process.stop). */
   readonly backgroundOps?: {
     list: () => Promise<BackgroundProcess[]>
@@ -149,6 +159,10 @@ export function App(props: AppProps) {
                 >
                   <TodoPanel snapshot={props.store.state.latestTodos} />
                   <NoticeBanner notice={props.store.state.notice} />
+                  <QueuedMessages
+                    queued={props.store.state.queuedPrompts}
+                    editIndex={props.store.state.queueEditIndex}
+                  />
                   <StatusBar store={props.store} />
                   <Switch
                     fallback={
@@ -161,12 +175,26 @@ export function App(props: AppProps) {
                         history={props.history}
                         onImagePaste={props.onImagePaste}
                         pasteStore={props.pasteStore}
+                        onPasteLimitExceeded={props.onPasteLimitExceeded}
                         onFocusDown={() => trayApi?.focusTray() ?? false}
                         registerFocus={fn => (focusComposer = fn)}
                         onDoubleEsc={openPromptHistory}
                         initialDraft={() => props.store.state.composerDraft}
                         clearVersion={() => props.store.state.composerClearVersion}
+                        replaceVersion={() => props.store.state.composerReplaceVersion}
                         onDraftChange={text => props.store.setComposerDraft(text)}
+                        queued={() => props.store.state.queuedPrompts}
+                        queueEditIndex={() => props.store.state.queueEditIndex}
+                        onQueueEdit={index => {
+                          props.store.setQueueEditIndex(index)
+                          props.onQueueEditChange?.(index)
+                        }}
+                        onQueueRemove={index => {
+                          props.store.removeQueuedPrompt(index)
+                        }}
+                        onSubmitQueued={props.onSubmitQueued}
+                        onSendQueuedIndex={props.onSendQueuedIndex}
+                        onDoubleEmptySubmit={props.onDoubleEmptySubmit}
                       />
                     }
                   >

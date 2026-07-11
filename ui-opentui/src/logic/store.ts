@@ -25,6 +25,7 @@ import {
 } from '../boundary/schema/SessionInfo.ts'
 import type { DetailsMode } from './details.ts'
 import { diffStats, type DiffStats } from './diff.ts'
+import { DEFAULT_BUSY_INPUT_MODE, queueAccepts, type BusyInputMode } from './busyQueue.ts'
 import type { SessionTabId } from './sessionPicker.ts'
 import { envFlag, envOutputUnlimited, toolOutputsEnabled } from './env.ts'
 import { registerNotifier } from './notify.ts'
@@ -83,6 +84,12 @@ export type Part =
 
 export interface Message {
   readonly role: 'user' | 'assistant' | 'system' | 'notification'
+  /** Client-only identity for an optimistic composer row. It is never sent to
+   * the gateway and lets the submission lease remove exactly that row when a
+   * pre-start rejection proves it was never committed to session history. */
+  clientId?: string
+  /** Visible client-only activity that never enters gateway/SQLite history. */
+  localOnly?: 'shell'
   /** Flat body for user/system rows (and settled/resumed assistant rows). */
   text: string
   /** Ordered parts for a live assistant turn; absent for user/system. */
@@ -282,6 +289,21 @@ export interface Catalog {
   }
   readonly skills: { readonly total: number; readonly categories: ReadonlyArray<{ name: string; count: number }> }
   readonly mcp: { readonly servers: ReadonlyArray<string> }
+  readonly readiness: {
+    readonly status: 'ready' | 'pending' | 'failed'
+    readonly warning: string | undefined
+    readonly retryAfterMs: number | undefined
+  }
+}
+
+/** Bounded server-directed retry for a catalog whose authoritative agent build
+ * is still pending. Ready/failed/legacy responses stop; malformed delays never
+ * create a hot loop. */
+export function startupCatalogRetryDelay(catalog: Catalog | undefined): number | undefined {
+  if (catalog?.readiness.status !== 'pending') return undefined
+  const raw = catalog.readiness.retryAfterMs
+  if (raw === undefined || !Number.isFinite(raw) || raw <= 0) return undefined
+  return Math.max(250, Math.min(30_000, Math.trunc(raw)))
 }
 
 export interface StoreState {
@@ -302,6 +324,9 @@ export interface StoreState {
   /** Monotonic imperative-clear signal for Ctrl+C. The native textarea is
    * uncontrolled, so changing only composerDraft would leave visible bytes. */
   composerClearVersion: number
+  /** Monotonic imperative-replace signal for `/undo` and dispatch `prefill`
+   * responses. The mounted native textarea observes it and adopts composerDraft. */
+  composerReplaceVersion: number
   /** The latest todo-tool snapshot, captured from every `todo` tool.complete
    *  REGARDLESS of HERMES_TUI_TOOL_OUTPUTS (the pinned TodoPanel is a live
    *  tracker, not a tool body). undefined until the agent first calls `todo`. */
@@ -353,6 +378,8 @@ export interface StoreState {
    *  drained one-per-turn-completion by the entry's onTurnComplete drain. NOT the
    *  transcript. */
   queuedPrompts: string[]
+  /** Queue row currently loaded into the composer for edit/send/delete. */
+  queueEditIndex: number | undefined
   /** Live session chrome for the status bar (model/effort/cwd/branch/context/running). */
   info: SessionInfo
   /** Transient hint shown above the composer (e.g. "Ctrl+C again to quit" — item 11);
@@ -391,6 +418,8 @@ export interface StoreState {
    *  bare `/reasoning` syncs it from the persisted `display.reasoning_full` (via
    *  config.get), so it reflects the saved pref on first invocation. */
   reasoningFull: boolean
+  /** Persisted display.busy_input_mode mirrored into the live submit policy. */
+  busyInputMode: BusyInputMode
 }
 
 const LRU_LIMIT = 1000
@@ -520,8 +549,14 @@ export function todoSnapshotFrom(result: unknown, args: unknown): TodoSnapshot |
  *  absent `enabled` flag means on; nameless toolsets/categories are dropped and
  *  non-string tool/server names are filtered (defensive — wire arrays are loose). */
 function catalogFrom(d: CatalogDecoded): Catalog {
+  const warning = d.readiness?.warning?.trim()
   return {
     mcp: { servers: onlyStrings(d.mcp?.servers) },
+    readiness: {
+      status: d.readiness?.status ?? 'ready',
+      retryAfterMs: d.readiness?.retry_after_ms,
+      warning: warning || undefined
+    },
     skills: {
       total: d.skills?.total ?? 0,
       categories: (d.skills?.categories ?? [])
@@ -611,6 +646,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     prompt: undefined,
     composerDraft: '',
     composerClearVersion: 0,
+    composerReplaceVersion: 0,
     latestTodos: undefined,
     pager: undefined,
     sessionPicker: undefined,
@@ -629,6 +665,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     notice: null,
     pendingNotice: null,
     queuedPrompts: [],
+    queueEditIndex: undefined,
     status: undefined,
     // startedAt is set ONCE here (store creation ≈ session start) — the status
     // bar's session-duration segment ticks from it; wire patches never carry it.
@@ -642,13 +679,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
     compact: false,
     details: 'collapsed',
     timestamps: false,
-    reasoningFull: false
+    reasoningFull: false,
+    busyInputMode: DEFAULT_BUSY_INPUT_MODE
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
   // text part doesn't remount/re-tokenize it).
   let partSeq = 0
   const nextId = () => `p${++partSeq}`
+  let clientMessageSeq = 0
+  const nextClientMessageId = () => `u${++clientMessageSeq}`
 
   // LRU id-dedup: events that carry a stable id are applied at most once.
   const applied = new Set<string>()
@@ -707,15 +747,28 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('theme', themeFromSkin(skin))
   }
 
-  // Trim the transcript to MESSAGE_CAP, dropping the OLDEST rows IN PLACE via
-  // `splice` (NOT a `slice`-reassign). A keyed `<For>` keeps rows by item
-  // REFERENCE, so splicing the head unmounts only the evicted rows (freeing their
-  // Yoga nodes) while the survivors keep their refs and are not remounted. A live
-  // streaming assistant turn is always the LAST row, so head-trimming never drops it.
+  // Trim the transcript to MESSAGE_CAP, dropping the OLDEST non-live rows IN
+  // PLACE via `splice` (NOT a `slice`-reassign). A keyed `<For>` keeps rows by
+  // item REFERENCE, so splicing unmounts only evicted rows (freeing their Yoga
+  // nodes) while survivors keep their refs and are not remounted. Client-local
+  // shell/notification rows may follow the live assistant, so explicitly protect
+  // the newest streaming turn instead of relying on it being the array tail.
   function capMessages(draft: StoreState): void {
     const overflow = draft.messages.length - MESSAGE_CAP
     if (overflow > 0) {
-      draft.messages.splice(0, overflow)
+      let protectedIndex = -1
+      for (let index = draft.messages.length - 1; index >= 0; index--) {
+        const message = draft.messages[index]
+        if (message?.role === 'assistant' && message.streaming) {
+          protectedIndex = index
+          break
+        }
+      }
+      for (let remaining = overflow; remaining > 0; remaining--) {
+        const removeIndex = protectedIndex === 0 ? 1 : 0
+        draft.messages.splice(removeIndex, 1)
+        if (protectedIndex > removeIndex) protectedIndex -= 1
+      }
       draft.dropped += overflow
     }
   }
@@ -728,11 +781,33 @@ export function createSessionStore(options?: SessionStoreOptions) {
     else parts.push({ type, id: nextId(), text })
   }
 
-  /** The live (last) assistant message, optionally only when still streaming. */
+  /** The newest assistant message, optionally only when still streaming.
+   *
+   * Client-local transcript rows (shell commands/output, slash feedback, and
+   * background notification cards) may be appended while a model turn is still
+   * streaming. The assistant therefore is not guaranteed to be the array tail.
+   * Walk backward to preserve the one live turn's identity across those rows;
+   * callers then update that same message instead of dropping deltas or creating
+   * a second orphan assistant. */
   function liveAssistant(draft: StoreState, streamingOnly = false): Message | undefined {
-    const last = draft.messages[draft.messages.length - 1]
-    if (last && last.role === 'assistant' && (!streamingOnly || last.streaming)) return last
+    for (let index = draft.messages.length - 1; index >= 0; index--) {
+      const message = draft.messages[index]
+      if (message?.role === 'assistant' && (!streamingOnly || message.streaming)) return message
+    }
     return undefined
+  }
+
+  /** Settle a turn that ended without message.complete. Empty native caret rows
+   * are removed; partial/tool content remains visible but no longer streams. */
+  function settleFailedAssistant(draft: StoreState): void {
+    for (let index = draft.messages.length - 1; index >= 0; index--) {
+      const message = draft.messages[index]
+      if (message?.role !== 'assistant' || !message.streaming) continue
+      const hasParts = (message.parts?.length ?? 0) > 0
+      if (!message.text && !hasParts) draft.messages.splice(index, 1)
+      else message.streaming = false
+      break
+    }
   }
 
   /** Ensure there's an open assistant turn to attach parts to (tool/reasoning). */
@@ -765,14 +840,33 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   /** Push a user message (composer submit). */
   function pushUser(text: string) {
+    const clientId = nextClientMessageId()
     setState(
       produce(draft => {
         // Stamp the user turn with wall-clock send time (unix SECONDS — matches the
         // server's non-wire `timestamp` key) so /timestamps can render [HH:MM].
-        draft.messages.push({ role: 'user', text, timestamp: Math.floor(Date.now() / 1000) })
+        draft.messages.push({ clientId, role: 'user', text, timestamp: Math.floor(Date.now() / 1000) })
         capMessages(draft)
       })
     )
+    return clientId
+  }
+
+  function pushLocalUser(text: string, localOnly: 'shell') {
+    const clientId = nextClientMessageId()
+    setState(
+      produce(draft => {
+        draft.messages.push({
+          clientId,
+          localOnly,
+          role: 'user',
+          text,
+          timestamp: Math.floor(Date.now() / 1000)
+        })
+        capMessages(draft)
+      })
+    )
+    return clientId
   }
 
   /** Push a SKILL invocation as a user row that renders COLLAPSED (the full body
@@ -781,10 +875,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
    *  invocation as typed (incl. args); `body` is the full skill content that the
    *  caller ALSO sends to the model via prompt.submit. (glitch 2026-06-23) */
   function pushSkill(command: string, body: string) {
+    const clientId = nextClientMessageId()
     const lineCount = body ? body.split('\n').length : 0
     setState(
       produce(draft => {
         draft.messages.push({
+          clientId,
           role: 'user',
           text: body,
           skill: { command, lineCount },
@@ -793,6 +889,20 @@ export function createSessionStore(options?: SessionStoreOptions) {
         capMessages(draft)
       })
     )
+    return clientId
+  }
+
+  /** Remove one still-optimistic user row without touching later local chrome
+   * or the previous committed exchange. Returns false after a snapshot/cap has
+   * already removed it, which is harmless and keeps the operation idempotent. */
+  function removeClientMessage(clientId: string): boolean {
+    const index = state.messages.findIndex(message => message.clientId === clientId)
+    if (index < 0) return false
+    setState(
+      'messages',
+      state.messages.filter(message => message.clientId !== clientId)
+    )
+    return true
   }
 
   /** Push a system line (slash output, errors, notices). */
@@ -924,9 +1034,15 @@ export function createSessionStore(options?: SessionStoreOptions) {
     onTurnComplete = fn
   }
 
-  /** Park a prompt that arrived mid-turn (FIFO tail). */
-  function enqueuePrompt(text: string): void {
-    setState('queuedPrompts', prev => [...prev, text])
+  /** Park a prompt at the FIFO tail (or head for a queue-edit fallback).
+   * Returns false when the explicit memory ceiling would be exceeded. */
+  function enqueuePrompt(text: string, front = false): boolean {
+    if (!text || !queueAccepts(state.queuedPrompts, text)) return false
+    setState('queuedPrompts', prev => (front ? [text, ...prev] : [...prev, text]))
+    if (front && state.queueEditIndex !== undefined) {
+      setState('queueEditIndex', state.queueEditIndex + 1)
+    }
+    return true
   }
 
   /** Pop the FIFO head (oldest queued prompt) and remove it; undefined if empty. */
@@ -934,12 +1050,46 @@ export function createSessionStore(options?: SessionStoreOptions) {
     const head = state.queuedPrompts[0]
     if (head === undefined) return undefined
     setState('queuedPrompts', prev => prev.slice(1))
+    if (state.queueEditIndex !== undefined) {
+      setState('queueEditIndex', index => (index === undefined || index === 0 ? undefined : index - 1))
+    }
     return head
+  }
+
+  /** Remove one queued row and return it. Indices outside the live queue are inert. */
+  function removeQueuedPrompt(index: number): string | undefined {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= state.queuedPrompts.length) return undefined
+    const removed = state.queuedPrompts[index]
+    setState('queuedPrompts', prev => prev.filter((_, row) => row !== index))
+    setState('queueEditIndex', current => {
+      if (current === undefined || current === index) return undefined
+      return current > index ? current - 1 : current
+    })
+    return removed
+  }
+
+  /** Replace an edited queue row without weakening the queue's memory ceiling. */
+  function replaceQueuedPrompt(index: number, text: string): boolean {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= state.queuedPrompts.length || !text) return false
+    if (!queueAccepts(state.queuedPrompts, text, index)) return false
+    setState('queuedPrompts', index, text)
+    return true
+  }
+
+  function setQueueEditIndex(index: number | undefined): void {
+    if (index === undefined) {
+      setState('queueEditIndex', undefined)
+      return
+    }
+    if (Number.isSafeInteger(index) && index >= 0 && index < state.queuedPrompts.length) {
+      setState('queueEditIndex', index)
+    }
   }
 
   /** Drop every queued prompt (e.g. /clear, /new). */
   function clearQueue(): void {
     setState('queuedPrompts', [])
+    setState('queueEditIndex', undefined)
   }
 
   /** How many prompts are currently queued. */
@@ -1010,6 +1160,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.dropped = snapshot.length - capped.length
         draft.prompt = undefined
         draft.composerDraft = ''
+        draft.composerClearVersion += 1
         draft.latestTodos = undefined
         draft.pager = undefined
         draft.sessionPicker = undefined
@@ -1028,6 +1179,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.notice = null
         draft.pendingNotice = null
         draft.queuedPrompts = []
+        draft.queueEditIndex = undefined
         draft.info = info
         draft.hint = undefined
         draft.catalog = undefined
@@ -1192,6 +1344,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // "Copied" on this store's hint line via the notify seam — the same surface
   // the entry's flashHint uses. One live store per app; latest wins.
   registerNotifier(setHint)
+
+  // Config hydration and `/busy` can race during startup. User commands bump
+  // this revision; the older hydration applies only if no command superseded it.
+  let busyInputModeRevision = 0
 
   /** /compact — set the compact-transcript display flag (Epic 3). */
   function setCompact(on: boolean): void {
@@ -1636,6 +1792,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
       // the user their in-flight reply was lost, and show a recovering status.
       case 'gateway.exited': {
         setState('info', prev => ({ ...prev, running: false }))
+        setState(produce(settleFailedAssistant))
+        // The authoritative settle event can no longer arrive from a dead
+        // child. Disarm the latch WITHOUT draining onto the dead transport;
+        // same-session recovery snapshots/restores the client queue explicitly.
+        turnInFlight = false
         // A turn can also end via the child exiting mid-reply (no message.complete) —
         // flush any held notice here too, the third turn-end site (Ink interruptTurn).
         flushPendingNotice()
@@ -1672,8 +1833,23 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'error': {
+        // `message.start` may be followed by a terminal error with no
+        // message.complete. Settle the newest streaming assistant before the
+        // system error row is appended: remove a wholly empty caret row, or
+        // retain partial/tool content as a non-streaming failed turn. This also
+        // prevents neverWindow from pinning one native row per failed turn.
+        setState(produce(settleFailedAssistant))
         const message = event.payload?.message
         pushSystem(message ? `error: ${message}` : 'error')
+        // A deferred agent build can fail before `message.start`; the gateway
+        // clears its running flag but emits no trailing session.info in that
+        // path. Settle the optimistic client flag and drain exactly once. For a
+        // turn that DID start, keep turnInFlight armed so the authoritative
+        // session.info(false) still owns the queue drain.
+        const preStartFailure = state.info.running === true && !turnInFlight
+        setState('info', prev => ({ ...prev, running: false }))
+        setState('status', undefined)
+        if (preStartFailure) onTurnComplete?.()
         // A turn can end via error without message.complete — flush any held
         // notice here too, matching Ink recordError.
         flushPendingNotice()
@@ -1696,11 +1872,67 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('composerDraft', text)
   }
 
+  /** Replace the mounted composer with server-provided editable text. */
+  function replaceComposerDraft(text: string): void {
+    // A delayed extension response must never overwrite an active queued-row
+    // editor and then submit its prefill as a replacement for that queue row.
+    setState('queueEditIndex', undefined)
+    setState('composerDraft', text)
+    setState('composerReplaceVersion', version => version + 1)
+  }
+
   /** Clear both persisted state and the mounted native textarea via its
    * monotonic signal (Composer observes composerClearVersion). */
   function clearComposerDraft(): void {
     setState('composerDraft', '')
     setState('composerClearVersion', version => version + 1)
+  }
+
+  function setBusyInputMode(mode: BusyInputMode): void {
+    busyInputModeRevision += 1
+    setState('busyInputMode', mode)
+  }
+
+  function hydrateBusyInputMode(mode: BusyInputMode, expectedRevision: number): boolean {
+    if (busyInputModeRevision !== expectedRevision) return false
+    setState('busyInputMode', mode)
+    return true
+  }
+
+  function getBusyInputModeRevision(): number {
+    return busyInputModeRevision
+  }
+
+  /** Most recent user body, including collapsed skill invocations. */
+  function lastUserMessage(): string | undefined {
+    for (let index = state.messages.length - 1; index >= 0; index--) {
+      const message = state.messages[index]
+      if (message?.role === 'user' && !message.localOnly) return message.text
+    }
+    return undefined
+  }
+
+  /** Remove the most recent visible user exchange while preserving local
+   * system/notification chrome that arrived after it. This is stronger than
+   * Ink's literal-tail trim: gateway history has already rewound, so a trailing
+   * `/fortune` row must not leave the old user/assistant exchange visible. */
+  function trimLastExchange(): number {
+    let userIndex = -1
+    for (let index = state.messages.length - 1; index >= 0; index--) {
+      if (state.messages[index]?.role === 'user' && !state.messages[index]?.localOnly) {
+        userIndex = index
+        break
+      }
+    }
+    if (userIndex < 0) return 0
+    let removed = 0
+    const next = state.messages.filter((message, index) => {
+      const drop = index === userIndex || (index > userIndex && message.role === 'assistant')
+      if (drop) removed += 1
+      return !drop
+    })
+    if (removed > 0) setState('messages', next)
+    return removed
   }
 
   // ── resume hydrate (opencode sync-v2): buffer live events while the snapshot
@@ -1760,10 +1992,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
    * Decoded ONCE via `CatalogSchema` (decode-at-boundary); garbage decodes to
    * `Option.none` → the catalog is left unset rather than crashing the panel.
    */
-  function setCatalog(raw: unknown): void {
+  function setCatalog(raw: unknown): Catalog | undefined {
     const decoded = decodeCatalog(raw)
-    if (Option.isNone(decoded)) return
-    setState('catalog', catalogFrom(decoded.value))
+    if (Option.isNone(decoded)) return undefined
+    const catalog = catalogFrom(decoded.value)
+    setState('catalog', catalog)
+    return catalog
   }
 
   function setCommandCatalog(catalog: CommandsCatalogResponse | undefined): void {
@@ -1784,13 +2018,18 @@ export function createSessionStore(options?: SessionStoreOptions) {
     state,
     apply,
     pushUser,
+    pushLocalUser,
     pushSkill,
+    removeClientMessage,
     pushSystem,
     pushNotification,
     showNotice,
     clearNotice,
     enqueuePrompt,
     dequeuePrompt,
+    removeQueuedPrompt,
+    replaceQueuedPrompt,
+    setQueueEditIndex,
     clearQueue,
     queuedCount,
     registerTurnCompleteHandler,
@@ -1825,6 +2064,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setDetails,
     setTimestamps,
     setReasoningFull,
+    setBusyInputMode,
+    hydrateBusyInputMode,
+    getBusyInputModeRevision,
     openDashboard,
     closeDashboard,
     openBackgroundPanel,
@@ -1840,6 +2082,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     duplicate,
     clearPrompt,
     setComposerDraft,
+    replaceComposerDraft,
+    lastUserMessage,
+    trimLastExchange,
     clearComposerDraft
   } as const
 }

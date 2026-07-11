@@ -54,7 +54,10 @@ const SessionInfoEvent = Schema.Struct({
 })
 
 // streaming text
-const MessageStart = Schema.Struct({ type: Schema.Literal('message.start'), session_id: opt(Str) })
+const MessageStart = Schema.Struct({
+  type: Schema.Literal('message.start'),
+  session_id: opt(Str)
+})
 const MessageDelta = Schema.Struct({
   type: Schema.Literal('message.delta'),
   session_id: opt(Str),
@@ -65,7 +68,13 @@ const MessageComplete = Schema.Struct({
   session_id: opt(Str),
   // `usage` carries the post-turn token/context totals → refreshes the status bar
   // (item 14). Kept loose (Record) — the chrome reader narrows what it needs.
-  payload: opt(Schema.Struct({ text: opt(Str), rendered: opt(Str), usage: opt(Schema.Record(Str, Schema.Unknown)) }))
+  payload: opt(
+    Schema.Struct({
+      text: opt(Str),
+      rendered: opt(Str),
+      usage: opt(Schema.Record(Str, Schema.Unknown))
+    })
+  )
 })
 
 // reasoning / thinking — toTaggedUnion needs ONE literal per member, so the

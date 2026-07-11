@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'vitest'
 
-import { actionExitBlocked, actionModifier, isExitHotkey, isRedrawHotkey, openTuiHotkeys } from '../logic/hotkeys.ts'
+import {
+  actionExitBlocked,
+  actionModifier,
+  isActionHotkey,
+  isExitHotkey,
+  isRedrawHotkey,
+  openTuiHotkeys
+} from '../logic/hotkeys.ts'
 
 const key = (
   name: string,
@@ -29,6 +36,13 @@ describe('platform action hotkeys', () => {
     expect(isExitHotkey(key('d', { meta: true, eventType: 'release' }), 'darwin')).toBe(false)
   })
 
+  test('generic action hotkeys use the same platform/release rules', () => {
+    expect(isActionHotkey(key('k', { ctrl: true }), 'k', 'linux')).toBe(true)
+    expect(isActionHotkey(key('k', { meta: true }), 'k', 'darwin')).toBe(true)
+    expect(isActionHotkey(key('k', { ctrl: true }), 'k', 'darwin')).toBe(false)
+    expect(isActionHotkey(key('k', { ctrl: true, eventType: 'release' }), 'k', 'linux')).toBe(false)
+  })
+
   test('help copy derives the action modifier from the same source', () => {
     expect(actionModifier('linux')).toBe('Ctrl')
     expect(actionModifier('darwin')).toBe('Cmd')
@@ -36,6 +50,12 @@ describe('platform action hotkeys', () => {
     expect(openTuiHotkeys('darwin')).toContainEqual(['Cmd+D', 'exit'])
     expect(openTuiHotkeys('linux')).toContainEqual(['Ctrl+L', 'redraw / repaint'])
     expect(openTuiHotkeys('darwin')).toContainEqual(['Cmd+L', 'redraw / repaint'])
+    expect(openTuiHotkeys('linux').some(([label]) => label === 'Ctrl+K')).toBe(false)
+    expect(openTuiHotkeys('darwin').some(([label]) => label === 'Cmd+K')).toBe(false)
+    expect(openTuiHotkeys('linux')).toContainEqual([
+      'Enter Enter (empty)',
+      'stop the turn / force the next queued message'
+    ])
   })
 
   test.each(['prompt', 'pager', 'sessionPicker', 'picker', 'billing'] as const)(
