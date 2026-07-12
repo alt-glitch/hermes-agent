@@ -41,6 +41,15 @@ import {
 import { decodeToolsConfigureResponse } from '../boundary/schema/ToolsConfigureResponse.ts'
 import { decodeBrowserManageResponse } from '../boundary/schema/BrowserResponses.ts'
 import { decodeVoiceToggleResponse } from '../boundary/schema/VoiceResponses.ts'
+import { openExternalUrl } from '../boundary/openExternalUrl.ts'
+import {
+  decodeCreditsViewResponse,
+  decodePersonalityResponse,
+  decodeRollbackDiffResponse,
+  decodeRollbackListResponse,
+  decodeRollbackRestoreResponse,
+  decodeSessionUsageResponse
+} from '../boundary/schema/SecondaryCommandResponses.ts'
 import { formatVoiceRecordKey } from './voiceKey.ts'
 import { decodeDelegationPauseResponse, decodeSpawnTreeListResponse } from '../boundary/schema/Delegation.ts'
 import { decodeProcessStopResponse } from '../boundary/schema/ProcessResponses.ts'
@@ -1082,6 +1091,124 @@ const replayCmd: ClientHandler = async (arg, ctx, flight) => {
   }
   ctx.openDashboard({ initialHistoryIndex: index })
 }
+const creditsCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const sid = ctx.sessionId()
+  const response = decodeCreditsViewResponse(await ctx.request('credits.view', { session_id: sid }))
+  if (!currentSessionIs(ctx, sid, flight)) return
+  if (!response) return ctx.pushSystem('error: invalid response: credits.view')
+  if (!response.logged_in) return ctx.pushSystem('💳 Not logged into Nous Portal — run /portal to log in.')
+  const lines = ['💳 Nous credits', ...response.balance_lines]
+  if (response.identity_line) lines.push('', response.identity_line)
+  if (response.topup_url) lines.push('', `Top up: ${response.topup_url}`)
+  ctx.pushSystem(lines.join('\n'))
+  if (response.topup_url) {
+    const url = response.topup_url
+    ctx.confirm(
+      { title: 'Add credits?', detail: url, confirmLabel: 'Open top-up in browser', cancelLabel: 'Cancel' },
+      () => {
+        const opened = openExternalUrl(url)
+        ctx.pushSystem(
+          opened
+            ? 'Complete your top-up in the browser — credits will appear in /credits shortly.'
+            : `Open this URL to top up: ${url}`
+        )
+      }
+    )
+  }
+}
+
+const usageCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const sid = ctx.sessionId()
+  const response = decodeSessionUsageResponse(await ctx.request('session.usage', { session_id: sid }))
+  if (!currentSessionIs(ctx, sid, flight)) return
+  if (!response) return ctx.pushSystem('error: invalid response: session.usage')
+  const credits = response.credits_lines ?? []
+  if (!(response.calls ?? 0) && !credits.length) return ctx.pushSystem('no API calls yet')
+  const lines = credits.length ? ['Nous credits', ...credits, ''] : []
+  if ((response.calls ?? 0) > 0) {
+    const f = (value: number | undefined) => (value ?? 0).toLocaleString()
+    lines.push(
+      'Usage',
+      `Model: ${response.model ?? ''}`,
+      `Input tokens: ${f(response.input)}`,
+      `Output tokens: ${f(response.output)}`,
+      `Total tokens: ${f(response.total)}`,
+      `API calls: ${f(response.calls)}`
+    )
+    if (response.context_max)
+      lines.push(
+        `Context: ${f(response.context_used)} / ${f(response.context_max)} (${String(response.context_percent ?? 0)}%)`
+      )
+    if (response.compressions) lines.push(`Compressions: ${String(response.compressions)}`)
+  }
+  ctx.openPager('Usage', lines.join('\n').trim())
+}
+
+const personalityCmd: ClientHandler = async (arg, ctx, flight) => {
+  const value = arg.trim()
+  if (!value) return
+  const sid = ctx.sessionId()
+  const response = decodePersonalityResponse(
+    await ctx.request('config.set', { key: 'personality', session_id: sid, value })
+  )
+  if (!currentSessionIs(ctx, sid, flight)) return
+  if (!response) return ctx.pushSystem('error: invalid response: personality')
+  if (response.history_reset) ctx.replaceConversationSnapshot([], response.info ?? undefined, undefined)
+  ctx.pushSystem(`personality: ${response.value || 'default'}${response.history_reset ? ' · transcript cleared' : ''}`)
+}
+
+const rollbackCmd: ClientHandler = async (arg, ctx, flight) => {
+  const sid = ctx.sessionId()
+  if (!sid) return ctx.pushSystem('no active session — nothing to rollback')
+  const parts = arg.trim().split(/\s+/).filter(Boolean)
+  const first = parts[0] ?? ''
+  const lower = first.toLowerCase()
+  if (!first || lower === 'list' || lower === 'ls') {
+    const response = decodeRollbackListResponse(await ctx.request('rollback.list', { session_id: sid }))
+    if (!currentSessionIs(ctx, sid, flight)) return
+    if (!response) return ctx.pushSystem('error: invalid response: rollback.list')
+    if (!response.enabled) return ctx.pushSystem('checkpoints are not enabled')
+    if (!response.checkpoints.length) return ctx.pushSystem('no checkpoints found')
+    ctx.openPager(
+      'Rollback checkpoints',
+      response.checkpoints
+        .map(
+          (item, index) =>
+            `${String(index + 1)}. ${item.hash.slice(0, 10)}  ${[item.timestamp, item.message].filter(Boolean).join(' · ') || '(no metadata)'}`
+        )
+        .join('\n')
+    )
+    return
+  }
+  if (lower === 'diff') {
+    const hash = parts[1]
+    if (!hash) return ctx.pushSystem('usage: /rollback diff <checkpoint>')
+    const response = decodeRollbackDiffResponse(await ctx.request('rollback.diff', { hash, session_id: sid }))
+    if (!currentSessionIs(ctx, sid, flight)) return
+    if (!response) return ctx.pushSystem('error: invalid response: rollback.diff')
+    const body = (response.rendered || response.diff || '').trim()
+    if (!body && !response.stat) return ctx.pushSystem('no changes since this checkpoint')
+    ctx.openPager('Rollback diff', [response.stat || '', body].filter(Boolean).join('\n\n'))
+    return
+  }
+  const filePath = parts.slice(1).join(' ')
+  const response = decodeRollbackRestoreResponse(
+    await ctx.request('rollback.restore', {
+      hash: first,
+      session_id: sid,
+      ...(filePath ? { file_path: filePath } : {})
+    })
+  )
+  if (!currentSessionIs(ctx, sid, flight)) return
+  if (!response) return ctx.pushSystem('error: invalid response: rollback.restore')
+  if (!response.success)
+    return ctx.pushSystem(`rollback failed: ${response.error || response.message || 'unknown error'}`)
+  ctx.pushSystem(
+    `rollback restored ${filePath || 'workspace'}: ${response.reason || response.message || response.restored_to || 'restored'}`
+  )
+  if ((response.history_removed ?? 0) > 0) ctx.trimLastExchange()
+}
+
 const pluginsCmd: ClientHandler = async (arg, ctx, flight) => {
   const command = arg.trim()
   if (!command) {
@@ -2203,6 +2330,7 @@ const CLIENT: Record<string, ClientHandler> = {
   btw: backgroundCmd,
   clear: freshSessionCmd(false),
   compact: compactCmd,
+  credits: creditsCmd,
   compress: compressCmd,
   branch: branchCmd,
   fork: branchCmd,
@@ -2226,6 +2354,7 @@ const CLIENT: Record<string, ClientHandler> = {
   model: modelCmd,
   image: imageCmd,
   paste: pasteCmd,
+  personality: personalityCmd,
   pet: petCmd,
   prompt: promptCmd,
   compose: promptCmd,
@@ -2235,6 +2364,7 @@ const CLIENT: Record<string, ClientHandler> = {
   reload_mcp: reloadMcpCmd,
   'reload-skills': reloadSkillsCmd,
   reload_skills: reloadSkillsCmd,
+  rollback: rollbackCmd,
   replay: replayCmd,
   'replay-diff': replayDiffCmd,
   resume: resumeCmd,
@@ -2267,6 +2397,7 @@ const CLIENT: Record<string, ClientHandler> = {
   retry: retryCmd,
   steer: steerCmd,
   undo: undoCmd,
+  usage: usageCmd,
   update: updateCmd
 }
 

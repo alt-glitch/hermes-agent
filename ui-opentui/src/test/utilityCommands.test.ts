@@ -21,7 +21,7 @@ import { formatBytes, heapSnapshotPath, memReport } from '../logic/diagnostics.t
 import type { BusyInputMode } from '../logic/busyQueue.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from '../logic/replay.ts'
 import { clientCommandNames, dispatchSlash, type SlashContext } from '../logic/slash.ts'
-import type { Part } from '../logic/store.ts'
+import type { Message, Part } from '../logic/store.ts'
 
 // The utility commands under test are DIAGNOSTIC commands — gated behind
 // HERMES_TUI_DIAGNOSTICS (logic/env.ts). This suite tests the commands
@@ -50,6 +50,12 @@ interface Probe {
   timestampsFlag: { value: boolean }
   reasoningFullFlag: { value: boolean }
   renderables: { value: number | undefined }
+  compressionMutations: Array<{
+    messages: Message[] | undefined
+    info: object | undefined
+    usage: object | undefined
+  }>
+  trimCalls: { value: number }
 }
 
 function makeCtx(request: (method: string, params: Record<string, unknown>) => Promise<unknown>): Probe {
@@ -63,6 +69,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const busyMode: { value: BusyInputMode } = { value: 'queue' }
   const queue: string[] = []
   const renderables: Probe['renderables'] = { value: undefined }
+  const compressionMutations: Probe['compressionMutations'] = []
+  const trimCalls = { value: 0 }
   const ctx: SlashContext = {
     guardBusySessionSwitch: () => false,
     newSession: () => {},
@@ -70,7 +78,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     beginToolsConfigure: () => {},
     endToolsConfigure: () => {},
     resetAfterToolsConfigure: () => {},
-    replaceConversationSnapshot: () => {},
+    replaceConversationSnapshot: (messages, info, usage) => compressionMutations.push({ messages, info, usage }),
     setCompressedSessionKey: () => {},
     hasConversation: () => true,
     setSessionTitle: () => {},
@@ -104,7 +112,10 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     clearQueued: () => queue.splice(0).length,
     steer: async () => 'queued',
     lastUserMessage: () => undefined,
-    trimLastExchange: () => 0,
+    trimLastExchange: () => {
+      trimCalls.value += 1
+      return 1
+    },
     prefillComposer: () => {},
     renderableCount: () => renderables.value,
     confirm: () => {},
@@ -132,7 +143,19 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     submit: () => {},
     submitSkill: () => {}
   }
-  return { calls, compactFlag, ctx, detailsFlag, paged, renderables, reasoningFullFlag, system, timestampsFlag }
+  return {
+    calls,
+    compressionMutations,
+    trimCalls,
+    compactFlag,
+    ctx,
+    detailsFlag,
+    paged,
+    renderables,
+    reasoningFullFlag,
+    system,
+    timestampsFlag
+  }
 }
 
 /** Let the fire-and-forget config.set promise settle (it's detached). */
@@ -237,6 +260,61 @@ describe('/fast, /yolo, /reload-mcp', () => {
       { method: 'reload.mcp', params: { confirm: true, session_id: 'sid-1' } }
     ])
     expect(p.system).toEqual(['cache warning', 'MCP servers reloaded · live agent tools refreshed'])
+  })
+})
+
+describe('account, personality, and rollback commands', () => {
+  test('credits and usage render decoded account data locally', async () => {
+    const p = makeCtx(async method =>
+      method === 'credits.view'
+        ? {
+            logged_in: true,
+            balance_lines: ['$4.00'],
+            identity_line: 'user@example.com',
+            topup_url: null,
+            depleted: false
+          }
+        : {
+            calls: 1,
+            input: 10,
+            output: 4,
+            total: 14,
+            model: 'test-model',
+            context_used: 20,
+            context_max: 100,
+            context_percent: 20
+          }
+    )
+    await dispatchSlash('/credits', p.ctx)
+    await dispatchSlash('/usage', p.ctx)
+    expect(p.system[0]).toContain('💳 Nous credits')
+    expect(p.paged.at(-1)).toMatchObject({ title: 'Usage' })
+    expect(p.paged.at(-1)?.text).toContain('Total tokens: 14')
+  })
+
+  test('personality resets visible history only when the gateway says so', async () => {
+    const p = makeCtx(async () => ({ value: 'friendly', history_reset: true, info: { model: 'm' } }))
+    await dispatchSlash('/personality friendly', p.ctx)
+    expect(p.calls).toEqual([
+      { method: 'config.set', params: { key: 'personality', session_id: 'sid-1', value: 'friendly' } }
+    ])
+    expect(p.compressionMutations).toEqual([{ messages: [], info: { model: 'm' }, usage: undefined }])
+    expect(p.system).toEqual(['personality: friendly · transcript cleared'])
+  })
+
+  test('rollback lists, diffs, restores, and reconciles one visible exchange', async () => {
+    const p = makeCtx(async method => {
+      if (method === 'rollback.list')
+        return { enabled: true, checkpoints: [{ hash: 'abcdef123456', timestamp: 'now', message: 'turn' }] }
+      if (method === 'rollback.diff') return { stat: '1 file', diff: '+line' }
+      return { success: true, reason: 'ok', history_removed: 2 }
+    })
+    await dispatchSlash('/rollback list', p.ctx)
+    await dispatchSlash('/rollback diff abcdef', p.ctx)
+    await dispatchSlash('/rollback abcdef', p.ctx)
+    expect(p.paged.map(row => row.title)).toEqual(['Rollback checkpoints', 'Rollback diff'])
+    expect(p.system).toContain('rollback restored workspace: ok')
+    expect(p.trimCalls.value).toBe(1)
   })
 })
 
