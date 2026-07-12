@@ -119,6 +119,7 @@ describe('statusSegments — progressive disclosure table (chrome v3 order)', ()
       cost: true,
       up: true,
       compressions: true,
+      sessions: true,
       profile: true,
       bg: true,
       mcp: true
@@ -131,6 +132,7 @@ describe('statusSegments — progressive disclosure table (chrome v3 order)', ()
       [125, { mcp: false, bg: true }], // mcp drops first
       [117, { mcp: false, bg: false, profile: true }], // then bg
       [107, { profile: false, compressions: true }], // then profile
+      [99, { sessions: false, compressions: true }], // then live-session count
       [93, { compressions: false, up: true }], // then cmp
       [87, { up: false, cost: true }], // then uptime
       [79, { cost: false, ctxDetail: true }], // then cost

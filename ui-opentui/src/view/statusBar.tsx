@@ -84,6 +84,8 @@ export interface StatusSegments {
   /** Session uptime (`up: 23m`). */
   up: boolean
   compressions: boolean
+  /** Process-global attachable TUI sessions (`N sessions`). */
+  sessions: boolean
   profile: boolean
   /** Running OS background-processes count (`bg: N`). */
   bg: boolean
@@ -98,6 +100,7 @@ export function statusSegments(cols: number): StatusSegments {
     cost: w >= 80,
     up: w >= 88,
     compressions: w >= 94,
+    sessions: w >= 100,
     profile: w >= 108,
     bg: w >= 118,
     mcp: w >= 126
@@ -309,6 +312,10 @@ export function StatusBar(props: { store: SessionStore }) {
     const n = props.store.state.bgTasks.length
     return segs().bg && n > 0 ? `bg: ${n}` : ''
   })
+  const sessionsText = createMemo(() => {
+    const count = props.store.state.liveSessionCount
+    return segs().sessions && count > 0 ? `${String(count)} ${count === 1 ? 'session' : 'sessions'}` : ''
+  })
   // `⛓ N` — active background delegations. The registry-backed usage count
   // wins whenever present, including explicit zero; local live rows support
   // older gateways.
@@ -348,6 +355,7 @@ export function StatusBar(props: { store: SessionStore }) {
       costText(),
       upText(),
       cmpText(),
+      sessionsText(),
       profileText(),
       bgText(),
       mcpText(),
@@ -442,6 +450,7 @@ export function StatusBar(props: { store: SessionStore }) {
           <Seg text={costText()} />
           <Seg text={upText()} />
           <Seg text={cmpText()} fg={cmpColorOf(cmpCount())} />
+          <Seg text={sessionsText()} fg={theme().color.accent} />
           {/* statusFg, not accent — persistent chrome spends no warm ink
               (design pass); the navy fill is the bar's one blue surface. */}
           <Seg text={profileText()} fg={theme().color.statusFg} />

@@ -21,7 +21,7 @@ import type { PromptHistory as ComposerHistory } from '../logic/history.ts'
 import type { PasteStore } from '../logic/pastes.ts'
 import { actionCommand, promptHistoryEntries } from '../logic/promptHistory.ts'
 import type { BackgroundProcess } from '../logic/backgroundActivity.ts'
-import type { SessionStore } from '../logic/store.ts'
+import type { PickerItem, SessionStore } from '../logic/store.ts'
 import { AgentsTray, type AgentsTrayApi } from './agentsTray.tsx'
 import { Composer } from './composer.tsx'
 import { DimensionsProvider } from './dimensions.tsx'
@@ -34,7 +34,10 @@ import { BillingOverlay } from './overlays/billing.tsx'
 import { Pager } from './overlays/pager.tsx'
 import { Picker } from './overlays/picker.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
-import { SessionPicker, type SessionPickerOps } from './overlays/sessionPicker.tsx'
+import {
+  SessionOrchestrator,
+  type SessionOrchestratorOps
+} from './overlays/sessionOrchestrator.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
 import { SessionInfoProvider } from './sessionInfo.tsx'
 import { StatusBar } from './statusBar.tsx'
@@ -57,8 +60,12 @@ export interface AppProps {
   readonly onType?: (text: string, cursor: number) => void
   readonly onRespond?: (method: string, params: Record<string, unknown>) => void
   readonly onResume?: (sessionId: string) => void
-  /** Gateway calls for the resume picker (session.list/peek/title). */
-  readonly sessionOps?: SessionPickerOps
+  readonly onActivateSession?: (sessionId: string) => void
+  readonly onNewLiveSession?: () => void
+  readonly onNewPromptSession?: (prompt: string, modelArg?: string) => void
+  readonly loadModelItems?: () => Promise<readonly PickerItem[]>
+  /** Gateway calls for the unified live + resumable Sessions orchestrator. */
+  readonly sessionOps?: SessionOrchestratorOps
   /** Fired after the resume picker closes WITHOUT a pick (boot path: the
    *  entry creates a fresh session when none exists yet). */
   readonly onSessionPickerClosed?: () => void
@@ -87,10 +94,11 @@ const NOOP_RESPOND = () => {}
 const NOOP_RESUME = () => {}
 const NO_SESSION = () => undefined
 /** Inert picker ops for headless mounts that pass no gateway (tests). */
-const NOOP_OPS: SessionPickerOps = {
-  list: () => Promise.resolve({ sessions: [], truncated: false }),
-  peek: () => Promise.resolve({}),
-  rename: () => Promise.resolve()
+const NOOP_OPS: SessionOrchestratorOps = {
+  history: () => Promise.resolve({ sessions: [] }),
+  refresh: () => Promise.resolve(),
+  close: () => Promise.resolve({ closed: false }),
+  delete: () => Promise.resolve({})
 }
 
 export function App(props: AppProps) {
@@ -220,15 +228,18 @@ export function App(props: AppProps) {
                       />
                     </Match>
                     <Match when={sessionPicker()}>
-                      {sp => (
-                        <SessionPicker
-                          ops={props.sessionOps ?? NOOP_OPS}
-                          initialTab={sp().tab}
-                          currentCwd={() => props.store.state.info.cwd}
-                          onResume={resume}
-                          onClose={closeSessionPicker}
-                        />
-                      )}
+                      <SessionOrchestrator
+                        ops={props.sessionOps ?? NOOP_OPS}
+                        currentSessionId={() => props.store.state.sessionId ?? null}
+                        liveSessions={() => props.store.state.liveSessions}
+                        onActivate={id => props.onActivateSession?.(id)}
+                        onResume={resume}
+                        onNew={() => props.onNewLiveSession?.()}
+                        onNewPrompt={(prompt, modelArg) => props.onNewPromptSession?.(prompt, modelArg)}
+                        modelItems={() => props.store.state.modelItems ?? []}
+                        loadModelItems={props.loadModelItems}
+                        onClose={closeSessionPicker}
+                      />
                     </Match>
                     <Match when={picker()}>
                       {p => (

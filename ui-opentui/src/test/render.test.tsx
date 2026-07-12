@@ -249,13 +249,13 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).not.toContain('Type your message') // composer hidden while the pager is open
   })
 
-  test('the resume picker renders session rows and replaces the composer', async () => {
+  test('the unified sessions orchestrator renders resumable rows and replaces the composer', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
     store.openSessionPicker()
 
     const sessionOps = {
-      list: () =>
+      history: () =>
         Promise.resolve({
           sessions: [
             { id: 's1', message_count: 5, preview: 'hi', source: 'tui', started_at: 1, title: 'First chat' },
@@ -263,8 +263,9 @@ describe('App render (Phase 1, themed)', () => {
           ],
           truncated: false
         }),
-      peek: () => Promise.resolve({}),
-      rename: () => Promise.resolve()
+      refresh: () => Promise.resolve(),
+      close: () => Promise.resolve({ closed: true }),
+      delete: (sessionId: string) => Promise.resolve({ deleted: sessionId })
     }
     const frame = await captureFrame(
       () => (
@@ -275,10 +276,10 @@ describe('App render (Phase 1, themed)', () => {
       { until: 'First chat', width: 72, height: 24 }
     )
 
-    expect(frame).toContain('Resume session') // picker header
+    expect(frame).toContain('Sessions') // unified orchestrator header
     expect(frame).toContain('First chat') // session row
     expect(frame).toContain('Second chat')
-    expect(frame).toContain('[ Recent ]') // default tab chip active
+    expect(frame).toContain('Start a new live session') // kept-live sibling creation row
     expect(frame).not.toContain('Type your message') // composer hidden while the picker is open
   })
 

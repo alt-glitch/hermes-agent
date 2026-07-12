@@ -164,6 +164,31 @@ describe('replaceSession', () => {
 })
 
 describe('resumeSession', () => {
+  it.effect('hydrates session age and arms completion drain for an already-running turn', () => {
+    const store = createSessionStore()
+    let drained = 0
+    store.registerTurnCompleteHandler(() => (drained += 1))
+    const service = fakeGateway(() =>
+      Effect.succeed({
+        inflight: { assistant: 'partial', streaming: true, user: 'question' },
+        info: { model: 'live-model' },
+        messages: [],
+        running: true,
+        session_id: 'running-live',
+        started_at: 123.5,
+        status: 'working'
+      })
+    ).service
+    return Effect.gen(function* () {
+      yield* resumeSession(service, store, { cols: 80, targetSessionId: 'durable-key' })
+      assert.strictEqual(store.state.info.startedAt, 123_500)
+      assert.isTrue(store.isTurnInFlight())
+      store.applyInfo({ running: false })
+      assert.strictEqual(drained, 1)
+      assert.isFalse(store.isTurnInFlight())
+    })
+  })
+
   it.effect('adopts the returned live SID, filters old buffered events, and returns the prior live SID', () => {
     const store = createSessionStore()
     store.setSessionId('old-live')

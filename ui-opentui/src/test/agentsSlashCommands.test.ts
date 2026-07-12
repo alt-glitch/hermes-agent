@@ -124,6 +124,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     logTail: () => [],
     modelItems: () => undefined,
     newSession: () => {},
+    newLiveSession: () => {},
     openBackgroundPanel: () => {},
     openBilling: () => {},
     openDashboard: request => opens.push(request),

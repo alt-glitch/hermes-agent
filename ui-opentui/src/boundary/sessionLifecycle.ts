@@ -9,9 +9,14 @@
 import { Data, Effect, Option, Schema } from 'effect'
 
 import type { GatewayServiceShape } from './gateway/GatewayService.ts'
+import {
+  decodeSessionActivateResponse,
+  decodeSessionResumeResponse,
+  type LiveSessionSnapshot
+} from './schema/SessionOrchestratorResponses.ts'
 import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { mapResumeHistory } from '../logic/resume.ts'
-import type { SessionStore } from '../logic/store.ts'
+import type { Message, SessionStore } from '../logic/store.ts'
 
 const InfoRecord = Schema.Record(Schema.String, Schema.Unknown)
 const SetupStatusResponseSchema = Schema.Struct({ provider_configured: Schema.optionalKey(Schema.Boolean) })
@@ -20,16 +25,9 @@ const SessionCreateResponseSchema = Schema.Struct({
   stored_session_id: Schema.optionalKey(Schema.String),
   info: Schema.optionalKey(InfoRecord)
 })
-const SessionResumeResponseSchema = Schema.Struct({
-  session_id: Schema.String,
-  resumed: Schema.optionalKey(Schema.String),
-  messages: Schema.optionalKey(Schema.Unknown),
-  info: Schema.optionalKey(InfoRecord)
-})
 
 const decodeSetupStatus = Schema.decodeUnknownOption(SetupStatusResponseSchema)
 const decodeSessionCreate = Schema.decodeUnknownOption(SessionCreateResponseSchema)
-const decodeSessionResume = Schema.decodeUnknownOption(SessionResumeResponseSchema)
 
 export interface ReplaceSessionOptions {
   readonly activeSessionId: string | undefined
@@ -60,7 +58,7 @@ export type ReplaceSessionResult =
 
 export class SessionProtocolError extends Data.TaggedError('SessionProtocolError')<{
   readonly message: string
-  readonly method: 'setup.status' | 'session.create' | 'session.resume'
+  readonly method: 'setup.status' | 'session.activate' | 'session.create' | 'session.resume'
 }> {}
 
 /** Create and schema-decode a session without any close/setup policy. */
@@ -141,6 +139,42 @@ export interface ResumeSessionResult {
   readonly previousSessionId?: string
 }
 
+function liveSnapshotMessages(response: LiveSessionSnapshot): Message[] {
+  const messages = mapResumeHistory(response.messages)
+  const inflightUser = response.inflight?.user?.trim()
+  if (inflightUser) messages.push({ role: 'user', text: inflightUser })
+  const inflightAssistant = response.inflight?.assistant ?? ''
+  if (inflightAssistant || response.inflight?.streaming) {
+    messages.push({
+      role: 'assistant',
+      text: inflightAssistant,
+      parts: inflightAssistant ? [{ id: 'inflight-1', text: inflightAssistant, type: 'text' }] : [],
+      streaming: true
+    })
+  }
+  return messages
+}
+
+function liveSnapshotInfo(response: LiveSessionSnapshot): Readonly<Record<string, unknown>> {
+  const running =
+    response.running === true || response.status === 'working' || response.status === 'waiting' || response.status === 'streaming'
+  return { ...(response.info ?? {}), running }
+}
+
+function liveSnapshotRunning(response: LiveSessionSnapshot): boolean {
+  return (
+    response.running === true ||
+    response.status === 'working' ||
+    response.status === 'waiting' ||
+    response.status === 'streaming' ||
+    response.inflight?.streaming === true
+  )
+}
+
+function liveSnapshotStartedAtMs(response: LiveSessionSnapshot): number | undefined {
+  return response.started_at === undefined ? undefined : response.started_at * 1_000
+}
+
 /**
  * Transactionally hydrate a persisted session into its returned LIVE routing
  * id. The requested id is a database key and is never used for live event/RPC
@@ -163,24 +197,17 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
       session_id: options.targetSessionId,
       with_tool_output: true
     })
-    const decoded = decodeSessionResume(raw)
-    if (Option.isNone(decoded)) {
+    const response = decodeSessionResumeResponse(raw)
+    if (!response || !response.session_id.trim()) {
       return yield* new SessionProtocolError({
         message: 'session.resume returned an invalid response',
         method: 'session.resume'
       })
     }
-    const response = decoded.value
     const liveSessionId = response.session_id.trim()
-    if (!liveSessionId) {
-      return yield* new SessionProtocolError({
-        message: 'session.resume returned no session_id',
-        method: 'session.resume'
-      })
-    }
 
     const t1 = Date.now()
-    const snapshot = mapResumeHistory(response.messages)
+    const snapshot = liveSnapshotMessages(response)
     const resumedId = response.resumed?.trim() || options.targetSessionId
     // Capture at the COMMIT boundary, not before the RPC: the composer remains
     // editable while session.resume is in flight and those latest bytes own the
@@ -191,9 +218,11 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
     store.commitSessionSnapshot(
       liveSessionId,
       snapshot,
-      response.info,
+      liveSnapshotInfo(response),
       event => eventBelongsToSession(event, liveSessionId),
-      resumedId
+      resumedId,
+      liveSnapshotRunning(response),
+      liveSnapshotStartedAtMs(response)
     )
     for (const text of preservedQueue) store.enqueuePrompt(text)
     if (preservedDraft) store.replaceComposerDraft(preservedDraft)
@@ -219,6 +248,57 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
         if (!committed) {
           store.abortBuffer(event => eventBelongsToSession(event, previousLiveSessionId))
         }
+      })
+    )
+  )
+})
+
+export interface ActivateSessionOptions {
+  readonly targetSessionId: string
+}
+
+/** Switch visible ownership to an already-live sibling without closing the
+ * previous session. The activate snapshot and any racing target events commit
+ * atomically; failure replays only the still-current session's buffered events. */
+export const activateSession = Effect.fn('SessionLifecycle.activate')(function* (
+  gateway: GatewayServiceShape,
+  store: SessionStore,
+  options: ActivateSessionOptions
+) {
+  const previousLiveSessionId = gateway.sessionId()
+  let committed = false
+  store.beginBuffer()
+  return yield* Effect.gen(function* () {
+    const raw = yield* gateway.request<unknown>('session.activate', { session_id: options.targetSessionId })
+    const response = decodeSessionActivateResponse(raw)
+    const liveSessionId = response?.session_id.trim() ?? ''
+    if (!response || !liveSessionId) {
+      return yield* new SessionProtocolError({
+        message: 'session.activate returned an invalid response',
+        method: 'session.activate'
+      })
+    }
+    const resumeId = response.session_key?.trim() || liveSessionId
+    const snapshot = liveSnapshotMessages(response)
+    store.commitSessionSnapshot(
+      liveSessionId,
+      snapshot,
+      liveSnapshotInfo(response),
+      event => eventBelongsToSession(event, liveSessionId),
+      resumeId,
+      liveSnapshotRunning(response),
+      liveSnapshotStartedAtMs(response)
+    )
+    committed = true
+    return {
+      messageCount: snapshot.length,
+      resumeId,
+      sessionId: liveSessionId
+    } as const
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        if (!committed) store.abortBuffer(event => eventBelongsToSession(event, previousLiveSessionId))
       })
     )
   )

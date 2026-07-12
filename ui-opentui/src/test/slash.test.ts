@@ -306,6 +306,7 @@ interface Probe {
   logLines: { value: string[] }
   logLimits: number[]
   newSessions: Array<[string | undefined, string | undefined]>
+  newLiveSessions: Array<[string | undefined, string | undefined]>
   toolsResets: Array<{ readonly [key: string]: unknown }>
   toolsConfiguring: { begins: number; ends: number; value: boolean }
   hasConversation: { value: boolean }
@@ -355,6 +356,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const logLines = { value: ['gateway: spawned', 'bootstrap: session created'] }
   const logLimits: number[] = []
   const newSessions: Probe['newSessions'] = []
+  const newLiveSessions: Probe['newLiveSessions'] = []
   const toolsResets: Probe['toolsResets'] = []
   const toolsConfiguring: Probe['toolsConfiguring'] = { begins: 0, ends: 0, value: false }
   const hasConversation = { value: true }
@@ -381,6 +383,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const ctx: SlashContext = {
     guardBusySessionSwitch: () => busy.value,
     newSession: (message, title) => newSessions.push([message, title]),
+    newLiveSession: (message, title) => newLiveSessions.push([message, title]),
     beginToolsConfigure: () => {
       toolsConfiguring.begins += 1
       toolsConfiguring.value = true
@@ -497,6 +500,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   return {
     calls,
     newSessions,
+    newLiveSessions,
     toolsResets,
     toolsConfiguring,
     hasConversation,
@@ -881,7 +885,7 @@ describe('dispatchSlash — client commands', () => {
     expect(p.paged[0]?.text).toContain('session created')
   })
 
-  test('/sessions (and bare /resume) open the resume picker on the Recent tab', async () => {
+  test('/sessions (and bare /resume) open the unified sessions orchestrator', async () => {
     const p = makeCtx(async () => ({}))
     await dispatchSlash('/sessions', p.ctx)
     expect(p.sessionPickers).toEqual(['recent'])
@@ -891,15 +895,16 @@ describe('dispatchSlash — client commands', () => {
     expect(p2.sessionPickers).toEqual(['recent'])
   })
 
-  test('/sessions cron|gateways pre-select that tab; garbage -> usage', async () => {
-    const p = makeCtx(async () => ({}))
-    await dispatchSlash('/sessions cron', p.ctx)
-    await dispatchSlash('/sessions gateways', p.ctx)
-    await dispatchSlash('/sessions all', p.ctx)
-    expect(p.sessionPickers).toEqual(['cron', 'gateways', 'all'])
-    await dispatchSlash('/sessions bogus', p.ctx)
-    expect(p.sessionPickers).toHaveLength(3)
-    expect(p.system.at(-1)).toContain('usage: /sessions')
+  test('/sessions new keeps the current sibling; other args direct-resume', async () => {
+    const rows = {
+      sessions: [{ id: 'abc-123', message_count: 5, preview: 'hello', started_at: 1, title: 'First chat' }]
+    }
+    const p = makeCtx(async method => (method === 'session.list' ? rows : {}))
+    await dispatchSlash('/sessions new', p.ctx)
+    expect(p.newLiveSessions).toEqual([['new live session started', undefined]])
+    expect(p.newSessions).toEqual([])
+    await dispatchSlash('/sessions first chat', p.ctx)
+    expect(p.resumed).toEqual(['abc-123'])
   })
 
   test('/skin <name> persists via config.set (the gateway then emits skin.changed)', async () => {

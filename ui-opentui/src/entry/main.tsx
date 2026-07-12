@@ -42,10 +42,11 @@ import {
   decodeCommandsCatalogResponse,
   decodeConfigFullResponse,
   decodeConfigMtimeResponse,
+  decodeConfigValueResponse,
   type SessionSteerDisposition
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
-import { createSession, replaceSession, resumeSession } from '../boundary/sessionLifecycle.ts'
+import { activateSession, createSession, replaceSession, resumeSession } from '../boundary/sessionLifecycle.ts'
 import { configSyncBlocked, createConfigSyncTracker, mcpReloadSucceeded } from '../logic/configSync.ts'
 import {
   createDelegationStatusRefresher,
@@ -86,6 +87,7 @@ import {
   type TransitionSubmission
 } from '../logic/transitionQueue.ts'
 import {
+  awaitModelPrefetch,
   clearModelPrefetch,
   classifySubmit,
   BUSY_QUEUE_FULL_MESSAGE,
@@ -106,6 +108,7 @@ import {
   BUSY_QUEUE_MAX_EDIT_CHARS,
   queueAccepts
 } from '../logic/busyQueue.ts'
+import { coordinatePromptLiveSession } from '../logic/promptLiveSession.ts'
 import {
   advancePreStartCancellationFence,
   createAutomaticQueueDrainGate,
@@ -121,7 +124,7 @@ import {
   takeSettledSteerPrefix,
   type SteerDelivery
 } from '../logic/busySubmit.ts'
-import { createSessionStore, startupCatalogRetryDelay, type Catalog, type SessionStore } from '../logic/store.ts'
+import { createSessionStore, startupCatalogRetryDelay, type Catalog, type PickerItem, type SessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { refreshLearnedNames, seedLearnedNames } from '../view/composer.tsx'
 import { TerminalChrome } from '../view/terminalChrome.tsx'
@@ -131,7 +134,7 @@ import { TerminalChrome } from '../view/terminalChrome.tsx'
 // <code>/<markdown> mount initializes the global tree-sitter client. Grammars
 // are fetched from GitHub on first use and cached under HERMES_TUI_PARSER_CACHE.
 registerRemoteParsers()
-import type { SessionPickerOps } from '../view/overlays/sessionPicker.tsx'
+import type { SessionOrchestratorOps } from '../view/overlays/sessionOrchestrator.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { makeFakeGatewayLayer, type FakeGatewayController } from './fakeGateway.ts'
 
@@ -605,6 +608,29 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         onInvalid: () => getLog().warn('agents', 'invalid delegation.status response')
       })
 
+      const activeSessionsRefresher = createDelegationStatusRefresher({
+        intervalMs: 1_000,
+        apply: raw => store.applyActiveSessionsResponse(raw, gateway.sessionId()),
+        fetch: () =>
+          Effect.runPromise(
+            gateway.request('session.active_list', {
+              current_session_id: gateway.sessionId() ?? ''
+            })
+          ),
+        onFailure: cause => getLog().debug('sessions', 'session.active_list failed', { cause: String(cause) }),
+        onInvalid: () => getLog().warn('sessions', 'invalid session.active_list response')
+      })
+      const activeSessionsTimer = setInterval(() => {
+        if (gateway.sessionId()) void activeSessionsRefresher.refresh()
+      }, 1_500)
+      activeSessionsTimer.unref()
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          clearInterval(activeSessionsTimer)
+          activeSessionsRefresher.invalidate()
+        })
+      )
+
       // Side effects run only when the store actually commits an event. In
       // particular, a billing verification received during resume buffering is
       // delayed until SID filtering accepts it; stale-session events never open
@@ -643,8 +669,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           void delegationStatusRefresher.refresh(store.state.delegation.maxSpawnDepth === null)
         } else if (event.type === 'gateway.exited') {
           delegationStatusRefresher.invalidate()
+          activeSessionsRefresher.invalidate()
         } else if (event.type === 'gateway.ready') {
           void delegationStatusRefresher.refresh(true)
+          if (gateway.sessionId()) void activeSessionsRefresher.refresh(true)
         }
         void spawnTreeSaveDrainer.drain()
       })
@@ -1509,6 +1537,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             pasteStore.retainOnly(store.state.composerDraft)
             stableSessionOwnerId = store.state.resumeId ?? resumeSid
             transitionSucceeded = true
+            activeSessionsRefresher.invalidate()
+            void activeSessionsRefresher.refresh(true)
             if (!store.state.catalog) {
               Effect.runFork(
                 postSessionSetup(gateway, store, liveSessionId).pipe(
@@ -1541,14 +1571,23 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
-      // The resume picker's gateway calls (view/overlays/sessionPicker.tsx).
-      // `rename` goes through `session.title` — the existing title RPC (it
-      // reaches only LIVE gateway sessions; the picker surfaces rejections).
-      const sessionOps: SessionPickerOps = {
-        list: params => Effect.runPromise(gateway.request('session.list', params)),
-        peek: sessionId => Effect.runPromise(gateway.request('session.peek', { session_id: sessionId })),
-        rename: (sessionId, title) =>
-          Effect.runPromise(gateway.request('session.title', { session_id: sessionId, title })).then(() => undefined)
+      // The unified Sessions orchestrator owns only transport calls. Live-list
+      // commits remain centralized in the generation-fenced refresher so a
+      // late response can never overwrite a newer activation/create result.
+      const sessionOps: SessionOrchestratorOps = {
+        history: () =>
+          Effect.runPromise(
+            gateway.request('session.list', {
+              limit: 200,
+              offset: 0,
+              query: '',
+              scope: 'all',
+              sort: 'recent'
+            })
+          ),
+        refresh: () => activeSessionsRefresher.refresh(true).then(() => undefined),
+        close: sessionId => Effect.runPromise(gateway.request('session.close', { session_id: sessionId })),
+        delete: sessionId => Effect.runPromise(gateway.request('session.delete', { session_id: sessionId }))
       }
 
       // The background-process panel's gateway calls (view/overlays/backgroundPanel.tsx):
@@ -1752,11 +1791,225 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
+      const startNewLiveSession = async (message?: string, title?: string): Promise<string | undefined> => {
+        if (isSessionTransitioning()) {
+          store.pushSystem('a session switch is already in progress')
+          return undefined
+        }
+        if (imageAttachInFlight || historyMutationInFlight || pendingPrompt || pendingSteerCount > 0) {
+          store.pushSystem('finish the current session mutation before starting a live sibling')
+          return undefined
+        }
+        if (store.queuedCount() > 0) {
+          store.pushSystem(`send or delete ${store.queuedCount()} queued message(s) before starting a live sibling`)
+          return undefined
+        }
+        if (heldTransitionBlocks(transitionSubmissions.length, heldTransitionOwner, 'live-new')) {
+          store.pushSystem('held submissions belong to another session switch — retry it or /queue --clear')
+          return undefined
+        }
+        clearModelPrefetch()
+        activeTransitionOwner = 'live-new'
+        sessionTransitionInFlight = true
+        store.closeSessionPicker()
+        store.setHint('starting live session…')
+        let transitionSucceeded = false
+        try {
+          const created = await Effect.runPromise(
+            createSession(gateway, {
+              cols: input.cols,
+              cwd: launchCwd()
+            })
+          )
+          store.adoptFreshSession(created.sessionId, created.info, created.resumeId)
+          pasteStore.clear()
+          writeActiveSession(created.resumeId)
+          stableSessionOwnerId = created.resumeId
+          store.setStatus('starting agent…')
+          if (message) store.pushSystem(message)
+          const requestedTitle = title?.trim()
+          if (requestedTitle) {
+            void Effect.runPromise(
+              gateway.request('session.title', {
+                session_id: created.sessionId,
+                title: requestedTitle
+              })
+            ).catch(cause => getLog().warn('sessions', 'live-session title failed', { cause: String(cause) }))
+          }
+          Effect.runFork(
+            postSessionSetup(gateway, store, created.sessionId).pipe(
+              Effect.catchCause(cause =>
+                Effect.sync(() => getLog().warn('sessions', 'live-session setup failed', { cause: String(cause) }))
+              )
+            )
+          )
+          transitionSucceeded = true
+          activeSessionsRefresher.invalidate()
+          void activeSessionsRefresher.refresh(true)
+          return created.sessionId
+        } catch (cause) {
+          const detail = cause instanceof Error ? cause.message : String(cause)
+          store.pushSystem(`new live session failed: ${detail}`)
+          return undefined
+        } finally {
+          sessionTransitionInFlight = false
+          if (store.state.hint === 'starting live session…') store.setHint(undefined)
+          if (transitionSucceeded) drainTransitionSubmissions()
+          else reportFailedTransitionSubmissions()
+          releaseTransitionOwnerUnlessPromoting()
+        }
+      }
+
+      /** Switch the visible owner to an already-live sibling. Unlike a cold
+       * resume, the source is allowed to keep running in the gateway. Local
+       * mutations and reserved input are still fenced because those are owned
+       * by this one renderer and must never be reassigned to the target. */
+      const activateLiveSession = (targetSessionId: string): void => {
+        const target = targetSessionId.trim()
+        if (!target || target === gateway.sessionId()) {
+          store.closeSessionPicker()
+          return
+        }
+        if (imageAttachInFlight) {
+          store.pushSystem('wait for the image attachment before switching live sessions')
+          return
+        }
+        if (historyMutationInFlight) {
+          store.pushSystem('wait for the history update before switching live sessions')
+          return
+        }
+        if (pendingPrompt) {
+          store.pushSystem('wait for the pending prompt request before switching live sessions')
+          return
+        }
+        if (pendingSteerCount > 0) {
+          store.pushSystem(`wait for ${pendingSteerCount} pending steer request(s) before switching live sessions`)
+          return
+        }
+        if (store.queuedCount() > 0) {
+          store.pushSystem(`send or delete ${store.queuedCount()} queued message(s) before switching live sessions`)
+          return
+        }
+        const transitionOwner = `activate:${target}`
+        if (heldTransitionBlocks(transitionSubmissions.length, heldTransitionOwner, transitionOwner)) {
+          store.pushSystem(
+            `${transitionSubmissions.length} held submission(s) belong to ${heldTransitionOwner ?? 'another switch'} — retry it or /queue --clear before switching live sessions`
+          )
+          return
+        }
+        if (isSessionTransitioning()) {
+          store.pushSystem('a session switch is already in progress')
+          return
+        }
+
+        clearModelPrefetch()
+        activeTransitionOwner = transitionOwner
+        sessionTransitionInFlight = true
+        store.closeSessionPicker()
+        store.setHint('switching session…')
+        let transitionSucceeded = false
+        Effect.runFork(
+          activateSession(gateway, store, { targetSessionId: target }).pipe(
+            Effect.tap(result =>
+              Effect.sync(() => {
+                pasteStore.retainOnly(store.state.composerDraft)
+                stableSessionOwnerId = result.resumeId
+                writeActiveSession(result.resumeId)
+                transitionSucceeded = true
+                Effect.runFork(
+                  postSessionSetup(gateway, store, result.sessionId).pipe(
+                    Effect.catchCause(cause =>
+                      Effect.sync(() =>
+                        getLog().warn('sessions', 'post-activate setup failed', { cause: String(cause) })
+                      )
+                    )
+                  )
+                )
+                activeSessionsRefresher.invalidate()
+                void activeSessionsRefresher.refresh(true)
+              })
+            ),
+            Effect.catchCause(cause =>
+              Effect.sync(() => {
+                const error = Cause.squash(cause)
+                const detail = error instanceof Error ? error.message : String(error)
+                getLog().warn('sessions', 'activate failed', { cause: detail, target })
+                store.pushSystem(`session switch failed: ${detail}`)
+              })
+            ),
+            Effect.ensuring(
+              Effect.sync(() => {
+                sessionTransitionInFlight = false
+                if (store.state.hint === 'switching session…') store.setHint(undefined)
+                if (transitionSucceeded) drainTransitionSubmissions()
+                else reportFailedTransitionSubmissions()
+                releaseTransitionOwnerUnlessPromoting()
+              })
+            )
+          )
+        )
+      }
+
+      /** Create a kept-live sibling, apply the exact Ink config.set model
+       * contract, then consume the draft only after prompt admission. */
+      const startNewPromptSession = async (prompt: string, modelArg?: string): Promise<void> => {
+        store.closeSessionPicker()
+        await coordinatePromptLiveSession({
+          create: () => startNewLiveSession('new live session started'),
+          ...(modelArg === undefined ? {} : { modelArg }),
+          notify: message => store.pushSystem(message),
+          onModelSwitched: value => {
+            if (gateway.sessionId() === store.state.sessionId) store.applyInfo({ model: value })
+          },
+          owns: sessionId => gateway.sessionId() === sessionId && store.state.sessionId === sessionId,
+          prompt,
+          restore: (text, notice) => {
+            store.replaceComposerDraft(text)
+            store.pushSystem(notice)
+          },
+          submit: text => sendPromptNow(text),
+          switchModel: async (sessionId, requestedModel) => {
+            const raw = await Effect.runPromise(
+              gateway.request('config.set', {
+                key: 'model',
+                session_id: sessionId,
+                value: requestedModel
+              })
+            )
+            const decoded = decodeConfigValueResponse(raw)
+            const value = decoded?.value.trim() ?? ''
+            if (!value) throw new Error('invalid response: model switch')
+            if (raw && typeof raw === 'object') {
+              const warning = (raw as { warning?: unknown }).warning
+              if (typeof warning === 'string' && warning.trim()) store.pushSystem(`warning: ${warning.trim()}`)
+            }
+            return value
+          }
+        })
+      }
+
+      const loadSessionModelItems = async (): Promise<readonly PickerItem[]> => {
+        const sessionId = gateway.sessionId()
+        if (!sessionId) return []
+        const cached = store.state.modelItems
+        if (cached?.length) return cached
+        await awaitModelPrefetch(sessionId)
+        if (gateway.sessionId() !== sessionId) return []
+        const hydrated = store.state.modelItems
+        if (hydrated?.length) return hydrated
+        const raw = await Effect.runPromise(gateway.request('model.options', { session_id: sessionId }))
+        if (gateway.sessionId() !== sessionId) return []
+        const items = mapModelOptions(raw)
+        if (items.length) store.setModelItems(items)
+        return items
+      }
+
       // Slash dispatch context (Solid logic; the boundary just hands it a
       // Promise-returning `request` + the host capabilities it needs).
       const slashCtx: SlashContext = {
         guardBusySessionSwitch,
         newSession: startNewSession,
+        newLiveSession: (message, title) => void startNewLiveSession(message, title),
         beginToolsConfigure: () => {
           clearModelPrefetch()
           activeTransitionOwner = `tools:${currentSessionOwnerId() ?? 'detached'}`
@@ -2152,6 +2405,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   onType={onType}
                   onRespond={respond}
                   onResume={onResume}
+                  onActivateSession={activateLiveSession}
+                  onNewLiveSession={() => void startNewLiveSession('new live session started')}
+                  onNewPromptSession={(prompt, modelArg) => void startNewPromptSession(prompt, modelArg)}
+                  loadModelItems={loadSessionModelItems}
                   sessionOps={sessionOps}
                   onSessionPickerClosed={onSessionPickerClosed}
                   sessionId={() => gateway.sessionId()}

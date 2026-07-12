@@ -18,6 +18,10 @@ import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/Gatewa
 import type { BillingOverlayState } from '../boundary/billing.ts'
 import type { CommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
 import {
+  decodeSessionActiveListResponse,
+  type ActiveItem
+} from '../boundary/schema/SessionOrchestratorResponses.ts'
+import {
   decodeDelegationPauseResponse,
   decodeDelegationStatusResponse,
   decodeSpawnTreeLoadResponse,
@@ -511,6 +515,12 @@ export interface StoreState {
   pager: PagerState | undefined
   /** The open resume picker (replaces the composer while set); undefined when none. */
   sessionPicker: SessionPickerOverlay | undefined
+  /** Process-global attachable sessions in this gateway. Updated by the
+   * single-flight active-session poll; survives session-owned resets. */
+  liveSessionCount: number
+  /** Last decoded active-list snapshot, shared by chrome and the Sessions
+   * orchestrator so opening the overlay does not add a duplicate poller. */
+  liveSessions: readonly ActiveItem[]
   /** The open generic picker (model/skills/…); undefined when none. */
   picker: PickerState | undefined
   /** Whether the Esc+Esc session prompt-history viewer is open (Epic 5). */
@@ -826,6 +836,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     latestTodos: undefined,
     pager: undefined,
     sessionPicker: undefined,
+    liveSessionCount: 0,
+    liveSessions: [],
     picker: undefined,
     promptHistory: false,
     completions: undefined,
@@ -1413,15 +1425,19 @@ export function createSessionStore(options?: SessionStoreOptions) {
     sessionId: string | undefined,
     rawInfo?: { readonly [k: string]: unknown },
     snapshot: Message[] = [],
-    resumeId: string | undefined = sessionId
+    resumeId: string | undefined = sessionId,
+    turnRunning = false,
+    startedAtMs: number = Date.now()
   ): void {
     if (noticeTimer) clearTimeout(noticeTimer)
     noticeTimer = undefined
     applied.clear()
     buffering = null
-    turnInFlight = false
+    // A live activate/resume can attach after message.start already fired.
+    // The snapshot must arm the server-confirmed-idle queue-drain latch.
+    turnInFlight = turnRunning
     agentsTurnArchived = true
-    const info: SessionInfo = { startedAt: Date.now(), ...(rawInfo ? readInfoPatch(rawInfo) : {}) }
+    const info: SessionInfo = { startedAt: startedAtMs, ...(rawInfo ? readInfoPatch(rawInfo) : {}) }
     const capped = snapshot.length > MESSAGE_CAP ? snapshot.slice(-MESSAGE_CAP) : snapshot
 
     setState(
@@ -1488,10 +1504,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
     snapshot: Message[],
     rawInfo: { readonly [k: string]: unknown } | undefined,
     acceptEvent: (event: GatewayEvent) => boolean,
-    resumeId: string = sessionId
+    resumeId: string = sessionId,
+    turnRunning = false,
+    startedAtMs: number = Date.now()
   ): void {
     const pending = buffering ?? []
-    resetSessionOwnedState(sessionId, rawInfo, snapshot, resumeId)
+    resetSessionOwnedState(sessionId, rawInfo, snapshot, resumeId, turnRunning, startedAtMs)
     for (const event of pending) if (acceptEvent(event)) applyNow(event)
   }
 
@@ -2138,6 +2156,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
           })
         )
         setState('delegation', current => ({ ...current, paused: false, updatedAtMs: null }))
+        setState('liveSessionCount', 0)
+        setState('liveSessions', [])
         setState(produce(settleFailedAssistant))
         // The authoritative settle event can no longer arrive from a dead
         // child. Disarm the latch WITHOUT draining onto the dead transport;
@@ -2371,6 +2391,55 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('resumeId', id)
   }
 
+  /** Apply active-list chrome only when it changed, avoiding a process-wide
+   * Solid invalidation every 1.5s while the terminal is idle. */
+  function setLiveSessionChrome(count: number, title: string): void {
+    const nextCount = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+    const nextTitle = title.trim()
+    if (state.liveSessionCount !== nextCount) setState('liveSessionCount', nextCount)
+    if ((state.info.title ?? '') === nextTitle) return
+    setState(
+      'info',
+      produce(info => {
+        if (nextTitle) info.title = nextTitle
+        else delete info.title
+      })
+    )
+  }
+
+  function applyActiveSessionsResponse(raw: unknown, currentSessionId: string | undefined): boolean {
+    const decoded = decodeSessionActiveListResponse(raw)
+    if (!decoded) return false
+    const wireRows = decoded.sessions ?? []
+    // A response can race a switch; prefer the authoritative SID supplied at apply time.
+    const exactCurrent = currentSessionId ? wireRows.some(row => row.id === currentSessionId) : false
+    const rows = exactCurrent
+      ? wireRows.map(row => ({ ...row, current: row.id === currentSessionId }))
+      : wireRows
+    const same =
+      rows.length === state.liveSessions.length &&
+      rows.every((row, index) => {
+        const previous = state.liveSessions[index]
+        return (
+          previous?.id === row.id &&
+          previous.current === row.current &&
+          previous.status === row.status &&
+          previous.title === row.title &&
+          previous.preview === row.preview &&
+          previous.model === row.model &&
+          previous.message_count === row.message_count &&
+          previous.last_active === row.last_active &&
+          previous.session_key === row.session_key &&
+          previous.started_at === row.started_at
+        )
+      })
+    if (!same) setState('liveSessions', rows)
+    const current =
+      (currentSessionId ? rows.find(row => row.id === currentSessionId) : undefined) ?? rows.find(row => row.current)
+    setLiveSessionChrome(rows.length, current?.title ?? '')
+    return true
+  }
+
   return {
     /** Effective retained-message cap after the production windowing ceiling. */
     messageCap: MESSAGE_CAP,
@@ -2405,6 +2474,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setCommandCatalog,
     setSessionId,
     setResumeId,
+    setLiveSessionChrome,
+    applyActiveSessionsResponse,
     detachSession,
     adoptFreshSession,
     commitSessionSnapshot,

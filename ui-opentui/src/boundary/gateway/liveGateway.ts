@@ -19,6 +19,11 @@ import { backoffMs, planGatewayRecovery } from '../../logic/gatewayRecovery.ts'
 import { GatewayError } from '../errors.ts'
 import { getLog } from '../log.ts'
 import { GatewayEventSchema, type GatewayEvent } from '../schema/GatewayEvent.ts'
+import {
+  decodeSessionActivateResponse,
+  decodeSessionCloseResponse,
+  decodeSessionResumeResponse
+} from '../schema/SessionOrchestratorResponses.ts'
 import { GatewayService, type GatewayServiceShape } from './GatewayService.ts'
 import { RawGatewayClient, RawGatewayRequestError } from './client.ts'
 
@@ -67,11 +72,25 @@ export function trackedSessionIdAfterRequest(
   params: unknown,
   result: unknown
 ): string | undefined {
-  if ((method === 'session.create' || method === 'session.resume') && result && typeof result === 'object') {
-    const sid = (result as { session_id?: unknown }).session_id
-    return typeof sid === 'string' && sid.trim() ? sid.trim() : current
+  if (method === 'session.resume') {
+    const decoded = decodeSessionResumeResponse(result)
+    return decoded?.session_id.trim() || current
+  }
+  if (method === 'session.activate') {
+    const decoded = decodeSessionActivateResponse(result)
+    return decoded?.session_id.trim() || current
+  }
+  if ((method === 'session.create' || method === 'session.branch') && result && typeof result === 'object') {
+    const response = result as { info?: unknown; session_id?: unknown }
+    const infoValid =
+      response.info === undefined ||
+      (response.info !== null && typeof response.info === 'object' && !Array.isArray(response.info))
+    return typeof response.session_id === 'string' && response.session_id.trim() && infoValid
+      ? response.session_id.trim()
+      : current
   }
   if (method === 'session.close' && params && typeof params === 'object') {
+    if (!decodeSessionCloseResponse(result)) return current
     const target = (params as { session_id?: unknown }).session_id
     if (typeof target === 'string' && target === current) return undefined
   }
@@ -204,7 +223,13 @@ function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
           Effect.sync(() => {
             const previous = sessionId
             sessionId = trackedSessionIdAfterRequest(sessionId, method, params, result)
-            if ((method === 'session.create' || method === 'session.resume') && sessionId !== previous) {
+            if (
+              (method === 'session.create' ||
+                method === 'session.resume' ||
+                method === 'session.activate' ||
+                method === 'session.branch') &&
+              sessionId !== previous
+            ) {
               recoverSid = undefined
             } else if (method === 'session.close' && previous !== undefined && sessionId === undefined) {
               recoverSid = undefined

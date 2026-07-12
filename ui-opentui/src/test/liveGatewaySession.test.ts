@@ -11,8 +11,16 @@ import {
 describe('live gateway session tracking', () => {
   test('create/resume adopt the returned live id', () => {
     expect(trackedSessionIdAfterRequest(undefined, 'session.create', {}, { session_id: 'new-1' })).toBe('new-1')
-    expect(trackedSessionIdAfterRequest('old-1', 'session.resume', {}, { session_id: 'live-2' })).toBe('live-2')
-    expect(trackedSessionIdAfterRequest('old-1', 'session.resume', {}, { session_id: '  live-3  ' })).toBe('live-3')
+    expect(trackedSessionIdAfterRequest('old-1', 'session.resume', {}, { messages: [], session_id: 'live-2' })).toBe(
+      'live-2'
+    )
+    expect(
+      trackedSessionIdAfterRequest('old-1', 'session.resume', {}, { messages: [], session_id: '  live-3  ' })
+    ).toBe('live-3')
+    expect(trackedSessionIdAfterRequest('old-1', 'session.activate', {}, { messages: [], session_id: 'live-4' })).toBe(
+      'live-4'
+    )
+    expect(trackedSessionIdAfterRequest('live-4', 'session.branch', {}, { session_id: 'live-5' })).toBe('live-5')
   })
 
   test('a successful matching close clears the routing id, including closed:false', () => {
@@ -29,7 +37,13 @@ describe('live gateway session tracking', () => {
 
   test('malformed create/resume responses never replace a valid id', () => {
     expect(trackedSessionIdAfterRequest('live-1', 'session.create', {}, {})).toBe('live-1')
-    expect(trackedSessionIdAfterRequest('live-1', 'session.resume', {}, { session_id: '  ' })).toBe('live-1')
+    expect(trackedSessionIdAfterRequest('live-1', 'session.create', {}, { info: [], session_id: 'poison' })).toBe(
+      'live-1'
+    )
+    expect(trackedSessionIdAfterRequest('live-1', 'session.resume', {}, { messages: [], session_id: '  ' })).toBe(
+      'live-1'
+    )
+    expect(trackedSessionIdAfterRequest('live-1', 'session.activate', {}, { session_id: 'poison' })).toBe('live-1')
   })
 
   test('raw failure provenance maps without string heuristics', () => {

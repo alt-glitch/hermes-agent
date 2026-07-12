@@ -18,7 +18,7 @@ import { diagnosticsEnabled } from './env.ts'
 import { DETAILS_SECTIONS, DETAILS_USAGE, type DetailsMode, nextDetailsMode, parseDetailsMode } from './details.ts'
 import { formatBytes, memReport, performHeapdump } from './diagnostics.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './replay.ts'
-import { mapSessionRows, parseSessionTabArg, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
+import { mapSessionRows, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
 import type { SpawnHistoryState, SpawnSnapshot } from './spawnHistory.ts'
 import type { CompletionItem, ConfirmRequest, PickerItem, PickerState } from './store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
@@ -115,6 +115,8 @@ export interface SlashContext {
   readonly guardBusySessionSwitch: (what?: string, requestedOwner?: string) => boolean
   /** Close the current live session and create/adopt a replacement. */
   readonly newSession: (message?: string, title?: string) => void
+  /** Create/adopt a new live sibling without closing the current session. */
+  readonly newLiveSession: (message?: string, title?: string) => void
   /** Adopt the same-SID agent reset returned by `tools.configure`, then refresh
    *  session catalogs asynchronously. */
   readonly resetAfterToolsConfigure: (info: { readonly [key: string]: unknown }) => void
@@ -390,29 +392,9 @@ const slashFlightIsCurrent = (ctx: SlashContext, flight: number): boolean => SLA
 const currentSessionIs = (ctx: SlashContext, expected: string | undefined, flight: number) =>
   slashFlightIsCurrent(ctx, flight) && ctx.sessionId() === expected
 
-/** `/sessions [recent|cron|gateways|all]` — open the tabbed resume picker,
- *  pre-selecting the named tab (shared by /sessions, /switch, /session). */
-const sessionsCmd: ClientHandler = (arg, ctx) => {
-  const tab = parseSessionTabArg(arg)
-  if (!tab) {
-    ctx.pushSystem('usage: /sessions [recent|cron|gateways|all]')
-    return
-  }
-  ctx.openSessionPicker(tab)
-}
-
-/** `/resume` — bare opens the picker; `/resume <id|name>` keeps the DIRECT
- *  path: resolve the arg against `session.list` (exact id → unique id prefix
- *  → exact/unique title) and hydrate without the overlay. */
-const resumeCmd: ClientHandler = async (arg, ctx) => {
-  const needle = arg.trim()
-  if (!needle) {
-    ctx.openSessionPicker('recent')
-    return
-  }
+/** Direct cold-session resolution shared by /sessions <id|title> and /resume. */
+const directResume = async (needle: string, ctx: SlashContext) => {
   try {
-    // One bounded page over ALL sources (the gateway deny-lists `tool`) — the
-    // direct path targets a known session, not a browse.
     const { rows } = mapSessionRows(await ctx.request('session.list', { limit: 200 }))
     const hit = resolveSessionArg(rows, needle)
     if (!hit) {
@@ -423,6 +405,33 @@ const resumeCmd: ClientHandler = async (arg, ctx) => {
   } catch (error) {
     ctx.pushSystem(`/resume: ${error instanceof Error ? error.message : 'session.list failed'}`)
   }
+}
+
+/** f7 unified orchestrator: bare opens it, `new` keeps the current sibling
+ * alive, and any other argument directly cold-resumes by id/title. */
+const sessionsCmd: ClientHandler = async (arg, ctx) => {
+  const needle = arg.trim()
+  if (!needle) {
+    ctx.openSessionPicker('recent')
+    return
+  }
+  if (needle.toLowerCase() === 'new') {
+    ctx.newLiveSession('new live session started')
+    return
+  }
+  await directResume(needle, ctx)
+}
+
+/** `/resume` — bare opens the unified orchestrator; `/resume <id|name>` keeps the DIRECT
+ *  path: resolve the arg against `session.list` (exact id → unique id prefix
+ *  → exact/unique title) and hydrate without the overlay. */
+const resumeCmd: ClientHandler = async (arg, ctx) => {
+  const needle = arg.trim()
+  if (!needle) {
+    ctx.openSessionPicker('recent')
+    return
+  }
+  await directResume(needle, ctx)
 }
 
 /**
@@ -628,7 +637,7 @@ export function startModelPrefetch<T>(
 }
 
 /** Await only this session's registered prefetch (bounded). */
-function awaitModelPrefetch(sessionId: string | undefined): Promise<void> {
+export function awaitModelPrefetch(sessionId: string | undefined): Promise<void> {
   const pending = modelPrefetch
   if (!pending || pending.sessionId !== sessionId) return Promise.resolve()
   return Promise.race([pending.promise, new Promise(resolve => setTimeout(resolve, pending.waitMs))]).then(

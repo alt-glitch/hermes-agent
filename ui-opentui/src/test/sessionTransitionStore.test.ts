@@ -148,6 +148,35 @@ describe('session-store replacement boundary', () => {
     expect(JSON.stringify(store.state.messages)).not.toContain('stale')
   })
 
+  test('live snapshot commit preserves age and arms the completion latch', () => {
+    const store = createSessionStore()
+    let drained = 0
+    store.registerTurnCompleteHandler(() => (drained += 1))
+    store.commitSessionSnapshot('live', [], { running: true }, () => true, 'key', true, 42_000)
+    expect(store.state.info.startedAt).toBe(42_000)
+    expect(store.isTurnInFlight()).toBe(true)
+    store.applyInfo({ running: false })
+    expect(drained).toBe(1)
+  })
+
+  test('active-list application prefers the supplied SID over stale wire current flags', () => {
+    const store = createSessionStore()
+    expect(
+      store.applyActiveSessionsResponse(
+        { sessions: [
+          { id: 'old', status: 'idle', title: 'Old', current: true },
+          { id: 'new', status: 'working', title: 'New', current: false }
+        ] },
+        'new'
+      )
+    ).toBe(true)
+    expect(store.state.info.title).toBe('New')
+    expect(store.state.liveSessions.map(row => [row.id, row.current])).toEqual([
+      ['old', false],
+      ['new', true]
+    ])
+  })
+
   test('busy lifetime includes message.complete until server-confirmed idle', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start', session_id: 'live' })

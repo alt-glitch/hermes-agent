@@ -20,7 +20,7 @@ Status meanings:
 - **In progress** — actively being implemented; never counts as shipped.
 - **Intentional skip** — an explicit supported-platform/product decision.
 
-Current slash tally: **19 Covered, 24 Thinner, 14 Missing, 0 In progress, 1
+Current slash tally: **21 Covered, 22 Thinner, 14 Missing, 0 In progress, 1
 Intentional skip**.
 
 ## Slash commands
@@ -54,7 +54,7 @@ Intentional skip**.
 | 25 | `/credits` | Thinner | Direct balance/identity/top-up RPCs, confirmation, and safe URL opening. |
 | 26 | `/background`, `/bg`, `/btw` | Covered | Direct `prompt.background` and background-task badge tracking. |
 | 27 | `/model` | Thinner | Busy guard, refresh, provider onboarding, expensive-model confirm, and session/global persistence choice. |
-| 28 | `/sessions`, `/session`, `/switch`, `/resume` | Thinner | Paged/searchable picker and direct resume use guarded transactional switching with persisted-vs-ephemeral SID separation, rollback, event fencing, catalog refresh, bounded drain, and skin-aware animated list/load-more/preview loading. Termctrl proves scoped loading and live resume; add live siblings, `/sessions new`, close/delete, and model-selection flows. |
+| 28 | `/sessions`, `/session`, `/switch`, `/resume` | Covered | The unified orchestrator pins +new above attachable live siblings and durable-key-deduped resumable history; decoded transactional activate/resume preserves ephemeral routing versus persisted identity, in-flight turns, rollback/event fencing, catalog refresh, and bounded drain. `/sessions new`, live close with safe fallback, historical delete confirmation, direct resume, and prompt-plus-Tab-model creation are covered. Termctrl exercised create/switch/close/resume flows and responsive rendering at 132×40 and 40×24. |
 | 29 | `/image` | Missing | Reuse direct `image.attach` and preserve any remainder text for the composer. |
 | 30 | `/personality` | Covered | The live gateway mirror applies personality without a detached-only mutation. |
 | 31 | `/compress` | Thinner | Gateway compression works; replace the visible snapshot/info/usage afterward. |
@@ -74,7 +74,7 @@ Intentional skip**.
 | 45 | `/reload` | Covered | Decoded direct `reload.env` runs in the live gateway, validates its update count, renders exact singular/plural feedback, and drops superseded results. |
 | 46 | `/browser` | Missing | Direct `browser.manage`, progress presentation, and live CDP indicator. |
 | 47 | `/rollback` | Thinner | Use structured list/diff/restore RPCs and reconcile visible transcript state. |
-| 48 | `/agents`, `/tasks` | Thinner | Live events, running-agent status chip, tray handoff, and a native master/detail trace dashboard work. Add pause/resume/status, kill-one/subtree, completed-turn history, replay/diff integration, sort/filter, timeline/tree metrics, and the parked-subagent resume hint. |
+| 48 | `/agents`, `/tasks` | Covered | Live events feed the responsive master/detail dashboard, running-agent chip, tray handoff, sort/filter, tree/timeline metrics, completed-turn history, replay/diff views, and parked-subagent resume hint. `/agents status`, pause/resume, and per-agent or subtree kill use decoded live controls. Termctrl exercised wide/narrow dashboards and a real background delegation through completion, automatic parent resume, and replay. |
 | 49 | `/journey`, `/learning`, `/memory-graph` | Missing | Target gateway `learning.*` exists; port the timeline/detail/edit/delete overlay. |
 | 50 | `/replay` | Thinner | Disk list/load pager exists; add in-memory history/navigation and dashboard integration. |
 | 51 | `/replay-diff` | Missing | Add pair selection, diff state, and native dashboard view. |
@@ -110,7 +110,7 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | Busy queue UX | Thinner | Queue/steer/interrupt policy, visible edit/remove/send rows, double-empty Enter, draft/unsent-queue crash retention, and an explicit-retry drain halt for uncertain delivery exist; Ctrl/Cmd+K remains the stock delete-to-line-end edit binding. Real-child termctrl covers FIFO drain and crash recovery. Settle typed provenance for shell/slash-like rows and explicitly approve the bounded ceiling divergence. |
 | New/clear session adoption | Covered | `sessionLifecycle` performs decoded create/replace/resume transactions; the store atomically replaces sparse info and every session-owned slice without replaying launch prompt/images, while a bounded transition queue preserves submissions safely. |
 | Session event scope | Covered | `eventMayEnterStore` gates reducer and side effects by the active ephemeral SID; resume buffering admits events only into a transaction buffer whose commit/abort filters against the adopted/restored live SID. |
-| Session picker/live siblings | Thinner | Paged cold browse/search/peek/resume, cwd grouping, and skin-aware animated list/load-more/preview states are termctrl-verified; add active switching, close/delete, and new/model flows. |
+| Session picker/live siblings | Covered | One animated, skin-aware orchestrator merges +new, attachable live siblings, and durable-key-deduped resumable history. Transactional activate/resume, live close/fallback, historical delete, prompt/model creation, selection re-anchoring, and narrow 40×24 rendering are contract- and termctrl-verified. |
 | Large history transport | Covered | Ordinary/corrupt frames remain capped at 32 MiB; only canonical pending `session.resume`/`session.history` responses receive the heap-derived bounded allowance. A real 36,156,260-byte resume hydrated 3,000 rows under termctrl. |
 | Startup tool catalog | Covered | Agent readiness timeout is explicit pending state with a bounded retry; permanent failure is visible and non-retrying. Termctrl proves pending `0 tools` refreshes to the authoritative catalog without holding shutdown. |
 | Live config synchronization | Thinner | A scoped five-second mtime tracker defers MCP reload while busy or transitioning, while a registry-transition lock serializes reload against agent construction and `/tools` without blocking prompt admission. External-edit propagation is termctrl-proven; port Ink's remaining display fan-out for bell, voice key, compact, details/sections, indicator, inline diffs, mouse, paste thresholds, reasoning, status bar, and streaming. |
