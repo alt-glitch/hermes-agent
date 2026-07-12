@@ -114,6 +114,16 @@ describe('native agents dashboard parity', () => {
     expect(frame).toContain('sonnet-5×1')
   })
 
+  test('the 132-column control footer stays whole inside its border and padding', async () => {
+    const frame = await captureFrame(dashboardNode({ subagents: [] }), {
+      height: 30,
+      until: 'No subagents this turn',
+      width: 132
+    })
+    expect(frame).toContain('q close')
+    expect(frame).not.toContain('q clos │')
+  })
+
   test('list navigation opens rich detail and Escape returns to the list', async () => {
     const probe = await renderProbe(dashboardNode(), { height: 34, kittyKeyboard: true, width: 116 })
     try {

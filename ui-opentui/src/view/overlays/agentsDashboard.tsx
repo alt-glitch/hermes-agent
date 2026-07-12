@@ -169,8 +169,11 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
         ? ` · [ / ] history ${String(historyIndex())}/${String(history().snapshots.length)}`
         : ''
     const full = `↑↓/jk move · g/G top/bottom · Enter/→ open detail${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · q close`
+    const medium = `↑↓ move · Enter/→ open detail · s/f view${locked} · q close`
     const compact = `↑↓ move · Enter open · s/f view${locked} · q close`
-    return truncRight(dims().width >= 104 ? full : compact, Math.max(8, dims().width - 4))
+    const available = Math.max(8, dims().width - 4)
+    const footer = full.length + 2 <= available ? full : medium.length + 2 <= available ? medium : compact
+    return truncRight(footer, available)
   })
   const detailFooter = createMemo(() => {
     const controls = replayMode()
@@ -178,7 +181,8 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       : ` · x kill · X subtree · p ${delegation().paused ? 'resume' : 'pause'}`
     const full = `↑↓/jk scroll · PgUp/PgDn page · g/G top/bottom · Esc/← back${controls} · q close`
     const compact = `↑↓ scroll · PgUp/PgDn page · Esc back${controls} · q close`
-    return truncRight(dims().width >= 96 ? full : compact, Math.max(8, dims().width - 4))
+    const available = Math.max(8, dims().width - 4)
+    return full.length + 2 <= available ? full : truncRight(compact, available)
   })
 
   function closeWithCleanup(): void {
