@@ -22,7 +22,7 @@
 import { createDefaultOpenTuiKeymap } from '@opentui/keymap/opentui'
 import { KeymapProvider } from '@opentui/keymap/solid'
 import { render } from '@opentui/solid'
-import { Cause, Deferred, Duration, Effect } from 'effect'
+import { Cause, Deferred, Duration, Effect, Option } from 'effect'
 import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import type { KeyEvent } from '@opentui/core'
@@ -36,6 +36,7 @@ import { startMemoryMonitor } from '../boundary/memoryMonitor.ts'
 import { startProactiveGc } from '../boundary/proactiveGc.ts'
 import { registerRemoteParsers } from '../boundary/parsers.ts'
 import { acquireRenderer, redrawRenderer } from '../boundary/renderer.ts'
+import { decodeSubagentInterruptResponse } from '../boundary/schema/Delegation.ts'
 import {
   classifySessionSteerResponse,
   decodeCommandsCatalogResponse,
@@ -46,6 +47,11 @@ import {
 import { makeAppLayer } from '../boundary/runtime.ts'
 import { createSession, replaceSession, resumeSession } from '../boundary/sessionLifecycle.ts'
 import { configSyncBlocked, createConfigSyncTracker, mcpReloadSucceeded } from '../logic/configSync.ts'
+import {
+  createDelegationStatusRefresher,
+  createSpawnTreeSaveDrainer,
+  tuiAgentsNudgeConfigValue
+} from '../logic/agentsRuntime.ts'
 import { nthAssistantResponse } from '../logic/copy.ts'
 import { presentBillingVerification } from '../logic/billingVerification.ts'
 import { performHeapdump } from '../logic/diagnostics.ts'
@@ -349,6 +355,7 @@ const postSessionSetup = (
     const decodedBusyConfig = decodeConfigFullResponse(busyConfig)
     if (isActive() && decodedBusyConfig) {
       store.hydrateBusyInputMode(busyInputModeFromConfig(decodedBusyConfig.config), busyModeRevision)
+      store.configureAgentsNudge(tuiAgentsNudgeConfigValue(decodedBusyConfig.config))
     }
 
     // A session switch may have completed while either best-effort catalog RPC
@@ -573,6 +580,31 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         return true
       }
 
+      const spawnTreeSaveDrainer = createSpawnTreeSaveDrainer({
+        next: () => store.nextSpawnTreeSaveIntent(),
+        settle: id => store.settleSpawnTreeSaveIntent(id),
+        save: request => Effect.runPromise(gateway.request('spawn_tree.save', request)),
+        onSaveFailure: (id, cause) =>
+          getLog().warn('agents', 'spawn-tree persistence failed', {
+            cause: String(cause),
+            snapshot_id: id
+          }),
+        onInvariantFailure: (id, cause) =>
+          getLog().error('agents', 'spawn-tree save intent settlement invariant failed', {
+            ...(cause === undefined
+              ? {}
+              : { cause: cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : 'unknown' }),
+            snapshot_id: id
+          })
+      })
+
+      const delegationStatusRefresher = createDelegationStatusRefresher({
+        apply: raw => store.applyDelegationStatusResponse(raw),
+        fetch: () => Effect.runPromise(gateway.request('delegation.status', {})),
+        onFailure: cause => getLog().warn('agents', 'delegation.status failed', { cause: String(cause) }),
+        onInvalid: () => getLog().warn('agents', 'invalid delegation.status response')
+      })
+
       // Side effects run only when the store actually commits an event. In
       // particular, a billing verification received during resume buffering is
       // delayed until SID filtering accepts it; stale-session events never open
@@ -605,6 +637,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             )
           }
         }
+
+        if (event.type === 'subagent.spawn_requested' || event.type === 'subagent.start') {
+          if (store.consumeAgentsNudge()) store.setStatus('subagents working · /agents to watch live')
+          void delegationStatusRefresher.refresh(store.state.delegation.maxSpawnDepth === null)
+        } else if (event.type === 'gateway.exited') {
+          delegationStatusRefresher.invalidate()
+        } else if (event.type === 'gateway.ready') {
+          void delegationStatusRefresher.refresh(true)
+        }
+        void spawnTreeSaveDrainer.drain()
       })
 
       const enqueueTransitionSubmission = (item: TransitionSubmission): boolean => {
@@ -1517,6 +1559,37 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         stopAll: () => Effect.runPromise(gateway.request('process.stop', {})).then(() => undefined)
       }
 
+      const agentsOps = {
+        refresh: () => delegationStatusRefresher.refresh(true).then(() => undefined),
+        interrupt: async (id: string): Promise<string> => {
+          try {
+            const raw = await Effect.runPromise(gateway.request('subagent.interrupt', { subagent_id: id }))
+            const decoded = decodeSubagentInterruptResponse(raw)
+            if (Option.isNone(decoded)) throw new Error('invalid response')
+            return decoded.value.found ? `killing ${id}` : `not found: ${id}`
+          } catch {
+            throw new Error(`kill failed: ${id}`)
+          }
+        },
+        interruptSubtree: (ids: readonly string[]): Promise<void> => {
+          for (const id of ids) {
+            void Effect.runPromise(gateway.request('subagent.interrupt', { subagent_id: id })).catch(cause =>
+              getLog().warn('agents', 'subtree interrupt failed', { cause: String(cause), subagent_id: id })
+            )
+          }
+          return Promise.resolve()
+        },
+        setPaused: async (paused: boolean): Promise<string> => {
+          try {
+            const raw = await Effect.runPromise(gateway.request('delegation.pause', { paused }))
+            if (!store.applyDelegationPauseResponse(raw)) throw new Error('invalid response')
+            return store.state.delegation.paused ? 'spawning paused' : 'spawning resumed'
+          } catch {
+            throw new Error('pause failed')
+          }
+        }
+      }
+
       // Boot-picker Esc fallback: the picker closed without a pick and no
       // session exists yet (bare `--resume` launch) — create a fresh one so
       // the composer has somewhere to send prompts.
@@ -1815,7 +1888,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         modelItems: () => store.state.modelItems,
         setModelItems: items => store.setModelItems(items),
         logTail: limit => gateway.logTail(limit),
-        openDashboard: () => store.openDashboard(),
+        agentsControl: {
+          applyPauseResponse: raw => store.applyDelegationPauseResponse(raw),
+          delegation: () => store.state.delegation,
+          history: () => store.state.spawnHistory,
+          loadSnapshot: (raw, path) => store.loadSpawnTreeSnapshot(raw, path)
+        },
+        openDashboard: request => store.openDashboard(request),
         openBackgroundPanel: () => store.openBackgroundPanel(),
         openBilling: overlay => store.openBilling(overlay),
         addBgTask: id => store.addBgTask(id),
@@ -2081,6 +2160,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   pasteStore={pasteStore}
                   onPasteLimitExceeded={showPasteLimit}
                   backgroundOps={backgroundOps}
+                  agentsOps={agentsOps}
                 />
               </ThemeProvider>
             </KeymapProvider>

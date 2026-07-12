@@ -4,7 +4,8 @@
  *   1. schema: the SessionInfo wire fields decode (and null/absence is safe)
  *   2. store: applyInfo merges the usage/chrome fields
  *   3. pure logic: statusSegments width table (priority drop order), the
- *      ctxBarCells gauge ladder, ctx/cmp threshold levels + compact formatters
+ *      ctxBarCells gauge ladder, ctx/cmp threshold levels, compact formatters,
+ *      and Ink-compatible spawn-HUD pressure/labels
  *   4. frames: the bar renders ONE left-flowing labeled row (`ctx:`/`cost:`/
  *      `up:`/`cmp:`/`mcp:`), drops tail segments whole as the terminal
  *      narrows (never wraps to a second line), and the update notice borrows
@@ -14,13 +15,15 @@ import { Option } from 'effect'
 import { describe, expect, test } from 'vitest'
 
 import { decodeSessionInfoPatch } from '../boundary/schema/SessionInfo.ts'
-import { createSessionStore, type SessionStore } from '../logic/store.ts'
+import { applyDelegationState, createDelegationState } from '../logic/agentStatus.ts'
+import { createSessionStore, type SessionStore, type SubagentInfo } from '../logic/store.ts'
 import {
   cmpLevel,
   ctxBarCells,
   ctxLevel,
   fmtShortDuration,
   fmtTokens,
+  spawnHudModel,
   StatusBar,
   statusSegments
 } from '../view/statusBar.tsx'
@@ -194,6 +197,64 @@ describe('compact formatters', () => {
   })
 })
 
+describe('spawnHudModel — Ink compact tree/cap semantics', () => {
+  const agent = (id: string, status: string, depth: number, parentId?: string): SubagentInfo => ({
+    depth,
+    goal: id,
+    id,
+    ...(parentId === undefined ? {} : { parentId }),
+    status
+  })
+  const tree = [
+    agent('root', 'running', 0),
+    agent('child-a', 'running', 1, 'root'),
+    agent('child-b', 'queued', 1, 'root')
+  ]
+  const caps = (depth: number, concurrency: number) =>
+    applyDelegationState(createDelegationState(), { max_concurrent_children: concurrency, max_spawn_depth: depth }, 1)
+
+  test('hides only when both the live tree is empty and delegation is not paused', () => {
+    expect(spawnHudModel([], createDelegationState())).toEqual({ text: '', tone: 'muted' })
+    const paused = applyDelegationState(createDelegationState(), { paused: true }, 1)
+    expect(spawnHudModel([], paused)).toEqual({ text: '⏸ paused', tone: 'error' })
+  })
+
+  test.each([
+    {
+      name: 'unknown caps stay compact and neutral',
+      rows: [agent('root', 'running', 0)],
+      delegation: createDelegationState(),
+      expected: { text: 'd1 ⚡1', tone: 'muted' }
+    },
+    {
+      name: 'below .66 is neutral',
+      rows: [agent('root', 'running', 0)],
+      delegation: caps(4, 4),
+      expected: { text: 'd1/4 ⚡1/4', tone: 'muted' }
+    },
+    {
+      name: 'widest level drives warn while +extra reports the remaining active rows',
+      rows: tree,
+      delegation: caps(3, 3),
+      expected: { text: 'd2/3 ⚡2/3+1', tone: 'warn' }
+    },
+    {
+      name: 'at-cap prefixes the warning glyph and uses error tone',
+      rows: tree,
+      delegation: caps(2, 2),
+      expected: { text: '⚠ d2/2 ⚡2/2+1', tone: 'error' }
+    },
+    {
+      name: 'a terminal tree keeps the depth HUD but omits the active-width label',
+      rows: [agent('root', 'completed', 0)],
+      delegation: caps(3, 4),
+      expected: { text: 'd1/3', tone: 'muted' }
+    }
+  ])('$name', ({ rows, delegation, expected }) => {
+    expect(spawnHudModel(rows, delegation)).toEqual(expected)
+  })
+})
+
 // ── 4. frames ────────────────────────────────────────────────────────────
 
 function seededStore(): SessionStore {
@@ -209,6 +270,13 @@ function seededStore(): SessionStore {
     mcp_servers: [{ connected: true }, { connected: true }],
     usage: { context_percent: 42, context_used: 84_000, context_max: 200_000, cost_usd: 0.41, compressions: 2 }
   })
+  return store
+}
+
+function parkedStore(count: number, running: boolean): SessionStore {
+  const store = createSessionStore()
+  store.apply({ type: 'gateway.ready' })
+  store.applyInfo({ model: 'm', running, usage: { active_subagents: count } })
   return store
 }
 
@@ -294,6 +362,117 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     expect(frame).not.toContain('█') // bar detail dropped
     expect(frame).not.toContain('84k')
     expect(frame).not.toContain('$0.41')
+  })
+
+  test('Agents chip uses authoritative usage including zero, with local-row fallback', async () => {
+    const store = seededStore()
+    store.apply({
+      type: 'subagent.start',
+      payload: { depth: 0, goal: 'local compatibility row', subagent_id: 'local-1' }
+    })
+    const probe = await renderProbe(bar(store), { width: 120, height: 3 })
+    try {
+      expect(probe.frame()).toContain('⛓ 1') // usage absent → normalized local fallback
+
+      store.applyInfo({ usage: { active_subagents: 0 } })
+      await probe.settle()
+      expect(probe.frame()).not.toContain('⛓') // explicit registry zero wins over the live row
+
+      store.applyInfo({ usage: { active_subagents: 3 } })
+      await probe.settle()
+      expect(probe.frame()).toContain('⛓ 3') // registry count need not match the local tree
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test.each([
+    [80, '↩ resumes when 12 subagents finish'],
+    [40, '↩ resumes · 12'],
+    [20, '↩ 12'],
+    [10, '']
+  ])('idle auto-resume hint picks one whole width-aware variant at %i columns', async (width, expected) => {
+    const frame = await captureFrame(bar(parkedStore(12, false)), { width, height: 3 })
+    const rows = frame.split('\n').filter(row => row.trim())
+    expect(rows).toHaveLength(1)
+    if (expected) expect(rows[0]).toContain(expected)
+    else expect(frame).not.toContain('↩')
+  })
+
+  test('idle hint uses actual remaining cells and preserves the minimum cwd tail', async () => {
+    const minimal = await captureFrame(bar(parkedStore(12, false)), { width: 70, height: 3 })
+    expect(minimal).toContain('↩ resumes when 12 subagents finish')
+
+    const crowded = seededStore()
+    crowded.applyInfo({ running: false, usage: { active_subagents: 12 } })
+    const frame = await captureFrame(bar(crowded), { width: 70, height: 3 })
+    const rows = frame.split('\n').filter(row => row.trim())
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toContain('↩ 12')
+    expect(rows[0]).not.toContain('↩ resumes')
+    expect(rows[0]).toContain('(main)')
+  })
+
+  test('auto-resume promise hides while the main turn runs, at registry zero, and for local fallback only', async () => {
+    const store = parkedStore(2, false)
+    const probe = await renderProbe(bar(store), { width: 80, height: 3 })
+    try {
+      expect(probe.frame()).toContain('↩ resumes when 2 subagents finish')
+
+      store.applyInfo({ running: true, usage: { active_subagents: 2 } })
+      await probe.settle()
+      expect(probe.frame()).not.toContain('↩')
+
+      store.applyInfo({ running: false, usage: { active_subagents: 0 } })
+      await probe.settle()
+      expect(probe.frame()).not.toContain('↩')
+    } finally {
+      probe.destroy()
+    }
+
+    const fallback = seededStore()
+    fallback.apply({ type: 'subagent.start', payload: { goal: 'legacy row', subagent_id: 'local-only' } })
+    const frame = await captureFrame(bar(fallback), { width: 120, height: 3 })
+    expect(frame).toContain('⛓ 1')
+    expect(frame).not.toContain('↩')
+  })
+
+  test('SpawnHud stays after width-gated segments and never creates a second chrome row', async () => {
+    const store = seededStore()
+    expect(
+      store.applyDelegationStatusResponse({
+        active: [],
+        max_concurrent_children: 3,
+        max_spawn_depth: 3,
+        paused: false
+      })
+    ).toBe(true)
+    store.apply({ type: 'subagent.start', payload: { depth: 0, goal: 'root', subagent_id: 'root' } })
+    store.apply({
+      type: 'subagent.start',
+      payload: { depth: 1, goal: 'child a', parent_id: 'root', subagent_id: 'child-a' }
+    })
+    store.apply({
+      type: 'subagent.spawn_requested',
+      payload: { depth: 1, goal: 'child b', parent_id: 'root', subagent_id: 'child-b' }
+    })
+
+    for (const width of [60, 70, 78, 120, 220]) {
+      const frame = await captureFrame(bar(store), { width, height: 3 })
+      const rows = frame.split('\n').filter(row => row.trim())
+      const chrome = rows.find(row => row.includes('claude-opus-4-8')) ?? ''
+      expect(chrome, `width ${String(width)}`).toContain('d2/3')
+      expect(chrome, `width ${String(width)}`).toContain('⚡2/3')
+      if (width === 220) expect(chrome).toContain('⚡2/3+1')
+      expect(rows.filter(row => row.includes('│')).length, `width ${String(width)}`).toBe(1)
+    }
+  })
+
+  test('paused SpawnHud remains visible with no live tree', async () => {
+    const store = seededStore()
+    expect(store.applyDelegationPauseResponse({ paused: true })).toBe(true)
+    const frame = await captureFrame(bar(store), { width: 120, height: 3 })
+    expect(frame).toContain('⏸ paused')
   })
 
   test('update notice borrows the line and Esc dismisses it back to the normal bar', async () => {

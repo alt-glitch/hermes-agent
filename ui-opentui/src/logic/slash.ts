@@ -11,11 +11,15 @@
  *      (exec/plugin → system · alias → re-dispatch · skill/send → submit a turn ·
  *       prefill → notice). Long output routes to the pager (Phase 5a).
  */
+import { Option } from 'effect'
+
+import { delegationStatusText, type DelegationState } from './agentStatus.ts'
 import { diagnosticsEnabled } from './env.ts'
 import { DETAILS_SECTIONS, DETAILS_USAGE, type DetailsMode, nextDetailsMode, parseDetailsMode } from './details.ts'
 import { formatBytes, memReport, performHeapdump } from './diagnostics.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './replay.ts'
 import { mapSessionRows, parseSessionTabArg, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
+import type { SpawnHistoryState, SpawnSnapshot } from './spawnHistory.ts'
 import type { CompletionItem, ConfirmRequest, PickerItem, PickerState } from './store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
 import {
@@ -31,6 +35,8 @@ import {
   decodeSkillsReloadResponse
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { decodeToolsConfigureResponse } from '../boundary/schema/ToolsConfigureResponse.ts'
+import { decodeDelegationPauseResponse, decodeSpawnTreeListResponse } from '../boundary/schema/Delegation.ts'
+import { decodeProcessStopResponse } from '../boundary/schema/ProcessResponses.ts'
 import { buildBillingCtx } from './billing.ts'
 import { dailyFortune, randomFortune } from './fortunes.ts'
 import { formatHelp } from './help.ts'
@@ -40,6 +46,27 @@ import { normalizeBusyInputMode, type BusyInputMode } from './busyQueue.ts'
 export interface ParsedSlash {
   name: string
   arg: string
+}
+
+/** One dashboard-open intent. The entry/store integration owns the Solid
+ * overlay state; slash handlers only describe which native surface to open. */
+export interface AgentsDashboardOpenRequest {
+  readonly diffPair?: {
+    readonly baseline: SpawnSnapshot
+    readonly candidate: SpawnSnapshot
+  }
+  /** 0 = live tree, 1 = newest completed tree, N = Nth newest tree. */
+  readonly initialHistoryIndex?: number
+}
+
+/** Transport-free Agents domain callbacks supplied by the store integration.
+ * Optional on SlashContext only for backwards-compatible embedders; the
+ * production entry supplies the complete bundle. */
+export interface AgentsSlashControl {
+  readonly applyPauseResponse: (response: unknown) => boolean
+  readonly delegation: () => DelegationState
+  readonly history: () => SpawnHistoryState
+  readonly loadSnapshot: (response: unknown, path: string) => SpawnSnapshot | null
 }
 
 /** Parse `/name rest…` → {name, arg}; null if not a slash command. */
@@ -125,8 +152,10 @@ export interface SlashContext {
   readonly resumeSession: (sessionId: string) => void
   /** Open a generic picker (model picker, skills hub). */
   readonly openPicker: (picker: PickerState) => void
-  /** Open the agents dashboard (/agents, /tasks). */
-  readonly openDashboard: () => void
+  /** Open the agents dashboard (/agents, /tasks, /replay, /replay-diff). */
+  readonly openDashboard: (request?: AgentsDashboardOpenRequest) => void
+  /** Store-owned Agents/replay state and decoded mutation callbacks. */
+  readonly agentsControl?: AgentsSlashControl
   /** Open the OS background-process panel (/processes). */
   readonly openBackgroundPanel: () => void
   /** Open the /billing overlay with a fetched state snapshot + ctx bundle. */
@@ -844,6 +873,46 @@ const skinCmd: ClientHandler = async (arg, ctx) => {
   }
 }
 
+const EMPTY_DELEGATION: DelegationState = Object.freeze({
+  maxConcurrentChildren: null,
+  maxSpawnDepth: null,
+  paused: false,
+  updatedAtMs: null
+})
+
+/** `/agents [pause|resume|unpause|status]` (alias `/tasks`). Bare and unknown
+ * subcommands open the native dashboard, matching Ink's interactive fallback. */
+const agentsCmd: ClientHandler = async (arg, ctx, flight) => {
+  const sub = arg.trim().toLowerCase()
+
+  if (sub === 'pause' || sub === 'resume' || sub === 'unpause') {
+    const sid = ctx.sessionId()
+    const raw = await ctx.request('delegation.pause', { paused: sub === 'pause' })
+    const decoded = decodeDelegationPauseResponse(raw)
+    if (Option.isNone(decoded)) {
+      if (currentSessionIs(ctx, sid, flight)) ctx.pushSystem('/agents: invalid delegation.pause response')
+      return
+    }
+    if (ctx.agentsControl?.applyPauseResponse(raw) === false) {
+      if (currentSessionIs(ctx, sid, flight)) ctx.pushSystem('/agents: invalid delegation.pause response')
+      return
+    }
+    // Delegation pause is process-global. Always reconcile successful gateway
+    // state even when a newer slash/session supersedes this command; only its
+    // transcript feedback is flight-scoped.
+    if (!currentSessionIs(ctx, sid, flight)) return
+    ctx.pushSystem(`delegation · ${decoded.value.paused ? 'paused' : 'resumed'}`)
+    return
+  }
+
+  if (sub === 'status') {
+    ctx.pushSystem(delegationStatusText(ctx.agentsControl?.delegation() ?? EMPTY_DELEGATION))
+    return
+  }
+
+  ctx.openDashboard()
+}
+
 /** Fetch + map the session's archived spawn trees (`spawn_tree.list`). */
 async function listSpawnTrees(ctx: SlashContext) {
   const r = await ctx.request('spawn_tree.list', { limit: 30, session_id: ctx.sessionId() ?? 'default' })
@@ -856,7 +925,7 @@ async function listSpawnTrees(ctx: SlashContext) {
  * trees with indices, `<n>` loads the n-th listed tree, anything else is treated
  * as a snapshot path on disk (`load <path>` accepted for Ink muscle memory).
  */
-const replayCmd: ClientHandler = async (arg, ctx) => {
+const legacyReplayCmd: ClientHandler = async (arg, ctx) => {
   const raw = arg.trim()
   const lower = raw.toLowerCase()
   try {
@@ -891,6 +960,131 @@ const replayCmd: ClientHandler = async (arg, ctx) => {
   } catch (error) {
     ctx.pushSystem(`/replay: ${error instanceof Error ? error.message : 'failed'}`)
   }
+}
+
+function formatArchivedSpawnTrees(
+  entries: readonly { count: number; finished_at?: number; label?: string; path: string }[]
+) {
+  return entries
+    .map(entry => {
+      const when = entry.finished_at ? new Date(entry.finished_at * 1000).toLocaleString() : '?'
+      const label = entry.label || `${String(entry.count)} subagents`
+      return `${when} · ${String(entry.count)}×\n${label}\n  ${entry.path}`
+    })
+    .join('\n\n')
+}
+
+/** `/replay [N|last|list|load <path>]` — in-memory history is the primary
+ * same-process path. Disk access is explicit and a loaded snapshot is inserted
+ * into the same bounded history before the dashboard opens at index 1. */
+const replayCmd: ClientHandler = async (arg, ctx, flight) => {
+  const control = ctx.agentsControl
+  if (!control) {
+    // Compatibility for embedders that have not yet adopted the Agents store
+    // bundle. The shipping entry supplies it, so production follows Ink below.
+    await legacyReplayCmd(arg, ctx, flight)
+    return
+  }
+
+  const raw = arg.trim()
+  const lower = raw.toLowerCase()
+  const sid = ctx.sessionId()
+
+  if (lower === 'list' || lower === 'ls') {
+    const result = await ctx.request('spawn_tree.list', {
+      limit: 30,
+      session_id: sid ?? 'default'
+    })
+    if (!currentSessionIs(ctx, sid, flight)) return
+    const decoded = decodeSpawnTreeListResponse(result)
+    if (Option.isNone(decoded)) {
+      ctx.pushSystem('/replay: invalid spawn_tree.list response')
+      return
+    }
+    if (!decoded.value.entries.length) {
+      ctx.pushSystem('no archived spawn trees on disk for this session')
+      return
+    }
+    ctx.openPager('Archived spawn trees', formatArchivedSpawnTrees(decoded.value.entries))
+    return
+  }
+
+  if (lower === 'load') {
+    ctx.pushSystem('usage: /replay load <path>')
+    return
+  }
+  if (lower.startsWith('load ')) {
+    const path = raw.slice(5).trim()
+    if (!path) {
+      ctx.pushSystem('usage: /replay load <path>')
+      return
+    }
+    const result = await ctx.request('spawn_tree.load', { path })
+    if (!currentSessionIs(ctx, sid, flight)) return
+    if (!control.loadSnapshot(result, path)) {
+      ctx.pushSystem('snapshot empty or unreadable')
+      return
+    }
+    ctx.openDashboard({ initialHistoryIndex: 1 })
+    return
+  }
+
+  const history = control.history().snapshots
+  if (!history.length) {
+    ctx.pushSystem('no completed spawn trees this session · try /replay list')
+    return
+  }
+
+  let index = 1
+  if (raw && lower !== 'last') {
+    const parsed = Number.parseInt(raw, 10)
+    if (Number.isNaN(parsed) || parsed < 1 || parsed > history.length) {
+      ctx.pushSystem(`replay: index out of range 1..${String(history.length)} · use /replay list for disk`)
+      return
+    }
+    index = parsed
+  }
+  ctx.openDashboard({ initialHistoryIndex: index })
+}
+
+/** `/replay-diff <baseline> <candidate>` — resolve newest-first in-memory
+ * indexes and let the native dashboard render the semantic diff. */
+const replayDiffCmd: ClientHandler = (arg, ctx) => {
+  const parts = arg.trim().split(/\s+/).filter(Boolean)
+  if (parts.length !== 2) {
+    ctx.pushSystem('usage: /replay-diff <a> <b>  (e.g. /replay-diff 1 2 for last two)')
+    return
+  }
+
+  const history = ctx.agentsControl?.history().snapshots ?? []
+  const resolve = (token: string | undefined): SpawnSnapshot | undefined => {
+    if (token === undefined) return undefined
+    const index = Number.parseInt(token, 10)
+    return Number.isFinite(index) && index >= 1 && index <= history.length ? history[index - 1] : undefined
+  }
+  const baseline = resolve(parts[0])
+  const candidate = resolve(parts[1])
+  if (!baseline || !candidate) {
+    ctx.pushSystem(`replay-diff: could not resolve indices · history has ${String(history.length)} entries`)
+    return
+  }
+
+  ctx.openDashboard({ diffPair: { baseline, candidate }, initialHistoryIndex: 0 })
+}
+
+/** `/stop` — stop OS background processes in the live gateway directly. This
+ * must not rely on the detached slash worker's process registry. */
+const stopCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const sid = ctx.sessionId()
+  const result = await ctx.request('process.stop', {})
+  if (!currentSessionIs(ctx, sid, flight)) return
+  const decoded = decodeProcessStopResponse(result)
+  if (Option.isNone(decoded)) {
+    ctx.pushSystem('/stop: invalid process.stop response')
+    return
+  }
+  const killed = decoded.value.killed
+  ctx.pushSystem(`stopped ${String(killed)} background ${killed === 1 ? 'process' : 'processes'}`)
 }
 
 /** `/heapdump` — write a V8 heap snapshot to `$HERMES_HOME|~/.hermes/logs/` and
@@ -1691,7 +1885,7 @@ const helpCmd: ClientHandler = async (_arg, ctx, flight) => {
 
 /** The TUI-only client commands (run in-process, never hit the gateway). */
 const CLIENT: Record<string, ClientHandler> = {
-  agents: (_arg, ctx) => ctx.openDashboard(),
+  agents: agentsCmd,
   background: backgroundCmd,
   bg: backgroundCmd,
   billing: billingCmd,
@@ -1717,6 +1911,7 @@ const CLIENT: Record<string, ClientHandler> = {
   'reload-skills': reloadSkillsCmd,
   reload_skills: reloadSkillsCmd,
   replay: replayCmd,
+  'replay-diff': replayDiffCmd,
   resume: resumeCmd,
   save: saveCmd,
   session: sessionsCmd,
@@ -1724,7 +1919,8 @@ const CLIENT: Record<string, ClientHandler> = {
   skills: skillsCmd,
   skin: skinCmd,
   switch: sessionsCmd,
-  tasks: (_arg, ctx) => ctx.openDashboard(),
+  stop: stopCmd,
+  tasks: agentsCmd,
   timestamps: timestampsCmd,
   title: titleCmd,
   ts: timestampsCmd,

@@ -419,13 +419,13 @@ describe('App render (Phase 1, themed)', () => {
           <App store={store} />
         </ThemeProvider>
       ),
-      { until: 'Agents', width: 72, height: 24 }
+      { until: 'Spawn tree', width: 72, height: 24 }
     )
 
-    expect(frame).toContain('Agents') // dashboard header
-    expect(frame).toContain('research the topic') // subagent goal (list + detail header)
-    expect(frame).toContain('web_search') // last tool + live trace line (item 15)
-    expect(frame).toContain('select') // footer hint "↑↓ select"
+    expect(frame).toContain('Spawn tree') // native dashboard header
+    expect(frame).toContain('research the topic') // subagent goal
+    expect(frame).toContain('Web Search') // canonical tool summary
+    expect(frame).toContain('Enter open') // list→detail interaction hint
     expect(frame).not.toContain('parent turn') // transcript replaced by the dashboard
   })
 

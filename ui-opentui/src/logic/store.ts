@@ -297,6 +297,18 @@ export interface SpawnTreeSaveIntent {
   }
 }
 
+export interface AgentsDashboardDiffPair {
+  readonly baseline: SpawnSnapshot
+  readonly candidate: SpawnSnapshot
+}
+
+export interface AgentsDashboardOpenOptions {
+  readonly agentId?: string
+  readonly diffPair?: AgentsDashboardDiffPair
+  /** 0 = live; N = Nth newest process-global archive. */
+  readonly initialHistoryIndex?: number
+}
+
 function epochMilliseconds(value: number): number {
   return Math.abs(value) < 100_000_000_000 ? value * 1000 : value
 }
@@ -524,6 +536,10 @@ export interface StoreState {
   dashboard: boolean
   /** Subagent id the dashboard should preselect on open (tray Enter — Epic 2.7). */
   dashboardAgent: string | undefined
+  /** Initial replay cursor captured at overlay-open time (0 = live). */
+  dashboardHistoryIndex: number
+  /** Optional semantic replay pair; owned here so slash dispatch can open it. */
+  dashboardDiffPair: AgentsDashboardDiffPair | undefined
   /** Whether the OS background-process panel overlay is open (/processes). */
   backgroundPanel: boolean
   /** The open /billing overlay (full-screen modal; undefined when closed). */
@@ -822,6 +838,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     delegation: createDelegationState(),
     dashboard: false,
     dashboardAgent: undefined,
+    dashboardHistoryIndex: 0,
+    dashboardDiffPair: undefined,
     backgroundPanel: false,
     billing: undefined,
     backgroundProcesses: [],
@@ -1425,6 +1443,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.agentsNudgePending = false
         draft.dashboard = false
         draft.dashboardAgent = undefined
+        draft.dashboardHistoryIndex = 0
+        draft.dashboardDiffPair = undefined
         draft.backgroundPanel = false
         draft.billing = undefined
         draft.bgTasks = []
@@ -1491,16 +1511,23 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return turnInFlight
   }
 
-  /** Open / close the agents dashboard overlay (/agents). The optional `agentId`
-   *  preselects that subagent's row (the tray's Enter — Epic 2.7). */
-  function openDashboard(agentId?: string) {
-    setState('dashboardAgent', agentId)
+  /** Open / close the agents dashboard overlay. A string preserves the tray's
+   * historical preselect API; slash commands pass replay/diff options. */
+  function openDashboard(input?: string | AgentsDashboardOpenOptions) {
+    const options: AgentsDashboardOpenOptions = typeof input === 'string' ? { agentId: input } : (input ?? {})
+    const rawIndex = options.initialHistoryIndex ?? 0
+    const requested = Number.isFinite(rawIndex) ? Math.max(0, Math.floor(rawIndex)) : 0
+    setState('dashboardAgent', options.agentId)
+    setState('dashboardHistoryIndex', Math.min(requested, state.spawnHistory.snapshots.length))
+    setState('dashboardDiffPair', options.diffPair)
     setState('dashboard', true)
     setState('agentsNudgePending', false)
   }
   function closeDashboard() {
     setState('dashboard', false)
     setState('dashboardAgent', undefined)
+    setState('dashboardHistoryIndex', 0)
+    setState('dashboardDiffPair', undefined)
   }
 
   function openBackgroundPanel() {
@@ -2100,7 +2127,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // archived bit keeps it from duplicating the normal snapshot.
         archiveAndClearSubagents(turnInFlight && !agentsTurnArchived)
         agentsTurnArchived = true
-        setState('info', prev => ({ ...prev, running: false }))
+        setState(
+          'info',
+          produce(info => {
+            info.running = false
+            // The count belongs to the dead Python process's in-memory async
+            // registry. Its workers cannot survive this exit; retaining it
+            // would falsely promise an automatic background resume forever.
+            delete info.activeSubagents
+          })
+        )
+        setState('delegation', current => ({ ...current, paused: false, updatedAtMs: null }))
         setState(produce(settleFailedAssistant))
         // The authoritative settle event can no longer arrive from a dead
         // child. Disarm the latch WITHOUT draining onto the dead transport;

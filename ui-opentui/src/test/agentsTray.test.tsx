@@ -15,6 +15,7 @@
  * The onType wiring mirrors slashMenu.test.tsx (planCompletion → fake catalog)
  * so the menu-precedence pin runs against entry-parity completions.
  */
+import { RGBA } from '@opentui/core'
 import { describe, expect, test } from 'vitest'
 
 import { createPromptHistory } from '../logic/history.ts'
@@ -79,35 +80,77 @@ const complete = (store: SessionStore, id: string) =>
   store.apply({ type: 'subagent.complete', payload: { subagent_id: id, summary: 'done' } })
 
 describe('agents tray — visibility', () => {
-  test('isTrayAgent: running-ish statuses are in; ALL terminal statuses are out', () => {
-    for (const status of ['running', 'thinking', 'tool', 'working']) {
+  test('isTrayAgent follows the canonical active/terminal status union', () => {
+    for (const status of ['running', 'queued']) {
       expect(isTrayAgent({ depth: 0, goal: 'g', id: 'x', status })).toBe(true)
     }
-    // `complete` is the store fallback; the LIVE gateway sends delegate_tool's
-    // payload status verbatim — `completed`/`failed`/`error`/`timeout`/`interrupted`
-    // (verified live: the success path emits status="completed").
-    for (const status of ['complete', 'completed', 'failed', 'error', 'timeout', 'interrupted']) {
+    for (const status of ['completed', 'failed', 'error', 'timeout', 'interrupted']) {
       expect(isTrayAgent({ depth: 0, goal: 'g', id: 'x', status })).toBe(false)
     }
+    expect(isTrayAgent({ depth: 0, goal: 'g', id: 'x', status: 'future-status' })).toBe(false)
+  })
+
+  test('legacy live aliases normalize through the canonical domain instead of becoming visual states', () => {
+    for (const status of ['thinking', 'tool', 'working', 'replying']) {
+      expect(isTrayAgent({ depth: 0, goal: 'g', id: 'x', status })).toBe(true)
+    }
+    expect(isTrayAgent({ depth: 0, goal: 'g', id: 'x', status: 'complete' })).toBe(false)
   })
 
   test('0 running agents → the tray renders nothing', async () => {
     const h = await mountApp()
     try {
-      expect(h.probe.frame()).not.toContain('⚡')
+      expect(h.probe.frame()).not.toContain('⛓')
     } finally {
       h.probe.destroy()
     }
   })
 
-  test('2 running agents → a ⚡ chip in the status bar (no persistent tray line)', async () => {
+  test('2 running agents → a ⛓ chip in the status bar (no persistent tray line)', async () => {
     const h = await mountApp()
     try {
       spawn(h.store, 'a1', 'research X')
       spawn(h.store, 'a2', 'compile Y')
-      const frame = await h.probe.waitForFrame(f => f.includes('⚡'))
-      expect(frame).toContain(`⚡ 2`)
+      const frame = await h.probe.waitForFrame(f => f.includes('⛓'))
+      expect(frame).toContain(`⛓ 2`)
       expect(frame).not.toContain(EXPANDED_HINT) // collapsed until focused
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('expanded running status renders canonically with the accent color, not warning', async () => {
+    const h = await mountApp()
+    try {
+      spawn(h.store, 'a1', 'research X')
+      await h.probe.waitForFrame(f => f.includes('⛓'))
+      h.probe.keys.pressArrow('down')
+      await h.probe.waitForFrame(f => f.includes('● running'))
+
+      const statusSpan = h.probe
+        .spans()
+        .lines.flatMap(line => line.spans)
+        .find(span => span.text.includes('● running'))
+      expect(statusSpan).toBeDefined()
+      const actual = statusSpan?.fg.toInts().slice(0, 3)
+      expect(actual).toEqual(RGBA.fromHex(h.store.state.theme.color.accent).toInts().slice(0, 3))
+      expect(actual).not.toEqual(RGBA.fromHex(h.store.state.theme.color.warn).toInts().slice(0, 3))
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('queued is an active canonical tray row and renders as queued', async () => {
+    const h = await mountApp()
+    try {
+      h.store.apply({
+        type: 'subagent.spawn_requested',
+        payload: { depth: 0, goal: 'waiting for a slot', subagent_id: 'queued-1' }
+      })
+      await h.probe.waitForFrame(f => f.includes('⛓ 1'))
+      h.probe.keys.pressArrow('down')
+      const frame = await h.probe.waitForFrame(f => f.includes('● queued'))
+      expect(frame).toContain('waiting for a slot')
     } finally {
       h.probe.destroy()
     }
@@ -118,13 +161,13 @@ describe('agents tray — visibility', () => {
     try {
       spawn(h.store, 'a1', 'research X')
       spawn(h.store, 'a2', 'compile Y')
-      await h.probe.waitForFrame(f => f.includes('⚡ 2'))
+      await h.probe.waitForFrame(f => f.includes('⛓ 2'))
       complete(h.store, 'a1')
-      const one = await h.probe.waitForFrame(f => f.includes('⚡ 1'))
-      expect(one).toContain(`⚡ 1`)
+      const one = await h.probe.waitForFrame(f => f.includes('⛓ 1'))
+      expect(one).toContain(`⛓ 1`)
       complete(h.store, 'a2')
-      const none = await h.probe.waitForFrame(f => !f.includes('⚡'))
-      expect(none).not.toContain('⚡')
+      const none = await h.probe.waitForFrame(f => !f.includes('⛓'))
+      expect(none).not.toContain('⛓')
     } finally {
       h.probe.destroy()
     }
@@ -137,7 +180,7 @@ describe('agents tray — Down-arrow focus routing', () => {
     try {
       spawn(h.store, 'a1', 'research X')
       spawn(h.store, 'a2', 'compile Y')
-      await h.probe.waitForFrame(f => f.includes('⚡'))
+      await h.probe.waitForFrame(f => f.includes('⛓'))
       h.probe.keys.pressArrow('down')
       const frame = await h.probe.waitForFrame(f => f.includes(EXPANDED_HINT))
       // rows show goal + status, with the first row selected
@@ -155,7 +198,7 @@ describe('agents tray — Down-arrow focus routing', () => {
     const h = await mountApp()
     try {
       spawn(h.store, 'a1', 'research X')
-      await h.probe.waitForFrame(f => f.includes('⚡'))
+      await h.probe.waitForFrame(f => f.includes('⛓'))
       await h.probe.keys.typeText('hello')
       await h.probe.settle()
       h.probe.keys.pressArrow('down')
@@ -163,7 +206,7 @@ describe('agents tray — Down-arrow focus routing', () => {
       const frame = h.probe.frame()
       expect(frame).toContain('hello') // text untouched
       expect(frame).not.toContain(EXPANDED_HINT)
-      expect(frame).toContain('⚡') // still just the indicator
+      expect(frame).toContain('⛓') // still just the indicator
     } finally {
       h.probe.destroy()
     }
@@ -173,7 +216,7 @@ describe('agents tray — Down-arrow focus routing', () => {
     const h = await mountApp()
     try {
       spawn(h.store, 'a1', 'research X')
-      await h.probe.waitForFrame(f => f.includes('⚡'))
+      await h.probe.waitForFrame(f => f.includes('⛓'))
       await h.probe.keys.typeText('/c')
       await h.probe.settle()
       await h.probe.waitForFrame(f => f.includes('/copy'))
@@ -209,12 +252,12 @@ describe('agents tray — Down-arrow focus routing', () => {
     const h = await mountApp()
     try {
       spawn(h.store, 'a1', 'research X')
-      await h.probe.waitForFrame(f => f.includes('⚡'))
+      await h.probe.waitForFrame(f => f.includes('⛓'))
       h.probe.keys.pressArrow('down')
       await h.probe.waitForFrame(f => f.includes(EXPANDED_HINT))
       h.probe.keys.pressEscape()
       const frame = await h.probe.waitForFrame(f => !f.includes(EXPANDED_HINT))
-      expect(frame).toContain('⚡') // back to the collapsed line
+      expect(frame).toContain('⛓') // back to the collapsed line
       await h.probe.keys.typeText('hi') // composer has focus again
       await h.probe.settle()
       expect(h.probe.frame()).toContain('hi')
@@ -227,12 +270,12 @@ describe('agents tray — Down-arrow focus routing', () => {
     const h = await mountApp()
     try {
       spawn(h.store, 'a1', 'research X')
-      await h.probe.waitForFrame(f => f.includes('⚡'))
+      await h.probe.waitForFrame(f => f.includes('⛓'))
       h.probe.keys.pressArrow('down')
       await h.probe.waitForFrame(f => f.includes(EXPANDED_HINT))
       await h.probe.keys.typeText('x')
       const frame = await h.probe.waitForFrame(f => !f.includes(EXPANDED_HINT))
-      expect(frame).toContain('⚡') // tray collapsed (textarea reclaimed focus)
+      expect(frame).toContain('⛓') // tray collapsed (textarea reclaimed focus)
       expect(frame).toContain('x') // …and the char landed in the composer
     } finally {
       h.probe.destroy()
@@ -246,16 +289,16 @@ describe('agents tray — Enter opens the dashboard preselected', () => {
     try {
       spawn(h.store, 'a1', 'research X')
       spawn(h.store, 'a2', 'compile Y')
-      await h.probe.waitForFrame(f => f.includes('⚡'))
+      await h.probe.waitForFrame(f => f.includes('⛓'))
       h.probe.keys.pressArrow('down') // focus the tray (row 0)
       await h.probe.waitForFrame(f => f.includes(EXPANDED_HINT))
       h.probe.keys.pressArrow('down') // select row 1 (compile Y)
       await h.probe.settle()
       h.probe.keys.pressEnter()
-      const frame = await h.probe.waitForFrame(f => f.includes('⛓ Agents'))
+      const frame = await h.probe.waitForFrame(f => f.includes('Spawn tree'))
       expect(h.store.state.dashboard).toBe(true)
       expect(h.store.state.dashboardAgent).toBe('a2')
-      expect(frame).toMatch(/▸ ● running\s+compile Y/) // master list preselected
+      expect(frame).toMatch(/2 ● compile Y/) // master list contains the requested row
       expect(h.submitted).toEqual([]) // Enter opened the dashboard, no submit
     } finally {
       h.probe.destroy()

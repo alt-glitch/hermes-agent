@@ -1,10 +1,10 @@
 import { createSignal } from 'solid-js'
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { createDelegationState } from '../logic/agentStatus.ts'
 import type { SpawnHistoryState, SpawnSnapshot } from '../logic/spawnHistory.ts'
 import { dashboardAgentFromRecord, type DashboardAgent } from '../view/overlays/agents/model.ts'
-import { AgentsDashboardV2 } from '../view/overlays/agentsDashboardV2.tsx'
+import { AgentsDashboard } from '../view/overlays/agentsDashboard.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { captureFrame, renderProbe } from './lib/render.ts'
 
@@ -66,10 +66,10 @@ const RICH_AGENTS: readonly DashboardAgent[] = [
   })
 ]
 
-function dashboardNode(props: Partial<Parameters<typeof AgentsDashboardV2>[0]> = {}) {
+function dashboardNode(props: Partial<Parameters<typeof AgentsDashboard>[0]> = {}) {
   return () => (
     <ThemeProvider>
-      <AgentsDashboardV2 subagents={RICH_AGENTS} onClose={() => {}} {...props} />
+      <AgentsDashboard subagents={RICH_AGENTS} onClose={() => {}} {...props} />
     </ThemeProvider>
   )
 }
@@ -88,6 +88,11 @@ function snapshot(id: string, label: string, rows: readonly DashboardAgent[], of
 }
 
 describe('native agents dashboard parity', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+  })
+
   test('legacy archived rows without a status remain completed', () => {
     expect(dashboardAgentFromRecord({ goal: 'legacy archived task', task_index: 0 })?.status).toBe('completed')
     expect(dashboardAgentFromRecord({ goal: 'future archived task', status: 'future-state' })?.status).toBe('completed')
@@ -217,6 +222,28 @@ describe('native agents dashboard parity', () => {
     }
   })
 
+  test('replay freezes running-row elapsed time at the snapshot boundary without arming a timer', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+    vi.setSystemTime(START + 60_000)
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    const archived = snapshot('snap-running', 'interrupted fan-out', [RICH_AGENTS[0]!], -20_000)
+    const history: SpawnHistoryState = Object.freeze({ snapshots: Object.freeze([archived]) })
+    const probe = await renderProbe(dashboardNode({ history, subagents: [] }), { height: 30, width: 112 })
+    try {
+      await probe.settle()
+      const frame = probe.frame()
+      expect(frame).toContain('Last turn')
+      expect(setIntervalSpy).not.toHaveBeenCalled()
+
+      vi.advanceTimersByTime(60_000)
+      await probe.settle()
+      expect(probe.frame()).toBe(frame)
+      expect(setIntervalSpy).not.toHaveBeenCalled()
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('opening after a completed turn shows the newest archive without an empty frame', async () => {
     const archived = snapshot('snap-1', 'previous fan-out', RICH_AGENTS, -20_000)
     const history: SpawnHistoryState = Object.freeze({ snapshots: Object.freeze([archived]) })
@@ -252,7 +279,7 @@ describe('native agents dashboard parity', () => {
     const probe = await renderProbe(
       () => (
         <ThemeProvider>
-          <AgentsDashboardV2 subagents={many} onClose={() => {}} />
+          <AgentsDashboard subagents={many} onClose={() => {}} />
         </ThemeProvider>
       ),
       { height: 24, width: 84 }
@@ -279,7 +306,7 @@ describe('native agents dashboard parity', () => {
     const probe = await renderProbe(
       () => (
         <ThemeProvider>
-          <AgentsDashboardV2 subagents={rows()} onClose={() => {}} preselect="child" />
+          <AgentsDashboard subagents={rows()} onClose={() => {}} preselect="child" />
         </ThemeProvider>
       ),
       { height: 32, width: 120 }

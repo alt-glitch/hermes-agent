@@ -17,7 +17,7 @@
  *     10–14 cells by terminal width (`ctxBarCells`), vs the old 5.
  *   - Responsive = drop, don't restack: as the terminal narrows, tail segments
  *     drop WHOLE in reverse priority (mcp → bg → profile → cmp → up → cost →
- *     ctx detail collapsing to a bare `ctx: 42%`, then the `⚡ agents` chip) via
+ *     ctx detail collapsing to a bare `ctx: 42%`, then the `⛓ agents` chip) via
  *     the pure, table-tested `statusSegments` ladder. The health dot, model and
  *     ctx % are pinned. Nothing truncates mid-segment, so the row NEVER wraps.
  *
@@ -28,10 +28,16 @@
  * correct blue surface), `statusFg` for the model/profile/percent, muted
  * metrics + labels, ok/warn dot, level-tinted ctx bar and cmp count.
  *
- * Background-activity chrome (glitch 2026-06-13): `⚡ N` = running subagents
- * (folded here from the old agents-tray line), `bg: N` = in-flight background
- * PROMPTS (`/bg` → prompt.background, cleared on background.complete). Both
- * hidden at zero. (OS background processes live in the /processes panel.)
+ * Background-activity chrome: `⛓ N` = active background delegations
+ * (registry-backed `usage.active_subagents` when present, including
+ * authoritative zero; local live rows are the compatibility fallback),
+ * `bg: N` = in-flight background PROMPTS (`/bg` → prompt.background, cleared
+ * on background.complete). Both hide at zero. (OS background processes live
+ * in the /processes panel.)
+ * While the main turn is idle, registry-backed background work also gets the
+ * longest whole `↩ resumes…` reassurance that fits the actual remaining row.
+ * The separate spawn HUD (`dD/C ⚡W/C+N`) summarizes the live turn tree and
+ * delegation-cap pressure, matching Ink rather than conflating the two counts.
  *
  * Parity notes (data that does not reach this TUI yet — reported, not faked):
  *   - `display.show_cost`: Ink reads it from its `config.get` polling loop,
@@ -43,9 +49,10 @@
 import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, onCleanup, Show } from 'solid-js'
 
-import type { SessionStore } from '../logic/store.ts'
+import { delegationPressure, idleSubagentResumeStatus, type DelegationState } from '../logic/agentStatus.ts'
+import type { SessionStore, SubagentInfo } from '../logic/store.ts'
+import { buildSubagentTree, treeTotals, widthByDepth } from '../logic/subagentTree.ts'
 import { truncLeft, truncRight } from '../logic/truncate.ts'
-import { isTrayAgent } from './agentsTray.tsx'
 import { useDimensions } from './dimensions.tsx'
 import { elapsedSeconds, useElapsedTick } from './elapsed.ts'
 import { useTheme } from './theme.tsx'
@@ -69,7 +76,7 @@ const NOTICE_TTL_MS = 30_000
  *  Dot+model and the ctx % are pinned and never gated here; the cwd is gated
  *  by its own leftover-width budget instead. */
 export interface StatusSegments {
-  /** Running-subagents `⚡ N` chip — survives narrowest (drops last). */
+  /** Active-background-delegations `⛓ N` chip — survives narrowest (drops last). */
   agents: boolean
   /** Full `ctx: ███░░ 42% · 84k` read-out; false → compact `ctx: 42%`. */
   ctxDetail: boolean
@@ -121,6 +128,49 @@ export function cmpLevel(n: number): CmpLevel {
   if (n >= 10) return 'bad'
   if (n >= 5) return 'warn'
   return 'ok'
+}
+
+export type SpawnHudTone = 'error' | 'muted' | 'warn'
+
+export interface SpawnHudModel {
+  readonly text: string
+  readonly tone: SpawnHudTone
+}
+
+/** Exact compact Ink SpawnHud semantics, kept pure for table tests. The HUD
+ * describes the live turn tree; it is deliberately separate from the
+ * registry-backed `active_subagents` count shown by the `⛓ N` chip. */
+export function spawnHudModel(subagents: readonly SubagentInfo[], delegation: DelegationState): SpawnHudModel {
+  const tree = buildSubagentTree(subagents)
+  const totals = treeTotals(tree)
+  if (totals.descendantCount === 0 && !delegation.paused) return { text: '', tone: 'muted' }
+
+  const depth = Math.max(0, totals.maxDepthFromHere)
+  const widestLevel = widthByDepth(tree).reduce((widest, level) => Math.max(widest, level), 0)
+  const pressure = delegationPressure(delegation, {
+    activeCount: totals.activeCount,
+    depth,
+    widestLevel
+  })
+  const pieces: string[] = []
+
+  if (delegation.paused) pieces.push('⏸ paused')
+  if (totals.descendantCount > 0) {
+    const depthLabel = delegation.maxSpawnDepth === null ? `${depth}` : `${depth}/${delegation.maxSpawnDepth}`
+    pieces.push(`d${depthLabel}`)
+
+    if (totals.activeCount > 0) {
+      const widthLabel =
+        delegation.maxConcurrentChildren === null
+          ? `${widestLevel}`
+          : `${widestLevel}/${delegation.maxConcurrentChildren}`
+      const extra = Math.max(0, totals.activeCount - widestLevel)
+      pieces.push(`⚡${widthLabel}${extra > 0 ? `+${extra}` : ''}`)
+    }
+  }
+
+  const tone: SpawnHudTone = pressure.level === 'error' ? 'error' : pressure.level === 'warn' ? 'warn' : 'muted'
+  return { text: `${pressure.atCap ? '⚠ ' : ''}${pieces.join(' ')}`, tone }
 }
 
 /** Compact token count: 84321 → `84k`, 1_250_000 → `1.3M`, 950 → `950`. */
@@ -259,13 +309,21 @@ export function StatusBar(props: { store: SessionStore }) {
     const n = props.store.state.bgTasks.length
     return segs().bg && n > 0 ? `bg: ${n}` : ''
   })
-  // `⚡ N` — running subagents. The ambient count lives HERE now (P4 input-density
-  // fold): the agents tray no longer keeps a persistent collapsed line under the
-  // composer — Down still expands it; this chip is the at-a-glance signal.
+  // `⛓ N` — active background delegations. The registry-backed usage count
+  // wins whenever present, including explicit zero; local live rows support
+  // older gateways.
+  // The tray no longer keeps a persistent collapsed line under the composer —
+  // Down still expands it; this chip is the at-a-glance signal.
+  const activeSubagents = createMemo(() => props.store.activeSubagentCount())
   const agentsText = createMemo(() => {
-    const n = props.store.state.subagents.filter(isTrayAgent).length
-    return segs().agents && n > 0 ? `⚡ ${n}` : ''
+    const n = activeSubagents().count
+    return segs().agents && n > 0 ? `⛓ ${n}` : ''
   })
+  const spawnHud = createMemo(() => spawnHudModel(props.store.state.subagents, props.store.state.delegation))
+  const spawnHudColor = () => {
+    const tone = spawnHud().tone
+    return tone === 'error' ? theme().color.error : tone === 'warn' ? theme().color.warn : theme().color.muted
+  }
   // `☑ done/total` — the at-a-glance todo signal. The full live list is the
   // pinned TodoPanel above the composer; this chip persists even when the panel
   // auto-hides (no active work), so progress is never lost from view. It's tiny
@@ -277,10 +335,10 @@ export function StatusBar(props: { store: SessionStore }) {
     return `☑ ${snap.counts.completed}/${snap.counts.total}`
   })
 
-  // The cwd flows LAST on the same line (not right-pinned): its budget is the
-  // row width minus every segment before it; it tail-truncates into that, and
-  // drops whole below CWD_MIN.
-  const leftLen = createMemo(() => {
+  // Fixed/higher-priority left run. The parked-subagent reassurance is
+  // variable-width, so it budgets against this real length instead of gaining
+  // a brittle fixed-column breakpoint.
+  const baseLeftLen = createMemo(() => {
     let len = 1 // dot
     if (model()) len += 1 + model().length + effort().length
     for (const seg of [
@@ -292,12 +350,29 @@ export function StatusBar(props: { store: SessionStore }) {
       cmpText(),
       profileText(),
       bgText(),
-      mcpText()
+      mcpText(),
+      spawnHud().text
     ]) {
       if (seg) len += SEP.length + seg.length
     }
     return len
   })
+  const resumeHintText = createMemo(() => {
+    const active = activeSubagents()
+    // Only the registry-backed count can promise an automatic future resume;
+    // local rows are a compatibility signal, not proof of parked background work.
+    const count = active.source === 'usage' ? active.count : 0
+    const cwdReserve = info().cwd ? SEP.length + CWD_MIN : 0
+    const availableCells = dims().width - ROW_PADDING - baseLeftLen() - SEP.length - cwdReserve
+    return idleSubagentResumeStatus({
+      availableCells,
+      count,
+      running: info().running === true
+    }).text
+  })
+  const leftLen = createMemo(() =>
+    resumeHintText() ? baseLeftLen() + SEP.length + resumeHintText().length : baseLeftLen()
+  )
   // The cwd is RIGHT-PINNED on its own (F10 — glitch 2026-06-13): left-aligning
   // it with everything else forced its head to truncate (`…/hermes-agent/ui-…`)
   // and stranded empty space at the right edge. Pinned right with a flex spacer,
@@ -344,7 +419,7 @@ export function StatusBar(props: { store: SessionStore }) {
       >
         {/* ONE left-flowing text run: dot+model, then the labeled segments in
             priority order, the (pre-truncated) cwd last. No spacers, no pinning. */}
-        <text selectable={false}>
+        <text selectable={false} wrapMode="none">
           <span style={{ fg: dotColor() }}>{dot()}</span>
           <Show when={model()}>
             <span style={{ fg: theme().color.statusFg }}>{` ${model()}`}</span>
@@ -372,6 +447,10 @@ export function StatusBar(props: { store: SessionStore }) {
           <Seg text={profileText()} fg={theme().color.statusFg} />
           <Seg text={bgText()} fg={theme().color.statusWarn} />
           <Seg text={mcpText()} />
+          <Seg text={resumeHintText()} />
+          {/* Always-on when a live tree exists (or delegation is paused),
+              after the width-gated tail segments just like Ink's SpawnHud. */}
+          <Seg text={spawnHud().text} fg={spawnHudColor()} />
         </text>
         {/* the cwd is RIGHT-PINNED (F10): a flex spacer eats the slack so the
             dirname + branch hug the right edge instead of stranding empty navy. */}

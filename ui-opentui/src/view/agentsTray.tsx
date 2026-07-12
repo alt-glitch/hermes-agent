@@ -1,11 +1,10 @@
 /**
  * AgentsTray — the background-agents tray docked below the composer (Epic 2.7).
  *
- * Collapsed (unfocused): one muted, always-honest line — `⚡ N agents running —
- * ↓ to inspect`. Nothing at all when no agent is running (no stolen transcript
- * height). Expanded (focused): one row per RUNNING subagent (status not
- * complete/failed) showing status · goal · elapsed-ish · last activity line,
- * with a themed highlight on the selection.
+ * Collapsed (unfocused): no row; the status bar carries `⛓ N` and the tree
+ * HUD, so the tray steals no transcript height. Expanded (focused): one row
+ * per ACTIVE subagent (canonical `running` or `queued`) showing status · goal ·
+ * elapsed-ish · last activity line, with a themed highlight on the selection.
  *
  * Focus routing (the hard part): the tray takes NATIVE focus (its root box is
  * focusable) — `focusRenderable` blurs the composer textarea for us, and
@@ -27,6 +26,7 @@ import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, Show } from 'solid-js'
 
 import type { SubagentInfo } from '../logic/store.ts'
+import { isRunning, normalizeSubagentStatus } from '../logic/subagentTree.ts'
 import { elapsedSeconds, useElapsedTick } from './elapsed.ts'
 import { useTheme } from './theme.tsx'
 
@@ -36,15 +36,10 @@ export interface AgentsTrayApi {
   focusTray: () => boolean
 }
 
-/** Terminal subagent statuses — everything the wire can end a branch with.
- *  `complete` is the store's fallback mapping for a status-less
- *  `subagent.complete`; the LIVE gateway sends the payload status verbatim from
- *  delegate_tool: `completed` / `failed` / `error` / `timeout` / `interrupted`. */
-const TERMINAL_STATUSES = new Set(['complete', 'completed', 'failed', 'error', 'timeout', 'interrupted'])
-
-/** Tray membership: a subagent still doing work. */
+/** Tray membership follows the canonical spawn-tree status domain. Legacy
+ * aliases normalize there; terminal and unknown values stay out. */
 export function isTrayAgent(sa: SubagentInfo): boolean {
-  return !TERMINAL_STATUSES.has(sa.status)
+  return isRunning(sa)
 }
 
 /** `m:ss` for the row's elapsed-ish counter. */
@@ -60,9 +55,20 @@ function truncate(s: string, max = 48): string {
 
 function statusColor(status: string, theme: ReturnType<typeof useTheme>): string {
   const c = theme().color
-  if (status === 'tool' || status === 'working') return c.accent
-  if (status.includes('error')) return c.error
-  return c.warn
+  switch (normalizeSubagentStatus(status)) {
+    case 'running':
+      return c.accent
+    case 'queued':
+      return c.muted
+    case 'completed':
+      return c.statusGood
+    case 'interrupted':
+    case 'timeout':
+      return c.warn
+    case 'error':
+    case 'failed':
+      return c.error
+  }
 }
 
 export function AgentsTray(props: {
@@ -140,7 +146,7 @@ export function AgentsTray(props: {
   })
 
   // Collapsed = NOTHING under the composer (P4 input-density fold, glitch
-  // 2026-06-13): the running count moved to the status bar's `⚡ N` chip, so the
+  // 2026-06-13): the running count moved to the status bar's `⛓ N` chip, so the
   // tray no longer keeps a persistent line here. The box stays mounted + focusable
   // so composer-Down still hands focus over and EXPANDS it into the rows.
   return (
@@ -173,6 +179,7 @@ function TrayRows(props: { agents: SubagentInfo[]; selected: number; firstSeen: 
           const active = () => i() === props.selected
           const last = () => sa.trace?.at(-1)?.text ?? sa.thought
           const secs = () => (tick(), elapsedSeconds(props.firstSeen.get(sa.id) ?? Date.now()))
+          const status = () => normalizeSubagentStatus(sa.status)
           return (
             <box
               style={{
@@ -183,7 +190,7 @@ function TrayRows(props: { agents: SubagentInfo[]; selected: number; firstSeen: 
                 <span style={{ fg: active() ? theme().color.accent : theme().color.muted }}>
                   {active() ? '▸ ' : '  '}
                 </span>
-                <span style={{ fg: statusColor(sa.status, theme) }}>{`● ${sa.status}`}</span>
+                <span style={{ fg: statusColor(status(), theme) }}>{`● ${status()}`}</span>
                 <span style={{ fg: active() ? theme().color.text : theme().color.label }}>{`  ${truncate(
                   sa.goal || sa.id,
                   72

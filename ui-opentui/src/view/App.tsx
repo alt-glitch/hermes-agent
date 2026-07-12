@@ -14,7 +14,7 @@
  * refocuses when an overlay closes; the key that closed an overlay can't leak
  * into it because the close is deferred a tick.
  */
-import { Match, Switch } from 'solid-js'
+import { createEffect, Match, Switch } from 'solid-js'
 
 import { deferClose } from '../logic/defer.ts'
 import type { PromptHistory as ComposerHistory } from '../logic/history.ts'
@@ -72,6 +72,14 @@ export interface AppProps {
     list: () => Promise<BackgroundProcess[]>
     stopAll: () => Promise<void>
   }
+  /** Native Agents dashboard controls. Views remain transport-free; the entry
+   * owns gateway requests and decoded store updates. */
+  readonly agentsOps?: {
+    refresh: () => Promise<void>
+    interrupt: (id: string) => Promise<string | void>
+    interruptSubtree: (ids: readonly string[]) => Promise<string | void>
+    setPaused: (paused: boolean) => Promise<string | void>
+  }
 }
 
 const NOOP = () => {}
@@ -100,6 +108,12 @@ export function App(props: AppProps) {
   const sessionPicker = () => props.store.state.sessionPicker
   const picker = () => props.store.state.picker
   const promptHistory = () => props.store.state.promptHistory
+  let dashboardWasOpen = false
+  createEffect(() => {
+    const open = dashboard()
+    if (open && !dashboardWasOpen) void props.agentsOps?.refresh().catch(() => {})
+    dashboardWasOpen = open
+  })
   // Defer the close so the key that closed an overlay (Esc/q/Enter) can't land in
   // the freshly-remounted composer (see deferClose).
   const closePager = () => deferClose(() => props.store.closePager())
@@ -254,8 +268,23 @@ export function App(props: AppProps) {
             <Match when={dashboard()}>
               <AgentsDashboard
                 subagents={props.store.state.subagents}
+                delegation={props.store.state.delegation}
+                history={props.store.state.spawnHistory}
+                initialHistoryIndex={props.store.state.dashboardHistoryIndex}
                 onClose={closeDashboard}
-                preselect={props.store.state.dashboardAgent}
+                {...(props.store.state.dashboardAgent === undefined
+                  ? {}
+                  : { preselect: props.store.state.dashboardAgent })}
+                {...(props.store.state.dashboardDiffPair === undefined
+                  ? {}
+                  : { diffPair: props.store.state.dashboardDiffPair })}
+                {...(props.agentsOps === undefined
+                  ? {}
+                  : {
+                      onKillAgent: props.agentsOps.interrupt,
+                      onKillSubtree: props.agentsOps.interruptSubtree,
+                      onPauseChange: props.agentsOps.setPaused
+                    })}
               />
             </Match>
             <Match when={backgroundPanel()}>

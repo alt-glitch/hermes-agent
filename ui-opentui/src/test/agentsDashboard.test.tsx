@@ -8,7 +8,7 @@ import { describe, expect, test } from 'vitest'
 import { createSessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
-import { captureFrame } from './lib/render.ts'
+import { captureFrame, renderProbe } from './lib/render.ts'
 
 const LONG_GOAL =
   'Poll the current UTC time 10 times with a 3-second sleep between each poll, run date -u and record each result, then report all ten timestamps as a timing exercise'
@@ -33,7 +33,7 @@ function dash() {
 
 describe('agents dashboard de-crowd (P2)', () => {
   test('a long goal is truncated to one line in the master list (no full-prompt wall)', async () => {
-    const frame = await captureFrame(dash(), { until: 'Agents', width: 116, height: 30 })
+    const frame = await captureFrame(dash(), { until: 'Spawn tree', width: 116, height: 30 })
     // The master row truncates to one line — the head shows with an ellipsis.
     // (The detail pane below still shows the full goal; that's the inspect half.)
     expect(frame).toContain('Poll the current UTC time')
@@ -41,12 +41,22 @@ describe('agents dashboard de-crowd (P2)', () => {
   })
 
   test('the detail pane renders the typed trace by kind (tool ⚡, summary ✓)', async () => {
-    const frame = await captureFrame(dash(), { until: 'Agents', width: 116, height: 30 })
-    expect(frame).toContain('⚡') // tool entry glyph
-    expect(frame).toContain('terminal — date -u') // tool entry text
-    expect(frame).toContain('✓') // summary entry glyph
-    expect(frame).toContain('all ten timestamps collected') // summary text (detail, not master)
-    expect(frame).toContain('poll 4 of 10 recorded') // progress entry
+    const probe = await renderProbe(dash(), { height: 30, width: 116 })
+    try {
+      probe.keys.pressEnter()
+      await probe.settle()
+      let frame = probe.frame()
+      expect(frame).toContain('⚡') // tool entry glyph
+      expect(frame).toContain('Terminal("date -u")') // canonical tool summary
+      probe.keys.pressKey('g', { shift: true })
+      await probe.settle()
+      frame = probe.frame()
+      expect(frame).toContain('✓') // summary entry glyph
+      expect(frame).toContain('all ten timestamps collected') // summary text (detail, not master)
+      expect(frame).toContain('poll 4 of 10 recorded') // progress trace
+    } finally {
+      probe.destroy()
+    }
   })
 
   test('a streamed subagent reply renders as a coalesced ❯ reply line (subagent.text)', async () => {
@@ -61,17 +71,24 @@ describe('agents dashboard de-crowd (P2)', () => {
     store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'ships two ' } })
     store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'features.' } })
     store.openDashboard()
-    const frame = await captureFrame(
+    const probe = await renderProbe(
       () => (
         <ThemeProvider theme={() => store.state.theme}>
           <App store={store} />
         </ThemeProvider>
       ),
-      { until: 'Agents', width: 116, height: 30 }
+      { width: 116, height: 30 }
     )
-    expect(frame).toContain('❯') // reply entry glyph (terminal-safe single-width, not a color emoji)
-    // the three per-token frames COALESCED into one line, not three '❯' rows
-    expect(frame).toContain('The release ships two features.')
-    expect(frame.split('❯').length - 1).toBe(1) // exactly one reply glyph in the frame
+    try {
+      probe.keys.pressEnter()
+      await probe.settle()
+      const frame = probe.frame()
+      expect(frame).toContain('❯') // reply entry glyph (terminal-safe single-width, not a color emoji)
+      // the three per-token frames COALESCED into one line, not three '❯' rows
+      expect(frame).toContain('The release ships two features.')
+      expect(frame.split('❯').length - 1).toBe(1) // exactly one reply glyph in the frame
+    } finally {
+      probe.destroy()
+    }
   })
 })

@@ -299,6 +299,37 @@ describe('Agents turn archives and delivery intents', () => {
 })
 
 describe('Agents status and session-owned lifecycle', () => {
+  test('dashboard open state carries bounded replay/diff intent and resets on close', () => {
+    const store = createSessionStore()
+    startTurn(store)
+    spawn(store, 'a1', 'first tree')
+    store.apply({ type: 'message.complete' })
+    const snapshot = store.state.spawnHistory.snapshots[0]
+    expect(snapshot).toBeDefined()
+
+    store.openDashboard({
+      diffPair: { baseline: snapshot!, candidate: snapshot! },
+      initialHistoryIndex: 99
+    })
+    expect(store.state).toMatchObject({
+      dashboard: true,
+      dashboardAgent: undefined,
+      dashboardHistoryIndex: 1
+    })
+    expect(store.state.dashboardDiffPair?.baseline.id).toBe(snapshot?.id)
+
+    store.closeDashboard()
+    expect(store.state).toMatchObject({
+      dashboard: false,
+      dashboardAgent: undefined,
+      dashboardHistoryIndex: 0
+    })
+    expect(store.state.dashboardDiffPair).toBeUndefined()
+
+    store.openDashboard('a1')
+    expect(store.state).toMatchObject({ dashboardAgent: 'a1', dashboardHistoryIndex: 0 })
+  })
+
   test('usage.active_subagents is authoritative including zero', () => {
     const store = createSessionStore()
     spawn(store, 'local')
@@ -316,6 +347,21 @@ describe('Agents status and session-owned lifecycle', () => {
 
     store.clearTranscript()
     expect(store.state.info.activeSubagents).toBeUndefined()
+  })
+
+  test('gateway exit drops the dead child process registry before idle chrome renders', () => {
+    const store = createSessionStore()
+    startTurn(store)
+    spawn(store, 'local')
+    store.applyInfo({ usage: { active_subagents: 2 } })
+    expect(store.applyDelegationPauseResponse({ paused: true })).toBe(true)
+    expect(store.activeSubagentCount()).toEqual({ count: 2, source: 'usage' })
+
+    store.apply({ type: 'gateway.exited', payload: { reason: 'SIGKILL' } })
+    expect(store.state.info.activeSubagents).toBeUndefined()
+    expect(store.state.subagents).toEqual([])
+    expect(store.activeSubagentCount()).toEqual({ count: 0, source: 'local' })
+    expect(store.state.delegation).toMatchObject({ paused: false, updatedAtMs: null })
   })
 
   test('nudge decision is once per turn, suppresses while open, and resets on adoption', () => {
