@@ -14,6 +14,8 @@ interface ActionExitOverlayState {
   readonly billing: unknown
   readonly dashboard: boolean
   readonly journey?: boolean
+  readonly pluginsHub?: boolean
+  readonly petPicker?: boolean
   readonly pager: unknown
   readonly picker: unknown
   readonly prompt: unknown
@@ -32,6 +34,8 @@ export function actionExitBlocked(state: ActionExitOverlayState): boolean {
     state.billing ||
     state.dashboard ||
     state.journey ||
+    state.pluginsHub ||
+    state.petPicker ||
     state.backgroundPanel ||
     state.promptHistory
   )

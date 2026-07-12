@@ -170,6 +170,8 @@ export interface SlashContext {
   /** Open the OS background-process panel (/processes). */
   readonly openBackgroundPanel: () => void
   readonly openJourney?: () => void
+  readonly openPluginsHub?: () => void
+  readonly openPetPicker?: () => void
   /** Open the /billing overlay with a fetched state snapshot + ctx bundle. */
   readonly openBilling: (overlay: BillingOverlayState) => void
   /** Track an in-flight background-prompt task id (`/bg` → prompt.background). */
@@ -1080,6 +1082,36 @@ const replayCmd: ClientHandler = async (arg, ctx, flight) => {
   }
   ctx.openDashboard({ initialHistoryIndex: index })
 }
+const pluginsCmd: ClientHandler = async (arg, ctx, flight) => {
+  const command = arg.trim()
+  if (!command) {
+    ctx.openPluginsHub?.()
+    return
+  }
+  const sid = ctx.sessionId()
+  const raw = await ctx.request('slash.exec', { command: `plugins ${command}`, session_id: sid })
+  if (!currentSessionIs(ctx, sid, flight)) return
+  const output = readStr(raw, 'output') || '/plugins: no output'
+  const warning = readStr(raw, 'warning')
+  const text = warning ? `warning: ${warning}\n${output}` : output
+  if (text.length > 180 || text.split('\n').filter(Boolean).length > 2) ctx.openPager('Plugins', text)
+  else ctx.pushSystem(text)
+}
+
+const petCmd: ClientHandler = async (arg, ctx, flight) => {
+  const command = arg.trim()
+  if (command.toLowerCase() === 'list') {
+    ctx.openPetPicker?.()
+    return
+  }
+  const sid = ctx.sessionId()
+  const raw = await ctx.request('slash.exec', { command: `pet${command ? ` ${command}` : ''}`, session_id: sid })
+  if (!currentSessionIs(ctx, sid, flight)) return
+  const output = readStr(raw, 'output') || '/pet: no output'
+  const warning = readStr(raw, 'warning')
+  ctx.pushSystem(warning ? `warning: ${warning}\n${output}` : output)
+}
+
 const fastCmd: ClientHandler = async (arg, ctx, flight) => {
   const mode = arg.trim().toLowerCase()
   if (!['', 'status', 'normal', 'fast', 'on', 'off', 'toggle'].includes(mode)) {
@@ -2188,11 +2220,13 @@ const CLIENT: Record<string, ClientHandler> = {
   journey: (_arg, ctx) => ctx.openJourney?.(),
   learning: (_arg, ctx) => ctx.openJourney?.(),
   'memory-graph': (_arg, ctx) => ctx.openJourney?.(),
+  plugins: pluginsCmd,
   processes: (_arg, ctx) => ctx.openBackgroundPanel(),
   procs: (_arg, ctx) => ctx.openBackgroundPanel(),
   model: modelCmd,
   image: imageCmd,
   paste: pasteCmd,
+  pet: petCmd,
   prompt: promptCmd,
   compose: promptCmd,
   reasoning: reasoningCmd,

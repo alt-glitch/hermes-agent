@@ -76,7 +76,7 @@ describe('platform action hotkeys', () => {
     }
   )
 
-  test.each(['dashboard', 'backgroundPanel', 'promptHistory'] as const)(
+  test.each(['dashboard', 'backgroundPanel', 'promptHistory', 'pluginsHub', 'petPicker'] as const)(
     'action+D is blocked while the %s overlay owns input',
     field => {
       const state = {

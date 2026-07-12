@@ -2213,6 +2213,33 @@ describe('external input and setup client surfaces', () => {
   })
 })
 
+describe('Plugins and Pet client routing', () => {
+  test('bare plugins and pet list open dedicated overlays; subcommands stay on slash.exec', async () => {
+    const p = makeCtx(async (_method, params) => ({ output: `worker: ${String(params.command)}` }))
+    let plugins = 0
+    let pets = 0
+    const ctx: SlashContext = {
+      ...p.ctx,
+      openPluginsHub: () => {
+        plugins += 1
+      },
+      openPetPicker: () => {
+        pets += 1
+      }
+    }
+    await dispatchSlash('/plugins', ctx)
+    await dispatchSlash('/pet list', ctx)
+    await dispatchSlash('/plugins enable demo', ctx)
+    await dispatchSlash('/pet toggle', ctx)
+    expect({ plugins, pets }).toEqual({ plugins: 1, pets: 1 })
+    expect(p.calls).toEqual([
+      { method: 'slash.exec', params: { command: 'plugins enable demo', session_id: 'sid-1' } },
+      { method: 'slash.exec', params: { command: 'pet toggle', session_id: 'sid-1' } }
+    ])
+    expect(p.system).toEqual(['worker: plugins enable demo', 'worker: pet toggle'])
+  })
+})
+
 describe('diagnostic command gating (HERMES_TUI_DIAGNOSTICS)', () => {
   const KEY = 'HERMES_TUI_DIAGNOSTICS'
   const prev = process.env[KEY]

@@ -33,7 +33,9 @@ import { BackgroundPanel } from './overlays/backgroundPanel.tsx'
 import { BillingOverlay } from './overlays/billing.tsx'
 import { Pager } from './overlays/pager.tsx'
 import { JourneyOverlay, type JourneyOps } from './overlays/journey.tsx'
+import { PetPicker, type PetOps } from './overlays/petPicker.tsx'
 import { Picker } from './overlays/picker.tsx'
+import { PluginsHub, type PluginOps } from './overlays/pluginsHub.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
 import { SessionOrchestrator, type SessionOrchestratorOps } from './overlays/sessionOrchestrator.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
@@ -80,6 +82,8 @@ export interface AppProps {
     stopAll: () => Promise<void>
   }
   readonly journeyOps?: JourneyOps
+  readonly pluginOps?: PluginOps
+  readonly petOps?: PetOps
   /** Native Agents dashboard controls. Views remain transport-free; the entry
    * owns gateway requests and decoded store updates. */
   readonly agentsOps?: {
@@ -100,6 +104,15 @@ const NOOP_JOURNEY_OPS: JourneyOps = {
   edit: () => Promise.resolve({ ok: false, message: 'unavailable' }),
   delete: () => Promise.resolve({ ok: false, message: 'unavailable' })
 }
+const NOOP_PLUGIN_OPS: PluginOps = {
+  list: () => Promise.resolve({ plugins: [], user_count: 0, bundled_count: 0 }),
+  toggle: () => Promise.resolve({ ok: false })
+}
+const NOOP_PET_OPS: PetOps = {
+  gallery: () => Promise.resolve({ active: '', enabled: false, pets: [] }),
+  select: slug => Promise.resolve({ displayName: slug, ok: false, slug })
+}
+
 /** Inert picker ops for headless mounts that pass no gateway (tests). */
 const NOOP_OPS: SessionOrchestratorOps = {
   history: () => Promise.resolve({ sessions: [] }),
@@ -123,6 +136,8 @@ export function App(props: AppProps) {
   const billing = () => props.store.state.billing
   const sessionPicker = () => props.store.state.sessionPicker
   const picker = () => props.store.state.picker
+  const pluginsHub = () => props.store.state.pluginsHub
+  const petPicker = () => props.store.state.petPicker
   const promptHistory = () => props.store.state.promptHistory
   let dashboardWasOpen = false
   createEffect(() => {
@@ -137,6 +152,8 @@ export function App(props: AppProps) {
   const closeBackgroundPanel = () => deferClose(() => props.store.closeBackgroundPanel())
   const closeBilling = () => deferClose(() => props.store.closeBilling())
   const closeJourney = () => deferClose(() => props.store.closeJourney())
+  const closePluginsHub = () => deferClose(() => props.store.closePluginsHub())
+  const closePetPicker = () => deferClose(() => props.store.closePetPicker())
   // Fetch the current OS-process snapshot into the store (panel refresh + the bg badge).
   const refreshBackground = () => {
     void props.backgroundOps
@@ -250,6 +267,12 @@ export function App(props: AppProps) {
                         loadModelItems={props.loadModelItems}
                         onClose={closeSessionPicker}
                       />
+                    </Match>
+                    <Match when={pluginsHub()}>
+                      <PluginsHub ops={props.pluginOps ?? NOOP_PLUGIN_OPS} onClose={closePluginsHub} />
+                    </Match>
+                    <Match when={petPicker()}>
+                      <PetPicker ops={props.petOps ?? NOOP_PET_OPS} onClose={closePetPicker} />
                     </Match>
                     <Match when={picker()}>
                       {p => (

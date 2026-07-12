@@ -47,6 +47,8 @@ import {
   decodeSetupStatusResponse
 } from '../boundary/schema/ExternalInputResponses.ts'
 import { decodeVoiceRecordResponse } from '../boundary/schema/VoiceResponses.ts'
+import { decodePetGalleryResponse, decodePetSelectResponse } from '../boundary/schema/PetResponses.ts'
+import { decodePluginsListResponse, decodePluginsToggleResponse } from '../boundary/schema/PluginResponses.ts'
 import {
   classifySessionSteerResponse,
   decodeCommandsCatalogResponse,
@@ -1668,6 +1670,35 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         stopAll: () => Effect.runPromise(gateway.request('process.stop', {})).then(() => undefined)
       }
 
+      const pluginOps = {
+        list: async () => {
+          const decoded = decodePluginsListResponse(
+            await Effect.runPromise(gateway.request('plugins.manage', { action: 'list' }))
+          )
+          if (!decoded) throw new Error('invalid plugins.manage list response')
+          return decoded
+        },
+        toggle: async (name: string, enable: boolean) => {
+          const decoded = decodePluginsToggleResponse(
+            await Effect.runPromise(gateway.request('plugins.manage', { action: 'toggle', enable, name }))
+          )
+          if (!decoded) throw new Error('invalid plugins.manage toggle response')
+          return decoded
+        }
+      }
+      const petOps = {
+        gallery: async () => {
+          const decoded = decodePetGalleryResponse(await Effect.runPromise(gateway.request('pet.gallery', {})))
+          if (!decoded) throw new Error('invalid pet.gallery response')
+          return decoded
+        },
+        select: async (slug: string) => {
+          const decoded = decodePetSelectResponse(await Effect.runPromise(gateway.request('pet.select', { slug })))
+          if (!decoded) throw new Error('invalid pet.select response')
+          return decoded
+        }
+      }
+
       const journeyOps = {
         frames: (cols: number, rows: number) =>
           Effect.runPromise(gateway.request('learning.frames', { cols, frames: 2, rows })),
@@ -2376,6 +2407,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         },
         openDashboard: request => store.openDashboard(request),
         openJourney: () => store.openJourney(),
+        openPluginsHub: () => store.openPluginsHub(),
+        openPetPicker: () => store.openPetPicker(),
         openBackgroundPanel: () => store.openBackgroundPanel(),
         openBilling: overlay => store.openBilling(overlay),
         addBgTask: id => store.addBgTask(id),
@@ -2638,6 +2671,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   loadModelItems={loadSessionModelItems}
                   sessionOps={sessionOps}
                   journeyOps={journeyOps}
+                  pluginOps={pluginOps}
+                  petOps={petOps}
                   onSessionPickerClosed={onSessionPickerClosed}
                   sessionId={() => gateway.sessionId()}
                   history={history}

@@ -559,6 +559,10 @@ export interface StoreState {
   backgroundPanel: boolean
   /** Whether the learning Journey timeline overlay is open. */
   journey: boolean
+  /** Whether the interactive Plugins Hub is open. */
+  pluginsHub: boolean
+  /** Whether the searchable Pet gallery is open. */
+  petPicker: boolean
   /** The open /billing overlay (full-screen modal; undefined when closed). */
   billing: BillingOverlayState | undefined
   /** OS background processes (from `agents.list`) — shown in the /processes panel. */
@@ -877,6 +881,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     dashboardAgent: undefined,
     dashboardHistoryIndex: 0,
     journey: false,
+    pluginsHub: false,
+    petPicker: false,
     dashboardDiffPair: undefined,
     backgroundPanel: false,
     billing: undefined,
@@ -1566,6 +1572,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.dashboard = false
         draft.dashboardAgent = undefined
         draft.journey = false
+        draft.pluginsHub = false
+        draft.petPicker = false
         draft.dashboardHistoryIndex = 0
         draft.dashboardDiffPair = undefined
         draft.backgroundPanel = false
@@ -1661,6 +1669,19 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function openJourney() {
     setState('journey', true)
   }
+  function openPluginsHub() {
+    setState('pluginsHub', true)
+  }
+  function closePluginsHub() {
+    setState('pluginsHub', false)
+  }
+  function openPetPicker() {
+    setState('petPicker', true)
+  }
+  function closePetPicker() {
+    setState('petPicker', false)
+  }
+
   function closeJourney() {
     setState('journey', false)
   }
@@ -2824,6 +2845,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setBrowserState,
     setCompact,
     openJourney,
+    openPluginsHub,
+    closePluginsHub,
+    openPetPicker,
+    closePetPicker,
     closeJourney,
     setDetails,
     setTimestamps,
