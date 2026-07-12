@@ -20,6 +20,11 @@ export type SessionSaveResponse = typeof SessionSaveResponseSchema.Type
 
 export const ReloadEnvResponseSchema = Schema.Struct({ updated: Num })
 export type ReloadEnvResponse = typeof ReloadEnvResponseSchema.Type
+export const ReloadMcpResponseSchema = Schema.Struct({
+  message: opt(Str),
+  status: Schema.Literals(['confirm_required', 'reloaded'])
+})
+export type ReloadMcpResponse = typeof ReloadMcpResponseSchema.Type
 
 export const ConfigValueResponseSchema = Schema.Struct({ value: Str })
 export type ConfigValueResponse = typeof ConfigValueResponseSchema.Type
@@ -77,6 +82,7 @@ const decodeStatus = Schema.decodeUnknownOption(SessionStatusResponseSchema)
 const decodeTitle = Schema.decodeUnknownOption(SessionTitleResponseSchema)
 const decodeSave = Schema.decodeUnknownOption(SessionSaveResponseSchema)
 const decodeReloadEnv = Schema.decodeUnknownOption(ReloadEnvResponseSchema)
+const decodeReloadMcp = Schema.decodeUnknownOption(ReloadMcpResponseSchema)
 const decodeConfigValue = Schema.decodeUnknownOption(ConfigValueResponseSchema)
 const decodeConfigFull = Schema.decodeUnknownOption(ConfigFullResponseSchema)
 const decodeConfigMtime = Schema.decodeUnknownOption(ConfigMtimeResponseSchema)
@@ -97,6 +103,7 @@ export const decodeSessionTitleResponse = (value: unknown): SessionTitleResponse
 export const decodeSessionSaveResponse = (value: unknown): SessionSaveResponse | undefined => some(decodeSave(value))
 
 export const decodeReloadEnvResponse = (value: unknown): ReloadEnvResponse | undefined => some(decodeReloadEnv(value))
+export const decodeReloadMcpResponse = (value: unknown): ReloadMcpResponse | undefined => some(decodeReloadMcp(value))
 
 export const decodeConfigValueResponse = (value: unknown): ConfigValueResponse | undefined =>
   some(decodeConfigValue(value))

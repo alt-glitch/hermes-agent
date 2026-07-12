@@ -7,6 +7,7 @@ import {
   decodeConfigMtimeResponse,
   decodeCommandsCatalogResponse,
   decodeReloadEnvResponse,
+  decodeReloadMcpResponse,
   decodeSessionSaveResponse,
   decodeSessionSteerResponse,
   decodeSessionStatusResponse,
@@ -25,6 +26,10 @@ describe('session-maintenance RPC Effect boundaries', () => {
     })
     expect(decodeSessionSaveResponse({ file: '/tmp/session.json' })).toEqual({ file: '/tmp/session.json' })
     expect(decodeReloadEnvResponse({ updated: 2 })).toEqual({ updated: 2 })
+    expect(decodeReloadMcpResponse({ status: 'confirm_required', message: 'confirm' })).toEqual({
+      status: 'confirm_required',
+      message: 'confirm'
+    })
     expect(decodeConfigValueResponse({ value: 'queue' })).toEqual({ value: 'queue' })
     expect(decodeConfigFullResponse({ config: { display: { busy_input_mode: 'steer' } } })).toEqual({
       config: { display: { busy_input_mode: 'steer' } }
@@ -87,6 +92,7 @@ describe('session-maintenance RPC Effect boundaries', () => {
     expect(decodeSessionTitleResponse({ pending: false })).toBeUndefined()
     expect(decodeSessionSaveResponse({ file: null })).toBeUndefined()
     expect(decodeReloadEnvResponse({ updated: '2' })).toBeUndefined()
+    expect(decodeReloadMcpResponse({ status: 'done' })).toBeUndefined()
     expect(decodeConfigValueResponse({ value: 1 })).toBeUndefined()
     expect(decodeConfigFullResponse({ config: null })).toBeUndefined()
     expect(decodeConfigMtimeResponse({ mtime: 'now' })).toBeUndefined()

@@ -2066,7 +2066,7 @@ describe('dispatchSlash — server ladder', () => {
 
     const old = dispatchSlash('/slow', p.ctx)
     await Promise.resolve()
-    await dispatchSlash('/fast', p.ctx)
+    await dispatchSlash('/fresh', p.ctx)
     resolveSlow({ output: 'stale output' })
     await old
 

@@ -168,7 +168,6 @@ describe('/compact', () => {
     expect(p.system).toEqual(['compact on', 'compact off', 'compact on'])
   })
 
-
   test('/compact garbage → usage line, no flag change, no RPC', async () => {
     const p = makeCtx(async () => ({}))
     await dispatchSlash('/compact sideways', p.ctx)
@@ -198,6 +197,46 @@ describe('/verbose', () => {
       { method: 'config.set', params: { key: 'verbose', session_id: 'sid-1', value: 'all' } }
     ])
     expect(p.system).toEqual(['verbose: new', 'verbose: all'])
+  })
+})
+
+describe('/fast, /yolo, /reload-mcp', () => {
+  test('fast validates, reads status, and sets explicit modes', async () => {
+    const p = makeCtx(async (method, params) => ({
+      value: method === 'config.get' ? 'normal' : params.value === 'on' ? 'fast' : 'normal'
+    }))
+    await dispatchSlash('/fast', p.ctx)
+    await dispatchSlash('/fast on', p.ctx)
+    await dispatchSlash('/fast turbo', p.ctx)
+    expect(p.calls).toEqual([
+      { method: 'config.get', params: { key: 'fast', session_id: 'sid-1' } },
+      { method: 'config.set', params: { key: 'fast', session_id: 'sid-1', value: 'on' } }
+    ])
+    expect(p.system).toEqual([
+      'fast mode: normal',
+      'fast mode: fast',
+      'usage: /fast [normal|fast|status|on|off|toggle]'
+    ])
+  })
+
+  test('yolo toggles only the live session', async () => {
+    const p = makeCtx(async () => ({ value: '1' }))
+    await dispatchSlash('/yolo', p.ctx)
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'yolo', session_id: 'sid-1' } }])
+    expect(p.system).toEqual(['yolo on'])
+  })
+
+  test('reload-mcp preserves the cache-warning gate and explicit approvals', async () => {
+    const p = makeCtx(async (_method, params) =>
+      params.confirm ? { status: 'reloaded' } : { status: 'confirm_required', message: 'cache warning' }
+    )
+    await dispatchSlash('/reload-mcp', p.ctx)
+    await dispatchSlash('/reload-mcp now', p.ctx)
+    expect(p.calls).toEqual([
+      { method: 'reload.mcp', params: { session_id: 'sid-1' } },
+      { method: 'reload.mcp', params: { confirm: true, session_id: 'sid-1' } }
+    ])
+    expect(p.system).toEqual(['cache warning', 'MCP servers reloaded · live agent tools refreshed'])
   })
 })
 

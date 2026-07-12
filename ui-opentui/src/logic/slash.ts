@@ -31,6 +31,7 @@ import {
   decodeConfigValueResponse,
   decodeCommandsCatalogResponse,
   decodeReloadEnvResponse,
+  decodeReloadMcpResponse,
   decodeSessionSaveResponse,
   decodeSessionStatusResponse,
   decodeSessionTitleResponse,
@@ -1079,17 +1080,67 @@ const replayCmd: ClientHandler = async (arg, ctx, flight) => {
   }
   ctx.openDashboard({ initialHistoryIndex: index })
 }
+const fastCmd: ClientHandler = async (arg, ctx, flight) => {
+  const mode = arg.trim().toLowerCase()
+  if (!['', 'status', 'normal', 'fast', 'on', 'off', 'toggle'].includes(mode)) {
+    ctx.pushSystem('usage: /fast [normal|fast|status|on|off|toggle]')
+    return
+  }
+  const sid = ctx.sessionId()
+  const response = decodeConfigValueResponse(
+    await ctx.request(mode === '' || mode === 'status' ? 'config.get' : 'config.set', {
+      key: 'fast',
+      session_id: sid,
+      ...(mode === '' || mode === 'status' ? {} : { value: mode })
+    })
+  )
+  if (!currentSessionIs(ctx, sid, flight)) return
+  if (!response) return ctx.pushSystem('error: invalid response: fast mode')
+  ctx.pushSystem(`fast mode: ${response.value === 'fast' ? 'fast' : 'normal'}`)
+}
+
+const yoloCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const sid = ctx.sessionId()
+  const response = decodeConfigValueResponse(await ctx.request('config.set', { key: 'yolo', session_id: sid }))
+  if (!currentSessionIs(ctx, sid, flight)) return
+  if (!response) return ctx.pushSystem('error: invalid response: yolo')
+  ctx.pushSystem(`yolo ${response.value === '1' ? 'on' : 'off'}`)
+}
+
+const reloadMcpCmd: ClientHandler = async (arg, ctx, flight) => {
+  const action = arg.trim().toLowerCase()
+  const sid = ctx.sessionId()
+  const confirm = ['now', 'approve', 'once', 'yes', 'always'].includes(action)
+  const response = decodeReloadMcpResponse(
+    await ctx.request('reload.mcp', {
+      session_id: sid ?? null,
+      ...(confirm ? { confirm: true } : {}),
+      ...(action === 'always' ? { always: true } : {})
+    })
+  )
+  if (!currentSessionIs(ctx, sid, flight)) return
+  if (!response) return ctx.pushSystem('error: invalid response: reload.mcp')
+  if (response.status === 'confirm_required') {
+    ctx.pushSystem(response.message || '/reload-mcp requires confirmation')
+    return
+  }
+  ctx.pushSystem(
+    action === 'always'
+      ? 'MCP servers reloaded · future /reload-mcp will run without confirmation'
+      : 'MCP servers reloaded · live agent tools refreshed'
+  )
+}
 
 /** `/verbose [off|new|all|verbose]` — cycle or set live tool-progress detail. */
 const verboseCmd: ClientHandler = async (arg, ctx, flight) => {
   const sid = ctx.sessionId()
-  const response = await ctx.request("config.set", {
-    key: "verbose",
+  const response = await ctx.request('config.set', {
+    key: 'verbose',
     session_id: sid,
-    value: arg.trim() || "cycle"
+    value: arg.trim() || 'cycle'
   })
   if (!currentSessionIs(ctx, sid, flight)) return
-  const value = readStr(response, "value")
+  const value = readStr(response, 'value')
   if (value) ctx.pushSystem(`verbose: ${value}`)
 }
 
@@ -2131,6 +2182,7 @@ const CLIENT: Record<string, ClientHandler> = {
   details: detailsCmd,
   exit: quitCmd,
   fortune: fortuneCmd,
+  fast: fastCmd,
   heapdump: heapdumpCmd,
   mem: memCmd,
   journey: (_arg, ctx) => ctx.openJourney?.(),
@@ -2145,6 +2197,8 @@ const CLIENT: Record<string, ClientHandler> = {
   compose: promptCmd,
   reasoning: reasoningCmd,
   reload: reloadCmd,
+  'reload-mcp': reloadMcpCmd,
+  reload_mcp: reloadMcpCmd,
   'reload-skills': reloadSkillsCmd,
   reload_skills: reloadSkillsCmd,
   replay: replayCmd,
@@ -2164,6 +2218,7 @@ const CLIENT: Record<string, ClientHandler> = {
   tools: toolsCmd,
   verbose: verboseCmd,
   voice: voiceCmd,
+  yolo: yoloCmd,
   status: statusCmd,
   setup: setupCmd,
   'terminal-setup': terminalSetupCmd,
