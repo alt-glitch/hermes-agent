@@ -17,10 +17,7 @@ import { createStore, produce } from 'solid-js/store'
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
 import type { BillingOverlayState } from '../boundary/billing.ts'
 import type { CommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
-import {
-  decodeSessionActiveListResponse,
-  type ActiveItem
-} from '../boundary/schema/SessionOrchestratorResponses.ts'
+import { decodeSessionActiveListResponse, type ActiveItem } from '../boundary/schema/SessionOrchestratorResponses.ts'
 import {
   decodeDelegationPauseResponse,
   decodeDelegationStatusResponse,
@@ -90,6 +87,8 @@ export interface ToolPartState {
   lineCount?: number
   /** One-line primary-arg preview from gateway `context` (always sent; redaction-safe). */
   argsPreview?: string
+  /** Bounded transient live progress; never replaces durable argsPreview. */
+  progressPreview?: string
   /** Full args (pretty JSON) for the expanded view — `args_text` (redacted) or stringified `args`. */
   argsText?: string
   /** Structured args from `tool.complete` (always sent) — the per-tool renderers read these. */
@@ -118,6 +117,7 @@ export interface ToolPartState {
 export type Part =
   | { type: 'text'; id: string; text: string }
   | { type: 'reasoning'; id: string; text: string }
+  | { type: 'moa'; id: string; text: string }
   | ToolPartState
 
 export interface Message {
@@ -286,6 +286,11 @@ const SUBAGENT_TRACE_LIMIT = 200
 const SUBAGENT_THINKING_LIMIT = 6
 const SUBAGENT_NOTES_LIMIT = 6
 const SUBAGENT_TOOLS_LIMIT = 8
+const MOA_REFERENCE_LIMIT = 16
+const MOA_REFERENCE_TEXT_LIMIT = 8_192
+const MOA_TURN_TEXT_LIMIT = 65_536
+const MOA_STORE_TEXT_LIMIT = 524_288
+const TOOL_PROGRESS_LIMIT = 512
 
 /** Transport-free persistence request emitted alongside an in-memory archive.
  * The entry layer drains this bounded FIFO and performs `spawn_tree.save`; the
@@ -656,7 +661,7 @@ function stringifyResult(v: unknown): string | undefined {
  * malformed payload decodes to `Option.none` → an empty patch (never crashes).
  * Only present fields are included so a partial patch can't clobber prior chrome.
  */
-function readInfoPatch(payload: { readonly [k: string]: unknown }): Partial<SessionInfo> {
+function readInfoPatch(payload: object): Partial<SessionInfo> {
   const decoded = decodeSessionInfoPatch(payload)
   if (Option.isNone(decoded)) return {}
   return infoPatchFrom(decoded.value)
@@ -917,6 +922,22 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // arming a new one (latest-wins), and the callback nulls it on fire. Mirrors the
   // Ink turnController's single `noticeTimer` handle.
   let noticeTimer: ReturnType<typeof setTimeout> | undefined
+  let statusRestoreTimer: ReturnType<typeof setTimeout> | undefined
+  let lastStatusNote = ''
+
+  function clearStatusRestoreTimer(): void {
+    if (statusRestoreTimer) clearTimeout(statusRestoreTimer)
+    statusRestoreTimer = undefined
+  }
+
+  function scheduleStatusRestore(delayMs: number): void {
+    clearStatusRestoreTimer()
+    statusRestoreTimer = setTimeout(() => {
+      statusRestoreTimer = undefined
+      setState('status', undefined)
+    }, delayMs)
+    statusRestoreTimer.unref()
+  }
 
   // Anti-flood for gateway.stderr. `/logs` reads the authoritative transport
   // ring from GatewayService; the store retains only a short startup-failure
@@ -974,6 +995,66 @@ export function createSessionStore(options?: SessionStoreOptions) {
     const last = parts[parts.length - 1]
     if (last && last.type === type) last.text += text
     else parts.push({ type, id: nextId(), text })
+  }
+
+  function hasReasoning(message: Message): boolean {
+    return (message.parts ?? []).some(part => part.type === 'reasoning' && part.text.trim().length > 0)
+  }
+
+  /** Completion/fallback reasoning is authoritative only when no streamed
+   * reasoning exists. This preserves one ordered part and prevents duplicate
+   * long reasoning bodies from `reasoning.available`/`message.complete`. */
+  function appendFallbackReasoning(draft: StoreState, text: string | undefined): void {
+    const value = text?.trim()
+    if (!value) return
+    const assistant = liveAssistant(draft) ?? ensureAssistant(draft)
+    if (!hasReasoning(assistant)) appendPart(assistant, 'reasoning', value)
+  }
+
+  /** Reconcile the server's authoritative final text without duplicating
+   * streamed segments. Prefix-compatible finals only append their unseen tail;
+   * corrected finals collapse prior text parts into one final part at the last
+   * text position while preserving every reasoning/tool/MoA part and its order. */
+  function reconcileFinalText(message: Message, finalText: string | undefined): void {
+    const final = finalText?.trim()
+    if (!final) return
+    const parts = (message.parts ??= [])
+    const textIndexes: number[] = []
+    let streamed = ''
+    for (let index = 0; index < parts.length; index++) {
+      const part = parts[index]
+      if (part?.type !== 'text') continue
+      textIndexes.push(index)
+      streamed += part.text
+    }
+    if (!textIndexes.length) {
+      parts.push({ type: 'text', id: nextId(), text: final })
+      return
+    }
+    if (final === streamed) return
+    if (final.startsWith(streamed)) {
+      const last = parts[textIndexes[textIndexes.length - 1] ?? -1]
+      if (last?.type === 'text') last.text += final.slice(streamed.length)
+      return
+    }
+    const lastIndex = textIndexes[textIndexes.length - 1]
+    const last = lastIndex === undefined ? undefined : parts[lastIndex]
+    if (!last || last.type !== 'text') return
+    last.text = final
+    for (let index = textIndexes.length - 2; index >= 0; index--) {
+      const removeAt = textIndexes[index]
+      if (removeAt !== undefined) parts.splice(removeAt, 1)
+    }
+  }
+
+  function findRunningToolByName(draft: StoreState, name: string): ToolPartState | undefined {
+    const parts = liveAssistant(draft)?.parts
+    if (!parts) return undefined
+    for (let index = parts.length - 1; index >= 0; index--) {
+      const part = parts[index]
+      if (part?.type === 'tool' && part.state === 'running' && part.name === name) return part
+    }
+    return undefined
   }
 
   /** The newest assistant message, optionally only when still streaming.
@@ -1429,6 +1510,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     turnRunning = false,
     startedAtMs: number = Date.now()
   ): void {
+    clearStatusRestoreTimer()
+    lastStatusNote = ''
     if (noticeTimer) clearTimeout(noticeTimer)
     noticeTimer = undefined
     applied.clear()
@@ -1748,6 +1831,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         applyInfo(event.payload)
         break
       case 'message.start':
+        clearStatusRestoreTimer()
+        lastStatusNote = ''
         // A fresh turn owns a fresh live spawn tree and one discovery credit.
         // Any prior late spawn/start row is stale and is cleared without
         // becoming a second archive for the preceding turn.
@@ -1795,6 +1880,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'message.complete':
+        if (event.payload?.reasoning) {
+          setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning)))
+        }
         // Archive BEFORE the normal turn clear. A child exit can still arrive
         // before session.info(false); `agentsTurnArchived` prevents a duplicate.
         archiveAndClearSubagents(!agentsTurnArchived)
@@ -1806,12 +1894,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
             const finalText = event.payload?.text
             const live = liveAssistant(draft, true) ?? (finalText ? ensureAssistant(draft) : undefined)
             if (!live) return
-            // If no deltas arrived (complete-only gateways), seed the full text once.
-            const hasText = (live.parts ?? []).some(p => p.type === 'text' && p.text.length > 0)
-            if (finalText && !hasText) appendPart(live, 'text', finalText)
+            reconcileFinalText(live, finalText)
             live.streaming = false
           })
         )
+        clearStatusRestoreTimer()
         setState('status', undefined)
         // LOCAL optimistic running:false flip — stops the busy spinner INSTANTLY
         // (statusLineSpinner.test.tsx) without waiting for the server's
@@ -1832,10 +1919,40 @@ export function createSessionStore(options?: SessionStoreOptions) {
       // thinking.delta / status.update are the TRANSIENT busy indicator (kaomoji
       // face/verb) — route them to the status line, NOT the transcript (gotcha: Ink
       // shows these as a FaceTicker, not message content).
-      case 'thinking.delta':
-      case 'status.update': {
+      case 'thinking.delta': {
         const text = event.payload?.text ?? ''
-        if (text) setState('status', text)
+        if (text) {
+          clearStatusRestoreTimer()
+          setState('status', text)
+        }
+        break
+      }
+      case 'status.update': {
+        const text = event.payload?.text?.trim() ?? ''
+        const kind = event.payload?.kind
+        if (!text) break
+        clearStatusRestoreTimer()
+        setState('status', text)
+        if (!kind || kind === 'status') break
+        if (lastStatusNote !== text) {
+          lastStatusNote = text
+          pushSystem(text)
+        }
+        if (kind === 'goal') {
+          setState(
+            'status',
+            text.startsWith('✓')
+              ? '✓ goal complete'
+              : text.startsWith('↻')
+                ? '↻ goal continuing'
+                : text.startsWith('⏸')
+                  ? '⏸ goal paused'
+                  : 'ready'
+          )
+          scheduleStatusRestore(6_000)
+        } else {
+          scheduleStatusRestore(4_000)
+        }
         break
       }
       // notification.show — background-activity notice (process/run state change,
@@ -1897,6 +2014,88 @@ export function createSessionStore(options?: SessionStoreOptions) {
             appendPart(ensureAssistant(draft), 'reasoning', text)
           })
         )
+        break
+      }
+      case 'reasoning.available': {
+        setState(produce(draft => appendFallbackReasoning(draft, event.payload?.text)))
+        break
+      }
+      case 'moa.reference': {
+        const payload = event.payload
+        const text = payload?.text?.trim()
+        if (!payload || !text) break
+        const label = payload.label?.trim() || 'reference'
+        const ordinal =
+          payload.index !== undefined && payload.count !== undefined ? ` ${payload.index}/${payload.count}` : ''
+        setState(
+          produce(draft => {
+            const assistant = ensureAssistant(draft)
+            const parts = (assistant.parts ??= [])
+            const references = parts.filter(part => part.type === 'moa')
+            if (references.length >= MOA_REFERENCE_LIMIT) return
+            const used = references.reduce((total, part) => total + part.text.length, 0)
+            const remaining = Math.max(0, MOA_TURN_TEXT_LIMIT - used)
+            const header = `**Reference${ordinal} — ${label}**\n\n`
+
+            // Keep newest references within a store-wide ceiling: evict only
+            // old MoA machinery parts (never answer/tool/user rows) before adding.
+            let retained = draft.messages.reduce(
+              (total, message) =>
+                total +
+                (message.parts ?? []).reduce((sum, part) => sum + (part.type === 'moa' ? part.text.length : 0), 0),
+              0
+            )
+            for (const message of draft.messages) {
+              const oldParts = message.parts
+              if (!oldParts || message === assistant) continue
+              for (let index = 0; index < oldParts.length && retained + header.length > MOA_STORE_TEXT_LIMIT; ) {
+                const part = oldParts[index]
+                if (part?.type === 'moa') {
+                  retained -= part.text.length
+                  oldParts.splice(index, 1)
+                } else index++
+              }
+              if (retained + header.length <= MOA_STORE_TEXT_LIMIT) break
+            }
+
+            const storeRemaining = Math.max(0, MOA_STORE_TEXT_LIMIT - retained)
+            const partCap = Math.min(MOA_REFERENCE_TEXT_LIMIT, remaining, storeRemaining)
+            if (partCap <= header.length) return
+            const bodyCap = partCap - header.length
+            const boundedText = text.length <= bodyCap ? text : `${text.slice(0, Math.max(0, bodyCap - 1))}…`
+            parts.push({ type: 'moa', id: nextId(), text: header + boundedText })
+          })
+        )
+        break
+      }
+      case 'moa.aggregating': {
+        const aggregator = event.payload?.aggregator?.trim()
+        setState('status', aggregator ? `aggregating with ${aggregator}…` : 'aggregating references…')
+        break
+      }
+      case 'tool.progress': {
+        const name = event.payload.name?.trim()
+        const preview = event.payload.preview?.trim()
+        if (!name || !preview) break
+        setState(
+          produce(draft => {
+            const tool = findRunningToolByName(draft, name)
+            if (tool) tool.progressPreview = preview.slice(0, TOOL_PROGRESS_LIMIT)
+          })
+        )
+        break
+      }
+      case 'tool.generating': {
+        const name = event.payload.name?.trim()
+        if (name) {
+          setState('status', `drafting ${name}…`)
+          scheduleStatusRestore(4_000)
+        }
+        break
+      }
+      case 'browser.progress': {
+        const message = readStr(event.payload, 'message')?.trim()
+        if (message) pushSystem(message)
         break
       }
       case 'tool.start': {
@@ -1984,6 +2183,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
               ;(ensureAssistant(draft).parts ??= []).push(part)
             }
             part.state = 'complete'
+            delete part.progressPreview
             if (name) part.name = name
             if (summary) part.summary = summary
             if (error) part.error = error
@@ -2140,6 +2340,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
       // spinner (no message.complete will ever arrive for the lost reply), tell
       // the user their in-flight reply was lost, and show a recovering status.
       case 'gateway.exited': {
+        clearStatusRestoreTimer()
+        lastStatusNote = ''
         // Only an actually-open turn owns an exit archive. A post-complete
         // transport exit happens while turnInFlight is still latched, but the
         // archived bit keeps it from duplicating the normal snapshot.
@@ -2383,6 +2585,27 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('commandCatalog', catalog)
   }
 
+  /** Replace only the active conversation after a fully-decoded same-SID mutation. */
+  function replaceConversationSnapshot(
+    snapshot: Message[] | undefined,
+    rawInfo: object | undefined,
+    rawUsage: object | undefined
+  ): void {
+    const capped =
+      snapshot === undefined ? undefined : snapshot.length > MESSAGE_CAP ? snapshot.slice(-MESSAGE_CAP) : snapshot
+    const infoPatch = readInfoPatch(rawUsage === undefined ? (rawInfo ?? {}) : { ...(rawInfo ?? {}), usage: rawUsage })
+    setState(
+      produce(draft => {
+        if (capped !== undefined && snapshot !== undefined) {
+          draft.messages = capped
+          draft.dropped = snapshot.length - capped.length
+        }
+        draft.info = { ...draft.info, ...infoPatch }
+        draft.status = undefined
+      })
+    )
+  }
+
   function setSessionId(sid: string | undefined): void {
     setState('sessionId', sid)
   }
@@ -2413,9 +2636,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     const wireRows = decoded.sessions ?? []
     // A response can race a switch; prefer the authoritative SID supplied at apply time.
     const exactCurrent = currentSessionId ? wireRows.some(row => row.id === currentSessionId) : false
-    const rows = exactCurrent
-      ? wireRows.map(row => ({ ...row, current: row.id === currentSessionId }))
-      : wireRows
+    const rows = exactCurrent ? wireRows.map(row => ({ ...row, current: row.id === currentSessionId })) : wireRows
     const same =
       rows.length === state.liveSessions.length &&
       rows.every((row, index) => {
@@ -2472,6 +2693,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     applyDelegationPauseResponse,
     setCatalog,
     setCommandCatalog,
+    replaceConversationSnapshot,
     setSessionId,
     setResumeId,
     setLiveSessionChrome,

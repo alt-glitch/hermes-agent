@@ -78,6 +78,7 @@ const MessageComplete = Schema.Struct({
       client_submission_ids: ClientSubmissionIds,
       text: opt(Str),
       rendered: opt(Str),
+      reasoning: opt(Str),
       usage: opt(Schema.Record(Str, Schema.Unknown))
     })
   )
@@ -91,6 +92,23 @@ const ReasoningShape = {
 }
 const ReasoningDelta = Schema.Struct({ type: Schema.Literal('reasoning.delta'), ...ReasoningShape })
 const ReasoningAvailable = Schema.Struct({ type: Schema.Literal('reasoning.available'), ...ReasoningShape })
+const MoaReference = Schema.Struct({
+  type: Schema.Literal('moa.reference'),
+  session_id: opt(Str),
+  payload: opt(
+    Schema.Struct({
+      count: opt(Schema.Number),
+      index: opt(Schema.Number),
+      label: opt(Str),
+      text: opt(Str)
+    })
+  )
+})
+const MoaAggregating = Schema.Struct({
+  type: Schema.Literal('moa.aggregating'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ aggregator: opt(Str) }))
+})
 const ThinkingDelta = Schema.Struct({
   type: Schema.Literal('thinking.delta'),
   session_id: opt(Str),
@@ -251,6 +269,8 @@ export const GatewayEventSchema = Schema.Union([
   MessageComplete,
   ReasoningDelta,
   ReasoningAvailable,
+  MoaReference,
+  MoaAggregating,
   ThinkingDelta,
   ToolStart,
   ToolComplete,

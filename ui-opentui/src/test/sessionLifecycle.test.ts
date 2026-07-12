@@ -3,7 +3,7 @@ import { Cause, Effect, Exit } from 'effect'
 
 import { GatewayError } from '../boundary/errors.ts'
 import type { GatewayServiceShape } from '../boundary/gateway/GatewayService.ts'
-import { replaceSession, resumeSession, SessionProtocolError } from '../boundary/sessionLifecycle.ts'
+import { branchSession, replaceSession, resumeSession, SessionProtocolError } from '../boundary/sessionLifecycle.ts'
 import { createSessionStore } from '../logic/store.ts'
 
 interface FakeGateway {
@@ -352,4 +352,91 @@ describe('resumeSession', () => {
       assert.strictEqual(store.state.messages.length, 1)
     })
   })
+})
+
+describe('branchSession', () => {
+  it.effect('adopts the child, preserves visible scrollback, then closes the parent', () => {
+    const store = createSessionStore()
+    store.setSessionId('parent-live')
+    store.pushUser('keep this')
+    const fake = fakeGateway(method => {
+      if (method === 'session.branch') return Effect.succeed({ parent: 'parent-key', session_id: 'child-live', session_key: 'child-key', title: 'forked' })
+      if (method === 'session.close') return Effect.succeed({ closed: true })
+      return Effect.succeed(undefined)
+    }, 'parent-live')
+    return Effect.gen(function* () {
+      const result = yield* branchSession(fake.service, store, { name: 'forked' })
+      assert.strictEqual(result.childSessionId, 'child-live')
+      assert.isFalse(result.closeFailed)
+      assert.strictEqual(result.resumeId, 'child-key')
+      assert.strictEqual(store.state.sessionId, 'child-live')
+      assert.strictEqual(store.state.resumeId, 'child-key')
+      assert.strictEqual(store.state.messages.some(message => message.text === 'keep this'), true)
+      assert.deepStrictEqual(fake.calls.map(call => call.method), ['session.branch', 'session.close'])
+    })
+  })
+
+  it.effect('keeps the committed child when parent close fails', () => {
+    const store = createSessionStore()
+    store.setSessionId('parent-live')
+    const fake = fakeGateway(method =>
+      method === 'session.branch'
+        ? Effect.succeed({ parent: 'parent-key', session_id: 'child-live', session_key: 'child-key', title: 'forked' })
+        : Effect.fail(rpcFailure(method)), 'parent-live')
+    return Effect.gen(function* () {
+      const result = yield* branchSession(fake.service, store, { name: '' })
+      assert.isTrue(result.closeFailed)
+      assert.strictEqual(store.state.sessionId, 'child-live')
+      assert.strictEqual(store.state.resumeId, 'child-key')
+    })
+  })
+  it('preserves composer edits authored while the branch RPC is pending', async () => {
+    let release: ((value: unknown) => void) | undefined
+    const pending = new Promise<unknown>(resolve => (release = resolve))
+    const store = createSessionStore()
+    store.setSessionId('parent-live')
+    store.setResumeId('parent-key')
+    store.replaceComposerDraft('before')
+    const fake = fakeGateway(method =>
+      method === 'session.branch' ? Effect.promise(() => pending) : Effect.succeed({ closed: true }), 'parent-live')
+    const running = Effect.runPromise(branchSession(fake.service, store, { name: 'forked' }))
+    await Promise.resolve()
+    store.replaceComposerDraft('edited during branch')
+    release?.({ parent: 'parent-key', session_id: 'child-live', session_key: 'child-key', title: 'forked' })
+    await running
+    assert.strictEqual(store.state.composerDraft, 'edited during branch')
+  })
+
+  it.effect('rejects a mismatched durable parent without committing or closing', () => {
+    const store = createSessionStore()
+    store.setSessionId('parent-live')
+    store.setResumeId('parent-key')
+    const fake = fakeGateway(method => Effect.succeed(
+      method === 'session.branch'
+        ? { parent: 'other-key', session_id: 'child-live', session_key: 'child-key', title: 'forked' }
+        : { closed: true }
+    ), 'parent-live')
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(branchSession(fake.service, store, { name: '' }))
+      assert.isTrue(Exit.isFailure(exit))
+      assert.strictEqual(store.state.sessionId, 'parent-live')
+      assert.deepStrictEqual(fake.calls.map(call => call.method), ['session.branch'])
+    })
+  })
+
+  it.effect('accepts exact-f7 old branch shape and flags closed:false', () => {
+    const store = createSessionStore()
+    store.setSessionId('parent-live')
+    const fake = fakeGateway(method => Effect.succeed(
+      method === 'session.branch'
+        ? { session_id: 'child-live', title: 'forked' }
+        : { closed: false }
+    ), 'parent-live')
+    return Effect.gen(function* () {
+      const result = yield* branchSession(fake.service, store, { name: '' })
+      assert.strictEqual(result.resumeId, 'child-live')
+      assert.isTrue(result.closeFailed)
+    })
+  })
+
 })

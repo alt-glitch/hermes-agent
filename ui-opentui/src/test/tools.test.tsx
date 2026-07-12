@@ -55,6 +55,28 @@ async function clickHeader(probe: RenderProbe, name: string): Promise<void> {
 }
 
 describe('tool renderer registry — labeled-args default (Epic 2.2)', () => {
+  test('running progress replaces only the visible subtitle; completion restores durable args', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({ type: 'message.start' })
+    store.apply({
+      type: 'tool.start',
+      payload: { context: 'echo durable-command', name: 'terminal', tool_id: 'progress-1' }
+    })
+    store.apply({ type: 'tool.progress', payload: { name: 'terminal', preview: 'streaming progress frame' } })
+    const probe = await mountApp(store)
+    try {
+      let frame = await probe.waitForFrame(value => value.includes('streaming progress frame'))
+      expect(frame).not.toContain('echo durable-command')
+      store.apply({ type: 'tool.complete', payload: { name: 'terminal', summary: 'done', tool_id: 'progress-1' } })
+      store.apply({ type: 'message.complete' })
+      await probe.settle()
+      frame = await probe.waitForFrame(value => value.includes('echo durable-command'))
+      expect(frame).not.toContain('streaming progress frame')
+    } finally {
+      probe.destroy()
+    }
+  })
   test('an unmapped MCP-ish tool with nested args renders labeled fields, never raw JSON', async () => {
     const store = createSessionStore()
     seedTool(

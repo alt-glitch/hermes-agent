@@ -39,6 +39,7 @@ import {
   type SessionOrchestratorOps
 } from './overlays/sessionOrchestrator.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
+import type { PromptResponseMethod } from '../boundary/promptResponses.ts'
 import { SessionInfoProvider } from './sessionInfo.tsx'
 import { StatusBar } from './statusBar.tsx'
 import { TodoPanel } from './todoPanel.tsx'
@@ -58,7 +59,7 @@ export interface AppProps {
   /** Entry observes edit end so a queue held across turn-settle can drain. */
   readonly onQueueEditChange?: (index: number | undefined) => void
   readonly onType?: (text: string, cursor: number) => void
-  readonly onRespond?: (method: string, params: Record<string, unknown>) => void
+  readonly onRespond?: (method: PromptResponseMethod, params: Record<string, unknown>) => Promise<boolean>
   readonly onResume?: (sessionId: string) => void
   readonly onActivateSession?: (sessionId: string) => void
   readonly onNewLiveSession?: () => void
@@ -90,7 +91,7 @@ export interface AppProps {
 }
 
 const NOOP = () => {}
-const NOOP_RESPOND = () => {}
+const NOOP_RESPOND = () => Promise.resolve(false)
 const NOOP_RESUME = () => {}
 const NO_SESSION = () => undefined
 /** Inert picker ops for headless mounts that pass no gateway (tests). */

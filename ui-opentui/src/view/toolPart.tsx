@@ -117,7 +117,12 @@ export function ToolPart(props: { part: ToolPartState }) {
   // Expandable when the renderer says there's a body to reveal beyond the header.
   const collapsible = () => !running() && renderer().expandable(props.part)
   // Header subtitle: errors win; otherwise the renderer's collapsed summary.
-  const subtitle = () => (props.part.error ? `✗ ${props.part.error}` : renderer().subtitle(props.part, info().cwd))
+  const subtitle = () =>
+    props.part.error
+      ? `✗ ${props.part.error}`
+      : running() && props.part.progressPreview
+        ? props.part.progressPreview
+        : renderer().subtitle(props.part, info().cwd)
   const hint = () => renderer().hint?.(props.part)
   // Optional `+N −M` change summary (file tools) — themed, settled parts only.
   const stats = () => (running() || props.part.error ? undefined : renderer().stats?.(props.part))

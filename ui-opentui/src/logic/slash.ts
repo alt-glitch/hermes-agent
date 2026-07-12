@@ -13,11 +13,14 @@
  */
 import { Option } from 'effect'
 
+import { decodeSessionCompressResponse } from '../boundary/compression.ts'
+
 import { delegationStatusText, type DelegationState } from './agentStatus.ts'
 import { diagnosticsEnabled } from './env.ts'
 import { DETAILS_SECTIONS, DETAILS_USAGE, type DetailsMode, nextDetailsMode, parseDetailsMode } from './details.ts'
 import { formatBytes, memReport, performHeapdump } from './diagnostics.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './replay.ts'
+import { mapResumeHistory } from './resume.ts'
 import { mapSessionRows, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
 import type { SpawnHistoryState, SpawnSnapshot } from './spawnHistory.ts'
 import type { CompletionItem, ConfirmRequest, PickerItem, PickerState } from './store.ts'
@@ -115,6 +118,8 @@ export interface SlashContext {
   readonly guardBusySessionSwitch: (what?: string, requestedOwner?: string) => boolean
   /** Close the current live session and create/adopt a replacement. */
   readonly newSession: (message?: string, title?: string) => void
+  /** Branch the current conversation into a newly adopted live session. */
+  readonly branchSession?: (name: string) => void
   /** Create/adopt a new live sibling without closing the current session. */
   readonly newLiveSession: (message?: string, title?: string) => void
   /** Adopt the same-SID agent reset returned by `tools.configure`, then refresh
@@ -201,6 +206,12 @@ export interface SlashContext {
   /** Conversation rewind/retry + generic dispatch-prefill capabilities. */
   readonly lastUserMessage: () => string | undefined
   readonly trimLastExchange: () => number
+  readonly replaceConversationSnapshot: (
+    messages: Message[] | undefined,
+    info: object | undefined,
+    usage: object | undefined
+  ) => void
+  readonly setCompressedSessionKey: (sessionKey: string) => void
   readonly prefillComposer: (text: string) => void
   /** Mounted-renderable count under the live renderer root (a /mem diagnostic);
    *  undefined when no renderer is reachable (tests). */
@@ -1531,6 +1542,64 @@ const busyCmd: ClientHandler = async (arg, ctx, flight) => {
   }
 }
 
+const COMPACT_NUMBER = new Intl.NumberFormat('en-US', { maximumFractionDigits: 1, notation: 'compact' })
+const compactTokens = (value: number) => COMPACT_NUMBER.format(value).replace(/[KMBT]$/, suffix => suffix.toLowerCase())
+
+const compressCmd: ClientHandler = async (arg, ctx) => {
+  const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('no active session — nothing to compress')
+    return
+  }
+  if (ctx.isSessionTransitioning()) {
+    ctx.pushSystem('session switch in progress — retry /compress when it finishes')
+    return
+  }
+  if (ctx.isBusy()) {
+    ctx.pushSystem('session busy — /interrupt the current turn before /compress')
+    return
+  }
+  if (!ctx.beginHistoryMutation()) {
+    ctx.pushSystem('history update already in progress — wait before /compress')
+    return
+  }
+  try {
+    const focus = arg.trim()
+    const raw = await ctx.request('session.compress', {
+      session_id: sid,
+      ...(focus ? { focus_topic: focus } : {})
+    })
+    if (ctx.sessionId() !== sid) return
+    const response = decodeSessionCompressResponse(raw)
+    if (!response) {
+      ctx.pushSystem('/compress: invalid session.compress response')
+      return
+    }
+    const snapshot = response.messages === undefined ? undefined : mapResumeHistory(response.messages)
+    if (snapshot !== undefined || response.info !== undefined || response.usage !== undefined) {
+      ctx.replaceConversationSnapshot(snapshot, response.info, response.usage)
+    }
+    const sessionKey = response.session_key?.trim()
+    if (sessionKey) ctx.setCompressedSessionKey(sessionKey)
+    if (response.summary?.headline) {
+      ctx.pushSystem((response.summary.noop ? '' : '✓ ') + response.summary.headline)
+      if (response.summary.token_line) ctx.pushSystem('  ' + response.summary.token_line)
+      if (response.summary.note) ctx.pushSystem('  ' + response.summary.note)
+    } else if ((response.removed ?? 0) <= 0) {
+      ctx.pushSystem('nothing to compress')
+    } else {
+      const tokenSuffix = response.usage?.total ? ` · ${compactTokens(response.usage.total)} tok` : ''
+      ctx.pushSystem('compressed ' + response.removed + ' messages' + tokenSuffix)
+    }
+  } catch (error) {
+    if (ctx.sessionId() === sid) {
+      ctx.pushSystem('/compress: ' + (error instanceof Error ? error.message : 'session.compress failed'))
+    }
+  } finally {
+    ctx.endHistoryMutation()
+  }
+}
+
 const requestRewind = async (
   ctx: SlashContext,
   sid: string,
@@ -1659,6 +1728,8 @@ export const DASHBOARD_EXIT_DISABLED_MESSAGE =
 
 export const DASHBOARD_UPDATE_DISABLED_MESSAGE =
   'update is disabled in hosted dashboard chat — the hosted environment is managed separately'
+
+const branchCmd: ClientHandler = (arg, ctx) => ctx.branchSession?.(arg.trim())
 
 const quitCmd: ClientHandler = (_arg, ctx) => {
   if (ctx.dashboardMode()) {
@@ -1902,6 +1973,9 @@ const CLIENT: Record<string, ClientHandler> = {
   btw: backgroundCmd,
   clear: freshSessionCmd(false),
   compact: compactCmd,
+  compress: compressCmd,
+  branch: branchCmd,
+  fork: branchCmd,
   copy: (arg, ctx) => {
     const n = Math.max(1, Number.parseInt(arg, 10) || 1)
     if (!ctx.copyResponse(n)) ctx.pushSystem('Nothing to copy yet.')

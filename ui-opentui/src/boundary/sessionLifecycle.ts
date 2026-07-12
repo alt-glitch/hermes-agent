@@ -11,6 +11,8 @@ import { Data, Effect, Option, Schema } from 'effect'
 import type { GatewayServiceShape } from './gateway/GatewayService.ts'
 import {
   decodeSessionActivateResponse,
+  decodeSessionBranchResponse,
+  decodeSessionCloseResponse,
   decodeSessionResumeResponse,
   type LiveSessionSnapshot
 } from './schema/SessionOrchestratorResponses.ts'
@@ -58,7 +60,7 @@ export type ReplaceSessionResult =
 
 export class SessionProtocolError extends Data.TaggedError('SessionProtocolError')<{
   readonly message: string
-  readonly method: 'setup.status' | 'session.activate' | 'session.create' | 'session.resume'
+  readonly method: 'setup.status' | 'session.activate' | 'session.branch' | 'session.create' | 'session.resume'
 }> {}
 
 /** Create and schema-decode a session without any close/setup policy. */
@@ -299,6 +301,72 @@ export const activateSession = Effect.fn('SessionLifecycle.activate')(function* 
     Effect.ensuring(
       Effect.sync(() => {
         if (!committed) store.abortBuffer(event => eventBelongsToSession(event, previousLiveSessionId))
+      })
+    )
+  )
+})
+
+export const branchSession = Effect.fn('SessionLifecycle.branch')(function* (
+  gateway: GatewayServiceShape,
+  store: SessionStore,
+  options: { readonly name: string }
+) {
+  const parentSessionId = gateway.sessionId()
+  if (!parentSessionId) {
+    return yield* new SessionProtocolError({ message: 'no active session to branch', method: 'session.branch' })
+  }
+  const parentResumeId = store.state.resumeId
+  const visible = [...store.state.messages]
+  const info = { ...store.state.info }
+  let committed = false
+  store.beginBuffer()
+  return yield* Effect.gen(function* () {
+    const raw = yield* gateway.request<unknown>('session.branch', {
+      name: options.name,
+      session_id: parentSessionId
+    })
+    const response = decodeSessionBranchResponse(raw)
+    const childSessionId = response?.session_id.trim() ?? ''
+    if (!response || !childSessionId) {
+      return yield* new SessionProtocolError({
+        message: 'session.branch returned an invalid response',
+        method: 'session.branch'
+      })
+    }
+    if (parentResumeId && response.parent !== undefined && response.parent.trim() !== parentResumeId) {
+      return yield* new SessionProtocolError({
+        message: 'session.branch returned a mismatched parent identity',
+        method: 'session.branch'
+      })
+    }
+    const resumeId = response.session_key?.trim() || childSessionId
+    const preservedDraft = store.state.composerDraft
+    store.commitSessionSnapshot(
+      childSessionId,
+      visible,
+      info,
+      event => eventBelongsToSession(event, childSessionId),
+      resumeId,
+      false,
+      Date.now()
+    )
+    if (preservedDraft) store.replaceComposerDraft(preservedDraft)
+    committed = true
+    let closeFailed = false
+    yield* gateway.request<unknown>('session.close', { session_id: parentSessionId }).pipe(
+      Effect.tap(raw =>
+        Effect.sync(() => {
+          const closed = decodeSessionCloseResponse(raw)
+          closeFailed = !closed || closed.closed !== true
+        })
+      ),
+      Effect.catchCause(() => Effect.sync(() => (closeFailed = true)))
+    )
+    return { childSessionId, closeFailed, parentSessionId, resumeId, title: response.title.trim() } as const
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        if (!committed) store.abortBuffer(event => eventBelongsToSession(event, parentSessionId))
       })
     )
   )

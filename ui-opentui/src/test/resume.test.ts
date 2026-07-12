@@ -57,6 +57,24 @@ describe('mapResumeHistory (Phase 4b)', () => {
     expect(tool.argsText).toContain('"command"')
   })
 
+  test('maps raw gateway content and correlates OpenAI tool calls with tool results', () => {
+    const msgs = mapResumeHistory([
+      { role: 'user', content: 'deploy it' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'call-1', function: { name: 'terminal', arguments: '{"command":"npm test"}' } }]
+      },
+      { role: 'tool', tool_call_id: 'call-1', content: 'all passed' },
+      { role: 'assistant', content: 'Done.' }
+    ])
+    expect(msgs.map(message => message.text)).toEqual(['deploy it', '', 'Done.'])
+    const tool = msgs[1]?.parts?.[0]
+    expect(tool).toMatchObject({ name: 'terminal', resultText: 'all passed', state: 'complete', type: 'tool' })
+    if (tool?.type !== 'tool') throw new Error('expected correlated tool part')
+    expect(tool.argsText).toContain('npm test')
+  })
+
   test('ignores non-arrays and unknown roles', () => {
     expect(mapResumeHistory(null)).toEqual([])
     expect(mapResumeHistory([{ role: 'weird', text: 'x' }])).toEqual([])

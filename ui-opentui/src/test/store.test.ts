@@ -375,6 +375,185 @@ describe('session store — ordered parts (Phase 2b)', () => {
     store.apply({ type: 'status.update', payload: { kind: 'tool', text: 'running terminal…' } })
     expect(store.state.status).toBe('running terminal…')
   })
+
+  test('reasoning.available and message.complete reasoning are fallback-only without duplication', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'reasoning.delta', payload: { text: 'streamed thought' } })
+    store.apply({ type: 'reasoning.available', payload: { text: 'fallback thought' } })
+    store.apply({ type: 'message.complete', payload: { reasoning: 'completion thought', text: 'answer' } })
+    const reasoning = store.state.messages
+      .find(message => message.role === 'assistant')
+      ?.parts?.filter(part => part.type === 'reasoning')
+    expect(reasoning).toHaveLength(1)
+    expect(reasoning?.[0]).toMatchObject({ text: 'streamed thought' })
+  })
+
+  test('completion-only reasoning creates one ordered settled reasoning part before answer text', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.complete', payload: { reasoning: 'recovered thought', text: 'final answer' } })
+    const assistant = store.state.messages.at(-1)
+    expect(assistant?.streaming).toBe(false)
+    expect(assistant?.parts).toMatchObject([
+      { type: 'reasoning', text: 'recovered thought' },
+      { type: 'text', text: 'final answer' }
+    ])
+  })
+
+  test('MoA references stay as distinct ordered visible parts; aggregation is status-only', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({
+      type: 'moa.reference',
+      payload: { count: 2, index: 1, label: 'provider/model-a', text: 'Alpha answer' }
+    })
+    store.apply({
+      type: 'moa.reference',
+      payload: { count: 2, index: 2, label: 'provider/model-b', text: 'Beta answer' }
+    })
+    const before = store.state.messages.at(-1)?.parts?.length
+    if (before === undefined) throw new Error('expected MoA parts')
+    store.apply({ type: 'moa.aggregating', payload: { aggregator: 'provider/model-z' } })
+    expect(store.state.messages.at(-1)?.parts).toHaveLength(before)
+    expect(store.state.status).toBe('aggregating with provider/model-z…')
+    expect(store.state.messages.at(-1)?.parts).toMatchObject([
+      { type: 'moa', text: expect.stringContaining('Reference 1/2 — provider/model-a') },
+      { type: 'moa', text: expect.stringContaining('Reference 2/2 — provider/model-b') }
+    ])
+  })
+
+  test('bounds MoA reference count, per-reference text, and total chars across many turns', () => {
+    const store = createSessionStore()
+    for (let turn = 0; turn < 24; turn++) {
+      store.apply({ type: 'message.start' })
+      for (let index = 0; index < 24; index++) {
+        store.apply({
+          type: 'moa.reference',
+          payload: { index: index + 1, label: `model-${index}`, text: 'x'.repeat(12_000) }
+        })
+      }
+      store.apply({ type: 'message.complete', payload: { text: `answer-${turn}` } })
+    }
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(24)
+    for (const assistant of assistants) {
+      const references = assistant.parts?.filter(part => part.type === 'moa') ?? []
+      expect(references.length).toBeLessThanOrEqual(16)
+      expect(references.every(reference => reference.text.length < 8_300)).toBe(true)
+      expect(references.reduce((total, reference) => total + reference.text.length, 0)).toBeLessThanOrEqual(65_536)
+    }
+    const retained = assistants.reduce(
+      (total, assistant) =>
+        total + (assistant.parts ?? []).reduce((sum, part) => sum + (part.type === 'moa' ? part.text.length : 0), 0),
+      0
+    )
+    expect(retained).toBeLessThanOrEqual(524_288)
+    expect(assistants.at(-1)?.parts?.some(part => part.type === 'moa')).toBe(true)
+  })
+
+  test('tool.progress updates the newest matching running tool and tool.generating updates status', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'tool.start', payload: { context: 'initial', name: 'browser', tool_id: 'b1' } })
+    store.apply({ type: 'tool.start', payload: { context: 'other', name: 'terminal', tool_id: 't1' } })
+    store.apply({ type: 'tool.progress', payload: { name: 'browser', preview: 'loaded hero cards' } })
+    store.apply({ type: 'tool.generating', payload: { name: 'image' } })
+    const tools = store.state.messages.at(-1)?.parts?.filter(part => part.type === 'tool') ?? []
+    expect(tools[0]).toMatchObject({ id: 'b1', argsPreview: 'initial', progressPreview: 'loaded hero cards' })
+    expect(tools[1]).toMatchObject({ id: 't1', argsPreview: 'other' })
+    expect(store.state.status).toBe('drafting image…')
+    store.apply({ type: 'tool.complete', payload: { name: 'browser', summary: 'done', tool_id: 'b1' } })
+    expect(tools[0]).toMatchObject({ id: 'b1', argsPreview: 'initial', state: 'complete' })
+    expect(tools[0]?.progressPreview).toBeUndefined()
+  })
+
+  test('message.complete final text is authoritative while preserving non-text ordered parts', () => {
+    const corrected = createSessionStore()
+    corrected.apply({ type: 'message.start' })
+    corrected.apply({ type: 'message.delta', payload: { text: 'before partial' } })
+    corrected.apply({ type: 'tool.start', payload: { name: 'terminal', tool_id: 't-final' } })
+    corrected.apply({ type: 'tool.complete', payload: { name: 'terminal', summary: 'done', tool_id: 't-final' } })
+    corrected.apply({ type: 'message.delta', payload: { text: ' stale tail' } })
+    corrected.apply({ type: 'message.complete', payload: { text: 'correct final answer' } })
+    const parts = corrected.state.messages.at(-1)?.parts ?? []
+    expect(parts.filter(part => part.type === 'tool')).toHaveLength(1)
+    expect(parts.filter(part => part.type === 'text')).toMatchObject([{ text: 'correct final answer' }])
+
+    const expanded = createSessionStore()
+    expanded.apply({ type: 'message.start' })
+    expanded.apply({ type: 'message.delta', payload: { text: 'hello' } })
+    expanded.apply({ type: 'message.complete', payload: { text: 'hello world' } })
+    expect(expanded.state.messages.at(-1)?.parts).toMatchObject([{ type: 'text', text: 'hello world' }])
+  })
+
+  test('typed status restore is latest-wins and uses exact 6s goal / 4s activity windows', () => {
+    vi.useFakeTimers()
+    try {
+      const store = createSessionStore()
+      store.apply({ type: 'status.update', payload: { kind: 'goal', text: '✓ shipped' } })
+      vi.advanceTimersByTime(5_999)
+      expect(store.state.status).toBe('✓ goal complete')
+      vi.advanceTimersByTime(1)
+      expect(store.state.status).toBeUndefined()
+
+      store.apply({ type: 'status.update', payload: { kind: 'warn', text: 'first warning' } })
+      vi.advanceTimersByTime(3_000)
+      store.apply({ type: 'status.update', payload: { kind: 'error', text: 'newest error' } })
+      vi.advanceTimersByTime(1_001)
+      expect(store.state.status).toBe('newest error')
+      vi.advanceTimersByTime(2_999)
+      expect(store.state.status).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('status restore timers cannot clear newer turn, session, or gateway teardown state', () => {
+    vi.useFakeTimers()
+    try {
+      const turn = createSessionStore()
+      turn.apply({ type: 'status.update', payload: { kind: 'warn', text: 'old warning' } })
+      turn.apply({ type: 'message.start' })
+      turn.setStatus('new turn status')
+      vi.advanceTimersByTime(5_000)
+      expect(turn.state.status).toBe('new turn status')
+
+      const session = createSessionStore()
+      session.apply({ type: 'status.update', payload: { kind: 'warn', text: 'old warning' } })
+      session.adoptFreshSession('new-session', {})
+      session.setStatus('new session status')
+      vi.advanceTimersByTime(5_000)
+      expect(session.state.status).toBe('new session status')
+
+      const gateway = createSessionStore()
+      gateway.apply({ type: 'status.update', payload: { kind: 'warn', text: 'old warning' } })
+      gateway.apply({ type: 'gateway.exited' })
+      vi.advanceTimersByTime(5_000)
+      expect(gateway.state.status).toBe('gateway exited')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('browser progress and typed goal/compression/warn/error statuses persist with duplicate activity bounded', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'browser.progress', payload: { message: '  browser authenticated  ' } })
+    store.apply({ type: 'browser.progress', payload: { message: '   ' } })
+    store.apply({ type: 'status.update', payload: { kind: 'goal', text: '✓ shipped' } })
+    expect(store.state.status).toBe('✓ goal complete')
+    store.apply({ type: 'status.update', payload: { kind: 'compressing', text: 'compressing context…' } })
+    store.apply({ type: 'status.update', payload: { kind: 'warn', text: 'quota nearing limit' } })
+    store.apply({ type: 'status.update', payload: { kind: 'warn', text: 'quota nearing limit' } })
+    store.apply({ type: 'status.update', payload: { kind: 'error', text: 'provider degraded' } })
+    const system = store.state.messages.filter(message => message.role === 'system').map(message => message.text)
+    expect(system).toEqual([
+      'browser authenticated',
+      '✓ shipped',
+      'compressing context…',
+      'quota nearing limit',
+      'provider degraded'
+    ])
+  })
 })
 
 describe('session store — blocking prompts (Phase 3)', () => {

@@ -101,7 +101,7 @@ export function lastTextId(parts: readonly Part[] | undefined): string | undefin
 export function firstTextId(parts: readonly Part[] | undefined): string | undefined {
   if (!parts) return undefined
   for (const p of parts) {
-    if (p && p.type === 'text') return p.id
+    if (p.type === 'text') return p.id
   }
   return undefined
 }
@@ -244,6 +244,9 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                       <Switch>
                         <Match when={part.type === 'tool' && part}>{tool => <ToolPart part={tool()} />}</Match>
                         <Match when={part.type === 'reasoning' && part}>
+                          {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
+                        </Match>
+                        <Match when={part.type === 'moa' && part}>
                           {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
                         </Match>
                         <Match when={part.type === 'hiddenRun' && part}>

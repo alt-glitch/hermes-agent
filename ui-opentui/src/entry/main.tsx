@@ -31,6 +31,7 @@ import { readClipboardImage, writeClipboard } from '../boundary/clipboard.ts'
 import { GatewayService, type GatewayServiceShape } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
+import { promptResponseAcknowledged, type PromptResponseMethod } from '../boundary/promptResponses.ts'
 import { startMemlog } from '../boundary/memlog.ts'
 import { startMemoryMonitor } from '../boundary/memoryMonitor.ts'
 import { startProactiveGc } from '../boundary/proactiveGc.ts'
@@ -46,7 +47,7 @@ import {
   type SessionSteerDisposition
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
-import { activateSession, createSession, replaceSession, resumeSession } from '../boundary/sessionLifecycle.ts'
+import { activateSession, branchSession, createSession, replaceSession, resumeSession } from '../boundary/sessionLifecycle.ts'
 import { configSyncBlocked, createConfigSyncTracker, mcpReloadSucceeded } from '../logic/configSync.ts'
 import {
   createDelegationStatusRefresher,
@@ -1950,6 +1951,54 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
+      const startBranchSession = (name: string): void => {
+        const owner = `branch:${gateway.sessionId() ?? 'detached'}`
+        if (guardBusySessionSwitch('branch the session', owner)) return
+        clearModelPrefetch()
+        activeTransitionOwner = owner
+        sessionTransitionInFlight = true
+        store.setHint('branching session…')
+        let transitionSucceeded = false
+        Effect.runFork(
+          branchSession(gateway, store, { name }).pipe(
+            Effect.tap(result =>
+              Effect.sync(() => {
+                pasteStore.retainOnly(store.state.composerDraft)
+                stableSessionOwnerId = result.resumeId
+                writeActiveSession(result.resumeId)
+                store.pushSystem(`branched → ${result.title}`)
+                if (result.closeFailed) store.pushSystem('warning: branch created, but parent session could not be closed')
+                transitionSucceeded = true
+                activeSessionsRefresher.invalidate()
+                void activeSessionsRefresher.refresh(true)
+                Effect.runFork(
+                  postSessionSetup(gateway, store, result.childSessionId).pipe(
+                    Effect.catchCause(cause =>
+                      Effect.sync(() => getLog().warn('branch', 'post-branch setup failed', { cause: String(cause) }))
+                    )
+                  )
+                )
+              })
+            ),
+            Effect.catchCause(cause =>
+              Effect.sync(() => {
+                const error = Cause.squash(cause)
+                store.pushSystem(`branch failed: ${error instanceof Error ? error.message : String(error)}`)
+              })
+            ),
+            Effect.ensuring(
+              Effect.sync(() => {
+                sessionTransitionInFlight = false
+                if (store.state.hint === 'branching session…') store.setHint(undefined)
+                if (transitionSucceeded) drainTransitionSubmissions()
+                else reportFailedTransitionSubmissions()
+                releaseTransitionOwnerUnlessPromoting()
+              })
+            )
+          )
+        )
+      }
+
       /** Create a kept-live sibling, apply the exact Ink config.set model
        * contract, then consume the draft only after prompt admission. */
       const startNewPromptSession = async (prompt: string, modelArg?: string): Promise<void> => {
@@ -2009,6 +2058,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const slashCtx: SlashContext = {
         guardBusySessionSwitch,
         newSession: startNewSession,
+        branchSession: startBranchSession,
         newLiveSession: (message, title) => void startNewLiveSession(message, title),
         beginToolsConfigure: () => {
           clearModelPrefetch()
@@ -2053,6 +2103,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         },
         commandCatalog: () => store.state.commandCatalog,
         historyItems: () => store.state.messages,
+        replaceConversationSnapshot: (messages, info, usage) =>
+          store.replaceConversationSnapshot(messages, info, usage),
+        setCompressedSessionKey: sessionKey => {
+          if (gateway.sessionId() !== store.state.sessionId) return
+          store.setResumeId(sessionKey)
+          stableSessionOwnerId = sessionKey
+          writeActiveSession(sessionKey)
+        },
         helpHeader: () => store.state.theme.brand.helpHeader,
         dashboardMode: () => hostedDashboard,
         compact: () => store.state.compact,
@@ -2346,18 +2404,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           })
       }
 
-      // Blocking-prompt replies (clarify/approval/sudo/secret `*.respond`). Same
-      // detached-runFork pattern; failures logged, never thrown into the view.
-      const respond = (method: string, params: Record<string, unknown>) => {
-        Effect.runFork(
-          gateway
-            .request(method, params)
-            .pipe(
-              Effect.catchCause(cause =>
-                Effect.sync(() => getLog().warn('respond', 'failed', { cause: String(cause), method }))
-              )
-            )
-        )
+      // Blocking prompts retain UI ownership until a decoded gateway ack.
+      const respond = async (method: PromptResponseMethod, params: Record<string, unknown>): Promise<boolean> => {
+        try {
+          const raw = await Effect.runPromise(gateway.request(method, params))
+          const acknowledged = promptResponseAcknowledged(method, raw)
+          if (!acknowledged) getLog().warn('respond', 'invalid acknowledgement', { method })
+          return acknowledged
+        } catch (cause) {
+          getLog().warn('respond', 'failed', { cause: String(cause), method })
+          throw cause
+        }
       }
 
       // Live backend: drive a session (create + optional initial prompt)

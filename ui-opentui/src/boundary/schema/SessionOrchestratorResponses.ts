@@ -66,6 +66,11 @@ export type SessionActivateResponse = LiveSessionSnapshot
 
 export const SessionResumeResponseSchema = LiveSessionSnapshotSchema
 export type SessionResumeResponse = LiveSessionSnapshot
+export const SessionBranchResponseSchema = Schema.StructWithRest(
+  Schema.Struct({ parent: opt(Str), session_id: Str, session_key: opt(Str), title: Str }),
+  [UnknownFields]
+)
+export type SessionBranchResponse = typeof SessionBranchResponseSchema.Type
 
 export const SessionCloseResponseSchema = Schema.StructWithRest(Schema.Struct({ closed: opt(Bool), ok: opt(Bool) }), [
   UnknownFields
@@ -99,6 +104,7 @@ const decodeLiveSnapshot = Schema.decodeUnknownOption(LiveSessionSnapshotSchema)
 const decodeClose = Schema.decodeUnknownOption(SessionCloseResponseSchema)
 const decodeDelete = Schema.decodeUnknownOption(SessionDeleteResponseSchema)
 const decodeList = Schema.decodeUnknownOption(SessionListResponseSchema)
+const decodeBranch = Schema.decodeUnknownOption(SessionBranchResponseSchema)
 
 function some<A>(value: Option.Option<A>): A | undefined {
   return Option.isSome(value) ? value.value : undefined
@@ -114,6 +120,11 @@ export const decodeSessionActiveListResponse = (value: unknown): SessionActiveLi
   return decoded
 }
 
+export const decodeSessionBranchResponse = (value: unknown): SessionBranchResponse | undefined => {
+  const decoded = some(decodeBranch(value))
+  if (!decoded || !nonblank(decoded.session_id)) return undefined
+  return decoded
+}
 export const decodeSessionActivateResponse = (value: unknown): SessionActivateResponse | undefined =>
   some(decodeLiveSnapshot(value))
 

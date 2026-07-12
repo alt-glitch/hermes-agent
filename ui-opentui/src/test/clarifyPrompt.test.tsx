@@ -12,6 +12,8 @@ import { ThemeProvider } from '../view/theme.tsx'
 import { describe, expect, test } from 'vitest'
 
 import { ClarifyPrompt } from '../view/prompts/clarifyPrompt.tsx'
+import { PromptOverlay } from '../view/prompts/promptOverlay.tsx'
+import type { PromptResponseMethod } from '../boundary/promptResponses.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
@@ -19,6 +21,20 @@ const LONG =
   'Just analyze for now — give me the implementation plan doc (code-path refs + line numbers, screen-by-screen), no code yet.'
 
 const theme = createSessionStore().state.theme
+
+async function mountOverlay(
+  store: ReturnType<typeof createSessionStore>,
+  onRespond: (method: PromptResponseMethod, params: Record<string, unknown>) => Promise<boolean>
+): Promise<RenderProbe> {
+  return renderProbe(
+    () => (
+      <ThemeProvider theme={() => theme}>
+        <PromptOverlay store={store} onRespond={onRespond} sessionId={() => 'live-1'} />
+      </ThemeProvider>
+    ),
+    { height: 24, kittyKeyboard: true, width: 60 }
+  )
+}
 
 async function mount(
   choices: string[] | null,
@@ -39,6 +55,50 @@ async function mount(
     { height: 24, kittyKeyboard: true, width: 60 }
   )
 }
+
+describe('PromptOverlay acknowledgement ownership', () => {
+  test('stays mounted while pending and prevents duplicate submit', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-1' } })
+    let calls = 0
+    let resolveResponse: ((value: boolean) => void) | undefined
+    const response = new Promise<boolean>(resolve => (resolveResponse = resolve))
+    const h = await mountOverlay(store, () => { calls += 1; return response })
+    try {
+      h.keys.pressEnter()
+      await h.settle()
+      expect(calls).toBe(1)
+      expect(store.state.prompt?.kind).toBe('clarify')
+      expect(h.frame()).toContain('sending response')
+      h.keys.pressEnter()
+      await h.settle()
+      expect(calls).toBe(1)
+      resolveResponse?.(true)
+      await new Promise(resolve => setTimeout(resolve, 5))
+      await h.settle()
+      expect(store.state.prompt).toBeUndefined()
+    } finally { h.destroy() }
+  })
+
+  test('invalid acknowledgement shows an error and allows retry', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-2' } })
+    let calls = 0
+    const h = await mountOverlay(store, () => Promise.resolve(++calls > 1))
+    try {
+      h.keys.pressEnter()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await h.settle()
+      expect(store.state.prompt?.kind).toBe('clarify')
+      expect(h.frame()).toContain('not acknowledged')
+      h.keys.pressEnter()
+      await new Promise(resolve => setTimeout(resolve, 5))
+      await h.settle()
+      expect(calls).toBe(2)
+      expect(store.state.prompt).toBeUndefined()
+    } finally { h.destroy() }
+  })
+})
 
 describe('ClarifyPrompt (F5/F6)', () => {
   test('numbers every option and shows the inline custom-answer input (F5)', async () => {

@@ -187,4 +187,40 @@ describe('session-store replacement boundary', () => {
     store.apply({ type: 'session.info', session_id: 'live', payload: { running: false } })
     expect(store.isTurnInFlight()).toBe(false)
   })
+
+  test('same-SID compression replacement preserves input, identity, and process-global state', () => {
+    const store = createSessionStore()
+    store.adoptFreshSession('live-1', { model: 'old-model' }, 'durable-1')
+    store.setComposerDraft('keep draft')
+    store.enqueuePrompt('keep queued')
+    store.setCompact(true)
+    store.setBackgroundProcesses([{ command: 'dev server', sessionId: 'proc-1', status: 'running', uptimeSeconds: 3 }])
+    store.pushUser('old transcript')
+
+    store.replaceConversationSnapshot(
+      [{ role: 'assistant', text: 'compressed', parts: [{ id: 'r1', type: 'text', text: 'compressed' }] }],
+      { cwd: '/work', model: 'new-model', running: false },
+      { compressions: 2, context_max: 100, context_percent: 25, context_used: 25, cost_usd: 0.5 }
+    )
+
+    expect(store.state.messages).toHaveLength(1)
+    expect(store.state.messages[0]?.text).toBe('compressed')
+    expect(store.state.sessionId).toBe('live-1')
+    expect(store.state.resumeId).toBe('durable-1')
+    expect(store.state.composerDraft).toBe('keep draft')
+    expect(store.state.queuedPrompts).toEqual(['keep queued'])
+    expect(store.state.compact).toBe(true)
+    expect(store.state.backgroundProcesses).toHaveLength(1)
+    expect(store.state.info).toMatchObject({
+      compressions: 2,
+      contextMax: 100,
+      contextPercent: 25,
+      contextUsed: 25,
+      costUsd: 0.5,
+      cwd: '/work',
+      model: 'new-model',
+      running: false
+    })
+  })
+
 })

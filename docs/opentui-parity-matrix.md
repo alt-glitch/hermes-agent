@@ -20,7 +20,7 @@ Status meanings:
 - **In progress** — actively being implemented; never counts as shipped.
 - **Intentional skip** — an explicit supported-platform/product decision.
 
-Current slash tally: **21 Covered, 22 Thinner, 14 Missing, 0 In progress, 1
+Current slash tally: **26 Covered, 18 Thinner, 13 Missing, 0 In progress, 1
 Intentional skip**.
 
 ## Slash commands
@@ -48,8 +48,8 @@ Intentional skip**.
 | 19 | `/statusbar`, `/sb` | Missing | Live off/top/bottom/toggle state plus persistence and responsive frame tests. |
 | 20 | `/queue`, `/q` | Thinner | Count/preview, bounded enqueue, three-row native view, edit/remove/send, confirmed clear, transition recovery, and reset behavior exist. Real-child termctrl proves FIFO drain, crash retention, and recovery. Settle typed provenance for shell/slash-like rows and explicitly approve the 100-row/4-Mi-character safety ceiling versus Ink's unbounded string queue. |
 | 21 | `/steer` | Thinner | Direct live injection uses upstream's in-memory `session.steer`; rejection or a definite RPC error retains the body in the local queue. Timeout/transport ambiguity retains the body, halts automatic drain, and requires an explicit retry. Real-child termctrl proves mid-turn delivery, fallback, and crash recovery; the remaining divergence is that an ACK is best-effort process admission rather than durable delivery. |
-| 22 | `/undo` | Thinner | Upstream `session.undo`, visible exchange trim, busy/SID/history-mutation guards, and feedback exist; final real-child validation remains. The mutation is process-local, not a new durable DB contract, and Ink intentionally does not prefill `/undo`. |
-| 23 | `/retry` | Thinner | Matches Ink's client sequence: remember the last user text, call `session.undo`, trim the visible exchange, then submit once; the non-parity `session.retry` RPC/lease path is gone. Complete real-child one-resubmission/error-restoration validation. |
+| 22 | `/undo` | Covered | Upstream `session.undo`, visible exchange trim, busy/SID/history-mutation guards, and exact feedback are contract-tested and proven against a real child with termctrl. The mutation remains intentionally process-local, and Ink intentionally does not prefill `/undo`. |
+| 23 | `/retry` | Covered | Matches Ink’s client sequence: remember the last user text, call `session.undo`, trim the visible exchange, then submit exactly once. Success, one-resubmission, and error restoration are contract- and termctrl-verified; the non-parity `session.retry` RPC/lease path is absent. |
 | 24 | `/billing` | Covered | Native billing overlay and RPC logic are present; device verification is tracked separately below. |
 | 25 | `/credits` | Thinner | Direct balance/identity/top-up RPCs, confirmation, and safe URL opening. |
 | 26 | `/background`, `/bg`, `/btw` | Covered | Direct `prompt.background` and background-task badge tracking. |
@@ -57,14 +57,14 @@ Intentional skip**.
 | 28 | `/sessions`, `/session`, `/switch`, `/resume` | Covered | The unified orchestrator pins +new above attachable live siblings and durable-key-deduped resumable history; decoded transactional activate/resume preserves ephemeral routing versus persisted identity, in-flight turns, rollback/event fencing, catalog refresh, and bounded drain. `/sessions new`, live close with safe fallback, historical delete confirmation, direct resume, and prompt-plus-Tab-model creation are covered. Termctrl exercised create/switch/close/resume flows and responsive rendering at 132×40 and 40×24. |
 | 29 | `/image` | Missing | Reuse direct `image.attach` and preserve any remainder text for the composer. |
 | 30 | `/personality` | Covered | The live gateway mirror applies personality without a detached-only mutation. |
-| 31 | `/compress` | Thinner | Gateway compression works; replace the visible snapshot/info/usage afterward. |
-| 32 | `/branch`, `/fork` | Missing | Direct `session.branch`, close/adopt the returned SID, reset chrome, and fence old events. |
+| 31 | `/compress` | Covered | Decoded direct `session.compress` replaces the visible snapshot/info/usage atomically, accepts the gateway’s raw OpenAI history rows, correlates tool calls/results, adopts a rotated durable key, and preserves sparse/no-op feedback. |
+| 32 | `/branch`, `/fork` | Covered | Decoded direct `session.branch` transactionally closes/adopts the returned live SID, resets session-owned chrome/state, fences old events, refreshes the catalog, and safely preserves queued submissions. |
 | 33 | `/voice` | Missing | Direct toggle/status/TTS, record key, reducer/view state, and real audio smoke. |
 | 34 | `/pet` | Intentional skip | Novelty surface remains available through Ink; do not displace production blockers. |
 | 35 | `/skin` | Covered | `skin.changed` drives the reactive OpenTUI theme. |
 | 36 | `/indicator` | Missing | Direct config RPC and immediate busy-indicator update. |
 | 37 | `/yolo` | Covered | Gateway-process mirror changes the active session approval mode. |
-| 38 | `/reasoning` | Thinner | Full/clamp is local; effort/show/hide must use direct live RPC and section state. |
+| 38 | `/reasoning` | Covered | Full/clamp plus effort/show/hide use decoded live configuration, update section state immediately, reconcile authoritative final reasoning, and preserve the setting across finalization. |
 | 39 | `/fast` | Thinner | Direct status/config path, model-support validation, request overrides, and exact feedback. |
 | 40 | `/busy` | Thinner | Queue/steer/interrupt policy, `config.yaml` persistence, immediate local application, and transition-gated five-second refresh of `display.busy_input_mode` exist. Termctrl proves an external mtime change during `/tools` settles without a competing reload or deadlock; make bare/status query authoritative `config.get` like Ink instead of cached local state. |
 | 41 | `/verbose` | Missing | Direct live tool-progress/agent verbosity mode and visible state. |
@@ -72,7 +72,7 @@ Intentional skip**.
 | 43 | `/stop` | Thinner | Direct `process.stop` and exact killed-count/error feedback. |
 | 44 | `/reload-mcp` | Thinner | Live reload, process-global idle admission, responsive prompt rejection, and RPC cache warning/confirmation exist. The slash mirror intentionally treats the typed command as consent; restore aliases, align that confirmation UX, and add detailed result copy. |
 | 45 | `/reload` | Covered | Decoded direct `reload.env` runs in the live gateway, validates its update count, renders exact singular/plural feedback, and drops superseded results. |
-| 46 | `/browser` | Missing | Direct `browser.manage`, progress presentation, and live CDP indicator. |
+| 46 | `/browser` | Missing | Port the direct `browser.manage` command/status controls and CDP lifecycle actions; browser progress events are already decoded and rendered. |
 | 47 | `/rollback` | Thinner | Use structured list/diff/restore RPCs and reconcile visible transcript state. |
 | 48 | `/agents`, `/tasks` | Covered | Live events feed the responsive master/detail dashboard, running-agent chip, tray handoff, sort/filter, tree/timeline metrics, completed-turn history, replay/diff views, and parked-subagent resume hint. `/agents status`, pause/resume, and per-agent or subtree kill use decoded live controls. Termctrl exercised wide/narrow dashboards and a real background delegation through completion, automatic parent resume, and replay. |
 | 49 | `/journey`, `/learning`, `/memory-graph` | Missing | Target gateway `learning.*` exists; port the timeline/detail/edit/delete overlay. |
@@ -98,11 +98,11 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | Native OpenTUI view | Covered | Use Solid/native renderables and public APIs; renderer quirks stay isolated in `boundary/`. |
 | Upstream gateway foundation | Covered | Target merge supplies isolated slash workers, expanded long handlers, PTY reconnect, resume sanitation/paging, title refresh, learning RPCs, and MoA relay. |
 | Ordered live transcript | Covered | `Message.parts` preserves chronological reasoning/tool/text blocks. |
-| Rich tool rendering | Covered | Registry-backed specialized cards plus safe structured fallback and collapse. |
+| Rich tool rendering | Covered | Registry-backed specialized cards plus safe structured fallback and collapse; start/progress/complete preserve authoritative status, summaries, arguments, results, and terminal-state semantics. |
 | Markdown/code/diff | Covered | Streaming Markdown and native code/diff renderables; keep parser and live fenced-code gates. |
 | Deferred resume tool output | Covered | `with_tool_output` survives the default deferred resume and has a gateway regression test. |
 | Resume tool grouping | Thinner | Canonical tool-before-final history must attach tools to the following assistant rather than create an extra row. |
-| Final response/reasoning reconciliation | Thinner | Treat `message.complete` text/reasoning as authoritative and honor reasoning visibility. |
+| Final response/reasoning reconciliation | Covered | `message.complete` text and reasoning are authoritative, ordered parts are reconciled without duplication, and the live reasoning visibility setting survives finalization. |
 | Transcript windowing | Covered | Exact-height spacers, append/resume adjudication, bounded mounted set, and native scrollbar. |
 | Resize cache invalidation | Thinner | Invalidate off-window height cache on width/detail changes without visible correction jank. |
 | Composer editing/completion/history | Covered | Native textarea, cursor-aware slash/`@`, shell `!`, paste, and per-directory history. |
@@ -113,16 +113,16 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | Session picker/live siblings | Covered | One animated, skin-aware orchestrator merges +new, attachable live siblings, and durable-key-deduped resumable history. Transactional activate/resume, live close/fallback, historical delete, prompt/model creation, selection re-anchoring, and narrow 40×24 rendering are contract- and termctrl-verified. |
 | Large history transport | Covered | Ordinary/corrupt frames remain capped at 32 MiB; only canonical pending `session.resume`/`session.history` responses receive the heap-derived bounded allowance. A real 36,156,260-byte resume hydrated 3,000 rows under termctrl. |
 | Startup tool catalog | Covered | Agent readiness timeout is explicit pending state with a bounded retry; permanent failure is visible and non-retrying. Termctrl proves pending `0 tools` refreshes to the authoritative catalog without holding shutdown. |
-| Live config synchronization | Thinner | A scoped five-second mtime tracker defers MCP reload while busy or transitioning, while a registry-transition lock serializes reload against agent construction and `/tools` without blocking prompt admission. External-edit propagation is termctrl-proven; port Ink's remaining display fan-out for bell, voice key, compact, details/sections, indicator, inline diffs, mouse, paste thresholds, reasoning, status bar, and streaming. |
+| Live config synchronization | Thinner | A scoped five-second mtime tracker defers MCP reload while busy or transitioning, while a registry-transition lock serializes reload against agent construction and `/tools` without blocking prompt admission. External-edit propagation is termctrl-proven; port Ink's remaining display fan-out for bell, voice key, compact, details/sections, indicator, inline diffs, mouse, paste thresholds, status bar, and streaming. |
 | Approval permanence security | Covered | Effect Schema preserves explicit `allow_permanent=false`; store/view remove the option and the response seam fail-closes any stale/invalid `always` choice to `deny`. |
-| Clarify/confirm polish | Thinner | Add numeric quick-picks, wrapped long commands, and Esc-back from custom input. |
+| Clarify/confirm polish | Thinner | Response ownership remains mounted until an acknowledged reply; pending input is visibly disabled, failed acknowledgements expose retry/cancel state, and confirm cancellation unblocks the gateway. Numeric quick-picks, wrapped long commands, and Esc-back from custom input remain thinner. |
 | Masked sudo/secret editing | Thinner | Use native full editing/paste/grapheme behavior rather than append-only input. |
 | Billing overlay | Covered | Buy/auto-reload/limits and error funnels are native. |
 | Billing verification event | Covered | `billing.step_up.verification` is decoded, committed only after transactional SID filtering, rendered with code/link, and opened through the http(s)-only external-URL boundary. |
-| MoA events | Missing | Decode/render `moa.reference` and aggregating/progress state. |
+| MoA events | Covered | Decoded `moa.reference`, aggregation, progress, and completion events preserve active-SID fencing and feed ordered transcript/status state. |
 | Voice events | Missing | Consume listening/transcribing/transcript events and expose status/record key. |
-| Browser progress | Missing | Consume progress events and show current CDP state. |
-| Notifications/status/subagents | Covered | Sticky/TTL notices, background completion, review summary, tray/dashboard traces. |
+| Browser progress | Covered | Decoded browser-progress events preserve active-SID fencing and update visible progress/CDP state; the `/browser` management command remains missing. |
+| Notifications/status/subagents | Covered | Sticky/TTL notices, background completion, review summary, MoA/subagent progress, and tray/dashboard traces use authoritative event status and terminal-state semantics. |
 | Status core/profile/MCP | Covered | Model/context/cost/duration/cwd/branch/profile/MCP are present and responsive. |
 | Status voice/browser/live sessions | Missing | Add only after their underlying live state is real. |
 | Theme/skins and terminal chrome | Covered | Reactive skins, OSC title, and native notifications; require live repaint smoke. |

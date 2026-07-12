@@ -18,6 +18,47 @@ function readStr(value: unknown, key: string): string | undefined {
   return typeof v === 'string' ? v : undefined
 }
 
+function readContent(value: unknown): string {
+  const text = readStr(value, 'text')
+  if (text !== undefined) return text
+  if (!value || typeof value !== 'object') return ''
+  const content = (value as { content?: unknown }).content
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map(part => (typeof part === 'string' ? part : (readStr(part, 'text') ?? '')))
+    .filter(Boolean)
+    .join('\n')
+}
+
+interface RawToolCall {
+  readonly name: string
+  readonly args?: unknown
+}
+
+function rememberToolCalls(raw: unknown, calls: Map<string, RawToolCall>): void {
+  if (!raw || typeof raw !== 'object') return
+  const toolCalls = (raw as { tool_calls?: unknown }).tool_calls
+  if (!Array.isArray(toolCalls)) return
+  for (const call of toolCalls) {
+    const callId = readStr(call, 'id')
+    if (!callId || !call || typeof call !== 'object') continue
+    const fn = (call as { function?: unknown }).function
+    const name = readStr(fn, 'name')
+    if (!name) continue
+    const encoded = readStr(fn, 'arguments')
+    let args: unknown = encoded
+    if (encoded) {
+      try {
+        args = JSON.parse(encoded)
+      } catch {
+        args = encoded
+      }
+    }
+    calls.set(callId, { name, args })
+  }
+}
+
 function readNum(value: unknown, key: string): number {
   if (!value || typeof value !== 'object') return 0
   const v = (value as { [k: string]: unknown })[key]
@@ -61,6 +102,7 @@ export function mapResumeHistory(history: unknown): Message[] {
   let seq = 0
   const id = () => `r${++seq}`
   let currentAssistant: Message | undefined
+  const toolCalls = new Map<string, RawToolCall>()
 
   for (const raw of history) {
     const role = readStr(raw, 'role')
@@ -69,13 +111,14 @@ export function mapResumeHistory(history: unknown): Message[] {
     const ts = readOptNum(raw, 'timestamp')
 
     if (role === 'tool') {
-      const name = readStr(raw, 'name') ?? 'tool'
+      const call = toolCalls.get(readStr(raw, 'tool_call_id') ?? '')
+      const name = readStr(raw, 'name') ?? call?.name ?? 'tool'
       const context = readStr(raw, 'context')
       const tool: ToolPartState = { type: 'tool', id: id(), name, state: 'complete' }
       // Match the live tool part exactly (item 1): primary-arg preview in the
       // header, plus the (capped) output so resumed tools are collapsible too.
       if (context) tool.argsPreview = context
-      const rawResult = readStr(raw, 'result_text')
+      const rawResult = readStr(raw, 'result_text') ?? readContent(raw)
       if (rawResult) {
         const { body, omittedNote } = stripOmittedNote(rawResult)
         const resultText = stripToolEnvelope(body)
@@ -85,10 +128,10 @@ export function mapResumeHistory(history: unknown): Message[] {
         }
         if (omittedNote) tool.omittedNote = omittedNote
       }
-      const args = (raw as { args?: unknown }).args
-      if (args && typeof args === 'object') {
+      const args = (raw as { args?: unknown }).args ?? call?.args
+      if (args !== undefined) {
         try {
-          tool.argsText = JSON.stringify(args, null, 2)
+          tool.argsText = typeof args === 'string' ? args : JSON.stringify(args, null, 2)
         } catch {
           /* unstringifiable — leave unset */
         }
@@ -102,8 +145,9 @@ export function mapResumeHistory(history: unknown): Message[] {
       continue
     }
 
-    const text = readStr(raw, 'text') ?? ''
+    const text = readContent(raw)
     if (role === 'assistant') {
+      rememberToolCalls(raw, toolCalls)
       const parts: Part[] = text ? [{ type: 'text', id: id(), text }] : []
       currentAssistant = { role: 'assistant', text, parts }
       if (ts !== undefined) currentAssistant.timestamp = ts

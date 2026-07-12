@@ -49,6 +49,26 @@ describe('reasoningFull store flag', () => {
 })
 
 describe('/reasoning full — expands all thinking (frame)', () => {
+  test('MoA reference blocks remain visible and labelled even when details are hidden', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({ type: 'message.start' })
+    store.apply({
+      type: 'moa.reference',
+      payload: { count: 2, index: 1, label: 'provider/model-a', text: 'Paris.' }
+    })
+    store.apply({ type: 'message.complete' })
+    store.setDetails('hidden')
+    const probe = await mountApp(store)
+    try {
+      const frame = await probe.waitForFrame(value => value.includes('Reference 1/2 — provider/model-a'))
+      expect(frame).toContain('Thought: Reference 1/2 — provider/model-a')
+      expect(frame).not.toContain('thought hidden')
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('settled reasoning is collapsed by default, expanded when reasoningFull is on (details stays collapsed)', async () => {
     const store = createSessionStore()
     seedReasoningTurn(store)

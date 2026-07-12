@@ -138,6 +138,19 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     expect(Option.isSome(decode({ type: 'review.summary' }))).toBe(true)
   })
 
+  test('decodes completion reasoning, MoA, tool progress, and browser progress events', () => {
+    for (const wire of [
+      { type: 'message.complete', payload: { reasoning: 'fallback thought', text: 'answer' } },
+      { type: 'moa.reference', payload: { count: 2, index: 1, label: 'model-a', text: 'reference answer' } },
+      { type: 'moa.aggregating', payload: { aggregator: 'model-z' } },
+      { type: 'tool.progress', payload: { name: 'browser', preview: 'loading page' } },
+      { type: 'tool.generating', payload: { name: 'image' } },
+      { type: 'browser.progress', payload: { message: 'browser authenticated' } }
+    ]) {
+      expect(Option.isSome(decode(wire))).toBe(true)
+    }
+  })
+
   test('SKIPS an unrecognized event type (Option.none, no throw)', () => {
     expect(Option.isNone(decode({ type: 'totally.unknown.event', foo: 1 }))).toBe(true)
   })

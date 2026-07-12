@@ -144,6 +144,8 @@ function makeHarness(options: HarnessOptions = {}): Harness {
       return responder(method, params)
     },
     resetAfterToolsConfigure: () => {},
+    replaceConversationSnapshot: () => {},
+    setCompressedSessionKey: () => {},
     resumeSession: () => {},
     sessionId: () => 'sid-1',
     sessionOwnerId: () => 'sid-1',

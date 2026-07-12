@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest'
 import {
   decodeSessionActivateResponse,
   decodeSessionActiveListResponse,
+  decodeSessionBranchResponse,
   decodeSessionCloseResponse,
   decodeSessionDeleteResponse,
   decodeSessionListResponse,
@@ -77,6 +78,17 @@ describe('session-orchestrator RPC Effect boundaries', () => {
     ).toBeUndefined()
     expect(decodeSessionResumeResponse({ info: [], messages: [], session_id: 'live-1' })).toBeUndefined()
     expect(decodeSessionResumeResponse({ messages: [], session_id: 1 })).toBeUndefined()
+  })
+
+  test('validates branch identity fields', () => {
+    expect(decodeSessionBranchResponse({ parent: 'parent-key', session_id: 'child-live', session_key: 'child-key', title: 'Fork' })).toEqual({
+      parent: 'parent-key', session_id: 'child-live', session_key: 'child-key', title: 'Fork'
+    })
+    expect(decodeSessionBranchResponse({ parent: 'parent-key', session_id: ' ', session_key: 'child-key', title: 'Fork' })).toBeUndefined()
+    expect(decodeSessionBranchResponse({ session_id: 'child-live', title: 'Fork' })).toEqual({
+      session_id: 'child-live',
+      title: 'Fork'
+    })
   })
 
   test('decodes close, delete, and stored-session list responses', () => {

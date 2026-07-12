@@ -36,6 +36,7 @@ import {
 import type { SessionTabId } from '../logic/sessionPicker.ts'
 import type { ConfirmRequest, Message, PickerItem } from '../logic/store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
+import type { SessionCompressResponse } from '../boundary/compression.ts'
 
 // the picker-refresh/tabs/prefetch seams are module-level state — never leak them across tests
 afterEach(() => {
@@ -46,6 +47,22 @@ afterEach(() => {
 })
 
 /** A minimal billing.state snapshot for the /billing dispatch tests. */
+function fakeCompressResponse(over: Partial<SessionCompressResponse> = {}): SessionCompressResponse {
+  return {
+    after_messages: 1,
+    after_tokens: 40,
+    before_messages: 6,
+    before_tokens: 120,
+    info: { model: 'test/model', running: false },
+    messages: [{ role: 'assistant', text: 'compressed summary' }],
+    removed: 5,
+    status: 'compressed',
+    summary: { headline: 'Compressed: 6 → 1 messages', noop: false, note: null, token_line: 'Approx request size: ~120 → ~40 tokens' },
+    usage: { calls: 2, completion: 20, input: 80, model: 'test/model', output: 20, prompt: 80, reasoning: 0, total: 100 },
+    ...over
+  }
+}
+
 function fakeBillingState(over: Partial<BillingStateResponse> = {}): BillingStateResponse {
   return {
     auto_reload: null,
@@ -333,6 +350,8 @@ interface Probe {
   prefills: string[]
   trimCalls: { value: number }
   historyMutation: { begins: number; ends: number; value: boolean }
+  compressionMutations: Array<{ messages: Message[] | undefined; info: object | undefined; usage: object | undefined }>
+  compressionKeys: string[]
   submitAccept: { value: boolean }
 }
 
@@ -379,6 +398,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const prefills: string[] = []
   const trimCalls = { value: 0 }
   const historyMutation = { begins: 0, ends: 0, value: false }
+  const compressionMutations: Probe['compressionMutations'] = []
+  const compressionKeys: string[] = []
   const submitAccept = { value: true }
   const ctx: SlashContext = {
     guardBusySessionSwitch: () => busy.value,
@@ -403,6 +424,11 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     },
     commandCatalog: () => cachedCatalog.value,
     historyItems: () => history.value,
+    replaceConversationSnapshot: (messages, info, usage) => {
+      compressionMutations.push({ messages, info, usage })
+      if (messages !== undefined) history.value = messages
+    },
+    setCompressedSessionKey: key => compressionKeys.push(key),
     helpHeader: () => '(^_^)? Commands',
     dashboardMode: () => dashboardMode.value,
     compact: () => compactFlag.value,
@@ -532,6 +558,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     exitCodes,
     history,
     historyMutation,
+    compressionMutations,
+    compressionKeys,
     logLines,
     logLimits,
     quit,
@@ -747,6 +775,96 @@ describe('dispatchSlash — client commands', () => {
     const malformed = makeCtx(async () => ({ value: 42 }))
     await dispatchSlash('/busy steer', malformed.ctx)
     expect(malformed.system).toEqual(['/busy: invalid config response'])
+  })
+
+  test('/compress atomically applies a decoded same-SID snapshot and structured feedback', async () => {
+    const response = fakeCompressResponse({
+      summary: {
+        headline: 'Compressed: 6 → 1 messages',
+        noop: false,
+        note: 'Note: denser summary',
+        token_line: 'Approx request size: ~120 → ~40 tokens'
+      }
+    })
+    const p = makeCtx(async method => (method === 'session.compress' ? response : {}))
+    p.history.value = [{ role: 'user', text: 'old transcript' }]
+    p.queued.push('keep queued')
+    await dispatchSlash('/compress   retain deployment details  ', p.ctx)
+    expect(p.calls).toEqual([{
+      method: 'session.compress',
+      params: { focus_topic: 'retain deployment details', session_id: 'sid-1' }
+    }])
+    expect(p.compressionMutations).toHaveLength(1)
+    expect(p.history.value[0]).toMatchObject({ role: 'assistant', text: 'compressed summary' })
+    expect(p.queued).toEqual(['keep queued'])
+    expect(p.system).toEqual([
+      '✓ Compressed: 6 → 1 messages',
+      '  Approx request size: ~120 → ~40 tokens',
+      '  Note: denser summary'
+    ])
+    expect(p.historyMutation).toMatchObject({ begins: 1, ends: 1, value: false })
+  })
+
+  test('/compress accepts sparse no-op and metadata-only responses', async () => {
+    const noop = makeCtx(async () => ({ removed: 0, status: 'compressed' }))
+    noop.history.value = [{ role: 'user', text: 'unchanged' }]
+    await dispatchSlash('/compress', noop.ctx)
+    expect(noop.history.value[0]?.text).toBe('unchanged')
+    expect(noop.compressionMutations).toEqual([])
+    expect(noop.system).toEqual(['nothing to compress'])
+
+    const sparse = makeCtx(async () => ({
+      info: { model: 'rotated-model' },
+      removed: 2,
+      session_key: 'durable-rotated',
+      status: 'compressed',
+      usage: { total: 1500 }
+    }))
+    sparse.history.value = [{ role: 'user', text: 'visible remains' }]
+    await dispatchSlash('/compress', sparse.ctx)
+    expect(sparse.history.value[0]?.text).toBe('visible remains')
+    expect(sparse.compressionMutations).toEqual([{
+      messages: undefined,
+      info: { model: 'rotated-model' },
+      usage: { total: 1500 }
+    }])
+    expect(sparse.compressionKeys).toEqual(['durable-rotated'])
+    expect(sparse.system).toEqual(['compressed 2 messages · 1.5k tok'])
+  })
+
+  test('/compress leaves history intact on malformed/error/stale responses and respects guards', async () => {
+    const malformed = makeCtx(async () => ({ ...fakeCompressResponse(), messages: 'bad' }))
+    malformed.history.value = [{ role: 'user', text: 'untouched' }]
+    await dispatchSlash('/compress', malformed.ctx)
+    expect(malformed.history.value).toEqual([{ role: 'user', text: 'untouched' }])
+    expect(malformed.compressionMutations).toEqual([])
+    expect(malformed.system).toEqual(['/compress: invalid session.compress response'])
+    expect(malformed.historyMutation.ends).toBe(1)
+
+    const failed = makeCtx(async () => { throw new Error('compressor offline') })
+    failed.history.value = [{ role: 'user', text: 'still intact' }]
+    await dispatchSlash('/compress', failed.ctx)
+    expect(failed.history.value[0]?.text).toBe('still intact')
+    expect(failed.compressionMutations).toEqual([])
+    expect(failed.system).toEqual(['/compress: compressor offline'])
+    expect(failed.historyMutation.ends).toBe(1)
+
+    const busy = makeCtx(async () => fakeCompressResponse())
+    busy.busy.value = true
+    await dispatchSlash('/compress', busy.ctx)
+    expect(busy.calls).toEqual([])
+    expect(busy.system).toEqual(['session busy — /interrupt the current turn before /compress'])
+
+    let resolve!: (value: unknown) => void
+    const stale = makeCtx(async () => new Promise(done => (resolve = done)))
+    stale.history.value = [{ role: 'user', text: 'old visible' }]
+    const run = dispatchSlash('/compress', stale.ctx)
+    stale.session.value = 'sid-2'
+    resolve(fakeCompressResponse())
+    await run
+    expect(stale.compressionMutations).toEqual([])
+    expect(stale.history.value[0]?.text).toBe('old visible')
+    expect(stale.historyMutation.ends).toBe(1)
   })
 
   test('/undo rewinds gateway + visible exchange and guards no-session/busy/malformed cases', async () => {

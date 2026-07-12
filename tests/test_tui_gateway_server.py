@@ -4667,7 +4667,7 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
 
     try:
         with patch("tui_gateway.server._emit"):
-            server.handle_request(
+            resp = server.handle_request(
                 {
                     "id": "1",
                     "method": "session.compress",
@@ -4676,6 +4676,7 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
             )
 
         assert server._sessions["sid"]["session_key"] == "rotated-id"
+        assert resp["result"]["session_key"] == "rotated-id"
         assert server._sessions["sid"]["pending_title"] is None
         assert len(restart_calls) == 1
     finally:

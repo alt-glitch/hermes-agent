@@ -1,7 +1,21 @@
 import { describe, expect, test } from 'vitest'
 
 import { approvalChoices, secureApprovalChoice } from '../logic/approval.ts'
+import { promptResponseAcknowledged } from '../boundary/promptResponses.ts'
 import { approvalOptions } from '../view/prompts/approvalPrompt.tsx'
+
+describe('blocking prompt acknowledgement boundary', () => {
+  test('accepts only exact f7 success payloads', () => {
+    expect(promptResponseAcknowledged('clarify.respond', { status: 'ok' })).toBe(true)
+    expect(promptResponseAcknowledged('sudo.respond', { status: 'ok' })).toBe(true)
+    expect(promptResponseAcknowledged('secret.respond', { status: 'ok' })).toBe(true)
+    expect(promptResponseAcknowledged('approval.respond', { resolved: 1 })).toBe(true)
+    expect(promptResponseAcknowledged('approval.respond', { resolved: 0 })).toBe(false)
+    expect(promptResponseAcknowledged('approval.respond', { resolved: true })).toBe(false)
+    expect(promptResponseAcknowledged('clarify.respond', { ok: true })).toBe(false)
+    expect(promptResponseAcknowledged('secret.respond', {})).toBe(false)
+  })
+})
 
 describe('approval permanence guard', () => {
   test('removes always from the visible choices when permanence is forbidden', () => {

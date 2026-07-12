@@ -60,7 +60,7 @@ export function collapseHiddenParts(parts: readonly Part[]): DisplayPart[] {
   const out: DisplayPart[] = []
   let run: HiddenRun | undefined
   for (const part of parts) {
-    if (part.type === 'text') {
+    if (part.type === 'text' || part.type === 'moa') {
       run = undefined
       out.push(part)
       continue
