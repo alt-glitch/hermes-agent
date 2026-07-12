@@ -1080,6 +1080,19 @@ const replayCmd: ClientHandler = async (arg, ctx, flight) => {
   ctx.openDashboard({ initialHistoryIndex: index })
 }
 
+/** `/verbose [off|new|all|verbose]` — cycle or set live tool-progress detail. */
+const verboseCmd: ClientHandler = async (arg, ctx, flight) => {
+  const sid = ctx.sessionId()
+  const response = await ctx.request("config.set", {
+    key: "verbose",
+    session_id: sid,
+    value: arg.trim() || "cycle"
+  })
+  if (!currentSessionIs(ctx, sid, flight)) return
+  const value = readStr(response, "value")
+  if (value) ctx.pushSystem(`verbose: ${value}`)
+}
+
 /** `/replay-diff <baseline> <candidate>` — resolve newest-first in-memory
  * indexes and let the native dashboard render the semantic diff. */
 const replayDiffCmd: ClientHandler = (arg, ctx) => {
@@ -2149,6 +2162,7 @@ const CLIENT: Record<string, ClientHandler> = {
   title: titleCmd,
   ts: timestampsCmd,
   tools: toolsCmd,
+  verbose: verboseCmd,
   voice: voiceCmd,
   status: statusCmd,
   setup: setupCmd,

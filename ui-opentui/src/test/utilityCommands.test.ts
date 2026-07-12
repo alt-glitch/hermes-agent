@@ -141,7 +141,7 @@ const tick = () => new Promise(r => setTimeout(r, 0))
 describe('client command catalog (registration)', () => {
   test('all five utility commands (and the /detail alias) are registered', () => {
     const names = clientCommandNames()
-    for (const name of ['compact', 'details', 'detail', 'replay', 'heapdump', 'mem']) {
+    for (const name of ['compact', 'details', 'detail', 'replay', 'heapdump', 'mem', 'verbose']) {
       expect(names).toContain(name)
     }
   })
@@ -168,6 +168,7 @@ describe('/compact', () => {
     expect(p.system).toEqual(['compact on', 'compact off', 'compact on'])
   })
 
+
   test('/compact garbage → usage line, no flag change, no RPC', async () => {
     const p = makeCtx(async () => ({}))
     await dispatchSlash('/compact sideways', p.ctx)
@@ -184,6 +185,19 @@ describe('/compact', () => {
     await tick()
     expect(p.compactFlag.value).toBe(true)
     expect(p.system).toEqual(['compact on'])
+  })
+})
+
+describe('/verbose', () => {
+  test('cycles by default and forwards explicit modes to the live session', async () => {
+    const p = makeCtx(async (_method, params) => ({ value: params.value === 'cycle' ? 'new' : params.value }))
+    await dispatchSlash('/verbose', p.ctx)
+    await dispatchSlash('/verbose all', p.ctx)
+    expect(p.calls).toEqual([
+      { method: 'config.set', params: { key: 'verbose', session_id: 'sid-1', value: 'cycle' } },
+      { method: 'config.set', params: { key: 'verbose', session_id: 'sid-1', value: 'all' } }
+    ])
+    expect(p.system).toEqual(['verbose: new', 'verbose: all'])
   })
 })
 
