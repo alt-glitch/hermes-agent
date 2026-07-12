@@ -18,9 +18,7 @@ export type PromptLiveSessionResult =
 
 /** Do not consume authored input until session creation, optional model switch,
  * ownership validation, and synchronous prompt admission have all succeeded. */
-export async function coordinatePromptLiveSession(
-  options: PromptLiveSessionOptions
-): Promise<PromptLiveSessionResult> {
+export async function coordinatePromptLiveSession(options: PromptLiveSessionOptions): Promise<PromptLiveSessionResult> {
   const prompt = options.prompt.trim()
   if (!prompt) return { kind: 'empty' }
 

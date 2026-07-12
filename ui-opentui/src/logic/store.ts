@@ -557,6 +557,8 @@ export interface StoreState {
   dashboardDiffPair: AgentsDashboardDiffPair | undefined
   /** Whether the OS background-process panel overlay is open (/processes). */
   backgroundPanel: boolean
+  /** Whether the learning Journey timeline overlay is open. */
+  journey: boolean
   /** The open /billing overlay (full-screen modal; undefined when closed). */
   billing: BillingOverlayState | undefined
   /** OS background processes (from `agents.list`) — shown in the /processes panel. */
@@ -564,6 +566,10 @@ export interface StoreState {
   /** In-flight background-PROMPT task ids (`/bg` → `prompt.background`, cleared on
    *  `background.complete`) — drives the `bg: N` status-bar badge. */
   bgTasks: string[]
+  /** Process-global voice-mode chrome. */
+  voice: VoiceState
+  /** Process-global browser connection/progress chrome. */
+  browser: BrowserState
   /** Transient busy indicator (the kaomoji face/verb from `thinking.delta`/`status.update`);
    *  shown above the composer WHILE a turn runs, cleared on `message.complete`. NOT transcript. */
   status: string | undefined
@@ -625,6 +631,20 @@ export interface StoreState {
   reasoningFull: boolean
   /** Persisted display.busy_input_mode mirrored into the live submit policy. */
   busyInputMode: BusyInputMode
+}
+
+export interface VoiceState {
+  enabled: boolean
+  tts: boolean
+  recording: boolean
+  processing: boolean
+  recordKey: string
+}
+
+export interface BrowserState {
+  connected: boolean
+  url?: string
+  lastProgress?: string
 }
 
 const LRU_LIMIT = 1000
@@ -856,11 +876,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
     dashboard: false,
     dashboardAgent: undefined,
     dashboardHistoryIndex: 0,
+    journey: false,
     dashboardDiffPair: undefined,
     backgroundPanel: false,
     billing: undefined,
     backgroundProcesses: [],
     bgTasks: [],
+    voice: { enabled: false, tts: false, recording: false, processing: false, recordKey: 'ctrl+b' },
+    browser: { connected: false },
     lastNotification: undefined,
     notice: null,
     pendingNotice: null,
@@ -1542,6 +1565,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.agentsNudgePending = false
         draft.dashboard = false
         draft.dashboardAgent = undefined
+        draft.journey = false
         draft.dashboardHistoryIndex = 0
         draft.dashboardDiffPair = undefined
         draft.backgroundPanel = false
@@ -1634,6 +1658,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function openBackgroundPanel() {
     setState('backgroundPanel', true)
   }
+  function openJourney() {
+    setState('journey', true)
+  }
+  function closeJourney() {
+    setState('journey', false)
+  }
   function closeBackgroundPanel() {
     setState('backgroundPanel', false)
   }
@@ -1722,6 +1752,50 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   function setStatus(text: string | undefined): void {
     setState('status', text)
+  }
+
+  /** Merge an authoritative voice.toggle/config response without allowing an
+   * older gateway that omits record_key to clobber the cached custom binding. */
+  function setVoiceMode(patch: { enabled?: boolean; tts?: boolean; recordKey?: string }): void {
+    setState(
+      'voice',
+      produce(voice => {
+        if (patch.enabled !== undefined) voice.enabled = patch.enabled
+        if (patch.tts !== undefined) voice.tts = patch.tts
+        const key = patch.recordKey?.trim()
+        if (key) voice.recordKey = key
+        if (patch.enabled === false) {
+          voice.recording = false
+          voice.processing = false
+        }
+      })
+    )
+  }
+
+  /** Optimistic record-key feedback; authoritative voice.status events replace it. */
+  function setVoiceActivity(recording: boolean, processing = false): void {
+    setState('voice', voice => ({ ...voice, recording, processing }))
+  }
+
+  /** Merge browser status without deleting an omitted URL/progress value. */
+  function setBrowserState(patch: { connected?: boolean; url?: string; lastProgress?: string }): void {
+    setState(
+      'browser',
+      produce(browser => {
+        if (patch.connected !== undefined) browser.connected = patch.connected
+        if (patch.url !== undefined) {
+          const url = patch.url.trim()
+          if (url) browser.url = url
+          else delete browser.url
+        }
+        if (patch.lastProgress !== undefined) {
+          const progress = patch.lastProgress.trim()
+          if (progress) browser.lastProgress = progress.slice(0, 512)
+          else delete browser.lastProgress
+        }
+        if (patch.connected === false) delete browser.url
+      })
+    )
   }
   // Per-block copy feedback (design pass piece 2): deep view nodes flash
   // "Copied" on this store's hint line via the notify seam — the same surface
@@ -2095,7 +2169,23 @@ export function createSessionStore(options?: SessionStoreOptions) {
       }
       case 'browser.progress': {
         const message = readStr(event.payload, 'message')?.trim()
-        if (message) pushSystem(message)
+        if (message) {
+          setBrowserState({ lastProgress: message })
+          pushSystem(message)
+        }
+        break
+      }
+      case 'voice.status': {
+        const voiceState = event.payload?.state
+        setVoiceActivity(voiceState === 'listening', voiceState === 'transcribing')
+        break
+      }
+      case 'voice.transcript': {
+        if (!event.payload?.no_speech_limit) break
+        // Exact-f7 only drops the umbrella mode/activity here; TTS state is
+        // retained until an explicit `/voice off` or gateway lifecycle reset.
+        setVoiceMode({ enabled: false })
+        pushSystem('voice: no speech detected 3 times, continuous mode stopped')
         break
       }
       case 'tool.start': {
@@ -2360,6 +2450,15 @@ export function createSessionStore(options?: SessionStoreOptions) {
         setState('delegation', current => ({ ...current, paused: false, updatedAtMs: null }))
         setState('liveSessionCount', 0)
         setState('liveSessions', [])
+        // Runtime-owned resources cannot survive the child process exit.
+        setState('voice', {
+          enabled: false,
+          tts: false,
+          recording: false,
+          processing: false,
+          recordKey: state.voice.recordKey
+        })
+        setBrowserState({ connected: false, url: '', lastProgress: '' })
         setState(produce(settleFailedAssistant))
         // The authoritative settle event can no longer arrive from a dead
         // child. Disarm the latch WITHOUT draining onto the dead transport;
@@ -2720,7 +2819,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
     applyInfo,
     setHint,
     setStatus,
+    setVoiceMode,
+    setVoiceActivity,
+    setBrowserState,
     setCompact,
+    openJourney,
+    closeJourney,
     setDetails,
     setTimestamps,
     setReasoningFull,

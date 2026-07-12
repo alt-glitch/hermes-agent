@@ -159,7 +159,10 @@ function liveSnapshotMessages(response: LiveSessionSnapshot): Message[] {
 
 function liveSnapshotInfo(response: LiveSessionSnapshot): Readonly<Record<string, unknown>> {
   const running =
-    response.running === true || response.status === 'working' || response.status === 'waiting' || response.status === 'streaming'
+    response.running === true ||
+    response.status === 'working' ||
+    response.status === 'waiting' ||
+    response.status === 'streaming'
   return { ...(response.info ?? {}), running }
 }
 
@@ -362,7 +365,7 @@ export const branchSession = Effect.fn('SessionLifecycle.branch')(function* (
       ),
       Effect.catchCause(() => Effect.sync(() => (closeFailed = true)))
     )
-    return { childSessionId, closeFailed, parentSessionId, resumeId, title: response.title.trim() } as const
+    return { childSessionId, closeFailed: Boolean(closeFailed), parentSessionId, resumeId, title: response.title.trim() } as const
   }).pipe(
     Effect.ensuring(
       Effect.sync(() => {

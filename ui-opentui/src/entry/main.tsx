@@ -28,6 +28,9 @@ import { writeFileSync } from 'node:fs'
 import type { KeyEvent } from '@opentui/core'
 
 import { readClipboardImage, writeClipboard } from '../boundary/clipboard.ts'
+import { launchHermesCommand } from '../boundary/externalCli.ts'
+import { openInEditor } from '../boundary/externalInput.ts'
+import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../boundary/terminalSetup.ts'
 import { GatewayService, type GatewayServiceShape } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
@@ -39,6 +42,12 @@ import { registerRemoteParsers } from '../boundary/parsers.ts'
 import { acquireRenderer, redrawRenderer } from '../boundary/renderer.ts'
 import { decodeSubagentInterruptResponse } from '../boundary/schema/Delegation.ts'
 import {
+  attachedImageNotice,
+  decodeImageAttachResponse,
+  decodeSetupStatusResponse
+} from '../boundary/schema/ExternalInputResponses.ts'
+import { decodeVoiceRecordResponse } from '../boundary/schema/VoiceResponses.ts'
+import {
   classifySessionSteerResponse,
   decodeCommandsCatalogResponse,
   decodeConfigFullResponse,
@@ -47,7 +56,13 @@ import {
   type SessionSteerDisposition
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
-import { activateSession, branchSession, createSession, replaceSession, resumeSession } from '../boundary/sessionLifecycle.ts'
+import {
+  activateSession,
+  branchSession,
+  createSession,
+  replaceSession,
+  resumeSession
+} from '../boundary/sessionLifecycle.ts'
 import { configSyncBlocked, createConfigSyncTracker, mcpReloadSucceeded } from '../logic/configSync.ts'
 import {
   createDelegationStatusRefresher,
@@ -70,6 +85,7 @@ import {
 } from '../logic/env.ts'
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
 import { actionExitBlocked, DASHBOARD_NEW_SESSION_MESSAGE, isExitHotkey, isRedrawHotkey } from '../logic/hotkeys.ts'
+import { isVoiceRecordKey, voiceRecordKeyFromConfig } from '../logic/voiceKey.ts'
 import { parseProcessList } from '../logic/backgroundActivity.ts'
 import { eventMayEnterStore } from '../logic/eventScope.ts'
 import { createPasteStore } from '../logic/pastes.ts'
@@ -125,7 +141,13 @@ import {
   takeSettledSteerPrefix,
   type SteerDelivery
 } from '../logic/busySubmit.ts'
-import { createSessionStore, startupCatalogRetryDelay, type Catalog, type PickerItem, type SessionStore } from '../logic/store.ts'
+import {
+  createSessionStore,
+  startupCatalogRetryDelay,
+  type Catalog,
+  type PickerItem,
+  type SessionStore
+} from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { refreshLearnedNames, seedLearnedNames } from '../view/composer.tsx'
 import { TerminalChrome } from '../view/terminalChrome.tsx'
@@ -360,6 +382,7 @@ const postSessionSetup = (
     if (isActive() && decodedBusyConfig) {
       store.hydrateBusyInputMode(busyInputModeFromConfig(decodedBusyConfig.config), busyModeRevision)
       store.configureAgentsNudge(tuiAgentsNudgeConfigValue(decodedBusyConfig.config))
+      store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedBusyConfig.config) })
     }
 
     // A session switch may have completed while either best-effort catalog RPC
@@ -636,9 +659,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // particular, a billing verification received during resume buffering is
       // delayed until SID filtering accepts it; stale-session events never open
       // a browser or leak their code into the successor transcript.
+      let submitVoiceTranscript: (text: string) => void = () => {}
       store.registerCommittedEventHandler(event => {
         if (event.type === 'billing.step_up.verification') {
           presentBillingVerification(event.payload, { pushSystem: text => store.pushSystem(text) })
+        } else if (event.type === 'voice.transcript' && !event.payload?.no_speech_limit) {
+          const text = event.payload?.text?.trim()
+          if (text) {
+            store.clearComposerDraft()
+            queueMicrotask(() => submitVoiceTranscript(text))
+          }
         } else if (
           pendingPrompt &&
           (event.type === 'message.start' || event.type === 'message.complete') &&
@@ -938,6 +968,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               if (!decodedConfig || !active) return
 
               store.hydrateBusyInputMode(busyInputModeFromConfig(decodedConfig.config), busyModeRevision)
+              store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedConfig.config) })
               if (configSync.completeHydration(plan, true) && plan.kind === 'change') {
                 store.pushSystem('MCP reloaded after config change')
               }
@@ -1184,7 +1215,19 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // Global action hotkeys consume their bytes before the textarea can
       // interpret them. Redraw invalidates buffers without resetting the input
       // parser; action+D shares Ink's local-exit / hosted-new-chat contract.
+      let toggleVoiceRecording: () => void = () => {}
       const onGlobalAction = (key: KeyEvent) => {
+        if (
+          isVoiceRecordKey(key, store.state.voice.recordKey) &&
+          !actionExitBlocked(store.state) &&
+          activeTransitionOwner === undefined &&
+          store.state.queueEditIndex === undefined &&
+          store.state.completions === undefined
+        ) {
+          key.preventDefault()
+          toggleVoiceRecording()
+          return
+        }
         if (isRedrawHotkey(key)) {
           key.preventDefault()
           redrawRenderer(renderer, { clearSelection: true })
@@ -1430,6 +1473,32 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         return sendPromptNow(text)
       }
 
+      submitVoiceTranscript = text => {
+        submitPrompt(text)
+      }
+      toggleVoiceRecording = () => {
+        if (!store.state.voice.enabled) {
+          store.pushSystem('voice: mode is off — enable with /voice on')
+          return
+        }
+        const starting = !store.state.voice.recording
+        store.setVoiceActivity(starting, false)
+        const action = starting ? 'start' : 'stop'
+        Effect.runPromise(gateway.request('voice.record', { action, session_id: gateway.sessionId() ?? null }))
+          .then(raw => {
+            const response = decodeVoiceRecordResponse(raw)
+            if (!response) throw new Error('invalid response: voice.record')
+            if (starting && response.status !== 'recording') {
+              store.setVoiceActivity(false, response.status === 'busy')
+              if (response.status === 'busy') store.pushSystem('voice: still transcribing; try again shortly')
+            }
+          })
+          .catch(error => {
+            if (starting) store.setVoiceActivity(false, false)
+            store.pushSystem(`voice error: ${error instanceof Error ? error.message : String(error)}`)
+          })
+      }
+
       // Submit a SKILL invocation (e.g. /dogfood): the full skill body still
       // goes to the model (so the model consumes the skill, prompt-cache intact),
       // but the transcript renders a COLLAPSED `▶ /name · N lines` row via
@@ -1599,6 +1668,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         stopAll: () => Effect.runPromise(gateway.request('process.stop', {})).then(() => undefined)
       }
 
+      const journeyOps = {
+        frames: (cols: number, rows: number) =>
+          Effect.runPromise(gateway.request('learning.frames', { cols, frames: 2, rows })),
+        detail: (id: string) => Effect.runPromise(gateway.request('learning.detail', { id })),
+        edit: (id: string, content: string) => Effect.runPromise(gateway.request('learning.edit', { content, id })),
+        delete: (id: string) => Effect.runPromise(gateway.request('learning.delete', { id }))
+      }
       const agentsOps = {
         refresh: () => delegationStatusRefresher.refresh(true).then(() => undefined),
         interrupt: async (id: string): Promise<string> => {
@@ -1967,7 +2043,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                 stableSessionOwnerId = result.resumeId
                 writeActiveSession(result.resumeId)
                 store.pushSystem(`branched → ${result.title}`)
-                if (result.closeFailed) store.pushSystem('warning: branch created, but parent session could not be closed')
+                if (result.closeFailed)
+                  store.pushSystem('warning: branch created, but parent session could not be closed')
                 transitionSucceeded = true
                 activeSessionsRefresher.invalidate()
                 void activeSessionsRefresher.refresh(true)
@@ -2051,6 +2128,91 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         const items = mapModelOptions(raw)
         if (items.length) store.setModelItems(items)
         return items
+      }
+
+      const suspendSync = (run: () => void): void => {
+        renderer.suspend()
+        try {
+          run()
+        } finally {
+          renderer.resume()
+        }
+      }
+      const openExternalEditor = async (seed: string): Promise<void> => {
+        const original = seed || store.state.composerDraft
+        let edited: null | string
+        try {
+          edited = await openInEditor(original, suspendSync, '.md')
+        } catch (error) {
+          store.pushSystem('external editor: ' + (error instanceof Error ? error.message : String(error)))
+          return
+        }
+        if (edited === null) return
+        const text = edited.trimEnd()
+        if (!text) return
+        store.replaceComposerDraft('')
+        if (submitPrompt(text) === false) store.replaceComposerDraft(text)
+      }
+      const attachImage = async (inputText: string): Promise<void> => {
+        const sid = gateway.sessionId()
+        if (!sid) {
+          store.pushSystem('no active session')
+          return
+        }
+        const raw = await Effect.runPromise(
+          gateway.request<unknown>('image.attach', { path: inputText, session_id: sid })
+        )
+        const response = decodeImageAttachResponse(raw)
+        if (!response) {
+          store.pushSystem('error: invalid response: image.attach')
+          return
+        }
+        store.pushSystem(attachedImageNotice(response))
+        if (response.remainder) store.replaceComposerDraft(response.remainder)
+      }
+      const configureTerminal = async (target: string): Promise<void> => {
+        const result =
+          target === 'auto'
+            ? await configureDetectedTerminalKeybindings()
+            : await configureTerminalKeybindings(target as 'cursor' | 'vscode' | 'windsurf')
+        store.pushSystem(result.message)
+        if (result.success && result.requiresRestart)
+          store.pushSystem('restart the IDE terminal for the new keybindings to take effect')
+      }
+      const runExternalSetup = async (args: readonly string[]): Promise<void> => {
+        store.pushSystem('launching `hermes ' + args.join(' ') + '`…')
+        store.setHint('setup running…')
+        renderer.suspend()
+        let result
+        try {
+          result = await launchHermesCommand([...args])
+        } finally {
+          renderer.resume()
+        }
+        if (result.error) {
+          store.pushSystem('error launching hermes: ' + result.error)
+          store.setHint('setup required')
+          return
+        }
+        if (result.code !== 0) {
+          store.pushSystem('hermes ' + args[0] + ' exited with code ' + String(result.code))
+          store.setHint('setup required')
+          return
+        }
+        const raw = await Effect.runPromise(gateway.request<unknown>('setup.status', {}))
+        const setup = decodeSetupStatusResponse(raw)
+        if (!setup) {
+          store.pushSystem('error: invalid response: setup.status')
+          store.setHint('setup required')
+          return
+        }
+        if (setup.provider_configured === false) {
+          store.pushSystem('still no provider configured')
+          store.setHint('setup required')
+          return
+        }
+        store.pushSystem('setup complete — starting session…')
+        startNewSession('new session started')
       }
 
       // Slash dispatch context (Solid logic; the boundary just hands it a
@@ -2157,6 +2319,11 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         steer: steerDirect,
         lastUserMessage: () => store.lastUserMessage(),
         trimLastExchange: () => store.trimLastExchange(),
+        openExternalEditor,
+        pasteClipboardImage: onImagePaste,
+        attachImage,
+        configureTerminal,
+        runExternalSetup,
         prefillComposer: text => {
           // Slash submission clears the uncontrolled textarea immediately after
           // its synchronous local handler returns. Publish prefill on the next
@@ -2198,6 +2365,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         },
         modelItems: () => store.state.modelItems,
         setModelItems: items => store.setModelItems(items),
+        setBrowserState: (connected, url) => store.setBrowserState({ connected, ...(url ? { url } : {}) }),
+        setVoiceMode: patch => store.setVoiceMode(patch),
         logTail: limit => gateway.logTail(limit),
         agentsControl: {
           applyPauseResponse: raw => store.applyDelegationPauseResponse(raw),
@@ -2206,6 +2375,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           loadSnapshot: (raw, path) => store.loadSpawnTreeSnapshot(raw, path)
         },
         openDashboard: request => store.openDashboard(request),
+        openJourney: () => store.openJourney(),
         openBackgroundPanel: () => store.openBackgroundPanel(),
         openBilling: overlay => store.openBilling(overlay),
         addBgTask: id => store.addBgTask(id),
@@ -2467,10 +2637,12 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   onNewPromptSession={(prompt, modelArg) => void startNewPromptSession(prompt, modelArg)}
                   loadModelItems={loadSessionModelItems}
                   sessionOps={sessionOps}
+                  journeyOps={journeyOps}
                   onSessionPickerClosed={onSessionPickerClosed}
                   sessionId={() => gateway.sessionId()}
                   history={history}
                   onImagePaste={onImagePaste}
+                  onOpenEditor={draft => void openExternalEditor(draft)}
                   pasteStore={pasteStore}
                   onPasteLimitExceeded={showPasteLimit}
                   backgroundOps={backgroundOps}

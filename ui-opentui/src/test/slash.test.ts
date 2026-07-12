@@ -57,8 +57,22 @@ function fakeCompressResponse(over: Partial<SessionCompressResponse> = {}): Sess
     messages: [{ role: 'assistant', text: 'compressed summary' }],
     removed: 5,
     status: 'compressed',
-    summary: { headline: 'Compressed: 6 → 1 messages', noop: false, note: null, token_line: 'Approx request size: ~120 → ~40 tokens' },
-    usage: { calls: 2, completion: 20, input: 80, model: 'test/model', output: 20, prompt: 80, reasoning: 0, total: 100 },
+    summary: {
+      headline: 'Compressed: 6 → 1 messages',
+      noop: false,
+      note: null,
+      token_line: 'Approx request size: ~120 → ~40 tokens'
+    },
+    usage: {
+      calls: 2,
+      completion: 20,
+      input: 80,
+      model: 'test/model',
+      output: 20,
+      prompt: 80,
+      reasoning: 0,
+      total: 100
+    },
     ...over
   }
 }
@@ -353,6 +367,7 @@ interface Probe {
   compressionMutations: Array<{ messages: Message[] | undefined; info: object | undefined; usage: object | undefined }>
   compressionKeys: string[]
   submitAccept: { value: boolean }
+  browserStates: Array<{ connected: boolean; url?: string }>
 }
 
 function makeCtx(request: (method: string, params: Record<string, unknown>) => Promise<unknown>): Probe {
@@ -401,6 +416,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const compressionMutations: Probe['compressionMutations'] = []
   const compressionKeys: string[] = []
   const submitAccept = { value: true }
+  const browserStates: Probe['browserStates'] = []
   const ctx: SlashContext = {
     guardBusySessionSwitch: () => busy.value,
     newSession: (message, title) => newSessions.push([message, title]),
@@ -494,6 +510,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       return logLines.value.slice(-limit)
     },
     modelItems: () => modelCache.value,
+    setBrowserState: (connected, url) => browserStates.push({ connected, ...(url ? { url } : {}) }),
+    setVoiceMode: () => {},
     setModelItems: items => (modelCache.value = items),
     openDashboard: () => (dashboard.value = true),
     openBackgroundPanel: () => {},
@@ -545,6 +563,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     timestampsFlag,
     reasoningFullFlag,
     busyMode,
+    browserStates,
     queued,
     queueAccept,
     prefills,
@@ -572,6 +591,104 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     system
   }
 }
+
+describe('voice command parity', () => {
+  test('status decodes the direct toggle response and renders exact mode requirements', async () => {
+    const p = makeCtx(async () => ({
+      details: 'Audio: OK\nSTT provider: OK',
+      enabled: true,
+      record_key: 'alt+r',
+      tts: false
+    }))
+    const states: Array<{ enabled?: boolean; tts?: boolean; recordKey?: string }> = []
+    const ctx: SlashContext = { ...p.ctx, setVoiceMode: patch => states.push(patch) }
+    await dispatchSlash('/voice status', ctx)
+    expect(p.calls).toEqual([{ method: 'voice.toggle', params: { action: 'status' } }])
+    expect(states).toEqual([{ enabled: true, recordKey: 'alt+r', tts: false }])
+    expect(p.system).toEqual([
+      'Voice Mode Status\n  Mode: ON\n  TTS: OFF\n  Record key: Alt+R\n\nRequirements\n  Audio: OK\n  STT provider: OK'
+    ])
+  })
+
+  test('on/off/tts preserve exact Ink feedback and unknown args query status', async () => {
+    const responses = [
+      { enabled: true, record_key: 'ctrl+b', tts: true },
+      { enabled: true, record_key: 'ctrl+b', tts: false },
+      { enabled: false, record_key: 'ctrl+b', tts: false },
+      { enabled: false, record_key: 'ctrl+b', tts: false }
+    ]
+    const p = makeCtx(async () => responses.shift())
+    await dispatchSlash('/voice on', p.ctx)
+    await dispatchSlash('/voice tts', p.ctx)
+    await dispatchSlash('/voice off', p.ctx)
+    await dispatchSlash('/voice nonsense', p.ctx)
+    expect(p.calls.map(call => call.params.action)).toEqual(['on', 'tts', 'off', 'status'])
+    expect(p.system.slice(0, 5)).toEqual([
+      'Voice mode enabled (TTS enabled)',
+      '  Press Ctrl+B to start/stop recording',
+      '  /voice tts  to toggle speech output',
+      '  /voice off  to disable voice mode',
+      'Voice TTS disabled.'
+    ])
+    expect(p.system).toContain('Voice mode disabled.')
+  })
+
+  test('malformed voice success is visible and cannot mutate local mode', async () => {
+    const p = makeCtx(async () => ({ enabled: 'yes' }))
+    await dispatchSlash('/voice', p.ctx)
+    expect(p.system).toEqual(['error: invalid response: voice.toggle'])
+  })
+})
+
+describe('browser command parity', () => {
+  test('connect uses the direct browser.manage boundary and commits live CDP chrome state', async () => {
+    const p = makeCtx(async () => ({ connected: true, url: 'http://127.0.0.1:9333' }))
+    await dispatchSlash('/browser connect http://127.0.0.1:9333', p.ctx)
+    expect(p.calls).toEqual([
+      {
+        method: 'browser.manage',
+        params: { action: 'connect', session_id: 'sid-1', url: 'http://127.0.0.1:9333' }
+      }
+    ])
+    expect(p.browserStates).toEqual([{ connected: true, url: 'http://127.0.0.1:9333' }])
+    expect(p.system).toEqual([
+      'checking Chromium-family browser remote debugging at http://127.0.0.1:9333...',
+      'Browser connected to live Chromium-family browser via CDP',
+      'Endpoint: http://127.0.0.1:9333',
+      'next browser tool call will use this CDP endpoint'
+    ])
+  })
+
+  test('status/disconnect and detached progress follow the exact Ink presentation contract', async () => {
+    const p = makeCtx(async (_method, params) =>
+      params.action === 'disconnect'
+        ? { connected: false }
+        : { connected: false, messages: ['launch attempt', 'manual hint'], url: 'http://127.0.0.1:9222' }
+    )
+    p.session.value = undefined
+    await dispatchSlash('/browser status', p.ctx)
+    await dispatchSlash('/browser disconnect', p.ctx)
+    expect(p.system).toEqual([
+      'launch attempt',
+      'manual hint',
+      'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)',
+      'browser disconnected'
+    ])
+    expect(p.browserStates).toEqual([{ connected: false, url: 'http://127.0.0.1:9222' }, { connected: false }])
+  })
+
+  test('rejects unknown actions and malformed success payloads without mutating CDP state', async () => {
+    const usage = makeCtx(async () => ({}))
+    await dispatchSlash('/browser launch', usage.ctx)
+    expect(usage.calls).toEqual([])
+    expect(usage.system[0]).toMatch(/^usage: \/browser/)
+
+    const malformed = makeCtx(async () => ({ connected: 'yes' }))
+    await dispatchSlash('/browser status', malformed.ctx)
+    expect(malformed.browserStates).toEqual([])
+    expect(malformed.system).toEqual(['error: invalid response: browser.manage'])
+  })
+})
 
 describe('dispatchSlash — client commands', () => {
   test('/quit and /exit request a cleanup-safe zero exit without hitting the gateway', async () => {
@@ -790,10 +907,12 @@ describe('dispatchSlash — client commands', () => {
     p.history.value = [{ role: 'user', text: 'old transcript' }]
     p.queued.push('keep queued')
     await dispatchSlash('/compress   retain deployment details  ', p.ctx)
-    expect(p.calls).toEqual([{
-      method: 'session.compress',
-      params: { focus_topic: 'retain deployment details', session_id: 'sid-1' }
-    }])
+    expect(p.calls).toEqual([
+      {
+        method: 'session.compress',
+        params: { focus_topic: 'retain deployment details', session_id: 'sid-1' }
+      }
+    ])
     expect(p.compressionMutations).toHaveLength(1)
     expect(p.history.value[0]).toMatchObject({ role: 'assistant', text: 'compressed summary' })
     expect(p.queued).toEqual(['keep queued'])
@@ -823,11 +942,13 @@ describe('dispatchSlash — client commands', () => {
     sparse.history.value = [{ role: 'user', text: 'visible remains' }]
     await dispatchSlash('/compress', sparse.ctx)
     expect(sparse.history.value[0]?.text).toBe('visible remains')
-    expect(sparse.compressionMutations).toEqual([{
-      messages: undefined,
-      info: { model: 'rotated-model' },
-      usage: { total: 1500 }
-    }])
+    expect(sparse.compressionMutations).toEqual([
+      {
+        messages: undefined,
+        info: { model: 'rotated-model' },
+        usage: { total: 1500 }
+      }
+    ])
     expect(sparse.compressionKeys).toEqual(['durable-rotated'])
     expect(sparse.system).toEqual(['compressed 2 messages · 1.5k tok'])
   })
@@ -841,7 +962,9 @@ describe('dispatchSlash — client commands', () => {
     expect(malformed.system).toEqual(['/compress: invalid session.compress response'])
     expect(malformed.historyMutation.ends).toBe(1)
 
-    const failed = makeCtx(async () => { throw new Error('compressor offline') })
+    const failed = makeCtx(async () => {
+      throw new Error('compressor offline')
+    })
     failed.history.value = [{ role: 'user', text: 'still intact' }]
     await dispatchSlash('/compress', failed.ctx)
     expect(failed.history.value[0]?.text).toBe('still intact')
@@ -2041,6 +2164,52 @@ describe('dispatchSlash — server ladder', () => {
     )
     await dispatchSlash('/triage-nous since yesterday', p.ctx)
     expect(p.skillSubmitted).toEqual([{ command: '/triage-nous since yesterday', body: 'body' }])
+  })
+})
+
+describe('external input and setup client surfaces', () => {
+  test('prompt aliases, paste, image, terminal setup, and setup stay client-local', async () => {
+    const p = makeCtx(async () => ({}))
+    const calls: string[] = []
+    const ctx: SlashContext = {
+      ...p.ctx,
+      openExternalEditor: async draft => {
+        calls.push('edit:' + draft)
+      },
+      pasteClipboardImage: () => calls.push('paste'),
+      attachImage: async input => {
+        calls.push('image:' + input)
+      },
+      configureTerminal: async target => {
+        calls.push('terminal:' + target)
+      },
+      runExternalSetup: async args => {
+        calls.push('setup:' + args.join(' '))
+      }
+    }
+    await dispatchSlash('/prompt hello world', ctx)
+    await dispatchSlash('/compose', ctx)
+    await dispatchSlash('/paste', ctx)
+    await dispatchSlash('/image photo.png caption', ctx)
+    await dispatchSlash('/terminal-setup cursor', ctx)
+    await dispatchSlash('/setup model', ctx)
+    expect(calls).toEqual([
+      'edit:hello world',
+      'edit:',
+      'paste',
+      'image:photo.png caption',
+      'terminal:cursor',
+      'setup:setup model'
+    ])
+    expect(p.calls).toHaveLength(0)
+  })
+
+  test('paste and terminal setup reject invalid arguments without side effects', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/paste nope', p.ctx)
+    await dispatchSlash('/terminal-setup xterm', p.ctx)
+    expect(p.system).toEqual(['usage: /paste', 'usage: /terminal-setup [auto|vscode|cursor|windsurf]'])
+    expect(p.calls).toHaveLength(0)
   })
 })
 

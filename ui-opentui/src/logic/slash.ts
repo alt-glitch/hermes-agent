@@ -38,6 +38,9 @@ import {
   decodeSkillsReloadResponse
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { decodeToolsConfigureResponse } from '../boundary/schema/ToolsConfigureResponse.ts'
+import { decodeBrowserManageResponse } from '../boundary/schema/BrowserResponses.ts'
+import { decodeVoiceToggleResponse } from '../boundary/schema/VoiceResponses.ts'
+import { formatVoiceRecordKey } from './voiceKey.ts'
 import { decodeDelegationPauseResponse, decodeSpawnTreeListResponse } from '../boundary/schema/Delegation.ts'
 import { decodeProcessStopResponse } from '../boundary/schema/ProcessResponses.ts'
 import { buildBillingCtx } from './billing.ts'
@@ -165,10 +168,15 @@ export interface SlashContext {
   readonly agentsControl?: AgentsSlashControl
   /** Open the OS background-process panel (/processes). */
   readonly openBackgroundPanel: () => void
+  readonly openJourney?: () => void
   /** Open the /billing overlay with a fetched state snapshot + ctx bundle. */
   readonly openBilling: (overlay: BillingOverlayState) => void
   /** Track an in-flight background-prompt task id (`/bg` → prompt.background). */
   readonly addBgTask: (id: string) => void
+  /** Commit the authoritative process-global CDP state returned by browser.manage. */
+  readonly setBrowserState: (connected: boolean, url?: string) => void
+  /** Commit decoded voice mode/TTS/key state returned by voice.toggle. */
+  readonly setVoiceMode: (patch: { enabled?: boolean; tts?: boolean; recordKey?: string }) => void
   /** Cached `/model` picker rows (Epic 7 instant open); undefined until prefetched. */
   readonly modelItems: () => PickerItem[] | undefined
   /** Update the cached `/model` picker rows. */
@@ -213,6 +221,11 @@ export interface SlashContext {
   ) => void
   readonly setCompressedSessionKey: (sessionKey: string) => void
   readonly prefillComposer: (text: string) => void
+  readonly openExternalEditor?: (draft: string) => Promise<void>
+  readonly pasteClipboardImage?: () => void
+  readonly attachImage?: (input: string) => Promise<void>
+  readonly configureTerminal?: (target: string) => Promise<void>
+  readonly runExternalSetup?: (args: readonly string[]) => Promise<void>
   /** Mounted-renderable count under the live renderer root (a /mem diagnostic);
    *  undefined when no renderer is reachable (tests). */
   readonly renderableCount: () => number | undefined
@@ -1729,6 +1742,38 @@ export const DASHBOARD_EXIT_DISABLED_MESSAGE =
 export const DASHBOARD_UPDATE_DISABLED_MESSAGE =
   'update is disabled in hosted dashboard chat — the hosted environment is managed separately'
 
+const promptCmd: ClientHandler = async (arg, ctx) => {
+  const draft = arg.trim() || ''
+  if (draft) ctx.prefillComposer(draft)
+  if (!ctx.openExternalEditor) return ctx.pushSystem('external editor unavailable')
+  await ctx.openExternalEditor(draft)
+}
+
+const pasteCmd: ClientHandler = (arg, ctx) => {
+  if (arg.trim()) return ctx.pushSystem('usage: /paste')
+  ctx.pasteClipboardImage?.()
+}
+
+const imageCmd: ClientHandler = async (arg, ctx) => {
+  if (!arg.trim()) return ctx.pushSystem('usage: /image <path>')
+  if (!ctx.attachImage) return ctx.pushSystem('image attachment unavailable')
+  await ctx.attachImage(arg)
+}
+
+const terminalSetupCmd: ClientHandler = async (arg, ctx) => {
+  const target = arg.trim().toLowerCase()
+  if (target && !['auto', 'cursor', 'vscode', 'windsurf'].includes(target)) {
+    return ctx.pushSystem('usage: /terminal-setup [auto|vscode|cursor|windsurf]')
+  }
+  if (!ctx.configureTerminal) return ctx.pushSystem('terminal setup unavailable')
+  await ctx.configureTerminal(target || 'auto')
+}
+
+const setupCmd: ClientHandler = async (arg, ctx) => {
+  if (!ctx.runExternalSetup) return ctx.pushSystem('setup unavailable')
+  await ctx.runExternalSetup(['setup', ...arg.split(/\s+/).filter(Boolean)])
+}
+
 const branchCmd: ClientHandler = (arg, ctx) => ctx.branchSession?.(arg.trim())
 
 const quitCmd: ClientHandler = (_arg, ctx) => {
@@ -1963,12 +2008,101 @@ const helpCmd: ClientHandler = async (_arg, ctx, flight) => {
   }
 }
 
+async function voiceCmd(arg: string, ctx: SlashContext, flight: number): Promise<void> {
+  const rawAction = arg.trim().toLowerCase()
+  const action = rawAction === 'on' || rawAction === 'off' || rawAction === 'tts' ? rawAction : 'status'
+  const sid = ctx.sessionId()
+  const raw = await ctx.request('voice.toggle', { action })
+  if (!currentSessionIs(ctx, sid, flight)) return
+  const response = decodeVoiceToggleResponse(raw)
+  if (!response) {
+    ctx.pushSystem('error: invalid response: voice.toggle')
+    return
+  }
+  const enabled = response.enabled === true
+  const tts = response.tts === true
+  const recordKey = response.record_key
+  ctx.setVoiceMode({ enabled, tts, ...(recordKey ? { recordKey } : {}) })
+  const keyLabel = formatVoiceRecordKey(recordKey ?? 'ctrl+b')
+
+  if (action === 'status') {
+    const lines = [
+      'Voice Mode Status',
+      `  Mode: ${enabled ? 'ON' : 'OFF'}`,
+      `  TTS: ${tts ? 'ON' : 'OFF'}`,
+      `  Record key: ${keyLabel}`
+    ]
+    const details = response.details?.trim()
+    if (details) lines.push('', 'Requirements', ...details.split('\n').map(line => `  ${line}`))
+    ctx.pushSystem(lines.join('\n'))
+    return
+  }
+  if (action === 'tts') {
+    ctx.pushSystem(`Voice TTS ${tts ? 'enabled' : 'disabled'}.`)
+    return
+  }
+  if (!enabled) {
+    ctx.pushSystem('Voice mode disabled.')
+    return
+  }
+  ctx.pushSystem(`Voice mode enabled${tts ? ' (TTS enabled)' : ''}`)
+  ctx.pushSystem(`  Press ${keyLabel} to start/stop recording`)
+  ctx.pushSystem('  /voice tts  to toggle speech output')
+  ctx.pushSystem('  /voice off  to disable voice mode')
+}
+
+async function browserCmd(arg: string, ctx: SlashContext, flight: number): Promise<void> {
+  const [rawAction = 'status', ...rest] = arg.trim().split(/\s+/).filter(Boolean)
+  const action = rawAction.toLowerCase()
+  if (action !== 'connect' && action !== 'disconnect' && action !== 'status') {
+    ctx.pushSystem('usage: /browser [connect|disconnect|status] [url] · persistent: set browser.cdp_url in config.yaml')
+    return
+  }
+
+  const sid = ctx.sessionId()
+  const url = action === 'connect' ? rest.join(' ').trim() || 'http://127.0.0.1:9222' : undefined
+  if (url) ctx.pushSystem(`checking Chromium-family browser remote debugging at ${url}...`)
+
+  const raw = await ctx.request('browser.manage', {
+    action,
+    session_id: sid ?? null,
+    ...(url ? { url } : {})
+  })
+  if (!currentSessionIs(ctx, sid, flight)) return
+  const response = decodeBrowserManageResponse(raw)
+  if (!response) {
+    ctx.pushSystem('error: invalid response: browser.manage')
+    return
+  }
+
+  ctx.setBrowserState(response.connected, response.url)
+  if (!sid) response.messages?.forEach(message => ctx.pushSystem(message))
+
+  if (action === 'status') {
+    ctx.pushSystem(
+      response.connected
+        ? `browser connected: ${response.url || '(url unavailable)'}`
+        : 'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)'
+    )
+    return
+  }
+  if (action === 'disconnect') {
+    ctx.pushSystem('browser disconnected')
+    return
+  }
+  if (!response.connected) return
+  ctx.pushSystem('Browser connected to live Chromium-family browser via CDP')
+  ctx.pushSystem(`Endpoint: ${response.url || '(url unavailable)'}`)
+  ctx.pushSystem('next browser tool call will use this CDP endpoint')
+}
+
 /** The TUI-only client commands (run in-process, never hit the gateway). */
 const CLIENT: Record<string, ClientHandler> = {
   agents: agentsCmd,
   background: backgroundCmd,
   bg: backgroundCmd,
   billing: billingCmd,
+  browser: browserCmd,
   busy: busyCmd,
   btw: backgroundCmd,
   clear: freshSessionCmd(false),
@@ -1986,9 +2120,16 @@ const CLIENT: Record<string, ClientHandler> = {
   fortune: fortuneCmd,
   heapdump: heapdumpCmd,
   mem: memCmd,
+  journey: (_arg, ctx) => ctx.openJourney?.(),
+  learning: (_arg, ctx) => ctx.openJourney?.(),
+  'memory-graph': (_arg, ctx) => ctx.openJourney?.(),
   processes: (_arg, ctx) => ctx.openBackgroundPanel(),
   procs: (_arg, ctx) => ctx.openBackgroundPanel(),
   model: modelCmd,
+  image: imageCmd,
+  paste: pasteCmd,
+  prompt: promptCmd,
+  compose: promptCmd,
   reasoning: reasoningCmd,
   reload: reloadCmd,
   'reload-skills': reloadSkillsCmd,
@@ -2008,7 +2149,10 @@ const CLIENT: Record<string, ClientHandler> = {
   title: titleCmd,
   ts: timestampsCmd,
   tools: toolsCmd,
+  voice: voiceCmd,
   status: statusCmd,
+  setup: setupCmd,
+  'terminal-setup': terminalSetupCmd,
   help: helpCmd,
   history: historyCmd,
   logs: logsCmd,

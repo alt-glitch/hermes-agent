@@ -20,7 +20,14 @@ describe('live gateway session tracking', () => {
     expect(trackedSessionIdAfterRequest('old-1', 'session.activate', {}, { messages: [], session_id: 'live-4' })).toBe(
       'live-4'
     )
-    expect(trackedSessionIdAfterRequest('live-4', 'session.branch', {}, { parent: 'key-4', session_id: 'live-5', session_key: 'key-5', title: 'Fork' })).toBe('live-5')
+    expect(
+      trackedSessionIdAfterRequest(
+        'live-4',
+        'session.branch',
+        {},
+        { parent: 'key-4', session_id: 'live-5', session_key: 'key-5', title: 'Fork' }
+      )
+    ).toBe('live-5')
   })
 
   test('a successful matching close clears the routing id, including closed:false', () => {

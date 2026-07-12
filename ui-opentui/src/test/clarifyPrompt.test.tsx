@@ -63,7 +63,10 @@ describe('PromptOverlay acknowledgement ownership', () => {
     let calls = 0
     let resolveResponse: ((value: boolean) => void) | undefined
     const response = new Promise<boolean>(resolve => (resolveResponse = resolve))
-    const h = await mountOverlay(store, () => { calls += 1; return response })
+    const h = await mountOverlay(store, () => {
+      calls += 1
+      return response
+    })
     try {
       h.keys.pressEnter()
       await h.settle()
@@ -77,7 +80,9 @@ describe('PromptOverlay acknowledgement ownership', () => {
       await new Promise(resolve => setTimeout(resolve, 5))
       await h.settle()
       expect(store.state.prompt).toBeUndefined()
-    } finally { h.destroy() }
+    } finally {
+      h.destroy()
+    }
   })
 
   test('invalid acknowledgement shows an error and allows retry', async () => {
@@ -96,7 +101,9 @@ describe('PromptOverlay acknowledgement ownership', () => {
       await h.settle()
       expect(calls).toBe(2)
       expect(store.state.prompt).toBeUndefined()
-    } finally { h.destroy() }
+    } finally {
+      h.destroy()
+    }
   })
 })
 

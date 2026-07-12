@@ -163,10 +163,12 @@ describe('session-store replacement boundary', () => {
     const store = createSessionStore()
     expect(
       store.applyActiveSessionsResponse(
-        { sessions: [
-          { id: 'old', status: 'idle', title: 'Old', current: true },
-          { id: 'new', status: 'working', title: 'New', current: false }
-        ] },
+        {
+          sessions: [
+            { id: 'old', status: 'idle', title: 'Old', current: true },
+            { id: 'new', status: 'working', title: 'New', current: false }
+          ]
+        },
         'new'
       )
     ).toBe(true)
@@ -222,5 +224,4 @@ describe('session-store replacement boundary', () => {
       running: false
     })
   })
-
 })

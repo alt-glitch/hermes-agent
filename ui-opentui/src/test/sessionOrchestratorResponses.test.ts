@@ -81,10 +81,22 @@ describe('session-orchestrator RPC Effect boundaries', () => {
   })
 
   test('validates branch identity fields', () => {
-    expect(decodeSessionBranchResponse({ parent: 'parent-key', session_id: 'child-live', session_key: 'child-key', title: 'Fork' })).toEqual({
-      parent: 'parent-key', session_id: 'child-live', session_key: 'child-key', title: 'Fork'
+    expect(
+      decodeSessionBranchResponse({
+        parent: 'parent-key',
+        session_id: 'child-live',
+        session_key: 'child-key',
+        title: 'Fork'
+      })
+    ).toEqual({
+      parent: 'parent-key',
+      session_id: 'child-live',
+      session_key: 'child-key',
+      title: 'Fork'
     })
-    expect(decodeSessionBranchResponse({ parent: 'parent-key', session_id: ' ', session_key: 'child-key', title: 'Fork' })).toBeUndefined()
+    expect(
+      decodeSessionBranchResponse({ parent: 'parent-key', session_id: ' ', session_key: 'child-key', title: 'Fork' })
+    ).toBeUndefined()
     expect(decodeSessionBranchResponse({ session_id: 'child-live', title: 'Fork' })).toEqual({
       session_id: 'child-live',
       title: 'Fork'

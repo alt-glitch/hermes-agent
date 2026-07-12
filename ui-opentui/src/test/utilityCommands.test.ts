@@ -92,6 +92,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     beginHistoryMutation: () => true,
     endHistoryMutation: () => {},
     busyInputMode: () => busyMode.value,
+    setBrowserState: () => {},
+    setVoiceMode: () => {},
     setBusyInputMode: mode => (busyMode.value = mode),
     queueCount: () => queue.length,
     enqueueQueued: (text, front = false) => {

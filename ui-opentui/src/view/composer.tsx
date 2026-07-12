@@ -163,6 +163,7 @@ export function Composer(props: {
   onDismiss?: (() => void) | undefined
   history?: PromptHistory | undefined
   onImagePaste?: (() => void) | undefined
+  onOpenEditor?: ((draft: string) => void) | undefined
   pasteStore?: PasteStore | undefined
   /** A paste/programmatic prefill exceeded the bounded retained-input store.
    * The body is not inserted into the native textarea; the host surfaces a
@@ -605,6 +606,11 @@ export function Composer(props: {
     // processes the key; the microtask runs after both). Equal-value signal
     // sets are no-ops, so this is cheap on every keystroke.
     queueMicrotask(syncCursorLine)
+    if (key.eventType !== 'release' && key.name === 'g' && (key.ctrl || key.meta || key.option)) {
+      key.preventDefault()
+      props.onOpenEditor?.(ta?.plainText ?? '')
+      return
+    }
     // 0) double-Esc bookkeeping: any non-Esc press is an intervening key and
     // disarms the pending Esc (free-code resets on every other input).
     if (key.eventType !== 'release' && key.name !== 'escape') doubleEsc.reset()

@@ -32,12 +32,10 @@ import { AgentsDashboard } from './overlays/agentsDashboard.tsx'
 import { BackgroundPanel } from './overlays/backgroundPanel.tsx'
 import { BillingOverlay } from './overlays/billing.tsx'
 import { Pager } from './overlays/pager.tsx'
+import { JourneyOverlay, type JourneyOps } from './overlays/journey.tsx'
 import { Picker } from './overlays/picker.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
-import {
-  SessionOrchestrator,
-  type SessionOrchestratorOps
-} from './overlays/sessionOrchestrator.tsx'
+import { SessionOrchestrator, type SessionOrchestratorOps } from './overlays/sessionOrchestrator.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
 import type { PromptResponseMethod } from '../boundary/promptResponses.ts'
 import { SessionInfoProvider } from './sessionInfo.tsx'
@@ -73,6 +71,7 @@ export interface AppProps {
   readonly sessionId?: () => string | undefined
   readonly history?: ComposerHistory
   readonly onImagePaste?: () => void
+  readonly onOpenEditor?: (draft: string) => void
   readonly pasteStore?: PasteStore
   readonly onPasteLimitExceeded?: (maxBytes: number) => void
   /** Gateway calls for the background-process panel (agents.list + process.stop). */
@@ -80,6 +79,7 @@ export interface AppProps {
     list: () => Promise<BackgroundProcess[]>
     stopAll: () => Promise<void>
   }
+  readonly journeyOps?: JourneyOps
   /** Native Agents dashboard controls. Views remain transport-free; the entry
    * owns gateway requests and decoded store updates. */
   readonly agentsOps?: {
@@ -94,6 +94,12 @@ const NOOP = () => {}
 const NOOP_RESPOND = () => Promise.resolve(false)
 const NOOP_RESUME = () => {}
 const NO_SESSION = () => undefined
+const NOOP_JOURNEY_OPS: JourneyOps = {
+  frames: () => Promise.resolve({ axis: { start: '', end: '' }, count: 0, frames: [], legend: [], summary: [] }),
+  detail: () => Promise.resolve({ ok: false, message: 'unavailable' }),
+  edit: () => Promise.resolve({ ok: false, message: 'unavailable' }),
+  delete: () => Promise.resolve({ ok: false, message: 'unavailable' })
+}
 /** Inert picker ops for headless mounts that pass no gateway (tests). */
 const NOOP_OPS: SessionOrchestratorOps = {
   history: () => Promise.resolve({ sessions: [] }),
@@ -107,6 +113,7 @@ export function App(props: AppProps) {
   // Background-agents tray focus plumbing (Epic 2.7): Down on an empty composer
   // hands focus to the tray; Esc from the tray hands it back. Plain refs — the
   // tray persists across composer remounts (overlay close re-registers focus).
+  const journey = () => props.store.state.journey
   let trayApi: AgentsTrayApi | undefined
   let focusComposer: (() => void) | undefined
   const blocked = () => props.store.state.prompt !== undefined
@@ -129,6 +136,7 @@ export function App(props: AppProps) {
   const closeDashboard = () => deferClose(() => props.store.closeDashboard())
   const closeBackgroundPanel = () => deferClose(() => props.store.closeBackgroundPanel())
   const closeBilling = () => deferClose(() => props.store.closeBilling())
+  const closeJourney = () => deferClose(() => props.store.closeJourney())
   // Fetch the current OS-process snapshot into the store (panel refresh + the bg badge).
   const refreshBackground = () => {
     void props.backgroundOps
@@ -197,6 +205,7 @@ export function App(props: AppProps) {
                         onDismiss={() => props.store.clearCompletions()}
                         history={props.history}
                         onImagePaste={props.onImagePaste}
+                        onOpenEditor={props.onOpenEditor}
                         pasteStore={props.pasteStore}
                         onPasteLimitExceeded={props.onPasteLimitExceeded}
                         onFocusDown={() => trayApi?.focusTray() ?? false}
@@ -311,6 +320,9 @@ export function App(props: AppProps) {
                 }}
                 onClose={closeBackgroundPanel}
               />
+            </Match>
+            <Match when={journey()}>
+              <JourneyOverlay ops={props.journeyOps ?? NOOP_JOURNEY_OPS} onClose={closeJourney} />
             </Match>
             <Match when={billing()}>
               {b => (

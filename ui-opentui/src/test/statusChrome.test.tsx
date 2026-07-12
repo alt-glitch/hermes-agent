@@ -117,10 +117,12 @@ describe('statusSegments — progressive disclosure table (chrome v3 order)', ()
       agents: true,
       ctxDetail: true,
       cost: true,
+      voice: true,
       up: true,
       compressions: true,
       sessions: true,
       profile: true,
+      browser: true,
       bg: true,
       mcp: true
     })
@@ -132,9 +134,11 @@ describe('statusSegments — progressive disclosure table (chrome v3 order)', ()
       [125, { mcp: false, bg: true }], // mcp drops first
       [117, { mcp: false, bg: false, profile: true }], // then bg
       [107, { profile: false, compressions: true }], // then profile
+      [111, { browser: false, profile: true }], // browser drops before profile
       [99, { sessions: false, compressions: true }], // then live-session count
       [93, { compressions: false, up: true }], // then cmp
       [87, { up: false, cost: true }], // then uptime
+      [83, { voice: false, cost: true }], // exact-f7 voice breakpoint
       [79, { cost: false, ctxDetail: true }], // then cost
       [71, { ctxDetail: false }] // finally the bar/token detail collapses to `ctx: 42%`
     ]

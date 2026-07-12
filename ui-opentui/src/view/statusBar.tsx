@@ -81,12 +81,16 @@ export interface StatusSegments {
   /** Full `ctx: ███░░ 42% · 84k` read-out; false → compact `ctx: 42%`. */
   ctxDetail: boolean
   cost: boolean
+  /** Voice mode / REC / STT chrome (exact-f7 breakpoint). */
+  voice: boolean
   /** Session uptime (`up: 23m`). */
   up: boolean
   compressions: boolean
   /** Process-global attachable TUI sessions (`N sessions`). */
   sessions: boolean
   profile: boolean
+  /** Connected browser-agent badge. */
+  browser: boolean
   /** Running OS background-processes count (`bg: N`). */
   bg: boolean
   mcp: boolean
@@ -98,10 +102,12 @@ export function statusSegments(cols: number): StatusSegments {
     agents: w >= 60,
     ctxDetail: w >= 72,
     cost: w >= 80,
+    voice: w >= 84,
     up: w >= 88,
     compressions: w >= 94,
     sessions: w >= 100,
     profile: w >= 108,
+    browser: w >= 112,
     bg: w >= 118,
     mcp: w >= 126
   }
@@ -298,6 +304,24 @@ export function StatusBar(props: { store: SessionStore }) {
   })
   const cmpCount = () => info().compressions ?? 0
   const cmpText = createMemo(() => (segs().compressions && cmpCount() > 0 ? `cmp: ${cmpCount()}` : ''))
+  const voiceText = createMemo(() => {
+    if (!segs().voice) return ''
+    const voice = props.store.state.voice
+    if (voice.recording) return '● REC'
+    if (voice.processing) return '◉ STT'
+    // The idle/off label is much less urgent than active REC/STT. Ink's final
+    // fit check drops it when the already-populated tail cannot afford it;
+    // OpenTUI's fixed ladder models that same outcome at normal widths.
+    if (!voice.enabled && dims().width < 140) return ''
+    return `voice ${voice.enabled ? 'on' : 'off'}${voice.tts ? ' [tts]' : ''}`
+  })
+  const voiceColor = () =>
+    props.store.state.voice.recording
+      ? theme().color.error
+      : props.store.state.voice.processing
+        ? theme().color.warn
+        : theme().color.muted
+  const browserText = createMemo(() => (segs().browser && props.store.state.browser.connected ? 'browser' : ''))
   const profileText = createMemo(() => {
     const p = info().profileName
     return segs().profile && p && p !== 'default' && p !== 'custom' ? p : ''
@@ -355,8 +379,10 @@ export function StatusBar(props: { store: SessionStore }) {
       costText(),
       upText(),
       cmpText(),
+      voiceText(),
       sessionsText(),
       profileText(),
+      browserText(),
       bgText(),
       mcpText(),
       spawnHud().text
@@ -450,10 +476,12 @@ export function StatusBar(props: { store: SessionStore }) {
           <Seg text={costText()} />
           <Seg text={upText()} />
           <Seg text={cmpText()} fg={cmpColorOf(cmpCount())} />
+          <Seg text={voiceText()} fg={voiceColor()} />
           <Seg text={sessionsText()} fg={theme().color.accent} />
           {/* statusFg, not accent — persistent chrome spends no warm ink
               (design pass); the navy fill is the bar's one blue surface. */}
           <Seg text={profileText()} fg={theme().color.statusFg} />
+          <Seg text={browserText()} fg={theme().color.accent} />
           <Seg text={bgText()} fg={theme().color.statusWarn} />
           <Seg text={mcpText()} />
           <Seg text={resumeHintText()} />
