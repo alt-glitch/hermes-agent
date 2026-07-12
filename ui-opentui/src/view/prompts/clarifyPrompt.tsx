@@ -58,6 +58,17 @@ export function ClarifyPrompt(props: {
       props.onCancel()
       return
     }
+    // Match Ink's direct choice shortcuts. Zero represents the tenth choice;
+    // choices beyond ten remain available through arrows/Enter.
+    if (!onInput() && !key.ctrl && !key.meta && !key.option) {
+      const quickIndex = key.name === '0' ? 9 : /^[1-9]$/.test(key.name) ? Number(key.name) - 1 : -1
+      const choice = choices()[quickIndex]
+      if (choice !== undefined) {
+        props.onAnswer(choice)
+        key.preventDefault()
+        return
+      }
+    }
     // Total rows = choices + the always-present custom input.
     const total = choices().length + 1
     if (key.name === 'up') {
@@ -142,7 +153,9 @@ export function ClarifyPrompt(props: {
       </box>
 
       <text fg={theme().color.muted}>
-        {onInput() ? '↑↓ select · Enter send · Esc cancel' : '↑↓ select · Enter choose · Esc cancel'}
+        {onInput()
+          ? '↑↓ select · Enter send · Esc cancel'
+          : `↑↓ select · Enter choose · 1-${Math.min(choices().length, 10)} quick pick · Esc cancel`}
       </text>
     </box>
   )

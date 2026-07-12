@@ -30,7 +30,7 @@ import {
   type CatalogDecoded,
   type SessionInfoPatchDecoded
 } from '../boundary/schema/SessionInfo.ts'
-import type { DetailsMode } from './details.ts'
+import type { DetailsMode, DetailsSection, DetailsSections } from './details.ts'
 import {
   applyDelegationState,
   clearAgentsNudgeTurn,
@@ -623,6 +623,8 @@ export interface StoreState {
   /** Global tool/reasoning detail mode (/details): collapsed (default) /
    *  expanded (bodies default-open) / hidden (runs fold to one muted line). */
   details: DetailsMode
+  detailsCommandOverride: boolean
+  detailsSections: DetailsSections
   /** Show a muted `[HH:MM]` time next to each transcript message that carries a
    *  stored unix `timestamp` (/timestamps — port of upstream 5ff11a689). Defaults
    *  OFF; like `compact`, the persisted pref doesn't reach the TUI via session.info,
@@ -907,6 +909,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     resumeId: undefined,
     compact: false,
     details: 'collapsed',
+    detailsCommandOverride: false,
+    detailsSections: {},
     timestamps: false,
     reasoningFull: false,
     busyInputMode: DEFAULT_BUSY_INPUT_MODE
@@ -1826,15 +1830,65 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // Config hydration and `/busy` can race during startup. User commands bump
   // this revision; the older hydration applies only if no command superseded it.
   let busyInputModeRevision = 0
+  let compactRevision = 0
+  let detailsRevision = 0
 
   /** /compact — set the compact-transcript display flag (Epic 3). */
   function setCompact(on: boolean): void {
+    compactRevision += 1
     setState('compact', on)
   }
 
+  function hydrateCompact(on: boolean, expectedRevision: number): boolean {
+    if (compactRevision !== expectedRevision) return false
+    setState('compact', on)
+    return true
+  }
+
+  function getCompactRevision(): number {
+    return compactRevision
+  }
+
   /** /details — set the global tool/reasoning detail mode (Epic 3). */
-  function setDetails(mode: DetailsMode): void {
-    setState('details', mode)
+  function setDetails(mode: DetailsMode, commandOverride = false): void {
+    detailsRevision += 1
+    setState(
+      produce(draft => {
+        draft.details = mode
+        draft.detailsCommandOverride = commandOverride
+        if (commandOverride) {
+          for (const section of ['thinking', 'tools', 'subagents', 'activity'] as const) {
+            draft.detailsSections[section] = mode
+          }
+        }
+      })
+    )
+  }
+
+  function setDetailSection(section: DetailsSection, mode: DetailsMode | null): void {
+    detailsRevision += 1
+    setState(
+      produce(draft => {
+        if (mode === null) delete draft.detailsSections[section]
+        else draft.detailsSections[section] = mode
+      })
+    )
+  }
+
+  function hydrateDetails(mode: DetailsMode, sections: DetailsSections, expectedRevision: number): boolean {
+    if (detailsRevision !== expectedRevision) return false
+    setState(
+      produce(draft => {
+        draft.details = mode
+        draft.detailsCommandOverride = false
+        draft.detailsSections = { ...sections }
+      })
+    )
+    return true
+  }
+
+  function getDetailsRevision(): number {
+    return detailsRevision
   }
 
   /** /timestamps — set the show-[HH:MM] display flag (port of upstream 5ff11a689). */
@@ -2844,6 +2898,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setVoiceActivity,
     setBrowserState,
     setCompact,
+    hydrateCompact,
+    getCompactRevision,
     openJourney,
     openPluginsHub,
     closePluginsHub,
@@ -2851,6 +2907,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     closePetPicker,
     closeJourney,
     setDetails,
+    setDetailSection,
+    hydrateDetails,
+    getDetailsRevision,
     setTimestamps,
     setReasoningFull,
     setBusyInputMode,

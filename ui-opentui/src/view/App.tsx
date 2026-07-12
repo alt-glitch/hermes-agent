@@ -14,9 +14,10 @@
  * refocuses when an overlay closes; the key that closed an overlay can't leak
  * into it because the close is deferred a tick.
  */
-import { createEffect, Match, Switch } from 'solid-js'
+import { createEffect, Match, Show, Switch } from 'solid-js'
 
 import { deferClose } from '../logic/defer.ts'
+import { sectionMode } from '../logic/details.ts'
 import type { PromptHistory as ComposerHistory } from '../logic/history.ts'
 import type { PasteStore } from '../logic/pastes.ts'
 import { actionCommand, promptHistoryEntries } from '../logic/promptHistory.ts'
@@ -139,6 +140,13 @@ export function App(props: AppProps) {
   const pluginsHub = () => props.store.state.pluginsHub
   const petPicker = () => props.store.state.petPicker
   const promptHistory = () => props.store.state.promptHistory
+  const subagentsVisible = () =>
+    sectionMode(
+      'subagents',
+      props.store.state.details,
+      props.store.state.detailsSections,
+      props.store.state.detailsCommandOverride
+    ) !== 'hidden'
   let dashboardWasOpen = false
   createEffect(() => {
     const open = dashboard()
@@ -211,7 +219,7 @@ export function App(props: AppProps) {
                     queued={props.store.state.queuedPrompts}
                     editIndex={props.store.state.queueEditIndex}
                   />
-                  <StatusBar store={props.store} />
+                  <StatusBar store={props.store} subagentsVisible={subagentsVisible()} />
                   <Switch
                     fallback={
                       <Composer
@@ -298,12 +306,14 @@ export function App(props: AppProps) {
                   {/* background-agents tray (Epic 2.7): renders nothing with no
                       running agents; a one-line indicator otherwise; expands while
                       focused (composer Down). Enter opens the dashboard on that row. */}
-                  <AgentsTray
-                    subagents={props.store.state.subagents}
-                    onOpen={id => props.store.openDashboard(id)}
-                    onExit={() => focusComposer?.()}
-                    bind={api => (trayApi = api)}
-                  />
+                  <Show when={subagentsVisible()}>
+                    <AgentsTray
+                      subagents={props.store.state.subagents}
+                      onOpen={id => props.store.openDashboard(id)}
+                      onExit={() => focusComposer?.()}
+                      bind={api => (trayApi = api)}
+                    />
+                  </Show>
                 </box>
               </>
             }

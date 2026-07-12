@@ -215,9 +215,17 @@ def test_dockerfile_preinstalls_hindsight_memory_dependency(dockerfile_text):
 
 
 def test_dockerfile_builds_tui_assets(dockerfile_text):
+    build_steps = _run_steps(dockerfile_text)
     assert any(
         "ui-tui" in step and "npm" in step and "run build" in step
-        for step in _run_steps(dockerfile_text)
+        for step in build_steps
+    )
+    assert any(
+        "ui-opentui" in step
+        and "npm" in step
+        and "run build" in step
+        and "npm prune --omit=dev" in step
+        for step in build_steps
     )
 
 

@@ -91,6 +91,7 @@ describe('App render (Phase 1, themed)', () => {
 
   test('mid-turn local rows render without splitting the streaming assistant', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     store.apply({ type: 'gateway.ready' })
     store.apply({ type: 'message.start' })
     store.apply({ type: 'message.delta', payload: { text: 'answer-before ' } })
@@ -131,6 +132,7 @@ describe('App render (Phase 1, themed)', () => {
 
   test('a tool part shows its primary-arg preview + duration in the collapsed header (item 2)', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     store.apply({ type: 'gateway.ready' })
     store.apply({ type: 'message.start' })
     store.apply({ type: 'tool.start', payload: { tool_id: 't1', name: 'terminal', context: 'ls -la src' } })

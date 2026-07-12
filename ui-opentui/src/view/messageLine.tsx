@@ -33,7 +33,7 @@
 import { For, Match, Show, Switch } from 'solid-js'
 
 import { copyBlock } from '../logic/blockCopy.ts'
-import { collapseHiddenParts, hiddenRunLabel } from '../logic/details.ts'
+import { collapseHiddenPartsBy, hiddenRunLabel, sectionMode } from '../logic/details.ts'
 import type { Message, Part } from '../logic/store.ts'
 import type { ThemeColors } from '../logic/theme.ts'
 import { useDisplay } from './display.tsx'
@@ -150,7 +150,12 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
   const spacing = () => turnSpacing(m().role, display().compact)
   // /details hidden: fold each run of tool/reasoning parts into ONE muted line
   // (the parts stay in the store — flipping the mode back restores them).
-  const displayParts = () => (display().details === 'hidden' ? collapseHiddenParts(m().parts ?? []) : (m().parts ?? []))
+  const displayParts = () =>
+    collapseHiddenPartsBy(
+      m().parts ?? [],
+      section =>
+        sectionMode(section, display().details, display().sections, display().detailsCommandOverride) === 'hidden'
+    )
   // Settled-turn narration demotion: once the turn stops streaming, every text
   // part EXCEPT the final answer drops to muted.
   const textFg = (id: string) =>
@@ -247,7 +252,9 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                           {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
                         </Match>
                         <Match when={part.type === 'moa' && part}>
-                          {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
+                          {r => (
+                            <ReasoningPart text={r().text} streaming={m().streaming ?? false} section="subagents" />
+                          )}
                         </Match>
                         <Match when={part.type === 'hiddenRun' && part}>
                           {/* /details hidden — the honest minimal render for a folded
@@ -297,7 +304,16 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
             </box>
           }
         >
-          {n => <NotificationCard notification={n()} compact={display().compact} />}
+          {n => (
+            <Show
+              when={
+                sectionMode('activity', display().details, display().sections, display().detailsCommandOverride) !==
+                'hidden'
+              }
+            >
+              <NotificationCard notification={n()} compact={display().compact} />
+            </Show>
+          )}
         </Show>
       }
     >

@@ -346,6 +346,53 @@ describe('transcript windowing — S2 idle exact-measure + zero-jank corrections
     }
   }, 120_000)
 
+  test('compact mode invalidates off-window heights and preserves the settled visible frame', async () => {
+    process.env.HERMES_TUI_WINDOW_IDLE_MS = '0'
+    const store = wrappySeed(WRAPPY_ROWS)
+    const on = await mountTranscript(store, '1')
+    try {
+      store.setCompact(true)
+      for (let i = 0; i < 4; i++) await on.probe.settle()
+      const stable = clipScrollbar(on.probe.frame())
+      for (let i = 0; i < 50; i++) {
+        await on.probe.settle()
+        expect(clipScrollbar(on.probe.frame())).toBe(stable)
+      }
+
+      const offStore = wrappySeed(WRAPPY_ROWS)
+      offStore.setCompact(true)
+      const off = await mountTranscript(offStore, '0')
+      try {
+        expect(on.scrollbox().scrollHeight).toBe(off.scrollbox().scrollHeight)
+      } finally {
+        off.probe.destroy()
+      }
+    } finally {
+      on.probe.destroy()
+    }
+  }, 120_000)
+
+  test('terminal width changes invalidate off-window heights and reconverge through zero-jank idle corrections', async () => {
+    process.env.HERMES_TUI_WINDOW_IDLE_MS = '0'
+    const on = await mountTranscript(wrappySeed(WRAPPY_ROWS), '1')
+    try {
+      on.probe.resize(32, 12)
+      for (let i = 0; i < 60; i++) await on.probe.settle()
+
+      const off = await mountTranscript(wrappySeed(WRAPPY_ROWS), '0')
+      try {
+        off.probe.resize(32, 12)
+        for (let i = 0; i < 8; i++) await off.probe.settle()
+        expect(on.scrollbox().scrollHeight).toBe(off.scrollbox().scrollHeight)
+        expect(on.probe.frame()).toContain('row-399')
+      } finally {
+        off.probe.destroy()
+      }
+    } finally {
+      on.probe.destroy()
+    }
+  }, 120_000)
+
   test('reading mid-history: above-viewport corrections compensate scrollTop in the same frame', async () => {
     process.env.HERMES_TUI_WINDOW_IDLE_MS = '0'
     const on = await mountTranscript(wrappySeed(WRAPPY_ROWS), '1')

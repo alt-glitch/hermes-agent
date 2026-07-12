@@ -49,7 +49,7 @@ describe('reasoningFull store flag', () => {
 })
 
 describe('/reasoning full — expands all thinking (frame)', () => {
-  test('MoA reference blocks remain visible and labelled even when details are hidden', async () => {
+  test('MoA reference blocks follow the subagents override independently of global details', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
     store.apply({ type: 'message.start' })
@@ -58,7 +58,8 @@ describe('/reasoning full — expands all thinking (frame)', () => {
       payload: { count: 2, index: 1, label: 'provider/model-a', text: 'Paris.' }
     })
     store.apply({ type: 'message.complete' })
-    store.setDetails('hidden')
+    store.setDetails('hidden', true)
+    store.setDetailSection('subagents', 'collapsed')
     const probe = await mountApp(store)
     try {
       const frame = await probe.waitForFrame(value => value.includes('Reference 1/2 — provider/model-a'))
@@ -69,12 +70,13 @@ describe('/reasoning full — expands all thinking (frame)', () => {
     }
   })
 
-  test('settled reasoning is collapsed by default, expanded when reasoningFull is on (details stays collapsed)', async () => {
+  test('reasoningFull expands an explicitly collapsed thinking section without changing global details', async () => {
     const store = createSessionStore()
     seedReasoningTurn(store)
+    store.setDetailSection('thinking', 'collapsed')
     const probe = await mountApp(store)
     try {
-      // default: collapsed — the Thought header shows the ◐ folded glyph.
+      // Explicit thinking override collapses the Thought header (the built-in default is expanded).
       const collapsed = await probe.waitForFrame(f => f.includes('Thought: Plan'))
       expect(collapsed).toContain('◐ Thought: Plan')
       expect(store.state.details).toBe('collapsed')

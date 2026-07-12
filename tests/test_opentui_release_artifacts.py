@@ -9,6 +9,7 @@ archives and a clean-venv install; metadata checks run in the normal suite.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -23,6 +24,19 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PORTABLE_ROOT = Path("ui-opentui")
+
+
+def test_opentui_package_version_tracks_hermes_release() -> None:
+    """The private engine is released with Hermes, not on a 0.0.0 line."""
+    package = json.loads((PORTABLE_ROOT / "package.json").read_text())
+    lock = json.loads((PORTABLE_ROOT / "package-lock.json").read_text())
+    project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+
+    assert package["version"] == project["version"]
+    assert lock["version"] == project["version"]
+    assert lock["packages"][""]["version"] == project["version"]
+
+
 BUILD_INPUT_FILES = {
     PORTABLE_ROOT / "package.json",
     PORTABLE_ROOT / "package-lock.json",
@@ -514,4 +528,3 @@ def test_clean_venv_install_places_seed_beside_hermes_cli(tmp_path: Path) -> Non
             env=clean_env,
         )
         assert hydrated.returncode == 0, hydrated.stdout + hydrated.stderr
-

@@ -34,7 +34,7 @@ installSyntaxStyleDegrade()
  * Total by construction — a copy must NEVER throw out of an input/event handler
  * (that would tear down the render loop).
  */
-function selectionCopyText(selection: Selection): string {
+export function selectionCopyText(selection: Selection): string {
   try {
     return selection.getSelectedText()
   } catch (cause) {

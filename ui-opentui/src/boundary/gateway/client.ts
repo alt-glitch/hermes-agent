@@ -42,6 +42,38 @@ interface CloseWatchdog extends StartupWatchdog {
   readonly reason: string
 }
 
+const WS_CONNECTING = 0
+const WS_OPEN = 1
+
+export function resolveGatewayAttachUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return env.HERMES_TUI_GATEWAY_URL?.trim() || undefined
+}
+
+const USERINFO_FALLBACK_RE = /^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i
+
+/** Dashboard attachment URLs carry credentials in user-info and/or the query.
+ * Never expose either through the diagnostics ring or structured logger. */
+export function redactGatewayUrl(raw: string): string {
+  try {
+    const url = new URL(raw)
+    const userInfo = url.username || url.password ? '***@' : ''
+    return `${url.protocol}//${userInfo}${url.host}${url.pathname}${url.search ? '?***' : ''}`
+  } catch {
+    const withoutUserInfo = raw.replace(USERINFO_FALLBACK_RE, '$1***@')
+    const query = withoutUserInfo.indexOf('?')
+    return query < 0 ? withoutUserInfo : `${withoutUserInfo.slice(0, query)}?***`
+  }
+}
+
+const wireDecoder = new TextDecoder()
+
+function websocketFrameText(raw: unknown): string | undefined {
+  if (typeof raw === 'string') return raw
+  if (raw instanceof ArrayBuffer) return wireDecoder.decode(raw)
+  if (ArrayBuffer.isView(raw)) return wireDecoder.decode(raw)
+  return undefined
+}
+
 export interface RawClientOptions {
   readonly log: Log
   /** Called with each server-pushed event's `params` object (still unknown — decoded upstream). */
@@ -178,6 +210,9 @@ export class TransportLogRing {
 
 export class RawGatewayClient {
   private proc: ChildProcessWithoutNullStreams | null = null
+  private ws: WebSocket | null = null
+  private wsConnectPromise: Promise<void> | null = null
+  private attachUrl: string | undefined
   private pending = new Map<string, Pending>()
   private reqId = 0
   private processGeneration = 0
@@ -206,13 +241,22 @@ export class RawGatewayClient {
 
   /** Spawn the gateway child and begin reading frames. Idempotent. */
   start(): void {
-    if (this.proc) return
+    const requestedAttachUrl = resolveGatewayAttachUrl()
+    if (this.proc || this.ws) {
+      if (requestedAttachUrl === this.attachUrl) return
+      this.replaceTransport('gateway attach url changed')
+    }
     // A finished child must never leave a watchdog behind. Clear defensively
     // before assigning the next generation so a stale handle cannot be lost
     // when the new child arms its own timer.
     this.clearStartupWatchdog()
     this.clearCloseWatchdog()
     const generation = ++this.processGeneration
+    this.attachUrl = requestedAttachUrl
+    if (requestedAttachUrl) {
+      this.startAttachedGateway(requestedAttachUrl, generation)
+      return
+    }
     const srcRoot = resolveSrcRoot()
     const python = resolvePython(srcRoot)
     const cwd = process.env.HERMES_CWD?.trim() || srcRoot
@@ -289,6 +333,132 @@ export class RawGatewayClient {
     // watchdog even when that frame is delivered immediately on subscription.
     this.readStdout(proc, generation)
     this.readStderr(proc, generation)
+  }
+
+  private armAttachedStartupWatchdog(generation: number, ws: WebSocket, safeUrl: string): void {
+    const handle = setTimeout(() => {
+      if (this.ws !== ws || this.processGeneration !== generation || this.startupWatchdog?.generation !== generation) {
+        return
+      }
+      this.startupWatchdog = undefined
+      const message = `no gateway.ready within ${STARTUP_TIMEOUT_MS}ms`
+      this.pushTransportLog(`[gateway] ${message}`)
+      try {
+        this.onEvent({ type: 'gateway.start_timeout', payload: { message } })
+      } finally {
+        this.finishAttachedGeneration(generation, `gateway startup timeout: ${safeUrl}`)
+      }
+    }, STARTUP_TIMEOUT_MS)
+    this.startupWatchdog = { generation, handle }
+  }
+
+  private startAttachedGateway(attachUrl: string, generation: number): void {
+    const safeUrl = redactGatewayUrl(attachUrl)
+    this.log.info('gateway', 'attaching to tui_gateway websocket', { url: safeUrl })
+    this.pushTransportLog(`[gateway] attaching ${safeUrl}`)
+    this.transportAccepting = false
+
+    try {
+      const ws = new WebSocket(attachUrl)
+      // Normalize binary server frames to ArrayBuffer so one bounded decoder
+      // handles Node's dashboard WebSocket implementation consistently.
+      ws.binaryType = 'arraybuffer'
+      this.ws = ws
+      let settled = false
+      const connected = new Promise<void>((resolve, reject) => {
+        ws.addEventListener(
+          'open',
+          () => {
+            if (settled) return
+            settled = true
+            this.transportAccepting = true
+            resolve()
+          },
+          { once: true }
+        )
+        ws.addEventListener(
+          'error',
+          () => {
+            if (settled) return
+            settled = true
+            reject(new RawGatewayRequestError('transport-down', 'gateway websocket connection failed'))
+          },
+          { once: true }
+        )
+        ws.addEventListener(
+          'close',
+          event => {
+            if (settled) return
+            settled = true
+            reject(
+              new RawGatewayRequestError('transport-down', `gateway websocket closed (${event.code}) during connect`)
+            )
+          },
+          { once: true }
+        )
+      })
+      connected.catch(() => {})
+      this.wsConnectPromise = connected
+      this.armAttachedStartupWatchdog(generation, ws, safeUrl)
+
+      ws.addEventListener('message', event => this.dispatchWebSocketFrame(event.data, ws, generation))
+      ws.addEventListener('close', event => {
+        if (this.ws !== ws || this.processGeneration !== generation) return
+        this.finishAttachedGeneration(generation, `gateway websocket closed${event.code ? ` (${event.code})` : ''}`)
+      })
+      ws.addEventListener('error', () => {
+        if (this.ws !== ws || this.processGeneration !== generation) return
+        const line = '[gateway] websocket transport error'
+        this.pushTransportLog(line)
+        this.onEvent({ type: 'gateway.stderr', payload: { line } })
+      })
+    } catch {
+      this.pushTransportLog(`[startup] failed to attach websocket ${safeUrl}`)
+      this.finishAttachedGeneration(generation, `gateway websocket startup failed: ${safeUrl}`)
+    }
+  }
+
+  private finishAttachedGeneration(generation: number, reason: string): boolean {
+    if (this.processGeneration !== generation || !this.attachUrl) return false
+    this.clearStartupWatchdog(generation)
+    this.transportAccepting = false
+    const ws = this.ws
+    this.ws = null
+    this.wsConnectPromise = null
+    this.pushTransportLog(`[gateway] ${reason}`)
+    try {
+      notifyTransportExit(reason, this.onExit, failedReason => this.rejectAll(failedReason))
+    } finally {
+      try {
+        ws?.close()
+      } catch {
+        // Best-effort cleanup; ownership was cleared before close dispatch.
+      }
+    }
+    return true
+  }
+
+  private closeSocket(): void {
+    const ws = this.ws
+    this.ws = null
+    this.wsConnectPromise = null
+    try {
+      ws?.close()
+    } catch {
+      // Best-effort teardown. Ownership was cleared first, so a late close is stale.
+    }
+  }
+
+  private replaceTransport(reason: string): void {
+    this.clearStartupWatchdog()
+    this.clearCloseWatchdog()
+    this.transportAccepting = false
+    this.rejectAll(reason)
+    this.closeSocket()
+    const proc = this.proc
+    this.proc = null
+    if (proc) this.terminateCaptured(proc)
+    this.attachUrl = undefined
   }
 
   private clearStartupWatchdog(generation?: number): void {
@@ -548,6 +718,26 @@ export class RawGatewayClient {
       this.onEvent({ type: 'gateway.protocol_error', payload: { preview: line.slice(0, 120) } })
       return
     }
+    this.routeFrame(line, msg, generation)
+  }
+
+  private dispatchWebSocketFrame(raw: unknown, ws: WebSocket, generation: number): void {
+    if (this.ws !== ws || this.processGeneration !== generation) return
+    const text = websocketFrameText(raw)
+    if (text === undefined) return
+    let msg: unknown
+    try {
+      msg = JSON.parse(text)
+    } catch {
+      const preview = text.trim().slice(0, 120) || '(empty frame)'
+      this.pushTransportLog(`[protocol] malformed websocket frame: ${preview}`)
+      this.onEvent({ type: 'gateway.protocol_error', payload: { preview } })
+      return
+    }
+    this.routeFrame(text, msg, generation)
+  }
+
+  private routeFrame(line: string, msg: unknown, generation: number): void {
     if (!msg || typeof msg !== 'object') return
     const frame = msg as { id?: unknown; method?: unknown; params?: unknown; result?: unknown; error?: unknown }
 
@@ -586,6 +776,19 @@ export class RawGatewayClient {
 
   /** Send a JSON-RPC request; resolves with `result` (long handlers reply async). */
   request<A = unknown>(method: string, params: unknown): Promise<A> {
+    const requestedAttachUrl = resolveGatewayAttachUrl()
+    if (requestedAttachUrl) {
+      if (requestedAttachUrl !== this.attachUrl) {
+        this.replaceTransport('gateway attach url changed')
+        this.start()
+      }
+      return this.requestOverWebSocket<A>(method, params)
+    }
+    if (this.attachUrl) {
+      this.replaceTransport('gateway attach url changed')
+      this.start()
+    }
+
     // Do NOT auto-start here: during the recovery backoff window `this.proc` is
     // null, and a respawn here would BYPASS the backoff (the first spawn always
     // comes from subscribe() → client.start()). A null proc rejects below.
@@ -635,6 +838,56 @@ export class RawGatewayClient {
     })
   }
 
+  private async ensureAttachedWebSocket(method: string): Promise<WebSocket> {
+    const ws = this.ws
+    if (!ws || !this.attachUrl) {
+      throw new RawGatewayRequestError('transport-down', 'gateway not running')
+    }
+    if (ws.readyState === WS_CONNECTING) {
+      await this.wsConnectPromise
+    }
+    if (this.ws !== ws || ws.readyState !== WS_OPEN) {
+      throw new RawGatewayRequestError('transport-down', `gateway not connected: ${method}`)
+    }
+    return ws
+  }
+
+  private async requestOverWebSocket<A>(method: string, params: unknown): Promise<A> {
+    const ws = await this.ensureAttachedWebSocket(method)
+    const id = `r${++this.reqId}`
+    const frame = JSON.stringify({ id, jsonrpc: '2.0', method, params: params ?? {} })
+    return new Promise<A>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          this.pushTransportLog(`[rpc] timeout: ${method}`)
+          reject(new RawGatewayRequestError('timeout', `timeout: ${method}`))
+        }
+      }, REQUEST_TIMEOUT_MS)
+      timer.unref()
+      this.pending.set(id, {
+        method,
+        resolve: result => {
+          clearTimeout(timer)
+          resolve(result as A)
+        },
+        reject: error => {
+          clearTimeout(timer)
+          reject(error)
+        }
+      })
+      try {
+        ws.send(frame)
+      } catch (cause) {
+        const pending = this.pending.get(id)
+        if (pending) {
+          clearTimeout(timer)
+          this.pending.delete(id)
+        }
+        reject(new RawGatewayRequestError('transport-down', cause instanceof Error ? cause.message : String(cause)))
+      }
+    })
+  }
+
   private rejectAll(reason: string): void {
     for (const p of this.pending.values()) p.reject(new RawGatewayRequestError('transport-down', reason))
     this.pending.clear()
@@ -650,6 +903,8 @@ export class RawGatewayClient {
     const stdin = proc?.stdin
     this.transportAccepting = false
     this.proc = null
+    this.closeSocket()
+    this.attachUrl = undefined
     if (!proc || !stdin) return
 
     // Graceful EOF first. Because ownership is detached immediately (so a

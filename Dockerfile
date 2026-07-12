@@ -190,8 +190,9 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 COPY web/ web/
 COPY ui-tui/ ui-tui/
 COPY ui-opentui/ ui-opentui/
-# ui-opentui is the opt-in native OpenTUI engine (HERMES_TUI_ENGINE=opentui;
-# default stays Ink). .dockerignore strips its node_modules/dist, so install +
+# ui-opentui is the production native engine selected automatically on supported
+# hosts; Ink remains the explicit and unsupported-host fallback. .dockerignore
+# strips OpenTUI's node_modules/dist, so install +
 # esbuild-build it here -> dist/main.js, then prune devDeps (esbuild/babel/
 # vitest); the runtime only needs the prod deps (the external @opentui/core +
 # its native blob -- the bundle inlines solid/effect). Build needs Node 26.3
@@ -284,15 +285,16 @@ COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-r
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
-# Point the TUI launcher at the prebuilt bundle baked at build time (Layer 8:
+# Point the Ink fallback at the prebuilt bundle baked at build time (Layer 8:
 # `ui-tui && npm run build`). This makes _make_tui_argv take the prebuilt-bundle
 # fast path (`node --expose-gc /opt/hermes/ui-tui/dist/entry.js`) and skip the
-# _tui_need_npm_install / runtime `npm install` branch entirely — exactly the
-# nix/packaged-release path the launcher was designed for.
+# _tui_need_npm_install / runtime `npm install` branch entirely. OpenTUI is
+# independently discovered at /opt/hermes/ui-opentui and launches its baked
+# dist/main.js plus the pruned host-native @opentui/core library.
 #
 # Why this is required (not just an optimization): the root package-lock.json
 # describes the WHOLE monorepo workspace set (root + web + ui-tui + apps/*),
-# but the image only installs root/web/ui-tui (apps/* — the desktop app — is
+# but the root install only actualizes root/web/ui-tui (apps/* — the desktop app — is
 # never `npm install`ed here). So the actualized node_modules permanently
 # disagrees with the canonical lock, _tui_need_npm_install() returns True on
 # every launch, and the runtime `npm install` it triggers (a) can never

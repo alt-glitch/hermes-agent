@@ -1,12 +1,12 @@
 {
   "name": "@hermes/ui-opentui",
-  "version": "0.0.0",
+  "version": "0.18.2",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=26.3"
   },
-  "description": "Native OpenTUI engine for Hermes (Solid + Effect-at-boundary, from scratch). Ink (ui-tui/) stays the shipping default.",
+  "description": "Production OpenTUI engine for Hermes v1 (Solid + Effect at the boundary); selected by default on supported hosts with Ink as the fallback.",
   "scripts": {
     "type-check": "tsc --noEmit",
     "lint": "eslint .",

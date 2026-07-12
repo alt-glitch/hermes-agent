@@ -17,7 +17,16 @@ import { decodeSessionCompressResponse } from '../boundary/compression.ts'
 
 import { delegationStatusText, type DelegationState } from './agentStatus.ts'
 import { diagnosticsEnabled } from './env.ts'
-import { DETAILS_SECTIONS, DETAILS_USAGE, type DetailsMode, nextDetailsMode, parseDetailsMode } from './details.ts'
+import {
+  DETAILS_SECTIONS,
+  DETAILS_SECTION_USAGE,
+  DETAILS_USAGE,
+  isDetailsSection,
+  type DetailsMode,
+  type DetailsSections,
+  nextDetailsMode,
+  parseDetailsMode
+} from './details.ts'
 import { formatBytes, memReport, performHeapdump } from './diagnostics.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './replay.ts'
 import { mapResumeHistory } from './resume.ts'
@@ -29,6 +38,7 @@ import {
   type CommandsCatalogResponse,
   type SessionUndoResponse,
   decodeConfigValueResponse,
+  decodeModelSwitchResponse,
   decodeCommandsCatalogResponse,
   decodeReloadEnvResponse,
   decodeReloadMcpResponse,
@@ -160,6 +170,8 @@ export interface SlashContext {
   readonly dashboardMode: () => boolean
   /** Copy the n-th newest assistant response to the clipboard; returns whether something was copied. */
   readonly copyResponse: (n: number) => boolean
+  /** Copy the active native renderer selection; returns its rendered text when present. */
+  readonly copySelection: () => string | undefined
   /** Request cleanup-safe renderer shutdown; code 42 asks the Python wrapper to update. */
   readonly quit: (code?: number) => void
   /** Force a renderer-native full repaint. */
@@ -193,12 +205,15 @@ export interface SlashContext {
   readonly modelItems: () => PickerItem[] | undefined
   /** Update the cached `/model` picker rows. */
   readonly setModelItems: (items: PickerItem[]) => void
+  readonly setCurrentModel: (model: string) => void
   /** Read / set the compact-transcript display flag (/compact — Epic 3). */
   readonly compact: () => boolean
   readonly setCompact: (on: boolean) => void
   /** Read / set the global tool/reasoning detail mode (/details — Epic 3). */
   readonly details: () => DetailsMode
-  readonly setDetails: (mode: DetailsMode) => void
+  readonly setDetails: (mode: DetailsMode, commandOverride?: boolean) => void
+  readonly detailSections: () => DetailsSections
+  readonly setDetailSection: (section: (typeof DETAILS_SECTIONS)[number], mode: DetailsMode | null) => void
   /** Read / set the show-[HH:MM] display flag (/timestamps — port of upstream 5ff11a689). */
   readonly timestamps: () => boolean
   readonly setTimestamps: (on: boolean) => void
@@ -681,12 +696,44 @@ export function awaitModelPrefetch(sessionId: string | undefined): Promise<void>
   )
 }
 
-/** Switch the model via the server (shared by `/model <name>` and the picker pick).
- *  A successful switch refreshes the cached rows in the background (fresh ✓). */
-async function switchModel(ctx: SlashContext, name: string): Promise<void> {
+/** Switch the model via the authoritative config RPC (shared by direct input and picker). */
+async function switchModel(ctx: SlashContext, name: string, confirmExpensiveModel = false): Promise<void> {
+  if (ctx.guardBusySessionSwitch('change models')) return
+  const sid = ctx.sessionId()
   try {
-    const r = await ctx.request('slash.exec', { command: `model ${name}`, session_id: ctx.sessionId() })
-    ctx.pushSystem(readStr(r, 'output') || `→ ${name}`)
+    const raw = await ctx.request('config.set', {
+      confirm_expensive_model: confirmExpensiveModel,
+      key: 'model',
+      session_id: sid,
+      value: name.trim()
+    })
+    if (ctx.sessionId() !== sid) return
+    const response = decodeModelSwitchResponse(raw)
+    if (!response) {
+      ctx.pushSystem('error: invalid response: model switch')
+      return
+    }
+    if (response.confirm_required) {
+      ctx.confirm(
+        {
+          cancelLabel: 'Cancel',
+          confirmLabel: 'Switch anyway',
+          danger: true,
+          detail: response.confirm_message || response.warning || 'This model has unusually high known pricing.',
+          title: 'Expensive model selection'
+        },
+        () => void switchModel(ctx, name, true)
+      )
+      return
+    }
+    const value = response.value?.trim()
+    if (!value) {
+      ctx.pushSystem('error: invalid response: model switch')
+      return
+    }
+    ctx.pushSystem(`model → ${value}`)
+    if (response.warning) ctx.pushSystem(`warning: ${response.warning}`)
+    ctx.setCurrentModel(value)
     void refreshModelItems(ctx).catch(() => {})
   } catch (error) {
     ctx.pushSystem(`/model ${name}: ${error instanceof Error ? error.message : 'switch failed'}`)
@@ -699,24 +746,32 @@ async function switchModel(ctx: SlashContext, name: string): Promise<void> {
  *  An empty cache first awaits the in-flight bootstrap prefetch (bounded) so
  *  an early `/model` never doubles the slow `model.options` RPC. */
 const modelCmd: ClientHandler = async (arg, ctx) => {
-  if (arg.trim()) {
-    await switchModel(ctx, arg.trim())
-    return
-  }
   const open = (items: PickerItem[]) => {
-    // Ctrl+R in the open picker re-fetches the catalog (and re-syncs the cache).
     registerPickerRefresh(() => refreshModelItems(ctx))
-    // Provider chip strip (picker v2.2): Nous-first configured-provider tabs.
     registerPickerTabs(buildModelTabs)
     ctx.openPicker({ items, onPick: name => void switchModel(ctx, name), title: 'Switch model' })
   }
+  const requested = arg.trim()
+  if (requested === '--refresh') {
+    if (ctx.guardBusySessionSwitch('change models')) return
+    const items = await refreshModelItems(ctx)
+    if (!items.some(item => !item.unavailable)) {
+      ctx.pushSystem('No models available (no authenticated providers).')
+      return
+    }
+    open(items)
+    return
+  }
+  if (requested) {
+    await switchModel(ctx, requested)
+    return
+  }
+  if (ctx.guardBusySessionSwitch('change models')) return
   const cached = ctx.modelItems()
   if (cached?.length) {
     open(cached)
     return
   }
-  // Cache empty but the bootstrap prefetch may be in flight — await it
-  // (bounded) and re-check instead of racing a SECOND model.options RPC.
   await awaitModelPrefetch(ctx.sessionId())
   const prefetched = ctx.modelItems()
   if (prefetched?.length) {
@@ -724,7 +779,6 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
     return
   }
   const items = mapModelOptions(await ctx.request('model.options', { session_id: ctx.sessionId() }))
-  // Unavailable hint rows alone are not a usable catalog — keep the notice.
   if (!items.some(i => !i.unavailable)) {
     ctx.pushSystem('No models available (no authenticated providers).')
     return
@@ -808,27 +862,38 @@ const timestampsCmd: ClientHandler = (arg, ctx) => {
 }
 
 /**
- * `/details [hidden|collapsed|expanded|cycle]` — GLOBAL detail mode (per-section
- * overrides deferred; the gateway's arg completion also suggests section names,
- * so those get an honest "not supported yet" notice). Bare `/details` reports the
+ * `/details [hidden|collapsed|expanded|cycle]` controls the global mode;
+ * `/details <section> <mode|reset>` owns the four Ink-compatible overrides. Bare `/details` reports the
  * persisted mode (`config.get details_mode`) and syncs the local flag to it; a
  * mode set persists via `config.set` (fire-and-forget, Ink parity).
  */
 const detailsCmd: ClientHandler = async (arg, ctx) => {
-  const first = arg.trim().toLowerCase().split(/\s+/)[0] ?? ''
-  if (!first) {
+  const trimmed = arg.trim().toLowerCase()
+  if (!trimmed) {
     try {
       const r = await ctx.request('config.get', { key: 'details_mode' })
       const mode = parseDetailsMode(readStr(r, 'value')) ?? ctx.details()
-      ctx.setDetails(mode)
-      ctx.pushSystem(`details: ${mode}`)
+      ctx.setDetails(mode, false)
+      const overrides = DETAILS_SECTIONS.filter(section => ctx.detailSections()[section])
+        .map(section => `${section}=${ctx.detailSections()[section]}`)
+        .join(' ')
+      ctx.pushSystem(`details: ${mode}${overrides ? `  (${overrides})` : ''}`)
     } catch {
       ctx.pushSystem(`details: ${ctx.details()}`)
     }
     return
   }
-  if ((DETAILS_SECTIONS as readonly string[]).includes(first)) {
-    ctx.pushSystem(`per-section detail overrides are not supported in the native engine yet — ${DETAILS_USAGE}`)
+  const [first = '', second] = trimmed.split(/\s+/)
+  if (second && isDetailsSection(first)) {
+    const reset = second === 'reset' || second === 'default' || second === 'inherit'
+    const mode = reset ? null : parseDetailsMode(second)
+    if (!reset && !mode) {
+      ctx.pushSystem(DETAILS_SECTION_USAGE)
+      return
+    }
+    ctx.setDetailSection(first, mode)
+    void ctx.request('config.set', { key: `details_mode.${first}`, value: mode ?? '' }).catch(() => {})
+    ctx.pushSystem(`details ${first}: ${mode ?? 'reset'}`)
     return
   }
   const next = first === 'cycle' || first === 'toggle' ? nextDetailsMode(ctx.details()) : parseDetailsMode(first)
@@ -836,7 +901,7 @@ const detailsCmd: ClientHandler = async (arg, ctx) => {
     ctx.pushSystem(DETAILS_USAGE)
     return
   }
-  ctx.setDetails(next)
+  ctx.setDetails(next, true)
   void ctx.request('config.set', { key: 'details_mode', value: next }).catch(() => {})
   ctx.pushSystem(`details: ${next}`)
 }
@@ -1753,7 +1818,15 @@ const busyCmd: ClientHandler = async (arg, ctx, flight) => {
     return
   }
   if (!requested || requested === 'status') {
-    ctx.pushSystem(`busy input mode: ${ctx.busyInputMode()}`)
+    const sid = ctx.sessionId()
+    try {
+      const response = decodeConfigValueResponse(await ctx.request('config.get', { key: 'busy' }))
+      if (!currentSessionIs(ctx, sid, flight)) return
+      ctx.pushSystem(`busy input mode: ${response ? normalizeBusyInputMode(response.value) : 'interrupt'}`)
+    } catch (error) {
+      if (currentSessionIs(ctx, sid, flight))
+        ctx.pushSystem(`/busy: ${error instanceof Error ? error.message : 'config request failed'}`)
+    }
     return
   }
   const sid = ctx.sessionId()
@@ -2335,6 +2408,17 @@ const CLIENT: Record<string, ClientHandler> = {
   branch: branchCmd,
   fork: branchCmd,
   copy: (arg, ctx) => {
+    if (!arg) {
+      const selected = ctx.copySelection()
+      if (selected) {
+        ctx.pushSystem('copied ' + selected.length + ' characters')
+        return
+      }
+    }
+    if (arg && Number.isNaN(Number.parseInt(arg, 10))) {
+      ctx.pushSystem('usage: /copy [number]')
+      return
+    }
     const n = Math.max(1, Number.parseInt(arg, 10) || 1)
     if (!ctx.copyResponse(n)) ctx.pushSystem('Nothing to copy yet.')
   },
@@ -2481,7 +2565,9 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
     return
   }
 
-  const client = CLIENT[parsed.name]
+  // Bare /skills owns the native picker. Explicit subcommands must keep using
+  // the persistent slash worker so the picker cannot swallow their output.
+  const client = parsed.name === 'skills' && parsed.arg ? undefined : CLIENT[parsed.name]
   if (client) {
     try {
       await client(parsed.arg, ctx, flight)

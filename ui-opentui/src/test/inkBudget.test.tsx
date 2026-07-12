@@ -166,6 +166,7 @@ describe('lastTextId — settled-turn narration demotion', () => {
 describe('machinery tier indent — tools + thinking nest +2 under the turn', () => {
   test('tool and Thought rows sit 2 columns right of where flat content starts', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     store.apply({ type: 'gateway.ready' })
     store.pushUser('inspect the files')
     store.apply({ type: 'message.start' })

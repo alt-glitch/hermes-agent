@@ -15,6 +15,7 @@
  */
 import { createMemo, createSignal, Show } from 'solid-js'
 
+import { sectionMode } from '../logic/details.ts'
 import type { ThemeColors } from '../logic/theme.ts'
 import { useDisplay } from './display.tsx'
 import { Markdown } from './markdown.tsx'
@@ -46,7 +47,7 @@ function reasoningSummary(text: string): { title?: string; body: string } {
   return { title, body: s.slice(m[0].length).trimStart() }
 }
 
-export function ReasoningPart(props: { text: string; streaming?: boolean }) {
+export function ReasoningPart(props: { text: string; streaming?: boolean; section?: 'thinking' | 'subagents' }) {
   const theme = useTheme()
   const anchor = useScrollAnchor()
   const display = useDisplay()
@@ -57,7 +58,15 @@ export function ReasoningPart(props: { text: string; streaming?: boolean }) {
   // overrides — a user who clicked a section collapsed keeps it until they click
   // again (override() still wins).
   const expanded = () =>
-    override() ?? (!!props.streaming || display().details === 'expanded' || display().reasoningFull)
+    override() ??
+    (!!props.streaming ||
+      sectionMode(
+        props.section ?? 'thinking',
+        display().details,
+        display().sections,
+        display().detailsCommandOverride
+      ) === 'expanded' ||
+      display().reasoningFull)
   const toggle = () => anchor(() => setOverride(!expanded()))
   const summary = createMemo(() => reasoningSummary(props.text))
   const label = () => (props.streaming ? 'Thinking' : 'Thought')

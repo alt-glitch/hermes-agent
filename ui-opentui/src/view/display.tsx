@@ -9,18 +9,27 @@
  */
 import { type Accessor, createContext, type JSX, useContext } from 'solid-js'
 
-import type { DetailsMode } from '../logic/details.ts'
+import type { DetailsMode, DetailsSections } from '../logic/details.ts'
 
 export interface DisplayFlags {
   compact: boolean
   details: DetailsMode
+  detailsCommandOverride: boolean
+  sections: DetailsSections
   /** /timestamps: render a muted [HH:MM] next to each message that has a stored timestamp. */
   timestamps: boolean
   /** /reasoning full: expand all thinking sections (independent of `details`). */
   reasoningFull: boolean
 }
 
-const DEFAULTS: DisplayFlags = { compact: false, details: 'collapsed', timestamps: false, reasoningFull: false }
+const DEFAULTS: DisplayFlags = {
+  compact: false,
+  details: 'collapsed',
+  detailsCommandOverride: false,
+  reasoningFull: false,
+  sections: {},
+  timestamps: false
+}
 const DEFAULT_FLAGS: Accessor<DisplayFlags> = () => DEFAULTS
 
 const Ctx = createContext<Accessor<DisplayFlags>>()

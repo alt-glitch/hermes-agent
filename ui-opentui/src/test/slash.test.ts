@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
-import type { DetailsMode } from '../logic/details.ts'
+import type { DetailsMode, DetailsSections } from '../logic/details.ts'
 import type { BusyInputMode } from '../logic/busyQueue.ts'
 import {
   buildModelTabs,
@@ -349,6 +349,7 @@ interface Probe {
   dashboard: { value: boolean }
   copied: number[]
   copyN: { value: (n: number) => boolean }
+  copySelection: { value: string | undefined }
   /** The cached /model rows (Epic 7) — seed to simulate a prefetched catalog. */
   modelCache: { value: PickerItem[] | undefined }
   /** Display flags (/compact, /details — Epic 3). */
@@ -402,9 +403,11 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const dashboard = { value: false }
   const copied: number[] = []
   const copyN: Probe['copyN'] = { value: () => false }
+  const copySelection: Probe['copySelection'] = { value: undefined }
   const modelCache: Probe['modelCache'] = { value: undefined }
   const compactFlag: Probe['compactFlag'] = { value: false }
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
+  const detailSections = { value: {} as DetailsSections }
   const timestampsFlag: Probe['timestampsFlag'] = { value: false }
   const reasoningFullFlag: Probe['reasoningFullFlag'] = { value: false }
   const busyMode: Probe['busyMode'] = { value: 'queue' }
@@ -451,6 +454,11 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,
     setDetails: mode => (detailsFlag.value = mode),
+    detailSections: () => detailSections.value,
+    setDetailSection: (section, mode) => {
+      if (mode === null) delete detailSections.value[section]
+      else detailSections.value[section] = mode
+    },
     timestamps: () => timestampsFlag.value,
     setTimestamps: on => (timestampsFlag.value = on),
     reasoningFull: () => reasoningFullFlag.value,
@@ -505,6 +513,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       copied.push(n)
       return copyN.value(n)
     },
+    copySelection: () => copySelection.value,
     logTail: limit => {
       logLimits.push(limit)
       return logLines.value.slice(-limit)
@@ -513,6 +522,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     setBrowserState: (connected, url) => browserStates.push({ connected, ...(url ? { url } : {}) }),
     setVoiceMode: () => {},
     setModelItems: items => (modelCache.value = items),
+    setCurrentModel: () => {},
     openDashboard: () => (dashboard.value = true),
     openBackgroundPanel: () => {},
     openBilling: overlay => billed.push(overlay),
@@ -557,6 +567,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     confirmed,
     copied,
     copyN,
+    copySelection,
     ctx,
     dashboard,
     detailsFlag,
@@ -882,12 +893,15 @@ describe('dispatchSlash — client commands', () => {
     expect(p.busyMode.value).toBe('queue') // status reports; it does not change the live policy
     await dispatchSlash('/busy interrupt', p.ctx)
     expect(p.busyMode.value).toBe('interrupt')
-    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'busy', value: 'interrupt' } }])
-    expect(p.system).toEqual(['busy input mode: queue', 'busy input mode: interrupt'])
+    expect(p.calls).toEqual([
+      { method: 'config.get', params: { key: 'busy' } },
+      { method: 'config.set', params: { key: 'busy', value: 'interrupt' } }
+    ])
+    expect(p.system).toEqual(['busy input mode: steer', 'busy input mode: interrupt'])
 
     await dispatchSlash('/busy drop', p.ctx)
     expect(p.system.at(-1)).toBe('usage: /busy [queue|steer|interrupt|status]')
-    expect(p.calls).toHaveLength(1)
+    expect(p.calls).toHaveLength(2)
 
     const malformed = makeCtx(async () => ({ value: 42 }))
     await dispatchSlash('/busy steer', malformed.ctx)
@@ -1187,7 +1201,7 @@ describe('dispatchSlash — client commands', () => {
   test('/model (bare) opens a GROUPED picker of authenticated providers’ models; pick switches', async () => {
     const p = makeCtx(async method => {
       if (method === 'model.options') return MODEL_OPTIONS
-      return { output: 'switched' }
+      return { value: 'claude-opus-4.6' }
     })
     await dispatchSlash('/model', p.ctx)
     expect(p.pickers).toHaveLength(1)
@@ -1207,16 +1221,37 @@ describe('dispatchSlash — client commands', () => {
     expect(selectable[0]!.current).toBe(true)
     expect(selectable[0]!.label).toBe('claude-sonnet-4.6')
     expect(selectable[1]!.current).toBeUndefined()
-    // picking switches via slash.exec `model <model> --provider <slug>`
+    // picking switches through config.set with session scope
     p.pickers[0]!.onPick('claude-opus-4.6 --provider anthropic')
     await new Promise(r => setTimeout(r, 0))
     expect(
-      p.calls.some(c => c.method === 'slash.exec' && c.params.command === 'model claude-opus-4.6 --provider anthropic')
+      p.calls.some(
+        c =>
+          c.method === 'config.set' &&
+          c.params.value === 'claude-opus-4.6 --provider anthropic' &&
+          c.params.session_id === 'sid-1'
+      )
     ).toBe(true)
   })
 
+  test('/model --refresh busy-guards, refetches, and opens the picker without config.set', async () => {
+    const busy = makeCtx(async () => MODEL_OPTIONS)
+    busy.busy.value = true
+    await dispatchSlash('/model --refresh', busy.ctx)
+    expect(busy.calls).toHaveLength(0)
+    expect(busy.pickers).toHaveLength(0)
+
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : {}))
+    p.modelCache.value = [{ label: 'stale', value: 'stale' }]
+    await dispatchSlash('/model --refresh', p.ctx)
+    expect(p.calls).toEqual([{ method: 'model.options', params: { session_id: 'sid-1' } }])
+    expect(p.calls.some(call => call.method === 'config.set')).toBe(false)
+    expect(p.pickers).toHaveLength(1)
+    expect(p.pickers[0]?.items.some(item => item.label === 'claude-sonnet-4.6')).toBe(true)
+  })
+
   test('/model maps UNCONFIGURED providers to dimmed hint rows (key_env → env-var hint, else warning)', async () => {
-    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     await dispatchSlash('/model', p.ctx)
     const unavailable = p.pickers[0]!.items.filter(i => i.unavailable)
     expect(unavailable).toHaveLength(2)
@@ -1251,7 +1286,7 @@ describe('dispatchSlash — client commands', () => {
   })
 
   test('/model registers the picker refresh seam; running it does ONE RPC and re-syncs the cache', async () => {
-    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     await dispatchSlash('/model', p.ctx)
     const opened = p.calls.filter(c => c.method === 'model.options').length // 1 (uncached open)
     const refreshed = await runPickerRefresh()
@@ -1292,7 +1327,7 @@ describe('dispatchSlash — client commands', () => {
   })
 
   test('/model uncached fetches ONCE, caches, and a pick refreshes the cache', async () => {
-    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     await dispatchSlash('/model', p.ctx)
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(1)
     expect(p.modelCache.value).toHaveLength(5) // first open seeded the cache (3 models + 2 unconfigured hints)
@@ -1300,9 +1335,9 @@ describe('dispatchSlash — client commands', () => {
     // refresh re-fetches model.options so the cached ✓ stays fresh.
     p.pickers[0]!.onPick('hermes-4-405b --provider nous')
     await new Promise(r => setTimeout(r, 0))
-    expect(
-      p.calls.some(c => c.method === 'slash.exec' && c.params.command === 'model hermes-4-405b --provider nous')
-    ).toBe(true)
+    expect(p.calls.some(c => c.method === 'config.set' && c.params.value === 'hermes-4-405b --provider nous')).toBe(
+      true
+    )
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(2)
   })
 
@@ -1326,7 +1361,7 @@ describe('dispatchSlash — client commands', () => {
   })
 
   test('/model registers the provider-tab seam (buildModelTabs); /skills clears it back to stripless', async () => {
-    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     await dispatchSlash('/model', p.ctx)
     // the open picker derives Nous-first tabs through the seam
     expect(pickerTabs(p.pickers[0]!.items)).toEqual(['Nous Research', 'Anthropic'])
@@ -1361,7 +1396,7 @@ describe('dispatchSlash — client commands', () => {
   })
 
   test('/model with a HUNG prefetch still opens via its own fetch after the bound', async () => {
-    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     registerModelPrefetch(p.session.value!, new Promise(() => {}), 10) // never settles; tiny test bound
     await dispatchSlash('/model', p.ctx)
     expect(p.pickers).toHaveLength(1) // fell back to fetching itself
@@ -1369,7 +1404,7 @@ describe('dispatchSlash — client commands', () => {
   })
 
   test('/model after a REJECTED background prefetch falls back to one fetch', async () => {
-    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     startModelPrefetch(p.session.value!, Promise.reject(new Error('background hydration failed')), () => {})
     await dispatchSlash('/model', p.ctx)
     expect(p.pickers).toHaveLength(1)
@@ -1377,7 +1412,7 @@ describe('dispatchSlash — client commands', () => {
   })
 
   test('/model never waits on the predecessor session prefetch', async () => {
-    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     startModelPrefetch('sid-old', new Promise(() => {}), () => {}, 5000)
     p.session.value = 'sid-new'
 
@@ -1397,13 +1432,40 @@ describe('dispatchSlash — client commands', () => {
   })
 
   test('/model <name> switches directly without opening the picker', async () => {
-    const p = makeCtx(async () => ({ output: 'ok' }))
+    const p = makeCtx(async () => ({ value: 'anthropic/claude-opus-4.6' }))
     await dispatchSlash('/model anthropic/claude-opus-4.6', p.ctx)
     expect(p.pickers).toHaveLength(0)
     expect(p.calls[0]).toEqual({
-      method: 'slash.exec',
-      params: { command: 'model anthropic/claude-opus-4.6', session_id: 'sid-1' }
+      method: 'config.set',
+      params: {
+        confirm_expensive_model: false,
+        key: 'model',
+        session_id: 'sid-1',
+        value: 'anthropic/claude-opus-4.6'
+      }
     })
+  })
+
+  test('/model guards busy sessions and confirms an expensive selection before retrying', async () => {
+    const busy = makeCtx(async () => ({ value: 'unused' }))
+    busy.busy.value = true
+    await dispatchSlash('/model claude-opus', busy.ctx)
+    expect(busy.calls).toHaveLength(0)
+
+    const expensive = makeCtx(async (_method, params) =>
+      params.confirm_expensive_model
+        ? { value: 'claude-opus' }
+        : { confirm_message: 'premium pricing', confirm_required: true }
+    )
+    await dispatchSlash('/model claude-opus', expensive.ctx)
+    expect(expensive.confirmed).toHaveLength(1)
+    expect(expensive.confirmed[0]?.request).toMatchObject({ danger: true, detail: 'premium pricing' })
+    expensive.confirmed[0]?.onConfirm()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(expensive.calls.filter(call => call.method === 'config.set').at(-1)?.params.confirm_expensive_model).toBe(
+      true
+    )
+    expect(expensive.system).toContain('model → claude-opus')
   })
 
   test('/copy copies via copyResponse; no system line on success', async () => {
@@ -1414,11 +1476,27 @@ describe('dispatchSlash — client commands', () => {
     expect(p.system).toHaveLength(0)
   })
 
+  test('/copy prefers an active native selection over the latest assistant response', async () => {
+    const p = makeCtx(async () => ({}))
+    p.copySelection.value = 'rendered selection'
+    p.copyN.value = () => true
+    await dispatchSlash('/copy', p.ctx)
+    expect(p.copied).toEqual([])
+    expect(p.system).toContain('copied 18 characters')
+  })
+
   test('/copy 2 passes the n-th index through', async () => {
     const p = makeCtx(async () => ({}))
     p.copyN.value = () => true
     await dispatchSlash('/copy 2', p.ctx)
     expect(p.copied).toEqual([2])
+  })
+
+  test('/copy rejects a non-numeric argument without copying', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/copy nope', p.ctx)
+    expect(p.copied).toEqual([])
+    expect(p.system).toContain('usage: /copy [number]')
   })
 
   test('/copy when nothing to copy pushes a system notice', async () => {
@@ -1445,6 +1523,19 @@ describe('dispatchSlash — client commands', () => {
     expect(p.pickers).toHaveLength(1)
     expect(p.pickers[0]!.title).toBe('Skills')
     expect(p.pickers[0]!.items.map(i => i.value).sort()).toEqual(['ffmpeg', 'firecrawl', 'whisper'])
+  })
+
+  test('/skills subcommands stay on the persistent slash worker and page long output', async () => {
+    const p = makeCtx(async (method, params) => {
+      if (method === 'slash.exec') {
+        expect(params).toEqual({ command: 'skills search terminal ui', session_id: 'sid-1' })
+        return { output: 'one\ntwo\nthree' }
+      }
+      throw new Error('unexpected ' + method)
+    })
+    await dispatchSlash('/skills search terminal ui', p.ctx)
+    expect(p.pickers).toHaveLength(0)
+    expect(p.paged).toEqual([{ title: 'Skills', text: 'one\ntwo\nthree' }])
   })
 
   test('/help renders the cached categorized catalog, skill count, TUI rows, and hotkeys', async () => {

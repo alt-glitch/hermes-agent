@@ -50,6 +50,7 @@ describe('/details — global detail mode drives default expansion (frame)', () 
   test('collapsed (default) → headers only; expanded → tool body + reasoning preview open', async () => {
     const store = createSessionStore()
     seedDetailedTurn(store)
+    store.setDetails('collapsed', true)
     const probe = await mountApp(store)
     try {
       // default: collapsed — tool body lines stay hidden, Thought folded.
@@ -61,13 +62,13 @@ describe('/details — global detail mode drives default expansion (frame)', () 
       expect(collapsed).not.toContain('beta.txt')
 
       // /details expanded → tool body + reasoning preview default-open (no clicks)
-      store.setDetails('expanded')
+      store.setDetails('expanded', true)
       const expanded = await probe.waitForFrame(f => f.includes('beta.txt'))
       expect(expanded).toContain('alpha.txt')
       expect(expanded).toContain('▼ Thought: Plan')
 
       // back to collapsed → bodies fold again
-      store.setDetails('collapsed')
+      store.setDetails('collapsed', true)
       const back = await probe.waitForFrame(f => !f.includes('beta.txt'))
       expect(back).toContain('terminal')
       expect(back).toContain('◐ Thought: Plan')
@@ -79,10 +80,11 @@ describe('/details — global detail mode drives default expansion (frame)', () 
   test('hidden → one muted run line replaces the tool+reasoning rows; flipping back restores', async () => {
     const store = createSessionStore()
     seedDetailedTurn(store)
+    store.setDetails('collapsed', true)
     const probe = await mountApp(store)
     try {
       await probe.waitForFrame(f => f.includes('terminal'))
-      store.setDetails('hidden')
+      store.setDetails('hidden', true)
       // reasoning + tool fold into ONE honest run line
       const hidden = await probe.waitForFrame(f => f.includes('hidden'))
       expect(hidden).toContain('⚡ 1 tool · 1 thought hidden — /details collapsed to show')
@@ -92,10 +94,47 @@ describe('/details — global detail mode drives default expansion (frame)', () 
       expect((store.state.messages.at(-1)!.parts ?? []).map(p => p.type)).toEqual(['reasoning', 'tool', 'text'])
 
       // restore — flipping the mode back brings the rows straight back
-      store.setDetails('collapsed')
+      store.setDetails('collapsed', true)
       const restored = await probe.waitForFrame(f => f.includes('terminal'))
       expect(restored).toContain('◐ Thought: Plan')
       expect(restored).not.toContain('hidden — /details')
+    } finally {
+      probe.destroy()
+    }
+  })
+  test('per-section override hides tools without hiding reasoning, then reset restores the inherited mode', async () => {
+    const store = createSessionStore()
+    seedDetailedTurn(store)
+    store.setDetails('collapsed', true)
+    const probe = await mountApp(store)
+    try {
+      await probe.waitForFrame(frame => frame.includes('terminal'))
+      store.setDetailSection('tools', 'hidden')
+      const toolsHidden = await probe.waitForFrame(frame => frame.includes('1 tool hidden'))
+      expect(toolsHidden).toContain('◐ Thought: Plan')
+      expect(toolsHidden).not.toContain('terminal')
+
+      store.setDetailSection('tools', null)
+      const restored = await probe.waitForFrame(frame => frame.includes('terminal'))
+      expect(restored).not.toContain('1 tool hidden')
+    } finally {
+      probe.destroy()
+    }
+  })
+  test('activity defaults hidden and an explicit override reveals notification cards', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.pushNotification({ id: 'activity-1', kind: 'task.done', level: 'info', text: 'background build finished' })
+    const probe = await mountApp(store)
+    try {
+      await probe.settle()
+      expect(probe.frame()).not.toContain('background build finished')
+      store.setDetailSection('activity', 'collapsed')
+      const visible = await probe.waitForFrame(frame => frame.includes('background build finished'))
+      expect(visible).toContain('background build finished')
+      store.setDetailSection('activity', 'hidden')
+      const hidden = await probe.waitForFrame(frame => !frame.includes('background build finished'))
+      expect(hidden).not.toContain('background build finished')
     } finally {
       probe.destroy()
     }

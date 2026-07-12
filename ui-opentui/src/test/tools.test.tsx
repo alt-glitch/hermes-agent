@@ -79,6 +79,7 @@ describe('tool renderer registry — labeled-args default (Epic 2.2)', () => {
   })
   test('an unmapped MCP-ish tool with nested args renders labeled fields, never raw JSON', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seedTool(
       store,
       { tool_id: 'm1', name: 'mcp_lookup' },
@@ -151,6 +152,7 @@ describe('tool renderer registry — labeled-args default (Epic 2.2)', () => {
 describe('bash tool renderer — command + full output (Epic 2.4)', () => {
   test('collapsed header shows the invoked command VERBATIM (args win over the gateway preview)', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seedTool(
       store,
       // the gateway's one-line preview is truncated — args.command is the truth
@@ -178,6 +180,7 @@ describe('bash tool renderer — command + full output (Epic 2.4)', () => {
 
   test('one-liner that fits the header: expanded body SKIPS the $ echo — just the output (item 3)', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seedTool(
       store,
       { tool_id: 'b2', name: 'terminal' },
@@ -206,6 +209,7 @@ describe('bash tool renderer — command + full output (Epic 2.4)', () => {
 
   test('multi-line command: expanded body KEEPS the $ echo (the header could not show it)', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seedTool(
       store,
       { tool_id: 'b2m', name: 'terminal' },
@@ -346,6 +350,7 @@ describe('file tool renderer — relative path + diff stats (Epic 2.3)', () => {
 
   test('read_file: relpath subtitle; expanded = CONTENT only — limit/offset suppressed (items 1+7)', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     store.apply({ type: 'session.info', payload: { cwd: '/home/u/proj' } })
     seedTool(
       store,
@@ -692,6 +697,7 @@ describe('tool lifecycle states — running / done / failed (Epic 2.5)', () => {
 
   test('failed tool reads as failed from the HEAD GLYPH (✗) and stays expandable when there is a body', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seedTool(
       store,
       { tool_id: 'e1', name: 'terminal', context: 'false' },
@@ -727,6 +733,7 @@ describe('tool lifecycle states — running / done / failed (Epic 2.5)', () => {
 
   test('settled success shows the PER-TOOL glyph ($) collapsed, ▼ expanded + duration (never ✗)', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seedTool(
       store,
       { tool_id: 'k1', name: 'terminal', context: 'ls' },
@@ -944,6 +951,7 @@ describe('redaction precedence — gateway args_text wins over raw args (securit
 
   test('labeled fields render the redacted args_text value, never the raw args secret', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seedTool(
       store,
       // verbose session: tool.start carries the gateway-redacted args_text

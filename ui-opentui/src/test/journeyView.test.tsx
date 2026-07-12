@@ -104,7 +104,7 @@ describe('JourneyOverlay', () => {
     const sized = await mount({}, { height: 20, width: 68 })
     try {
       expect(sized.frameCalls).toEqual([{ cols: 60, rows: 6 }])
-      expect(sized.probe.frame()).toContain("starmap hidden below 80 columns")
+      expect(sized.probe.frame()).toContain('starmap hidden below 80 columns')
       sized.probe.resize(120, 35)
       await sized.probe.settle()
       expect(sized.probe.frame()).toContain('Deploy skill')

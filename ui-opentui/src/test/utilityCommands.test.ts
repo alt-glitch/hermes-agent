@@ -12,10 +12,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import {
   collapseHiddenParts,
+  collapseHiddenPartsBy,
+  compactFromConfig,
+  detailsFromConfig,
   hiddenRunLabel,
   nextDetailsMode,
+  sectionMode,
   parseDetailsMode,
-  type DetailsMode
+  type DetailsMode,
+  type DetailsSections
 } from '../logic/details.ts'
 import { formatBytes, heapSnapshotPath, memReport } from '../logic/diagnostics.ts'
 import type { BusyInputMode } from '../logic/busyQueue.ts'
@@ -47,6 +52,7 @@ interface Probe {
   paged: Array<{ title: string; text: string }>
   compactFlag: { value: boolean }
   detailsFlag: { value: DetailsMode }
+  detailSections: { value: DetailsSections }
   timestampsFlag: { value: boolean }
   reasoningFullFlag: { value: boolean }
   renderables: { value: number | undefined }
@@ -64,6 +70,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const paged: Probe['paged'] = []
   const compactFlag = { value: false }
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
+  const detailSections: Probe['detailSections'] = { value: {} }
   const timestampsFlag = { value: false }
   const reasoningFullFlag = { value: false }
   const busyMode: { value: BusyInputMode } = { value: 'queue' }
@@ -90,7 +97,15 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
     details: () => detailsFlag.value,
-    setDetails: mode => (detailsFlag.value = mode),
+    setDetails: (mode, commandOverride) => {
+      detailsFlag.value = mode
+      if (commandOverride) detailSections.value = { activity: mode, subagents: mode, thinking: mode, tools: mode }
+    },
+    detailSections: () => detailSections.value,
+    setDetailSection: (section, mode) => {
+      if (mode === null) delete detailSections.value[section]
+      else detailSections.value[section] = mode
+    },
     timestamps: () => timestampsFlag.value,
     setTimestamps: on => (timestampsFlag.value = on),
     reasoningFull: () => reasoningFullFlag.value,
@@ -120,9 +135,11 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     renderableCount: () => renderables.value,
     confirm: () => {},
     copyResponse: () => false,
+    copySelection: () => undefined,
     logTail: () => [],
     modelItems: () => undefined,
     setModelItems: () => {},
+    setCurrentModel: () => {},
     openDashboard: () => {},
     openBackgroundPanel: () => {},
     openBilling: () => {},
@@ -150,6 +167,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     compactFlag,
     ctx,
     detailsFlag,
+    detailSections,
     paged,
     renderables,
     reasoningFullFlag,
@@ -348,11 +366,28 @@ describe('/details', () => {
     expect(p.calls).toHaveLength(0)
   })
 
-  test('a gateway-suggested SECTION arg gets the honest deferred notice', async () => {
+  test('/details supports per-section override, reset, and authoritative bare summary', async () => {
+    const p = makeCtx(async method => (method === 'config.get' ? { value: 'collapsed' } : {}))
+    await dispatchSlash('/details tools hidden', p.ctx)
+    expect(p.detailSections.value).toEqual({ tools: 'hidden' })
+    expect(p.calls.at(-1)).toEqual({
+      method: 'config.set',
+      params: { key: 'details_mode.tools', value: 'hidden' }
+    })
+    await dispatchSlash('/details', p.ctx)
+    expect(p.system.at(-1)).toBe('details: collapsed  (tools=hidden)')
+    await dispatchSlash('/details tools reset', p.ctx)
+    expect(p.detailSections.value).toEqual({})
+    expect(p.calls.at(-1)).toEqual({
+      method: 'config.set',
+      params: { key: 'details_mode.tools', value: '' }
+    })
+  })
+
+  test('/details section rejects invalid mode with section-specific usage', async () => {
     const p = makeCtx(async () => ({}))
-    await dispatchSlash('/details thinking expanded', p.ctx)
-    expect(p.system[0]).toContain('per-section detail overrides are not supported')
-    expect(p.detailsFlag.value).toBe('collapsed')
+    await dispatchSlash('/details thinking loud', p.ctx)
+    expect(p.system).toEqual(['usage: /details <thinking|tools|subagents|activity> <hidden|collapsed|expanded|reset>'])
     expect(p.calls).toHaveLength(0)
   })
 
@@ -604,6 +639,25 @@ describe('/heapdump', () => {
 })
 
 describe('details logic (pure)', () => {
+  test('compactFromConfig mirrors Ink truthiness for the persisted compact flag', () => {
+    expect(compactFromConfig({ display: { tui_compact: true } })).toBe(true)
+    expect(compactFromConfig({ display: { tui_compact: false } })).toBe(false)
+    expect(compactFromConfig({ display: { tui_compact: 'true' } })).toBe(true)
+    expect(compactFromConfig({})).toBe(false)
+  })
+
+  test('detailsFromConfig hydrates global mode and only validated section overrides', () => {
+    expect(
+      detailsFromConfig({
+        display: {
+          details_mode: 'expanded',
+          sections: { activity: 'hidden', thinking: 'loud', tools: 'collapsed', future: 'hidden' }
+        }
+      })
+    ).toEqual({ mode: 'expanded', sections: { activity: 'hidden', tools: 'collapsed' } })
+    expect(detailsFromConfig({ display: { thinking_mode: 'full' } })).toEqual({ mode: 'expanded', sections: {} })
+  })
+
   test('parseDetailsMode + nextDetailsMode', () => {
     expect(parseDetailsMode(' Expanded ')).toBe('expanded')
     expect(parseDetailsMode('nope')).toBeNull()
@@ -626,6 +680,23 @@ describe('details logic (pure)', () => {
     expect(out[0]).toBe(parts[0]) // identity preserved → no remount of text parts
     expect(out[1]).toMatchObject({ id: 'hidden-p2', thoughts: 1, tools: 2 })
     expect(out[3]).toMatchObject({ thoughts: 0, tools: 1 })
+  })
+
+  test('sectionMode follows explicit override → global command → built-in default → global config', () => {
+    expect(sectionMode('tools', 'collapsed', { tools: 'hidden' })).toBe('hidden')
+    expect(sectionMode('tools', 'hidden', {}, true)).toBe('hidden')
+    expect(sectionMode('tools', 'collapsed', {})).toBe('expanded')
+    expect(sectionMode('subagents', 'collapsed', {})).toBe('collapsed')
+  })
+
+  test('collapseHiddenPartsBy folds only hidden sections and preserves visible boundaries', () => {
+    const parts: Part[] = [
+      { id: 'r', text: 'thought', type: 'reasoning' },
+      { id: 't', name: 'bash', state: 'complete', type: 'tool' }
+    ]
+    const out = collapseHiddenPartsBy(parts, section => section === 'tools')
+    expect(out.map(part => part.type)).toEqual(['reasoning', 'hiddenRun'])
+    expect(out[1]).toMatchObject({ thoughts: 0, tools: 1 })
   })
 
   test('hiddenRunLabel pluralizes honestly and points back to /details', () => {

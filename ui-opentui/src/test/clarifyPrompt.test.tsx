@@ -160,6 +160,45 @@ describe('ClarifyPrompt (F5/F6)', () => {
     }
   })
 
+  test('number keys quick-pick choices, with 0 selecting the tenth', async () => {
+    const answers: string[] = []
+    const first = await mount(['Alpha', 'Beta'], answer => answers.push(answer))
+    try {
+      first.keys.pressKey('2')
+      await first.settle()
+      expect(answers).toEqual(['Beta'])
+    } finally {
+      first.destroy()
+    }
+
+    const tenth = await mount(
+      Array.from({ length: 10 }, (_, index) => `Choice ${index + 1}`),
+      answer => answers.push(answer)
+    )
+    try {
+      tenth.keys.pressKey('0')
+      await tenth.settle()
+      expect(answers).toEqual(['Beta', 'Choice 10'])
+    } finally {
+      tenth.destroy()
+    }
+  })
+
+  test('digits remain custom input when the inline input is selected', async () => {
+    let answered: string | undefined
+    const h = await mount(['Only choice'], answer => (answered = answer))
+    try {
+      h.keys.pressArrow('down')
+      await h.settle()
+      await h.keys.typeText('123')
+      h.keys.pressEnter()
+      await h.settle()
+      expect(answered).toBe('123')
+    } finally {
+      h.destroy()
+    }
+  })
+
   test('Down past the last choice lands on the custom input; Enter sends typed text', async () => {
     let answered: string | undefined
     const h = await mount(['Only choice'], a => (answered = a))

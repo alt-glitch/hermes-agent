@@ -4,10 +4,12 @@
  * the store's `Message[]`. Each history entry is either `{role, text}` (user/
  * assistant/system) or `{role:'tool', name, context}` (NO text — render it).
  *
- * Tool rows are folded into the PRECEDING assistant turn's ordered `parts[]`
- * (state:'complete', summary=context) so a resumed transcript renders inline like
- * a live one. Resumed assistant text is given a single text part so it renders
- * through the native markdown path. IDs are `r*` (distinct from live `p*`).
+ * Tool rows are buffered and folded into the FOLLOWING visible assistant turn's
+ * ordered `parts[]`, matching Ink's canonical `toTranscriptMessages`: persisted
+ * tool-call assistant placeholders are omitted by the gateway, so their tool
+ * results precede the final assistant answer in resume history. Resumed assistant
+ * text is given a text part after that tool trail so it renders in live order.
+ * IDs are `r*` (distinct from live `p*`).
  */
 import type { Message, Part, SessionItem, ToolPartState } from './store.ts'
 import { stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
@@ -101,7 +103,7 @@ export function mapResumeHistory(history: unknown): Message[] {
   const out: Message[] = []
   let seq = 0
   const id = () => `r${++seq}`
-  let currentAssistant: Message | undefined
+  let pendingTools: ToolPartState[] = []
   const toolCalls = new Map<string, RawToolCall>()
 
   for (const raw of history) {
@@ -136,27 +138,29 @@ export function mapResumeHistory(history: unknown): Message[] {
           /* unstringifiable — leave unset */
         }
       }
-      if (!currentAssistant) {
-        currentAssistant = { role: 'assistant', text: '', parts: [] }
-        if (ts !== undefined) currentAssistant.timestamp = ts
-        out.push(currentAssistant)
-      }
-      ;(currentAssistant.parts ??= []).push(tool)
+      pendingTools.push(tool)
       continue
     }
 
     const text = readContent(raw)
     if (role === 'assistant') {
       rememberToolCalls(raw, toolCalls)
-      const parts: Part[] = text ? [{ type: 'text', id: id(), text }] : []
-      currentAssistant = { role: 'assistant', text, parts }
-      if (ts !== undefined) currentAssistant.timestamp = ts
-      out.push(currentAssistant)
+      // The gateway omits empty assistant tool-call placeholders. Keep this
+      // guard for raw/malformed snapshots too: they may carry correlation data,
+      // but must not create a second visible transcript row.
+      if (!text.trim()) continue
+      const parts: Part[] = [...pendingTools, { type: 'text', id: id(), text }]
+      const assistant: Message = { role: 'assistant', text, parts }
+      if (ts !== undefined) assistant.timestamp = ts
+      out.push(assistant)
+      pendingTools = []
     } else if (role === 'user' || role === 'system') {
       const msg: Message = { role, text }
       if (ts !== undefined) msg.timestamp = ts
       out.push(msg)
-      currentAssistant = undefined
+      // A user/system boundary makes a pending tool trail malformed. Ink drops
+      // it rather than attaching it across turns or synthesising a holder row.
+      pendingTools = []
     }
   }
 

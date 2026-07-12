@@ -1271,6 +1271,32 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     expect(store.state.busyInputMode).toBe('steer')
   })
 
+  test('late compact hydration cannot overwrite a newer /compact command', () => {
+    const store = createSessionStore()
+    const revision = store.getCompactRevision()
+    store.setCompact(true)
+    expect(store.hydrateCompact(false, revision)).toBe(false)
+    expect(store.state.compact).toBe(true)
+
+    const current = store.getCompactRevision()
+    expect(store.hydrateCompact(false, current)).toBe(true)
+    expect(store.state.compact).toBe(false)
+  })
+
+  test('late details hydration cannot overwrite a newer /details command', () => {
+    const store = createSessionStore()
+    const revision = store.getDetailsRevision()
+    store.setDetailSection('tools', 'hidden')
+    expect(store.hydrateDetails('expanded', { activity: 'expanded' }, revision)).toBe(false)
+    expect(store.state.detailsSections).toEqual({ tools: 'hidden' })
+
+    const current = store.getDetailsRevision()
+    expect(store.hydrateDetails('expanded', { activity: 'collapsed' }, current)).toBe(true)
+    expect(store.state.details).toBe('expanded')
+    expect(store.state.detailsCommandOverride).toBe(false)
+    expect(store.state.detailsSections).toEqual({ activity: 'collapsed' })
+  })
+
   test('lastUserMessage + trimLastExchange mirror Ink trailing-exchange semantics', () => {
     const store = createSessionStore()
     store.pushSystem('intro')

@@ -30,6 +30,7 @@ import { useDimensions } from './dimensions.tsx'
 import { useDisplay } from './display.tsx'
 import { createSignal, Show } from 'solid-js'
 
+import { sectionMode } from '../logic/details.ts'
 import { argsCapColumns, truncate } from '../logic/toolOutput.ts'
 import { elapsedSeconds, useElapsedTick } from './elapsed.ts'
 import { useScrollAnchor } from './scrollAnchor.tsx'
@@ -104,7 +105,9 @@ export function ToolPart(props: { part: ToolPartState }) {
   // /details expanded → settled bodies default-OPEN; a manual click overrides
   // either way (and a later global flip applies again to un-overridden parts).
   const [override, setOverride] = createSignal<boolean | undefined>(undefined)
-  const expanded = () => override() ?? display().details === 'expanded'
+  const expanded = () =>
+    override() ??
+    sectionMode('tools', display().details, display().sections, display().detailsCommandOverride) === 'expanded'
   const toggle = () => anchor(() => setOverride(!expanded()))
 
   // Per-tool renderer (re-dispatches if the name settles on tool.complete).

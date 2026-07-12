@@ -5,6 +5,7 @@ import {
   decodeConfigValueResponse,
   decodeConfigFullResponse,
   decodeConfigMtimeResponse,
+  decodeModelSwitchResponse,
   decodeCommandsCatalogResponse,
   decodeReloadEnvResponse,
   decodeReloadMcpResponse,
@@ -31,6 +32,16 @@ describe('session-maintenance RPC Effect boundaries', () => {
       message: 'confirm'
     })
     expect(decodeConfigValueResponse({ value: 'queue' })).toEqual({ value: 'queue' })
+    expect(
+      decodeModelSwitchResponse({
+        confirm_message: 'premium pricing',
+        confirm_required: true,
+        warning: 'high cost'
+      })
+    ).toEqual({ confirm_message: 'premium pricing', confirm_required: true, warning: 'high cost' })
+    expect(decodeModelSwitchResponse({ value: 'anthropic/claude-opus' })).toEqual({
+      value: 'anthropic/claude-opus'
+    })
     expect(decodeConfigFullResponse({ config: { display: { busy_input_mode: 'steer' } } })).toEqual({
       config: { display: { busy_input_mode: 'steer' } }
     })

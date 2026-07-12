@@ -226,7 +226,7 @@ function ctxBar(pct: number, width: number): string {
   return '█'.repeat(filled) + '░'.repeat(width - filled)
 }
 
-export function StatusBar(props: { store: SessionStore }) {
+export function StatusBar(props: { store: SessionStore; subagentsVisible?: boolean }) {
   const theme = useTheme()
   const dims = useDimensions()
   const info = () => props.store.state.info
@@ -345,12 +345,18 @@ export function StatusBar(props: { store: SessionStore }) {
   // older gateways.
   // The tray no longer keeps a persistent collapsed line under the composer —
   // Down still expands it; this chip is the at-a-glance signal.
-  const activeSubagents = createMemo(() => props.store.activeSubagentCount())
+  const activeSubagents = createMemo(() =>
+    props.subagentsVisible === false ? { count: 0, source: 'local' as const } : props.store.activeSubagentCount()
+  )
   const agentsText = createMemo(() => {
     const n = activeSubagents().count
     return segs().agents && n > 0 ? `⛓ ${n}` : ''
   })
-  const spawnHud = createMemo(() => spawnHudModel(props.store.state.subagents, props.store.state.delegation))
+  const spawnHud = createMemo(() =>
+    props.subagentsVisible === false
+      ? { text: '', tone: 'muted' as const }
+      : spawnHudModel(props.store.state.subagents, props.store.state.delegation)
+  )
   const spawnHudColor = () => {
     const tone = spawnHud().tone
     return tone === 'error' ? theme().color.error : tone === 'warn' ? theme().color.warn : theme().color.muted

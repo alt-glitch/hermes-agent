@@ -39,7 +39,7 @@ import { startMemlog } from '../boundary/memlog.ts'
 import { startMemoryMonitor } from '../boundary/memoryMonitor.ts'
 import { startProactiveGc } from '../boundary/proactiveGc.ts'
 import { registerRemoteParsers } from '../boundary/parsers.ts'
-import { acquireRenderer, redrawRenderer } from '../boundary/renderer.ts'
+import { acquireRenderer, redrawRenderer, selectionCopyText } from '../boundary/renderer.ts'
 import { decodeSubagentInterruptResponse } from '../boundary/schema/Delegation.ts'
 import {
   attachedImageNotice,
@@ -66,6 +66,7 @@ import {
   resumeSession
 } from '../boundary/sessionLifecycle.ts'
 import { configSyncBlocked, createConfigSyncTracker, mcpReloadSucceeded } from '../logic/configSync.ts'
+import { compactFromConfig, detailsFromConfig } from '../logic/details.ts'
 import {
   createDelegationStatusRefresher,
   createSpawnTreeSaveDrainer,
@@ -326,6 +327,8 @@ const postSessionSetup = (
   Effect.gen(function* () {
     const isActive = () => gateway.sessionId() === sid && store.state.sessionId === sid
     const busyModeRevision = store.getBusyInputModeRevision()
+    const compactRevision = store.getCompactRevision()
+    const detailsRevision = store.getDetailsRevision()
 
     // Claim model hydration for this SID before the first async yield. Session
     // transitions clear the previous claim, so an immediate `/model` can only
@@ -383,6 +386,9 @@ const postSessionSetup = (
     const decodedBusyConfig = decodeConfigFullResponse(busyConfig)
     if (isActive() && decodedBusyConfig) {
       store.hydrateBusyInputMode(busyInputModeFromConfig(decodedBusyConfig.config), busyModeRevision)
+      store.hydrateCompact(compactFromConfig(decodedBusyConfig.config), compactRevision)
+      const details = detailsFromConfig(decodedBusyConfig.config)
+      store.hydrateDetails(details.mode, details.sections, detailsRevision)
       store.configureAgentsNudge(tuiAgentsNudgeConfigValue(decodedBusyConfig.config))
       store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedBusyConfig.config) })
     }
@@ -954,6 +960,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               const plan = configSync.plan(nextMtime, configSyncBlocked(isTurnBusy(), isSessionTransitioning()))
               if (!plan) return
               const busyModeRevision = store.getBusyInputModeRevision()
+              const compactRevision = store.getCompactRevision()
+              const detailsRevision = store.getDetailsRevision()
 
               if (plan.reload) {
                 const reload = yield* gateway
@@ -970,6 +978,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               if (!decodedConfig || !active) return
 
               store.hydrateBusyInputMode(busyInputModeFromConfig(decodedConfig.config), busyModeRevision)
+              store.hydrateCompact(compactFromConfig(decodedConfig.config), compactRevision)
+              const details = detailsFromConfig(decodedConfig.config)
+              store.hydrateDetails(details.mode, details.sections, detailsRevision)
               store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedConfig.config) })
               if (configSync.completeHydration(plan, true) && plan.kind === 'change') {
                 store.pushSystem('MCP reloaded after config change')
@@ -2309,7 +2320,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         compact: () => store.state.compact,
         setCompact: on => store.setCompact(on),
         details: () => store.state.details,
-        setDetails: mode => store.setDetails(mode),
+        setDetails: (mode, commandOverride) => store.setDetails(mode, commandOverride),
+        detailSections: () => store.state.detailsSections,
+        setDetailSection: (section, mode) => store.setDetailSection(section, mode),
         timestamps: () => store.state.timestamps,
         setTimestamps: on => store.setTimestamps(on),
         reasoningFull: () => store.state.reasoningFull,
@@ -2394,8 +2407,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           flashHint(n > 1 ? `Copied response #${n} to clipboard` : 'Copied response to clipboard')
           return true
         },
+        copySelection: () => {
+          const selection = renderer.getSelection()
+          const text = selection ? selectionCopyText(selection) : ''
+          if (!text) return undefined
+          void writeClipboard(text)
+          return text
+        },
         modelItems: () => store.state.modelItems,
         setModelItems: items => store.setModelItems(items),
+        setCurrentModel: model => store.applyInfo({ model }),
         setBrowserState: (connected, url) => store.setBrowserState({ connected, ...(url ? { url } : {}) }),
         setVoiceMode: patch => store.setVoiceMode(patch),
         logTail: limit => gateway.logTail(limit),

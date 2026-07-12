@@ -274,7 +274,7 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
             <text>
               {visual()?.categories?.map((item, index) => (
                 <span style={{ fg: item.color || theme().color.muted }}>
-                  {index ? "  " : ""}
+                  {index ? '  ' : ''}
                   {item.glyph} {item.label}
                 </span>
               ))}

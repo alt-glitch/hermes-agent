@@ -29,6 +29,14 @@ export type ReloadMcpResponse = typeof ReloadMcpResponseSchema.Type
 export const ConfigValueResponseSchema = Schema.Struct({ value: Str })
 export type ConfigValueResponse = typeof ConfigValueResponseSchema.Type
 
+export const ModelSwitchResponseSchema = Schema.Struct({
+  confirm_message: opt(Str),
+  confirm_required: opt(Schema.Boolean),
+  value: opt(Str),
+  warning: opt(Str)
+})
+export type ModelSwitchResponse = typeof ModelSwitchResponseSchema.Type
+
 export const ConfigFullResponseSchema = Schema.Struct({
   config: Schema.Record(Str, Schema.Unknown)
 })
@@ -84,6 +92,7 @@ const decodeSave = Schema.decodeUnknownOption(SessionSaveResponseSchema)
 const decodeReloadEnv = Schema.decodeUnknownOption(ReloadEnvResponseSchema)
 const decodeReloadMcp = Schema.decodeUnknownOption(ReloadMcpResponseSchema)
 const decodeConfigValue = Schema.decodeUnknownOption(ConfigValueResponseSchema)
+const decodeModelSwitch = Schema.decodeUnknownOption(ModelSwitchResponseSchema)
 const decodeConfigFull = Schema.decodeUnknownOption(ConfigFullResponseSchema)
 const decodeConfigMtime = Schema.decodeUnknownOption(ConfigMtimeResponseSchema)
 const decodeSessionSteer = Schema.decodeUnknownOption(SessionSteerResponseSchema)
@@ -107,6 +116,8 @@ export const decodeReloadMcpResponse = (value: unknown): ReloadMcpResponse | und
 
 export const decodeConfigValueResponse = (value: unknown): ConfigValueResponse | undefined =>
   some(decodeConfigValue(value))
+export const decodeModelSwitchResponse = (value: unknown): ModelSwitchResponse | undefined =>
+  some(decodeModelSwitch(value))
 
 export const decodeConfigFullResponse = (value: unknown): ConfigFullResponse | undefined =>
   some(decodeConfigFull(value))

@@ -1,4 +1,4 @@
-"""Harness: the image ships a prebuilt TUI bundle, not a runtime npm install.
+"""Harness: the image ships both production TUI engines.
 
 Regression guard for the hosted-chat failure where the embedded dashboard
 Chat tab died with a 502 / "[session ended]". Root cause: the image installs
@@ -12,7 +12,7 @@ concurrent /api/pty connections → ENOTEMPTY.
 The fix is ``ENV HERMES_TUI_DIR=/opt/hermes/ui-tui`` in the Dockerfile, which
 makes the launcher take the prebuilt-bundle fast path (``node --expose-gc
 .../dist/entry.js``) and skip the install check entirely. These tests assert
-that invariant holds in the built image.
+that Ink fallback invariant plus OpenTUI's automatic native launch contract.
 """
 from __future__ import annotations
 
@@ -77,3 +77,46 @@ def test_prebuilt_bundle_present_and_no_runtime_install(built_image: str) -> Non
     assert "npm" not in out["argv"][0].lower(), (
         f"launcher resolved to an npm invocation, not the prebuilt bundle: {out['argv']!r}"
     )
+
+
+def test_opentui_baked_runtime_and_automatic_selection(built_image: str) -> None:
+    """The supported Linux image selects its baked OpenTUI runtime without npm."""
+    py = (
+        "import json, os, platform\n"
+        "from pathlib import Path\n"
+        "os.environ.pop('HERMES_TUI_ENGINE', None)\n"
+        "os.environ['HERMES_HOME'] = '/tmp/hermes-release-contract'\n"
+        "from hermes_cli.main import _make_opentui_argv, _resolve_tui_engine\n"
+        "root = Path('/opt/hermes/ui-opentui')\n"
+        "argv, cwd = _make_opentui_argv(tui_dev=False)\n"
+        "arch = {'x86_64': 'linux-x64', 'aarch64': 'linux-arm64'}[platform.machine()]\n"
+        "native = root / 'node_modules' / ('@opentui/core-' + arch)\n"
+        "print(json.dumps({\n"
+        "  'engine': _resolve_tui_engine(),\n"
+        "  'cwd': str(cwd),\n"
+        "  'argv': argv,\n"
+        "  'bundle': (root / 'dist/main.js').is_file(),\n"
+        "  'native': native.is_dir(),\n"
+        "}))\n"
+    )
+    out = json.loads(_exec_py(built_image, py))
+    assert out["engine"] == "opentui"
+    assert out["cwd"] == "/opt/hermes/ui-opentui"
+    assert out["bundle"] and out["native"]
+    assert out["argv"][1:4] == ["--experimental-ffi", "--no-warnings", "--expose-gc"]
+    assert out["argv"][-1] == "/opt/hermes/ui-opentui/dist/main.js"
+
+
+def test_opentui_node_can_load_host_native_library(built_image: str) -> None:
+    """Load the pruned native package before a separate real-PTY smoke."""
+    script = "import('@opentui/core').then(() => process.stdout.write('ok'))"
+    r = subprocess.run(
+        [
+            "docker", "run", "--rm", "--entrypoint", "sh", built_image, "-c",
+            "cd /opt/hermes/ui-opentui && node --experimental-ffi --no-warnings "
+            f"-e {shlex.quote(script)}",
+        ],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert r.stdout == "ok"

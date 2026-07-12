@@ -76,9 +76,10 @@
  * `windowRowStats`) — exposed on `globalThis.__hermesTuiWindowStats` when
  * HERMES_TUI_WINDOW_STATS is set, asserted bounded by the headless tests.
  *
- * Known S2 limits (documented, deferred): /compact·/details toggles and width
- * resizes leave out-of-window spacer heights stale until remount or the idle
- * march (resize invalidation is S3, design §5). A discrete scroll jump larger
+ * Width and display-mode changes invalidate the exactness of off-window
+ * heights without changing the spacer height currently occupying layout. The
+ * idle measure march then refreshes those rows; every delta still obeys the
+ * same-frame correction law below. A discrete scroll jump larger
  * than the margin in one frame remounts a mis-estimated row already inside
  * the viewport — the in-viewport correction is forbidden (jank rule), so that
  * single user-caused frame absorbs the estimate error (the design's accepted
@@ -197,6 +198,11 @@ export function Transcript(props: { store: SessionStore }) {
   // wrapper's onSizeChange value; includes the row's margins). Non-reactive:
   // spacers read it once at swap time, the frame driver reads it per compute.
   const heights = new Map<number, number>()
+  // Keys whose previous exact height belongs to an older width/display-mode
+  // layout. Keep the old occupied height in `heights` so invalidation itself
+  // cannot move the viewport; treat it as unmeasured for adjudication and let
+  // the ordinary idle/remount correction path replace it without jank.
+  const staleHeights = new Set<number>()
   // key → the height the LAYOUT currently occupies for the row (real or
   // spacer/estimate — whatever the wrapper last laid out at). The S2 spacer-
   // correction compares a fresh measurement against this to compute the delta
@@ -268,6 +274,8 @@ export function Transcript(props: { store: SessionStore }) {
   let lastScrollTop = -1
   let lastActivityAt = Date.now()
   let lastPulseAt = 0
+  let lastViewportWidth = -1
+  let lastDisplayFingerprint = ''
   let measureBatch: ReadonlySet<number> = new Set<number>()
   const idleMs = measureIdleDelayMs(process.env.HERMES_TUI_WINDOW_IDLE_MS)
   const tick = (force = false): void => {
@@ -306,16 +314,42 @@ export function Transcript(props: { store: SessionStore }) {
     const viewportHeight = sb.viewport.height
     if (viewportHeight <= 0) return
     const messages = props.store.state.messages
+    const viewportWidth = sb.viewport.width
+    const sections = props.store.state.detailsSections
+    const displayFingerprint = [
+      props.store.state.compact ? '1' : '0',
+      props.store.state.details,
+      props.store.state.detailsCommandOverride ? '1' : '0',
+      sections.thinking ?? '',
+      sections.tools ?? '',
+      sections.subagents ?? '',
+      sections.activity ?? ''
+    ].join('|')
+    if (
+      (lastViewportWidth >= 0 && viewportWidth !== lastViewportWidth) ||
+      (lastDisplayFingerprint && displayFingerprint !== lastDisplayFingerprint)
+    ) {
+      // Mounted rows are re-laid out by OpenTUI and their onSizeChange refreshes
+      // the cache. Only off-window rows need explicit invalidation.
+      for (const key of heights.keys()) if (!mountedNow(key)) staleHeights.add(key)
+      estimates.clear()
+      anchor = null
+      lastActivityAt = Date.now()
+      force = true
+    }
+    lastViewportWidth = viewportWidth
+    lastDisplayFingerprint = displayFingerprint
     // Idle measure pull: a batch row whose mount landed at EXACTLY the spacer
     // height fires no onSizeChange — read its post-layout height directly so
     // the march advances past it. (Batch publishes happen only in frame-
     // callback ticks, so by ANY later tick the batch's layout has run.)
     for (const key of measureBatch) {
-      if (heights.has(key) || !mountedNow(key)) continue
+      if ((heights.has(key) && !staleHeights.has(key)) || !mountedNow(key)) continue
       const wrapper = wrappers.get(key)
       const h = wrapper?.height ?? 0
       if (h > 0) {
         heights.set(key, h)
+        staleHeights.delete(key)
         assumed.set(key, h)
       }
     }
@@ -337,17 +371,20 @@ export function Transcript(props: { store: SessionStore }) {
     const pulseDue =
       !force &&
       !running &&
-      heights.size < messages.length &&
+      heights.size - staleHeights.size < messages.length &&
       now - lastActivityAt >= idleMs &&
       now - lastPulseAt >= idleMs
     if (!force && !countChanged && !heightMoved && !scrolled && !pulseDue) return
     const rows = messages.map((message, i) => {
       const key = keyOf(message)
-      const height = heights.get(key) ?? null
+      const occupied = heights.get(key)
+      const height = occupied !== undefined && !staleHeights.has(key) ? occupied : null
       return {
         key,
         height,
-        estimate: height === null ? estimateFor(message, key) : undefined,
+        // A stale exact height remains the least disruptive spacer estimate:
+        // invalidation changes no layout until a legal measured correction.
+        estimate: height === null ? (occupied ?? estimateFor(message, key)) : undefined,
         // Never window: a streaming row (remount would restart native markdown
         // streaming) and the last row while a turn runs (deltas land there).
         // A row with an expanded tool/reasoning body is NOT detectable from
@@ -378,6 +415,7 @@ export function Transcript(props: { store: SessionStore }) {
       for (const map of [heights, assumed, defaults, estimates]) {
         for (const key of map.keys()) if (!known.has(key)) map.delete(key)
       }
+      for (const key of staleHeights) if (!known.has(key)) staleHeights.delete(key)
     }
     // Idle measure batch: mount the next never-measured rows nearest the
     // window edge. The previous batch stays mounted until the NEXT pulse
@@ -389,7 +427,7 @@ export function Transcript(props: { store: SessionStore }) {
     if (pulseDue) {
       batch = new Set(edgeMeasureBatch(rows, result.mounted, MEASURE_BATCH_ROWS))
       lastPulseAt = now
-    } else if (heights.size < messages.length) {
+    } else if (heights.size - staleHeights.size < messages.length) {
       for (const key of measureBatch) if (known.has(key)) batch.add(key)
     }
     measureBatch = batch
@@ -442,7 +480,10 @@ export function Transcript(props: { store: SessionStore }) {
       if (h <= 0) return
       // Record the exact height only while the REAL row is mounted — a
       // spacer's (estimate's) height must never overwrite the measurement.
-      if (mountedNow(key)) heights.set(key, h)
+      if (mountedNow(key)) {
+        heights.set(key, h)
+        staleHeights.delete(key)
+      }
       const prev = assumed.get(key)
       assumed.set(key, h)
       if (prev === undefined || prev === h) return
@@ -513,6 +554,8 @@ export function Transcript(props: { store: SessionStore }) {
             flags={() => ({
               compact: props.store.state.compact,
               details: props.store.state.details,
+              detailsCommandOverride: props.store.state.detailsCommandOverride,
+              sections: props.store.state.detailsSections,
               timestamps: props.store.state.timestamps,
               reasoningFull: props.store.state.reasoningFull
             })}

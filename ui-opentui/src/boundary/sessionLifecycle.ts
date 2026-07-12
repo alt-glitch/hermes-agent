@@ -365,7 +365,13 @@ export const branchSession = Effect.fn('SessionLifecycle.branch')(function* (
       ),
       Effect.catchCause(() => Effect.sync(() => (closeFailed = true)))
     )
-    return { childSessionId, closeFailed: Boolean(closeFailed), parentSessionId, resumeId, title: response.title.trim() } as const
+    return {
+      childSessionId,
+      closeFailed: Boolean(closeFailed),
+      parentSessionId,
+      resumeId,
+      title: response.title.trim()
+    } as const
   }).pipe(
     Effect.ensuring(
       Effect.sync(() => {

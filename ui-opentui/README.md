@@ -1,9 +1,10 @@
 # ui-opentui — native OpenTUI engine for Hermes
 
 Solid + `@opentui/core@0.4.1` over Node FFI, with Effect 4 only at transport and
-resource boundaries. Ink (`ui-tui/`) remains the fallback while the canonical
-f7c9 parity ledger is closed; current status and release blockers live in
-`../docs/opentui-parity-matrix.md`.
+resource boundaries. This is the production v1 TUI on supported hosts; Ink
+(`ui-tui/`) remains the supported fallback. Current parity lives in
+`../docs/opentui-parity-matrix.md`; the final local gate and benchmark record is
+`../docs/opentui-release-evidence-f7c9.md`.
 
 ## Node 26 setup (required; will not touch your other projects)
 
@@ -83,13 +84,29 @@ Run `npm run check`, a production build, and one adversarial review over the
 combined feature-category diff. Run startup/hydration/RSS/renderable/CPU and
 repeated-cycle leak measurements once, at the final parity gate. Memory/perf
 benchmarks live in the **tui-bench** repo
-(`github.com/NousResearch/tui-bench`; see its README). Transcript windowing is
+(`github.com/NousResearch/tui-bench`; see its README). The retained f7c9 run
+filenames, medians, quality gates, and live-smoke caveat are recorded in
+`../docs/opentui-release-evidence-f7c9.md`. Transcript windowing is
 documented in `../docs/plans/opentui-transcript-windowing.md`.
 
 The universal wheel ships a portable source/bundle/lock seed, not native
 `node_modules`. A cold OpenTUI activation therefore needs Node 26 and npm
 registry access; strict offline parity with the prebundled Ink engine requires
 platform-specific artifacts or bundled npm tarballs.
+
+## Support and rollback policy
+
+- OpenTUI is supported on Linux and macOS, x64 and arm64, with Node 26.3 or
+  newer. Hermes selects it automatically when its verified runtime is present.
+- Windows and Termux remain supported through Ink because the required Node FFI
+  runtime is unavailable there. Ink is also the recovery path on any host:
+  `HERMES_TUI_ENGINE=ink hermes` for one launch, or set
+  `display.tui_engine: ink` in `~/.hermes/config.yaml` persistently.
+- Both engines use the same Python gateway and session store. Rolling back the
+  renderer does not migrate, rewrite, or discard conversation history.
+- To return to OpenTUI, remove the persistent override (or set it to
+  `opentui`) and run `hermes`; runtime validation/build failures fail clearly
+  and leave Ink available for recovery.
 
 ## Local UX contracts
 
@@ -103,6 +120,10 @@ platform-specific artifacts or bundled npm tarballs.
 - `/logs [n]` reads a bounded gateway-transport ring with lifecycle, stderr,
   protocol, and RPC error/timeout/write diagnostics; oversized lines carry a
   truncation marker.
+- Width/detail changes invalidate off-window height generations while preserving
+  byte-stable visible corrections. External config refresh revision-fences
+  compact/details/section changes; bell, inline-diff, paste-threshold, and
+  streaming fan-out remain explicit product decisions.
 - Hosted dashboard mode is internal launcher plumbing
   (`HERMES_TUI_DASHBOARD=1`): exits/updates are refused and idle Ctrl+C or
   action+D requests a fresh browser chat through the existing event sidecar.
@@ -137,9 +158,10 @@ platform-specific artifacts or bundled npm tarballs.
   `node scripts/build.mjs scripts/queue-bench.tsx .bench`, then
   `node --experimental-ffi --expose-gc --no-warnings .bench/queue-bench.js`.
 
-Parity status is intentionally **Thinner** for `/queue`, `/steer`, `/busy`,
-`/undo`, `/retry`, and the aggregate Busy Queue UX until the real-PTY comparison
-passes. Queued entries are currently always sent as model prompts: unlike Ink,
+Parity status is intentionally **Thinner** for `/queue`, `/steer`, and the
+aggregate Busy Queue UX because their bounded/provenance and delivery-admission
+divergences are accepted production decisions. Queued entries are currently always sent as model
+prompts: unlike Ink,
 the engine will not reinterpret a queued `!command`, slash-like string, or
 flattened skill body as executable local syntax until the queue has typed
 provenance. See `../docs/opentui-parity-matrix.md` for the canonical ledger.

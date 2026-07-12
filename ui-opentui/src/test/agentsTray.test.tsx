@@ -156,6 +156,22 @@ describe('agents tray — visibility', () => {
     }
   })
 
+  test('subagents hidden suppresses both the delegation HUD and agents tray', async () => {
+    const h = await mountApp()
+    try {
+      spawn(h.store, 'a1', 'research X')
+      await h.probe.waitForFrame(frame => frame.includes('⛓ 1'))
+      h.store.setDetailSection('subagents', 'hidden')
+      const hidden = await h.probe.waitForFrame(frame => !frame.includes('⛓ 1'))
+      expect(hidden).not.toContain('research X')
+      h.store.setDetailSection('subagents', 'collapsed')
+      const restored = await h.probe.waitForFrame(frame => frame.includes('⛓ 1'))
+      expect(restored).toContain('⛓ 1')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
   test('completed agents drop out; the tray empties when all finish', async () => {
     const h = await mountApp()
     try {

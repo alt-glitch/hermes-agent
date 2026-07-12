@@ -84,6 +84,7 @@ describe('clarify renderer — Q/A, never JSON (item 4)', () => {
 
   test('frame: collapsed `q: a` subtitle; expanded `User answered:` rows; NO JSON anywhere', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seedTool(store, { context: 'Which color do you prefer?', name: 'clarify', tool_id: 'c1' }, COMPLETE)
     const probe = await mountApp(store)
     try {
@@ -161,6 +162,7 @@ describe('skill_view renderer — WHICH skill, not its contents (item 5)', () =>
 
   test('frame: collapsed shows the name; expanded shows name + description, NEVER the contents', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seedTool(store, { context: 'plan', name: 'skill_view', tool_id: 'k1' }, COMPLETE)
     const probe = await mountApp(store)
     try {
@@ -228,6 +230,7 @@ describe('search_files renderer — pattern + results only (item 2)', () => {
 
   test('frame: pattern subtitle; expanded = result rows; context/output_mode/path never shown', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     const complete = {
       ...COMPLETE,
       args: { context: 2, output_mode: 'content', path: 'ui-opentui/src', pattern: 'syntaxStyleFor', target: 'content' }

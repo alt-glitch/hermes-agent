@@ -89,6 +89,7 @@ describe('node-ffi coordinate safety (boundary/ffiSafe.ts)', () => {
 
   test('tall diff expand/collapse + resize churn survives without render-loop errors', async () => {
     const store = createSessionStore()
+    store.setDetails('collapsed', true)
     seed(store)
     const probe = await renderProbe(
       () => (

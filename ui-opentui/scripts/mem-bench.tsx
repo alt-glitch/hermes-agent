@@ -62,6 +62,8 @@ const lib = resolveRenderLib()
 
 const TOTAL = Number.parseInt(process.env.MEM_BENCH_TOTAL ?? '4000', 10)
 const SAMPLE_EVERY = Number.parseInt(process.env.MEM_BENCH_SAMPLE ?? '500', 10)
+const CYCLES = Number.parseInt(process.env.MEM_BENCH_CYCLES ?? '1', 10)
+const ALLOCATION_TOLERANCE = Number.parseInt(process.env.MEM_BENCH_ALLOCATION_TOLERANCE ?? '0', 10)
 const HIGHLIGHT_TIMEOUT_MS = Number.parseInt(process.env.MEM_BENCH_HIGHLIGHT_TIMEOUT_MS ?? '750', 10)
 const REQUESTED_CAP = process.env.HERMES_TUI_MAX_MESSAGES ?? '(production default)'
 const MODE = (() => {
@@ -69,6 +71,15 @@ const MODE = (() => {
   if (value === 'live' || value === 'resume-cold' || value === 'resume-switch') return value
   throw new Error(`invalid MEM_BENCH_MODE: ${value}`)
 })()
+
+if (!Number.isInteger(CYCLES) || CYCLES < 1) throw new Error(`invalid MEM_BENCH_CYCLES: ${CYCLES}`)
+if (CYCLES > 1 && CYCLES < 8) throw new Error('repeated switch proof requires at least 8 cycles')
+if (MODE !== 'resume-switch' && CYCLES !== 1) {
+  throw new Error('MEM_BENCH_CYCLES is only supported with MEM_BENCH_MODE=resume-switch')
+}
+if (!Number.isInteger(ALLOCATION_TOLERANCE) || ALLOCATION_TOLERANCE < 0) {
+  throw new Error(`invalid MEM_BENCH_ALLOCATION_TOLERANCE: ${ALLOCATION_TOLERANCE}`)
+}
 
 const MB = (bytes: number) => (bytes / 1024 / 1024).toFixed(1)
 
@@ -278,60 +289,97 @@ async function main(): Promise<void> {
       }
     }
 
-    // Both mapped fixtures were allocated before renderer setup; collect
-    // materialization garbage now so it cannot trigger GC inside the timed commit.
-    forceGc()
-    const baselineMemory = process.memoryUsage()
-    const baselineAllocs = lib.getAllocatorStats().activeAllocations
-    const baselineRenderables = descendantCount(setup.renderer.root)
-
-    const hydrateStartedAt = performance.now()
-    store.beginBuffer()
-    store.commitSessionSnapshot('bench-target', targetFixture, { model: 'fixture-target' }, () => true)
-    const snapshotCommittedAt = performance.now()
-    const expectedMounted = Math.min(targetFixture.length, store.messageCap)
-    if (store.state.messages.length !== expectedMounted) {
-      throw new Error(`message cap regression: mounted ${store.state.messages.length}, expected ${expectedMounted}`)
-    }
-    await setup.renderOnce()
-    await setup.flush()
-    const layoutFlushedAt = performance.now()
-    const settlement = await settleHighlights(setup.renderer.root)
-    await setup.renderOnce()
-    await setup.flush()
-    const postHighlightFlushAt = performance.now()
-    forceGc()
-
-    const memory = process.memoryUsage()
-    const allocations = lib.getAllocatorStats().activeAllocations
-    const renderables = descendantCount(setup.renderer.root)
-    if (settlement.codeRenderables === 0) {
-      throw new Error('resume fixture mounted zero CodeRenderables')
-    }
     process.stdout.write(`\n--- resume component path (${MODE}; RPC/map/terminal paint excluded) ---\n`)
     process.stdout.write(`requested cap      : ${REQUESTED_CAP}\n`)
     process.stdout.write(`effective cap      : ${store.messageCap}\n`)
     process.stdout.write(`fixture msgs built : ${targetFixture.length}\n`)
-    process.stdout.write(`mounted msgs       : ${store.state.messages.length}\n`)
-    process.stdout.write(`renderables        : ${renderables}\n`)
-    process.stdout.write(`renderable delta   : ${renderables - baselineRenderables}\n`)
-    process.stdout.write(`activeAllocations  : ${allocations}\n`)
-    process.stdout.write(`allocation delta   : ${allocations - baselineAllocs}\n`)
-    process.stdout.write(`rss(MB)            : ${MB(memory.rss)}\n`)
-    process.stdout.write(`rss delta(MB)      : ${MB(memory.rss - baselineMemory.rss)}\n`)
-    process.stdout.write(`session adoption(ms): ${(snapshotCommittedAt - hydrateStartedAt).toFixed(2)}\n`)
-    process.stdout.write(`layout stage(ms)   : ${(layoutFlushedAt - snapshotCommittedAt).toFixed(2)}\n`)
+    process.stdout.write(`cycles              : ${CYCLES}\n`)
     process.stdout.write(
-      `highlight settle   : ${settlement.complete ? 'complete' : 'timeout'} ` +
-        `${settlement.elapsedMs.toFixed(2)}ms ` +
-        `(${settlement.pending} pending, ${settlement.rejected} rejected, ` +
-        `${settlement.codeRenderables} code renderables)\n`
+      'cycle | fixture | mounted | rss(MB) | activeAllocs | renderables | adopt(ms) | layout(ms) | highlight(ms) | total(ms)\n'
     )
-    process.stdout.write(`highlight stage(ms): ${(postHighlightFlushAt - layoutFlushedAt).toFixed(2)}\n`)
-    process.stdout.write(`total component(ms): ${(postHighlightFlushAt - hydrateStartedAt).toFixed(2)}\n`)
-    if (!settlement.complete) {
-      throw new Error(`resume highlighting failed (${settlement.pending} pending, ${settlement.rejected} rejected)`)
+
+    const warmPlateau = new Map<string, { allocations: number; renderables: number }>()
+    const plateauViolations: string[] = []
+    for (let cycle = 1; cycle <= CYCLES; cycle++) {
+      const useTarget = cycle % 2 === 1 || !previousFixture
+      const fixture = useTarget ? targetFixture : previousFixture
+      const fixtureName = useTarget ? 'target' : 'previous'
+
+      forceGc()
+      const hydrateStartedAt = performance.now()
+      store.beginBuffer()
+      store.commitSessionSnapshot(
+        `bench-${fixtureName}-${cycle}`,
+        fixture,
+        { model: `fixture-${fixtureName}` },
+        () => true
+      )
+      const snapshotCommittedAt = performance.now()
+      const expectedMounted = Math.min(fixture.length, store.messageCap)
+      if (store.state.messages.length !== expectedMounted) {
+        throw new Error(`message cap regression: mounted ${store.state.messages.length}, expected ${expectedMounted}`)
+      }
+      await setup.renderOnce()
+      await setup.flush()
+      const layoutFlushedAt = performance.now()
+      const settlement = await settleHighlights(setup.renderer.root)
+      await setup.renderOnce()
+      await setup.flush()
+      await new Promise<void>(resolve => setTimeout(resolve, 25))
+      await setup.renderOnce()
+      await setup.flush()
+      const postHighlightFlushAt = performance.now()
+      forceGc()
+
+      const memory = process.memoryUsage()
+      if (memory.rss > 350 * 1024 * 1024) throw new Error(`RSS safety stop: ${MB(memory.rss)} MB`)
+      const allocations = lib.getAllocatorStats().activeAllocations
+      const renderables = descendantCount(setup.renderer.root)
+      if (settlement.codeRenderables === 0) throw new Error('resume fixture mounted zero CodeRenderables')
+      if (!settlement.complete) {
+        throw new Error(`resume highlighting failed (${settlement.pending} pending, ${settlement.rejected} rejected)`)
+      }
+
+      process.stdout.write(
+        [
+          String(cycle).padStart(5),
+          fixtureName.padStart(8),
+          String(store.state.messages.length).padStart(7),
+          MB(memory.rss).padStart(7),
+          String(allocations).padStart(12),
+          String(renderables).padStart(11),
+          (snapshotCommittedAt - hydrateStartedAt).toFixed(2).padStart(9),
+          (layoutFlushedAt - snapshotCommittedAt).toFixed(2).padStart(10),
+          settlement.elapsedMs.toFixed(2).padStart(13),
+          (postHighlightFlushAt - hydrateStartedAt).toFixed(2).padStart(9)
+        ].join(' | ') + '\n'
+      )
+
+      // Two target/previous round trips warm native allocator pools. Each
+      // fixture's next visit establishes its plateau; later visits must match it.
+      if (cycle > 4) {
+        const warm = warmPlateau.get(fixtureName)
+        if (warm === undefined) {
+          warmPlateau.set(fixtureName, { allocations, renderables })
+        } else {
+          if (renderables !== warm.renderables) {
+            plateauViolations.push(
+              `renderable leak: cycle ${cycle} has ${renderables}, warm ${fixtureName} had ${warm.renderables}`
+            )
+          }
+          if (allocations > warm.allocations + ALLOCATION_TOLERANCE) {
+            plateauViolations.push(
+              `allocation leak: cycle ${cycle} has ${allocations}, warm ${fixtureName} had ${warm.allocations} ` +
+                `(tolerance ${ALLOCATION_TOLERANCE})`
+            )
+          }
+        }
+      }
     }
+    if (plateauViolations.length > 0) throw new Error(plateauViolations.join('; '))
+    process.stdout.write(
+      `repeated-switch plateau: pass (renderables exact, active allocation tolerance ${ALLOCATION_TOLERANCE})\n`
+    )
   } finally {
     setup.renderer.destroy()
   }

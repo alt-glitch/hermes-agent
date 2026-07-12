@@ -1,7 +1,7 @@
 /**
- * Global detail-mode logic (/details — Epic 3 utility-command port; mirrors Ink
- * `domain/details.ts`, GLOBAL mode only — per-section overrides are explicitly
- * deferred). The mode drives how the transcript treats tool + reasoning rows:
+ * Detail-mode logic (/details — Epic 3 utility-command port; mirrors Ink
+ * `domain/details.ts`). Global mode plus per-section overrides drive how the
+ * transcript treats tool + reasoning rows:
  *
  *   - `collapsed` (default): today's behaviour — headers with click-to-expand.
  *   - `expanded`: tool bodies + settled reasoning previews default-OPEN.
@@ -12,19 +12,83 @@
  * Pure data + functions; the store carries the flag, messageLine/toolPart/
  * reasoningPart read it via the display context.
  */
+import { Option, Schema } from 'effect'
+
 import type { Part } from './store.ts'
 
 export type DetailsMode = 'hidden' | 'collapsed' | 'expanded'
+export type DetailsSection = 'thinking' | 'tools' | 'subagents' | 'activity'
+export type DetailsSections = Partial<Record<DetailsSection, DetailsMode>>
 
 /** Cycle order (Ink parity: hidden → collapsed → expanded → hidden). */
 export const DETAILS_MODES = ['hidden', 'collapsed', 'expanded'] as const
 
-/** Gateway `complete.slash` suggests these per-section names after `/details ` —
- *  recognized so picking one yields an honest "not supported yet" notice instead
- *  of the generic usage line (per-section overrides are deferred). */
+/** Gateway `complete.slash` suggests these supported per-section names after
+ * `/details `; each can persist its own visibility mode or reset to inheritance. */
 export const DETAILS_SECTIONS = ['thinking', 'tools', 'subagents', 'activity'] as const
 
 export const DETAILS_USAGE = 'usage: /details [hidden|collapsed|expanded|cycle]'
+export const DETAILS_SECTION_USAGE =
+  'usage: /details <thinking|tools|subagents|activity> <hidden|collapsed|expanded|reset>'
+
+const SECTION_DEFAULTS: DetailsSections = { activity: 'hidden', thinking: 'expanded', tools: 'expanded' }
+
+export interface DetailsConfig {
+  mode: DetailsMode
+  sections: DetailsSections
+}
+
+const DetailsDisplayConfigSchema = Schema.Struct({
+  details_mode: Schema.optionalKey(Schema.Unknown),
+  tui_compact: Schema.optionalKey(Schema.Unknown),
+  sections: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
+  thinking_mode: Schema.optionalKey(Schema.Unknown)
+})
+const DetailsRootConfigSchema = Schema.Struct({ display: Schema.optionalKey(DetailsDisplayConfigSchema) })
+const decodeDetailsRootConfig = Schema.decodeUnknownOption(DetailsRootConfigSchema)
+
+/** Decode Ink's persisted compact flag from `config.get full`. */
+export function compactFromConfig(config: unknown): boolean {
+  const decoded = decodeDetailsRootConfig(config)
+  return Option.isSome(decoded) && Boolean(decoded.value.display?.tui_compact)
+}
+
+/** Decode the display subset of `config.get full`; invalid overrides are ignored. */
+export function detailsFromConfig(config: unknown): DetailsConfig {
+  const decoded = decodeDetailsRootConfig(config)
+  const display = Option.isSome(decoded) ? decoded.value.display : undefined
+  const thinkingRaw = display?.thinking_mode
+  const thinking = typeof thinkingRaw === 'string' ? thinkingRaw.trim().toLowerCase() : ''
+  const mode =
+    parseDetailsMode(display?.details_mode) ??
+    (thinking === 'full'
+      ? 'expanded'
+      : thinking === 'collapsed' || thinking === 'truncated'
+        ? 'collapsed'
+        : 'collapsed')
+  const rawSections = display?.sections
+  const sections: DetailsSections = {}
+  if (rawSections && typeof rawSections === 'object' && !Array.isArray(rawSections)) {
+    for (const section of DETAILS_SECTIONS) {
+      const value = parseDetailsMode(rawSections[section])
+      if (value) sections[section] = value
+    }
+  }
+  return { mode, sections }
+}
+
+export function isDetailsSection(value: unknown): value is DetailsSection {
+  return typeof value === 'string' && (DETAILS_SECTIONS as readonly string[]).includes(value)
+}
+
+export function sectionMode(
+  name: DetailsSection,
+  global: DetailsMode,
+  sections: DetailsSections,
+  commandOverride = false
+): DetailsMode {
+  return sections[name] ?? (commandOverride ? global : (SECTION_DEFAULTS[name] ?? global))
+}
 
 /** Parse a mode word; null for anything unrecognized (non-strings included). */
 export function parseDetailsMode(v: unknown): DetailsMode | null {
@@ -57,10 +121,19 @@ export type DisplayPart = Part | HiddenRun
  * the mode back restores everything.
  */
 export function collapseHiddenParts(parts: readonly Part[]): DisplayPart[] {
+  return collapseHiddenPartsBy(parts, () => true)
+}
+
+export function collapseHiddenPartsBy(
+  parts: readonly Part[],
+  hidden: (section: DetailsSection) => boolean
+): DisplayPart[] {
   const out: DisplayPart[] = []
   let run: HiddenRun | undefined
   for (const part of parts) {
-    if (part.type === 'text' || part.type === 'moa') {
+    const section =
+      part.type === 'tool' ? 'tools' : part.type === 'reasoning' ? 'thinking' : part.type === 'moa' ? 'subagents' : null
+    if (!section || !hidden(section)) {
       run = undefined
       out.push(part)
       continue
