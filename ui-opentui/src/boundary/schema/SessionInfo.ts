@@ -43,7 +43,12 @@ const UsageSchema = Schema.Struct({
   context_max: opt(Num),
   context_percent: opt(Num),
   compressions: opt(Num),
-  cost_usd: opt(Num)
+  cost_usd: opt(Num),
+  // Live count of background/async delegations still running
+  // (`delegate_task(background=true)` — `tools.async_delegation.active_count()`).
+  // Drives the status bar's idle resume-hint (`↩ resumes when subagent finishes`);
+  // the running subagents themselves already show in the `⚡` tray.
+  active_subagents: opt(Num)
 })
 
 export const SessionInfoPatchSchema = Schema.Struct({
@@ -70,6 +75,7 @@ export const SessionInfoPatchSchema = Schema.Struct({
   context_max: opt(Num),
   context_percent: opt(Num),
   compressions: opt(Num),
+  active_subagents: opt(Num),
   usage: opt(UsageSchema)
 })
 export type SessionInfoPatchDecoded = typeof SessionInfoPatchSchema.Type
