@@ -5,7 +5,10 @@ export type HelpRow = HotkeyRow
 
 const TUI_ROWS: readonly HelpRow[] = [
   ['/details [hidden|collapsed|expanded|cycle]', 'set global agent detail visibility mode'],
-  ['/details <section> [hidden|collapsed|expanded|reset]', 'override one section (thinking/tools/subagents/activity)'],
+  [
+    '/details <section> [hidden|collapsed|expanded|reset]',
+    'override one section (thinking/tools/subagents/activity/delegation)'
+  ],
   ['/fortune [random|daily]', 'show a random or daily local fortune']
 ]
 

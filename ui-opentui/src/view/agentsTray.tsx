@@ -1,10 +1,10 @@
 /**
  * AgentsTray — the background-agents tray docked below the composer (Epic 2.7).
  *
- * Collapsed (unfocused): no row; the status bar carries `⛓ N` and the tree
- * HUD, so the tray steals no transcript height. Expanded (focused): one row
- * per ACTIVE subagent (canonical `running` or `queued`) showing status · goal ·
- * elapsed-ish · last activity line, with a themed highlight on the selection.
+ * Compact (unfocused): a bounded, at-a-glance list of ACTIVE subagents
+ * (canonical `running` or `queued`) showing model + goal. Expanded (focused):
+ * one row per active subagent showing status · goal · elapsed-ish · last
+ * activity line, with a themed highlight on the selection.
  *
  * Focus routing (the hard part): the tray takes NATIVE focus (its root box is
  * focusable) — `focusRenderable` blurs the composer textarea for us, and
@@ -51,6 +51,12 @@ function fmtElapsed(secs: number): string {
 function truncate(s: string, max = 48): string {
   const flat = s.replace(/\s+/g, ' ').trim()
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
+}
+
+/** Provider prefixes are useful in configuration, noisy in a narrow live tray. */
+function shortModel(model?: string): string {
+  if (!model) return 'agent'
+  return model.split('/').at(-1) || model
 }
 
 function statusColor(status: string, theme: ReturnType<typeof useTheme>): string {
@@ -145,18 +151,59 @@ export function AgentsTray(props: {
     }
   })
 
-  // Collapsed = NOTHING under the composer (P4 input-density fold, glitch
-  // 2026-06-13): the running count moved to the status bar's `⛓ N` chip, so the
-  // tray no longer keeps a persistent line here. The box stays mounted + focusable
-  // so composer-Down still hands focus over and EXPANDS it into the rows.
+  // The compact list is intentionally capped: it makes background work visible
+  // without letting a wide fan-out consume the transcript. Composer-Down hands
+  // focus to the same box and swaps in the existing full inspector rows.
   return (
     <Show when={running().length > 0}>
       <box ref={attach} focusable style={{ flexDirection: 'column', flexShrink: 0 }}>
-        <Show when={focused()}>
+        <Show when={focused()} fallback={<CompactTrayRows agents={running()} />}>
           <TrayRows agents={running()} selected={selected()} firstSeen={firstSeen} />
         </Show>
       </box>
     </Show>
+  )
+}
+
+const COMPACT_AGENT_LIMIT = 5
+
+/** Persistent live summary. No synthetic `main` row: these are only agents the
+ * gateway has authoritatively reported through the subagent event stream. */
+function CompactTrayRows(props: { agents: SubagentInfo[] }) {
+  const theme = useTheme()
+  const visible = () => props.agents.slice(0, COMPACT_AGENT_LIMIT)
+  const remaining = () => Math.max(0, props.agents.length - COMPACT_AGENT_LIMIT)
+  return (
+    <box
+      style={{
+        backgroundColor: theme().color.completionBg,
+        flexDirection: 'column',
+        paddingLeft: 1,
+        paddingRight: 1
+      }}
+    >
+      <text selectable={false} wrapMode="none">
+        <span style={{ fg: theme().color.accent }}>
+          <b>{`◆ ${props.agents.length} agent${props.agents.length === 1 ? '' : 's'} active`}</b>
+        </span>
+        <span style={{ fg: theme().color.muted }}>{'  ·  ↓ inspect'}</span>
+      </text>
+      <For each={visible()}>
+        {sa => {
+          const status = () => normalizeSubagentStatus(sa.status)
+          return (
+            <text selectable={false} wrapMode="none">
+              <span style={{ fg: statusColor(status(), theme) }}>{status() === 'queued' ? '○ ' : '● '}</span>
+              <span style={{ fg: theme().color.muted }}>{`${truncate(shortModel(sa.model), 24)}  `}</span>
+              <span style={{ fg: theme().color.label }}>{truncate(sa.goal || sa.id, 72)}</span>
+            </text>
+          )
+        }}
+      </For>
+      <Show when={remaining() > 0}>
+        <text selectable={false} fg={theme().color.muted} wrapMode="none">{`… +${remaining()} more`}</text>
+      </Show>
+    </box>
   )
 }
 
@@ -186,7 +233,7 @@ function TrayRows(props: { agents: SubagentInfo[]; selected: number; firstSeen: 
                 backgroundColor: active() ? theme().color.completionCurrentBg : theme().color.completionBg
               }}
             >
-              <text selectable={false}>
+              <text selectable={false} wrapMode="none">
                 <span style={{ fg: active() ? theme().color.accent : theme().color.muted }}>
                   {active() ? '▸ ' : '  '}
                 </span>

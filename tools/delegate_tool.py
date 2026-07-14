@@ -202,7 +202,7 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
-def list_active_subagents() -> List[Dict[str, Any]]:
+def list_active_subagents(parent_session_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
     Each record: {subagent_id, parent_id, depth, goal, model, started_at,
@@ -212,6 +212,7 @@ def list_active_subagents() -> List[Dict[str, Any]]:
         return [
             {k: v for k, v in r.items() if k != "agent"}
             for r in _active_subagents.values()
+            if not parent_session_id or r.get("parent_session_id") == parent_session_id
         ]
 
 
@@ -1370,6 +1371,10 @@ def _build_child_agent(
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
+    child._root_parent_session_id = (
+        getattr(parent_agent, "_root_parent_session_id", None)
+        or getattr(parent_agent, "session_id", None)
+    )
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
@@ -1876,6 +1881,11 @@ def _run_single_child(
             {
                 "subagent_id": _subagent_id,
                 "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
+                "parent_session_id": (
+                    getattr(child, "_root_parent_session_id", None)
+                    if isinstance(getattr(child, "_root_parent_session_id", None), str)
+                    else None
+                ),
                 "depth": _tui_depth,
                 "goal": goal,
                 "model": (

@@ -24,16 +24,22 @@ export function NotificationCard(props: { notification: ActivityNotification; co
   const [override, setOverride] = createSignal<boolean | undefined>(undefined)
   const n = () => props.notification
   const detail = () => n().detail?.trim() ?? ''
+  const isDelegationCompletion = () => n().kind === 'async delegation'
   const expanded = () =>
     override() ??
-    sectionMode('activity', display().details, display().sections, display().detailsCommandOverride) === 'expanded'
+    sectionMode(
+      isDelegationCompletion() ? 'delegation' : 'activity',
+      display().details,
+      display().sections,
+      isDelegationCompletion() ? false : display().detailsCommandOverride
+    ) === 'expanded'
   const toggle = () => anchor(() => setOverride(!expanded()))
   const levelColor = () => {
     const c = theme().color
     return n().level === 'error' ? c.error : n().level === 'warn' ? c.warn : c.accent
   }
   // A label for the card head: the kind if the gateway sent one, else a neutral word.
-  const label = () => n().kind || 'notice'
+  const label = () => (isDelegationCompletion() ? 'delegation complete' : n().kind || 'notice')
   return (
     <box
       style={{

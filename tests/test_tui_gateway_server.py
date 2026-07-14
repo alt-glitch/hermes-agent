@@ -3643,6 +3643,28 @@ def test_config_set_section_writes_per_section_override(tmp_path, monkeypatch):
     assert saved["display"]["sections"] == {"activity": "hidden"}
 
 
+def test_config_set_delegation_section_writes_explicit_override(tmp_path, monkeypatch):
+    import yaml
+
+    cfg_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {"key": "details_mode.delegation", "value": "expanded"},
+        }
+    )
+
+    assert resp["result"] == {
+        "key": "details_mode.delegation",
+        "value": "expanded",
+    }
+    saved = yaml.safe_load(cfg_path.read_text())
+    assert saved["display"]["sections"] == {"delegation": "expanded"}
+
+
 def test_config_set_section_clears_override_on_empty_value(tmp_path, monkeypatch):
     import yaml
 
@@ -3909,6 +3931,46 @@ def test_complete_slash_returns_plain_string_fields():
         assert isinstance(item["meta"], str), item
 
 
+def test_delegation_status_scopes_active_snapshot_to_live_agent_session(monkeypatch):
+    from tools import delegate_tool
+
+    seen = []
+    monkeypatch.setattr(
+        delegate_tool,
+        "list_active_subagents",
+        lambda parent_session_id=None: seen.append(parent_session_id) or [],
+    )
+    server._sessions["ui-session"] = _session(
+        agent=types.SimpleNamespace(session_id="durable-agent-session")
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "delegation.status",
+            "params": {"session_id": "ui-session"},
+        }
+    )
+
+    assert resp["result"]["active"] == []
+    assert seen == ["durable-agent-session"]
+
+    seen.clear()
+    missing = server.handle_request(
+        {"id": "2", "method": "delegation.status", "params": {}}
+    )
+    unknown = server.handle_request(
+        {
+            "id": "3",
+            "method": "delegation.status",
+            "params": {"session_id": "not-live"},
+        }
+    )
+    assert missing["result"]["active"] == []
+    assert unknown["result"]["active"] == []
+    assert seen == []
+
+
 def test_complete_slash_includes_tui_details_command():
     resp = server.handle_request(
         {"id": "1", "method": "complete.slash", "params": {"text": "/det"}}
@@ -3956,6 +4018,7 @@ def test_complete_slash_details_args():
 
     assert resp_root["result"]["replace_from"] == len("/details")
     assert any(item["text"] == " thinking" for item in resp_root["result"]["items"])
+    assert any(item["text"] == " delegation" for item in resp_root["result"]["items"])
     assert any(item["text"] == "thinking" for item in resp_section["result"]["items"])
     assert any(item["text"] == "expanded" for item in resp_mode["result"]["items"])
 
@@ -10427,6 +10490,8 @@ class TestProcessCompletionCard:
         assert sid == "s1"
         assert payload["always_visible"] is True
         assert "2 agents" in payload["text"]
+        assert payload["text"].startswith("2 agents · all done")
+        assert payload["text"].endswith("deleg_test")
         assert "FULL_SENTINEL" not in payload["text"]
         assert payload["detail"] == detail
 

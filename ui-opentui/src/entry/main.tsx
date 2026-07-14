@@ -645,7 +645,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
       const delegationStatusRefresher = createDelegationStatusRefresher({
         apply: raw => store.applyDelegationStatusResponse(raw),
-        fetch: () => Effect.runPromise(gateway.request('delegation.status', {})),
+        fetch: () => Effect.runPromise(gateway.request('delegation.status', { session_id: gateway.sessionId() ?? '' })),
         onFailure: cause => getLog().warn('agents', 'delegation.status failed', { cause: String(cause) }),
         onInvalid: () => getLog().warn('agents', 'invalid delegation.status response')
       })
@@ -833,6 +833,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           Effect.gen(function* () {
             const liveSessionId = yield* resumeInto(gateway, store, resumeId, input.cols, 'same-session')
             pasteStore.retainOnly(store.state.composerDraft)
+            delegationStatusRefresher.invalidate()
+            void delegationStatusRefresher.refresh(true)
             transitionSucceeded = true
             Effect.runFork(
               postSessionSetup(gateway, store, liveSessionId).pipe(
@@ -1702,6 +1704,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             pasteStore.retainOnly(store.state.composerDraft)
             stableSessionOwnerId = store.state.resumeId ?? resumeSid
             transitionSucceeded = true
+            delegationStatusRefresher.invalidate()
+            void delegationStatusRefresher.refresh(true)
             activeSessionsRefresher.invalidate()
             void activeSessionsRefresher.refresh(true)
             if (!store.state.catalog) {

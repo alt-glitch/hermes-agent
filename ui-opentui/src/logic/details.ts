@@ -17,7 +17,7 @@ import { Option, Schema } from 'effect'
 import type { Part } from './store.ts'
 
 export type DetailsMode = 'hidden' | 'collapsed' | 'expanded'
-export type DetailsSection = 'thinking' | 'tools' | 'subagents' | 'activity'
+export type DetailsSection = 'thinking' | 'tools' | 'subagents' | 'activity' | 'delegation'
 export type DetailsSections = Partial<Record<DetailsSection, DetailsMode>>
 
 /** Cycle order (Ink parity: hidden → collapsed → expanded → hidden). */
@@ -25,13 +25,18 @@ export const DETAILS_MODES = ['hidden', 'collapsed', 'expanded'] as const
 
 /** Gateway `complete.slash` suggests these supported per-section names after
  * `/details `; each can persist its own visibility mode or reset to inheritance. */
-export const DETAILS_SECTIONS = ['thinking', 'tools', 'subagents', 'activity'] as const
+export const DETAILS_SECTIONS = ['thinking', 'tools', 'subagents', 'activity', 'delegation'] as const
 
 export const DETAILS_USAGE = 'usage: /details [hidden|collapsed|expanded|cycle]'
 export const DETAILS_SECTION_USAGE =
-  'usage: /details <thinking|tools|subagents|activity> <hidden|collapsed|expanded|reset>'
+  'usage: /details <thinking|tools|subagents|activity|delegation> <hidden|collapsed|expanded|reset>'
 
-const SECTION_DEFAULTS: DetailsSections = { activity: 'hidden', thinking: 'expanded', tools: 'expanded' }
+const SECTION_DEFAULTS: DetailsSections = {
+  activity: 'hidden',
+  delegation: 'collapsed',
+  thinking: 'expanded',
+  tools: 'expanded'
+}
 
 export interface DetailsConfig {
   mode: DetailsMode

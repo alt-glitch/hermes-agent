@@ -200,6 +200,10 @@ describe('Agents live reducer', () => {
   })
 })
 
+function finish(store: SessionStore, id: string): void {
+  store.apply({ type: 'subagent.complete', payload: { status: 'completed', subagent_id: id, summary: 'done' } })
+}
+
 describe('Agents turn archives and delivery intents', () => {
   test('normal completion snapshots synchronously, queues save intent, then clears live rows', () => {
     const store = createSessionStore()
@@ -225,11 +229,46 @@ describe('Agents turn archives and delivery intents', () => {
     expect(store.state.spawnHistory.snapshots[0]?.subagents[0]?.['goal']).toBe('research')
   })
 
+  test('parent completion retains active background agents until their own terminal event', () => {
+    const store = createSessionStore()
+    startTurn(store)
+    spawn(store, 'background', 'keep working')
+
+    store.apply({ type: 'message.complete', payload: { text: 'dispatched' } })
+    expect(store.state.subagents).toEqual([
+      expect.objectContaining({ goal: 'keep working', id: 'background', status: 'running' })
+    ])
+    expect(store.state.spawnHistory.snapshots).toEqual([])
+
+    finish(store, 'background')
+    expect(store.state.subagents[0]?.status).toBe('completed')
+
+    startTurn(store)
+    expect(store.state.subagents).toEqual([])
+    expect(store.state.spawnHistory.snapshots[0]?.subagents[0]).toMatchObject({
+      goal: 'keep working',
+      id: 'background',
+      status: 'completed'
+    })
+  })
+
+  test('parent turn error also retains active background agents', () => {
+    const store = createSessionStore()
+    startTurn(store)
+    spawn(store, 'background-error', 'survive parent error')
+
+    store.apply({ type: 'error', payload: { message: 'parent failed' } })
+
+    expect(store.state.subagents).toEqual([expect.objectContaining({ id: 'background-error', status: 'running' })])
+    expect(store.state.spawnHistory.snapshots).toEqual([])
+  })
+
   test('history and persistence intent queues retain only the newest ten trees', () => {
     const store = createSessionStore()
     for (let turn = 0; turn < 12; turn += 1) {
       startTurn(store)
       spawn(store, `a${String(turn)}`, `goal ${String(turn)}`)
+      finish(store, `a${String(turn)}`)
       store.apply({ type: 'message.complete' })
     }
     expect(store.state.spawnHistory.snapshots).toHaveLength(10)
@@ -241,6 +280,7 @@ describe('Agents turn archives and delivery intents', () => {
     const store = createSessionStore()
     startTurn(store)
     spawn(store, 'error-agent')
+    finish(store, 'error-agent')
     store.apply({ type: 'error', payload: { message: 'turn failed' } })
     expect(store.state.spawnHistory.snapshots).toHaveLength(1)
     expect(store.state.subagents).toEqual([])
@@ -253,6 +293,7 @@ describe('Agents turn archives and delivery intents', () => {
 
     startTurn(store)
     spawn(store, 'complete-agent')
+    finish(store, 'complete-agent')
     store.apply({ type: 'message.complete' })
     expect(store.state.spawnHistory.snapshots).toHaveLength(3)
     // A stale start may create by contract, but the exit in the optimistic
@@ -268,6 +309,7 @@ describe('Agents turn archives and delivery intents', () => {
     store.setSessionId('old-sid')
     startTurn(store)
     spawn(store, 'a1')
+    finish(store, 'a1')
     store.apply({ type: 'message.complete' })
     const intent = store.nextSpawnTreeSaveIntent()
     expect(intent).toBeDefined()
@@ -303,6 +345,7 @@ describe('Agents status and session-owned lifecycle', () => {
     const store = createSessionStore()
     startTurn(store)
     spawn(store, 'a1', 'first tree')
+    finish(store, 'a1')
     store.apply({ type: 'message.complete' })
     const snapshot = store.state.spawnHistory.snapshots[0]
     expect(snapshot).toBeDefined()
@@ -387,6 +430,47 @@ describe('Agents status and session-owned lifecycle', () => {
     expect(store.state.agentsNudge).toMatchObject({ activeTurnId: null, enabled: false, nudgedTurnId: null })
     expect(store.state.agentsNudgePending).toBe(false)
     expect(store.state.subagents).toEqual([])
+  })
+
+  test('delegation status restores active rows after session-owned state is reset', () => {
+    const store = createSessionStore()
+    const response = {
+      active: [
+        {
+          depth: 1,
+          goal: 'continue background audit',
+          last_tool: 'read_file',
+          model: 'anthropic/claude-opus-4.8',
+          parent_id: null,
+          started_at: 1_700_000_000,
+          status: 'running',
+          subagent_id: 'reconnected-agent',
+          tool_count: 3
+        }
+      ],
+      max_concurrent_children: 4,
+      max_spawn_depth: 3,
+      paused: false
+    }
+
+    expect(store.applyDelegationStatusResponse(response, 100)).toBe(true)
+    expect(store.state.subagents[0]).toMatchObject({
+      depth: 1,
+      goal: 'continue background audit',
+      id: 'reconnected-agent',
+      lastTool: 'read_file',
+      model: 'anthropic/claude-opus-4.8',
+      status: 'running',
+      toolCount: 3
+    })
+
+    store.adoptFreshSession('resumed-session')
+    expect(store.state.subagents).toEqual([])
+    expect(store.applyDelegationStatusResponse(response, 200)).toBe(true)
+    expect(store.state.subagents[0]).toMatchObject({
+      id: 'reconnected-agent',
+      status: 'running'
+    })
   })
 
   test('delegation status/pause responses decode before they enter Solid state', () => {

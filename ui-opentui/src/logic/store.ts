@@ -1422,13 +1422,15 @@ export function createSessionStore(options?: SessionStoreOptions) {
     }
   }
 
-  /** Archive synchronously before clearing. Persistence remains a bounded
-   * process-global delivery intent so a same-tick session adoption cannot drop
-   * the old session's tree before the entry layer drains it. */
-  function archiveAndClearSubagents(capture: boolean): SpawnSnapshot | null {
+  /** Archive terminal rows synchronously before clearing. Active background
+   * rows may survive a parent turn boundary; hard session/gateway boundaries
+   * still clear the entire tree. Persistence remains a bounded process-global
+   * delivery intent so adoption cannot drop a captured tree. */
+  function archiveAndClearSubagents(capture: boolean, preserveActive = false): SpawnSnapshot | null {
+    const archivedRows = preserveActive ? state.subagents.filter(sa => isTerminalStatus(sa.status)) : state.subagents
     let snapshot: SpawnSnapshot | null = null
-    if (capture && state.subagents.length > 0) {
-      const captured = captureLiveSpawnTree(state.spawnHistory, state.subagents, {
+    if (capture && archivedRows.length > 0) {
+      const captured = captureLiveSpawnTree(state.spawnHistory, archivedRows, {
         sessionId: state.sessionId ?? null
       })
       snapshot = captured.snapshot
@@ -1438,7 +1440,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         setState('spawnTreeSaveIntents', previous => [...previous, intent].slice(-SPAWN_HISTORY_LIMIT))
       }
     }
-    if (state.subagents.length > 0) setState('subagents', [])
+    if (state.subagents.length > 0) {
+      setState('subagents', preserveActive ? current => current.filter(sa => !isTerminalStatus(sa.status)) : [])
+    }
     setState('agentsNudge', current => clearAgentsNudgeTurn(current))
     setState('agentsNudgePending', false)
     return snapshot
@@ -1982,6 +1986,21 @@ export function createSessionStore(options?: SessionStoreOptions) {
     const decoded = decodeDelegationStatusResponse(raw)
     if (Option.isNone(decoded)) return false
     setState('delegation', current => applyDelegationState(current, decoded.value, updatedAtMs))
+    setState(
+      produce(draft => {
+        for (const payload of decoded.value.active) {
+          const id = payload.subagent_id
+          const existing = draft.subagents.find(agent => agent.id === id)
+          if (existing) {
+            mergeSubagentPayload(existing, payload)
+            if (!isTerminalStatus(existing.status)) existing.status = 'running'
+          } else {
+            draft.subagents.push(makeSubagent(payload, id, 'running'))
+          }
+        }
+        draft.subagents.sort((left, right) => left.depth - right.depth || (left.index ?? 0) - (right.index ?? 0))
+      })
+    )
     return true
   }
 
@@ -2059,10 +2078,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
         settlePendingSteers(event.payload?.client_submission_ids)
         clearStatusRestoreTimer()
         lastStatusNote = ''
-        // A fresh turn owns a fresh live spawn tree and one discovery credit.
-        // Any prior late spawn/start row is stale and is cleared without
-        // becoming a second archive for the preceding turn.
-        archiveAndClearSubagents(false)
+        // A fresh turn gets one discovery credit. Archive terminal rows left by
+        // the preceding turn, but retain authoritative running/queued rows: an
+        // async delegation may intentionally outlive its dispatching turn.
+        archiveAndClearSubagents(true, true)
         agentsTurnArchived = false
         setState('agentsNudge', current => startAgentsNudgeTurn(current))
         setState('status', undefined)
@@ -2112,7 +2131,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         }
         // Archive BEFORE the normal turn clear. A child exit can still arrive
         // before session.info(false); `agentsTurnArchived` prevents a duplicate.
-        archiveAndClearSubagents(!agentsTurnArchived)
+        archiveAndClearSubagents(!agentsTurnArchived, true)
         agentsTurnArchived = true
         setState(
           produce(draft => {
@@ -2656,7 +2675,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
       case 'error': {
         settlePendingSteers(event.payload?.client_submission_ids)
         const actualTurnBoundary = (turnInFlight || state.info.running === true) && !agentsTurnArchived
-        archiveAndClearSubagents(actualTurnBoundary)
+        archiveAndClearSubagents(actualTurnBoundary, true)
         agentsTurnArchived = true
         // `message.start` may be followed by a terminal error with no
         // message.complete. Settle the newest streaming assistant before the

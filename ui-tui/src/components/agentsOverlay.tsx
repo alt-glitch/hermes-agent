@@ -590,7 +590,7 @@ function DiffView({
 
 // ── Main overlay ─────────────────────────────────────────────────────
 
-export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: AgentsOverlayProps) {
+export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, sessionId, t }: AgentsOverlayProps) {
   const liveSubagents = useTurnSelector(state => state.subagents)
   const delegation = useStore($delegationState)
   const history = useStore($spawnHistory)
@@ -677,10 +677,10 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
 
   useEffect(() => {
     // Warm caps + paused flag on open.
-    gw.request<DelegationStatusResponse>('delegation.status', {})
+    gw.request<DelegationStatusResponse>('delegation.status', { session_id: sessionId ?? '' })
       .then(r => applyDelegationStatus(asRpcResult<DelegationStatusResponse>(r)))
       .catch(() => {})
-  }, [gw])
+  }, [gw, sessionId])
 
   useEffect(() => {
     if (cursor >= rows.length) {
@@ -963,6 +963,7 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
 
 interface AgentsOverlayProps {
   gw: GatewayClient
+  sessionId: null | string
   initialHistoryIndex?: number
   onClose: () => void
   t: Theme

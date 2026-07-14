@@ -390,7 +390,9 @@ describe('/details', () => {
   test('/details section rejects invalid mode with section-specific usage', async () => {
     const p = makeCtx(async () => ({}))
     await dispatchSlash('/details thinking loud', p.ctx)
-    expect(p.system).toEqual(['usage: /details <thinking|tools|subagents|activity> <hidden|collapsed|expanded|reset>'])
+    expect(p.system).toEqual([
+      'usage: /details <thinking|tools|subagents|activity|delegation> <hidden|collapsed|expanded|reset>'
+    ])
     expect(p.calls).toHaveLength(0)
   })
 
@@ -718,6 +720,8 @@ describe('details logic (pure)', () => {
     expect(sectionMode('tools', 'hidden', {}, true)).toBe('hidden')
     expect(sectionMode('tools', 'collapsed', {})).toBe('expanded')
     expect(sectionMode('subagents', 'collapsed', {})).toBe('collapsed')
+    expect(sectionMode('delegation', 'expanded', {})).toBe('collapsed')
+    expect(sectionMode('delegation', 'collapsed', { delegation: 'expanded' })).toBe('expanded')
   })
 
   test('collapseHiddenPartsBy folds only hidden sections and preserves visible boundaries', () => {

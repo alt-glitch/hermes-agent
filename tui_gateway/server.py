@@ -172,7 +172,8 @@ try:
 except (ValueError, TypeError):
     _ws_orphan_reap_grace = 20.0
 _WS_ORPHAN_REAP_GRACE_S = max(0.0, _ws_orphan_reap_grace)
-_DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
+_DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity", "delegation")
+_GLOBAL_DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 
 # ── Async RPC dispatch (#12546) ──────────────────────────────────────
@@ -8987,10 +8988,20 @@ def _(rid, params: dict) -> dict:
         _get_max_spawn_depth,
     )
 
+    requested_sid = str(params.get("session_id") or "")
+    session = _sessions.get(requested_sid) if requested_sid else None
+    parent_session_id = str(
+        getattr((session or {}).get("agent"), "session_id", "")
+    )
+
     return _ok(
         rid,
         {
-            "active": list_active_subagents(),
+            "active": (
+                list_active_subagents(parent_session_id)
+                if parent_session_id
+                else []
+            ),
             "paused": is_spawn_paused(),
             "max_spawn_depth": _get_max_spawn_depth(),
             "max_concurrent_children": _get_max_concurrent_children(),
@@ -9627,7 +9638,6 @@ def _async_delegation_notice(evt: dict, detail: str) -> dict:
         )
         failed = max(0, count - succeeded)
         pieces = [
-            deleg_id,
             f"{count} agent{'s' if count != 1 else ''}",
             "all done" if count > 0 and failed == 0 else f"{succeeded} done",
         ]
@@ -9636,10 +9646,11 @@ def _async_delegation_notice(evt: dict, detail: str) -> dict:
         level = "success" if failed == 0 else "warn"
     else:
         status = str(evt.get("status") or "completed").strip().lower()
-        pieces = [deleg_id, status]
+        pieces = [status]
         level = "success" if status in {"completed", "success"} else "warn"
     if duration:
         pieces.append(duration)
+    pieces.append(deleg_id)
     return {
         "always_visible": True,
         "detail": detail,
@@ -11862,7 +11873,7 @@ def _(rid, params: dict) -> dict:
             display.get("sections") if isinstance(display.get("sections"), dict) else {}
         )
         display["details_mode"] = nv
-        for section in _DETAIL_SECTION_NAMES:
+        for section in _GLOBAL_DETAIL_SECTION_NAMES:
             sections[section] = nv
         display["sections"] = sections
         cfg["display"] = display
@@ -13959,7 +13970,7 @@ def _details_completions(text: str) -> list[dict] | None:
         body = body[1:]
     parts = body.split()
     has_trailing_space = text.endswith(" ")
-    sections = ("thinking", "tools", "subagents", "activity")
+    sections = _DETAIL_SECTION_NAMES
     modes = ("hidden", "collapsed", "expanded")
 
     if not body or (len(parts) == 0 and has_trailing_space):

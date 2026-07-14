@@ -2,8 +2,8 @@
  * Background-agents tray tests (Epic 2.7). Headless frames through the real
  * App + Composer + AgentsTray with a simulated keyboard:
  *
- *   - visibility: nothing rendered with 0 running agents; a one-line muted
- *     indicator with the count otherwise; completed/failed agents drop out.
+ *   - visibility: nothing rendered with 0 running agents; a bounded compact
+ *     model + goal list otherwise; completed/failed agents drop out.
  *   - focus-routing table: Down on an EMPTY composer with running agents
  *     focuses/expands the tray; Down with text keeps its meaning; Down with
  *     the slash menu open stays menu navigation (routeMenuKey integration
@@ -73,8 +73,8 @@ async function mountApp(historyEntries: string[] = []): Promise<Harness> {
   return { probe, store, submitted, typed }
 }
 
-const spawn = (store: SessionStore, id: string, goal: string) =>
-  store.apply({ type: 'subagent.start', payload: { depth: 0, goal, subagent_id: id } })
+const spawn = (store: SessionStore, id: string, goal: string, model?: string) =>
+  store.apply({ type: 'subagent.start', payload: { depth: 0, goal, ...(model ? { model } : {}), subagent_id: id } })
 
 const complete = (store: SessionStore, id: string) =>
   store.apply({ type: 'subagent.complete', payload: { subagent_id: id, summary: 'done' } })
@@ -106,14 +106,34 @@ describe('agents tray — visibility', () => {
     }
   })
 
-  test('2 running agents → a ⛓ chip in the status bar (no persistent tray line)', async () => {
+  test('2 running agents → status chip plus compact model and goal rows', async () => {
     const h = await mountApp()
     try {
-      spawn(h.store, 'a1', 'research X')
-      spawn(h.store, 'a2', 'compile Y')
-      const frame = await h.probe.waitForFrame(f => f.includes('⛓'))
+      spawn(h.store, 'a1', 'research X', 'anthropic/claude-opus-4.8')
+      spawn(h.store, 'a2', 'compile Y', 'openai/gpt-5.6')
+      const frame = await h.probe.waitForFrame(f => f.includes('2 agents active'))
       expect(frame).toContain(`⛓ 2`)
-      expect(frame).not.toContain(EXPANDED_HINT) // collapsed until focused
+      expect(frame).toContain('claude-opus-4.8  research X')
+      expect(frame).toContain('gpt-5.6  compile Y')
+      expect(frame).toContain('↓ inspect')
+      expect(frame).not.toContain(EXPANDED_HINT)
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('compact fan-out is capped at five rows with an overflow count', async () => {
+    const h = await mountApp()
+    try {
+      for (let index = 1; index <= 7; index += 1) {
+        spawn(h.store, `a${String(index)}`, `task ${String(index)}`, 'anthropic/claude-sonnet-5')
+      }
+      const frame = await h.probe.waitForFrame(f => f.includes('7 agents active'))
+      expect(frame).toContain('task 1')
+      expect(frame).toContain('task 5')
+      expect(frame).not.toContain('task 6')
+      expect(frame).not.toContain('task 7')
+      expect(frame).toContain('… +2 more')
     } finally {
       h.probe.destroy()
     }

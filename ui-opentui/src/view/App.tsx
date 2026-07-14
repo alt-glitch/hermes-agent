@@ -309,9 +309,10 @@ export function App(props: AppProps) {
                       />
                     </Match>
                   </Switch>
-                  {/* background-agents tray (Epic 2.7): renders nothing with no
-                      running agents; a one-line indicator otherwise; expands while
-                      focused (composer Down). Enter opens the dashboard on that row. */}
+                  {/* Background-agents tray (Epic 2.7): renders nothing with no
+                      running agents; otherwise shows a bounded live summary and
+                      expands while focused (composer Down). Enter opens the
+                      dashboard on that row. */}
                   <Show when={subagentsVisible()}>
                     <AgentsTray
                       subagents={props.store.state.subagents}
