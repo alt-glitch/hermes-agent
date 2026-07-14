@@ -203,8 +203,10 @@ interface PendingPrompt {
 
 interface PendingSteerRequest {
   readonly front: boolean
+  readonly onAccepted: ((clientSubmissionId: string) => void) | undefined
   outcome?: SessionSteerDisposition
   readonly resolve: (delivery: SteerDelivery) => void
+  readonly submissionId: string
   readonly text: string
 }
 
@@ -1319,7 +1321,12 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
        * is invented. Definite rejection joins the normal queue. Ambiguous
        * transport delivery also joins it, but closes automatic draining until
        * the user explicitly chooses to retry. */
-      const issueSteer = (sessionId: string, text: string, front = false): Promise<SteerDelivery> => {
+      const issueSteer = (
+        sessionId: string,
+        text: string,
+        front = false,
+        onAccepted?: (clientSubmissionId: string) => void
+      ): Promise<SteerDelivery> => {
         if (!canSteer(text, front)) throw new Error('steer reservation unavailable')
         pendingSteerCount += 1
         pendingSteerCharacters += text.length
@@ -1353,6 +1360,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           for (const request of settled) {
             const delivery = request.outcome === 'accepted' ? 'accepted' : (deliveries.get(request) ?? 'retained')
             if (delivery === 'fallback') shouldDrain = true
+            if (delivery === 'accepted') request.onAccepted?.(request.submissionId)
             request.resolve(delivery)
           }
           if (shouldDrain && automaticQueueDrain.canDrain() && !isTurnBusy()) {
@@ -1360,15 +1368,22 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           }
         }
 
+        const submissionId = randomUUID()
         return new Promise<SteerDelivery>(resolve => {
-          pendingSteers.set(sequence, { front, resolve, text })
+          pendingSteers.set(sequence, { front, onAccepted, resolve, submissionId, text })
           void Effect.runPromise(
-            gateway.request<unknown>('session.steer', { session_id: sessionId, text }).pipe(
-              Effect.map(classifySessionSteerResponse),
-              Effect.catchTag('GatewayError', error =>
-                Effect.succeed<SessionSteerDisposition>(deliveryFailureIsUncertain(error) ? 'uncertain' : 'rejected')
+            gateway
+              .request<unknown>('session.steer', {
+                client_submission_id: submissionId,
+                session_id: sessionId,
+                text
+              })
+              .pipe(
+                Effect.map(classifySessionSteerResponse),
+                Effect.catchTag('GatewayError', error =>
+                  Effect.succeed<SessionSteerDisposition>(deliveryFailureIsUncertain(error) ? 'uncertain' : 'rejected')
+                )
               )
-            )
           ).then(
             outcome => {
               const request = pendingSteers.get(sequence)
@@ -1523,7 +1538,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       ): Promise<'fallback' | 'queued' | 'retained' | 'saturated' | 'uncertain'> => {
         if (!canSteer(text)) return Promise.resolve('saturated')
         try {
-          return issueSteer(sessionId, text).then(delivery => (delivery === 'accepted' ? 'queued' : delivery))
+          return issueSteer(sessionId, text, false, submissionId => {
+            const preview = `${text.slice(0, 50)}${text.length > 50 ? '…' : ''}`
+            store.pushPendingSteer(submissionId, `steer queued — arrives after next tool call: "${preview}"`)
+          }).then(delivery => (delivery === 'accepted' ? 'queued' : delivery))
         } catch {
           return Promise.resolve('saturated')
         }

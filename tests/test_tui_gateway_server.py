@@ -5446,6 +5446,92 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
 
 
 
+def test_session_steer_retains_correlation_id_only_after_admission():
+    accepted = _session(agent=types.SimpleNamespace(steer=lambda _text: True))
+    rejected = _session(agent=types.SimpleNamespace(steer=lambda _text: False))
+    server._sessions.update({"accepted": accepted, "rejected": rejected})
+    try:
+        accepted_response = server.handle_request(
+            {
+                "id": "accepted-request",
+                "method": "session.steer",
+                "params": {
+                    "client_submission_id": "steer-accepted",
+                    "session_id": "accepted",
+                    "text": "accepted text",
+                },
+            }
+        )
+        rejected_response = server.handle_request(
+            {
+                "id": "rejected-request",
+                "method": "session.steer",
+                "params": {
+                    "client_submission_id": "steer-rejected",
+                    "session_id": "rejected",
+                    "text": "rejected text",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("accepted", None)
+        server._sessions.pop("rejected", None)
+
+    assert accepted_response["result"]["status"] == "queued"
+    assert accepted["_pending_steer_submission_ids"] == ["steer-accepted"]
+    assert rejected_response["result"]["status"] == "rejected"
+    assert "_pending_steer_submission_ids" not in rejected
+
+
+def test_session_steer_rejects_correlation_overflow_before_agent_admission():
+    calls = []
+    session = _session(
+        agent=types.SimpleNamespace(steer=lambda text: calls.append(text) or True),
+        _pending_steer_submission_ids=[f"existing-{index}" for index in range(1024)],
+    )
+    server._sessions["sid"] = session
+    try:
+        response = server.handle_request(
+            {
+                "id": "overflow-id",
+                "method": "session.steer",
+                "params": {
+                    "client_submission_id": "one-too-many",
+                    "session_id": "sid",
+                    "text": "must not land",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["error"]["code"] == 4009
+    assert calls == []
+    assert len(session["_pending_steer_submission_ids"]) == 1024
+
+
+def test_session_steer_rejects_invalid_correlation_id():
+    session = _session(agent=types.SimpleNamespace(steer=lambda _text: True))
+    server._sessions["sid"] = session
+    try:
+        response = server.handle_request(
+            {
+                "id": "invalid-id",
+                "method": "session.steer",
+                "params": {
+                    "client_submission_id": "x" * 129,
+                    "session_id": "sid",
+                    "text": "must not land",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["error"]["code"] == 4004
+    assert "_pending_steer_submission_ids" not in session
+
+
 def test_session_steer_rejects_empty_text():
     server._sessions["sid"] = _session(
         agent=types.SimpleNamespace(steer=lambda t: True)

@@ -95,6 +95,37 @@ describe('session store — theming / dedup / hydrate (Phase 1)', () => {
   })
 })
 
+describe('session store — correlated steer notices', () => {
+  test('removes only the steer acknowledged by message.complete', () => {
+    const store = createSessionStore()
+    store.pushPendingSteer('steer-a', 'steer queued: a')
+    store.pushPendingSteer('steer-b', 'steer queued: b')
+
+    store.apply({ type: 'message.complete', payload: { client_submission_ids: ['steer-a'] } })
+
+    expect(store.state.messages.map(message => message.text)).toEqual(['steer queued: b'])
+  })
+
+  test('removes promoted steers on correlated message.start and terminal errors', () => {
+    const store = createSessionStore()
+    store.pushPendingSteer('promoted', 'steer queued: promoted')
+    store.apply({ type: 'message.start', payload: { client_submission_ids: ['promoted'] } })
+    expect(store.state.messages.some(message => message.steerSubmissionId === 'promoted')).toBe(false)
+
+    store.pushPendingSteer('failed', 'steer queued: failed')
+    store.apply({ type: 'error', payload: { client_submission_ids: ['failed'], message: 'turn failed' } })
+    expect(store.state.messages.some(message => message.steerSubmissionId === 'failed')).toBe(false)
+    expect(store.state.messages.at(-1)?.text).toBe('error: turn failed')
+  })
+
+  test('does not resurrect a notice when completion wins the RPC-response race', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.complete', payload: { client_submission_ids: ['fast-steer'] } })
+    store.pushPendingSteer('fast-steer', 'must not appear')
+    expect(store.state.messages).toEqual([])
+  })
+})
+
 describe('session store — ordered parts (Phase 2b)', () => {
   test('interleaves text → tool → text as ordered parts in one assistant turn', () => {
     const store = createSessionStore()

@@ -126,6 +126,9 @@ export interface Message {
    * the gateway and lets the submission lease remove exactly that row when a
    * pre-start rejection proves it was never committed to session history. */
   clientId?: string
+  /** Correlates a local pending-steer notice with the gateway event that proves
+   * the steer was consumed, promoted into a turn, or terminally failed. */
+  steerSubmissionId?: string
   /** Visible client-only activity that never enters gateway/SQLite history. */
   localOnly?: 'shell'
   /** Flat body for user/system rows (and settled/resumed assistant rows). */
@@ -933,6 +936,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   // LRU id-dedup: events that carry a stable id are applied at most once.
   const applied = new Set<string>()
+  // A completion can race ahead of the session.steer RPC response on separate
+  // gateway threads. Remember recent acknowledgements so a late local notice
+  // cannot be inserted after its authoritative removal event already passed.
+  const settledSteerSubmissionIds = new Set<string>()
   function duplicate(id: string | undefined): boolean {
     if (!id) return false
     if (applied.has(id)) return true
@@ -1243,6 +1250,35 @@ export function createSessionStore(options?: SessionStoreOptions) {
       state.messages.filter(message => message.clientId !== clientId)
     )
     return true
+  }
+
+  /** Push a pending direct-steer notice. Unlike ordinary slash output, this is
+   * removed only by an authoritative gateway correlation id. */
+  function pushPendingSteer(clientSubmissionId: string, text: string) {
+    if (settledSteerSubmissionIds.has(clientSubmissionId)) return
+    const clean = stripAnsi(text)
+    setState(
+      produce(draft => {
+        draft.messages.push({ role: 'system', steerSubmissionId: clientSubmissionId, text: clean })
+        capMessages(draft)
+      })
+    )
+  }
+
+  function settlePendingSteers(clientSubmissionIds: readonly string[] | undefined) {
+    if (!clientSubmissionIds?.length) return
+    for (const id of clientSubmissionIds) {
+      settledSteerSubmissionIds.add(id)
+      if (settledSteerSubmissionIds.size > LRU_LIMIT) {
+        const oldest = settledSteerSubmissionIds.values().next()
+        if (!oldest.done) settledSteerSubmissionIds.delete(oldest.value)
+      }
+    }
+    const settled = new Set(clientSubmissionIds)
+    setState(
+      'messages',
+      state.messages.filter(message => !message.steerSubmissionId || !settled.has(message.steerSubmissionId))
+    )
   }
 
   /** Push a system line (slash output, errors, notices). */
@@ -2020,6 +2056,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         applyInfo(event.payload)
         break
       case 'message.start':
+        settlePendingSteers(event.payload?.client_submission_ids)
         clearStatusRestoreTimer()
         lastStatusNote = ''
         // A fresh turn owns a fresh live spawn tree and one discovery credit.
@@ -2069,6 +2106,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'message.complete':
+        settlePendingSteers(event.payload?.client_submission_ids)
         if (event.payload?.reasoning) {
           setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning, event.payload?.text)))
         }
@@ -2616,6 +2654,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'error': {
+        settlePendingSteers(event.payload?.client_submission_ids)
         const actualTurnBoundary = (turnInFlight || state.info.running === true) && !agentsTurnArchived
         archiveAndClearSubagents(actualTurnBoundary)
         agentsTurnArchived = true
@@ -2885,6 +2924,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     pushLocalUser,
     pushSkill,
     removeClientMessage,
+    pushPendingSteer,
     pushSystem,
     pushNotification,
     showNotice,

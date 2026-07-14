@@ -9204,6 +9204,13 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    client_submission_id = params.get("client_submission_id")
+    if client_submission_id is not None and (
+        not isinstance(client_submission_id, str)
+        or not client_submission_id
+        or len(client_submission_id) > _MAX_CLIENT_SUBMISSION_ID_CHARS
+    ):
+        return _err(rid, 4004, "invalid client_submission_id")
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -9212,7 +9219,28 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4010, "agent does not support steer")
     try:
         with session["history_lock"]:
+            if client_submission_id is not None:
+                correlated_ids = list(
+                    dict.fromkeys(
+                        [
+                            *list(session.get("_active_client_submission_ids") or []),
+                            *list(session.get("_pending_steer_submission_ids") or []),
+                            client_submission_id,
+                        ]
+                    )
+                )
+                if len(correlated_ids) > _MAX_QUEUED_SUBMISSION_IDS:
+                    return _err(
+                        rid,
+                        4009,
+                        "pending input submission count reached — retry after the current turn",
+                    )
             accepted = _accept_steer_locked(session, agent, text)
+            if accepted and client_submission_id is not None:
+                pending_ids = list(session.get("_pending_steer_submission_ids") or [])
+                session["_pending_steer_submission_ids"] = list(
+                    dict.fromkeys([*pending_ids, client_submission_id])
+                )
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
     return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})

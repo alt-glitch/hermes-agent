@@ -834,7 +834,9 @@ describe('dispatchSlash — client commands', () => {
     live.busy.value = true
     await dispatchSlash('/steer now', live.ctx)
     expect(live.calls).toEqual([{ method: 'session.steer', params: { session_id: 'sid-1', text: 'now' } }])
-    expect(live.system).toEqual(['steer queued — arrives after next tool call: "now"'])
+    // The production host owns the correlation-backed transient notice; the
+    // slash handler must not add an untracked permanent duplicate.
+    expect(live.system).toEqual([])
 
     const uncertain = makeCtx(async method => (method === 'session.steer' ? { status: 'uncertain' } : {}))
     uncertain.busy.value = true

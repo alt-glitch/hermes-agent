@@ -1862,8 +1862,9 @@ const steerCmd: ClientHandler = async (arg, ctx) => {
       ctx.pushSystem('steer fallback queue is full — command restored to composer')
       return
     }
+    // The host creates a correlation-backed transient notice on admission;
+    // it disappears only when the gateway proves this steer was consumed.
     if (ctx.sessionId() !== sid) return
-    ctx.pushSystem(`steer queued — arrives after next tool call: "${text.slice(0, 50)}${text.length > 50 ? '…' : ''}"`)
   } catch (error) {
     if (ctx.sessionId() === sid) {
       const detail = error instanceof Error ? error.message : 'session.steer failed'
