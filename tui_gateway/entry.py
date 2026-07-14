@@ -28,6 +28,30 @@ logger = logging.getLogger(__name__)
 _mcp_discovery_thread = None
 
 
+def _restore_runtime_cwd() -> str | None:
+    """Return gateway runtime work to the launcher's project directory.
+
+    Node starts ``python -m tui_gateway.entry`` in the selected Hermes source
+    root so initial package resolution cannot be shadowed by a project. After
+    ``harden_import_path`` has removed dynamic cwd entries and pinned that
+    source root, cwd-sensitive RPCs and the slash worker can safely inherit the
+    user's workspace instead.
+    """
+    for raw in (os.environ.get("HERMES_CWD"), os.environ.get("TERMINAL_CWD")):
+        value = (raw or "").strip()
+        if not value:
+            continue
+        candidate = os.path.abspath(os.path.expanduser(value))
+        if not os.path.isdir(candidate):
+            continue
+        try:
+            os.chdir(candidate)
+        except OSError:
+            continue
+        return candidate
+    return None
+
+
 def _install_sidecar_publisher() -> None:
     """Mirror every dispatcher emit to the dashboard sidebar via WS.
 
@@ -291,6 +315,7 @@ def join_mcp_discovery(timeout: float | None = None) -> bool:
 
 
 def main():
+    _restore_runtime_cwd()
     _install_sidecar_publisher()
 
     # MCP tool discovery — runs in a background daemon thread so a slow or

@@ -27,6 +27,45 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+def _last_visible_reasoning_for_turn(messages, final_response):
+    """Project the current turn's latest non-answer reasoning for display.
+
+    Provider output can be transformed by a plugin before it becomes
+    ``final_response``. Compare reasoning against both that transformed text
+    and the latest provider-authored assistant content, while retaining the
+    original reasoning metadata in ``messages`` for provider replay.
+    """
+    from agent.agent_runtime_helpers import reasoning_repeats_visible_answer
+
+    current_turn = []
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            break
+        current_turn.append(msg)
+
+    provider_answer = next(
+        (
+            msg.get("content")
+            for msg in current_turn
+            if msg.get("role") == "assistant"
+            and isinstance(msg.get("content"), str)
+            and msg.get("content").strip()
+        ),
+        None,
+    )
+
+    for msg in current_turn:
+        if msg.get("role") != "assistant" or not msg.get("reasoning"):
+            continue
+        candidate = msg["reasoning"]
+        if reasoning_repeats_visible_answer(candidate, final_response):
+            continue
+        if reasoning_repeats_visible_answer(candidate, provider_answer):
+            continue
+        return candidate
+    return None
+
+
 def finalize_turn(
     agent,
     *,
@@ -413,21 +452,11 @@ def finalize_turn(
     # reasoning on the tool-call step and leave the final-answer step
     # with reasoning=None, so picking only the last assistant would
     # silently drop legitimate same-turn reasoning.
-    from agent.agent_runtime_helpers import reasoning_repeats_visible_answer
-
-    last_reasoning = None
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            break  # turn boundary — don't cross into prior turns
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            candidate = msg["reasoning"]
-            # Some OpenAI-compatible providers mirror their final answer into
-            # the reasoning summary. Preserve the message metadata, but do not
-            # project a second visible copy. Keep walking so earlier genuine
-            # same-turn reasoning can still be displayed.
-            if not reasoning_repeats_visible_answer(candidate, final_response):
-                last_reasoning = candidate
-                break
+    # Some OpenAI-compatible providers mirror their final answer into the
+    # reasoning summary. Preserve the message metadata, but do not project a
+    # second visible copy. The helper also compares against provider-authored
+    # content from before any output-transform plugin rewrote final_response.
+    last_reasoning = _last_visible_reasoning_for_turn(messages, final_response)
 
     # Build result with interrupt info if applicable
     result = {

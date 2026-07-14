@@ -473,6 +473,18 @@ describe('createGatewayEventHandler', () => {
     expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
+  it('drops streamed reasoning that repeats the completed answer', () => {
+    const appended: Msg[] = []
+    const answer = 'The frontend talks to Apollo over direct HTTP APIs.\n'
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { text: answer.replace(/\n/g, '\r\n') }, type: 'reasoning.available' } as any)
+    onEvent({ payload: { text: answer }, type: 'message.complete' } as any)
+
+    expect(appended).toEqual([{ role: 'assistant', text: answer.trim() }])
+    expect(appended.some(msg => Boolean(msg.thinking?.trim()))).toBe(false)
+  })
+
   it('renders browser.progress events as system transcript lines as they stream in', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

@@ -45,6 +45,26 @@ const diffSegmentBody = (msg: Msg): null | string => {
 
 const hasDetails = (msg: Msg): boolean => Boolean(msg.thinking || msg.tools?.length || msg.toolTokens)
 
+const sameVisibleText = (left: unknown, right: unknown): boolean => {
+  if (typeof left !== 'string' || typeof right !== 'string') {
+    return false
+  }
+
+  const normalizedLeft = left.replace(/\r\n?/g, '\n').trim()
+  const normalizedRight = right.replace(/\r\n?/g, '\n').trim()
+
+  return Boolean(normalizedLeft && normalizedLeft === normalizedRight)
+}
+
+const withoutThinking = (msg: Msg): Msg => {
+  const next = { ...msg }
+
+  delete next.thinking
+  delete next.thinkingTokens
+
+  return next
+}
+
 const isTodoStatus = (status: unknown): status is TodoItem['status'] =>
   status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'cancelled'
 
@@ -567,7 +587,9 @@ class TurnController {
     const split = splitReasoning(rawText)
     const finalText = finalTail(split.text, this.segmentMessages)
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
-    const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
+    const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning]
+      .filter(reasoning => reasoning && !sameVisibleText(reasoning, finalText))
+      .join('\n\n')
     const savedToolTokens = this.toolTokenAcc
     let tools = this.pendingSegmentTools
     const last = this.segmentMessages[this.segmentMessages.length - 1]
@@ -588,10 +610,20 @@ class TurnController {
     // assistant narration stays put.
     const finalHasOwnDiffFence = /```(?:diff|patch)\b/i.test(finalText)
 
-    const segments = this.segmentMessages.filter(msg => {
+    const segments = this.segmentMessages.flatMap(msg => {
       const body = diffSegmentBody(msg)
 
-      return body === null || (!finalHasOwnDiffFence && !finalText.includes(body))
+      if (body !== null && (finalHasOwnDiffFence || finalText.includes(body))) {
+        return []
+      }
+
+      if (sameVisibleText(msg.thinking, finalText)) {
+        const withoutDuplicate = withoutThinking(msg)
+
+        return withoutDuplicate.text || hasDetails(withoutDuplicate) ? [withoutDuplicate] : []
+      }
+
+      return [msg]
     })
 
     const hasReasoningSegment =

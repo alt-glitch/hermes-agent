@@ -12,7 +12,11 @@ failure.
 """
 
 import ast
+import json
+import os
 import pathlib
+import subprocess
+import sys
 
 import hermes_bootstrap
 
@@ -79,3 +83,54 @@ def test_guard_handles_absolute_cwd_path():
         )
     finally:
         sys.path[:] = original
+
+
+def test_gateway_restores_project_cwd_after_isolated_package_bootstrap(tmp_path):
+    """The real stdio entry imports from Hermes, then runs RPCs in HERMES_CWD."""
+    repo_root = pathlib.Path(__file__).resolve().parent.parent.parent
+    workspace = tmp_path / "project"
+    hermes_home = tmp_path / "home"
+    workspace.mkdir()
+    hermes_home.mkdir()
+
+    requests = [
+        {"jsonrpc": "2.0", "id": "config", "method": "config.show", "params": {}},
+        {
+            "jsonrpc": "2.0",
+            "id": "shell",
+            "method": "shell.exec",
+            "params": {"command": "pwd"},
+        },
+    ]
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_CWD": str(workspace),
+            "HERMES_HOME": str(hermes_home),
+            "HERMES_PYTHON_SRC_ROOT": str(repo_root),
+            "PYTHONPATH": str(repo_root),
+            "TERMINAL_CWD": str(tmp_path / "wrong-terminal-cwd"),
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "tui_gateway.entry"],
+        cwd=repo_root,
+        env=env,
+        input="".join(json.dumps(request) + "\n" for request in requests),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    frames = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    config = next(frame for frame in frames if frame.get("id") == "config")
+    shell = next(frame for frame in frames if frame.get("id") == "shell")
+    environment_rows = next(
+        section["rows"]
+        for section in config["result"]["sections"]
+        if section["title"] == "Environment"
+    )
+
+    assert ["Working Dir", str(workspace)] in environment_rows
+    assert shell["result"]["stdout"].strip() == str(workspace)

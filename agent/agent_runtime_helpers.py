@@ -1312,8 +1312,8 @@ def reasoning_repeats_visible_answer(reasoning: object, answer: object) -> bool:
     """
     if not isinstance(reasoning, str) or not isinstance(answer, str):
         return False
-    normalized_reasoning = reasoning.replace("\r\n", "\n").strip()
-    normalized_answer = answer.replace("\r\n", "\n").strip()
+    normalized_reasoning = reasoning.replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized_answer = answer.replace("\r\n", "\n").replace("\r", "\n").strip()
     return bool(normalized_reasoning and normalized_reasoning == normalized_answer)
 
 
