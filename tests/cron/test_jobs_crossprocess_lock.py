@@ -8,8 +8,8 @@ serializes writers *inside one process*, so a CLI pause issued while the gateway
 was live could be silently lost to a concurrent gateway write — the job kept
 firing even though the CLI reported "Paused".
 
-``_jobs_lock()`` closes that gap with a short-held cross-process advisory file
-lock. This test proves the lock actually excludes a *separate process*, which an
+``cron_store_transaction()`` exposes that lock for multi-operation
+transactions with a short-held cross-process advisory file lock. This test proves the lock actually excludes a *separate process*, which an
 in-process ``threading.Lock`` cannot do.
 """
 
@@ -52,7 +52,7 @@ def test_jobs_lock_excludes_another_process(tmp_path, monkeypatch):
             jobs.JOBS_FILE = jobs.CRON_DIR / "jobs.json"
             jobs.OUTPUT_DIR = jobs.CRON_DIR / "output"
 
-            with jobs._jobs_lock():
+            with jobs.cron_store_transaction():
                 pathlib.Path({str(ready)!r}).write_text("1")
                 # Hold the lock until the parent signals (bounded so a wedged
                 # test can never hang CI).
@@ -77,7 +77,7 @@ def test_jobs_lock_excludes_another_process(tmp_path, monkeypatch):
             jobs.OUTPUT_DIR = jobs.CRON_DIR / "output"
 
             pathlib.Path({str(blocker_started)!r}).write_text("1")
-            with jobs._jobs_lock():
+            with jobs.cron_store_transaction():
                 pathlib.Path({str(blocker_acquired)!r}).write_text("1")
             """
         )
@@ -113,15 +113,19 @@ def test_jobs_lock_excludes_another_process(tmp_path, monkeypatch):
             time.sleep(0.01)
         assert blocker_started.exists(), "blocker process never started"
         time.sleep(0.05)
-        assert not blocker_acquired.exists(), "second process entered _jobs_lock() while held"
+        assert not blocker_acquired.exists(), (
+            "second process entered cron transaction while held"
+        )
     finally:
         release.write_text("1")
         child.wait(timeout=15)
         if blocker_child is not None:
             blocker_child.wait(timeout=15)
 
-    assert blocker_acquired.exists(), "second process did not acquire _jobs_lock() after release"
+    assert blocker_acquired.exists(), (
+        "second process did not acquire _jobs_lock() after release"
+    )
 
     # Once the child has released, the lock is freely acquirable again.
-    with jobs._jobs_lock():
+    with jobs.cron_store_transaction():
         pass

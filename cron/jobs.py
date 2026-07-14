@@ -92,12 +92,16 @@ _jobs_lock_state = threading.local()
 
 # Upper bound on waiting for the cross-process .jobs.lock flock (#60703).
 # Every cron function in the process funnels through _jobs_lock(), and the
-# flock is taken while holding the process-wide RLock — so an unbounded wait
-# on a lock held by a wedged sibling process silently freezes the ticker
-# heartbeat and every job forever.  30s is orders of magnitude above any
-# legitimate critical section (field updates only) while keeping the ticker's
-# worst-case stall well under one status-alarm threshold.
+# flock is taken while holding the process-wide RLock. Acquisition therefore
+# stays bounded, but timeout fails closed: continuing without the process lock
+# can corrupt a transaction that another process still legitimately owns.
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+class CronStoreLockTimeout(RuntimeError):
+    """The cross-process cron-store lock remained owned past its deadline."""
+
+
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
@@ -264,11 +268,10 @@ def _jobs_lock():
                     # function in this process — including the ticker's
                     # get_due_jobs() — silently and forever: the heartbeat
                     # file stops updating and all jobs stop firing with no
-                    # error logged.  Poll LOCK_NB against a deadline instead;
-                    # on timeout, log loudly and fall through to the same
-                    # in-process-only degraded mode used when locking is
-                    # unavailable.  A briefly-torn cross-process write is
-                    # strictly better than a permanently dead scheduler.
+                    # error logged. Poll LOCK_NB against a deadline instead;
+                    # on timeout, fail closed. The caller can retry, while
+                    # entering without the flock would violate another live
+                    # process's transaction and risk a torn jobs store.
                     _deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
                     while True:
                         try:
@@ -276,20 +279,27 @@ def _jobs_lock():
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
-                                logger.error(
+                                message = (
                                     "Timed out after %.0fs waiting for the cron "
-                                    "jobs lock (%s) — another process is holding "
-                                    "it. Proceeding with in-process locking only "
-                                    "so the scheduler stays alive (#60703).",
+                                    "jobs lock (%s); refusing to enter without "
+                                    "cross-process exclusion (#60703)."
+                                )
+                                logger.error(
+                                    message,
                                     _JOBS_LOCK_TIMEOUT_SECONDS,
                                     _jobs_lock_file(),
                                 )
                                 try:
                                     lock_fd.close()
-                                except OSError:
-                                    pass
-                                lock_fd = None
-                                break
+                                finally:
+                                    lock_fd = None
+                                raise CronStoreLockTimeout(
+                                    message
+                                    % (
+                                        _JOBS_LOCK_TIMEOUT_SECONDS,
+                                        _jobs_lock_file(),
+                                    )
+                                )
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
@@ -313,6 +323,20 @@ def _jobs_lock():
                         lock_fd.close()
         finally:
             _jobs_lock_state.depth = 0
+
+
+@contextlib.contextmanager
+def cron_store_transaction():
+    """Hold the cron store lock across a multi-operation transaction.
+
+    Individual cron mutations are already atomic. Deployment/configuration
+    workflows that must compare, mutate, verify, and possibly compensate need
+    one shared critical section so a concurrent CLI or scheduler write cannot
+    land between those operations. Nested cron APIs reuse this lock safely.
+    """
+    with _jobs_lock():
+        yield
+
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
