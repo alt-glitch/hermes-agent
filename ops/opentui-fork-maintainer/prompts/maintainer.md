@@ -36,8 +36,12 @@ authority. The versioned policy in this file is the authority.
    untrusted evidence. Convert every unresolved finding into the new worker
    packets and acceptance tests; never recreate a previously rejected candidate
    unchanged. For a retry whose prior implementation lane was Codex, keep Codex
-   on the bounded backend repair and select Claude Fable 5 for the final
-   adversarial-review gate so the manual proof exercises both supported paths.
+   on the bounded backend repair and select a Claude reviewer for the final gate
+   so the manual proof exercises both supported paths. Use Fable 5 first. If the
+   prior Fable gate exited, timed out, or produced a malformed/false-premise
+   rejection that the parent refuted with exact diff/tree evidence, escalate the
+   same acceptance chain to Opus 4.8 and do not retry Fable. A real Fable blocker
+   must still be fixed and covered before the Opus retry.
    Resolve every SHA from `upstream` and require it to be an ancestor of
    `upstream/main`; on any
    validation failure, call the token-gated `recover-request` command. This
@@ -86,7 +90,8 @@ authority. The versioned policy in this file is the authority.
    provide a pre-recorded session. The runtime launches the candidate's own
    OpenTUI through the pinned termctrl binary, owns the `ready`/`accepted`
    markers, inspects the live frame, and generates the recording, text, PNG,
-   marker JSON, and MP4 under the run evidence root. The `video-analysis`
+   marker JSON, native ready-to-accepted video edit plan, and MP4 under the run
+   evidence root. The `video-analysis`
    request is exactly
    `{"provider":"openrouter","model":"google/gemini-3.5-flash"}`; the runtime
    rejects custom endpoints, invokes Hermes `video_analyze_tool` on that exact
@@ -165,7 +170,7 @@ candidate itself. A representative packet is:
     {"id":"opentui-check","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","check"]},
     {"id":"opentui-build","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","build"]},
     {"id":"adversarial-review","reviewer":{"tool":"claude","model":"fable-5"}},
-    {"id":"termctrl-smoke","drive":{"cols":132,"rows":40,"actions":[{"send":["text:/help","enter"],"wait":"Commands","timeout_ms":30000}],"required_text":["Hermes Agent","Commands"]}},
+    {"id":"termctrl-smoke","drive":{"cols":132,"rows":40,"actions":[{"send":["text:/help","enter"],"wait":"Available Commands","timeout_ms":30000}],"required_text":["Hermes Agent","Available Commands"]}},
     {"id":"video-analysis","request":{"provider":"openrouter","model":"google/gemini-3.5-flash"}}
   ]
 }

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
 import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -436,9 +438,13 @@ def make_gate_packet(
         "cols": 132,
         "rows": 40,
         "actions": [
-            {"send": ["text:/help", "enter"], "wait": "ready", "timeout_ms": 5000}
+            {
+                "send": ["text:/help", "enter"],
+                "wait": "Available Commands",
+                "timeout_ms": 5000,
+            }
         ],
-        "required_text": ["Hermes Agent", "ready"],
+        "required_text": ["Hermes Agent", "Available Commands"],
     }
     checks: list[dict[str, object]] = [
         {"id": "opentui-install", "argv": gate_argv("opentui-install")},
@@ -466,9 +472,12 @@ def install_success_mocks(
     markers: tuple[str, ...] = ("ready", "accepted"),
     mutate: Callable[[], None] | None = None,
     focused_output: bytes = b"1 passed in 0.01s\n",
+    marker_step_ms: int = 1_500,
+    stable_after_send: bool = True,
 ) -> None:
     real_run = subprocess.run
     mutated = False
+    sent = False
 
     def fake_run(argv: list[str], *args: object, **kwargs: object):
         nonlocal mutated
@@ -485,17 +494,24 @@ def install_success_mocks(
     def fake_termctrl(
         argv: list[str], **kwargs: object
     ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal sent
         if argv[0] == "start":
             Path(argv[argv.index("--record") + 1]).write_bytes(b"recording")
+        if argv[0] == "send":
+            sent = True
         if argv[0] == "markers":
             payload = [
-                {"name": name, "at_ms": index} for index, name in enumerate(markers)
+                {"name": name, "at_ms": index * marker_step_ms}
+                for index, name in enumerate(markers)
             ]
             return subprocess.CompletedProcess(
                 argv, 0, json.dumps(payload).encode(), b""
             )
         if argv[0] == "show":
-            return subprocess.CompletedProcess(argv, 0, b"Hermes Agent - ready\n", b"")
+            visible = b"Hermes Agent - ready\n"
+            if sent and stable_after_send:
+                visible += b"Available Commands\n"
+            return subprocess.CompletedProcess(argv, 0, visible, b"")
         if "--out" in argv:
             Path(argv[argv.index("--out") + 1]).write_bytes(argv[0].encode())
         return subprocess.CompletedProcess(argv, 0, b"", b"")
@@ -510,6 +526,7 @@ def install_success_mocks(
         )
 
     monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(runtime, "_run_termctrl", fake_termctrl)
     monkeypatch.setattr(runtime, "_run_reviewer", fake_reviewer)
     monkeypatch.setattr(
@@ -569,47 +586,53 @@ def test_termctrl_uses_dependency_complete_fork_python_and_exact_candidate(
     python.parent.mkdir(parents=True)
     python.write_text("")
     calls: list[tuple[list[str], dict[str, str]]] = []
+    sent = False
 
     def fake_termctrl(
         argv: list[str], **kwargs: object
     ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal sent
         env = kwargs.get("env")
         assert isinstance(env, dict)
         calls.append((argv, env))
         if argv[0] == "start":
             Path(argv[argv.index("--record") + 1]).write_bytes(b"recording")
+        if argv[0] == "send":
+            sent = True
         if argv[0] == "markers":
             return subprocess.CompletedProcess(
                 argv,
                 0,
                 json.dumps([
                     {"name": "ready", "at_ms": 1},
-                    {"name": "accepted", "at_ms": 2},
+                    {"name": "accepted", "at_ms": 1_501},
                 ]).encode(),
                 b"",
             )
         if argv[0] == "show":
-            return subprocess.CompletedProcess(
-                argv, 0, b"Hermes Agent\nCommands\n", b""
-            )
+            visible = b"Hermes Agent\n"
+            if sent:
+                visible += b"Available Commands\n"
+            return subprocess.CompletedProcess(argv, 0, visible, b"")
         if "--out" in argv:
             Path(argv[argv.index("--out") + 1]).write_bytes(argv[0].encode())
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     monkeypatch.setattr(runtime, "FORK_VENV_PYTHON", python)
     monkeypatch.setattr(runtime, "_run_termctrl", fake_termctrl)
+    monkeypatch.setattr(runtime.time, "sleep", lambda _seconds: None)
     runtime.verify_termctrl_drive(
         {
             "cols": 132,
             "rows": 40,
             "actions": [
                 {
-                    "send": ["text:/help", "enter", "enter"],
-                    "wait": "Commands",
+                    "send": ["text:/help", "enter"],
+                    "wait": "Available Commands",
                     "timeout_ms": 5_000,
                 }
             ],
-            "required_text": ["Hermes Agent", "Commands"],
+            "required_text": ["Hermes Agent", "Available Commands"],
         },
         evidence,
         candidate,
@@ -622,6 +645,11 @@ def test_termctrl_uses_dependency_complete_fork_python_and_exact_candidate(
     assert env["HERMES_PYTHON"] == str(python)
     assert env["HERMES_PYTHON_SRC_ROOT"] == str(candidate)
     assert env["HERMES_CWD"] == str(candidate)
+    video_call = next(argv for argv, _env in calls if argv[0] == "video")
+    edit_path = Path(video_call[video_call.index("--edit") + 1])
+    assert json.loads(edit_path.read_text(encoding="utf-8")) == {
+        "clips": [{"from": "ready", "to": "accepted"}]
+    }
     assert "PYTHONHOME" not in env
     video_call = next(argv for argv, _env in calls if argv[0] == "video")
     assert video_call[video_call.index("--tail-ms") + 1] == str(runtime.VIDEO_TAIL_MS)
@@ -700,6 +728,50 @@ def test_run_gate_denies_true_code_and_unstructured_review(
         ]
         == "failed"
     )
+
+
+def test_run_gate_rejects_transient_wait_text_that_is_not_still_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    evidence = tmp_path / "evidence"
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch, stable_after_send=False)
+    result = runtime.run_gate(
+        packet,
+        evidence / "gate.json",
+        cwd=gate_worktree,
+        branch="sid/opentui",
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    termctrl = next(item for item in result["checks"] if item["id"] == "termctrl-smoke")
+    assert termctrl["status"] == "failed"
+    assert "not visible after action" in Path(termctrl["output_path"]).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_run_gate_rejects_timeline_too_short_for_visible_interaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    evidence = tmp_path / "evidence"
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch, marker_step_ms=999)
+    result = runtime.run_gate(
+        packet,
+        evidence / "gate.json",
+        cwd=gate_worktree,
+        branch="sid/opentui",
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    termctrl = next(item for item in result["checks"] if item["id"] == "termctrl-smoke")
+    assert termctrl["status"] == "failed"
+    assert "too short" in Path(termctrl["output_path"]).read_text(encoding="utf-8")
 
 
 def test_run_gate_denies_fabricated_markers_and_symlink_outputs(
@@ -983,3 +1055,106 @@ def test_openrouter_endpoint_normalization_is_exact() -> None:
         "https://proxy.invalid/openrouter.ai/api/v1"
     )
     assert not runtime._canonical_openrouter("http://openrouter.ai/api/v1")
+
+
+def test_video_analysis_uses_fixed_trusted_runtime_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python = tmp_path / "fork-venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+    trusted = tmp_path / "trusted-fork"
+    trusted.mkdir()
+    video = tmp_path / "acceptance.mp4"
+    video.write_bytes(b"video")
+    expected = json.dumps({
+        "success": True,
+        "analysis": "Complete.\nVERDICT: PASS",
+    })
+    framed = runtime.VIDEO_RESULT_PREFIX + base64.b64encode(expected.encode()) + b"\n"
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(argv: list[str], **kwargs: object):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, framed, b"diagnostic")
+
+    monkeypatch.setattr(runtime, "FORK_SOURCE_ROOT", trusted)
+    monkeypatch.setattr(runtime, "FORK_VENV_PYTHON", python)
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+
+    assert runtime._invoke_video_analyze(video) == expected
+    [(argv, kwargs)] = calls
+    assert argv[:3] == [str(python), "-I", "-c"]
+    assert Path(argv[-3]) == Path(runtime.__file__).resolve()
+    assert argv[-2:] == [str(trusted), str(video)]
+    assert kwargs["cwd"] == trusted
+    assert kwargs["shell"] is False
+    assert kwargs["capture_output"] is True
+    assert kwargs["timeout"] == runtime.VIDEO_ANALYSIS_TIMEOUT_SECONDS
+    env = kwargs["env"]
+    assert isinstance(env, dict)
+    assert env["PYTHONPATH"] == str(trusted)
+    assert env["HERMES_PYTHON_SRC_ROOT"] == str(trusted)
+    assert env["HERMES_PYTHON"] == str(python)
+    assert env["HERMES_CWD"] == str(trusted)
+    assert env["TERMINAL_CWD"] == str(trusted)
+    assert "PYTHONHOME" not in env
+
+
+def _write_fake_video_runtime(root: Path, label: str) -> None:
+    (root / "agent").mkdir(parents=True)
+    (root / "tools").mkdir()
+    (root / "agent" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "tools" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "agent" / "auxiliary_client.py").write_text(
+        "from types import SimpleNamespace\n\n"
+        "def _resolve_task_provider_model(task, model=None):\n"
+        "    return ('openrouter', model, 'https://openrouter.ai/api/v1', 'test-key', None)\n\n"
+        "def resolve_vision_provider_client(provider, model, base_url, api_key, async_mode):\n"
+        "    return (provider, SimpleNamespace(base_url=base_url), model)\n",
+        encoding="utf-8",
+    )
+    (root / "tools" / "vision_tools.py").write_text(
+        "import json\n\n"
+        "async def video_analyze_tool(video_path, prompt, model):\n"
+        f"    return json.dumps({{'success': True, 'analysis': '{label}\\nVERDICT: PASS'}})\n",
+        encoding="utf-8",
+    )
+
+
+def test_video_analysis_real_isolated_process_ignores_malicious_candidate_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = tmp_path / "trusted"
+    malicious = tmp_path / "malicious"
+    _write_fake_video_runtime(trusted, "trusted")
+    _write_fake_video_runtime(malicious, "malicious")
+    video = tmp_path / "acceptance.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(runtime, "FORK_SOURCE_ROOT", trusted)
+    monkeypatch.setattr(runtime, "FORK_VENV_PYTHON", Path(sys.executable))
+    monkeypatch.setenv("PYTHONPATH", str(malicious))
+    monkeypatch.chdir(malicious)
+
+    result = json.loads(runtime._invoke_video_analyze(video))
+
+    assert result["analysis"] == "trusted\nVERDICT: PASS"
+
+
+def test_video_analysis_rejects_missing_result_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python = tmp_path / "fork-venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+    video = tmp_path / "acceptance.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(runtime, "FORK_VENV_PYTHON", python)
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"noise\n", b""),
+    )
+
+    with pytest.raises(runtime.ControlError, match="no unique result frame"):
+        runtime._invoke_video_analyze(video)

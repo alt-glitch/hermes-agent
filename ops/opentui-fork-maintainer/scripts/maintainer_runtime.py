@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import fcntl
 import hashlib
 import json
@@ -49,9 +50,8 @@ NODE26_DIR = Path(
 NODE26 = NODE26_DIR / "node"
 NPM26 = NODE26_DIR / "npm"
 TERMCTRL = Path("/home/daimon/.cargo/bin/termctrl")
-FORK_VENV_PYTHON = Path(
-    "/home/daimon/side-quests/hermes-agent/.venv/bin/python"
-)
+FORK_SOURCE_ROOT = Path("/home/daimon/side-quests/hermes-agent")
+FORK_VENV_PYTHON = FORK_SOURCE_ROOT / ".venv/bin/python"
 CONTROLLED_PATH = f"{NODE26_DIR}:/usr/local/bin:/usr/bin:/bin"
 CANONICAL_CODE_GATES = {
     "opentui-install": [str(NPM26), "--prefix", "ui-opentui", "ci"],
@@ -60,11 +60,17 @@ CANONICAL_CODE_GATES = {
 }
 VIDEO_MODEL = "google/gemini-3.5-flash"
 VIDEO_TAIL_MS = 3_000
+TERMCTRL_READY_HOLD_SECONDS = 1.5
+TERMCTRL_MIN_ACTION_TIMELINE_MS = 1_000
+VIDEO_ANALYSIS_TIMEOUT_SECONDS = 10 * 60
+REVIEW_TIMEOUT_SECONDS = 15 * 60
+VIDEO_RESULT_PREFIX = b"HERMES_VIDEO_RESULT_B64="
 VIDEO_PROMPT = (
     "Review this Hermes OpenTUI acceptance recording. End with exactly "
     "VERDICT: PASS only if the tested flow is visibly complete and there is no "
     "crash, clipping, corruption, duplicate content, or stuck overlay; otherwise "
-    "end with exactly VERDICT: FAIL and explain every finding."
+    "end with exactly VERDICT: FAIL and explain every finding. The final line "
+    "must be plain ASCII with no Markdown, punctuation, or suffix after PASS or FAIL."
 )
 
 REVIEWER_COMMANDS: dict[tuple[str, str], list[str]] = {
@@ -222,9 +228,9 @@ def _record_retry_context(
     runs_dir = state_dir / "runs"
     if not runs_dir.is_dir():
         return
-    request_bytes = (
-        json.dumps(request_value, sort_keys=True, separators=(",", ":")).encode()
-    )
+    request_bytes = json.dumps(
+        request_value, sort_keys=True, separators=(",", ":")
+    ).encode()
     current = Path(os.path.abspath(evidence_dir))
     candidates: list[Path] = []
     for run_dir in runs_dir.iterdir():
@@ -1023,6 +1029,8 @@ def _validate_drive(value: Any) -> tuple[int, int, list[dict[str, Any]], list[st
         )
     ):
         raise ControlError("termctrl drive must require visible acceptance text")
+    if actions[-1]["wait"] not in required:
+        raise ControlError("termctrl final wait text must be required at acceptance")
     return cols, rows, actions, required
 
 
@@ -1038,7 +1046,15 @@ def verify_termctrl_drive(
     text_path = _safe_output_path(generated, "accepted.txt")
     png_path = _safe_output_path(generated, "accepted.png")
     video_path = _safe_output_path(generated, "acceptance.mp4")
-    for output in (recording, marker_path, text_path, png_path, video_path):
+    edit_path = _safe_output_path(generated, "video-edit.json")
+    for output in (
+        recording,
+        marker_path,
+        text_path,
+        png_path,
+        video_path,
+        edit_path,
+    ):
         output.unlink(missing_ok=True)
     session = f"maintainer-{os.getpid()}-{time.time_ns()}"
     if not FORK_VENV_PYTHON.is_file():
@@ -1076,12 +1092,20 @@ def verify_termctrl_drive(
         _run_termctrl(launch, cwd=candidate, env=child_env)
         started = True
         _run_termctrl(
-            ["wait", session, "Hermes Agent", "--timeout", "60000"],
+            ["wait", session, "opentui · ready", "--timeout", "60000"],
             cwd=candidate,
             env=child_env,
         )
         _run_termctrl(["mark", session, "ready"], cwd=candidate, env=child_env)
+        time.sleep(TERMCTRL_READY_HOLD_SECONDS)
         for action in actions:
+            before = _run_termctrl(
+                ["show", session], cwd=candidate, env=child_env
+            ).stdout.decode("utf-8", errors="replace")
+            if action["wait"].casefold() in before.casefold():
+                raise ControlError(
+                    "termctrl wait text was already visible before action"
+                )
             _run_termctrl(
                 ["send", session, *action["send"]], cwd=candidate, env=child_env
             )
@@ -1096,6 +1120,11 @@ def verify_termctrl_drive(
                 cwd=candidate,
                 env=child_env,
             )
+            after = _run_termctrl(
+                ["show", session], cwd=candidate, env=child_env
+            ).stdout.decode("utf-8", errors="replace")
+            if action["wait"].casefold() not in after.casefold():
+                raise ControlError("termctrl wait text was not visible after action")
         _run_termctrl(["mark", session, "accepted"], cwd=candidate, env=child_env)
         shown = _run_termctrl(["show", session], cwd=candidate, env=child_env).stdout
         text_path.write_bytes(shown)
@@ -1119,8 +1148,12 @@ def verify_termctrl_drive(
     names, times = _marker_names(marker_value)
     if not {"ready", "accepted"}.issubset(names):
         raise ControlError("recording is missing ready or accepted markers")
-    if "ready" in times and "accepted" in times and times["ready"] > times["accepted"]:
-        raise ControlError("recording accepted marker precedes ready marker")
+    if "ready" in times and "accepted" in times:
+        elapsed = times["accepted"] - times["ready"]
+        if elapsed < 0:
+            raise ControlError("recording accepted marker precedes ready marker")
+        if elapsed < TERMCTRL_MIN_ACTION_TIMELINE_MS:
+            raise ControlError("recording is too short to show the tested interaction")
     _run_termctrl(
         [
             "save",
@@ -1136,10 +1169,13 @@ def verify_termctrl_drive(
         cwd=candidate,
         env=child_env,
     )
+    _atomic_json(edit_path, {"clips": [{"from": "ready", "to": "accepted"}]})
     _run_termctrl(
         [
             "video",
             str(recording),
+            "--edit",
+            str(edit_path),
             "--tail-ms",
             str(VIDEO_TAIL_MS),
             "--out",
@@ -1148,7 +1184,7 @@ def verify_termctrl_drive(
         cwd=candidate,
         env=child_env,
     )
-    for output in (recording, marker_path, text_path, png_path, video_path):
+    for output in (recording, marker_path, text_path, png_path, video_path, edit_path):
         if not output.is_file() or output.is_symlink() or output.stat().st_size <= 0:
             raise ControlError(f"termctrl did not regenerate {output.name}")
     return {
@@ -1163,6 +1199,8 @@ def verify_termctrl_drive(
         "png_sha256": _file_sha256(png_path),
         "video_path": str(video_path),
         "video_sha256": _file_sha256(video_path),
+        "video_edit_path": str(edit_path),
+        "video_edit_sha256": _file_sha256(edit_path),
     }
 
 
@@ -1191,7 +1229,9 @@ def _run_reviewer(
         start_new_session=True,
     )
     try:
-        stdout, stderr = process.communicate(input=prompt, timeout=1800)
+        stdout, stderr = process.communicate(
+            input=prompt, timeout=REVIEW_TIMEOUT_SECONDS
+        )
     except subprocess.TimeoutExpired as exc:
         _terminate_process_group(process)
         raise ControlError("adversarial reviewer timed out") from exc
@@ -1263,7 +1303,7 @@ def _canonical_openrouter(value: Any) -> bool:
     return str(value).rstrip("/") == "https://openrouter.ai/api/v1"
 
 
-def _invoke_video_analyze(video_path: Path) -> str:
+def _invoke_video_analyze_in_process(video_path: Path) -> str:
     try:
         from agent.auxiliary_client import (
             _resolve_task_provider_model,
@@ -1301,6 +1341,94 @@ def _invoke_video_analyze(video_path: Path) -> str:
     if not _canonical_openrouter(getattr(client, "base_url", None)):
         raise ControlError("video analysis client route changed during verification")
     return raw
+
+
+def _invoke_video_analyze(video_path: Path) -> str:
+    """Run Hermes video analysis through the dependency-complete fork venv.
+
+    The control-plane script itself is a PEP 723 isolated program and therefore
+    cannot import Hermes' optional inference dependencies. Keep that isolation:
+    launch the fixed fork interpreter in isolated mode, load this trusted runtime
+    by exact path, and import the verdict-producing Hermes code only from the
+    trusted deployed fork. The candidate contributes the hashed MP4, never judge code.
+    """
+    video_path = Path(os.path.abspath(video_path))
+    trusted_root = Path(os.path.abspath(FORK_SOURCE_ROOT))
+    runtime_path = Path(__file__).resolve()
+    if not FORK_VENV_PYTHON.is_file():
+        raise ControlError("dependency-complete fork Python is unavailable")
+    if not trusted_root.is_dir() or trusted_root.is_symlink():
+        raise ControlError(
+            "trusted video analysis source root is unavailable or unsafe"
+        )
+    if not video_path.is_file() or video_path.is_symlink():
+        raise ControlError("video analysis input is unavailable or unsafe")
+    helper = r"""
+import base64
+import importlib.util
+import pathlib
+import sys
+
+runtime_path = pathlib.Path(sys.argv[1])
+trusted_root = pathlib.Path(sys.argv[2])
+video_path = pathlib.Path(sys.argv[3])
+sys.path.insert(0, str(trusted_root))
+spec = importlib.util.spec_from_file_location("_hermes_maintainer_runtime", runtime_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError("could not load trusted maintainer runtime")
+runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runtime)
+raw = runtime._invoke_video_analyze_in_process(video_path)
+encoded = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+print("HERMES_VIDEO_RESULT_B64=" + encoded)
+"""
+    env = {
+        **os.environ,
+        # -I ignores this for the primary interpreter; descendants inherit it.
+        "PYTHONPATH": str(trusted_root),
+        "PYTHONSAFEPATH": "1",
+        "HERMES_PYTHON_SRC_ROOT": str(trusted_root),
+        "HERMES_PYTHON": str(FORK_VENV_PYTHON),
+        "HERMES_CWD": str(trusted_root),
+        "TERMINAL_CWD": str(trusted_root),
+    }
+    env.pop("PYTHONHOME", None)
+    argv = [
+        str(FORK_VENV_PYTHON),
+        "-I",
+        "-c",
+        helper,
+        str(runtime_path),
+        str(trusted_root),
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=trusted_root,
+            env=env,
+            shell=False,
+            capture_output=True,
+            check=False,
+            timeout=VIDEO_ANALYSIS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ControlError("video analysis subprocess timed out") from exc
+    if result.returncode != 0:
+        raise ControlError("video analysis subprocess exited unsuccessfully")
+    framed = [
+        line.removeprefix(VIDEO_RESULT_PREFIX)
+        for line in result.stdout.splitlines()
+        if line.startswith(VIDEO_RESULT_PREFIX)
+    ]
+    if len(framed) != 1:
+        raise ControlError("video analysis subprocess returned no unique result frame")
+    try:
+        return base64.b64decode(framed[0], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ControlError(
+            "video analysis subprocess returned an invalid result frame"
+        ) from exc
 
 
 def verify_video_request(
