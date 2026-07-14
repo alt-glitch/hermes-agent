@@ -1766,6 +1766,7 @@ setup_path() {
 #!/usr/bin/env bash
 unset PYTHONPATH
 unset PYTHONHOME
+export PYTHONSAFEPATH=1
 exec "$HERMES_BIN" "\$@"
 EOF
     chmod +x "$command_link_dir/hermes"

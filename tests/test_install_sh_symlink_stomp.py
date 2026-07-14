@@ -117,6 +117,7 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
     shim_text = shim_path.read_text()
     assert "unset PYTHONPATH" in shim_text
     assert "unset PYTHONHOME" in shim_text
+    assert "export PYTHONSAFEPATH=1" in shim_text
     assert f'exec "{pip_entry}"' in shim_text
     shim_mode = shim_path.stat().st_mode
     assert shim_mode & stat.S_IXUSR, "shim must be user-executable"
