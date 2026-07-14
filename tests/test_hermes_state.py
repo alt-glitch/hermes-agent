@@ -76,6 +76,214 @@ def db(tmp_path):
 
 
 # =========================================================================
+# Model picker usage
+# =========================================================================
+
+class TestModelPickerUsage:
+    def test_record_activation_upserts_and_normalizes_endpoint(self, db, monkeypatch):
+        timestamps = iter((10.0, 20.0))
+        monkeypatch.setattr(hermes_state.time, "time", lambda: next(timestamps))
+
+        first = db.record_model_activation(
+            "  custom:local  ",
+            "  qwen3.5:27b  ",
+            "http://localhost:11434/v1/",
+        )
+        second = db.record_model_activation(
+            "custom:local",
+            "qwen3.5:27b",
+            "http://localhost:11434/v1",
+        )
+
+        assert first == {
+            "provider_id": "custom:local",
+            "model": "qwen3.5:27b",
+            "base_url": "http://localhost:11434/v1",
+            "last_used_at": 10.0,
+            "activation_count": 1,
+        }
+        assert second["activation_count"] == 2
+        assert second["last_used_at"] == 20.0
+        assert db.list_recent_models() == [second]
+
+    def test_identity_keeps_local_endpoints_and_providers_distinct(self, db, monkeypatch):
+        timestamps = iter((1.0, 2.0, 3.0))
+        monkeypatch.setattr(hermes_state.time, "time", lambda: next(timestamps))
+
+        db.record_model_activation("custom:local-a", "qwen", "http://127.0.0.1:8000/v1")
+        db.record_model_activation("custom:local-a", "qwen", "http://127.0.0.1:9000/v1")
+        db.record_model_activation("custom:local-b", "qwen", "http://127.0.0.1:8000/v1")
+
+        rows = db.list_recent_models(limit=10)
+        assert len(rows) == 3
+        assert {
+            (row["provider_id"], row["model"], row["base_url"])
+            for row in rows
+        } == {
+            ("custom:local-a", "qwen", "http://127.0.0.1:8000/v1"),
+            ("custom:local-a", "qwen", "http://127.0.0.1:9000/v1"),
+            ("custom:local-b", "qwen", "http://127.0.0.1:8000/v1"),
+        }
+
+    def test_recent_models_orders_by_time_and_honors_limit(self, db, monkeypatch):
+        timestamps = iter((10.0, 30.0, 20.0))
+        monkeypatch.setattr(hermes_state.time, "time", lambda: next(timestamps))
+
+        db.record_model_activation("anthropic", "sonnet")
+        db.record_model_activation("openai-codex", "gpt-5")
+        db.record_model_activation("custom:local", "qwen", "http://localhost:11434/v1")
+
+        assert [
+            (row["provider_id"], row["model"])
+            for row in db.list_recent_models(limit=2)
+        ] == [
+            ("openai-codex", "gpt-5"),
+            ("custom:local", "qwen"),
+        ]
+        assert db.list_recent_models(limit=0) == []
+
+    def test_frequent_models_orders_by_count_then_recency(self, db, monkeypatch):
+        timestamps = iter((1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0))
+        monkeypatch.setattr(hermes_state.time, "time", lambda: next(timestamps))
+
+        for _ in range(3):
+            db.record_model_activation("anthropic", "sonnet")
+        for _ in range(2):
+            db.record_model_activation("openai-codex", "gpt-5")
+        for _ in range(3):
+            db.record_model_activation("custom:local", "qwen", "http://localhost:11434/v1")
+
+        rows = db.list_frequent_models(limit=3)
+        assert [
+            (row["provider_id"], row["activation_count"])
+            for row in rows
+        ] == [
+            ("custom:local", 3),
+            ("anthropic", 3),
+            ("openai-codex", 2),
+        ]
+        assert db.list_frequent_models(limit=-1) == []
+
+    def test_rankings_include_real_session_usage_and_local_endpoints(self, db):
+        db.create_session("local-session", "cli", model="qwen")
+        db.update_token_counts(
+            "local-session",
+            model="qwen",
+            billing_provider="local-lab",
+            billing_base_url="http://localhost:11434/v1",
+            api_call_count=7,
+        )
+        db.record_model_activation("anthropic", "sonnet")
+
+        frequent = db.list_frequent_models(limit=2)
+        assert frequent[0]["provider_id"] == "local-lab"
+        assert frequent[0]["model"] == "qwen"
+        assert frequent[0]["base_url"] == "http://localhost:11434/v1"
+        assert frequent[0]["activation_count"] == 7
+        assert {row["provider_id"] for row in db.list_recent_models(limit=5)} == {
+            "local-lab",
+            "anthropic",
+        }
+
+    def test_absolute_api_counts_remain_attributed_across_model_switch(self, db):
+        db.create_session("switch-session", "tui", model="model-a")
+        db.update_token_counts(
+            "switch-session",
+            model="model-a",
+            billing_provider="provider-a",
+            billing_base_url="https://a.invalid/v1",
+            api_call_count=100,
+            absolute=True,
+        )
+        db.update_session_model("switch-session", "model-b")
+        db.update_session_billing_route(
+            "switch-session",
+            provider="provider-b",
+            base_url="https://b.invalid/v1",
+        )
+        db.update_token_counts(
+            "switch-session",
+            model="model-b",
+            billing_provider="provider-b",
+            billing_base_url="https://b.invalid/v1",
+            api_call_count=101,
+            absolute=True,
+        )
+
+        rows = db.list_frequent_models(limit=5)
+        assert [(row["provider_id"], row["model"], row["activation_count"]) for row in rows] == [
+            ("provider-a", "model-a", 100),
+            ("provider-b", "model-b", 1),
+        ]
+
+    def test_per_call_route_attributes_automatic_provider_fallback(self, db):
+        db.create_session("fallback-session", "cli", model="model-a")
+        db.update_token_counts(
+            "fallback-session",
+            model="model-a",
+            billing_provider="provider-a",
+            billing_base_url="https://a.invalid/v1",
+            api_call_count=1,
+        )
+        # Automatic fallback changes the live agent route but intentionally
+        # does not rewrite the session's sticky display route.
+        db.update_token_counts(
+            "fallback-session",
+            model="model-b",
+            billing_provider="provider-b",
+            billing_base_url="https://b.invalid/v1",
+            api_call_count=1,
+        )
+
+        rows = db.list_frequent_models(limit=5)
+        assert {(row["provider_id"], row["model"], row["activation_count"]) for row in rows} == {
+            ("provider-a", "model-a", 1),
+            ("provider-b", "model-b", 1),
+        }
+
+    def test_usage_survives_reopen(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "model_usage_state.db"
+        monkeypatch.setattr(hermes_state.time, "time", lambda: 42.0)
+
+        first = SessionDB(db_path=db_path)
+        first.record_model_activation(
+            "custom:ollama",
+            "qwen3.5:27b",
+            "http://localhost:11434/v1",
+        )
+        first.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.list_recent_models() == [
+                {
+                    "provider_id": "custom:ollama",
+                    "model": "qwen3.5:27b",
+                    "base_url": "http://localhost:11434/v1",
+                    "last_used_at": 42.0,
+                    "activation_count": 1,
+                }
+            ]
+        finally:
+            reopened.close()
+
+    @pytest.mark.parametrize(
+        ("provider_id", "model"),
+        [
+            ("", "qwen"),
+            ("custom:local", ""),
+            ("   ", "qwen"),
+            ("custom:local", "   "),
+        ],
+    )
+    def test_record_activation_rejects_incomplete_identity(
+        self, db, provider_id, model
+    ):
+        with pytest.raises(ValueError):
+            db.record_model_activation(provider_id, model)
+
+
+# =========================================================================
 # Session lifecycle
 # =========================================================================
 

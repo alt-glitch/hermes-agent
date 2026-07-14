@@ -10213,6 +10213,186 @@ class TestProcessCompletionCard:
         server._emit_process_completion_card("s1", {"type": "completion", "command": "daemon", "session_id": "p4"})
         assert emitted[0][2]["text"] == "daemon finished"
 
+    def test_async_delegation_is_compact_with_full_disclosure(self, monkeypatch):
+        emitted = self._capture(monkeypatch)
+        detail = (
+            "[ASYNC DELEGATION BATCH COMPLETE — deleg_test]\n"
+            "A background fan-out has finished.\n\n"
+            "--- ✓ TASK 1/2: inspect runtime ---\nFULL_SENTINEL_A\n"
+            "--- ✓ TASK 2/2: inspect config ---\nFULL_SENTINEL_B"
+        )
+        evt = {
+            "type": "async_delegation",
+            "delegation_id": "deleg_test",
+            "is_batch": True,
+            "goals": ["inspect runtime", "inspect config"],
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "FULL_SENTINEL_A"},
+                {"task_index": 1, "status": "completed", "summary": "FULL_SENTINEL_B"},
+            ],
+            "total_duration_seconds": 2.4,
+        }
+
+        server._emit_process_completion_card("s1", evt, detail)
+
+        assert len(emitted) == 1
+        event, sid, payload = emitted[0]
+        assert event == "notification.show"
+        assert sid == "s1"
+        assert payload["always_visible"] is True
+        assert "2 agents" in payload["text"]
+        assert "FULL_SENTINEL" not in payload["text"]
+        assert payload["detail"] == detail
+
+
+def test_history_to_messages_compacts_internal_async_prompt_only_for_opentui():
+    detail = (
+        "[ASYNC DELEGATION BATCH COMPLETE — deleg_resume]\n"
+        "A background fan-out has finished.\n\n"
+        "--- ✓ TASK 1/1: inspect runtime ---\nFULL_RESUME_SENTINEL"
+    )
+    history = [{"role": "user", "content": detail}]
+
+    native = server._history_to_messages(history, include_tool_output=True)
+    assert native[0]["role"] == "notification"
+    assert native[0]["notification"]["detail"] == detail
+    assert native[0]["notification"]["always_visible"] is True
+    assert "FULL_RESUME_SENTINEL" not in native[0]["text"]
+
+    ink = server._history_to_messages(history, include_tool_output=False)
+    assert ink == [{"role": "user", "text": detail}]
+
+
+def test_session_activate_compacts_internal_async_prompt_for_opentui(monkeypatch):
+    detail = (
+        "[ASYNC DELEGATION BATCH COMPLETE — deleg_live]\n"
+        "A background fan-out has finished.\n\n"
+        "--- ✓ TASK 1/1: inspect runtime ---\nFULL_LIVE_SENTINEL"
+    )
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    server._sessions["sid-async-live"] = _session(
+        agent=types.SimpleNamespace(model="model-a"),
+        history=[{"role": "user", "content": detail}],
+        session_key="key-async-live",
+    )
+    try:
+        native = server.handle_request(
+            {
+                "id": "native",
+                "method": "session.activate",
+                "params": {"session_id": "sid-async-live", "with_ui_chrome": True},
+            }
+        )["result"]["messages"]
+        assert native[0]["role"] == "notification"
+        assert native[0]["notification"]["detail"] == detail
+        assert "FULL_LIVE_SENTINEL" not in native[0]["text"]
+
+        ink = server.handle_request(
+            {
+                "id": "ink",
+                "method": "session.activate",
+                "params": {"session_id": "sid-async-live"},
+            }
+        )["result"]["messages"]
+        assert ink == [{"role": "user", "text": detail}]
+    finally:
+        server._sessions.pop("sid-async-live", None)
+
+
+def test_custom_model_probe_rpc_is_shape_safe(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.custom_provider_service.probe_custom_provider",
+        lambda *args, **kwargs: {
+            "models": ["local-a"],
+            "resolved_base_url": "http://localhost:11434/v1",
+            "reachable": True,
+        },
+    )
+    response = server._methods["model.custom.probe"](
+        "r1", {"base_url": "http://localhost:11434", "api_mode": "chat_completions"}
+    )
+    assert response["result"]["models"] == ["local-a"]
+    assert response["result"]["reachable"] is True
+
+
+def test_custom_model_save_rpc_never_echoes_secret(monkeypatch):
+    seen = {}
+
+    def fake_save(**kwargs):
+        seen.update(kwargs)
+        return {
+            "provider_key": "local-lab",
+            "provider_identity": "custom:local-lab",
+            "model": "local-a",
+            "switch_value": "local-a --provider local-lab",
+            "created": True,
+        }
+
+    monkeypatch.setattr("hermes_cli.custom_provider_service.save_custom_provider", fake_save)
+    response = server._methods["model.custom.save"](
+        "r2",
+        {
+            "display_name": "Local Lab",
+            "base_url": "http://localhost:8000/v1",
+            "model": "local-a",
+            "api_key": "FULL_SECRET_SENTINEL",
+        },
+    )
+    assert seen["api_key"] == "FULL_SECRET_SENTINEL"
+    assert "FULL_SECRET_SENTINEL" not in str(response)
+    assert response["result"]["switch_value"] == "local-a --provider local-lab"
+
+
+def test_model_options_includes_local_model_in_recent_and_frequent(monkeypatch):
+    class FakeContext:
+        def with_overrides(self, **kwargs):
+            return self
+
+    payload = {
+        "model": "qwen3.5:27b",
+        "provider": "custom",
+        "providers": [
+            {
+                "authenticated": True,
+                "api_url": "http://localhost:11434/v1",
+                "is_current": True,
+                "models": ["qwen3.5:27b"],
+                "name": "Local Ollama",
+                "slug": "local-ollama",
+            }
+        ],
+    }
+    usage = {
+        "provider_id": "custom:local-ollama",
+        "model": "qwen3.5:27b",
+        "base_url": "http://localhost:11434/v1",
+        "last_used_at": 123.0,
+        "activation_count": 4,
+    }
+
+    class FakeDB:
+        def list_recent_models(self, limit=5):
+            return [usage]
+
+        def list_frequent_models(self, limit=5):
+            return [usage]
+
+    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: FakeContext())
+    monkeypatch.setattr("hermes_cli.inventory.build_models_payload", lambda *args, **kwargs: dict(payload))
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+
+    response = server._methods["model.options"]("r3", {})
+    recent = response["result"]["recent_models"]
+    frequent = response["result"]["frequent_models"]
+    assert recent == [
+        {
+            **usage,
+            "provider": "local-ollama",
+            "provider_name": "Local Ollama",
+        }
+    ]
+    assert frequent == recent
+
 
 def test_session_create_records_ui_model_as_session_override(monkeypatch):
     """The desktop composer owns its model as plain UI state and ships it on

@@ -32,7 +32,7 @@ import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './re
 import { mapResumeHistory } from './resume.ts'
 import { mapSessionRows, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
 import type { SpawnHistoryState, SpawnSnapshot } from './spawnHistory.ts'
-import type { CompletionItem, ConfirmRequest, PickerItem, PickerState } from './store.ts'
+import type { CompletionItem, ConfirmRequest, CustomModelSetupState, PickerItem, PickerState } from './store.ts'
 import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
 import {
   type CommandsCatalogResponse,
@@ -184,6 +184,7 @@ export interface SlashContext {
   readonly resumeSession: (sessionId: string) => void
   /** Open a generic picker (model picker, skills hub). */
   readonly openPicker: (picker: PickerState) => void
+  readonly openCustomModelSetup?: (setup: CustomModelSetupState) => void
   /** Open the agents dashboard (/agents, /tasks, /replay, /replay-diff). */
   readonly openDashboard: (request?: AgentsDashboardOpenRequest) => void
   /** Store-owned Agents/replay state and decoded mutation callbacks. */
@@ -508,6 +509,38 @@ export function mapModelOptions(opts: unknown): PickerItem[] {
   const current = readStr(opts, 'model')
   const currentProvider = readStr(opts, 'provider')
   const items: PickerItem[] = []
+  const activeProviderSlugs = new Set(
+    providers
+      .filter(
+        provider =>
+          provider && typeof provider === 'object' && (provider as { is_current?: unknown }).is_current === true
+      )
+      .map(provider => readStr(provider, 'slug'))
+      .filter((slug): slug is string => Boolean(slug))
+  )
+  const appendUsage = (key: 'recent_models' | 'frequent_models', group: string) => {
+    const rows = (opts as Record<string, unknown>)[key]
+    if (!Array.isArray(rows)) return
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue
+      const model = readStr(row, 'model')
+      const provider = readStr(row, 'provider')
+      if (!model || !provider) continue
+      const providerName = readStr(row, 'provider_name') ?? provider
+      const count = Number((row as { activation_count?: unknown }).activation_count)
+      const item: PickerItem = {
+        description: `${providerName}${Number.isFinite(count) && count > 0 ? ` · ${count} use${count === 1 ? '' : 's'}` : ''}`,
+        group,
+        haystacks: [provider, providerName, readStr(row, 'base_url') ?? ''].filter(Boolean),
+        label: model,
+        value: `${model} --provider ${provider}`
+      }
+      if (model === current && (activeProviderSlugs.has(provider) || currentProvider === provider)) item.current = true
+      items.push(item)
+    }
+  }
+  appendUsage('recent_models', 'Recent')
+  appendUsage('frequent_models', 'Most used')
   for (const p of providers) {
     if (!p || typeof p !== 'object') continue
     const slug = readStr(p, 'slug') ?? readStr(p, 'name') ?? ''
@@ -566,15 +599,17 @@ export function mapModelOptions(opts: unknown): PickerItem[] {
  */
 export function buildModelTabs(items: readonly PickerItem[]): string[] {
   const seen = new Set<string>()
+  const ranked: string[] = []
   const nous: string[] = []
   const rest: string[] = []
   for (const it of items) {
     if (it.unavailable || !it.group || seen.has(it.group)) continue
     seen.add(it.group)
     const identity = [it.group, ...(it.haystacks ?? [])].join(' ').toLowerCase()
-    ;(identity.includes('nous') ? nous : rest).push(it.group)
+    if (it.group === 'Recent' || it.group === 'Most used') ranked.push(it.group)
+    else (identity.includes('nous') ? nous : rest).push(it.group)
   }
-  return [...nous, ...rest]
+  return [...ranked, ...nous, ...rest]
 }
 
 /** Flatten `skills.manage {action:'list'}` ({skills: Record<category, names[]>}) into
@@ -594,12 +629,14 @@ function mapSkills(result: unknown): PickerItem[] {
 /** Re-fetch `model.options` and update the cached picker rows. Resolves with
  *  the fresh rows (the open picker swaps them in live — Ctrl+R, picker v2.1);
  *  rejections are the CALLER's to handle (background callers fire-and-forget). */
-function refreshModelItems(ctx: SlashContext): Promise<PickerItem[]> {
-  return ctx.request('model.options', { session_id: ctx.sessionId() }).then(opts => {
-    const items = mapModelOptions(opts)
-    if (items.length) ctx.setModelItems(items)
-    return items
-  })
+function refreshModelItems(ctx: SlashContext, refresh = false): Promise<PickerItem[]> {
+  return ctx
+    .request('model.options', { session_id: ctx.sessionId(), ...(refresh ? { refresh: true } : {}) })
+    .then(opts => {
+      const items = mapModelOptions(opts)
+      if (items.length) ctx.setModelItems(items)
+      return items
+    })
 }
 
 /**
@@ -697,7 +734,12 @@ export function awaitModelPrefetch(sessionId: string | undefined): Promise<void>
 }
 
 /** Switch the model via the authoritative config RPC (shared by direct input and picker). */
-async function switchModel(ctx: SlashContext, name: string, confirmExpensiveModel = false): Promise<void> {
+async function switchModel(
+  ctx: SlashContext,
+  name: string,
+  confirmExpensiveModel = false,
+  sessionScoped = false
+): Promise<void> {
   if (ctx.guardBusySessionSwitch('change models')) return
   const sid = ctx.sessionId()
   try {
@@ -705,7 +747,7 @@ async function switchModel(ctx: SlashContext, name: string, confirmExpensiveMode
       confirm_expensive_model: confirmExpensiveModel,
       key: 'model',
       session_id: sid,
-      value: name.trim()
+      value: `${name.trim()}${sessionScoped ? ' --session' : ''}`
     })
     if (ctx.sessionId() !== sid) return
     const response = decodeModelSwitchResponse(raw)
@@ -722,7 +764,7 @@ async function switchModel(ctx: SlashContext, name: string, confirmExpensiveMode
           detail: response.confirm_message || response.warning || 'This model has unusually high known pricing.',
           title: 'Expensive model selection'
         },
-        () => void switchModel(ctx, name, true)
+        () => void switchModel(ctx, name, true, sessionScoped)
       )
       return
     }
@@ -746,19 +788,41 @@ async function switchModel(ctx: SlashContext, name: string, confirmExpensiveMode
  *  An empty cache first awaits the in-flight bootstrap prefetch (bounded) so
  *  an early `/model` never doubles the slow `model.options` RPC. */
 const modelCmd: ClientHandler = async (arg, ctx) => {
+  const setupValue = '__hermes_add_custom_model__'
+  const setupItem: PickerItem = {
+    description: 'Ollama, llama.cpp, vLLM, LM Studio, SGLang, or any compatible endpoint',
+    group: 'Local & custom',
+    haystacks: ['ollama', 'llama.cpp', 'vllm', 'lm studio', 'sglang', 'local'],
+    label: 'Add a local/custom model…',
+    value: setupValue
+  }
+  const withSetup = (items: PickerItem[]) => [...items, setupItem]
   const open = (items: PickerItem[]) => {
-    registerPickerRefresh(() => refreshModelItems(ctx))
+    registerPickerRefresh(async () => withSetup(await refreshModelItems(ctx, true)))
     registerPickerTabs(buildModelTabs)
-    ctx.openPicker({ items, onPick: name => void switchModel(ctx, name), title: 'Switch model' })
+    ctx.openPicker({
+      items: withSetup(items),
+      onPick: name => {
+        if (name === setupValue) {
+          if (ctx.openCustomModelSetup) {
+            ctx.openCustomModelSetup({
+              request: ctx.request,
+              onSaved: value => void switchModel(ctx, value, false, true)
+            })
+          } else {
+            ctx.pushSystem('Custom model setup is unavailable in this TUI host.')
+          }
+        } else {
+          void switchModel(ctx, name, false, true)
+        }
+      },
+      title: 'Switch model'
+    })
   }
   const requested = arg.trim()
   if (requested === '--refresh') {
     if (ctx.guardBusySessionSwitch('change models')) return
-    const items = await refreshModelItems(ctx)
-    if (!items.some(item => !item.unavailable)) {
-      ctx.pushSystem('No models available (no authenticated providers).')
-      return
-    }
+    const items = await refreshModelItems(ctx, true)
     open(items)
     return
   }
@@ -779,10 +843,6 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
     return
   }
   const items = mapModelOptions(await ctx.request('model.options', { session_id: ctx.sessionId() }))
-  if (!items.some(i => !i.unavailable)) {
-    ctx.pushSystem('No models available (no authenticated providers).')
-    return
-  }
   ctx.setModelItems(items)
   open(items)
 }

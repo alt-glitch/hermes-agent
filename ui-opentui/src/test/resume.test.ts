@@ -120,4 +120,26 @@ describe('mapResumeHistory (Phase 4b)', () => {
     expect(mapResumeHistory(null)).toEqual([])
     expect(mapResumeHistory([{ role: 'weird', text: 'x' }])).toEqual([])
   })
+
+  test('maps persisted async delegation disclosure metadata', () => {
+    const detail = '[ASYNC DELEGATION BATCH COMPLETE — deleg_resume]\nFULL_SENTINEL'
+    const [message] = mapResumeHistory([
+      {
+        role: 'notification',
+        text: 'deleg_resume · 2 agents · all done · 2s',
+        notification: {
+          id: 'deleg:deleg_resume',
+          kind: 'async delegation',
+          level: 'success',
+          text: 'deleg_resume · 2 agents · all done · 2s',
+          detail,
+          always_visible: true
+        }
+      }
+    ])
+
+    expect(message?.role).toBe('notification')
+    expect(message?.notification?.detail).toBe(detail)
+    expect(message?.notification?.alwaysVisible).toBe(true)
+  })
 })

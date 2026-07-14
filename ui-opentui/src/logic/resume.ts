@@ -12,6 +12,7 @@
  * IDs are `r*` (distinct from live `p*`).
  */
 import type { Message, Part, SessionItem, ToolPartState } from './store.ts'
+import { parseNotification } from './backgroundActivity.ts'
 import { stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
 
 function readStr(value: unknown, key: string): string | undefined {
@@ -111,6 +112,18 @@ export function mapResumeHistory(history: unknown): Message[] {
     // Optional stored send/receive time (unix seconds). Carried onto the produced
     // Message so /timestamps can render [HH:MM]; undefined when the entry lacks it.
     const ts = readOptNum(raw, 'timestamp')
+
+    if (role === 'notification') {
+      const payload = raw && typeof raw === 'object' ? (raw as { notification?: unknown }).notification : undefined
+      const notification = parseNotification(payload)
+      if (notification) {
+        const message: Message = { notification, role: 'notification', text: notification.text }
+        if (ts !== undefined) message.timestamp = ts
+        out.push(message)
+      }
+      pendingTools = []
+      continue
+    }
 
     if (role === 'tool') {
       const call = toolCalls.get(readStr(raw, 'tool_call_id') ?? '')

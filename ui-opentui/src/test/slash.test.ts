@@ -21,6 +21,7 @@ import {
   HISTORY_MAX_MESSAGES,
   HISTORY_MAX_PAGER_CHARS,
   HISTORY_MAX_PREVIEW,
+  mapModelOptions,
   mapCompletions,
   parseSlash,
   pickerTabs,
@@ -1212,10 +1213,11 @@ describe('dispatchSlash — client commands', () => {
     expect(selectable.map(i => i.value)).toEqual([
       'claude-sonnet-4.6 --provider anthropic',
       'claude-opus-4.6 --provider anthropic',
-      'hermes-4-405b --provider nous'
+      'hermes-4-405b --provider nous',
+      '__hermes_add_custom_model__'
     ])
     // grouped by the provider's display (lab) name; slug+lab are fuzzy haystacks
-    expect(selectable.map(i => i.group)).toEqual(['Anthropic', 'Anthropic', 'Nous Research'])
+    expect(selectable.map(i => i.group)).toEqual(['Anthropic', 'Anthropic', 'Nous Research', 'Local & custom'])
     expect(selectable[2]!.haystacks).toEqual(['nous', 'Nous Research'])
     // current is FLAGGED (not baked into the label, so fuzzy never matches the ✓)
     expect(selectable[0]!.current).toBe(true)
@@ -1228,7 +1230,7 @@ describe('dispatchSlash — client commands', () => {
       p.calls.some(
         c =>
           c.method === 'config.set' &&
-          c.params.value === 'claude-opus-4.6 --provider anthropic' &&
+          c.params.value === 'claude-opus-4.6 --provider anthropic --session' &&
           c.params.session_id === 'sid-1'
       )
     ).toBe(true)
@@ -1244,7 +1246,7 @@ describe('dispatchSlash — client commands', () => {
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : {}))
     p.modelCache.value = [{ label: 'stale', value: 'stale' }]
     await dispatchSlash('/model --refresh', p.ctx)
-    expect(p.calls).toEqual([{ method: 'model.options', params: { session_id: 'sid-1' } }])
+    expect(p.calls).toEqual([{ method: 'model.options', params: { refresh: true, session_id: 'sid-1' } }])
     expect(p.calls.some(call => call.method === 'config.set')).toBe(false)
     expect(p.pickers).toHaveLength(1)
     expect(p.pickers[0]?.items.some(item => item.label === 'claude-sonnet-4.6')).toBe(true)
@@ -1272,17 +1274,20 @@ describe('dispatchSlash — client commands', () => {
       'Anthropic',
       'OpenAI API',
       'Nous Research',
-      'OpenAI Codex'
+      'OpenAI Codex',
+      'Local & custom'
     ])
   })
 
-  test('/model with ONLY unconfigured providers keeps the no-models notice', async () => {
+  test('/model with ONLY unconfigured providers still exposes local/custom setup', async () => {
     const p = makeCtx(async () => ({
       providers: [{ authenticated: false, key_env: 'XAI_API_KEY', models: [], name: 'xAI', slug: 'xai' }]
     }))
     await dispatchSlash('/model', p.ctx)
-    expect(p.pickers).toHaveLength(0)
-    expect(p.system).toEqual(['No models available (no authenticated providers).'])
+    expect(p.pickers).toHaveLength(1)
+    expect(p.pickers[0]?.items.filter(item => !item.unavailable).map(item => item.label)).toEqual([
+      'Add a local/custom model…'
+    ])
   })
 
   test('/model registers the picker refresh seam; running it does ONE RPC and re-syncs the cache', async () => {
@@ -1291,8 +1296,13 @@ describe('dispatchSlash — client commands', () => {
     const opened = p.calls.filter(c => c.method === 'model.options').length // 1 (uncached open)
     const refreshed = await runPickerRefresh()
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(opened + 1)
-    expect(refreshed!.filter(i => !i.unavailable)).toHaveLength(3)
-    expect(p.modelCache.value).toEqual(refreshed) // cache re-synced for the next open
+    expect(p.calls.filter(c => c.method === 'model.options').at(-1)?.params).toEqual({
+      refresh: true,
+      session_id: 'sid-1'
+    })
+    expect(refreshed!.filter(i => !i.unavailable)).toHaveLength(4)
+    expect(refreshed?.at(-1)?.label).toBe('Add a local/custom model…')
+    expect(p.modelCache.value).toHaveLength(5) // canonical inventory cache stays free of action rows
   })
 
   test('/skills clears the picker refresh seam (Ctrl+R is a no-op there)', async () => {
@@ -1322,7 +1332,8 @@ describe('dispatchSlash — client commands', () => {
     ]
     await dispatchSlash('/model', p.ctx)
     expect(p.pickers).toHaveLength(1)
-    expect(p.pickers[0]!.items).toHaveLength(2)
+    expect(p.pickers[0]!.items).toHaveLength(3)
+    expect(p.pickers[0]!.items.at(-1)?.label).toBe('Add a local/custom model…')
     expect(p.calls).toHaveLength(0) // the whole point: open = memory, not network
   })
 
@@ -1335,9 +1346,9 @@ describe('dispatchSlash — client commands', () => {
     // refresh re-fetches model.options so the cached ✓ stays fresh.
     p.pickers[0]!.onPick('hermes-4-405b --provider nous')
     await new Promise(r => setTimeout(r, 0))
-    expect(p.calls.some(c => c.method === 'config.set' && c.params.value === 'hermes-4-405b --provider nous')).toBe(
-      true
-    )
+    expect(
+      p.calls.some(c => c.method === 'config.set' && c.params.value === 'hermes-4-405b --provider nous --session')
+    ).toBe(true)
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(2)
   })
 
@@ -1360,11 +1371,57 @@ describe('dispatchSlash — client commands', () => {
     expect(buildModelTabs([])).toEqual([])
   })
 
+  test('local models participate in Recent and Most used with endpoint/provider identity intact', () => {
+    const items = mapModelOptions({
+      model: 'qwen3.5:27b',
+      provider: 'custom',
+      recent_models: [
+        {
+          activation_count: 3,
+          base_url: 'http://localhost:11434/v1',
+          model: 'qwen3.5:27b',
+          provider: 'local-ollama',
+          provider_name: 'Local Ollama'
+        }
+      ],
+      frequent_models: [
+        {
+          activation_count: 8,
+          base_url: 'http://localhost:11434/v1',
+          model: 'qwen3.5:27b',
+          provider: 'local-ollama',
+          provider_name: 'Local Ollama'
+        }
+      ],
+      providers: [
+        {
+          authenticated: true,
+          is_current: true,
+          models: ['qwen3.5:27b'],
+          name: 'Local Ollama',
+          slug: 'local-ollama'
+        }
+      ]
+    })
+
+    expect(items.filter(item => item.label === 'qwen3.5:27b').map(item => item.group)).toEqual([
+      'Recent',
+      'Most used',
+      'Local Ollama'
+    ])
+    expect(items[0]).toMatchObject({
+      current: true,
+      description: 'Local Ollama · 3 uses',
+      value: 'qwen3.5:27b --provider local-ollama'
+    })
+    expect(buildModelTabs(items)).toEqual(['Recent', 'Most used', 'Local Ollama'])
+  })
+
   test('/model registers the provider-tab seam (buildModelTabs); /skills clears it back to stripless', async () => {
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     await dispatchSlash('/model', p.ctx)
     // the open picker derives Nous-first tabs through the seam
-    expect(pickerTabs(p.pickers[0]!.items)).toEqual(['Nous Research', 'Anthropic'])
+    expect(pickerTabs(p.pickers[0]!.items)).toEqual(['Nous Research', 'Anthropic', 'Local & custom'])
     const p2 = makeCtx(async () => ({ skills: { General: ['memory'] } }))
     await dispatchSlash('/skills', p2.ctx)
     expect(pickerTabs(p.pickers[0]!.items)).toEqual([])
@@ -1391,7 +1448,7 @@ describe('dispatchSlash — client commands', () => {
     finish([{ group: 'Anthropic', haystacks: ['anthropic'], label: 'claude-sonnet-4.6', value: 'a' }])
     await dispatched
     expect(p.pickers).toHaveLength(1) // opened from the prefetched cache
-    expect(p.pickers[0]!.items).toHaveLength(1)
+    expect(p.pickers[0]!.items).toHaveLength(2)
     expect(p.calls).toHaveLength(0) // the dedupe: no second model.options
   })
 

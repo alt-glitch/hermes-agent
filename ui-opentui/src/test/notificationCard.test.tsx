@@ -7,6 +7,7 @@
 import { describe, expect, test } from 'vitest'
 
 import { createSessionStore } from '../logic/store.ts'
+import { DisplayProvider } from '../view/display.tsx'
 import { NotificationCard } from '../view/notificationCard.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { captureFrame } from './lib/render.ts'
@@ -44,6 +45,26 @@ describe('notification store wiring', () => {
     expect(store.state.messages.some(m => m.role === 'notification')).toBe(false)
   })
 
+  test('preserves disclosure detail and always-visible metadata', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({
+      type: 'notification.show',
+      payload: {
+        id: 'deleg:test',
+        kind: 'async delegation',
+        level: 'success',
+        text: 'deleg_test · 2 agents · all done · 2s',
+        detail: 'FULL_DETAIL_SENTINEL',
+        always_visible: true
+      }
+    })
+
+    const message = store.state.messages.at(-1)
+    expect(message?.notification?.detail).toBe('FULL_DETAIL_SENTINEL')
+    expect(message?.notification?.alwaysVisible).toBe(true)
+  })
+
   test('background.complete → a completion card + drops the bg task from the badge count', () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
@@ -71,5 +92,64 @@ describe('NotificationCard frame', () => {
     expect(frame).toContain('◆')
     expect(frame).toContain('task.done')
     expect(frame).toContain('build finished')
+  })
+
+  test('keeps long async delegation detail collapsed by default', async () => {
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => createSessionStore().state.theme}>
+          <NotificationCard
+            notification={{
+              id: 'deleg:test',
+              kind: 'async delegation',
+              level: 'success',
+              text: 'deleg_test · 2 agents · all done · 2s',
+              detail: 'FULL_DETAIL_SENTINEL\n'.repeat(100),
+              alwaysVisible: true
+            }}
+          />
+        </ThemeProvider>
+      ),
+      { width: 80, height: 5 }
+    )
+
+    expect(frame).toContain('async delegation')
+    expect(frame).toContain('2 agents')
+    expect(frame).toContain('▶')
+    expect(frame).not.toContain('FULL_DETAIL_SENTINEL')
+  })
+
+  test('/details activity expanded reveals detail without mouse input', async () => {
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => createSessionStore().state.theme}>
+          <DisplayProvider
+            flags={() => ({
+              compact: false,
+              details: 'collapsed',
+              detailsCommandOverride: false,
+              reasoningFull: false,
+              sections: { activity: 'expanded' },
+              timestamps: false
+            })}
+          >
+            <NotificationCard
+              notification={{
+                id: 'deleg:test',
+                kind: 'async delegation',
+                level: 'success',
+                text: 'deleg_test · done',
+                detail: 'FULL_DETAIL_SENTINEL',
+                alwaysVisible: true
+              }}
+            />
+          </DisplayProvider>
+        </ThemeProvider>
+      ),
+      { width: 80, height: 8, until: 'FULL_DETAIL_SENTINEL' }
+    )
+
+    expect(frame).toContain('▼')
+    expect(frame).toContain('FULL_DETAIL_SENTINEL')
   })
 })

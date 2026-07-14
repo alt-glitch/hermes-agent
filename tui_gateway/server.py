@@ -195,6 +195,7 @@ _LONG_HANDLERS = frozenset(
         # RPC — notably complete.slash, so the first `/` dropdown after launch
         # took seconds to paint.
         "model.options",
+        "model.custom.probe",
         # Completion RPCs run inline on the reader thread by default, but both
         # can block it for seconds: complete.path spawns `git ls-files` and
         # fuzzy-ranks the whole repo (slow on large repos / WSL2 mounts), and
@@ -3096,6 +3097,30 @@ def _apply_model_switch(
         }
     if persist_global:
         _persist_model_switch(result)
+    if sid and isinstance(session, dict):
+        # Picker ranking counts successful activations, not tokens. Keep the
+        # endpoint in the identity so two local servers exposing `qwen` remain
+        # separate, and suppress duplicate rebuild/sync recordings per session.
+        provider_id = explicit_provider.strip() or str(result.target_provider or "").strip()
+        base_url = str(result.base_url or current_base_url or "").strip().rstrip("/")
+        if provider_id in {"custom", ""} and base_url:
+            try:
+                from hermes_cli.runtime_provider import canonical_custom_identity
+
+                provider_id = canonical_custom_identity(base_url=base_url) or provider_id
+            except Exception:
+                pass
+        if provider_id.startswith("custom:"):
+            provider_id = provider_id.split(":", 1)[1]
+        identity = (provider_id, result.new_model, base_url)
+        if provider_id and session.get("model_usage_identity") != identity:
+            try:
+                db = _get_db()
+                if db is not None:
+                    db.record_model_activation(provider_id, result.new_model, base_url)
+                    session["model_usage_identity"] = identity
+            except Exception:
+                logger.debug("model picker usage record failed", exc_info=True)
     return {
         "value": result.new_model,
         "warning": result.warning_message or "",
@@ -5129,7 +5154,11 @@ def _coerce_message_text(content: Any) -> str:
     return str(content)
 
 
-def _history_to_messages(history: list[dict], include_tool_output: bool = False) -> list[dict]:
+def _history_to_messages(
+    history: list[dict],
+    include_tool_output: bool = False,
+    include_ui_chrome: bool = False,
+) -> list[dict]:
     # ``include_tool_output`` (opt-in; only the native/opentui engine passes it via
     # session.resume) folds each tool's redacted+capped result + args into its row so
     # a resumed transcript renders collapsible tool blocks identical to a live turn.
@@ -5171,6 +5200,23 @@ def _history_to_messages(history: list[dict], include_tool_output: bool = False)
                     tool_msg["result_text"] = _redact_tui_verbose_text(content_text)
             messages.append(tool_msg)
             continue
+        # Async-delegation reinjections are internal prompts for the parent
+        # agent. The full text stays untouched in SQLite/model history, but a
+        # cold OpenTUI resume must not resurrect it as a giant user bubble.
+        # ``include_ui_chrome`` is the native-engine opt-in, keeping Ink's
+        # response unchanged. ``include_tool_output`` implies it for backwards
+        # compatibility with OpenTUI clients that predate the explicit flag.
+        if (include_ui_chrome or include_tool_output) and role == "user":
+            notification = _async_delegation_notice_from_text(content_text)
+            if notification is not None:
+                messages.append(
+                    {
+                        "role": "notification",
+                        "text": notification["text"],
+                        "notification": notification,
+                    }
+                )
+                continue
         # An assistant turn may carry only reasoning/thinking content with no
         # visible text (extended-thinking turns, thinking-only recovery
         # responses). Such a turn is persisted with its reasoning fields and is
@@ -6311,6 +6357,9 @@ def _(rid, params: dict) -> dict:
             cols=cols,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            include_ui_chrome=is_truthy_value(
+                params.get("with_ui_chrome", params.get("with_tool_output", False))
+            ),
         )
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
@@ -6368,7 +6417,12 @@ def _(rid, params: dict) -> dict:
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
-        messages = _history_to_messages(history)
+        messages = _history_to_messages(
+            history,
+            include_ui_chrome=is_truthy_value(
+                params.get("with_ui_chrome", params.get("with_tool_output", False))
+            ),
+        )
         return _ok(
             rid,
             {
@@ -6448,7 +6502,9 @@ def _(rid, params: dict) -> dict:
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
         messages = _history_to_messages(
-            display_history, include_tool_output=bool(params.get("with_tool_output"))
+            display_history,
+            include_tool_output=bool(params.get("with_tool_output")),
+            include_ui_chrome=bool(params.get("with_ui_chrome")),
         )
         return _ok(
             rid,
@@ -6503,7 +6559,9 @@ def _(rid, params: dict) -> dict:
         ]
         history = sanitize_replay_history(raw_history)
         messages = _history_to_messages(
-            display_history, include_tool_output=bool(params.get("with_tool_output"))
+            display_history,
+            include_tool_output=bool(params.get("with_tool_output")),
+            include_ui_chrome=bool(params.get("with_ui_chrome")),
         )
         tokens = _set_session_context(target)
         try:
@@ -6551,6 +6609,9 @@ def _(rid, params: dict) -> dict:
                 cols=cols,
                 touch=True,
                 transport=current_transport() or _stdio_transport,
+                include_ui_chrome=is_truthy_value(
+                    params.get("with_ui_chrome", params.get("with_tool_output", False))
+                ),
             )
             payload["resumed"] = target
             return _ok(rid, payload)
@@ -6753,6 +6814,7 @@ def _live_session_payload(
     cols: int | None = None,
     touch: bool = False,
     transport: Transport | None = None,
+    include_ui_chrome: bool = False,
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
@@ -6769,7 +6831,7 @@ def _live_session_payload(
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": _history_to_messages(history),
+        "messages": _history_to_messages(history, include_ui_chrome=include_ui_chrome),
         "running": running,
         "session_id": sid,
         "session_key": _session_lookup_key(session, fallback=sid),
@@ -6839,6 +6901,7 @@ def _(rid, params: dict) -> dict:
             session,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            include_ui_chrome=is_truthy_value(params.get("with_ui_chrome", False)),
         ),
     )
 
@@ -9477,7 +9540,116 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
-def _emit_process_completion_card(sid: str, evt: dict) -> None:
+def _duration_label(value: Any) -> str:
+    """Compact a process/delegation duration for one-line notification chrome."""
+    if value in (None, "", "?"):
+        return ""
+    try:
+        seconds = max(0, int(float(value)))
+    except (TypeError, ValueError):
+        text = str(value).strip()
+        return text if text.endswith(("s", "m", "h")) else f"{text}s"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m" if seconds == 0 else f"{minutes}m{seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h" if minutes == 0 else f"{hours}h{minutes}m"
+
+
+def _async_delegation_notice(evt: dict, detail: str) -> dict:
+    """Build compact UI chrome while keeping the full detail for disclosure."""
+    deleg_id = str(evt.get("delegation_id") or "delegation")
+    results = evt.get("results")
+    is_batch = bool(evt.get("is_batch")) or isinstance(results, list)
+    duration = _duration_label(
+        evt.get("total_duration_seconds")
+        if is_batch
+        else evt.get("duration_seconds")
+    )
+    if is_batch:
+        rows = results if isinstance(results, list) else []
+        goals = evt.get("goals")
+        count = len(rows) or (len(goals) if isinstance(goals, list) else 0)
+        succeeded = sum(
+            1
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("status") or "").lower() in {"completed", "success"}
+        )
+        failed = max(0, count - succeeded)
+        pieces = [
+            deleg_id,
+            f"{count} agent{'s' if count != 1 else ''}",
+            "all done" if count > 0 and failed == 0 else f"{succeeded} done",
+        ]
+        if failed:
+            pieces.append(f"{failed} failed")
+        level = "success" if failed == 0 else "warn"
+    else:
+        status = str(evt.get("status") or "completed").strip().lower()
+        pieces = [deleg_id, status]
+        level = "success" if status in {"completed", "success"} else "warn"
+    if duration:
+        pieces.append(duration)
+    return {
+        "always_visible": True,
+        "detail": detail,
+        "key": f"deleg:{deleg_id}",
+        "kind": "async delegation",
+        "level": level,
+        "text": " · ".join(pieces),
+    }
+
+
+def _async_delegation_notice_from_text(detail: str) -> dict | None:
+    """Reconstruct compact presentation metadata from a persisted reinjection."""
+    import re
+
+    header = re.match(
+        r"^\[ASYNC DELEGATION( BATCH)? COMPLETE [—-] ([^\]]+)\]",
+        detail,
+    )
+    if header is None:
+        return None
+    deleg_id = header.group(2).strip()
+    task_statuses = re.findall(
+        r"^--- ([✓✗]) TASK \d+/\d+",
+        detail,
+        flags=re.MULTILINE,
+    )
+    if header.group(1):
+        evt: dict = {
+            "delegation_id": deleg_id,
+            "is_batch": True,
+            "results": [
+                {"status": "completed" if icon == "✓" else "failed"}
+                for icon in task_statuses
+            ],
+        }
+        if not task_statuses:
+            count_match = re.search(r"fan-out of (\d+) subagent", detail)
+            if count_match is not None:
+                evt["goals"] = [""] * int(count_match.group(1))
+        duration_match = re.search(r"Total duration:\s*([^\n]+)", detail)
+        if duration_match is not None:
+            evt["total_duration_seconds"] = duration_match.group(1).strip()
+    else:
+        status_match = re.search(r"^Status:\s*([^\s]+)", detail, flags=re.MULTILINE)
+        duration_match = re.search(r"Duration:\s*([^\s]+)", detail)
+        evt = {
+            "delegation_id": deleg_id,
+            "status": status_match.group(1) if status_match is not None else "completed",
+        }
+        if duration_match is not None:
+            evt["duration_seconds"] = duration_match.group(1)
+    return _async_delegation_notice(evt, detail)
+
+
+def _emit_process_completion_card(
+    sid: str, evt: dict, detail: str | None = None
+) -> None:
     """Surface a background-process COMPLETION to the TUI as a notification card,
     in ADDITION to the agent turn it triggers. A bare `notify_on_complete` exit
     otherwise reaches the TUI only as the agent's narration (the completion is fed
@@ -9487,7 +9659,13 @@ def _emit_process_completion_card(sid: str, evt: dict) -> None:
     notice. Additive — no existing behaviour changes. Completion events only
     (watch matches aren't terminal); the dedup at the call sites ensures one card
     per completion. (glitch 2026-06-14)"""
-    if evt.get("type", "completion") != "completion":
+    evt_type = evt.get("type", "completion")
+    if evt_type == "async_delegation":
+        if not detail:
+            return
+        _emit("notification.show", sid, _async_delegation_notice(evt, detail))
+        return
+    if evt_type != "completion":
         return
     cmd = str(evt.get("command") or "process").strip().replace("\n", " ")
     if len(cmd) > 60:
@@ -9583,7 +9761,11 @@ def _notification_poller_loop(
         # visible independently.
         _dedup_key = _notification_event_dedup_key(evt)
         if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
+            if evt.get("type") == "async_delegation":
+                notice = _async_delegation_notice(evt, text)
+                _emit("status.update", sid, {"kind": "status", "text": notice["text"]})
+            else:
+                _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
         _requeued = False
@@ -9602,7 +9784,7 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
-            _emit_process_completion_card(sid, evt)
+            _emit_process_completion_card(sid, evt, text)
             # NOTE: do NOT emit a manual ``message.start`` here. _run_prompt_submit
             # already emits its own ``message.start`` for the turn it runs; emitting
             # a second one created an EXTRA empty assistant message in the OpenTUI
@@ -9650,7 +9832,11 @@ def _notification_poller_loop(
 
         _dedup_key = _notification_event_dedup_key(evt)
         if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
+            if evt.get("type") == "async_delegation":
+                notice = _async_delegation_notice(evt, text)
+                _emit("status.update", sid, {"kind": "status", "text": notice["text"]})
+            else:
+                _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
         with _mcp_reload_admission_lock, session["history_lock"]:
@@ -9661,7 +9847,7 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
-            _emit_process_completion_card(sid, evt)
+            _emit_process_completion_card(sid, evt, text)
             # NOTE: do NOT emit a manual ``message.start`` here. _run_prompt_submit
             # already emits its own ``message.start`` for the turn it runs; emitting
             # a second one created an EXTRA empty assistant message in the OpenTUI
@@ -10394,7 +10580,7 @@ def _run_prompt_submit(
                         break
                     session["running"] = True
                 try:
-                    _emit_process_completion_card(sid, _evt)
+                    _emit_process_completion_card(sid, _evt, synth)
                     # No manual message.start — _run_prompt_submit emits its own;
                     # a second one orphaned an empty "⚕ ▍" assistant row (see the
                     # poller fix above). (glitch 2026-06-23)
@@ -13891,9 +14077,122 @@ def _(rid, params: dict) -> dict:
             probe_custom_providers=bool(params.get("refresh")),
             probe_current_custom_provider=not bool(params.get("refresh")),
         )
+        db = _get_db()
+        if db is not None:
+            recent = db.list_recent_models(limit=6)
+            frequent = db.list_frequent_models(limit=6)
+        else:
+            recent, frequent = [], []
+
+        providers = payload.get("providers") if isinstance(payload, dict) else []
+        provider_rows = providers if isinstance(providers, list) else []
+
+        def _available_usage(rows):
+            available = []
+            for usage in rows:
+                if not isinstance(usage, dict):
+                    continue
+                raw_provider = str(usage.get("provider_id") or "").strip()
+                provider = raw_provider.split(":", 1)[1] if raw_provider.startswith("custom:") else raw_provider
+                model = str(usage.get("model") or "").strip()
+                endpoint = str(usage.get("base_url") or "").strip().rstrip("/").lower()
+                match = None
+                for row in provider_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    slug = str(row.get("slug") or "").strip()
+                    api_url = str(row.get("api_url") or "").strip().rstrip("/").lower()
+                    models = row.get("models") if isinstance(row.get("models"), list) else []
+                    if model not in models:
+                        continue
+                    if slug == provider or (endpoint and api_url == endpoint):
+                        match = row
+                        break
+                if match is None:
+                    continue
+                available.append(
+                    {
+                        **usage,
+                        "provider": str(match.get("slug") or provider),
+                        "provider_name": str(match.get("name") or match.get("slug") or provider),
+                    }
+                )
+            return available
+
+        recent_models = _available_usage(recent)
+        frequent_models = _available_usage(frequent)
+        # A configured current model should appear in Recent immediately, even
+        # before this profile has accumulated activation history.
+        current_model = str(payload.get("model") or "") if isinstance(payload, dict) else ""
+        current_row = next(
+            (row for row in provider_rows if isinstance(row, dict) and row.get("is_current") is True),
+            None,
+        )
+        if current_model and isinstance(current_row, dict) and not any(
+            row.get("model") == current_model and row.get("provider") == current_row.get("slug")
+            for row in recent_models
+        ):
+            recent_models.insert(
+                0,
+                {
+                    "provider": str(current_row.get("slug") or ""),
+                    "provider_name": str(current_row.get("name") or current_row.get("slug") or ""),
+                    "model": current_model,
+                    "base_url": str(current_row.get("api_url") or ""),
+                    "last_used_at": time.time(),
+                    "activation_count": 0,
+                },
+            )
+        payload["recent_models"] = recent_models[:6]
+        payload["frequent_models"] = frequent_models[:6]
         return _ok(rid, payload)
     except Exception as e:
         return _err(rid, 5033, str(e))
+
+
+@method("model.custom.probe")
+def _(rid, params: dict) -> dict:
+    """Probe an OpenAI/Anthropic-compatible local endpoint without saving it."""
+    try:
+        from hermes_cli.custom_provider_service import probe_custom_provider
+
+        base_url = str(params.get("base_url") or "").strip()
+        if not base_url:
+            return _err(rid, 4001, "base_url is required")
+        result = probe_custom_provider(
+            base_url,
+            api_key=str(params.get("api_key") or ""),
+            api_mode=str(params.get("api_mode") or "chat_completions"),
+        )
+        return _ok(rid, result)
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
+    except Exception as exc:
+        return _err(rid, 5034, f"provider probe failed: {exc}")
+
+
+@method("model.custom.save")
+def _(rid, params: dict) -> dict:
+    """Persist a canonical custom provider; credentials never enter config.yaml."""
+    try:
+        from hermes_cli.custom_provider_service import save_custom_provider
+
+        result = save_custom_provider(
+            display_name=str(params.get("display_name") or ""),
+            base_url=str(params.get("base_url") or ""),
+            model=str(params.get("model") or ""),
+            api_key=str(params.get("api_key") or ""),
+            api_mode=str(params.get("api_mode") or "chat_completions"),
+            context_length=params.get("context_length"),
+            discover_models=bool(params.get("discover_models", True)),
+        )
+        return _ok(rid, result)
+    except PermissionError as exc:
+        return _err(rid, 4006, str(exc))
+    except (TypeError, ValueError) as exc:
+        return _err(rid, 4002, str(exc))
+    except Exception as exc:
+        return _err(rid, 5035, f"provider save failed: {exc}")
 
 
 @method("model.save_key")

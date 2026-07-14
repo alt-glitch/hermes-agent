@@ -2435,6 +2435,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         addBgTask: id => store.addBgTask(id),
         openPager: (title, text) => store.openPager(title, text),
         openPicker: picker => store.openPicker(picker),
+        openCustomModelSetup: setup => store.openCustomModelSetup(setup),
         openSessionPicker: tab => store.openSessionPicker(tab),
         resumeSession: onResume,
         pushSystem: text => store.pushSystem(text),

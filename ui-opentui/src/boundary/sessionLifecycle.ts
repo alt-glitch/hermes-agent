@@ -200,6 +200,7 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
     const raw = yield* gateway.request<unknown>('session.resume', {
       cols: options.cols,
       session_id: options.targetSessionId,
+      with_ui_chrome: true,
       with_tool_output: true
     })
     const response = decodeSessionResumeResponse(raw)
@@ -274,7 +275,10 @@ export const activateSession = Effect.fn('SessionLifecycle.activate')(function* 
   let committed = false
   store.beginBuffer()
   return yield* Effect.gen(function* () {
-    const raw = yield* gateway.request<unknown>('session.activate', { session_id: options.targetSessionId })
+    const raw = yield* gateway.request<unknown>('session.activate', {
+      session_id: options.targetSessionId,
+      with_ui_chrome: true
+    })
     const response = decodeSessionActivateResponse(raw)
     const liveSessionId = response?.session_id.trim() ?? ''
     if (!response || !liveSessionId) {

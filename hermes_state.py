@@ -787,12 +787,25 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS model_picker_usage (
+    provider_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    base_url TEXT NOT NULL DEFAULT '',
+    last_used_at REAL NOT NULL,
+    activation_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider_id, model, base_url)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_model_picker_usage_recent
+    ON model_picker_usage(last_used_at DESC);
+CREATE INDEX IF NOT EXISTS idx_model_picker_usage_frequent
+    ON model_picker_usage(activation_count DESC, last_used_at DESC);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -2404,6 +2417,108 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def record_model_activation(
+        self,
+        provider_id: str,
+        model: str,
+        base_url: str = "",
+    ) -> Dict[str, Any]:
+        """Record one successful model activation for the profile.
+
+        The database itself is profile-scoped, so this state follows the
+        active ``HERMES_HOME`` without adding a profile column. Identity is
+        the full ``(provider_id, model, base_url)`` tuple: two local endpoints
+        serving the same model remain separate picker choices. Endpoint
+        trailing slashes are normalized so equivalent URL spellings do not
+        fragment the history.
+
+        Returns the updated row, including its incremented
+        ``activation_count`` and ``last_used_at`` timestamp.
+        """
+        provider = str(provider_id or "").strip()
+        model_id = str(model or "").strip()
+        endpoint = str(base_url or "").strip().rstrip("/")
+        if not provider:
+            raise ValueError("provider_id is required")
+        if not model_id:
+            raise ValueError("model is required")
+
+        used_at = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO model_picker_usage
+                       (provider_id, model, base_url, last_used_at, activation_count)
+                   VALUES (?, ?, ?, ?, 1)
+                   ON CONFLICT(provider_id, model, base_url) DO UPDATE SET
+                       last_used_at = excluded.last_used_at,
+                       activation_count = model_picker_usage.activation_count + 1""",
+                (provider, model_id, endpoint, used_at),
+            )
+            row = conn.execute(
+                """SELECT provider_id, model, base_url, last_used_at,
+                          activation_count
+                   FROM model_picker_usage
+                   WHERE provider_id = ? AND model = ? AND base_url = ?""",
+                (provider, model_id, endpoint),
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
+    def list_recent_models(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Return model identities ordered by latest activation or API call."""
+        try:
+            row_limit = int(limit)
+        except (TypeError, ValueError):
+            row_limit = 5
+        if row_limit <= 0:
+            return []
+
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT provider_id, model, base_url, last_used_at,
+                          activation_count
+                   FROM model_picker_usage
+                   ORDER BY last_used_at DESC,
+                            activation_count DESC,
+                            provider_id ASC,
+                            model ASC,
+                            base_url ASC
+                   LIMIT ?""",
+                (row_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_frequent_models(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Return models ranked by real API use plus successful picker activation.
+
+        The same profile-scoped row receives exact per-call deltas from
+        ``update_token_counts`` across all surfaces plus successful picker
+        activations. Local endpoints remain distinct by normalized base URL.
+        """
+        try:
+            row_limit = int(limit)
+        except (TypeError, ValueError):
+            row_limit = 5
+        if row_limit <= 0:
+            return []
+
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT provider_id, model, base_url, last_used_at,
+                          activation_count
+                   FROM model_picker_usage
+                   ORDER BY activation_count DESC,
+                            last_used_at DESC,
+                            provider_id ASC,
+                            model ASC,
+                            base_url ASC
+                   LIMIT ?""",
+                (row_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def update_token_counts(
         self,
         session_id: str,
@@ -2499,8 +2614,47 @@ class SessionDB:
             api_call_count,
             session_id,
         )
+        used_at = time.time()
+
         def _do(conn):
+            previous_api_calls = 0
+            if absolute:
+                previous = conn.execute(
+                    "SELECT COALESCE(api_call_count, 0) FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if previous is not None:
+                    previous_api_calls = int(previous[0])
             conn.execute(sql, params)
+            delta = max(0, int(api_call_count) - previous_api_calls) if absolute else max(0, int(api_call_count))
+            if delta <= 0:
+                return
+            route = conn.execute(
+                """SELECT COALESCE(billing_provider, ''), COALESCE(model, ''),
+                          COALESCE(billing_base_url, '')
+                   FROM sessions WHERE id = ?""",
+                (session_id,),
+            ).fetchone()
+            if route is None:
+                return
+            # Per-call identity wins: automatic provider fallback changes the
+            # active route without rewriting the session's sticky display
+            # route. Stored fields remain the fallback for runtimes that only
+            # report an API-call delta.
+            provider_id = str(billing_provider or route[0] or "").strip()
+            model_id = str(model or route[1] or "").strip()
+            endpoint = str(billing_base_url or route[2] or "").strip().rstrip("/")
+            if not provider_id or not model_id:
+                return
+            conn.execute(
+                """INSERT INTO model_picker_usage
+                       (provider_id, model, base_url, last_used_at, activation_count)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(provider_id, model, base_url) DO UPDATE SET
+                       last_used_at = excluded.last_used_at,
+                       activation_count = model_picker_usage.activation_count + excluded.activation_count""",
+                (provider_id, model_id, endpoint, used_at, delta),
+            )
         self._execute_write(_do)
 
     def ensure_session(

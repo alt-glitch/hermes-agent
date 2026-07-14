@@ -245,11 +245,20 @@ function partLines(part: Part, chips: boolean): number {
  * line (settled non-system rows outside /compact — messageLine.tsx CopyChip).
  */
 export function estimateMessageHeight(
-  message: Pick<Message, 'text' | 'parts'> & { readonly role?: Message['role'] },
+  message: Pick<Message, 'text' | 'parts'> & {
+    readonly notification?: Message['notification']
+    readonly role?: Message['role']
+  },
   spacing: { readonly top: number; readonly bottom: number },
   gap: number,
   chips = false
 ): number {
+  // Notification details are collapsed by default. Never budget their hidden
+  // long-form body into a resume spacer; doing so recreates the giant-scroll
+  // footprint that the disclosure row exists to prevent.
+  if (message.notification) {
+    return Math.min(ESTIMATE_MAX_LINES, Math.max(1, lineCount(message.text))) + spacing.top + spacing.bottom
+  }
   const parts = message.parts
   let content: number
   if (parts && parts.length > 0) {

@@ -36,6 +36,7 @@ import { Pager } from './overlays/pager.tsx'
 import { JourneyOverlay, type JourneyOps } from './overlays/journey.tsx'
 import { PetPicker, type PetOps } from './overlays/petPicker.tsx'
 import { Picker } from './overlays/picker.tsx'
+import { CustomModelSetup } from './overlays/customModelSetup.tsx'
 import { PluginsHub, type PluginOps } from './overlays/pluginsHub.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
 import { SessionOrchestrator, type SessionOrchestratorOps } from './overlays/sessionOrchestrator.tsx'
@@ -137,6 +138,7 @@ export function App(props: AppProps) {
   const billing = () => props.store.state.billing
   const sessionPicker = () => props.store.state.sessionPicker
   const picker = () => props.store.state.picker
+  const customModelSetup = () => props.store.state.customModelSetup
   const pluginsHub = () => props.store.state.pluginsHub
   const petPicker = () => props.store.state.petPicker
   const promptHistory = () => props.store.state.promptHistory
@@ -176,6 +178,7 @@ export function App(props: AppProps) {
       props.onSessionPickerClosed?.()
     })
   const closePicker = () => deferClose(() => props.store.closePicker())
+  const closeCustomModelSetup = () => deferClose(() => props.store.closeCustomModelSetup())
   const closePromptHistory = () => deferClose(() => props.store.closePromptHistory())
   // Esc+Esc viewer trigger (Epic 5): only when this session HAS user prompts —
   // an empty session opens nothing (no empty modal).
@@ -281,6 +284,9 @@ export function App(props: AppProps) {
                     </Match>
                     <Match when={petPicker()}>
                       <PetPicker ops={props.petOps ?? NOOP_PET_OPS} onClose={closePetPicker} />
+                    </Match>
+                    <Match when={customModelSetup()}>
+                      {setup => <CustomModelSetup setup={setup()} onClose={closeCustomModelSetup} />}
                     </Match>
                     <Match when={picker()}>
                       {p => (

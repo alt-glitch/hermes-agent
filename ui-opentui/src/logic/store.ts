@@ -221,6 +221,11 @@ export interface PickerState {
   onPick: (value: string) => void
 }
 
+export interface CustomModelSetupState {
+  request: (method: string, params: Record<string, unknown>) => Promise<unknown>
+  onSaved: (switchValue: string) => void
+}
+
 /** A slash-completion candidate (from `complete.slash`). */
 export interface CompletionItem {
   text: string
@@ -528,6 +533,8 @@ export interface StoreState {
   liveSessions: readonly ActiveItem[]
   /** The open generic picker (model/skills/…); undefined when none. */
   picker: PickerState | undefined
+  /** Staged local/custom-provider setup launched from /model. */
+  customModelSetup: CustomModelSetupState | undefined
   /** Whether the Esc+Esc session prompt-history viewer is open (Epic 5). */
   promptHistory: boolean
   /** Live completion candidates (slash-name/args or file/@-mention) shown above the composer. */
@@ -870,6 +877,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     liveSessionCount: 0,
     liveSessions: [],
     picker: undefined,
+    customModelSetup: undefined,
     promptHistory: false,
     completions: undefined,
     completionFrom: 0,
@@ -1567,6 +1575,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.pager = undefined
         draft.sessionPicker = undefined
         draft.picker = undefined
+        draft.customModelSetup = undefined
         draft.promptHistory = false
         draft.completions = undefined
         draft.completionFrom = 0
@@ -1755,6 +1764,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
   /** Close the generic picker. */
   function closePicker() {
     setState('picker', undefined)
+  }
+
+  function openCustomModelSetup(setup: CustomModelSetupState) {
+    setState('customModelSetup', setup)
+  }
+
+  function closeCustomModelSetup() {
+    setState('customModelSetup', undefined)
   }
 
   /** Open / close the Esc+Esc session prompt-history viewer (Epic 5). */
@@ -2886,6 +2903,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     closeSessionPicker,
     openPicker,
     closePicker,
+    openCustomModelSetup,
+    closeCustomModelSetup,
     openPromptHistory,
     closePromptHistory,
     setModelItems,

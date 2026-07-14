@@ -8,7 +8,8 @@
  * needs.
  *
  * Wire shapes (see boundary/schema/GatewayEvent.ts ~134):
- *   notification.show  payload {text, level, kind, ttl_ms, key, id}  (loose Record)
+ *   notification.show  payload {text, detail, level, kind, ttl_ms, key, id,
+ *                               always_visible}  (loose Record)
  *   notification.clear payload {key}
  *   agents.list result {processes:[{session_id, command, status, uptime_seconds}]}
  */
@@ -17,6 +18,12 @@ export interface ActivityNotification {
   id: string
   key?: string
   text: string
+  /** Optional long-form body. Cards keep this collapsed by default so
+   * internal/background payloads remain inspectable without flooding chat. */
+  detail?: string
+  /** Important completion cards remain visible even when /details hides the
+   * general activity section. */
+  alwaysVisible?: boolean
   level: 'info' | 'warn' | 'error' | 'success'
   kind: string
   ttlMs?: number
@@ -41,6 +48,13 @@ function readNum(value: unknown, key: string): number | undefined {
   if (!value || typeof value !== 'object') return undefined
   const v = (value as { [k: string]: unknown })[key]
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
+/** Loose-read a boolean field off an `unknown` object. */
+function readBool(value: unknown, key: string): boolean | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const v = (value as { [k: string]: unknown })[key]
+  return typeof v === 'boolean' ? v : undefined
 }
 
 /** Coerce any wire `level` to the closed union; anything that isn't a known
@@ -79,6 +93,10 @@ export function parseNotification(payload: unknown): ActivityNotification | null
     text
   }
   if (key !== undefined) out.key = key
+  const detail = readStr(payload, 'detail')
+  if (detail !== undefined) out.detail = detail
+  const alwaysVisible = readBool(payload, 'always_visible')
+  if (alwaysVisible !== undefined) out.alwaysVisible = alwaysVisible
   const ttlMs = readNum(payload, 'ttl_ms')
   if (ttlMs !== undefined) out.ttlMs = ttlMs
   return out

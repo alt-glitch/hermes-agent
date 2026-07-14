@@ -307,8 +307,9 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
           {n => (
             <Show
               when={
+                n().alwaysVisible ||
                 sectionMode('activity', display().details, display().sections, display().detailsCommandOverride) !==
-                'hidden'
+                  'hidden'
               }
             >
               <NotificationCard notification={n()} compact={display().compact} />

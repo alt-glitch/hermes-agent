@@ -258,6 +258,37 @@ describe('correctionIsLegal — the jank rule', () => {
 })
 
 describe('estimateMessageHeight — line-count estimate for never-mounted rows', () => {
+  test('does not charge collapsed notification detail to the transcript window', () => {
+    const detail = Array.from({ length: 500 }, (_, index) => `detail ${index}`).join('\n')
+    const message: Pick<Message, 'text' | 'parts' | 'notification'> = {
+      text: 'deleg_test · 3 agents · all done · 4m48s',
+      notification: {
+        id: 'deleg:test',
+        kind: 'async delegation',
+        level: 'success',
+        text: 'deleg_test · 3 agents · all done · 4m48s',
+        detail,
+        alwaysVisible: true
+      }
+    }
+
+    expect(estimateMessageHeight(message, { top: 1, bottom: 0 }, 1)).toBe(2)
+  })
+
+  test('still counts every visible line in an ordinary notification', () => {
+    const message: Pick<Message, 'text' | 'parts' | 'notification'> = {
+      text: 'background task complete\nsecond visible line\nthird visible line',
+      notification: {
+        id: 'background:test',
+        kind: 'background.complete',
+        level: 'info',
+        text: 'background task complete\nsecond visible line\nthird visible line'
+      }
+    }
+
+    expect(estimateMessageHeight(message, { top: 1, bottom: 1 }, 1)).toBe(5)
+  })
+
   const spacing = { top: 2, bottom: 1 }
 
   test('flat row: newline count + turn spacing', () => {
