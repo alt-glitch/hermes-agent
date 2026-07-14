@@ -1304,6 +1304,18 @@ _TRANSIENT_TRANSPORT_ERRORS = frozenset({
 })
 
 
+def reasoning_repeats_visible_answer(reasoning: object, answer: object) -> bool:
+    """Whether display fallback reasoning is the visible final answer again.
+
+    This is intentionally a display-only comparison. Provider reasoning fields
+    remain untouched on persisted messages for replay continuity.
+    """
+    if not isinstance(reasoning, str) or not isinstance(answer, str):
+        return False
+    normalized_reasoning = reasoning.replace("\r\n", "\n").strip()
+    normalized_answer = answer.replace("\r\n", "\n").strip()
+    return bool(normalized_reasoning and normalized_reasoning == normalized_answer)
+
 
 def extract_reasoning(agent, assistant_message) -> Optional[str]:
     """

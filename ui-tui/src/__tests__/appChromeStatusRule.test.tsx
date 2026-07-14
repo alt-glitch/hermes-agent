@@ -104,6 +104,21 @@ const baseProps = {
   voiceLabel: ''
 }
 
+describe('StatusRule reasoning effort', () => {
+  it('shows medium as a concrete effort and keeps it when lower-priority session chrome yields', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 44,
+      liveSessionCount: 3,
+      modelReasoningEffort: 'medium'
+    })
+
+    const rendered = textContent(element)
+    expect(rendered).toContain('opus 4.8 medium')
+    expect(rendered).not.toContain('3 sessions')
+  })
+})
+
 describe('StatusRule background-subagent indicator', () => {
   it('renders ⛓ N on a wide terminal when subagents are running', () => {
     const element = StatusRule({

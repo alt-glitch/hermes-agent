@@ -413,13 +413,21 @@ def finalize_turn(
     # reasoning on the tool-call step and leave the final-answer step
     # with reasoning=None, so picking only the last assistant would
     # silently drop legitimate same-turn reasoning.
+    from agent.agent_runtime_helpers import reasoning_repeats_visible_answer
+
     last_reasoning = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
             break  # turn boundary — don't cross into prior turns
         if msg.get("role") == "assistant" and msg.get("reasoning"):
-            last_reasoning = msg["reasoning"]
-            break
+            candidate = msg["reasoning"]
+            # Some OpenAI-compatible providers mirror their final answer into
+            # the reasoning summary. Preserve the message metadata, but do not
+            # project a second visible copy. Keep walking so earlier genuine
+            # same-turn reasoning can still be displayed.
+            if not reasoning_repeats_visible_answer(candidate, final_response):
+                last_reasoning = candidate
+                break
 
     # Build result with interrupt info if applicable
     result = {

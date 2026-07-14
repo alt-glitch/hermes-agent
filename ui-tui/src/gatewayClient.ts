@@ -344,7 +344,6 @@ export class GatewayClient extends EventEmitter {
 
   private startSpawnedGateway(root: string) {
     const python = resolvePython(root)
-    const cwd = process.env.HERMES_CWD || root
     const env = { ...process.env }
     const pyPath = env.PYTHONPATH?.trim()
 
@@ -352,9 +351,20 @@ export class GatewayClient extends EventEmitter {
     // Tell the gateway child where the Hermes source root is so its import
     // guard can force it ahead of any same-named package in the launch cwd.
     env.HERMES_PYTHON_SRC_ROOT = root
-    this.startReadyTimer(python, cwd)
-    this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
-    this.lifecycle(`[lifecycle] spawned gateway child ${describeChild(this.proc)} python=${python} cwd=${cwd}`)
+    // `python -m` resolves the top-level tui_gateway package before entry.py's
+    // import guard runs. Pin the process cwd to the selected runtime so a
+    // project (including a `-w` worktree) cannot supply a mismatched package.
+    // HERMES_CWD / TERMINAL_CWD remain in env as the user's workspace.
+    const pythonCwd = root
+    this.startReadyTimer(python, pythonCwd)
+    this.proc = spawn(python, ['-m', 'tui_gateway.entry'], {
+      cwd: pythonCwd,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe']
+    })
+    this.lifecycle(
+      `[lifecycle] spawned gateway child ${describeChild(this.proc)} python=${python} cwd=${pythonCwd}`
+    )
 
     this.stdoutRl = createInterface({ input: this.proc.stdout! })
     this.stdoutRl.on('line', raw => {

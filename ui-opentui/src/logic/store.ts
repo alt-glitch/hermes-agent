@@ -1031,6 +1031,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
   }
 
   // ── parts helpers (operate on a draft message inside produce) ───────────
+  function sameVisibleText(a: string | undefined, b: string | undefined): boolean {
+    const left = a?.replace(/\r\n?/gu, '\n').trim() ?? ''
+    const right = b?.replace(/\r\n?/gu, '\n').trim() ?? ''
+    return !!left && left === right
+  }
+
   function appendPart(m: Message, type: 'text' | 'reasoning', text: string): void {
     const parts = (m.parts ??= [])
     const last = parts[parts.length - 1]
@@ -1045,13 +1051,30 @@ export function createSessionStore(options?: SessionStoreOptions) {
   /** Completion/fallback reasoning is authoritative only when no streamed
    * reasoning exists. This preserves one ordered part and prevents duplicate
    * long reasoning bodies from `reasoning.available`/`message.complete`. */
-  function appendFallbackReasoning(draft: StoreState, text: string | undefined): void {
+  function appendFallbackReasoning(draft: StoreState, text: string | undefined, answer?: string): void {
     const value = text?.trim()
     if (!value) return
     const assistant = liveAssistant(draft) ?? ensureAssistant(draft)
-    if (!hasReasoning(assistant)) appendPart(assistant, 'reasoning', value)
+    const visibleAnswer = (assistant.parts ?? [])
+      .filter(part => part.type === 'text')
+      .map(part => part.text)
+      .join('')
+    if (sameVisibleText(value, answer) || sameVisibleText(value, visibleAnswer)) return
+    if (hasReasoning(assistant)) return
+    const parts = (assistant.parts ??= [])
+    const firstText = parts.findIndex(part => part.type === 'text')
+    parts.splice(firstText < 0 ? parts.length : firstText, 0, { type: 'reasoning', id: nextId(), text: value })
   }
 
+  function dropAnswerDuplicateReasoning(message: Message, answer: string | undefined): void {
+    if (!answer || !message.parts) return
+    for (let index = message.parts.length - 1; index >= 0; index--) {
+      const part = message.parts[index]
+      if (part?.type === 'reasoning' && sameVisibleText(part.text, answer)) {
+        message.parts.splice(index, 1)
+      }
+    }
+  }
   /** Reconcile the server's authoritative final text without duplicating
    * streamed segments. Prefix-compatible finals only append their unseen tail;
    * corrected finals collapse prior text parts into one final part at the last
@@ -2047,7 +2070,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
       }
       case 'message.complete':
         if (event.payload?.reasoning) {
-          setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning)))
+          setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning, event.payload?.text)))
         }
         // Archive BEFORE the normal turn clear. A child exit can still arrive
         // before session.info(false); `agentsTurnArchived` prevents a duplicate.
@@ -2062,6 +2085,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
             if (!live) return
             reconcileFinalText(live, finalText)
             live.streaming = false
+            dropAnswerDuplicateReasoning(live, finalText)
           })
         )
         clearStatusRestoreTimer()

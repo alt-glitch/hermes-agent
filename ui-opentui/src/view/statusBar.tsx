@@ -204,10 +204,10 @@ function shortModel(model: string): string {
   return model.includes('/') ? (model.split('/').at(-1) ?? model) : model
 }
 
-/** Reasoning effort → a compact suffix; hidden for the default/medium effort. */
+/** Reasoning effort → a compact suffix; hidden only when unset/default. */
 export function effortSuffix(effort: string | undefined, fast: boolean | undefined): string {
   const parts: string[] = []
-  if (effort && effort !== 'medium' && effort !== 'default') parts.push(effort)
+  if (effort && effort !== 'default') parts.push(effort)
   if (fast) parts.push('fast')
   return parts.length ? ` ·${parts.join('·')}` : ''
 }

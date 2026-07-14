@@ -400,6 +400,25 @@ describe('session store — ordered parts (Phase 2b)', () => {
     ])
   })
 
+  test('completion fallback reasoning never repeats the visible final answer', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'same answer' } })
+    store.apply({ type: 'message.complete', payload: { reasoning: 'same answer', text: 'same answer' } })
+    expect(store.state.messages.at(-1)?.parts).toMatchObject([{ type: 'text', text: 'same answer' }])
+  })
+
+  test('distinct completion fallback reasoning is ordered before streamed answer text', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'final answer' } })
+    store.apply({ type: 'message.complete', payload: { reasoning: 'genuine thought', text: 'final answer' } })
+    expect(store.state.messages.at(-1)?.parts).toMatchObject([
+      { type: 'reasoning', text: 'genuine thought' },
+      { type: 'text', text: 'final answer' }
+    ])
+  })
+
   test('MoA references stay as distinct ordered visible parts; aggregation is status-only', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start' })

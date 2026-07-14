@@ -112,9 +112,11 @@ describe('store.applyInfo — chrome merge', () => {
 
 // ── 3. pure logic ────────────────────────────────────────────────────────
 
-test('reasoning footer removes a prior xhigh suffix when medium arrives', () => {
+test('reasoning footer shows concrete medium effort but hides an unset/default effort', () => {
   expect(effortSuffix('xhigh', false)).toBe(' ·xhigh')
-  expect(effortSuffix('medium', false)).toBe('')
+  expect(effortSuffix('medium', false)).toBe(' ·medium')
+  expect(effortSuffix('default', false)).toBe('')
+  expect(effortSuffix(undefined, false)).toBe('')
 })
 
 describe('statusSegments — progressive disclosure table (chrome v3 order)', () => {
@@ -301,6 +303,37 @@ function bar(store: SessionStore) {
 }
 
 describe('StatusBar frames (one left-aligned labeled line)', () => {
+  test('a session.info effort update repaints medium immediately', async () => {
+    const store = seededStore()
+    const probe = await renderProbe(bar(store), { width: 120, height: 3 })
+    try {
+      expect(probe.frame()).toContain('·high')
+
+      store.apply({ type: 'session.info', payload: { reasoning_effort: 'medium' } })
+      await probe.settle()
+
+      expect(probe.frame()).toContain('·medium')
+      expect(probe.frame()).not.toContain('·high')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('medium effort stays pinned while lower-priority session and uptime segments yield', async () => {
+    const store = seededStore()
+    store.applyInfo({ reasoning_effort: 'medium' })
+    store.setLiveSessionChrome(1, '')
+
+    const frame = await captureFrame(bar(store), { width: 87, height: 3 })
+    const rows = frame.split('\n').filter(row => row.trim())
+    const row = rows.find(value => value.includes('claude-opus-4-8')) ?? ''
+
+    expect(row).toContain('·medium')
+    expect(row).not.toContain('1 session')
+    expect(row).not.toContain('up:')
+    expect(rows.filter(value => value.includes('│'))).toHaveLength(1)
+  })
+
   test('WIDE (220) renders every labeled segment in order on ONE line, cwd last', async () => {
     const frame = await captureFrame(bar(seededStore()), { width: 220, height: 4 })
     const rows = frame.split('\n').filter(r => r.trim())

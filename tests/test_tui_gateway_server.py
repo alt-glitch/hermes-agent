@@ -10896,3 +10896,34 @@ def test_get_usage_clamps_post_compression_sentinel():
     usage = server._get_usage(agent)
     assert "context_used" not in usage
     assert "context_percent" not in usage
+
+@pytest.mark.parametrize(("reasoning", "expected"), [("answer", None), ("genuine thought", "genuine thought")])
+def test_prompt_submit_suppresses_only_reasoning_that_repeats_final_answer(monkeypatch, reasoning, expected):
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            return {
+                "final_response": "answer",
+                "last_reasoning": reasoning,
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "answer", "reasoning": reasoning},
+                ],
+            }
+
+    server._sessions["reasoning-dedup"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    with patch("agent.title_generator.maybe_auto_title"):
+        server.handle_request({
+            "id": "reasoning-dedup",
+            "method": "prompt.submit",
+            "params": {"session_id": "reasoning-dedup", "text": "question"},
+        })
+
+    complete = next(args[2] for args in emitted if len(args) == 3 and args[0] == "message.complete")
+    assert complete.get("reasoning") == expected

@@ -51,6 +51,17 @@ node scripts/build.mjs
 HERMES_TUI_MOUSE=1 node --experimental-ffi --no-warnings dist/main.js
 ```
 
+To exercise the complete launcher + Python gateway path from a development
+checkout, invoke that checkout explicitly from the repository root:
+
+```bash
+uv run hermes --tui --dev --yolo -w
+```
+
+`-w` creates an isolated worktree for the project workspace; it does not select
+which Hermes checkout provides the TUI runtime. Using `uv run` here avoids a
+bare `hermes` command resolving to a separately installed checkout.
+
 ### Live PTY smoke with terminal-control
 
 `termctrl --host opentui` is the primary visual/interactive smoke driver. Under

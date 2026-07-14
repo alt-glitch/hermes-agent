@@ -263,16 +263,22 @@ export class RawGatewayClient {
     }
     const srcRoot = resolveSrcRoot()
     const python = resolvePython(srcRoot)
-    const cwd = process.env.HERMES_CWD?.trim() || srcRoot
     const env: Record<string, string> = { ...(process.env as Record<string, string>) }
     env.PYTHONPATH = env.PYTHONPATH ? `${srcRoot}:${env.PYTHONPATH}` : srcRoot
     env.HERMES_PYTHON_SRC_ROOT = srcRoot
 
-    this.log.info('gateway', 'spawning tui_gateway', { python, cwd, srcRoot })
-    this.pushTransportLog(`[gateway] spawning python=${python} cwd=${cwd}`)
+    // Python resolves the package named by `-m` before tui_gateway.entry can
+    // harden sys.path. Always start it in the selected Hermes runtime, never
+    // HERMES_CWD (which may be a project or a `-w` worktree that contains its
+    // own tui_gateway package). The gateway still uses HERMES_CWD /
+    // TERMINAL_CWD from env as the user's workspace.
+    const pythonCwd = srcRoot
+
+    this.log.info('gateway', 'spawning tui_gateway', { python, cwd: pythonCwd, srcRoot })
+    this.pushTransportLog(`[gateway] spawning python=${python} cwd=${pythonCwd}`)
 
     const proc = spawn(python, ['-m', 'tui_gateway.entry'], {
-      cwd,
+      cwd: pythonCwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe']
     })

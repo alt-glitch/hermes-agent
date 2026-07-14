@@ -108,6 +108,32 @@ describe('RawGatewayClient child lifecycle isolation', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+    vi.unstubAllEnvs()
+  })
+
+  test('pins the Python import cwd to the runtime while retaining the worktree workspace env', () => {
+    const child = fakeChild()
+    spawnMock.mockReturnValueOnce(child.process)
+    vi.stubEnv('HERMES_PYTHON_SRC_ROOT', '/runtime/hermes-agent')
+    vi.stubEnv('HERMES_PYTHON', '/runtime/hermes-agent/.venv/bin/python')
+    vi.stubEnv('HERMES_CWD', '/project/.worktrees/hermes-test')
+    vi.stubEnv('TERMINAL_CWD', '/project/.worktrees/hermes-test')
+    vi.stubEnv('PYTHONPATH', '/existing/pythonpath')
+    const client = new RawGatewayClient({ log: new Log(null, 'debug'), onEvent: () => {} })
+
+    client.start()
+
+    expect(spawnMock).toHaveBeenCalledOnce()
+    const options = spawnMock.mock.calls[0]?.[2] as {
+      cwd?: string
+      env?: Record<string, string | undefined>
+    }
+    expect(options.cwd).toBe('/runtime/hermes-agent')
+    expect(options.env?.HERMES_CWD).toBe('/project/.worktrees/hermes-test')
+    expect(options.env?.TERMINAL_CWD).toBe('/project/.worktrees/hermes-test')
+    expect(options.env?.PYTHONPATH).toBe('/runtime/hermes-agent:/existing/pythonpath')
+
+    client.stop('test.complete')
   })
 
   test('derives the large session-response ceiling from heap headroom with an absolute bound', () => {

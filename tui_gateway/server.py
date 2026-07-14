@@ -10239,6 +10239,11 @@ def _run_prompt_submit(
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
+                from agent.agent_runtime_helpers import reasoning_repeats_visible_answer
+
+                if reasoning_repeats_visible_answer(last_reasoning, raw):
+                    last_reasoning = None
+            if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
                 payload["warning"] = status_note

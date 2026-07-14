@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 
 interface ListenerEntry {
   callback: (event: any) => void
@@ -95,9 +97,35 @@ const { FakeWebSocket } = vi.hoisted(() => {
   return { FakeWebSocket }
 })
 
+const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }))
+
+vi.mock('node:child_process', () => ({ spawn: spawnMock }))
 vi.mock('undici', () => ({ WebSocket: FakeWebSocket }))
 
 import { GatewayClient } from '../gatewayClient.js'
+
+function fakeSpawnedGateway() {
+  const events = new EventEmitter()
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  const stderr = new PassThrough()
+  const kill = vi.fn(() => {
+    events.emit('exit', 0, null)
+    events.emit('close', 0, null)
+    return true
+  })
+
+  return Object.assign(events, {
+    exitCode: null,
+    kill,
+    killed: false,
+    pid: 4242,
+    signalCode: null,
+    stderr,
+    stdin,
+    stdout
+  })
+}
 
 describe('GatewayClient websocket attach mode', () => {
   const originalWebSocket = globalThis.WebSocket
@@ -107,6 +135,7 @@ describe('GatewayClient websocket attach mode', () => {
   beforeEach(() => {
     originalGatewayUrl = process.env.HERMES_TUI_GATEWAY_URL
     originalSidecarUrl = process.env.HERMES_TUI_SIDECAR_URL
+    spawnMock.mockReset()
     FakeWebSocket.reset()
     ;(globalThis as { WebSocket?: unknown }).WebSocket = FakeWebSocket as unknown as typeof WebSocket
   })
@@ -125,12 +154,40 @@ describe('GatewayClient websocket attach mode', () => {
     }
 
     FakeWebSocket.reset()
+    vi.unstubAllEnvs()
 
     if (originalWebSocket) {
       globalThis.WebSocket = originalWebSocket
     } else {
       delete (globalThis as { WebSocket?: unknown }).WebSocket
     }
+  })
+
+  it('pins the Python import cwd to the runtime while retaining the worktree workspace env', () => {
+    spawnMock.mockReturnValueOnce(fakeSpawnedGateway())
+    vi.stubEnv('HERMES_PYTHON_SRC_ROOT', '/runtime/hermes-agent')
+    vi.stubEnv('HERMES_PYTHON', '/runtime/hermes-agent/.venv/bin/python')
+    vi.stubEnv('HERMES_CWD', '/project/.worktrees/hermes-test')
+    vi.stubEnv('TERMINAL_CWD', '/project/.worktrees/hermes-test')
+    vi.stubEnv('PYTHONPATH', '/existing/pythonpath')
+    delete process.env.HERMES_TUI_GATEWAY_URL
+    const gw = new GatewayClient()
+
+    gw.start()
+
+    expect(spawnMock).toHaveBeenCalledOnce()
+    const options = spawnMock.mock.calls[0]?.[2] as {
+      cwd?: string
+      env?: Record<string, string | undefined>
+    }
+    expect(options.cwd).toBe('/runtime/hermes-agent')
+    expect(options.env?.HERMES_CWD).toBe('/project/.worktrees/hermes-test')
+    expect(options.env?.TERMINAL_CWD).toBe('/project/.worktrees/hermes-test')
+    expect(options.env?.PYTHONPATH).toBe(
+      `/runtime/hermes-agent${process.platform === 'win32' ? ';' : ':'}/existing/pythonpath`
+    )
+
+    gw.kill('test.complete')
   })
 
   it('waits for websocket open and resolves RPC requests', async () => {

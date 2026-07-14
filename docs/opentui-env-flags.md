@@ -42,7 +42,7 @@ classified by who should ever touch it. The design rule shipped with this doc:
 
 | var | set by | effect |
 |---|---|---|
-| `HERMES_PYTHON`, `HERMES_PYTHON_SRC_ROOT`, `HERMES_CWD` | launcher / bench | Which gateway python + repo root + cwd the TUI spawns against (the bench's fake-gateway seam). |
+| `HERMES_PYTHON`, `HERMES_PYTHON_SRC_ROOT`, `HERMES_CWD`, `TERMINAL_CWD` | launcher / bench | `HERMES_PYTHON` and `HERMES_PYTHON_SRC_ROOT` select the gateway interpreter/runtime. The Python process starts with that runtime as its import cwd; `HERMES_CWD` / `TERMINAL_CWD` separately anchor the user's workspace (including the isolated project worktree created by `-w`). |
 | `HERMES_TUI_ACTIVE_SESSION_FILE` | launcher/bench | Session handoff file. |
 | `HERMES_TUI_DASHBOARD` | dashboard PTY launcher | Marks the TUI as hosted. Explicit `/quit`/`/exit` and `/update` are refused; idle Ctrl+C or action+D publishes `dashboard.new_session_requested` instead of destroying the PTY. Busy Ctrl+C still only interrupts. This flag is the sole hosted-mode discriminator; `HERMES_TUI_INLINE` is not equivalent. |
 | `HERMES_TUI_SIDECAR_URL` | dashboard PTY launcher | Event-publisher WebSocket consumed by the spawned Python `tui_gateway.entry`. The JS engine still uses its stdio Effect boundary; server `_emit` frames (including hosted new-session requests) are mirrored to the dashboard through the existing multiplexed publisher. |
