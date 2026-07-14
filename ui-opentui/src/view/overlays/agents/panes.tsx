@@ -156,12 +156,44 @@ export function AgentsTimeline(props: {
   )
   const shown = createMemo(() => spans().slice(windowStart(), windowStart() + Math.max(1, props.maxRows)))
   const duration = createMemo(() => Math.max(0, (globalEnd() - globalStart()) / 1000))
-  const bar = (span: TimelineSpan): string => {
-    const start = Math.floor(((span.startAt - globalStart()) / totalSpan()) * barWidth())
-    const end = Math.min(barWidth(), Math.ceil(((span.endAt - globalStart()) / totalSpan()) * barWidth()))
-    const fill = Math.max(1, end - start)
-    return ' '.repeat(start) + '█'.repeat(fill) + ' '.repeat(Math.max(0, barWidth() - start - fill))
+  const lane = (span: TimelineSpan, endGlyph: string): string => {
+    const width = barWidth()
+    const start = Math.min(width - 1, Math.floor(((span.startAt - globalStart()) / totalSpan()) * (width - 1)))
+    const end = Math.max(
+      start,
+      Math.min(width - 1, Math.ceil(((span.endAt - globalStart()) / totalSpan()) * (width - 1)))
+    )
+    const chars = Array.from({ length: width }, () => ' ')
+    if (start === end) {
+      chars[start] = endGlyph
+      return chars.join('')
+    }
+    chars[start] = '╺'
+    for (let column = start + 1; column < end; column += 1) chars[column] = '━'
+    chars[end] = endGlyph
+    return chars.join('')
   }
+  const ruler = createMemo(() =>
+    Array.from({ length: barWidth() }, (_, column) => {
+      if (column > 0 && column % 10 === 0) return '┼'
+      if (column > 0 && column % 5 === 0) return '·'
+      return '─'
+    }).join('')
+  )
+  const rulerLabels = createMemo(() => {
+    if (duration() <= 0) return ''
+    const width = barWidth()
+    const step = duration() < 20 && width > 20 ? 5 : 10
+    const chars = Array.from({ length: width }, () => ' ')
+    for (let column = 0; column < width; column += step) {
+      const seconds = (column / Math.max(1, width - 1)) * duration()
+      const label = column === 0 ? '0' : seconds >= 1 ? `${String(Math.round(seconds))}s` : `${seconds.toFixed(1)}s`
+      for (let offset = 0; offset < label.length && column + offset < width; offset += 1) {
+        chars[column + offset] = label[offset] ?? ' '
+      }
+    }
+    return chars.join('')
+  })
 
   return (
     <Show when={spans().length > 0}>
@@ -180,9 +212,12 @@ export function AgentsTimeline(props: {
             return (
               <text wrapMode="none">
                 <span style={{ fg: active() ? theme().color.accent : theme().color.muted }}>
-                  {rowId(props.nodes.findIndex(node => node.item.id === span.node.item.id))}{' '}
+                  {rowId(props.nodes.findIndex(node => node.item.id === span.node.item.id))}
+                  {'  '}
                 </span>
-                <span style={{ fg: active() ? theme().color.accent : visual().color }}>{bar(span)}</span>
+                <span style={{ fg: active() ? theme().color.accent : visual().color }}>
+                  {lane(span, visual().glyph)}
+                </span>
                 <span style={{ fg: theme().color.muted }}>
                   {elapsed() === undefined ? '' : `  ${fmtDuration(elapsed() ?? 0)}`}
                 </span>
@@ -192,8 +227,16 @@ export function AgentsTimeline(props: {
         </For>
         <text fg={theme().color.muted} wrapMode="none">
           {'    '}
-          {'─'.repeat(barWidth())}
+          {ruler()}
         </text>
+        <Show when={rulerLabels()}>
+          {labels => (
+            <text fg={theme().color.muted} wrapMode="none">
+              {'    '}
+              {labels()}
+            </text>
+          )}
+        </Show>
       </box>
     </Show>
   )

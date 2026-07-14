@@ -114,6 +114,35 @@ describe('native agents dashboard parity', () => {
     expect(frame).toContain('sonnet-5×1')
   })
 
+  test('timeline keeps simultaneous fan-outs as distinct lanes with a scaled ruler', async () => {
+    const simultaneous = [
+      agent('lane-1', 'First parallel task', { durationSeconds: 42, startedAt: START }),
+      agent('lane-2', 'Second parallel task', { durationSeconds: 42, index: 1, startedAt: START }),
+      agent('lane-3', 'Third parallel task', { durationSeconds: 42, index: 2, startedAt: START }),
+      agent('lane-4', 'Completed offset task', {
+        durationSeconds: 15,
+        index: 3,
+        startedAt: START + 5_000,
+        status: 'completed'
+      })
+    ]
+    const frame = await captureFrame(dashboardNode({ subagents: simultaneous }), {
+      height: 34,
+      until: 'Timeline',
+      width: 116
+    })
+    const lanes = frame.split('\n').filter(line => line.includes('╺'))
+    const ruler = frame.split('\n').find(line => line.includes('┼'))
+    const labels = frame.split('\n').find(line => /0\s+\d+s\s+\d+s/.test(line))
+
+    expect(lanes).toHaveLength(4)
+    expect(lanes.slice(0, 3).every(line => line.includes('●'))).toBe(true)
+    expect(lanes.some(line => line.includes('✓'))).toBe(true)
+    expect(frame).not.toContain('██')
+    expect(ruler).toBeDefined()
+    expect(labels).toBeDefined()
+  })
+
   test('the 132-column control footer stays whole inside its border and padding', async () => {
     const frame = await captureFrame(dashboardNode({ subagents: [] }), {
       height: 30,
