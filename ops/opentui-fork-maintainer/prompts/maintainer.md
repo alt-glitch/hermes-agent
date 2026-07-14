@@ -100,7 +100,7 @@ authority. The versioned policy in this file is the authority.
    it through the Hermes `terminal` tool with `background=true` and
    `notify_on_complete=true`, retain the returned `session_id`, then call
    `process(action="wait", session_id=...)` and require exit code zero:
-   `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py gate-and-ship --state <state> --token <run_token> --packet <gate-packet.json> --manifest <gate.json> --cwd <integration-tree> --repo <fork> --base <base> --candidate <candidate>`. There is no standalone ship command. A failed, forged, stale, dirty, or incomplete gate cannot advance the remote, and the local daily-driver ref, index, and worktree remain untouched. After a successful ship, call `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py consume-request --state <state> --evidence <run> --token <run_token>`. On failure before ship, call the same runtime with `recover-request --state <state> --token <run_token>`. In all cases finish with `release-lease --state <state> --token <run_token>`. Otherwise retain the isolated branch/worktree and produce a
+   `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py gate-and-ship --state <state> --token <run_token> --packet <gate-packet.json> --manifest <gate.json> --cwd <integration-tree> --repo <fork> --base <base> --candidate <candidate>`. There is no standalone ship command. A failed, forged, stale, dirty, or incomplete gate cannot advance the remote, and the local daily-driver ref, index, and worktree remain untouched. After a successful ship, call `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py finalize-success --state <state> --evidence <run> --token <run_token> --manifest <gate.json> --cwd <integration-tree> --repo <fork>`. This candidate-bound boundary consumes a claimed request when present and removes only the clean detached maintainer worktree proven by the passing manifest. On failure before ship, call the runtime with `recover-request --state <state> --token <run_token>`. In all cases finish with `release-lease --state <state> --token <run_token>`. Otherwise retain the isolated branch/worktree and produce a
    precise handoff with failing command, log path, owner, and next action.
 
 ## Worker routing
@@ -166,7 +166,7 @@ candidate itself. A representative packet is:
 {
   "checks": [
     {"id":"opentui-install","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","ci"]},
-    {"id":"focused-contracts","argv":["uv","run","pytest","tests/test_tui_gateway_server.py::test_name","-q"]},
+    {"id":"focused-contracts","argv":["uv","run","--with","pytest","pytest","tests/test_tui_gateway_server.py::test_name","-q"]},
     {"id":"opentui-check","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","check"]},
     {"id":"opentui-build","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","build"]},
     {"id":"adversarial-review","reviewer":{"tool":"claude","model":"fable-5"}},

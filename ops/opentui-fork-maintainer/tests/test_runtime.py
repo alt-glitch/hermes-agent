@@ -26,7 +26,9 @@ def git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def make_repo(tmp_path: Path) -> tuple[Path, Path, str, str, Path]:
+def make_repo(
+    tmp_path: Path, *, worktree_name: str = "gate-worktree"
+) -> tuple[Path, Path, str, str, Path]:
     remote = tmp_path / "remote.git"
     repo = tmp_path / "repo"
     git(tmp_path, "init", "--bare", str(remote))
@@ -46,7 +48,8 @@ def make_repo(tmp_path: Path) -> tuple[Path, Path, str, str, Path]:
     (repo / "file").write_text("candidate\n")
     git(repo, "commit", "-am", "candidate")
     candidate = git(repo, "rev-parse", "HEAD")
-    gate_worktree = tmp_path / "gate-worktree"
+    gate_worktree = tmp_path / worktree_name
+    gate_worktree.parent.mkdir(parents=True, exist_ok=True)
     git(repo, "worktree", "add", "--detach", str(gate_worktree), candidate)
     return repo, remote, base, candidate, gate_worktree
 
@@ -256,6 +259,20 @@ def test_request_claim_is_recoverable_and_one_shot(tmp_path: Path) -> None:
     runtime.consume_request(state, evidence)
     assert not (state / "run-request.inflight.json").exists()
     assert (evidence / "request.consumed.json").exists()
+
+
+def test_focused_contracts_accept_fixed_uv_pytest_dependency() -> None:
+    argv = [
+        "uv",
+        "run",
+        "--with",
+        "pytest",
+        "pytest",
+        "tests/cron/test_jobs.py",
+        "-q",
+    ]
+    assert runtime._is_focused_contract_command(argv)
+    assert runtime._focused_output_proves_execution(argv, "350 passed in 7.5s\n")
 
 
 def test_recovered_request_records_hashed_prior_gate_context(tmp_path: Path) -> None:
@@ -713,21 +730,16 @@ def test_run_gate_denies_true_code_and_unstructured_review(
     review = next(item for item in checks if item["id"] == "adversarial-review")
     review["reviewer"] = {"tool": "claude", "model": "untrusted"}
     packet.write_text(json.dumps({"checks": checks}))
-    result = runtime.run_gate(
-        packet,
-        evidence / "review-bad.json",
-        cwd=gate_worktree,
-        branch="sid/opentui",
-        base_sha=base,
-        candidate_sha=candidate,
-        token="test-token",
-    )
-    assert (
-        next(item for item in result["checks"] if item["id"] == "adversarial-review")[
-            "status"
-        ]
-        == "failed"
-    )
+    with pytest.raises(runtime.ControlError, match="allowlisted reviewer"):
+        runtime.run_gate(
+            packet,
+            evidence / "review-bad.json",
+            cwd=gate_worktree,
+            branch="sid/opentui",
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+        )
 
 
 def test_run_gate_rejects_transient_wait_text_that_is_not_still_visible(
@@ -1019,6 +1031,240 @@ def test_failed_atomic_gate_never_moves_remote(
             token="test-token",
         )
     assert remote_sha(repo) == base
+
+
+def test_gate_skips_expensive_checks_after_first_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    evidence = tmp_path / "evidence"
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch, focused_output=b"collected 0 items\n")
+    monkeypatch.setattr(
+        runtime,
+        "run_adversarial_review",
+        lambda *args, **kwargs: pytest.fail("review must be skipped"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "verify_termctrl_drive",
+        lambda *args, **kwargs: pytest.fail("termctrl must be skipped"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "verify_video_request",
+        lambda *args, **kwargs: pytest.fail("video analysis must be skipped"),
+    )
+    result = runtime.run_gate(
+        packet,
+        evidence / "gate.json",
+        cwd=gate_worktree,
+        branch="sid/opentui",
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    status = {item["id"]: item["status"] for item in result["checks"]}
+    assert status["opentui-install"] == "passed"
+    assert status["focused-contracts"] == "failed"
+    assert all(
+        status[gate_id] == "skipped"
+        for gate_id in (
+            "opentui-check",
+            "opentui-build",
+            "adversarial-review",
+            "termctrl-smoke",
+            "video-analysis",
+        )
+    )
+
+
+def test_finalize_success_consumes_request_and_removes_proven_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed_root = tmp_path / "managed-worktrees"
+    monkeypatch.setattr(runtime, "MAINTAINER_WORKTREE_ROOT", managed_root)
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="managed-worktrees/sync-20260714-000000"
+    )
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    (state / "run-request.json").write_text(
+        json.dumps({"mode": "backport", "commits": ["abcdef1"]})
+    )
+    runtime.claim_request(state, evidence)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    result = runtime.finalize_success(
+        repo,
+        manifest_path,
+        state_dir=state,
+        evidence_dir=evidence,
+        cwd=gate_worktree,
+        token="test-token",
+    )
+    assert result["request_consumed"] is True
+    assert not gate_worktree.exists()
+    assert not (state / "run-request.inflight.json").exists()
+    assert (evidence / "request.consumed.json").exists()
+    assert (
+        json.loads((evidence / "success-finalization.json").read_text())[
+            "candidate_sha"
+        ]
+        == candidate
+    )
+
+
+def test_finalize_success_rejects_arbitrary_detached_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    with pytest.raises(runtime.ControlError, match="proven maintainer worktree"):
+        runtime.finalize_success(
+            repo,
+            manifest_path,
+            state_dir=state,
+            evidence_dir=evidence,
+            cwd=gate_worktree,
+            token="test-token",
+        )
+    assert gate_worktree.exists()
+
+
+def test_finalize_success_rejects_unbound_evidence_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="opentui-maint-unbound"
+    )
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    (state / "run-request.json").write_text(
+        json.dumps({"mode": "backport", "commits": ["abcdef1"]})
+    )
+    runtime.claim_request(state, evidence)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    with pytest.raises(runtime.ControlError, match="evidence must match"):
+        runtime.finalize_success(
+            repo,
+            manifest_path,
+            state_dir=state,
+            evidence_dir=tmp_path / "other-evidence",
+            cwd=gate_worktree,
+            token="test-token",
+        )
+    assert gate_worktree.exists()
+    assert (state / "run-request.inflight.json").exists()
+
+
+def test_gate_prevalidates_later_special_gate_before_any_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    evidence = tmp_path / "evidence"
+    packet_path, checks = make_gate_packet(evidence, gate_worktree, base, candidate)
+    review = next(item for item in checks if item["id"] == "adversarial-review")
+    review["reviewer"] = {"tool": "claude", "model": "not-allowlisted"}
+    packet_path.write_text(json.dumps({"checks": checks}))
+    monkeypatch.setattr(
+        runtime,
+        "_worktree_proof",
+        lambda *args, **kwargs: pytest.fail("packet validation must run first"),
+    )
+    with pytest.raises(runtime.ControlError, match="allowlisted reviewer"):
+        runtime.run_gate(
+            packet_path,
+            evidence / "gate.json",
+            cwd=gate_worktree,
+            branch="sid/opentui",
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+        )
+
+
+def test_finalize_success_rejects_replaced_inflight_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="opentui-maint-replaced-request"
+    )
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    (state / "run-request.json").write_text(
+        json.dumps({"mode": "backport", "commits": ["abcdef1"]})
+    )
+    runtime.claim_request(state, evidence)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    (state / "run-request.inflight.json").write_text(
+        json.dumps({"mode": "backport", "commits": ["1234567"]})
+    )
+    with pytest.raises(runtime.ControlError, match="does not match this run claim"):
+        runtime.finalize_success(
+            repo,
+            manifest_path,
+            state_dir=state,
+            evidence_dir=evidence,
+            cwd=gate_worktree,
+            token="test-token",
+        )
+    assert gate_worktree.exists()
+    assert (state / "run-request.inflight.json").exists()
+    assert not (evidence / "request.consumed.json").exists()
 
 
 def test_video_raw_output_rejects_symlink(

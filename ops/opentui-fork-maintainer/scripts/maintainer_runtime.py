@@ -50,6 +50,9 @@ NODE26_DIR = Path(
 NODE26 = NODE26_DIR / "node"
 NPM26 = NODE26_DIR / "npm"
 TERMCTRL = Path("/home/daimon/.cargo/bin/termctrl")
+MAINTAINER_WORKTREE_ROOT = Path(
+    "/home/daimon/projects/opentui-fork-maintainer/worktrees"
+)
 FORK_SOURCE_ROOT = Path("/home/daimon/side-quests/hermes-agent")
 FORK_VENV_PYTHON = FORK_SOURCE_ROOT / ".venv/bin/python"
 CONTROLLED_PATH = f"{NODE26_DIR}:/usr/local/bin:/usr/bin:/bin"
@@ -336,6 +339,16 @@ def consume_request(state_dir: Path, evidence_dir: Path) -> None:
         _consume_request_unlocked(state_dir, evidence_dir)
 
 
+def _read_bound_request(path: Path, root: Path, *, label: str) -> dict[str, Any]:
+    """Load one canonical request file without permitting path substitution."""
+    safe_path = _evidence_path(str(path), root, label=label)
+    try:
+        value = json.loads(safe_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError(f"{label} is invalid: {type(exc).__name__}") from exc
+    return _validate_request(value)
+
+
 @contextmanager
 def _lease_lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -541,10 +554,19 @@ def _is_focused_contract_command(argv: list[str]) -> bool:
         for arg in argv
     ):
         return False
+    pytest_args = None
     if argv[:3] == ["uv", "run", "pytest"]:
-        return len(argv) > 3 and any(
+        pytest_args = argv[3:]
+    elif argv[:5] == ["uv", "run", "--with", "pytest", "pytest"]:
+        # Fresh detached worktrees do not necessarily have pytest installed in
+        # their shared project venv. Keep the dependency declaration fixed and
+        # explicit instead of mutating the candidate environment before the
+        # trusted gate can run.
+        pytest_args = argv[5:]
+    if pytest_args is not None:
+        return bool(pytest_args) and any(
             "::" in arg or arg.endswith(".py") or "/tests/" in f"/{arg}"
-            for arg in argv[3:]
+            for arg in pytest_args
         )
     vitest_prefix = [
         str(NPM26),
@@ -572,7 +594,13 @@ def _validate_code_command(gate_id: str, argv: list[str]) -> None:
 
 def _focused_output_proves_execution(argv: list[str], output: str) -> bool:
     plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
-    if argv[:3] == ["uv", "run", "pytest"]:
+    if argv[:3] == ["uv", "run", "pytest"] or argv[:5] == [
+        "uv",
+        "run",
+        "--with",
+        "pytest",
+        "pytest",
+    ]:
         counts = re.findall(r"\b(\d+)\s+(?:passed|failed|xfailed|xpassed)\b", plain)
         return sum(int(value) for value in counts) > 0
     counts = re.findall(r"\bTests\s+(\d+)\s+(?:passed|failed)\b", plain)
@@ -1468,6 +1496,44 @@ def verify_video_request(
     }
 
 
+def _validate_gate_packet_item(gate_id: str, item: Any) -> None:
+    """Validate every gate packet before the first gate spends resources."""
+    if gate_id == "termctrl-smoke":
+        if not isinstance(item, dict) or set(item) != {"id", "drive"}:
+            raise ControlError("termctrl gate must contain a bounded drive packet")
+        _validate_drive(item["drive"])
+        return
+    if gate_id == "video-analysis":
+        if not isinstance(item, dict) or set(item) != {"id", "request"}:
+            raise ControlError("video gate must contain an inline route request")
+        if item["request"] != {"provider": "openrouter", "model": VIDEO_MODEL}:
+            raise ControlError("video analysis used the wrong provider or model")
+        return
+    if gate_id == "adversarial-review":
+        if not isinstance(item, dict) or set(item) != {"id", "reviewer"}:
+            raise ControlError("review gate must select an external reviewer")
+        reviewer = item["reviewer"]
+        if (
+            not isinstance(reviewer, dict)
+            or set(reviewer) != {"tool", "model"}
+            or (reviewer.get("tool"), reviewer.get("model")) not in REVIEWER_COMMANDS
+        ):
+            raise ControlError("adversarial review must select an allowlisted reviewer")
+        return
+    argv = (
+        item.get("argv")
+        if isinstance(item, dict) and set(item) == {"id", "argv"}
+        else None
+    )
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(value, str) for value in argv)
+    ):
+        raise ControlError("gate check must contain id and a fixed argv")
+    _validate_code_command(gate_id, argv)
+
+
 def run_gate(
     packet_path: Path,
     manifest_path: Path,
@@ -1500,6 +1566,8 @@ def run_gate(
         or len(ids) != len(set(ids))
     ):
         raise ControlError("gate packet must contain each required gate exactly once")
+    for item in checks:
+        _validate_gate_packet_item(item["id"], item)
     before = _worktree_proof(cwd, candidate_sha)
     node_proof = _validate_node_runtime()
     by_id = {item["id"]: item for item in checks}
@@ -1514,10 +1582,29 @@ def run_gate(
     )
     recorded: list[dict[str, Any]] = []
     termctrl_evidence: dict[str, Any] | None = None
+    failed_gate: str | None = None
     for gate_id in order:
         item = by_id[gate_id]
         output_path = _safe_output_path(evidence_root, "gate-logs", f"{gate_id}.log")
         output_path.unlink(missing_ok=True)
+        if failed_gate is not None:
+            if gate_id in {"termctrl-smoke", "video-analysis", "adversarial-review"}:
+                argv = ["runtime-verifier", gate_id]
+            else:
+                argv = item["argv"]
+            output_path.write_text(
+                f"skipped: prerequisite gate {failed_gate} failed\n",
+                encoding="utf-8",
+            )
+            recorded.append({
+                "id": gate_id,
+                "argv": argv,
+                "exit_code": 125,
+                "status": "skipped",
+                "output_path": str(output_path),
+                "output_sha256": _file_sha256(output_path),
+            })
+            continue
         if gate_id in {"termctrl-smoke", "video-analysis", "adversarial-review"}:
             try:
                 if gate_id == "termctrl-smoke":
@@ -1604,6 +1691,8 @@ def run_gate(
             "output_path": str(output_path),
             "output_sha256": _file_sha256(output_path),
         })
+        if returncode != 0:
+            failed_gate = gate_id
     after_raw = _worktree_proof(cwd, candidate_sha)
     if before["tree_sha"] != after_raw["tree_sha"]:
         raise ControlError("gate worktree tree changed while gates ran")
@@ -1668,6 +1757,111 @@ def gate_and_ship(
     return result
 
 
+def finalize_success(
+    repo: Path,
+    manifest_path: Path,
+    *,
+    state_dir: Path,
+    evidence_dir: Path,
+    cwd: Path,
+    token: str,
+    remote: str = REMOTE,
+    branch: str = BRANCH,
+) -> dict[str, Any]:
+    """Consume any claimed request and remove a proven shipped worktree.
+
+    Publication has already happened through ``gate_and_ship``. This boundary
+    makes the remaining success cleanup deterministic and candidate-bound so a
+    parent cannot consume a failed request or remove an arbitrary checkout.
+    """
+    evidence_root = Path(os.path.abspath(manifest_path.parent))
+    if Path(os.path.abspath(evidence_dir)) != evidence_root:
+        raise ControlError("success evidence must match the gate manifest directory")
+    manifest_path = _evidence_path(
+        str(manifest_path), evidence_root, label="success gate manifest"
+    )
+    raw = _load_gate(manifest_path)
+    base_sha = raw.get("base_sha")
+    candidate_sha = raw.get("candidate_sha")
+    if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha):
+        raise ControlError("success manifest has an invalid base commit")
+    if not isinstance(candidate_sha, str) or not SHA_RE.fullmatch(candidate_sha):
+        raise ControlError("success manifest has an invalid candidate commit")
+    manifest = validate_gate_manifest(
+        repo,
+        manifest_path,
+        base_sha=base_sha,
+        candidate_sha=candidate_sha,
+        token=token,
+        branch=branch,
+    )
+    if _remote_sha(repo, remote, branch) != candidate_sha:
+        raise ControlError("remote branch does not match the proven candidate")
+    recorded_cwd = Path(manifest["worktree_proof"]["worktree"]).resolve()
+    resolved_cwd = cwd.resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    managed_root = MAINTAINER_WORKTREE_ROOT.resolve()
+    is_scratch_worktree = resolved_cwd.is_relative_to(
+        temp_root
+    ) and resolved_cwd.name.startswith("opentui-maint-")
+    is_managed_worktree = (
+        resolved_cwd.parent == managed_root and resolved_cwd.name.startswith("sync-")
+    )
+    if (
+        resolved_cwd != recorded_cwd
+        or resolved_cwd == repo.resolve()
+        or not (is_scratch_worktree or is_managed_worktree)
+    ):
+        raise ControlError("success cleanup path is not the proven maintainer worktree")
+    if _git_status(resolved_cwd, ["symbolic-ref", "-q", "HEAD"]) == 0:
+        raise ControlError("success cleanup refuses a branch-attached worktree")
+
+    claimed = evidence_root / "request.claimed.json"
+    consumed = evidence_root / "request.consumed.json"
+    inflight = state_dir / "run-request.inflight.json"
+    request_consumed = False
+    if claimed.exists():
+        claimed_value = _read_bound_request(
+            claimed, evidence_root, label="claimed request"
+        )
+        if consumed.exists():
+            if inflight.exists():
+                raise ControlError("a consumed request cannot also remain in flight")
+            if (
+                _read_bound_request(consumed, evidence_root, label="consumed request")
+                != claimed_value
+            ):
+                raise ControlError("consumed request does not match this run claim")
+            request_consumed = True
+        else:
+            if not inflight.exists():
+                raise ControlError("the claimed request is no longer in flight")
+            if (
+                _read_bound_request(inflight, state_dir, label="in-flight request")
+                != claimed_value
+            ):
+                raise ControlError("in-flight request does not match this run claim")
+            consume_request(state_dir, evidence_root)
+            request_consumed = True
+    elif inflight.exists():
+        raise ControlError("in-flight request is not bound to this run evidence")
+
+    # Re-prove the exact candidate after request finalization. Git's non-force
+    # removal also refuses dirty trees, but this closes the clean-new-HEAD race.
+    _worktree_proof(resolved_cwd, candidate_sha)
+    _git(repo, ["worktree", "remove", str(resolved_cwd)])
+    result = {
+        "schema_version": 1,
+        "candidate_sha": candidate_sha,
+        "remote": remote,
+        "branch": branch,
+        "request_consumed": request_consumed,
+        "worktree_removed": str(resolved_cwd),
+    }
+    _atomic_json(evidence_root / "success-finalization.json", result)
+    return result
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1682,6 +1876,15 @@ def _parser() -> argparse.ArgumentParser:
     consume.add_argument("--state", type=Path, required=True)
     consume.add_argument("--evidence", type=Path, required=True)
     consume.add_argument("--token", required=True)
+    finalize = sub.add_parser("finalize-success")
+    finalize.add_argument("--state", type=Path, required=True)
+    finalize.add_argument("--evidence", type=Path, required=True)
+    finalize.add_argument("--token", required=True)
+    finalize.add_argument("--manifest", type=Path, required=True)
+    finalize.add_argument("--cwd", type=Path, required=True)
+    finalize.add_argument("--repo", type=Path, required=True)
+    finalize.add_argument("--remote", default=REMOTE)
+    finalize.add_argument("--branch", default=BRANCH)
     packet = sub.add_parser("run-packet")
     packet.add_argument("--packet", type=Path, required=True)
     packet.add_argument("--cwd", type=Path, required=True)
@@ -1724,6 +1927,20 @@ def main(argv: list[str] | None = None) -> int:
         with run_lock(args.state):
             validate_lease(args.state, args.token)
             consume_request(args.state, args.evidence)
+        return 0
+    if args.command == "finalize-success":
+        with run_lock(args.state):
+            validate_lease(args.state, args.token)
+            finalize_success(
+                args.repo,
+                args.manifest,
+                state_dir=args.state,
+                evidence_dir=args.evidence,
+                cwd=args.cwd,
+                token=args.token,
+                remote=args.remote,
+                branch=args.branch,
+            )
         return 0
     if args.command == "run-packet":
         # Lease renewal already serializes on the blocking token-gated lease
