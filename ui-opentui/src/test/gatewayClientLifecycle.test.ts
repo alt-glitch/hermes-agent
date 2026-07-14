@@ -133,7 +133,7 @@ describe('RawGatewayClient child lifecycle isolation', () => {
     expect(options.env?.TERMINAL_CWD).toBe('/project/.worktrees/hermes-test')
     expect(options.env?.PYTHONPATH).toBe('/runtime/hermes-agent:/existing/pythonpath')
 
-    client.stop('test.complete')
+    client.stop()
   })
 
   test('derives the large session-response ceiling from heap headroom with an absolute bound', () => {

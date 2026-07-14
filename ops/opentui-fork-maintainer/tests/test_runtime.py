@@ -256,6 +256,36 @@ def test_request_claim_is_recoverable_and_one_shot(tmp_path: Path) -> None:
     assert (evidence / "request.consumed.json").exists()
 
 
+def test_recovered_request_records_hashed_prior_gate_context(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    previous = state / "runs" / "run-old"
+    current = state / "runs" / "run-new"
+    previous.mkdir(parents=True)
+    current.mkdir(parents=True)
+    request = {"mode": "backport", "commits": ["abcdef1"]}
+    (state / "run-request.json").write_text(json.dumps(request))
+    (previous / "request.claimed.json").write_text(json.dumps(request))
+    (previous / "handoff.md").write_text("fix the rejected race\n")
+    (previous / "gate.json").write_text('{"failed": true}\n')
+    review = previous / "review-verified" / "stdout.txt"
+    review.parent.mkdir()
+    review.write_text("BLOCKER: stale runner\nVERDICT: REJECTED\n")
+
+    assert runtime.claim_request(state, current) == request
+    context = json.loads((current / "retry-context.json").read_text())
+    assert context["schema_version"] == 1
+    assert context["previous_run"] == "run-old"
+    assert [item["kind"] for item in context["artifacts"]] == [
+        "handoff",
+        "gate",
+        "review",
+    ]
+    for item in context["artifacts"]:
+        path = Path(item["path"])
+        assert path.is_relative_to(previous)
+        assert item["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_missing_invalid_and_failed_gates_never_move_remote(tmp_path: Path) -> None:
     repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
     state = tmp_path / "state"
@@ -528,6 +558,75 @@ def test_run_gate_records_candidate_bound_success(
     assert (gate.parent / "video-analysis.raw.json").is_file()
 
 
+def test_termctrl_uses_dependency_complete_fork_python_and_exact_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    python = tmp_path / "fork-venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_termctrl(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        calls.append((argv, env))
+        if argv[0] == "start":
+            Path(argv[argv.index("--record") + 1]).write_bytes(b"recording")
+        if argv[0] == "markers":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps([
+                    {"name": "ready", "at_ms": 1},
+                    {"name": "accepted", "at_ms": 2},
+                ]).encode(),
+                b"",
+            )
+        if argv[0] == "show":
+            return subprocess.CompletedProcess(
+                argv, 0, b"Hermes Agent\nCommands\n", b""
+            )
+        if "--out" in argv:
+            Path(argv[argv.index("--out") + 1]).write_bytes(argv[0].encode())
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(runtime, "FORK_VENV_PYTHON", python)
+    monkeypatch.setattr(runtime, "_run_termctrl", fake_termctrl)
+    runtime.verify_termctrl_drive(
+        {
+            "cols": 132,
+            "rows": 40,
+            "actions": [
+                {
+                    "send": ["text:/help", "enter", "enter"],
+                    "wait": "Commands",
+                    "timeout_ms": 5_000,
+                }
+            ],
+            "required_text": ["Hermes Agent", "Commands"],
+        },
+        evidence,
+        candidate,
+    )
+
+    launch, env = calls[0]
+    command = launch[launch.index("--") + 1 :]
+    assert command == [str(python), "-m", "hermes_cli.main", "--tui", "--yolo"]
+    assert env["PYTHONPATH"] == str(candidate)
+    assert env["HERMES_PYTHON"] == str(python)
+    assert env["HERMES_PYTHON_SRC_ROOT"] == str(candidate)
+    assert env["HERMES_CWD"] == str(candidate)
+    assert "PYTHONHOME" not in env
+    video_call = next(argv for argv, _env in calls if argv[0] == "video")
+    assert video_call[video_call.index("--tail-ms") + 1] == str(runtime.VIDEO_TAIL_MS)
+
+
 def test_run_gate_denies_wrong_or_dirty_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -750,6 +849,14 @@ def test_worktree_proof_rejects_assume_unchanged(tmp_path: Path) -> None:
     git(gate_worktree, "update-index", "--assume-unchanged", "file")
     with pytest.raises(runtime.ControlError, match="assume-unchanged"):
         runtime._worktree_proof(gate_worktree, candidate)
+
+
+def test_codex_reviewer_uses_the_vm_compatible_local_worker_mode() -> None:
+    command = runtime.REVIEWER_COMMANDS[("codex", "gpt-5.6-sol")]
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
+    assert "--skip-git-repo-check" in command
+    assert "-s" not in command
+    assert "read-only" not in command
 
 
 def test_reviewer_commands_use_host_verified_claude_model_ids() -> None:
