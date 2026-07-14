@@ -3961,7 +3961,9 @@ def test_complete_slash_details_args():
 
 
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
+    events = []
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload: events.append((event, sid, payload)))
     agent = types.SimpleNamespace(reasoning_config=None)
     server._sessions["sid"] = _session(agent=agent)
 
@@ -3974,6 +3976,8 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_effort["result"]["value"] == "low"
     assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+    assert events[-1][0:2] == ("session.info", "sid")
+    assert events[-1][2]["reasoning_effort"] == "low"
 
     resp_show = server.handle_request(
         {
@@ -4023,6 +4027,102 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     cfg_clamp = server._load_cfg()
     assert cfg_clamp["display"]["reasoning_full"] is False
     assert cfg_clamp["display"]["sections"]["thinking"] == "collapsed"
+
+
+@pytest.mark.parametrize("stale_sid", ["missing-session", "", None])
+def test_config_set_reasoning_rejects_stale_session_without_global_write(monkeypatch, stale_sid):
+    monkeypatch.setattr(
+        server,
+        "_write_config_key",
+        lambda *args, **kwargs: pytest.fail("stale session must not mutate global config"),
+    )
+
+    response = server.handle_request(
+        {
+            "id": "stale-reasoning",
+            "method": "config.set",
+            "params": {
+                "session_id": stale_sid,
+                "key": "reasoning",
+                "value": "medium",
+            },
+        }
+    )
+
+    assert response["error"]["code"] == 4006
+
+
+def test_reasoning_changed_during_deferred_build_wins_at_install(monkeypatch):
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload: events.append((event, sid, payload)))
+    session = _session(
+        agent=None,
+        create_reasoning_override={"enabled": True, "effort": "xhigh"},
+        resume_runtime_overrides={
+            "reasoning_config_override": {"enabled": True, "effort": "xhigh"}
+        },
+    )
+    server._sessions["sid"] = session
+    response = server.handle_request(
+        {
+            "id": "reasoning-during-build",
+            "method": "config.set",
+            "params": {"session_id": "sid", "key": "reasoning", "value": "medium"},
+        }
+    )
+    built_agent = types.SimpleNamespace(reasoning_config={"enabled": True, "effort": "xhigh"})
+
+    assert response["result"]["value"] == "medium"
+    assert events == [("session.info", "sid", {"reasoning_effort": "medium"})]
+    assert server._install_deferred_agent_runtime(session, built_agent) is True
+    assert built_agent.reasoning_config == {"enabled": True, "effort": "medium"}
+    assert session["resume_runtime_overrides"]["reasoning_config_override"] == built_agent.reasoning_config
+
+
+def test_prompt_submit_marks_mcp_reload_rejection_as_safe_to_retry(monkeypatch):
+    session = _session()
+    server._sessions["sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda *args, **kwargs: pytest.fail("pre-admission rejection must not build an agent"),
+    )
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_reload_admission():
+        with server._mcp_reload_admission_lock:
+            acquired.set()
+            release.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_reload_admission, daemon=True)
+    holder.start()
+    assert acquired.wait(timeout=1)
+    try:
+        response = server.handle_request(
+            {
+                "id": "prompt-1",
+                "method": "prompt.submit",
+                "params": {
+                    "client_submission_id": "submission-1",
+                    "session_id": "sid",
+                    "text": "hello",
+                },
+            }
+        )
+    finally:
+        release.set()
+        holder.join(timeout=1)
+
+    assert response["error"]["code"] == 4009
+    assert response["error"]["data"] == {
+        "kind": "mcp_reload_in_progress",
+        "retry_after_ms": 250,
+    }
+    assert session["running"] is False
+    assert session["history"] == []
+    assert "inflight_turn" not in session
+    assert "queued_prompt" not in session
 
 
 def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch):

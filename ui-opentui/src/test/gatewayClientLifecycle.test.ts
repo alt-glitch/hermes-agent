@@ -247,11 +247,21 @@ describe('RawGatewayClient child lifecycle isolation', () => {
     client.start()
     child.stdout.write(readyFrame())
     const pending = rawRequestFailure(client.request('session.steer', { session_id: 's1', text: 'reject me' }))
+    const data = { kind: 'mcp_reload_in_progress', retry_after_ms: 250 }
     child.stdout.write(
-      `${JSON.stringify({ jsonrpc: '2.0', id: 'r1', error: { code: 4009, message: 'session busy' } })}\n`
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'r1',
+        error: { code: 4009, data, message: 'session busy' }
+      })}\n`
     )
 
-    await expect(pending).resolves.toMatchObject({ reason: 'rpc-error', message: 'session busy' })
+    await expect(pending).resolves.toMatchObject({
+      code: 4009,
+      data,
+      reason: 'rpc-error',
+      message: 'session busy'
+    })
     client.stop()
   })
 

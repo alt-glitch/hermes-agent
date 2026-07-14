@@ -205,7 +205,7 @@ function shortModel(model: string): string {
 }
 
 /** Reasoning effort → a compact suffix; hidden for the default/medium effort. */
-function effortSuffix(effort: string | undefined, fast: boolean | undefined): string {
+export function effortSuffix(effort: string | undefined, fast: boolean | undefined): string {
   const parts: string[] = []
   if (effort && effort !== 'medium' && effort !== 'default') parts.push(effort)
   if (fast) parts.push('fast')

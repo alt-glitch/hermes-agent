@@ -103,7 +103,13 @@ export function trackedSessionIdAfterRequest(
 export function gatewayErrorFromRawFailure(method: string, cause: unknown): GatewayError {
   const message = cause instanceof Error ? cause.message : String(cause)
   const reason = cause instanceof RawGatewayRequestError ? cause.reason : 'transport-down'
-  return new GatewayError({ method, reason, message })
+  return new GatewayError({
+    method,
+    reason,
+    message,
+    ...(cause instanceof RawGatewayRequestError && cause.code !== undefined ? { code: cause.code } : {}),
+    ...(cause instanceof RawGatewayRequestError && cause.data !== undefined ? { data: cause.data } : {})
+  })
 }
 
 function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {

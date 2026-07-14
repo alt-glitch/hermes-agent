@@ -5,8 +5,10 @@ import {
   advancePreStartCancellationFence,
   cancelledPreStartInfoIsStale,
   createAutomaticQueueDrainGate,
+  createPreAdmissionRetryTimer,
   createQueueEditDrainGate,
   deliveryFailureIsUncertain,
+  preAdmissionRetryDelay,
   pendingPromptAfterBoundary,
   pendingPromptBoundaryMatches,
   promptLifecycleMatchesSubmission,
@@ -286,5 +288,60 @@ describe('busy submit policy', () => {
     expect(
       deliveryFailureIsUncertain(new GatewayError({ message: 'busy', method: 'prompt.submit', reason: 'rpc-error' }))
     ).toBe(false)
+  })
+
+  test('only structured MCP pre-admission rejection is automatically retryable', () => {
+    expect(
+      preAdmissionRetryDelay(
+        new GatewayError({
+          code: 4009,
+          data: { kind: 'mcp_reload_in_progress', retry_after_ms: 25 },
+          message: 'reloading',
+          method: 'prompt.submit',
+          reason: 'rpc-error'
+        })
+      )
+    ).toBe(100)
+    expect(
+      preAdmissionRetryDelay(
+        new GatewayError({ code: 4009, message: 'session busy', method: 'prompt.submit', reason: 'rpc-error' })
+      )
+    ).toBeUndefined()
+    expect(
+      preAdmissionRetryDelay(new GatewayError({ message: 'timeout', method: 'prompt.submit', reason: 'timeout' }))
+    ).toBeUndefined()
+  })
+
+  test('synchronous cancellation owns a scheduled pre-admission retry', () => {
+    vi.useFakeTimers()
+    try {
+      const run = vi.fn()
+      const retry = createPreAdmissionRetryTimer()
+      retry.schedule(retry.epoch(), run, 250)
+
+      retry.cancel()
+      vi.advanceTimersByTime(250)
+
+      expect(run).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('late rejection cannot re-arm retry after cancellation', () => {
+    vi.useFakeTimers()
+    try {
+      const run = vi.fn()
+      const retry = createPreAdmissionRetryTimer()
+      const requestEpoch = retry.epoch()
+
+      retry.cancel()
+      expect(retry.schedule(requestEpoch, run, 250)).toBe(false)
+      vi.advanceTimersByTime(250)
+
+      expect(run).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

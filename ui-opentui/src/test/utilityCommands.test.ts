@@ -56,6 +56,7 @@ interface Probe {
   timestampsFlag: { value: boolean }
   reasoningFullFlag: { value: boolean }
   renderables: { value: number | undefined }
+  sessionId: { value: string | undefined }
   compressionMutations: Array<{
     messages: Message[] | undefined
     info: object | undefined
@@ -76,6 +77,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const busyMode: { value: BusyInputMode } = { value: 'queue' }
   const queue: string[] = []
   const renderables: Probe['renderables'] = { value: undefined }
+  const sessionId: Probe['sessionId'] = { value: 'sid-1' }
   const compressionMutations: Probe['compressionMutations'] = []
   const trimCalls = { value: 0 }
   const ctx: SlashContext = {
@@ -155,7 +157,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       calls.push({ method, params })
       return request(method, params)
     },
-    sessionId: () => 'sid-1',
+    sessionId: () => sessionId.value,
     sessionOwnerId: () => 'sid-1',
     submit: () => {},
     submitSkill: () => {}
@@ -171,6 +173,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     paged,
     renderables,
     reasoningFullFlag,
+    sessionId,
     system,
     timestampsFlag
   }
@@ -467,13 +470,41 @@ describe('/reasoning', () => {
     expect(p.system).toEqual(['reasoning: full'])
   })
 
-  test('a non-handled arg (effort/show/hide) re-dispatches to the gateway slash.exec', async () => {
-    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'reasoning effort: high' } : {}))
+  test('effort updates the live session through config.set', async () => {
+    const p = makeCtx(async method => (method === 'config.set' ? { key: 'reasoning', value: 'high' } : {}))
     await dispatchSlash('/reasoning high', p.ctx)
-    // routed through the gateway, NOT handled locally → display flag untouched
     expect(p.reasoningFullFlag.value).toBe(false)
-    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'reasoning high', session_id: 'sid-1' } }])
-    expect(p.system).toEqual(['reasoning effort: high'])
+    expect(p.calls).toEqual([
+      { method: 'config.set', params: { key: 'reasoning', value: 'high', session_id: 'sid-1' } }
+    ])
+    expect(p.system).toEqual(['reasoning: high'])
+  })
+
+  test('effort requires an active session', async () => {
+    const p = makeCtx(async () => ({ value: 'medium' }))
+    p.sessionId.value = undefined
+
+    await dispatchSlash('/reasoning medium', p.ctx)
+
+    expect(p.calls).toEqual([])
+    expect(p.system).toEqual(['reasoning: no active session'])
+  })
+
+  test('a delayed effort reply cannot land in a successor session', async () => {
+    let resolveRequest: (value: unknown) => void = () => {}
+    const p = makeCtx(
+      () =>
+        new Promise(resolve => {
+          resolveRequest = resolve
+        })
+    )
+    const dispatch = dispatchSlash('/reasoning medium', p.ctx)
+    p.sessionId.value = 'sid-2'
+    resolveRequest({ value: 'medium' })
+
+    await dispatch
+
+    expect(p.system).toEqual([])
   })
 })
 

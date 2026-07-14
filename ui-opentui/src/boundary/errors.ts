@@ -23,6 +23,8 @@ export class PythonResolutionError extends Data.TaggedError('PythonResolutionErr
 
 /** A JSON-RPC request to the gateway failed (timeout, transport down, rpc error). */
 export class GatewayError extends Data.TaggedError('GatewayError')<{
+  readonly code?: number
+  readonly data?: unknown
   readonly method: string
   readonly reason: 'timeout' | 'transport-down' | 'rpc-error'
   readonly message: string

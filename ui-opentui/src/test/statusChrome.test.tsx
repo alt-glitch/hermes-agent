@@ -21,6 +21,7 @@ import {
   cmpLevel,
   ctxBarCells,
   ctxLevel,
+  effortSuffix,
   fmtShortDuration,
   fmtTokens,
   spawnHudModel,
@@ -110,6 +111,11 @@ describe('store.applyInfo — chrome merge', () => {
 })
 
 // ── 3. pure logic ────────────────────────────────────────────────────────
+
+test('reasoning footer removes a prior xhigh suffix when medium arrives', () => {
+  expect(effortSuffix('xhigh', false)).toBe(' ·xhigh')
+  expect(effortSuffix('medium', false)).toBe('')
+})
 
 describe('statusSegments — progressive disclosure table (chrome v3 order)', () => {
   test('full width shows everything', () => {

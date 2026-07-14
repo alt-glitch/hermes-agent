@@ -132,8 +132,10 @@ import { coordinatePromptLiveSession } from '../logic/promptLiveSession.ts'
 import {
   advancePreStartCancellationFence,
   createAutomaticQueueDrainGate,
+  createPreAdmissionRetryTimer,
   createQueueEditDrainGate,
   deliveryFailureIsUncertain,
+  preAdmissionRetryDelay,
   pendingPromptAfterBoundary,
   pendingPromptBoundaryMatches,
   pendingPromptDecision,
@@ -184,6 +186,7 @@ export interface TuiInput {
 const READY_POLL = Duration.millis(100)
 const READY_TIMEOUT_MS = 20_000
 const CONFIG_MTIME_POLL = Duration.seconds(5)
+const PRE_ADMISSION_RETRY_WINDOW_MS = 30_000
 /** Window after a Ctrl+C in which a second Ctrl+C quits the TUI (item 11). */
 const QUIT_WINDOW_MS = 3_000
 const PENDING_STEER_LIMIT = 8
@@ -191,6 +194,8 @@ const PENDING_STEER_MAX_CHARS = 4 * 1024 * 1024
 
 interface PendingPrompt {
   readonly clientMessageId: string
+  readonly retryDeadlineAt: number
+  retryNoticeShown: boolean
   readonly submissionId: string
   readonly sessionId: string
   readonly text: string
@@ -554,6 +559,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       let promoteHeldTransitionSubmissions = () => {}
       let promoteHeldAfterRecovery = false
       let pendingPrompt: PendingPrompt | undefined
+      const pendingPromptRetry = createPreAdmissionRetryTimer()
+      const cancelPendingPromptRetry = pendingPromptRetry.cancel
       // A deferred-build interrupt can receive its ACK before the Python build
       // thread publishes one stale session.info(running:true), then clear server
       // running without a matching false event. Fence only that cancelled SID's
@@ -599,6 +606,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
        * resumes persisted history and never submits it automatically. */
       const retainPendingPromptForRetry = (current: PendingPrompt, notice: string): boolean => {
         if (pendingPrompt !== current) return false
+        cancelPendingPromptRetry()
         pendingPrompt = undefined
         if (!store.enqueuePrompt(current.text, true)) {
           // sendPromptNow reserves this exact row/character capacity before it
@@ -1014,6 +1022,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const interruptTurn = () => {
         const sid = gateway.sessionId()
         if (!sid) return
+        // Own cancellation synchronously before a scheduled retry can write
+        // prompt.submit behind this interrupt on the transport.
+        cancelPendingPromptRetry()
         const interruptedBeforeStart = !store.isTurnInFlight()
         const interruptedPrompt = pendingPrompt
         Effect.runFork(
@@ -1054,7 +1065,19 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               })
             ),
             Effect.catchCause(cause =>
-              Effect.sync(() => getLog().warn('interrupt', 'failed', { cause: String(cause) }))
+              Effect.sync(() => {
+                if (
+                  pendingPrompt === interruptedPrompt &&
+                  interruptedPrompt?.sessionId === sid &&
+                  gateway.sessionId() === sid
+                ) {
+                  retainPendingPromptForRetry(
+                    interruptedPrompt,
+                    'prompt cancellation uncertain — message retained; verify the turn state before retrying'
+                  )
+                }
+                getLog().warn('interrupt', 'failed', { cause: String(cause) })
+              })
             )
           )
         )
@@ -1190,6 +1213,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           if (recoveryRetryTimer) clearTimeout(recoveryRetryTimer)
+          cancelPendingPromptRetry()
           recoveryRetryTimer = undefined
         })
       )
@@ -1365,6 +1389,69 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       /** Start one real user turn and synchronously mark it running before the
        * RPC round-trip, closing the double-Enter race that otherwise launches
        * two prompt.submit calls before message.start arrives. */
+      const requestPendingPrompt = (current: PendingPrompt): void => {
+        if (
+          pendingPrompt !== current ||
+          gateway.sessionId() !== current.sessionId ||
+          store.state.sessionId !== current.sessionId
+        ) {
+          return
+        }
+        // A Ctrl+C invalidates this epoch synchronously. A late structured
+        // rejection from the request below must not re-arm automatic retry.
+        const retryEpoch = pendingPromptRetry.epoch()
+        Effect.runFork(
+          gateway
+            .request('prompt.submit', {
+              client_submission_id: current.submissionId,
+              session_id: current.sessionId,
+              text: current.text
+            })
+            .pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  if (pendingPrompt === current) {
+                    pendingPrompt = pendingPromptAfterBoundary(current, 'rpc-ack')
+                  }
+                })
+              ),
+              Effect.catchTag('GatewayError', error =>
+                Effect.sync(() => {
+                  const retryDelay = preAdmissionRetryDelay(error)
+                  if (retryDelay !== undefined && Date.now() < current.retryDeadlineAt) {
+                    if (!current.retryNoticeShown) {
+                      current.retryNoticeShown = true
+                      store.pushSystem('MCP reload finishing — prompt will retry automatically')
+                    }
+                    pendingPromptRetry.schedule(
+                      retryEpoch,
+                      () => {
+                        requestPendingPrompt(current)
+                      },
+                      retryDelay
+                    )
+                    return
+                  }
+                  const notice = deliveryFailureIsUncertain(error)
+                    ? 'prompt delivery uncertain — message retained; send it explicitly to retry'
+                    : 'prompt rejected before start — message retained; send it explicitly to retry'
+                  retainPendingPromptForRetry(current, notice)
+                  getLog().warn('submit', 'failed', { error: error.message, reason: error.reason })
+                })
+              ),
+              Effect.catchCause(cause =>
+                Effect.sync(() => {
+                  retainPendingPromptForRetry(
+                    current,
+                    'prompt delivery uncertain — message retained; send it explicitly to retry'
+                  )
+                  getLog().warn('submit', 'unexpected failure', { cause: String(cause) })
+                })
+              )
+            )
+        )
+      }
+
       sendPromptNow = (text: string, skillCommand?: string): boolean => {
         const sid = gateway.sessionId()
         if (!sid) {
@@ -1394,41 +1481,18 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           return false
         }
         const clientMessageId = skillCommand ? store.pushSkill(skillCommand, text) : store.pushUser(text)
-        const current: PendingPrompt = { clientMessageId, submissionId: randomUUID(), sessionId: sid, text }
+        const current: PendingPrompt = {
+          clientMessageId,
+          retryDeadlineAt: Date.now() + PRE_ADMISSION_RETRY_WINDOW_MS,
+          retryNoticeShown: false,
+          submissionId: randomUUID(),
+          sessionId: sid,
+          text
+        }
         pendingPrompt = current
         store.applyInfo({ running: true })
 
-        Effect.runFork(
-          gateway.request('prompt.submit', { client_submission_id: current.submissionId, session_id: sid, text }).pipe(
-            Effect.tap(() =>
-              Effect.sync(() => {
-                // An ACK only means the request handler spawned deferred startup.
-                // Keep the body cancelable until committed message.start.
-                if (pendingPrompt === current) {
-                  pendingPrompt = pendingPromptAfterBoundary(current, 'rpc-ack')
-                }
-              })
-            ),
-            Effect.catchTag('GatewayError', error =>
-              Effect.sync(() => {
-                const notice = deliveryFailureIsUncertain(error)
-                  ? 'prompt delivery uncertain — message retained; send it explicitly to retry'
-                  : 'prompt rejected before start — message retained; send it explicitly to retry'
-                retainPendingPromptForRetry(current, notice)
-                getLog().warn('submit', 'failed', { error: error.message, reason: error.reason })
-              })
-            ),
-            Effect.catchCause(cause =>
-              Effect.sync(() => {
-                retainPendingPromptForRetry(
-                  current,
-                  'prompt delivery uncertain — message retained; send it explicitly to retry'
-                )
-                getLog().warn('submit', 'unexpected failure', { cause: String(cause) })
-              })
-            )
-          )
-        )
+        requestPendingPrompt(current)
         return true
       }
 

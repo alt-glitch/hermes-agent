@@ -1261,8 +1261,11 @@ def _ok(rid, result: dict) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "result": result}
 
 
-def _err(rid, code: int, msg: str) -> dict:
-    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
+def _err(rid, code: int, msg: str, data: dict | None = None) -> dict:
+    error = {"code": code, "message": msg}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": rid, "error": error}
 
 
 def method(name: str):
@@ -1393,6 +1396,17 @@ def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
     return _err(rid, 5032, err) if err else None
 
 
+def _install_deferred_agent_runtime(session: dict, agent) -> bool:
+    """Install an agent without losing session overrides changed mid-build."""
+    runtime_lock = session.setdefault("runtime_override_lock", threading.Lock())
+    with runtime_lock:
+        latest_reasoning = session.get("create_reasoning_override")
+        if latest_reasoning is not None:
+            agent.reasoning_config = latest_reasoning
+        session["agent"] = agent
+    return latest_reasoning is not None
+
+
 def _start_agent_build(sid: str, session: dict) -> None:
     """Start building the real AIAgent for a TUI session, once.
 
@@ -1481,7 +1495,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
+            if _install_deferred_agent_runtime(current, agent):
+                _persist_live_session_runtime(current)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -9244,6 +9259,10 @@ def _(rid, params: dict) -> dict:
                 rid,
                 4009,
                 "MCP reload in progress — retry the prompt when it finishes",
+                {
+                    "kind": "mcp_reload_in_progress",
+                    "retry_after_ms": 250,
+                },
             )
         if session.get("_tools_configuring"):
             return _err(
@@ -11679,6 +11698,13 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5001, str(e))
 
     if key == "reasoning":
+        requested_sid = params.get("session_id")
+        if "session_id" in params and session is None:
+            return _err(
+                rid,
+                4006,
+                f"unknown session: {requested_sid}",
+            )
         try:
             from hermes_constants import parse_reasoning_effort
 
@@ -11768,15 +11794,25 @@ def _(rid, params: dict) -> dict:
                 # Model territory). Writing config.yaml here let every
                 # desktop model-menu selection rewrite the user's global
                 # agent.reasoning_effort to the preset default.
-                session["create_reasoning_override"] = parsed
-                if session.get("agent") is not None:
-                    session["agent"].reasoning_config = parsed
+                runtime_lock = session.setdefault("runtime_override_lock", threading.Lock())
+                with runtime_lock:
+                    session["create_reasoning_override"] = parsed
+                    resume_overrides = session.get("resume_runtime_overrides")
+                    if isinstance(resume_overrides, dict):
+                        resume_overrides["reasoning_config_override"] = parsed
+                    live_agent = session.get("agent")
+                    if live_agent is not None:
+                        live_agent.reasoning_config = parsed
+                # A deferred/lazy agent may take seconds to publish. Repaint
+                # the session-scoped status field immediately; the eventual
+                # full session.info will reaffirm the same value.
+                _emit(
+                    "session.info",
+                    params.get("session_id", ""),
+                    {"reasoning_effort": str(parsed.get("effort", "") or "none")},
+                )
+                if live_agent is not None:
                     _persist_live_session_runtime(session)
-                    _emit(
-                        "session.info",
-                        params.get("session_id", ""),
-                        _session_info(session["agent"], session),
-                    )
             else:
                 _write_config_key("agent.reasoning_effort", arg)
             return _ok(rid, {"key": key, "value": arg})

@@ -240,6 +240,57 @@ export function deliveryFailureIsUncertain(error: GatewayError): boolean {
   return error.reason !== 'rpc-error'
 }
 
+/** Return a bounded delay only for a server-proven rejection before prompt
+ * admission. Retrying any timeout/transport failure risks duplicating a turn. */
+export function preAdmissionRetryDelay(error: GatewayError): number | undefined {
+  if (error.reason !== 'rpc-error' || error.code !== 4009 || error.data === null || typeof error.data !== 'object') {
+    return undefined
+  }
+  const data = error.data as { readonly kind?: unknown; readonly retry_after_ms?: unknown }
+  if (data.kind !== 'mcp_reload_in_progress') return undefined
+  const requested =
+    typeof data.retry_after_ms === 'number' && Number.isFinite(data.retry_after_ms) ? data.retry_after_ms : 250
+  return Math.min(2_000, Math.max(100, Math.round(requested)))
+}
+
+export interface PreAdmissionRetryTimer {
+  readonly epoch: () => number
+  readonly cancel: () => void
+  readonly schedule: (epoch: number, run: () => void, delayMs: number) => boolean
+}
+
+/** One process-local retry epoch. Cancellation synchronously invalidates both
+ * an armed timer and any in-flight request continuation that could otherwise
+ * re-arm after Ctrl+C writes its interrupt RPC. */
+export function createPreAdmissionRetryTimer(): PreAdmissionRetryTimer {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let generation = 0
+  const clear = (): void => {
+    if (!timer) return
+    clearTimeout(timer)
+    timer = undefined
+  }
+  const cancel = (): void => {
+    generation += 1
+    clear()
+  }
+  return {
+    epoch: () => generation,
+    cancel,
+    schedule(epoch, run, delayMs) {
+      if (epoch !== generation) return false
+      clear()
+      timer = setTimeout(() => {
+        timer = undefined
+        if (epoch !== generation) return
+        run()
+      }, delayMs)
+      timer.unref()
+      return true
+    }
+  }
+}
+
 export function submitWhileBusy(host: BusySubmitHost, text: string, front = false): boolean {
   const mode = host.mode()
   if (mode === 'queue') return host.enqueue(text, front)

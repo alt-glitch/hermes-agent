@@ -976,14 +976,11 @@ const detailsCmd: ClientHandler = async (arg, ctx) => {
  *   - `full` (alias `all`): expand all → local flag on + persist `value:'full'`.
  *   - `clamp` (aliases `collapse`, `short`): collapse all → flag off + `value:'clamp'`.
  *
- * ROUTING DECISION (non-handled args): the server-side `/reasoning` ALSO accepts a
- * reasoning EFFORT (`high`/`medium`/`low`) and visibility (`show`/`hide`). Those are
- * NOT display-expansion concerns, so we do NOT reimplement them here — for any arg
- * other than bare/full/all/clamp/collapse/short we re-dispatch through the gateway
- * via `slash.exec` and surface its `output`. This keeps the client handler tiny
- * while still letting the full server-side `/reasoning` surface work from the TUI.
+ * Effort and visibility values use the gateway's session-aware `config.set`
+ * contract. Sending them through `slash.exec` runs a separate worker process:
+ * it can persist config, but cannot update the live agent or status chrome.
  */
-const reasoningCmd: ClientHandler = async (arg, ctx) => {
+const reasoningCmd: ClientHandler = async (arg, ctx, flight) => {
   const first = arg.trim().toLowerCase().split(/\s+/)[0] ?? ''
   if (!first) {
     try {
@@ -1008,13 +1005,19 @@ const reasoningCmd: ClientHandler = async (arg, ctx) => {
     ctx.pushSystem('reasoning: clamp')
     return
   }
-  // Non-handled arg (effort like high/medium/low, or show/hide): re-dispatch to
-  // the gateway's full `/reasoning` surface and surface its output.
+  // Effort (high/medium/low/etc.) and visibility (show/hide) must update the
+  // live session so session.info repaints the footer immediately.
+  const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('reasoning: no active session')
+    return
+  }
   try {
-    const r = await ctx.request('slash.exec', { command: `reasoning ${first}`, session_id: ctx.sessionId() })
-    ctx.pushSystem(readStr(r, 'output') || 'reasoning updated')
+    const r = await ctx.request('config.set', { key: 'reasoning', value: first, session_id: sid })
+    if (!currentSessionIs(ctx, sid, flight)) return
+    ctx.pushSystem(`reasoning: ${readStr(r, 'value') || first}`)
   } catch {
-    ctx.pushSystem('reasoning: failed to update')
+    if (currentSessionIs(ctx, sid, flight)) ctx.pushSystem('reasoning: failed to update')
   }
 }
 

@@ -87,12 +87,16 @@ export interface RawClientOptions {
 export type RawGatewayFailureReason = 'rpc-error' | 'timeout' | 'transport-down'
 
 export class RawGatewayRequestError extends Error {
+  readonly code: number | undefined
+  readonly data: unknown
   readonly reason: RawGatewayFailureReason
 
-  constructor(reason: RawGatewayFailureReason, message: string) {
+  constructor(reason: RawGatewayFailureReason, message: string, code?: number, data?: unknown) {
     super(message)
     this.name = 'RawGatewayRequestError'
     this.reason = reason
+    this.code = code
+    this.data = data
   }
 }
 
@@ -747,11 +751,18 @@ export class RawGatewayClient {
       const p = pending
       this.pending.delete(frame.id)
       if (frame.error) {
-        const err = frame.error as { code?: unknown; message?: unknown }
+        const err = frame.error as { code?: unknown; data?: unknown; message?: unknown }
         this.pushTransportLog(formatRpcErrorLog(p.method, err))
         const message = typeof err.message === 'string' && err.message.trim() ? err.message : undefined
         const code = typeof err.code === 'number' && Number.isFinite(err.code) ? err.code : '?'
-        p.reject(new RawGatewayRequestError('rpc-error', message ?? `rpc error (${code})`))
+        p.reject(
+          new RawGatewayRequestError(
+            'rpc-error',
+            message ?? `rpc error (${code})`,
+            typeof err.code === 'number' && Number.isFinite(err.code) ? err.code : undefined,
+            err.data
+          )
+        )
       } else {
         p.resolve(frame.result)
       }
