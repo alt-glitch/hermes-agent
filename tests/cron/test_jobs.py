@@ -21,6 +21,7 @@ from cron.jobs import (
     advance_next_run,
     claim_dispatch,
     heartbeat_run_claim,
+    run_claim_is_owned,
     get_due_jobs,
     save_job_output,
 )
@@ -1100,8 +1101,10 @@ class TestGetDueJobs:
             "repeat": {"times": 2, "completed": 0},
         }])
         assert [j["id"] for j in get_due_jobs()] == ["claimclear"]
-        assert get_job("claimclear").get("run_claim") is not None
-        mark_job_run("claimclear", True)
+        token = get_job("claimclear")["run_claim"]["token"]
+        assert mark_job_run(
+            "claimclear", True, expected_run_claim_token=token
+        ) is True
         assert get_job("claimclear")["run_claim"] is None
 
     def test_stale_maxed_oneshot_kept_while_running_in_this_process(
@@ -1166,13 +1169,17 @@ class TestGetDueJobs:
         }])
 
         # Tick claims + dispatches the job.
-        assert [j["id"] for j in get_due_jobs()] == ["slowrun"]
+        claimed = get_due_jobs()
+        assert [j["id"] for j in claimed] == ["slowrun"]
+        token = claimed[0]["run_claim"]["token"]
         assert claim_dispatch("slowrun") is True
 
         # Mid-run heartbeat before the TTL horizon refreshes the claim.
         monkeypatch.setattr("cron.jobs._hermes_now",
                             lambda: t0 + timedelta(seconds=ttl - 60))
-        assert heartbeat_run_claim("slowrun") is True
+        assert heartbeat_run_claim(
+            "slowrun", expected_token=token
+        ) is True
 
         # Past the ORIGINAL claim's TTL horizon: without the heartbeat this
         # tick would stale-remove the maxed one-shot; with it the claim is
@@ -1184,8 +1191,69 @@ class TestGetDueJobs:
 
         # Run completes → outcome lands on a record that still exists
         # (times=1 reached, so mark_job_run retires the job normally).
-        mark_job_run("slowrun", True)
+        mark_job_run(
+            "slowrun", True, expected_run_claim_token=token
+        )
         assert get_job("slowrun") is None
+
+    def test_reclaim_uses_new_token_and_fences_stale_heartbeat_and_completion(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A expires -> B replaces -> A cannot heartbeat or complete B."""
+        from cron.jobs import _oneshot_run_claim_ttl_seconds
+
+        t0 = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+        current_time = [t0]
+        generated = iter(("dispatch-a", "dispatch-b"))
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: current_time[0])
+        monkeypatch.setattr("cron.jobs._machine_id", lambda: "same-host:123")
+        monkeypatch.setattr(
+            "cron.jobs.secrets.token_urlsafe", lambda size: next(generated)
+        )
+        run_at = (t0 - timedelta(seconds=5)).isoformat()
+        save_jobs([
+            {
+                "id": "reclaimed",
+                "name": "reclaimed",
+                "prompt": "x",
+                "schedule": {"kind": "once", "run_at": run_at},
+                "next_run_at": run_at,
+                "enabled": True,
+                "state": "scheduled",
+            }
+        ])
+
+        first = get_due_jobs()[0]["run_claim"]
+        current_time[0] = t0 + timedelta(
+            seconds=_oneshot_run_claim_ttl_seconds() + 1
+        )
+        second = get_due_jobs()[0]["run_claim"]
+
+        assert first == {
+            "at": t0.isoformat(),
+            "by": "same-host:123",
+            "token": "dispatch-a",
+        }
+        assert second["by"] == first["by"]
+        assert second["token"] == "dispatch-b"
+        assert heartbeat_run_claim(
+            "reclaimed", expected_token="dispatch-a"
+        ) is False
+        assert run_claim_is_owned(
+            "reclaimed", expected_token="dispatch-b"
+        ) is True
+
+        before = get_job("reclaimed")
+        assert mark_job_run(
+            "reclaimed",
+            False,
+            "stale failure",
+            expected_run_claim_token="dispatch-a",
+        ) is False
+        assert mark_job_run(
+            "reclaimed", False, "unfenced failure"
+        ) is False
+        assert get_job("reclaimed") == before
 
     def test_heartbeat_run_claim_noop_without_claim(self, tmp_cron_dir):
         """heartbeat_run_claim is a safe no-op when there is nothing to refresh
@@ -1196,9 +1264,53 @@ class TestGetDueJobs:
             "schedule": {"kind": "once", "run_at": future},
             "next_run_at": future, "enabled": True, "state": "scheduled",
         }])
-        assert heartbeat_run_claim("noclaim") is False
-        assert heartbeat_run_claim("missing-job") is False
+        assert heartbeat_run_claim(
+            "noclaim", expected_token="missing-token"
+        ) is False
+        assert heartbeat_run_claim(
+            "missing-job", expected_token="missing-token"
+        ) is False
         assert get_job("noclaim").get("run_claim") is None
+
+    def test_external_oneshot_fire_uses_same_fenced_token(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """The external trigger path cannot bypass one-shot run fencing."""
+        from cron.jobs import claim_job_for_fire
+
+        t0 = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+        current_time = [t0]
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: current_time[0])
+        save_jobs(
+            [
+                {
+                    "id": "external-once",
+                    "name": "external once",
+                    "prompt": "x",
+                    "schedule": {
+                        "kind": "once",
+                        "run_at": (t0 + timedelta(hours=1)).isoformat(),
+                    },
+                    "enabled": True,
+                    "state": "scheduled",
+                }
+            ]
+        )
+
+        assert claim_job_for_fire("external-once") is True
+        claimed = get_job("external-once")
+        token = claimed["run_claim"]["token"]
+        assert token
+        assert claimed["fire_claim"]["token"] == token
+
+        current_time[0] = t0 + timedelta(seconds=60)
+        assert heartbeat_run_claim(
+            "external-once", expected_token=token
+        ) is True
+        refreshed = get_job("external-once")
+        assert refreshed["run_claim"]["at"] == current_time[0].isoformat()
+        assert refreshed["fire_claim"]["at"] == current_time[0].isoformat()
+        assert claim_job_for_fire("external-once") is False
 
 
     def test_broken_cron_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):

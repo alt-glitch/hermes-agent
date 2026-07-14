@@ -17,6 +17,7 @@ import threading
 import time
 import os
 import re
+import secrets
 import uuid
 
 # Cross-process advisory file locking for jobs.json critical sections.
@@ -1489,8 +1490,14 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    *,
+    expected_run_claim_token: Optional[str] = None,
+) -> bool:
     """
     Mark a job as having been run.
     
@@ -1499,11 +1506,41 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    Token-bearing one-shot claims require ``expected_run_claim_token`` to
+    match. This compare and the claim clear happen under the same jobs-file
+    lock, so a stale runner cannot complete, disable, or clear a replacement
+    run. Legacy persisted claims without a token retain their old completion
+    behavior for rolling-upgrade compatibility.
     """
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                claim = job.get("run_claim")
+                stored_token = (
+                    str(claim.get("token") or "")
+                    if isinstance(claim, dict)
+                    else ""
+                )
+                token_mismatch = (
+                    bool(stored_token)
+                    and expected_run_claim_token != stored_token
+                )
+                invalid_expected_token = (
+                    expected_run_claim_token is not None
+                    and (
+                        job.get("schedule", {}).get("kind") != "once"
+                        or not stored_token
+                    )
+                )
+                if token_mismatch or invalid_expected_token:
+                    logger.warning(
+                        "Job '%s': refusing stale completion; run_claim "
+                        "ownership changed",
+                        job.get("name", job_id),
+                    )
+                    return False
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
@@ -1544,7 +1581,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)
-                        return
+                        return True
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -1579,9 +1616,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def claim_dispatch(job_id: str) -> bool:
@@ -1647,7 +1685,24 @@ def claim_dispatch(job_id: str) -> bool:
         return True
 
 
-def heartbeat_run_claim(job_id: str) -> bool:
+def run_claim_is_owned(job_id: str, *, expected_token: str) -> bool:
+    """Return whether ``expected_token`` still owns a one-shot run claim."""
+    if not expected_token:
+        return False
+    with _jobs_lock():
+        for job in load_jobs():
+            if job.get("id") != job_id:
+                continue
+            claim = job.get("run_claim")
+            return bool(
+                job.get("schedule", {}).get("kind") == "once"
+                and isinstance(claim, dict)
+                and claim.get("token") == expected_token
+            )
+    return False
+
+
+def heartbeat_run_claim(job_id: str, *, expected_token: str) -> bool:
     """Refresh a one-shot's ``run_claim`` timestamp while its run is alive.
 
     Called periodically from the scheduler's run monitor (#62002) so a
@@ -1656,18 +1711,33 @@ def heartbeat_run_claim(job_id: str) -> bool:
     nor this process's own next tick will re-dispatch or stale-remove the job
     while the run is in flight. mark_job_run() clears the claim on completion.
 
-    Returns True if a claim was refreshed; False when the job or its claim is
-    gone (nothing to refresh — e.g. a manual run that never stamped one).
+    ``expected_token`` is the cryptographically random nonce captured from the
+    dispatched job, not its machine/PID attribution. Returns True only when
+    that exact dispatch still owns the one-shot claim. A matching external
+    ``fire_claim`` is refreshed with it so both trigger paths use one fence.
     """
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            claim = job.get("run_claim")
-            if not isinstance(claim, dict):
+            if job.get("schedule", {}).get("kind") != "once":
                 return False
-            claim["at"] = _hermes_now().isoformat()
+            claim = job.get("run_claim")
+            if (
+                not expected_token
+                or not isinstance(claim, dict)
+                or claim.get("token") != expected_token
+            ):
+                return False
+            now = _hermes_now().isoformat()
+            claim["at"] = now
+            fire_claim = job.get("fire_claim")
+            if (
+                isinstance(fire_claim, dict)
+                and fire_claim.get("token") == expected_token
+            ):
+                fire_claim["at"] = now
             save_jobs(jobs)
             return True
     return False
@@ -1748,6 +1818,7 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
             now = _hermes_now()
+            kind = job.get("schedule", {}).get("kind")
             existing = job.get("fire_claim")
             if existing:
                 try:
@@ -1763,8 +1834,26 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
-            kind = job.get("schedule", {}).get("kind")
+            if kind == "once":
+                existing_run = job.get("run_claim")
+                if existing_run:
+                    try:
+                        claimed_at = _ensure_aware(
+                            datetime.fromisoformat(existing_run["at"])
+                        )
+                        _age = (now - claimed_at).total_seconds()
+                        if 0 <= _age < claim_ttl_seconds:
+                            return False
+                    except Exception:
+                        pass
+            claim = {
+                "at": now.isoformat(),
+                "by": _machine_id(),
+                "token": secrets.token_urlsafe(32),
+            }
+            job["fire_claim"] = claim
+            if kind == "once":
+                job["run_claim"] = dict(claim)
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
@@ -2106,7 +2195,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # (_oneshot_run_claim_ttl_seconds, derived from HERMES_CRON_TIMEOUT),
                 # so the job is re-dispatched rather than wedged forever.
                 if kind == "once":
-                    claim = {"at": now.isoformat(), "by": _machine_id()}
+                    claim = {
+                        "at": now.isoformat(),
+                        "by": _machine_id(),
+                        "token": secrets.token_urlsafe(32),
+                    }
                     job["run_claim"] = claim
                     for rj in raw_jobs:
                         if rj["id"] == job["id"]:

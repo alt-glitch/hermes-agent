@@ -1,6 +1,8 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
 import contextlib
+from datetime import datetime, timedelta, timezone
+import itertools
 import json
 import logging
 import os
@@ -2426,6 +2428,169 @@ class TestRunJobSkillBacked:
         assert "Instructions for blogwatcher." in prompt_arg
         assert "Instructions for maps." in prompt_arg
         assert "Combine the results." in prompt_arg
+
+    def test_agent_heartbeat_stops_after_dispatch_token_is_lost(
+        self, tmp_path, monkeypatch
+    ):
+        """A False heartbeat is ownership loss, not a result to ignore."""
+        job = {
+            "id": "heartbeat-job",
+            "name": "heartbeat",
+            "prompt": "hello",
+            "schedule": {"kind": "once", "run_at": "2026-07-14T12:00:00Z"},
+            "run_claim": {
+                "at": "2026-07-14T12:00:00Z",
+                "by": "same-host:123",
+                "token": "dispatch-a",
+            },
+        }
+        fake_db = MagicMock()
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+        class FakeFuture:
+            def result(self):
+                return {"final_response": "ok"}
+
+        fake_future = FakeFuture()
+        fake_pool = MagicMock()
+        fake_pool.submit.return_value = fake_future
+        wait_results = [
+            (set(), set()),
+            (set(), set()),
+            ({fake_future}, set()),
+        ]
+        monotonic_ticks = itertools.count(step=61.0)
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+
+        with (
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("hermes_state.SessionDB", return_value=fake_db),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "***",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+            ),
+            patch("run_agent.AIAgent", FakeAgent),
+            patch(
+                "cron.scheduler.concurrent.futures.ThreadPoolExecutor",
+                return_value=fake_pool,
+            ),
+            patch(
+                "cron.scheduler.concurrent.futures.wait",
+                side_effect=wait_results,
+            ),
+            patch(
+                "cron.scheduler.time.monotonic",
+                side_effect=monotonic_ticks.__next__,
+            ),
+            patch(
+                "cron.scheduler.heartbeat_run_claim", return_value=False
+            ) as heartbeat,
+        ):
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        heartbeat.assert_called_once_with(
+            "heartbeat-job", expected_token="dispatch-a"
+        )
+
+
+class TestOneShotDispatchFencing:
+    @pytest.mark.parametrize(
+        ("no_agent", "raise_after_reclaim", "expected_result"),
+        [
+            (True, False, True),
+            (False, False, True),
+            (False, True, False),
+        ],
+        ids=("script-only", "agent-backed", "agent-failure"),
+    )
+    def test_replaced_runner_cannot_deliver_complete_or_clear_new_claim(
+        self,
+        tmp_path,
+        monkeypatch,
+        no_agent,
+        raise_after_reclaim,
+        expected_result,
+    ):
+        """A expires -> B replaces -> A resumes, including failure paths."""
+        import cron.jobs as jobs
+        import cron.scheduler as scheduler
+
+        t0 = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+        current_time = [t0]
+        generated = iter(("dispatch-a", "dispatch-b"))
+        run_at = (t0 - timedelta(seconds=5)).isoformat()
+        stored = {
+            "id": "replaced-runner",
+            "name": "replaced runner",
+            "prompt": "report",
+            "schedule": {"kind": "once", "run_at": run_at},
+            "next_run_at": run_at,
+            "enabled": True,
+            "state": "scheduled",
+            "no_agent": no_agent,
+        }
+        if no_agent:
+            stored["script"] = "watchdog.py"
+
+        monkeypatch.setattr(jobs, "_hermes_now", lambda: current_time[0])
+        monkeypatch.setattr(jobs, "_machine_id", lambda: "same-host:123")
+        monkeypatch.setattr(
+            jobs.secrets, "token_urlsafe", lambda size: next(generated)
+        )
+        monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+        delivery = MagicMock()
+        monkeypatch.setattr(scheduler, "_deliver_result", delivery)
+        monkeypatch.setattr(
+            scheduler,
+            "save_job_output",
+            lambda job_id, output: tmp_path / f"{job_id}.md",
+        )
+
+        replacement = {}
+
+        def _run_then_resume(job, *, defer_agent_teardown=None):
+            current_time[0] = t0 + timedelta(
+                seconds=jobs._oneshot_run_claim_ttl_seconds() + 1
+            )
+            replacement["job"] = jobs.get_due_jobs()[0]
+            if raise_after_reclaim:
+                raise RuntimeError("runner A resumed with a failure")
+            return True, "output", "externally visible result", None
+
+        monkeypatch.setattr(scheduler, "run_job", _run_then_resume)
+
+        with (
+            jobs.use_cron_store(tmp_path),
+            patch("agent.secret_scope.build_profile_secret_scope", return_value={}),
+            patch("agent.secret_scope.set_secret_scope", return_value=object()),
+            patch("agent.secret_scope.reset_secret_scope"),
+        ):
+            jobs.save_jobs([stored])
+            runner_a = jobs.get_due_jobs()[0]
+            result = scheduler.run_one_job(runner_a)
+            durable = jobs.get_job("replaced-runner")
+
+        assert result is expected_result
+        assert delivery.call_count == 0
+        assert replacement["job"]["run_claim"]["token"] == "dispatch-b"
+        assert durable["run_claim"]["token"] == "dispatch-b"
+        assert durable["enabled"] is True
+        assert "last_run_at" not in durable
+        assert "last_status" not in durable
 
 
 class TestSilentDelivery:

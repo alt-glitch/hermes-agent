@@ -59,6 +59,7 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
             "run_claim": {
                 "at": original_timestamp,
                 "by": "dispatch-owner",
+                "token": "dispatch-token",
             },
         }
 
@@ -73,8 +74,8 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
     real_heartbeat = jobs.heartbeat_run_claim
     second_scheduler_scan = {}
 
-    def _observed_heartbeat(job_id: str, *, expected_owner: str) -> bool:
-        updated = real_heartbeat(job_id, expected_owner=expected_owner)
+    def _observed_heartbeat(job_id: str, *, expected_token: str) -> bool:
+        updated = real_heartbeat(job_id, expected_token=expected_token)
         # A different scheduler scans after the ORIGINAL claim's TTL while the
         # script is still blocked. The refreshed claim must keep the job out of
         # the due set and preserve its durable record.
@@ -104,15 +105,19 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
     assert error is None
     assert profile_claim["at"] != original_timestamp
     assert profile_claim["by"] == "dispatch-owner"
+    assert profile_claim["token"] == "dispatch-token"
     assert second_scheduler_scan == {"due": [], "record_present": True}
     assert jobs.get_job("long-script")["run_claim"] == {
         "at": original_timestamp,
         "by": "dispatch-owner",
+        "token": "dispatch-token",
     }
 
 
-def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
-    """A stale script runner cannot refresh a replacement owner's claim."""
+def test_script_heartbeat_stops_when_captured_token_loses_ownership(
+    tmp_path, monkeypatch
+):
+    """A stale script stops heartbeating a replacement dispatch's claim."""
     import cron.jobs as jobs
     import cron.scheduler as scheduler
 
@@ -124,7 +129,11 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         "id": "reclaimed-script",
         "script": "watchdog.py",
         "schedule": {"kind": "once", "run_at": original_timestamp},
-        "run_claim": {"at": original_timestamp, "by": "original-owner"},
+        "run_claim": {
+            "at": original_timestamp,
+            "by": "same-machine-pid",
+            "token": "dispatch-a",
+        },
     }
 
     with jobs.use_cron_store(profile_home):
@@ -133,16 +142,19 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
                 **job,
                 "run_claim": {
                     "at": replacement_timestamp,
-                    "by": "replacement-owner",
+                    "by": "same-machine-pid",
+                    "token": "dispatch-b",
                 },
             }
         ])
 
     heartbeat_seen = threading.Event()
     real_heartbeat = jobs.heartbeat_run_claim
+    heartbeat_tokens = []
 
-    def _observed_heartbeat(job_id: str, *, expected_owner: str) -> bool:
-        updated = real_heartbeat(job_id, expected_owner=expected_owner)
+    def _observed_heartbeat(job_id: str, *, expected_token: str) -> bool:
+        heartbeat_tokens.append(expected_token)
+        updated = real_heartbeat(job_id, expected_token=expected_token)
         heartbeat_seen.set()
         return updated
 
@@ -161,5 +173,7 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         )
         assert jobs.get_job("reclaimed-script")["run_claim"] == {
             "at": replacement_timestamp,
-            "by": "replacement-owner",
+            "by": "same-machine-pid",
+            "token": "dispatch-b",
         }
+    assert heartbeat_tokens == ["dispatch-a"]

@@ -238,7 +238,16 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    get_job,
+    heartbeat_run_claim,
+    mark_job_run,
+    run_claim_is_owned,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -297,6 +306,7 @@ def _is_cron_silence_response(text: str) -> bool:
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
+_running_run_claim_tokens: dict[str, str] = {}
 _running_lock = threading.Lock()
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
@@ -354,12 +364,19 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     """
     with _running_lock:
         job_ids = list(_running_job_ids)
+        claim_tokens = {
+            job_id: _running_run_claim_tokens.get(job_id) for job_id in job_ids
+        }
         _interrupted_job_ids.update(job_ids)
     marked = []
     for job_id in job_ids:
         try:
-            mark_job_run(job_id, False, reason)
-            marked.append(job_id)
+            token = claim_tokens[job_id]
+            kwargs = (
+                {"expected_run_claim_token": token} if token is not None else {}
+            )
+            if mark_job_run(job_id, False, reason, **kwargs) is not False:
+                marked.append(job_id)
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
     return marked
@@ -2147,28 +2164,36 @@ def _run_job_script_with_claim_heartbeat(
     Recurring jobs and unclaimed/manual runs have no durable one-shot claim and
     therefore use the ordinary script path without starting a thread.
 
-    The claim owner is captured from the dispatched job and never re-read from
-    storage.  ``heartbeat_run_claim`` compares that stable owner before every
-    refresh, so a stale runner cannot extend a replacement owner's claim.
+    The dispatch token is captured from the dispatched job and never re-read
+    from storage. ``heartbeat_run_claim`` compares that unique nonce before
+    every refresh, so a stale runner cannot extend a replacement claim.
     """
     schedule = job.get("schedule")
     claim = job.get("run_claim")
-    owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    token = str(claim.get("token") or "") if isinstance(claim, dict) else ""
     if not (
         isinstance(schedule, dict)
         and schedule.get("kind") == "once"
-        and owner
+        and token
     ):
         return _run_job_script(script_path)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
+    ownership_lost = threading.Event()
     heartbeat_context = contextvars.copy_context()
 
     def _heartbeat_loop() -> None:
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
-                heartbeat_run_claim(job_id, expected_owner=owner)
+                if not heartbeat_run_claim(job_id, expected_token=token):
+                    ownership_lost.set()
+                    logger.warning(
+                        "Job '%s': script run_claim ownership lost; stopping "
+                        "heartbeats and fencing its result",
+                        job_id,
+                    )
+                    return
             except Exception:
                 logger.debug(
                     "Job '%s': script run_claim heartbeat failed",
@@ -3176,21 +3201,36 @@ def run_job(
             isinstance(_job_schedule, dict) and _job_schedule.get("kind") == "once"
         )
         _run_claim = job.get("run_claim")
-        _run_claim_owner = (
-            str(_run_claim.get("by") or "") if isinstance(_run_claim, dict) else ""
+        _run_claim_token = (
+            str(_run_claim.get("token") or "")
+            if isinstance(_run_claim, dict)
+            else ""
         )
+        _run_claim_ownership_lost = False
         _last_claim_heartbeat = time.monotonic()
 
         def _heartbeat_run_claim_if_due():
-            nonlocal _last_claim_heartbeat
-            if not _is_oneshot or not _run_claim_owner:
+            nonlocal _last_claim_heartbeat, _run_claim_ownership_lost
+            if (
+                not _is_oneshot
+                or not _run_claim_token
+                or _run_claim_ownership_lost
+            ):
                 return
             _mono = time.monotonic()
             if _mono - _last_claim_heartbeat < _RUN_CLAIM_HEARTBEAT_SECONDS:
                 return
             _last_claim_heartbeat = _mono
             try:
-                heartbeat_run_claim(job_id, expected_owner=_run_claim_owner)
+                if not heartbeat_run_claim(
+                    job_id, expected_token=_run_claim_token
+                ):
+                    _run_claim_ownership_lost = True
+                    logger.warning(
+                        "Job '%s': run_claim ownership lost; stopping "
+                        "heartbeats and fencing its result",
+                        job_name,
+                    )
             except Exception:
                 logger.debug(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
@@ -3207,7 +3247,7 @@ def run_job(
             if _cron_inactivity_limit is None:
                 # Unlimited — no inactivity watchdog, but a one-shot still
                 # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
+                if _is_oneshot and _run_claim_token:
                     result = None
                     while True:
                         done, _ = concurrent.futures.wait(
@@ -3474,6 +3514,35 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    expected_run_claim_token = ""
+    job_schedule = job.get("schedule")
+    is_one_shot = (
+        isinstance(job_schedule, dict) and job_schedule.get("kind") == "once"
+    )
+    if is_one_shot:
+        claim = job.get("run_claim")
+        if isinstance(claim, dict):
+            expected_run_claim_token = str(claim.get("token") or "")
+
+    def _mark_this_dispatch(
+        success: bool,
+        error: Optional[str] = None,
+        *,
+        delivery_error: Optional[str] = None,
+    ) -> bool:
+        kwargs = (
+            {"expected_run_claim_token": expected_run_claim_token}
+            if expected_run_claim_token
+            else {}
+        )
+        return mark_job_run(
+            job["id"],
+            success,
+            error,
+            delivery_error=delivery_error,
+            **kwargs,
+        )
+
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3488,6 +3557,28 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 job.get("name", job["id"]),
             )
             return True  # not an error — already handled/removed
+
+        # External one-shot fire callers historically hand in the job snapshot
+        # from before claim_job_for_fire() stamped its token. Hydrate only that
+        # paired fire/run claim so the shared run path captures the claim just
+        # acquired, while ordinary manual/unclaimed runs remain unfenced.
+        if (
+            is_one_shot and not expected_run_claim_token
+        ):
+            stored_job = get_job(job["id"])
+            if stored_job is not None:
+                stored_run_claim = stored_job.get("run_claim")
+                stored_fire_claim = stored_job.get("fire_claim")
+                if (
+                    isinstance(stored_run_claim, dict)
+                    and isinstance(stored_fire_claim, dict)
+                    and stored_run_claim.get("token")
+                    == stored_fire_claim.get("token")
+                ):
+                    expected_run_claim_token = str(
+                        stored_run_claim.get("token") or ""
+                    )
+                    job = {**job, "run_claim": dict(stored_run_claim)}
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -3536,6 +3627,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         delivery_error = None
+        ownership_lost = False
         try:
             output_file = save_job_output(job["id"], output)
             if verbose:
@@ -3574,6 +3666,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 should_deliver = False
 
             if should_deliver:
+                if expected_run_claim_token and not run_claim_is_owned(
+                    job["id"], expected_token=expected_run_claim_token
+                ):
+                    ownership_lost = True
+                    should_deliver = False
+                    logger.warning(
+                        "Job '%s': suppressing stale result because run_claim "
+                        "ownership changed before delivery",
+                        job.get("name", job["id"]),
+                    )
+
+            if should_deliver:
                 try:
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                 except Exception as de:
@@ -3593,14 +3697,27 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        if ownership_lost:
+            return True
+
+        if expected_run_claim_token and not run_claim_is_owned(
+            job["id"], expected_token=expected_run_claim_token
+        ):
+            logger.warning(
+                "Job '%s': suppressing stale completion because run_claim "
+                "ownership changed",
+                job.get("name", job["id"]),
+            )
+            return True
+
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            _mark_this_dispatch(success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
+            _mark_this_dispatch(False, str(e))
         return False
 
 
@@ -3742,6 +3859,11 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
+                run_claim = job.get("run_claim")
+                if isinstance(run_claim, dict) and run_claim.get("token"):
+                    _running_run_claim_tokens[job_id] = str(
+                        run_claim["token"]
+                    )
             _ctx = contextvars.copy_context()
 
             def _run_and_release(j=job, ctx=_ctx):
@@ -3750,6 +3872,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
+                        _running_run_claim_tokens.pop(j["id"], None)
 
             try:
                 return pool.submit(_run_and_release)
@@ -3759,6 +3882,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 if _interpreter_shutting_down(submit_err):
                     with _running_lock:
                         _running_job_ids.discard(job_id)
+                        _running_run_claim_tokens.pop(job_id, None)
                     logger.warning(
                         "Job '%s' not dispatched — interpreter is shutting down",
                         job.get("name", job_id),
