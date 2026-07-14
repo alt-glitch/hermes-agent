@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, ContextManager
 
@@ -488,6 +489,16 @@ def _restore_cron_job(cron_call: Callable[..., str], snapshot: dict[str, Any]) -
         raise ConfigurationError(f"cron {action} rollback failed: {transition}")
 
 
+def _is_future_timestamp(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        instant = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return instant.tzinfo is not None and instant > datetime.now(timezone.utc)
+
+
 def _normalized_text(value: Any, *, strip_trailing_slash: bool = False) -> str | None:
     """Match the supported cron API normalization for optional strings."""
     if value is None:
@@ -729,6 +740,51 @@ def apply_configuration(
                                 action="resume",
                                 job_id=JOB_ID,
                             )
+                        final_job = copy.deepcopy(cron_read_call(JOB_ID))
+                        if not isinstance(final_job, dict):
+                            raise ConfigurationError(
+                                "cron disappeared after deployment finalization"
+                            )
+                        expected_paused = (
+                            cron_snapshot.get("state") == "paused"
+                            or cron_snapshot.get("enabled") is False
+                        )
+                        if expected_paused:
+                            valid_final_state = (
+                                final_job.get("state") == "paused"
+                                and final_job.get("enabled") is False
+                            )
+                            expected = "paused"
+                        else:
+                            valid_final_state = (
+                                final_job.get("state") == "scheduled"
+                                and final_job.get("enabled") is True
+                                and _is_future_timestamp(final_job.get("next_run_at"))
+                            )
+                            expected = "scheduled with a future run"
+                        if not valid_final_state:
+                            raise ConfigurationError(
+                                f"cron final state is not durably {expected}"
+                            )
+                        # The update response is captured while the deployment
+                        # safety pause is active. Preserve its public API shape,
+                        # but refresh lifecycle fields from durable storage so
+                        # operators do not see a stale paused state after resume.
+                        formatted_job = result.get("job")
+                        if not isinstance(formatted_job, dict):
+                            raise ConfigurationError(
+                                "cron update response omitted its formatted job"
+                            )
+                        result = dict(result)
+                        result["job"] = dict(formatted_job)
+                        for field in (
+                            "enabled",
+                            "state",
+                            "next_run_at",
+                            "paused_at",
+                            "paused_reason",
+                        ):
+                            result["job"][field] = final_job.get(field)
                 except BaseException as exc:
                     if recovering:
                         # The pre-run local state may already be mixed because a

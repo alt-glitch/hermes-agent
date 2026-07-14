@@ -48,13 +48,33 @@ def _stateful_cron(initial: dict) -> tuple[list[dict], dict, object, object]:
         if action == "pause":
             holder["job"].update({"state": "paused", "enabled": False})
         elif action == "resume":
-            holder["job"].update({"state": "scheduled", "enabled": True})
+            holder["job"].update({
+                "state": "scheduled",
+                "enabled": True,
+                "next_run_at": "2099-01-01T00:00:00+00:00",
+            })
         elif action == "update":
             state = holder["job"].get("state", "scheduled")
             enabled = holder["job"].get("enabled", True)
+            next_run_at = holder["job"].get("next_run_at")
             holder["job"] = _persisted_job_from_update(kwargs)
-            holder["job"].update({"state": state, "enabled": enabled})
-        return json.dumps({"success": True, "job": holder["job"]})
+            holder["job"].update({
+                "state": state,
+                "enabled": enabled,
+                "next_run_at": next_run_at,
+            })
+        job = holder["job"]
+        formatted = {
+            "job_id": job["id"],
+            "name": job.get("name"),
+            "prompt_preview": str(job.get("prompt") or "")[:100],
+            "enabled": job.get("enabled", True),
+            "state": job.get("state"),
+            "next_run_at": job.get("next_run_at"),
+            "paused_at": job.get("paused_at"),
+            "paused_reason": job.get("paused_reason"),
+        }
+        return json.dumps({"success": True, "job": formatted})
 
     def read_call(_job_id: str):
         return holder["job"]
@@ -326,6 +346,11 @@ def test_apply_uses_supported_cron_api_after_deploy(
     )
 
     assert result["success"] is True
+    assert result["job"]["job_id"] == configure.JOB_ID
+    assert "prompt" not in result["job"]
+    assert result["job"]["state"] == "scheduled"
+    assert result["job"]["enabled"] is True
+    assert result["job"]["next_run_at"]
     assert [call["action"] for call in calls] == ["pause", "update", "resume"]
     assert calls[1] == configure.cron_update(runtime, hermes_home)
     assert (runtime / "prompts/maintainer.md").read_text() == "policy\n"
@@ -716,6 +741,50 @@ def test_apply_persists_journal_and_pauses_before_first_live_asset_mutation(
     assert [call["action"] for call in calls] == ["pause", "update", "resume"]
     assert calls[1]["script"] == configure.CRON_ENTRYPOINT_NAME
     assert not configure._deployment_journal_path(runtime).exists()
+
+
+@pytest.mark.parametrize(
+    ("broken_state", "broken_enabled", "broken_next_run"),
+    [
+        ("error", True, "2099-01-01T00:00:00+00:00"),
+        ("scheduled", True, None),
+        ("scheduled", True, "not-a-timestamp"),
+        ("scheduled", True, "2020-01-01T00:00:00+00:00"),
+    ],
+)
+def test_apply_rejects_non_runnable_final_cron_state(
+    tmp_path: Path,
+    monkeypatch,
+    broken_state: str,
+    broken_enabled: bool,
+    broken_next_run: str | None,
+) -> None:
+    source, runtime, hermes_home = _deployment_fixture(tmp_path, monkeypatch)
+    calls, holder, stateful_cron, read_cron = _stateful_cron(_active_prior_job())
+
+    def corrupting_cron(**kwargs):
+        response = stateful_cron(**kwargs)
+        if kwargs["action"] == "resume":
+            holder["job"].update({
+                "state": broken_state,
+                "enabled": broken_enabled,
+                "next_run_at": broken_next_run,
+            })
+        return response
+
+    with pytest.raises(
+        configure.ConfigurationError, match="not durably scheduled with a future run"
+    ):
+        configure.apply_configuration(
+            source_home=source,
+            runtime_home=runtime,
+            hermes_home=hermes_home,
+            cron_call=corrupting_cron,
+            cron_snapshot_call=read_cron,
+            cron_read_call=read_cron,
+        )
+
+    assert [call["action"] for call in calls[:3]] == ["pause", "update", "resume"]
 
 
 def test_stale_deployment_journal_is_paused_converged_and_resumed_on_rerun(
