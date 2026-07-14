@@ -626,17 +626,29 @@ function mapSkills(result: unknown): PickerItem[] {
   return items
 }
 
+/** Lightweight OpenTUI model-options request. The gateway defaults stay fully
+ * enriched for desktop/Ink callers; this picker does not consume pricing or
+ * capability fields and passive hydration must not probe a live custom endpoint. */
+export function modelOptionsParams(sessionId: string | undefined, refresh = false): Record<string, unknown> {
+  return {
+    capabilities: false,
+    pricing: false,
+    probe_current_custom_provider: false,
+    session_id: sessionId,
+    ...(refresh ? { refresh: true } : {})
+  }
+}
+
 /** Re-fetch `model.options` and update the cached picker rows. Resolves with
  *  the fresh rows (the open picker swaps them in live — Ctrl+R, picker v2.1);
  *  rejections are the CALLER's to handle (background callers fire-and-forget). */
-function refreshModelItems(ctx: SlashContext, refresh = false): Promise<PickerItem[]> {
-  return ctx
-    .request('model.options', { session_id: ctx.sessionId(), ...(refresh ? { refresh: true } : {}) })
-    .then(opts => {
-      const items = mapModelOptions(opts)
-      if (items.length) ctx.setModelItems(items)
-      return items
-    })
+function refreshModelItems(ctx: SlashContext, refresh = false, sessionId = ctx.sessionId()): Promise<PickerItem[]> {
+  return ctx.request('model.options', modelOptionsParams(sessionId, refresh)).then(opts => {
+    if (ctx.sessionId() !== sessionId) return []
+    const items = mapModelOptions(opts)
+    if (items.length) ctx.setModelItems(items)
+    return items
+  })
 }
 
 /**
@@ -647,10 +659,10 @@ function refreshModelItems(ctx: SlashContext, refresh = false): Promise<PickerIt
  * carries only the PickerState basics; the seam keeps the overlay generic for
  * the upcoming resume-session picker (register a `session.list` re-fetch).
  */
-let activePickerRefresh: (() => Promise<PickerItem[]>) | undefined
+let activePickerRefresh: ((force?: boolean) => Promise<PickerItem[]>) | undefined
 
 /** Register (or clear, with `undefined`) the open picker's catalog re-fetch. */
-export function registerPickerRefresh(fn: (() => Promise<PickerItem[]>) | undefined): void {
+export function registerPickerRefresh(fn: ((force?: boolean) => Promise<PickerItem[]>) | undefined): void {
   activePickerRefresh = fn
 }
 
@@ -660,8 +672,8 @@ export function canRefreshPicker(): boolean {
 }
 
 /** Run the registered catalog re-fetch; undefined when none is registered. */
-export function runPickerRefresh(): Promise<PickerItem[]> | undefined {
-  return activePickerRefresh?.()
+export function runPickerRefresh(force = true): Promise<PickerItem[]> | undefined {
+  return activePickerRefresh?.(force)
 }
 
 /**
@@ -686,11 +698,10 @@ export function pickerTabs(items: readonly PickerItem[]): string[] {
 
 /**
  * The bootstrap `model.options` prefetch seam (perf: prefetch dedupe). The
- * entry stashes its in-flight prefetch promise here; a bare `/model` that
- * finds the cache empty AWAITS it (bounded by `waitMs`) and re-checks the
- * cache instead of issuing a second concurrent `model.options` RPC. A hung
- * prefetch only delays the picker by the bound — `/model` then opens via its
- * own fetch as before.
+ * entry stashes its in-flight prefetch promise here. A cold `/model` mounts
+ * its loading shell immediately; mounted hydration then awaits this promise
+ * (bounded by `waitMs`) before falling back to one model.options RPC. A hung
+ * prefetch delays only row hydration, never the overlay's first frame.
  */
 let modelPrefetch: { promise: Promise<unknown>; sessionId: string; waitMs: number } | undefined
 
@@ -785,8 +796,8 @@ async function switchModel(
 /** `/model` — bare opens the model picker; `/model <name>` switches directly.
  *  Opens from the CACHED catalog when present — zero RPCs, same-frame paint
  *  (Epic 7; the catalog is prefetched at bootstrap and refreshed on switch).
- *  An empty cache first awaits the in-flight bootstrap prefetch (bounded) so
- *  an early `/model` never doubles the slow `model.options` RPC. */
+ *  An empty cache mounts a loading shell first; its hydration then awaits the
+ *  in-flight prefetch (bounded) so an early `/model` never doubles the RPC. */
 const modelCmd: ClientHandler = async (arg, ctx) => {
   const setupValue = '__hermes_add_custom_model__'
   const setupItem: PickerItem = {
@@ -797,11 +808,24 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
     value: setupValue
   }
   const withSetup = (items: PickerItem[]) => [...items, setupItem]
-  const open = (items: PickerItem[]) => {
-    registerPickerRefresh(async () => withSetup(await refreshModelItems(ctx, true)))
+  const open = (items: PickerItem[], initialRefresh = false) => {
+    const sessionId = ctx.sessionId()
+    registerPickerRefresh(async (force = true) => {
+      if (!force) {
+        await awaitModelPrefetch(sessionId)
+        if (ctx.sessionId() !== sessionId) return []
+        const hydrated = ctx.modelItems()
+        if (hydrated?.length) return withSetup(hydrated)
+      }
+      return withSetup(await refreshModelItems(ctx, force, sessionId))
+    })
     registerPickerTabs(buildModelTabs)
     ctx.openPicker({
-      items: withSetup(items),
+      errorLabel: 'Could not load models',
+      initialRefresh,
+      initialTab: 'all',
+      items: initialRefresh ? [] : withSetup(items),
+      loadingLabel: 'Loading models…',
       onPick: name => {
         if (name === setupValue) {
           if (ctx.openCustomModelSetup) {
@@ -836,15 +860,9 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
     open(cached)
     return
   }
-  await awaitModelPrefetch(ctx.sessionId())
-  const prefetched = ctx.modelItems()
-  if (prefetched?.length) {
-    open(prefetched)
-    return
-  }
-  const items = mapModelOptions(await ctx.request('model.options', { session_id: ctx.sessionId() }))
-  ctx.setModelItems(items)
-  open(items)
+  // Paint the complete picker shell now. Mount-time hydration reuses the
+  // in-flight prefetch and only falls back to one model.options RPC.
+  open([], true)
 }
 
 /** `/skills` — open the skills hub; picking a skill shows its info in the pager. */

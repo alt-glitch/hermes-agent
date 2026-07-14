@@ -22,6 +22,7 @@ import {
   HISTORY_MAX_PAGER_CHARS,
   HISTORY_MAX_PREVIEW,
   mapModelOptions,
+  modelOptionsParams,
   mapCompletions,
   parseSlash,
   pickerTabs,
@@ -1209,9 +1210,11 @@ describe('dispatchSlash — client commands', () => {
     await dispatchSlash('/model', p.ctx)
     expect(p.pickers).toHaveLength(1)
     expect(p.pickers[0]!.title).toBe('Switch model')
+    expect(p.pickers[0]).toMatchObject({ initialRefresh: true, initialTab: 'all', items: [] })
+    const hydrated = await runPickerRefresh(false)
     // authenticated providers' models are the SELECTABLE rows; values carry the
     // explicit provider so a pick under a different provider switches both.
-    const selectable = p.pickers[0]!.items.filter(i => !i.unavailable)
+    const selectable = hydrated!.filter(i => !i.unavailable)
     expect(selectable.map(i => i.value)).toEqual([
       'claude-sonnet-4.6 --provider anthropic',
       'claude-opus-4.6 --provider anthropic',
@@ -1248,7 +1251,7 @@ describe('dispatchSlash — client commands', () => {
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : {}))
     p.modelCache.value = [{ label: 'stale', value: 'stale' }]
     await dispatchSlash('/model --refresh', p.ctx)
-    expect(p.calls).toEqual([{ method: 'model.options', params: { refresh: true, session_id: 'sid-1' } }])
+    expect(p.calls).toEqual([{ method: 'model.options', params: modelOptionsParams('sid-1', true) }])
     expect(p.calls.some(call => call.method === 'config.set')).toBe(false)
     expect(p.pickers).toHaveLength(1)
     expect(p.pickers[0]?.items.some(item => item.label === 'claude-sonnet-4.6')).toBe(true)
@@ -1257,7 +1260,8 @@ describe('dispatchSlash — client commands', () => {
   test('/model maps UNCONFIGURED providers to dimmed hint rows (key_env → env-var hint, else warning)', async () => {
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     await dispatchSlash('/model', p.ctx)
-    const unavailable = p.pickers[0]!.items.filter(i => i.unavailable)
+    const hydrated = await runPickerRefresh(false)
+    const unavailable = hydrated!.filter(i => i.unavailable)
     expect(unavailable).toHaveLength(2)
     // api_key provider → the `no API key — set <ENV_VAR>` hint as the row label
     expect(unavailable[0]).toEqual({
@@ -1271,7 +1275,7 @@ describe('dispatchSlash — client commands', () => {
     expect(unavailable[1]!.group).toBe('OpenAI Codex')
     expect(unavailable[1]!.label).toBe('run `hermes model` to configure (oauth_external)')
     // payload (canonical) order is preserved — unconfigured rows interleave
-    expect(p.pickers[0]!.items.map(i => i.group)).toEqual([
+    expect(hydrated!.map(i => i.group)).toEqual([
       'Anthropic',
       'Anthropic',
       'OpenAI API',
@@ -1287,21 +1291,17 @@ describe('dispatchSlash — client commands', () => {
     }))
     await dispatchSlash('/model', p.ctx)
     expect(p.pickers).toHaveLength(1)
-    expect(p.pickers[0]?.items.filter(item => !item.unavailable).map(item => item.label)).toEqual([
-      'Add a local/custom model…'
-    ])
+    const hydrated = await runPickerRefresh(false)
+    expect(hydrated!.filter(item => !item.unavailable).map(item => item.label)).toEqual(['Add a local/custom model…'])
   })
 
   test('/model registers the picker refresh seam; running it does ONE RPC and re-syncs the cache', async () => {
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     await dispatchSlash('/model', p.ctx)
-    const opened = p.calls.filter(c => c.method === 'model.options').length // 1 (uncached open)
+    const opened = p.calls.filter(c => c.method === 'model.options').length // 0: shell opens before hydration
     const refreshed = await runPickerRefresh()
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(opened + 1)
-    expect(p.calls.filter(c => c.method === 'model.options').at(-1)?.params).toEqual({
-      refresh: true,
-      session_id: 'sid-1'
-    })
+    expect(p.calls.filter(c => c.method === 'model.options').at(-1)?.params).toEqual(modelOptionsParams('sid-1', true))
     expect(refreshed!.filter(i => !i.unavailable)).toHaveLength(4)
     expect(refreshed?.at(-1)?.label).toBe('Add a local/custom model…')
     expect(p.modelCache.value).toHaveLength(5) // canonical inventory cache stays free of action rows
@@ -1336,12 +1336,15 @@ describe('dispatchSlash — client commands', () => {
     expect(p.pickers).toHaveLength(1)
     expect(p.pickers[0]!.items).toHaveLength(3)
     expect(p.pickers[0]!.items.at(-1)?.label).toBe('Add a local/custom model…')
+    expect(p.pickers[0]).toMatchObject({ initialRefresh: false, initialTab: 'all' })
     expect(p.calls).toHaveLength(0) // the whole point: open = memory, not network
   })
 
-  test('/model uncached fetches ONCE, caches, and a pick refreshes the cache', async () => {
+  test('/model uncached opens immediately, hydrates once, caches, and refreshes after pick', async () => {
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     await dispatchSlash('/model', p.ctx)
+    expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(0)
+    await runPickerRefresh(false)
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(1)
     expect(p.modelCache.value).toHaveLength(5) // first open seeded the cache (3 models + 2 unconfigured hints)
     // cross-provider pick: switch lands on the gateway, then a background
@@ -1422,8 +1425,9 @@ describe('dispatchSlash — client commands', () => {
   test('/model registers the provider-tab seam (buildModelTabs); /skills clears it back to stripless', async () => {
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     await dispatchSlash('/model', p.ctx)
+    const hydrated = await runPickerRefresh(false)
     // the open picker derives Nous-first tabs through the seam
-    expect(pickerTabs(p.pickers[0]!.items)).toEqual(['Nous Research', 'Anthropic', 'Local & custom'])
+    expect(pickerTabs(hydrated!)).toEqual(['Nous Research', 'Anthropic', 'Local & custom'])
     const p2 = makeCtx(async () => ({ skills: { General: ['memory'] } }))
     await dispatchSlash('/skills', p2.ctx)
     expect(pickerTabs(p.pickers[0]!.items)).toEqual([])
@@ -1446,11 +1450,13 @@ describe('dispatchSlash — client commands', () => {
       5000
     )
     expect(started).toBeUndefined() // session setup never receives a promise to await
-    const dispatched = dispatchSlash('/model', p.ctx)
+    await dispatchSlash('/model', p.ctx)
+    expect(p.pickers).toHaveLength(1) // shell opens before the prefetch resolves
+    expect(p.pickers[0]).toMatchObject({ initialRefresh: true, items: [] })
+    const hydration = runPickerRefresh(false)
     finish([{ group: 'Anthropic', haystacks: ['anthropic'], label: 'claude-sonnet-4.6', value: 'a' }])
-    await dispatched
-    expect(p.pickers).toHaveLength(1) // opened from the prefetched cache
-    expect(p.pickers[0]!.items).toHaveLength(2)
+    const hydrated = await hydration
+    expect(hydrated).toHaveLength(2)
     expect(p.calls).toHaveLength(0) // the dedupe: no second model.options
   })
 
@@ -1458,7 +1464,9 @@ describe('dispatchSlash — client commands', () => {
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'switched-model' }))
     registerModelPrefetch(p.session.value!, new Promise(() => {}), 10) // never settles; tiny test bound
     await dispatchSlash('/model', p.ctx)
-    expect(p.pickers).toHaveLength(1) // fell back to fetching itself
+    expect(p.pickers).toHaveLength(1) // shell is visible while the bound elapses
+    expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(0)
+    await runPickerRefresh(false)
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(1)
   })
 
@@ -1467,6 +1475,8 @@ describe('dispatchSlash — client commands', () => {
     startModelPrefetch(p.session.value!, Promise.reject(new Error('background hydration failed')), () => {})
     await dispatchSlash('/model', p.ctx)
     expect(p.pickers).toHaveLength(1)
+    expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(0)
+    await runPickerRefresh(false)
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(1)
   })
 
@@ -1478,7 +1488,25 @@ describe('dispatchSlash — client commands', () => {
     await dispatchSlash('/model', p.ctx)
 
     expect(p.pickers).toHaveLength(1)
+    expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(0)
+    await runPickerRefresh(false)
     expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(1)
+  })
+
+  test('/model discards a late hydration response after the session changes', async () => {
+    let resolveOptions: (value: unknown) => void = () => {}
+    const p = makeCtx(
+      () =>
+        new Promise(resolve => {
+          resolveOptions = resolve
+        })
+    )
+    await dispatchSlash('/model', p.ctx)
+    const hydration = runPickerRefresh(false)
+    p.session.value = 'sid-new'
+    resolveOptions(MODEL_OPTIONS)
+    await expect(hydration).resolves.toEqual([])
+    expect(p.modelCache.value).toBeUndefined()
   })
 
   test('client slash RPC failures resolve with a user-visible error', async () => {

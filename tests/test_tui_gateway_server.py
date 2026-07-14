@@ -7121,6 +7121,23 @@ def test_model_options_hides_unconfigured_providers_by_default(monkeypatch):
     assert "result" in resp, resp
     assert calls[-1]["explicit_only"] is False
     assert calls[-1]["include_unconfigured"] is False
+    assert calls[-1]["pricing"] is True
+    assert calls[-1]["capabilities"] is True
+    assert calls[-1]["probe_current_custom_provider"] is True
+
+    resp = server._methods["model.options"](
+        102,
+        {
+            "session_id": "",
+            "pricing": False,
+            "capabilities": False,
+            "probe_current_custom_provider": False,
+        },
+    )
+    assert "result" in resp, resp
+    assert calls[-1]["pricing"] is False
+    assert calls[-1]["capabilities"] is False
+    assert calls[-1]["probe_current_custom_provider"] is False
 
     resp = server._methods["model.options"](
         100,

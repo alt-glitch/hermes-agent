@@ -293,6 +293,10 @@ export function App(props: AppProps) {
                         <Picker
                           title={p().title}
                           items={p().items}
+                          errorLabel={p().errorLabel ?? 'Could not load options'}
+                          initialRefresh={p().initialRefresh === true}
+                          initialTab={p().initialTab ?? 'current'}
+                          loadingLabel={p().loadingLabel ?? 'Loading…'}
                           onPick={value => {
                             p().onPick(value)
                             closePicker()

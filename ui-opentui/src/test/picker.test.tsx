@@ -56,13 +56,29 @@ interface Harness {
   closed: { value: boolean }
 }
 
-async function mountPicker(items: PickerItem[] = ITEMS): Promise<Harness> {
+interface MountPickerOptions {
+  errorLabel?: string
+  initialRefresh?: boolean
+  initialTab?: 'all' | 'current'
+  loadingLabel?: string
+}
+
+async function mountPicker(items: PickerItem[] = ITEMS, options: MountPickerOptions = {}): Promise<Harness> {
   const picked: string[] = []
   const closed = { value: false }
   const probe = await renderProbe(
     () => (
       <ThemeProvider theme={() => DEFAULT_THEME}>
-        <Picker title="Switch model" items={items} onPick={v => picked.push(v)} onClose={() => (closed.value = true)} />
+        <Picker
+          title="Switch model"
+          items={items}
+          errorLabel={options.errorLabel ?? 'Could not load models'}
+          initialRefresh={options.initialRefresh === true}
+          initialTab={options.initialTab ?? 'current'}
+          loadingLabel={options.loadingLabel ?? 'Loading…'}
+          onPick={v => picked.push(v)}
+          onClose={() => (closed.value = true)}
+        />
       </ThemeProvider>
     ),
     // kitty keyboard so a SIMULATED lone Esc parses (see lib/render.ts)
@@ -86,6 +102,58 @@ describe('Picker — grouped render', () => {
     } finally {
       h.probe.destroy()
     }
+  })
+})
+
+describe('Picker — optimistic model hydration', () => {
+  test('mounts a loading shell immediately, then swaps hydrated rows into the All page', async () => {
+    let resolveLoad: (items: PickerItem[]) => void = () => {}
+    registerPickerTabs(buildModelTabs)
+    registerPickerRefresh(() => new Promise(resolve => (resolveLoad = resolve)))
+    const h = await mountPicker([], { initialRefresh: true, initialTab: 'all', loadingLabel: 'Loading models…' })
+    try {
+      expect(h.probe.frame()).toContain('Loading models…')
+      resolveLoad(ITEMS)
+      await h.probe.settle()
+      const frame = await h.probe.waitForFrame(value => value.includes('hermes-4-405b'))
+      expect(stripLine(frame)).toContain('[ All ]')
+      expect(frame).toContain('claude-sonnet-4 ✓')
+      expect(frame).toContain('gpt-5')
+      expect(frame).not.toContain('Loading models…')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('shows a retryable error, then Ctrl+R recovers in place', async () => {
+    let calls = 0
+    registerPickerRefresh(() => {
+      calls += 1
+      return calls === 1 ? Promise.reject(new Error('offline')) : Promise.resolve(ITEMS)
+    })
+    const h = await mountPicker([], { initialRefresh: true, loadingLabel: 'Loading models…' })
+    try {
+      const frame = await h.probe.waitForFrame(value => value.includes('Could not load models'))
+      expect(frame).toContain('Ctrl+R retry')
+      expect(frame).not.toContain('(no matches)')
+      h.probe.keys.pressKey('r', { ctrl: true })
+      await h.probe.settle()
+      const recovered = await h.probe.waitForFrame(value => value.includes('hermes-4-405b'))
+      expect(recovered).not.toContain('Could not load models')
+      expect(calls).toBe(2)
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('ignores a late hydration result after the picker unmounts', async () => {
+    let resolveLoad: (items: PickerItem[]) => void = () => {}
+    registerPickerRefresh(() => new Promise(resolve => (resolveLoad = resolve)))
+    const h = await mountPicker([], { initialRefresh: true })
+    h.probe.destroy()
+    resolveLoad(ITEMS)
+    await Promise.resolve()
+    await Promise.resolve()
   })
 })
 

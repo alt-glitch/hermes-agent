@@ -222,6 +222,15 @@ export interface PickerState {
   title: string
   items: PickerItem[]
   onPick: (value: string) => void
+  /** Start the tabbed picker on its combined All page instead of the current
+   *  item's group. */
+  initialTab?: 'all' | 'current'
+  /** Mount immediately, then hydrate rows through the registered refresh seam. */
+  initialRefresh?: boolean
+  /** Empty-state copy while initial hydration is in flight. */
+  loadingLabel?: string
+  /** Retryable failure copy after initial hydration fails. */
+  errorLabel?: string
 }
 
 export interface CustomModelSetupState {

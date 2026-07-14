@@ -117,6 +117,7 @@ import {
   dispatchSlash,
   mapCompletions,
   mapModelOptions,
+  modelOptionsParams,
   planCompletion,
   readReplaceFrom,
   startModelPrefetch,
@@ -317,10 +318,10 @@ const scheduleStartupCatalogRetry = (
  * Post-session setup, shared by every way a session comes to exist (create,
  * boot resume, boot-picker pick): the tools/skills/MCP catalog for the home
  * panel (item 9 — best-effort), the optional initial prompt, and the `/model`
- * catalog prefetch (Epic 7 instant open: `model.options` is the slow RPC —
- * network pricing fetch + Nous tier check — so pay it ONCE in an already-
- * forked fiber; the promise is STASHED in the slash seam so an early `/model`
- * awaits THIS request instead of doubling it). The prefetch must remain
+ * catalog prefetch (Epic 7 instant open: rich `model.options` can be slow,
+ * so OpenTUI requests its lightweight shape once in an already-
+ * forked fiber; the promise is STASHED in the slash seam so a cold `/model`
+ * paints its shell first, then awaits THIS request instead of doubling it). The prefetch must remain
  * background work: awaiting it here holds the session-transition input lock.
  */
 const postSessionSetup = (
@@ -344,7 +345,7 @@ const postSessionSetup = (
       sid,
       Effect.runPromise(
         gateway
-          .request<unknown>('model.options', { session_id: sid })
+          .request<unknown>('model.options', modelOptionsParams(sid))
           .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
       ),
       modelOpts => {
@@ -2251,7 +2252,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         if (gateway.sessionId() !== sessionId) return []
         const hydrated = store.state.modelItems
         if (hydrated?.length) return hydrated
-        const raw = await Effect.runPromise(gateway.request('model.options', { session_id: sessionId }))
+        const raw = await Effect.runPromise(gateway.request('model.options', modelOptionsParams(sessionId)))
         if (gateway.sessionId() !== sessionId) return []
         const items = mapModelOptions(raw)
         if (items.length) store.setModelItems(items)

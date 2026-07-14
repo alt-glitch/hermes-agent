@@ -14145,17 +14145,20 @@ def _(rid, params: dict) -> dict:
         # Curated model lists are preserved — list_authenticated_providers
         # populates `models` from the curated catalog, not provider_model_ids
         # (which would pull non-agentic models like TTS/embeddings/etc.).
+        refresh = bool(params.get("refresh"))
         payload = build_models_payload(
             ctx,
             explicit_only=bool(params.get("explicit_only")),
             include_unconfigured=bool(params.get("include_unconfigured")),
             picker_hints=True,
             canonical_order=True,
-            pricing=True,
-            capabilities=True,
-            refresh=bool(params.get("refresh")),
-            probe_custom_providers=bool(params.get("refresh")),
-            probe_current_custom_provider=not bool(params.get("refresh")),
+            pricing=bool(params.get("pricing", True)),
+            capabilities=bool(params.get("capabilities", True)),
+            refresh=refresh,
+            probe_custom_providers=refresh,
+            probe_current_custom_provider=bool(
+                params.get("probe_current_custom_provider", not refresh)
+            ),
         )
         db = _get_db()
         if db is not None:

@@ -36,7 +36,7 @@
  */
 import type { BoxRenderable, InputRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
-import { createEffect, createMemo, createSignal, For, on, Show } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
 import { buildPickerRows, fuzzyFilter, visibleRows, type FuzzyField } from '../../logic/fuzzy.ts'
 import { canRefreshPicker, pickerTabs, runPickerRefresh } from '../../logic/slash.ts'
@@ -93,6 +93,10 @@ export function TabChips(props: { labels: string[]; active: number }) {
 export function Picker(props: {
   title: string
   items: PickerItem[]
+  errorLabel?: string
+  initialRefresh?: boolean
+  initialTab?: 'all' | 'current'
+  loadingLabel?: string
   onPick: (value: string) => void
   onClose: () => void
 }) {
@@ -113,6 +117,8 @@ export function Picker(props: {
   // Ctrl+R live-refreshed rows override the (static) opener snapshot.
   const [live, setLive] = createSignal<PickerItem[] | undefined>(undefined)
   const [refreshing, setRefreshing] = createSignal(false)
+  const [initialPending, setInitialPending] = createSignal(props.initialRefresh === true)
+  const [refreshFailed, setRefreshFailed] = createSignal(false)
   const items = () => live() ?? props.items
 
   // ── provider tabs (v2.2) ────────────────────────────────────────────────
@@ -122,6 +128,7 @@ export function Picker(props: {
   // Open lands on the CURRENT (✓) item's provider tab; All when it has none.
   const [activeTab, setActiveTab] = createSignal<string | undefined>(
     (() => {
+      if (props.initialTab === 'all') return undefined
       const cur = props.items.find(it => it.current)?.group
       return cur !== undefined && pickerTabs(props.items).includes(cur) ? cur : undefined
     })()
@@ -160,7 +167,20 @@ export function Picker(props: {
       grouped().flat.findIndex(it => it.current)
     )
   )
-  createEffect(on([query, showAll, live], () => setSel(0), { defer: true }))
+  createEffect(on([query, showAll], () => setSel(0), { defer: true }))
+  createEffect(
+    on(
+      live,
+      () =>
+        setSel(
+          Math.max(
+            0,
+            grouped().flat.findIndex(it => it.current)
+          )
+        ),
+      { defer: true }
+    )
+  )
 
   /** Cycle the chip strip (Tab/Shift+Tab; ←/→ on an empty query): provider
    *  tabs in registered order, then the trailing All, wrapping both ways. */
@@ -184,18 +204,34 @@ export function Picker(props: {
   }
 
   /** Ctrl+R: run the opener-registered catalog re-fetch, swap the rows in live. */
-  const refresh = () => {
+  let disposed = false
+  onCleanup(() => {
+    disposed = true
+  })
+
+  const refresh = (force = true) => {
     if (refreshing()) return
-    const pending = runPickerRefresh()
+    const pending = runPickerRefresh(force)
     if (!pending) return
     setRefreshing(true)
+    setRefreshFailed(false)
     pending
       .then(fresh => {
-        if (fresh.length) setLive(fresh)
+        if (!disposed && fresh.length) setLive(fresh)
       })
-      .catch(() => {})
-      .finally(() => setRefreshing(false))
+      .catch(() => {
+        if (!disposed) setRefreshFailed(true)
+      })
+      .finally(() => {
+        if (disposed) return
+        setRefreshing(false)
+        setInitialPending(false)
+      })
   }
+
+  onMount(() => {
+    if (props.initialRefresh) refresh(false)
+  })
 
   useKeyboard(key => {
     // Esc/Ctrl+C also close via the keymap layer above; handling them here too
@@ -239,7 +275,7 @@ export function Picker(props: {
     }
     if (key.ctrl && key.name === 'r') {
       key.preventDefault()
-      refresh()
+      refresh(true)
       return
     }
     // everything else (printables, backspace, word-delete, home/end…) belongs
@@ -271,7 +307,7 @@ export function Picker(props: {
           focusedBackgroundColor="transparent"
           style={{ flexGrow: 1, minWidth: 0 }}
         />
-        <Show when={refreshing()}>
+        <Show when={refreshing() && !initialPending()}>
           <text fg={theme().color.muted}>refreshing…</text>
         </Show>
       </box>
@@ -313,7 +349,13 @@ export function Picker(props: {
         }
       </For>
       <Show when={filtered().length === 0}>
-        <text fg={theme().color.muted}> (no matches)</text>
+        <text fg={refreshFailed() ? theme().color.error : theme().color.muted}>
+          {initialPending()
+            ? ` ${props.loadingLabel || 'Loading…'}`
+            : refreshFailed()
+              ? ` ${props.errorLabel || 'Could not load options'} · Ctrl+R retry`
+              : ' (no matches)'}
+        </text>
       </Show>
       <Show when={win().below > 0}>
         <text fg={theme().color.muted}>{`  ↓ ${win().below} more`}</text>
