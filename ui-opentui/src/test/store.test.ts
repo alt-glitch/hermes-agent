@@ -6,6 +6,7 @@
  */
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
+import { approvalChoices } from '../logic/approval.ts'
 import { DEFAULT_THEME } from '../logic/theme.ts'
 import { createSessionStore, startupCatalogRetryDelay, type Message } from '../logic/store.ts'
 
@@ -630,6 +631,33 @@ describe('session store — blocking prompts (Phase 3)', () => {
     expect(store.state.prompt).toMatchObject({ kind: 'approval', allowPermanent: false })
   })
 
+  test('approval.request scopes smart-denied prompts to exactly once and deny', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'approval.request',
+      payload: {
+        allow_permanent: true,
+        command: 'rm -rf /',
+        description: 'smart deny override',
+        smart_denied: true
+      }
+    })
+    const prompt = store.state.prompt
+    expect(prompt?.kind).toBe('approval')
+    if (prompt?.kind === 'approval') expect(approvalChoices(prompt.allowPermanent)).toEqual(['once', 'deny'])
+  })
+
+  test('approval.request keeps explicit server choices authoritative', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'approval.request',
+      payload: { choices: ['once', 'deny'], command: 'rm -rf /', description: 'restricted' }
+    })
+    const prompt = store.state.prompt
+    expect(prompt?.kind).toBe('approval')
+    if (prompt?.kind === 'approval') expect(approvalChoices(prompt.allowPermanent)).toEqual(['once', 'deny'])
+  })
+
   test('clarify.request carries question + choices + request_id', () => {
     const store = createSessionStore()
     store.apply({ type: 'clarify.request', payload: { question: 'Which?', choices: ['a', 'b'], request_id: 'r1' } })
@@ -651,6 +679,22 @@ describe('session store — blocking prompts (Phase 3)', () => {
     expect(store.state.prompt).toMatchObject({ kind: 'sudo', requestId: 's1' })
     store.apply({ type: 'secret.request', payload: { env_var: 'API_KEY', prompt: 'Enter key', request_id: 's2' } })
     expect(store.state.prompt).toMatchObject({ kind: 'secret', envVar: 'API_KEY', requestId: 's2' })
+  })
+
+  test('sensitive expiry clears only the matching active prompt', () => {
+    const store = createSessionStore()
+
+    store.apply({ type: 'secret.request', payload: { env_var: 'NEW_KEY', prompt: 'Enter key', request_id: 'new' } })
+    store.apply({ type: 'secret.expire', payload: { request_id: 'old' } })
+    expect(store.state.prompt).toMatchObject({ kind: 'secret', requestId: 'new' })
+    store.apply({ type: 'secret.expire', payload: { request_id: 'new' } })
+    expect(store.state.prompt).toBeUndefined()
+
+    store.apply({ type: 'sudo.request', payload: { request_id: 'sudo-new' } })
+    store.apply({ type: 'sudo.expire', payload: { request_id: 'sudo-old' } })
+    expect(store.state.prompt).toMatchObject({ kind: 'sudo', requestId: 'sudo-new' })
+    store.apply({ type: 'sudo.expire', payload: { request_id: 'sudo-new' } })
+    expect(store.state.prompt).toBeUndefined()
   })
 })
 

@@ -72,6 +72,7 @@ import {
   normalizeTerminalStatus,
   type SubagentStatus
 } from './subagentTree.ts'
+import { approvalPolicy, type ApprovalChoicePolicy } from './approval.ts'
 
 /** A tool call inside an assistant turn (matched start↔complete by `id`=tool_id). */
 export interface ToolPartState {
@@ -183,7 +184,7 @@ export type ConfirmRequest = string | ConfirmSpec
  */
 export type ActivePrompt =
   | { kind: 'clarify'; question: string; choices: string[] | null; requestId: string }
-  | { kind: 'approval'; allowPermanent: boolean; command: string; description: string }
+  | { kind: 'approval'; allowPermanent: ApprovalChoicePolicy; command: string; description: string }
   | { kind: 'sudo'; requestId: string }
   | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
@@ -2532,9 +2533,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
       case 'approval.request':
         setState('prompt', {
           kind: 'approval',
-          // Only an explicit false removes the permanent option. Older gateway
-          // versions omit the field and retain the historical default.
-          allowPermanent: event.payload.allow_permanent !== false,
+          // Explicit choices are authoritative. smart_denied is the additive
+          // fallback for gateways that send the marker without choices; older
+          // gateways retain the historical allow_permanent-derived catalog.
+          allowPermanent: approvalPolicy({
+            ...(event.payload.allow_permanent === undefined ? {} : { allowPermanent: event.payload.allow_permanent }),
+            ...(event.payload.choices === undefined ? {} : { choices: event.payload.choices }),
+            ...(event.payload.smart_denied === undefined ? {} : { smartDenied: event.payload.smart_denied })
+          }),
           command: event.payload.command,
           description: event.payload.description
         })
@@ -2549,6 +2555,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
           prompt: event.payload.prompt,
           requestId: event.payload.request_id
         })
+        break
+      case 'sudo.expire':
+        if (state.prompt?.kind === 'sudo' && state.prompt.requestId === event.payload.request_id) clearPrompt()
+        break
+      case 'secret.expire':
+        if (state.prompt?.kind === 'secret' && state.prompt.requestId === event.payload.request_id) clearPrompt()
         break
       // ── subagents (agents dashboard) — track the delegation tree by id ──
       case 'subagent.spawn_requested':

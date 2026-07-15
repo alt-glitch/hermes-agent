@@ -150,7 +150,13 @@ const ClarifyRequest = Schema.Struct({
 const ApprovalRequest = Schema.Struct({
   type: Schema.Literal('approval.request'),
   session_id: opt(Str),
-  payload: Schema.Struct({ allow_permanent: opt(Schema.Boolean), command: Str, description: Str })
+  payload: Schema.Struct({
+    allow_permanent: opt(Schema.Boolean),
+    choices: opt(Schema.Array(Str)),
+    command: Str,
+    description: Str,
+    smart_denied: opt(Schema.Boolean)
+  })
 })
 const SudoRequest = Schema.Struct({
   type: Schema.Literal('sudo.request'),
@@ -162,6 +168,12 @@ const SecretRequest = Schema.Struct({
   session_id: opt(Str),
   payload: Schema.Struct({ env_var: Str, prompt: Str, request_id: Str })
 })
+const SensitivePromptExpiryShape = {
+  session_id: opt(Str),
+  payload: Schema.Struct({ request_id: Str })
+}
+const SudoExpire = Schema.Struct({ type: Schema.Literal('sudo.expire'), ...SensitivePromptExpiryShape })
+const SecretExpire = Schema.Struct({ type: Schema.Literal('secret.expire'), ...SensitivePromptExpiryShape })
 
 // chrome / agent
 const StatusUpdate = Schema.Struct({
@@ -280,6 +292,8 @@ export const GatewayEventSchema = Schema.Union([
   ApprovalRequest,
   SudoRequest,
   SecretRequest,
+  SudoExpire,
+  SecretExpire,
   StatusUpdate,
   NotificationShow,
   NotificationClear,

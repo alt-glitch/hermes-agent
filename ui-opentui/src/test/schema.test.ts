@@ -45,13 +45,20 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
-  test('decodes the 4 blocking prompt requests', () => {
+  test('decodes blocking prompt requests and sensitive expiry events', () => {
     expect(Option.isSome(decode({ type: 'clarify.request', payload: { question: '?', request_id: 'r' } }))).toBe(true)
     expect(Option.isSome(decode({ type: 'approval.request', payload: { command: 'rm', description: 'd' } }))).toBe(true)
     expect(Option.isSome(decode({ type: 'sudo.request', payload: { request_id: 'r' } }))).toBe(true)
     expect(
       Option.isSome(decode({ type: 'secret.request', payload: { env_var: 'X', prompt: 'p', request_id: 'r' } }))
     ).toBe(true)
+    for (const type of ['sudo.expire', 'secret.expire'] as const) {
+      const ev = decode({ type, payload: { request_id: `${type}-1` } })
+      expect(Option.isSome(ev)).toBe(true)
+      if (Option.isSome(ev) && (ev.value.type === 'sudo.expire' || ev.value.type === 'secret.expire')) {
+        expect(ev.value.payload.request_id).toBe(`${type}-1`)
+      }
+    }
   })
 
   test('preserves an explicit approval allow_permanent=false', () => {
@@ -62,6 +69,23 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     expect(Option.isSome(ev)).toBe(true)
     if (Option.isSome(ev) && ev.value.type === 'approval.request') {
       expect(ev.value.payload.allow_permanent).toBe(false)
+    }
+  })
+
+  test('preserves server-authoritative approval choices and smart-denied scope', () => {
+    const ev = decode({
+      type: 'approval.request',
+      payload: {
+        choices: ['once', 'deny'],
+        command: 'rm -rf /',
+        description: 'smart deny override',
+        smart_denied: true
+      }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'approval.request') {
+      expect(ev.value.payload.choices).toEqual(['once', 'deny'])
+      expect(ev.value.payload.smart_denied).toBe(true)
     }
   })
 

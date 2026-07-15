@@ -6,7 +6,7 @@
  */
 import type { BoxRenderable } from '@opentui/core'
 
-import { approvalChoices, type ApprovalChoice } from '../../logic/approval.ts'
+import { approvalChoices, type ApprovalChoice, type ApprovalChoicePolicy } from '../../logic/approval.ts'
 import { useCloseLayer } from '../keymap.tsx'
 import { useTheme } from '../theme.tsx'
 
@@ -17,12 +17,12 @@ const COPY: Record<ApprovalChoice, { description: string; name: string }> = {
   deny: { description: 'Reject this command', name: 'Deny' }
 }
 
-export function approvalOptions(allowPermanent: boolean) {
-  return approvalChoices(allowPermanent).map(value => ({ ...COPY[value], value }))
+export function approvalOptions(policy: ApprovalChoicePolicy) {
+  return approvalChoices(policy).map(value => ({ ...COPY[value], value }))
 }
 
 export function ApprovalPrompt(props: {
-  allowPermanent: boolean
+  allowPermanent: ApprovalChoicePolicy
   command: string
   description: string
   onChoose: (choice: ApprovalChoice) => void
