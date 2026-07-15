@@ -9318,7 +9318,11 @@ def _(rid, params: dict) -> dict:
 
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
-    sid, text = params.get("session_id", ""), params.get("text", "")
+    from hermes_cli.input_sanitize import sanitize_user_prompt_text
+
+    sid = params.get("session_id", "")
+    raw_text = params.get("text", "")
+    text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
     client_submission_id = params.get("client_submission_id")
     if client_submission_id is None:
         client_submission_ids = []
