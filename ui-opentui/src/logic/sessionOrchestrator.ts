@@ -204,12 +204,10 @@ export function closeFallbackAfterClose(
 }
 
 export function draftModelArgFromPickerValue(value: string): string {
-  return value
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .filter(part => part !== TUI_SESSION_MODEL_FLAG && part !== '--global')
-    .join(' ')
+  const parts = value.trim().split(/\s+/).filter(Boolean)
+  const kept = parts.filter(part => part !== TUI_SESSION_MODEL_FLAG && part !== '--global' && part !== '--session')
+
+  return kept.length ? `${kept.join(' ')} --session` : ''
 }
 
 export function draftModelNameFromArg(value: string): string {

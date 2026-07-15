@@ -1,3 +1,5 @@
+import { draftModelArgFromPickerValue } from './sessionOrchestrator.ts'
+
 /** Transaction coordinator for the Sessions `+ new` prompt row. */
 export interface PromptLiveSessionOptions {
   readonly create: () => Promise<string | undefined>
@@ -35,7 +37,7 @@ export async function coordinatePromptLiveSession(options: PromptLiveSessionOpti
     )
   }
 
-  const requestedModel = options.modelArg?.trim()
+  const requestedModel = options.modelArg ? draftModelArgFromPickerValue(options.modelArg) : ''
   if (requestedModel) {
     try {
       const value = (await options.switchModel(sessionId, requestedModel)).trim()

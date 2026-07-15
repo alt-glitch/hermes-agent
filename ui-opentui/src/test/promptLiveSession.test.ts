@@ -49,6 +49,20 @@ describe('coordinatePromptLiveSession', () => {
     expect(h.restored).toEqual([])
   })
 
+  test('normalizes the prompt-session config model value to exactly one session flag', async () => {
+    const requested: Array<[string, string]> = []
+    const h = harness({
+      modelArg: 'model-a --provider provider-a --global --session --tui-session --session',
+      switchModel: (sessionId, modelArg) => {
+        requested.push([sessionId, modelArg])
+        return Promise.resolve('model-a')
+      }
+    })
+
+    await expect(coordinatePromptLiveSession(h.options)).resolves.toEqual({ kind: 'created', sessionId: 'live-new' })
+    expect(requested).toEqual([['live-new', 'model-a --provider provider-a --session']])
+  })
+
   test.each([
     ['create', { create: () => Promise.resolve(undefined) }],
     ['model', { switchModel: () => Promise.resolve('   ') }],

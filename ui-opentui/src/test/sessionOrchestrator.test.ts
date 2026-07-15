@@ -141,7 +141,16 @@ describe('session orchestrator contracts', () => {
 
   test('normalizes picker args and derives compact prompt presentation', () => {
     expect(draftModelArgFromPickerValue('kimi-k2.6 --provider ollama-cloud --tui-session')).toBe(
-      'kimi-k2.6 --provider ollama-cloud'
+      'kimi-k2.6 --provider ollama-cloud --session'
+    )
+    expect(
+      draftModelArgFromPickerValue(
+        '  openai/gpt-5.5 --provider "openai-codex" --global --session --tui-session --session  '
+      )
+    ).toBe('openai/gpt-5.5 --provider "openai-codex" --session')
+    expect(draftModelArgFromPickerValue('--global --tui-session --session')).toBe('')
+    expect(draftModelArgFromPickerValue('anthropic/claude-sonnet-4.6 --provider openrouter --session')).toBe(
+      'anthropic/claude-sonnet-4.6 --provider openrouter --session'
     )
     expect(draftModelDisplayLabel('openai/gpt-5.5 --provider openai-codex --global')).toBe('gpt-5.5')
     expect(draftModelDisplayLabel('')).toBe('current/default')
