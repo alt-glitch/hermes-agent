@@ -54,6 +54,63 @@ def make_repo(
     return repo, remote, base, candidate, gate_worktree
 
 
+def make_upstream_merge_repo(
+    tmp_path: Path, *, ours: bool = False
+) -> tuple[Path, str, str, str, str]:
+    repo = tmp_path / ("ours-repo" if ours else "merge-repo")
+    git(tmp_path, "init", str(repo))
+    git(repo, "config", "user.email", "test@example.invalid")
+    git(repo, "config", "user.name", "Test")
+    (repo / "shared").write_text("common\n")
+    git(repo, "add", "shared")
+    git(repo, "commit", "-m", "common")
+    common = git(repo, "rev-parse", "HEAD")
+
+    git(repo, "checkout", "-b", "upstream")
+    (repo / "shared").write_text("upstream\n")
+    (repo / "trusted-upstream-only").write_text("TRUSTED-UPSTREAM-BULK\n" * 10_000)
+    git(repo, "add", "shared", "trusted-upstream-only")
+    git(repo, "commit", "-m", "upstream")
+    upstream = git(repo, "rev-parse", "HEAD")
+
+    git(repo, "checkout", "-b", "sid/opentui", common)
+    (repo / "shared").write_text("fork\n")
+    git(repo, "commit", "-am", "fork base")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-b", "integration")
+    if ours:
+        git(repo, "merge", "--no-ff", "-s", "ours", "upstream", "-m", "merge upstream")
+    else:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "merge",
+                "--no-ff",
+                "upstream",
+                "-m",
+                "merge upstream",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        (repo / "shared").write_text("resolved\n")
+        git(repo, "add", "shared")
+        git(repo, "commit", "-m", "merge upstream")
+    merge_commit = git(repo, "rev-parse", "HEAD")
+    if not ours:
+        (repo / "ui-opentui").mkdir()
+        (repo / "ui-opentui" / "adaptation.ts").write_text(
+            "export const ported = true\n"
+        )
+        git(repo, "add", "ui-opentui/adaptation.ts")
+        git(repo, "commit", "-m", "port opentui")
+    candidate = git(repo, "rev-parse", "HEAD")
+    return repo, base, upstream, merge_commit, candidate
+
+
 def gate_argv(gate_id: str) -> list[str]:
     if gate_id == "focused-contracts":
         return ["uv", "run", "pytest", "tests/test_example.py"]
@@ -71,18 +128,26 @@ def manifest(
     failed: str | None = None,
 ) -> None:
     checks = []
+    review_proof = {
+        "review_mode": "linear-candidate",
+        "upstream_sha": None,
+        "argv": ["runtime-verifier", "adversarial-review"],
+    }
     (path.parent / "gate-logs").mkdir(exist_ok=True)
     for gate_id in sorted(runtime.REQUIRED_GATES):
         did_fail = gate_id == failed
         output_path = path.parent / "gate-logs" / f"{gate_id}.log"
-        output_path.write_text(gate_id)
+        output = (
+            json.dumps(review_proof) if gate_id == "adversarial-review" else gate_id
+        )
+        output_path.write_text(output)
         checks.append({
             "id": gate_id,
             "argv": gate_argv(gate_id),
             "exit_code": 1 if did_fail else 0,
             "status": "failed" if did_fail else "passed",
             "output_path": str(output_path),
-            "output_sha256": hashlib.sha256(gate_id.encode()).hexdigest(),
+            "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
         })
     path.write_text(
         json.dumps({
@@ -91,6 +156,12 @@ def manifest(
             "base_sha": base,
             "candidate_sha": candidate,
             "lease_token_sha256": hashlib.sha256(b"test-token").hexdigest(),
+            "run_binding": {
+                "mode": "backport",
+                "request_sha256": None,
+                "last_synced_upstream": None,
+            },
+            "review_proof": review_proof,
             "checks": checks,
             "worktree_proof": {
                 "worktree": str(gate_worktree.resolve()),
@@ -123,6 +194,13 @@ def write_live_lease(
     (state_dir / "run.lease.json").write_text(
         json.dumps({"token": token, "expires_unix": expires_unix})
     )
+
+
+def claim_backport(state: Path, evidence: Path) -> None:
+    (state / "run-request.json").write_text(
+        json.dumps({"mode": "backport", "commits": ["abcdef1"]})
+    )
+    runtime.claim_request(state, evidence)
 
 
 def test_worker_and_gate_renewals_bypass_nonblocking_run_lock(
@@ -536,8 +614,8 @@ def install_success_mocks(
     def fake_reviewer(
         argv: list[str], prompt: bytes, cwd: Path
     ) -> subprocess.CompletedProcess[bytes]:
-        assert b"DIFF_SHA256:" in prompt
-        assert b"BEGIN EXACT DIFF" in prompt
+        assert b"REVIEW_SCOPE_SHA256:" in prompt
+        assert b"BEGIN BOUNDED EXACT DIFF" in prompt
         return subprocess.CompletedProcess(
             argv, 0, b"No blockers.\nVERDICT: APPROVED\n", b""
         )
@@ -978,6 +1056,208 @@ def test_review_runtime_rejects_blocker_even_with_approved_tail(
         )
 
 
+def test_scheduled_review_excludes_trusted_upstream_and_includes_owned_deltas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, base, upstream, merge_commit, candidate = make_upstream_merge_repo(tmp_path)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    prompts: list[bytes] = []
+
+    def approve(argv: list[str], prompt: bytes, cwd: Path):
+        prompts.append(prompt)
+        return subprocess.CompletedProcess(argv, 0, b"VERDICT: APPROVED\n", b"")
+
+    monkeypatch.setattr(runtime, "_trusted_upstream_tip", lambda _repo: upstream)
+    monkeypatch.setattr(runtime, "_run_reviewer", approve)
+    result = runtime.run_adversarial_review(
+        {"tool": "claude", "model": "fable-5"},
+        evidence,
+        repo,
+        base,
+        candidate,
+    )
+
+    assert result["review_mode"] == "upstream-merge"
+    assert result["upstream_sha"] == upstream
+    assert result["merge_commit"] == merge_commit
+    assert result["chunk_count"] == 1
+    [prompt] = prompts
+    assert b"TRUSTED-UPSTREAM-BULK" not in prompt
+    assert b"+resolved" in prompt
+    assert b"adaptation.ts" in prompt
+    assert len(prompt) < 100_000
+
+
+def test_ours_merge_cannot_hide_dropped_upstream_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, base, upstream, merge_commit, candidate = make_upstream_merge_repo(
+        tmp_path, ours=True
+    )
+    monkeypatch.setattr(runtime, "_trusted_upstream_tip", lambda _repo: upstream)
+    scope = runtime._review_scope(repo, base, candidate)
+    chunks, ranges = runtime._review_chunks(repo, scope)
+    joined = b"".join(chunks)
+
+    assert scope["upstream_sha"] == upstream
+    assert scope["merge_commit"] == merge_commit
+    assert (
+        next(item for item in ranges if item["label"] == "conflict-resolution")[
+            "patches"
+        ]
+        >= 1
+    )
+    assert b"trusted-upstream-only" in joined
+    assert b"TRUSTED-UPSTREAM-BULK" in joined
+
+
+def test_scheduled_review_rejects_noncanonical_second_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, base, _upstream, _merge_commit, candidate = make_upstream_merge_repo(tmp_path)
+    monkeypatch.setattr(runtime, "_trusted_upstream_tip", lambda _repo: base)
+    with pytest.raises(runtime.ControlError, match="not canonical upstream main"):
+        runtime._review_scope(repo, base, candidate)
+
+
+def test_canonical_review_diff_preserves_rename_copy_and_binary_bytes(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "diff-repo"
+    git(tmp_path, "init", str(repo))
+    git(repo, "config", "user.email", "test@example.invalid")
+    git(repo, "config", "user.name", "Test")
+    (repo / "old policy").write_text("enforce=true\n")
+    (repo / "binary.bin").write_bytes(bytes(range(256)) * 8)
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "mv", "old policy", "archived policy")
+    (repo / "policy copy").write_text("enforce=true\n")
+    (repo / "binary.bin").write_bytes(bytes(reversed(range(256))) * 8)
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "rename copy binary")
+    candidate = git(repo, "rev-parse", "HEAD")
+
+    diff = runtime._canonical_range_diff(repo, base, candidate)
+    patches = runtime._split_diff_patches(diff)
+
+    assert b"".join(patches) == diff
+    assert diff.count(b"rename from old policy") == 1
+    assert diff.count(b"rename to ") == 1
+    assert diff.count(b"copy from old policy") == 1
+    assert diff.count(b"copy to ") == 1
+    assert b"archived policy" in diff and b"policy copy" in diff
+    assert b"GIT binary patch" in diff
+
+
+def test_review_mode_is_bound_instead_of_inferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, _ = make_repo(tmp_path)
+    with pytest.raises(runtime.ControlError, match="scheduled review requires"):
+        runtime._review_scope(repo, base, candidate, expected_mode="scheduled")
+
+    merge_repo, merge_base, upstream, _, merge_candidate = make_upstream_merge_repo(
+        tmp_path
+    )
+    monkeypatch.setattr(runtime, "_trusted_upstream_tip", lambda _repo: upstream)
+    with pytest.raises(runtime.ControlError, match="backport review requires"):
+        runtime._review_scope(
+            merge_repo, merge_base, merge_candidate, expected_mode="backport"
+        )
+
+
+def test_trusted_git_environment_discards_url_rewrite_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.file:///attacker.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", runtime.UPSTREAM_URL)
+    monkeypatch.setenv("GIT_DIR", "/attacker")
+    monkeypatch.setenv("HOME", "/attacker-home")
+
+    env = runtime._trusted_git_environment(tmp_path)
+
+    assert not any(key.startswith("GIT_CONFIG_KEY_") for key in env)
+    assert "GIT_CONFIG_COUNT" not in env
+    assert "GIT_DIR" not in env
+    assert env["HOME"] == str(tmp_path)
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+
+
+def test_review_chunks_require_independent_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, _, _ = make_repo(tmp_path)
+    git(repo, "checkout", "integration")
+    for index in range(3):
+        (repo / f"chunk-{index}").write_text(str(index) * 300)
+    git(repo, "add", "chunk-0", "chunk-1", "chunk-2")
+    git(repo, "commit", "-m", "large adaptation")
+    candidate = git(repo, "rev-parse", "HEAD")
+    evidence = tmp_path / "chunk-evidence"
+    evidence.mkdir()
+    prompts: list[bytes] = []
+
+    def approve(argv: list[str], prompt: bytes, cwd: Path):
+        prompts.append(prompt)
+        return subprocess.CompletedProcess(argv, 0, b"VERDICT: APPROVED\n", b"")
+
+    monkeypatch.setattr(runtime, "REVIEW_PROMPT_MAX_BYTES", 700)
+    monkeypatch.setattr(runtime, "_run_reviewer", approve)
+    result = runtime.run_adversarial_review(
+        {"tool": "claude", "model": "fable-5"},
+        evidence,
+        repo,
+        base,
+        candidate,
+    )
+    assert result["chunk_count"] == len(prompts)
+    assert len(prompts) >= 2
+    assert all(
+        f"CHUNK: {index}/{len(prompts)}".encode() in prompt
+        for index, prompt in enumerate(prompts, start=1)
+    )
+
+
+def test_run_lock_records_inactive_release_state(tmp_path: Path) -> None:
+    with runtime.run_lock(tmp_path):
+        active = json.loads((tmp_path / "maintainer.lock").read_text())
+        assert active["pid"] > 0
+        assert "active" not in active
+    released = json.loads((tmp_path / "maintainer.lock").read_text())
+    assert released["active"] is False
+    assert released["released_unix"] >= released["acquired_unix"]
+
+
+def test_finalize_failure_records_durable_status_and_recovers_request(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "run-1"
+    evidence.mkdir(parents=True)
+    (state / "run-request.json").write_text(
+        json.dumps({"mode": "backport", "commits": ["abcdef1"]})
+    )
+    runtime.claim_request(state, evidence)
+    outcome = runtime.finalize_failure(
+        state,
+        evidence,
+        stage="gate",
+        reason_code="gate-failed",
+    )
+    durable = json.loads((state / "last-run.json").read_text())
+    assert outcome["status"] == "failed"
+    assert durable["status"] == "failed"
+    assert durable["reason_code"] == "gate-failed"
+    assert Path(durable["evidence_path"]) == evidence / "run-outcome.json"
+    assert (state / "run-request.json").exists()
+    assert not (state / "run-request.inflight.json").exists()
+
+
 def test_atomic_gate_and_ship_is_only_publish_cli(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -985,6 +1265,7 @@ def test_atomic_gate_and_ship_is_only_publish_cli(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
+    claim_backport(state, evidence)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     runtime.gate_and_ship(
@@ -1010,6 +1291,7 @@ def test_failed_atomic_gate_never_moves_remote(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
+    claim_backport(state, evidence)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     monkeypatch.setattr(
@@ -1134,6 +1416,7 @@ def test_finalize_success_rejects_arbitrary_detached_worktree(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
+    claim_backport(state, evidence)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     manifest_path = evidence / "gate.json"
@@ -1265,6 +1548,103 @@ def test_finalize_success_rejects_replaced_inflight_request(
     assert gate_worktree.exists()
     assert (state / "run-request.inflight.json").exists()
     assert not (evidence / "request.consumed.json").exists()
+
+
+def test_failure_after_publish_is_truthful_and_preserves_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="opentui-maint-published-failure"
+    )
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    claim_backport(state, evidence)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        evidence / "gate.json",
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+
+    outcome = runtime.finalize_failure(
+        state,
+        evidence,
+        stage="finalization",
+        reason_code="finalization-failed",
+    )
+
+    assert outcome["published"] is True
+    assert outcome["needs_finalization"] is True
+    assert outcome["request_recovered"] is False
+    assert (state / "run-request.inflight.json").exists()
+    assert not (state / "run-request.json").exists()
+
+
+def test_finalize_success_retries_after_cleanup_before_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="opentui-maint-finalize-retry"
+    )
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    claim_backport(state, evidence)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    real_record = runtime._record_run_outcome
+    calls = 0
+
+    def fail_once(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated crash after cleanup")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_record_run_outcome", fail_once)
+    with pytest.raises(OSError, match="simulated crash"):
+        runtime.finalize_success(
+            repo,
+            manifest_path,
+            state_dir=state,
+            evidence_dir=evidence,
+            cwd=gate_worktree,
+            token="test-token",
+        )
+    assert not gate_worktree.exists()
+
+    result = runtime.finalize_success(
+        repo,
+        manifest_path,
+        state_dir=state,
+        evidence_dir=evidence,
+        cwd=gate_worktree,
+        token="test-token",
+    )
+    assert result["candidate_sha"] == candidate
+    assert (
+        json.loads((state / "publish-journal.json").read_text())["phase"] == "finalized"
+    )
+    assert json.loads((state / "last-run.json").read_text())["published"] is True
 
 
 def test_video_raw_output_rejects_symlink(

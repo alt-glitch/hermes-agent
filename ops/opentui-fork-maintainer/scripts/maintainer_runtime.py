@@ -29,6 +29,7 @@ from typing import Any, Iterator
 
 BRANCH = "sid/opentui"
 REMOTE = "origin"
+UPSTREAM_URL = "https://github.com/NousResearch/hermes-agent.git"
 REQUIRED_GATES = frozenset({
     "opentui-install",
     "focused-contracts",
@@ -40,7 +41,7 @@ REQUIRED_GATES = frozenset({
 })
 SHA_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHORT_SHA_RE = __import__("re").compile(r"^[0-9a-fA-F]{7,40}$")
-GATE_SCHEMA_VERSION = 2
+GATE_SCHEMA_VERSION = 3
 LEASE_TTL_SECONDS = 6 * 60 * 60
 PACKET_TIMEOUT_SECONDS = 4 * 60 * 60
 WORKER_SLOT_COUNT = 2
@@ -67,6 +68,7 @@ TERMCTRL_READY_HOLD_SECONDS = 1.5
 TERMCTRL_MIN_ACTION_TIMELINE_MS = 1_000
 VIDEO_ANALYSIS_TIMEOUT_SECONDS = 10 * 60
 REVIEW_TIMEOUT_SECONDS = 15 * 60
+REVIEW_PROMPT_MAX_BYTES = 900_000
 VIDEO_RESULT_PREFIX = b"HERMES_VIDEO_RESULT_B64="
 VIDEO_PROMPT = (
     "Review this Hermes OpenTUI acceptance recording. End with exactly "
@@ -169,6 +171,47 @@ def _atomic_json(path: Path, value: Any) -> None:
             pass
 
 
+def _atomic_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _record_run_outcome(
+    state_dir: Path, evidence_dir: Path, value: dict[str, Any]
+) -> dict[str, Any]:
+    evidence_root = Path(os.path.abspath(evidence_dir))
+    outcome = {
+        "schema_version": 1,
+        "recorded_unix": int(time.time()),
+        **value,
+    }
+    evidence_path = _safe_output_path(evidence_root, "run-outcome.json")
+    _atomic_json(evidence_path, outcome)
+    durable = {
+        **outcome,
+        "evidence_path": str(evidence_path),
+        "evidence_sha256": _file_sha256(evidence_path),
+    }
+    _atomic_json(state_dir / "last-run.json", durable)
+    return outcome
+
+
 @contextmanager
 def run_lock(state_dir: Path) -> Iterator[None]:
     """Acquire the maintainer lock without waiting."""
@@ -191,6 +234,19 @@ def run_lock(state_dir: Path) -> Iterator[None]:
         try:
             yield
         finally:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(
+                json.dumps({
+                    "pid": os.getpid(),
+                    "acquired_unix": int(time.time()),
+                    "active": False,
+                    "released_unix": int(time.time()),
+                })
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
@@ -347,6 +403,52 @@ def _read_bound_request(path: Path, root: Path, *, label: str) -> dict[str, Any]
     except (OSError, json.JSONDecodeError) as exc:
         raise ControlError(f"{label} is invalid: {type(exc).__name__}") from exc
     return _validate_request(value)
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _derive_run_binding(state_dir: Path, evidence_dir: Path) -> dict[str, Any]:
+    """Bind a gate to either the scheduled sync or one exact claimed backport."""
+    evidence_root = Path(os.path.abspath(evidence_dir))
+    with _request_lock(state_dir):
+        queued = state_dir / "run-request.json"
+        inflight = state_dir / "run-request.inflight.json"
+        claimed = evidence_root / "request.claimed.json"
+        if claimed.exists():
+            if queued.exists() or not inflight.exists():
+                raise ControlError("claimed backport request state is inconsistent")
+            claimed_value = _read_bound_request(
+                claimed, evidence_root, label="claimed request"
+            )
+            inflight_value = _read_bound_request(
+                inflight, state_dir, label="in-flight request"
+            )
+            if claimed_value != inflight_value:
+                raise ControlError(
+                    "claimed backport request does not match in-flight state"
+                )
+            mode = "backport"
+            request_sha = _canonical_json_sha256(claimed_value)
+        else:
+            if queued.exists() or inflight.exists():
+                raise ControlError("a pending request must be claimed before gating")
+            mode = "scheduled"
+            request_sha = None
+    marker = state_dir / "last_synced_upstream.sha"
+    last_synced = (
+        marker.read_text(encoding="utf-8").strip() if marker.exists() else None
+    )
+    if last_synced is not None and not SHA_RE.fullmatch(last_synced):
+        raise ControlError("last synced upstream marker is invalid")
+    return {
+        "mode": mode,
+        "request_sha256": request_sha,
+        "last_synced_upstream": last_synced,
+    }
 
 
 @contextmanager
@@ -669,6 +771,7 @@ def validate_gate_manifest(
     if not isinstance(checks, list):
         raise ControlError("gate manifest checks must be a list")
     seen: set[str] = set()
+    review_log: Path | None = None
     for check in checks:
         if not isinstance(check, dict) or set(check) != {
             "id",
@@ -712,11 +815,34 @@ def validate_gate_manifest(
         if check.get("status") != "passed" or check.get("exit_code") != 0:
             raise ControlError(f"gate did not pass: {gate_id}")
         seen.add(gate_id)
+        if gate_id == "adversarial-review":
+            review_log = resolved_output
     missing = REQUIRED_GATES - seen
     if missing:
         raise ControlError(
             "required gate evidence missing: " + ", ".join(sorted(missing))
         )
+    binding = value.get("run_binding")
+    if (
+        not isinstance(binding, dict)
+        or set(binding) != {"mode", "request_sha256", "last_synced_upstream"}
+        or binding.get("mode") not in {"scheduled", "backport"}
+    ):
+        raise ControlError("gate manifest run binding is invalid")
+    proof = value.get("review_proof")
+    if not isinstance(proof, dict) or review_log is None:
+        raise ControlError("gate manifest review proof is missing")
+    try:
+        logged_proof = json.loads(review_log.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError("gate manifest review proof is invalid") from exc
+    if proof != logged_proof:
+        raise ControlError("gate manifest review proof does not match hashed evidence")
+    expected_review_mode = (
+        "upstream-merge" if binding["mode"] == "scheduled" else "linear-candidate"
+    )
+    if proof.get("review_mode") != expected_review_mode:
+        raise ControlError("gate manifest review mode does not match run binding")
     resolved_base = _git(repo, ["rev-parse", f"{base_sha}^{{commit}}"])
     resolved_candidate = _git(repo, ["rev-parse", f"{candidate_sha}^{{commit}}"])
     if resolved_base != base_sha or resolved_candidate != candidate_sha:
@@ -732,6 +858,66 @@ def _remote_sha(repo: Path, remote: str, branch: str) -> str:
     return parts[0]
 
 
+def _journal_path(state_dir: Path) -> Path:
+    return state_dir / "publish-journal.json"
+
+
+def _load_publish_journal(state_dir: Path) -> dict[str, Any] | None:
+    path = _journal_path(state_dir)
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError("publish journal is invalid") from exc
+    required = {
+        "schema_version",
+        "phase",
+        "repo",
+        "remote",
+        "branch",
+        "base_sha",
+        "candidate_sha",
+        "manifest_path",
+        "manifest_sha256",
+        "evidence_dir",
+        "worktree",
+        "upstream_sha",
+        "run_binding",
+        "prepared_unix",
+    }
+    if (
+        not isinstance(value, dict)
+        or not required.issubset(value)
+        or value.get("schema_version") != 1
+        or value.get("phase")
+        not in {"prepared", "published", "finalizing", "finalized", "aborted"}
+        or not SHA_RE.fullmatch(str(value.get("base_sha", "")))
+        or not SHA_RE.fullmatch(str(value.get("candidate_sha", "")))
+    ):
+        raise ControlError("publish journal has an invalid shape")
+    manifest = Path(str(value["manifest_path"]))
+    if not manifest.is_file() or _file_sha256(manifest) != value["manifest_sha256"]:
+        raise ControlError("publish journal manifest evidence changed")
+    return value
+
+
+def _publication_identity(value: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        value[key]
+        for key in (
+            "repo",
+            "remote",
+            "branch",
+            "base_sha",
+            "candidate_sha",
+            "manifest_path",
+            "manifest_sha256",
+            "evidence_dir",
+        )
+    )
+
+
 def ship_candidate(
     repo: Path,
     manifest_path: Path,
@@ -744,7 +930,7 @@ def ship_candidate(
     branch: str = BRANCH,
 ) -> None:
     """Publish a proven candidate without touching the local daily-driver ref."""
-    validate_gate_manifest(
+    manifest = validate_gate_manifest(
         repo,
         manifest_path,
         base_sha=base_sha,
@@ -759,26 +945,57 @@ def ship_candidate(
     # holder can take ownership between that check and the remote CAS.
     with _lease_lock(state_dir):
         _validate_lease_value(_lease_value(state_dir), token, int(time.time()))
+        prepared = {
+            "schema_version": 1,
+            "phase": "prepared",
+            "repo": str(repo.resolve()),
+            "remote": remote,
+            "branch": branch,
+            "base_sha": base_sha,
+            "candidate_sha": candidate_sha,
+            "manifest_path": str(manifest_path.resolve()),
+            "manifest_sha256": _file_sha256(manifest_path),
+            "evidence_dir": str(manifest_path.parent.resolve()),
+            "worktree": manifest["worktree_proof"]["worktree"],
+            "upstream_sha": manifest["review_proof"].get("upstream_sha"),
+            "run_binding": manifest["run_binding"],
+            "prepared_unix": int(time.time()),
+        }
+        prior = _load_publish_journal(state_dir)
+        if prior is not None and prior["phase"] not in {"finalized", "aborted"}:
+            if _publication_identity(prior) != _publication_identity(prepared):
+                raise ControlError("another publication requires finalization first")
+            prepared = prior
+        else:
+            _atomic_json(_journal_path(state_dir), prepared)
         current_remote = _remote_sha(repo, remote, branch)
-        if current_remote != base_sha:
+        if current_remote not in {base_sha, candidate_sha}:
             raise ControlError("remote branch moved since base capture")
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo),
-                "push",
-                "--porcelain",
-                f"--force-with-lease=refs/heads/{branch}:{base_sha}",
-                remote,
-                f"{candidate_sha}:refs/heads/{branch}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        if result.returncode != 0:
-            raise ControlError("guarded remote fast-forward was refused")
+        if current_remote == base_sha:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "push",
+                    "--porcelain",
+                    f"--force-with-lease=refs/heads/{branch}:{base_sha}",
+                    remote,
+                    f"{candidate_sha}:refs/heads/{branch}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            reconciled = _remote_sha(repo, remote, branch)
+            if reconciled != candidate_sha:
+                raise ControlError("guarded remote fast-forward was refused")
+        published = {
+            **prepared,
+            "phase": "published",
+            "published_unix": int(time.time()),
+        }
+        _atomic_json(_journal_path(state_dir), published)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1244,6 +1461,279 @@ def _candidate_diff(repo: Path, base_sha: str, candidate_sha: str) -> bytes:
     return result.stdout
 
 
+def _commit_parents(repo: Path, commit: str) -> list[str]:
+    line = _git(repo, ["show", "-s", "--format=%P", commit])
+    parents = line.split()
+    if not all(SHA_RE.fullmatch(parent) for parent in parents):
+        raise ControlError("candidate ancestry contains an invalid parent")
+    return parents
+
+
+def _first_parent_commits(repo: Path, base_sha: str, candidate_sha: str) -> list[str]:
+    if _git_status(repo, ["merge-base", "--is-ancestor", base_sha, candidate_sha]) != 0:
+        raise ControlError("review candidate is not a descendant of the captured base")
+    output = _git(
+        repo,
+        ["rev-list", "--first-parent", "--reverse", f"{base_sha}..{candidate_sha}"],
+    )
+    commits = output.splitlines() if output else []
+    if not commits or not all(SHA_RE.fullmatch(commit) for commit in commits):
+        raise ControlError("review candidate has no valid first-parent delta")
+    return commits
+
+
+def _synthetic_merge_tree(repo: Path, base_sha: str, upstream_sha: str) -> str:
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "merge-tree",
+            "--write-tree",
+            base_sha,
+            upstream_sha,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    # Git returns 1 when conflicts exist while still emitting the deterministic
+    # conflicted tree as the first stdout line.
+    if result.returncode not in {0, 1}:
+        raise ControlError("could not derive the synthetic upstream merge tree")
+    first_line = result.stdout.splitlines()[0].strip() if result.stdout else ""
+    if not SHA_RE.fullmatch(first_line):
+        raise ControlError("synthetic upstream merge did not produce a tree")
+    if _git_status(repo, ["cat-file", "-e", f"{first_line}^{{tree}}"]):
+        raise ControlError("synthetic upstream merge tree is unavailable")
+    return first_line
+
+
+def _trusted_git_environment(root: Path) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+        and key not in {"HOME", "XDG_CONFIG_HOME", "SSH_AUTH_SOCK"}
+    }
+    env.update({
+        "HOME": str(root),
+        "XDG_CONFIG_HOME": str(root / "xdg"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    return env
+
+
+def _trusted_upstream_tip(repo: Path) -> str:
+    """Fetch canonical main without honoring repository or user Git config."""
+    with tempfile.TemporaryDirectory(prefix="hermes-upstream-quarantine-") as raw:
+        root = Path(raw)
+        quarantine = root / "repo.git"
+        bundle = root / "canonical.bundle"
+        env = _trusted_git_environment(root)
+
+        def trusted_git(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-c",
+                    "protocol.allow=never",
+                    "-c",
+                    "protocol.https.allow=always",
+                    *args,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=env,
+            )
+
+        if trusted_git("init", "--bare", "--template=", str(quarantine)).returncode:
+            raise ControlError("could not initialize canonical upstream quarantine")
+        fetched = trusted_git(
+            "-C",
+            str(quarantine),
+            "fetch",
+            "--no-tags",
+            "--force",
+            "--quiet",
+            UPSTREAM_URL,
+            "refs/heads/main:refs/heads/main",
+        )
+        if fetched.returncode != 0:
+            raise ControlError("could not resolve canonical upstream main")
+        resolved = trusted_git(
+            "-C", str(quarantine), "rev-parse", "refs/heads/main^{commit}"
+        )
+        tip = resolved.stdout.strip()
+        if resolved.returncode or not SHA_RE.fullmatch(tip):
+            raise ControlError("canonical upstream main is not a full commit id")
+        created = trusted_git(
+            "-C", str(quarantine), "bundle", "create", str(bundle), "refs/heads/main"
+        )
+        if created.returncode:
+            raise ControlError("could not package canonical upstream objects")
+        imported = trusted_git("-C", str(repo), "bundle", "unbundle", str(bundle))
+        if imported.returncode:
+            raise ControlError("could not import canonical upstream objects")
+        if _git_status(repo, ["cat-file", "-e", f"{tip}^{{commit}}"]):
+            raise ControlError("canonical upstream commit was not imported")
+        return tip
+
+
+def _review_scope(
+    repo: Path,
+    base_sha: str,
+    candidate_sha: str,
+    expected_mode: str | None = None,
+    last_synced_upstream: str | None = None,
+) -> dict[str, Any]:
+    """Derive the trusted-upstream boundary and fork-owned review ranges."""
+    commits = _first_parent_commits(repo, base_sha, candidate_sha)
+    first = commits[0]
+    parents = _commit_parents(repo, first)
+    if len(parents) == 1:
+        if expected_mode == "scheduled":
+            raise ControlError("scheduled review requires an upstream merge candidate")
+        if any(len(_commit_parents(repo, commit)) != 1 for commit in commits):
+            raise ControlError("linear review candidate contains a hidden merge")
+        return {
+            "mode": "linear-candidate",
+            "ranges": [("candidate", base_sha, candidate_sha)],
+            "upstream_sha": None,
+            "merge_commit": None,
+            "synthetic_merge_tree": None,
+        }
+    if len(parents) != 2 or parents[0] != base_sha:
+        raise ControlError(
+            "scheduled review candidate must begin with a two-parent upstream merge"
+        )
+    if expected_mode == "backport":
+        raise ControlError("manual backport review requires a linear candidate")
+    if any(len(_commit_parents(repo, commit)) != 1 for commit in commits[1:]):
+        raise ControlError("post-merge adaptation history must be linear")
+    upstream_sha = parents[1]
+    trusted_tip = _trusted_upstream_tip(repo)
+    if upstream_sha != trusted_tip:
+        raise ControlError(
+            "scheduled review merge parent is not canonical upstream main"
+        )
+    if _git_status(repo, ["merge-base", "--is-ancestor", upstream_sha, base_sha]) == 0:
+        raise ControlError(
+            "scheduled review cannot merge an already-integrated upstream"
+        )
+    if last_synced_upstream is not None:
+        if not SHA_RE.fullmatch(last_synced_upstream):
+            raise ControlError("last synced upstream marker is invalid")
+        if _git_status(
+            repo,
+            ["merge-base", "--is-ancestor", last_synced_upstream, upstream_sha],
+        ):
+            raise ControlError(
+                "scheduled review would regress canonical upstream history"
+            )
+    synthetic_tree = _synthetic_merge_tree(repo, base_sha, upstream_sha)
+    return {
+        "mode": "upstream-merge",
+        "ranges": [
+            ("conflict-resolution", synthetic_tree, first),
+            ("post-merge-adaptation", first, candidate_sha),
+        ],
+        "upstream_sha": upstream_sha,
+        "merge_commit": first,
+        "synthetic_merge_tree": synthetic_tree,
+    }
+
+
+def _canonical_range_diff(repo: Path, before: str, after: str) -> bytes:
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.quotePath=true",
+            "-C",
+            str(repo),
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--find-renames",
+            "--find-copies-harder",
+            "--ignore-submodules=none",
+            "--diff-algorithm=myers",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            before,
+            after,
+            "--",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        raise ControlError("could not produce the canonical bounded review diff")
+    return result.stdout
+
+
+def _split_diff_patches(diff: bytes) -> list[bytes]:
+    if not diff:
+        return []
+    offsets = [match.start() for match in re.finditer(rb"(?m)^diff --git ", diff)]
+    if not offsets or offsets[0] != 0:
+        raise ControlError("canonical review diff has an invalid patch boundary")
+    patches = [
+        diff[start:end] for start, end in zip(offsets, [*offsets[1:], len(diff)])
+    ]
+    if b"".join(patches) != diff:
+        raise ControlError("canonical review diff could not be split exactly")
+    return patches
+
+
+def _review_chunks(
+    repo: Path, scope: dict[str, Any]
+) -> tuple[list[bytes], list[dict[str, Any]]]:
+    chunks: list[bytes] = []
+    current = bytearray()
+    ranges: list[dict[str, Any]] = []
+    for label, before, after in scope["ranges"]:
+        canonical = _canonical_range_diff(repo, before, after)
+        patches = _split_diff_patches(canonical)
+        range_hash = hashlib.sha256(canonical).hexdigest()
+        ranges.append({
+            "label": label,
+            "before": before,
+            "after": after,
+            "patches": len(patches),
+            "diff_bytes": len(canonical),
+            "diff_sha256": range_hash,
+        })
+        for patch_index, diff in enumerate(patches, start=1):
+            framed = (
+                f"\n--- SCOPE {label} PATCH {patch_index}/{len(patches)} ---\n".encode()
+                + diff
+            )
+            if len(framed) > REVIEW_PROMPT_MAX_BYTES:
+                raise ControlError(
+                    f"single review patch exceeds the bounded reviewer limit: {label}"
+                )
+            if current and len(current) + len(framed) > REVIEW_PROMPT_MAX_BYTES:
+                chunks.append(bytes(current))
+                current.clear()
+            current.extend(framed)
+    if current:
+        chunks.append(bytes(current))
+    if not chunks:
+        chunks = [b"\n(no fork-owned diff; topology proof only)\n"]
+    return chunks, ranges
+
+
 def _run_reviewer(
     argv: list[str], prompt: bytes, cwd: Path
 ) -> subprocess.CompletedProcess[bytes]:
@@ -1272,6 +1762,9 @@ def run_adversarial_review(
     repo: Path,
     base_sha: str,
     candidate_sha: str,
+    *,
+    expected_mode: str | None = None,
+    last_synced_upstream: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(reviewer, dict) or set(reviewer) != {"tool", "model"}:
         raise ControlError("adversarial review must select an allowlisted reviewer")
@@ -1281,20 +1774,17 @@ def run_adversarial_review(
         raise ControlError("adversarial reviewer tool/model is not allowlisted")
     if not Path(template[0]).is_file():
         raise ControlError("allowlisted adversarial reviewer executable is unavailable")
-    diff = _candidate_diff(repo, base_sha, candidate_sha)
-    diff_hash = hashlib.sha256(diff).hexdigest()
-    prompt = (
-        (
-            "Perform an independent adversarial code review of the exact candidate diff below.\n"
-            f"BASE_SHA: {base_sha}\nCANDIDATE_SHA: {candidate_sha}\nDIFF_SHA256: {diff_hash}\n"
-            "Find correctness, race, security, UX, and test-fidelity defects. Do not modify files.\n"
-            "For every release-blocking issue emit a line beginning exactly BLOCKER:.\n"
-            "The final non-empty output line must be exactly VERDICT: APPROVED only when no blocker remains; otherwise VERDICT: REJECTED.\n"
-            "--- BEGIN EXACT DIFF ---\n"
-        ).encode()
-        + diff
-        + b"\n--- END EXACT DIFF ---\n"
+    scope = _review_scope(
+        repo,
+        base_sha,
+        candidate_sha,
+        expected_mode=expected_mode,
+        last_synced_upstream=last_synced_upstream,
     )
+    chunks, ranges = _review_chunks(repo, scope)
+    scope_hash = hashlib.sha256(
+        json.dumps(ranges, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     review_dir = _safe_output_path(
         evidence_root, "review-verified", "placeholder"
     ).parent
@@ -1303,22 +1793,60 @@ def run_adversarial_review(
     stdout_path.unlink(missing_ok=True)
     stderr_path.unlink(missing_ok=True)
     argv = list(template)
-    result = _run_reviewer(argv, prompt, repo)
-    stdout_path.write_bytes(result.stdout)
-    stderr_path.write_bytes(result.stderr)
-    output = result.stdout.decode("utf-8", errors="replace")
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
-    if result.returncode != 0:
-        raise ControlError("adversarial reviewer exited unsuccessfully")
-    if not lines or lines[-1] != "VERDICT: APPROVED" or "BLOCKER:" in output:
-        raise ControlError("adversarial review did not approve the candidate")
+    stdout_parts: list[bytes] = []
+    stderr_parts: list[bytes] = []
+    prompt_hashes: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        prompt = (
+            (
+                "Perform an independent adversarial review of this bounded fork-owned sync delta.\n"
+                f"BASE_SHA: {base_sha}\nCANDIDATE_SHA: {candidate_sha}\n"
+                f"REVIEW_MODE: {scope['mode']}\nREVIEW_SCOPE_SHA256: {scope_hash}\n"
+                f"CHUNK: {index}/{len(chunks)}\n"
+                "Trusted upstream commits are not reproduced here. The runtime proved the exact merge topology and derived the conflict-resolution baseline with git merge-tree.\n"
+                "Find correctness, race, security, UX, and test-fidelity defects. Do not modify files.\n"
+                "For every release-blocking issue emit a line beginning exactly BLOCKER:.\n"
+                "The final non-empty output line must be exactly VERDICT: APPROVED only when no blocker remains; otherwise VERDICT: REJECTED.\n"
+                "--- BEGIN BOUNDED EXACT DIFF ---\n"
+            ).encode()
+            + chunk
+            + b"\n--- END BOUNDED EXACT DIFF ---\n"
+        )
+        if len(prompt) > REVIEW_PROMPT_MAX_BYTES + 4096:
+            raise ControlError("bounded reviewer prompt exceeds the runtime limit")
+        prompt_hashes.append(hashlib.sha256(prompt).hexdigest())
+        result = _run_reviewer(argv, prompt, repo)
+        stdout_parts.append(
+            f"--- CHUNK {index}/{len(chunks)} ---\n".encode() + result.stdout
+        )
+        stderr_parts.append(
+            f"--- CHUNK {index}/{len(chunks)} ---\n".encode() + result.stderr
+        )
+        output = result.stdout.decode("utf-8", errors="replace")
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if result.returncode != 0:
+            stdout_path.write_bytes(b"\n".join(stdout_parts))
+            stderr_path.write_bytes(b"\n".join(stderr_parts))
+            raise ControlError("adversarial reviewer exited unsuccessfully")
+        if not lines or lines[-1] != "VERDICT: APPROVED" or "BLOCKER:" in output:
+            stdout_path.write_bytes(b"\n".join(stdout_parts))
+            stderr_path.write_bytes(b"\n".join(stderr_parts))
+            raise ControlError("adversarial review did not approve the candidate")
+    stdout_path.write_bytes(b"\n".join(stdout_parts))
+    stderr_path.write_bytes(b"\n".join(stderr_parts))
     return {
         "reviewer": {"tool": key[0], "model": key[1]},
         "argv": argv,
         "base_sha": base_sha,
         "candidate_sha": candidate_sha,
-        "reviewed_diff_sha256": diff_hash,
-        "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
+        "review_mode": scope["mode"],
+        "merge_commit": scope["merge_commit"],
+        "upstream_sha": scope["upstream_sha"],
+        "synthetic_merge_tree": scope["synthetic_merge_tree"],
+        "review_ranges": ranges,
+        "review_scope_sha256": scope_hash,
+        "chunk_count": len(chunks),
+        "prompt_sha256": prompt_hashes,
         "verdict": "approved",
         "stdout_path": str(stdout_path),
         "stdout_sha256": _file_sha256(stdout_path),
@@ -1543,6 +2071,7 @@ def run_gate(
     base_sha: str,
     candidate_sha: str,
     token: str,
+    run_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute candidate-bound gates and atomically record their real results."""
     evidence_root = Path(os.path.abspath(manifest_path.parent))
@@ -1569,6 +2098,20 @@ def run_gate(
     for item in checks:
         _validate_gate_packet_item(item["id"], item)
     before = _worktree_proof(cwd, candidate_sha)
+    if run_binding is None:
+        # Internal direct callers (principally tests) retain an explicit legacy
+        # path. The production gate-and-ship boundary always supplies a binding.
+        run_binding = {
+            "mode": "backport",
+            "request_sha256": None,
+            "last_synced_upstream": None,
+        }
+    if (
+        not isinstance(run_binding, dict)
+        or set(run_binding) != {"mode", "request_sha256", "last_synced_upstream"}
+        or run_binding.get("mode") not in {"scheduled", "backport"}
+    ):
+        raise ControlError("gate run binding is invalid")
     node_proof = _validate_node_runtime()
     by_id = {item["id"]: item for item in checks}
     order = (
@@ -1582,6 +2125,7 @@ def run_gate(
     )
     recorded: list[dict[str, Any]] = []
     termctrl_evidence: dict[str, Any] | None = None
+    review_evidence: dict[str, Any] | None = None
     failed_gate: str | None = None
     for gate_id in order:
         item = by_id[gate_id]
@@ -1636,8 +2180,15 @@ def run_gate(
                             "review gate must select an external reviewer"
                         )
                     details = run_adversarial_review(
-                        item["reviewer"], evidence_root, cwd, base_sha, candidate_sha
+                        item["reviewer"],
+                        evidence_root,
+                        cwd,
+                        base_sha,
+                        candidate_sha,
+                        expected_mode=run_binding["mode"],
+                        last_synced_upstream=run_binding["last_synced_upstream"],
                     )
+                    review_evidence = details
                     argv = details["argv"]
                 returncode, output = 0, json.dumps(details, sort_keys=True) + "\n"
             except ControlError as exc:
@@ -1702,6 +2253,8 @@ def run_gate(
         "base_sha": base_sha,
         "candidate_sha": candidate_sha,
         "lease_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+        "run_binding": run_binding,
+        "review_proof": review_evidence,
         "worktree_proof": {
             "worktree": before["worktree"],
             "before": {
@@ -1732,6 +2285,7 @@ def gate_and_ship(
     branch: str = BRANCH,
 ) -> dict[str, Any]:
     """Run every gate and immediately publish by remote CAS in one invocation."""
+    run_binding = _derive_run_binding(state_dir, manifest_path.parent)
     result = run_gate(
         packet_path,
         manifest_path,
@@ -1740,6 +2294,7 @@ def gate_and_ship(
         base_sha=base_sha,
         candidate_sha=candidate_sha,
         token=token,
+        run_binding=run_binding,
     )
     failed = [item["id"] for item in result["checks"] if item["status"] != "passed"]
     if failed:
@@ -1780,24 +2335,43 @@ def finalize_success(
     manifest_path = _evidence_path(
         str(manifest_path), evidence_root, label="success gate manifest"
     )
-    raw = _load_gate(manifest_path)
-    base_sha = raw.get("base_sha")
-    candidate_sha = raw.get("candidate_sha")
-    if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha):
-        raise ControlError("success manifest has an invalid base commit")
-    if not isinstance(candidate_sha, str) or not SHA_RE.fullmatch(candidate_sha):
-        raise ControlError("success manifest has an invalid candidate commit")
-    manifest = validate_gate_manifest(
-        repo,
-        manifest_path,
-        base_sha=base_sha,
-        candidate_sha=candidate_sha,
-        token=token,
-        branch=branch,
-    )
-    if _remote_sha(repo, remote, branch) != candidate_sha:
-        raise ControlError("remote branch does not match the proven candidate")
-    recorded_cwd = Path(manifest["worktree_proof"]["worktree"]).resolve()
+    journal = _load_publish_journal(state_dir)
+    if journal is None:
+        raise ControlError("success finalization requires a publication journal")
+    if (
+        Path(journal["manifest_path"]).resolve() != manifest_path.resolve()
+        or Path(journal["evidence_dir"]).resolve() != evidence_root.resolve()
+        or Path(journal["repo"]).resolve() != repo.resolve()
+        or journal["remote"] != remote
+        or journal["branch"] != branch
+    ):
+        raise ControlError("publication journal does not match success finalization")
+    base_sha = journal["base_sha"]
+    candidate_sha = journal["candidate_sha"]
+    if journal["phase"] == "finalized":
+        final_path = evidence_root / "success-finalization.json"
+        if not final_path.is_file():
+            raise ControlError("finalized publication is missing success evidence")
+        return json.loads(final_path.read_text(encoding="utf-8"))
+    current_remote = _remote_sha(repo, remote, branch)
+    if current_remote != candidate_sha:
+        raise ControlError("remote branch does not match the published candidate")
+    if journal["phase"] == "prepared":
+        journal = {
+            **journal,
+            "phase": "published",
+            "published_unix": int(time.time()),
+        }
+    if journal["phase"] == "published":
+        journal = {
+            **journal,
+            "phase": "finalizing",
+            "finalizing_unix": int(time.time()),
+        }
+        _atomic_json(_journal_path(state_dir), journal)
+    if journal["phase"] != "finalizing":
+        raise ControlError("publication journal is not finalizable")
+    recorded_cwd = Path(journal["worktree"]).resolve()
     resolved_cwd = cwd.resolve()
     temp_root = Path(tempfile.gettempdir()).resolve()
     managed_root = MAINTAINER_WORKTREE_ROOT.resolve()
@@ -1846,20 +2420,140 @@ def finalize_success(
     elif inflight.exists():
         raise ControlError("in-flight request is not bound to this run evidence")
 
-    # Re-prove the exact candidate after request finalization. Git's non-force
-    # removal also refuses dirty trees, but this closes the clean-new-HEAD race.
-    _worktree_proof(resolved_cwd, candidate_sha)
-    _git(repo, ["worktree", "remove", str(resolved_cwd)])
+    # The finalizing phase is durable before cleanup, so absence is safe on retry.
+    worktree_removed: str | None = None
+    if resolved_cwd.exists():
+        _worktree_proof(resolved_cwd, candidate_sha)
+        _git(repo, ["worktree", "remove", str(resolved_cwd)])
+        worktree_removed = str(resolved_cwd)
+    upstream_sha = journal["upstream_sha"]
     result = {
         "schema_version": 1,
         "candidate_sha": candidate_sha,
         "remote": remote,
         "branch": branch,
         "request_consumed": request_consumed,
-        "worktree_removed": str(resolved_cwd),
+        "worktree_removed": worktree_removed,
+        "upstream_sha": upstream_sha,
     }
+    _record_run_outcome(
+        state_dir,
+        evidence_root,
+        {
+            "status": "success",
+            "stage": "finalized",
+            "base_sha": base_sha,
+            "candidate_sha": candidate_sha,
+            "upstream_sha": upstream_sha,
+            "published": True,
+        },
+    )
+    if isinstance(upstream_sha, str):
+        _atomic_text(state_dir / "last_synced_upstream.sha", upstream_sha + "\n")
     _atomic_json(evidence_root / "success-finalization.json", result)
+    _atomic_json(
+        _journal_path(state_dir),
+        {**journal, "phase": "finalized", "finalized_unix": int(time.time())},
+    )
     return result
+
+
+def finalize_failure(
+    state_dir: Path,
+    evidence_dir: Path,
+    *,
+    stage: str,
+    reason_code: str,
+) -> dict[str, Any]:
+    allowed_stages = {
+        "integration",
+        "worker",
+        "gate",
+        "publish",
+        "finalization",
+        "external",
+    }
+    allowed_reasons = {
+        "integration-failed",
+        "worker-failed",
+        "gate-failed",
+        "publish-refused",
+        "finalization-failed",
+        "external-blocker",
+    }
+    if stage not in allowed_stages or reason_code not in allowed_reasons:
+        raise ControlError("failure outcome is not an allowlisted stage/reason")
+    evidence_root = Path(os.path.abspath(evidence_dir))
+    journal = _load_publish_journal(state_dir)
+    journal_matches = (
+        journal is not None
+        and Path(journal["evidence_dir"]).resolve() == evidence_root.resolve()
+    )
+    if journal_matches and journal is not None:
+        if journal["phase"] == "finalized":
+            raise ControlError("a finalized publication cannot be recorded as failed")
+        repo = Path(journal["repo"])
+        remote_sha = _remote_sha(repo, journal["remote"], journal["branch"])
+        if remote_sha == journal["candidate_sha"]:
+            if journal["phase"] == "prepared":
+                journal = {
+                    **journal,
+                    "phase": "published",
+                    "published_unix": int(time.time()),
+                }
+                _atomic_json(_journal_path(state_dir), journal)
+            return _record_run_outcome(
+                state_dir,
+                evidence_root,
+                {
+                    "status": "failed",
+                    "stage": stage,
+                    "reason_code": reason_code,
+                    "published": True,
+                    "needs_finalization": True,
+                    "candidate_sha": journal["candidate_sha"],
+                    "request_recovered": False,
+                },
+            )
+        if journal["phase"] == "prepared" and remote_sha == journal["base_sha"]:
+            _atomic_json(
+                _journal_path(state_dir),
+                {**journal, "phase": "aborted", "aborted_unix": int(time.time())},
+            )
+        elif journal["phase"] in {"prepared", "published", "finalizing"}:
+            raise ControlError(
+                "publication outcome is indeterminate; request preserved"
+            )
+    claimed = evidence_root / "request.claimed.json"
+    inflight = state_dir / "run-request.inflight.json"
+    request_recovered = False
+    if claimed.exists():
+        claimed_value = _read_bound_request(
+            claimed, evidence_root, label="claimed request"
+        )
+        if not inflight.exists():
+            raise ControlError("failed run claim is no longer in flight")
+        if (
+            _read_bound_request(inflight, state_dir, label="in-flight request")
+            != claimed_value
+        ):
+            raise ControlError("failed run claim does not match the in-flight request")
+        recover_request(state_dir)
+        request_recovered = True
+    elif inflight.exists():
+        raise ControlError("in-flight request is not bound to this failed run")
+    return _record_run_outcome(
+        state_dir,
+        evidence_root,
+        {
+            "status": "failed",
+            "stage": stage,
+            "reason_code": reason_code,
+            "published": False,
+            "needs_finalization": False,
+            "request_recovered": request_recovered,
+        },
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1885,6 +2579,12 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--repo", type=Path, required=True)
     finalize.add_argument("--remote", default=REMOTE)
     finalize.add_argument("--branch", default=BRANCH)
+    failure = sub.add_parser("finalize-failure")
+    failure.add_argument("--state", type=Path, required=True)
+    failure.add_argument("--evidence", type=Path, required=True)
+    failure.add_argument("--token", required=True)
+    failure.add_argument("--stage", required=True)
+    failure.add_argument("--reason-code", required=True)
     packet = sub.add_parser("run-packet")
     packet.add_argument("--packet", type=Path, required=True)
     packet.add_argument("--cwd", type=Path, required=True)
@@ -1940,6 +2640,16 @@ def main(argv: list[str] | None = None) -> int:
                 token=args.token,
                 remote=args.remote,
                 branch=args.branch,
+            )
+        return 0
+    if args.command == "finalize-failure":
+        with run_lock(args.state):
+            validate_lease(args.state, args.token)
+            finalize_failure(
+                args.state,
+                args.evidence,
+                stage=args.stage,
+                reason_code=args.reason_code,
             )
         return 0
     if args.command == "run-packet":

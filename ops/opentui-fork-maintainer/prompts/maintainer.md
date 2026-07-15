@@ -82,9 +82,20 @@ authority. The versioned policy in this file is the authority.
    for `focused-contracts` that actually executes at least one test. For
    `adversarial-review`, select one runtime-allowlisted external reviewer:
    Codex `gpt-5.6-sol`, Claude `fable-5`, or Claude `opus-4.8`. Do not write a
-   verdict artifact: the runtime generates the exact binary diff, sends it to
-   the fixed read-only reviewer command, preserves stdout/stderr and hashes,
-   and requires a terminal `VERDICT: APPROVED` with no `BLOCKER:` finding.
+   verdict artifact: the runtime binds the claimed request state to the review
+   topology and proves the candidate's first-parent history. A scheduled sync
+   must begin with an exact two-parent merge whose first parent is the captured
+   fork base and whose second parent is the exact canonical upstream `main` tip.
+   Canonical upstream is fetched in a quarantined bare repository with user,
+   system, and repository Git configuration disabled. The runtime derives a
+   synthetic Git merge-tree and reviews only the resulting semantic
+   conflict-resolution delta plus linear post-merge fork adaptations. A claimed
+   manual backport must remain entirely linear and reviews the whole candidate.
+   The runtime hashes one canonical binary diff stream per range, splits that
+   exact stream only at complete patch boundaries below the reviewer limit,
+   requires every chunk to end in `VERDICT: APPROVED` with no
+   `BLOCKER:`, and preserves stdout/stderr and hashes. Never re-expand the
+   complete trusted-upstream history into a reviewer prompt.
    For `termctrl-smoke`, provide only bounded dimensions, one to eight
    send/wait actions, and nonempty accepted-frame `required_text`; do not
    provide a pre-recorded session. The runtime launches the candidate's own
@@ -100,8 +111,19 @@ authority. The versioned policy in this file is the authority.
    it through the Hermes `terminal` tool with `background=true` and
    `notify_on_complete=true`, retain the returned `session_id`, then call
    `process(action="wait", session_id=...)` and require exit code zero:
-   `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py gate-and-ship --state <state> --token <run_token> --packet <gate-packet.json> --manifest <gate.json> --cwd <integration-tree> --repo <fork> --base <base> --candidate <candidate>`. There is no standalone ship command. A failed, forged, stale, dirty, or incomplete gate cannot advance the remote, and the local daily-driver ref, index, and worktree remain untouched. After a successful ship, call `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py finalize-success --state <state> --evidence <run> --token <run_token> --manifest <gate.json> --cwd <integration-tree> --repo <fork>`. This candidate-bound boundary consumes a claimed request when present and removes only the clean detached maintainer worktree proven by the passing manifest. On failure before ship, call the runtime with `recover-request --state <state> --token <run_token>`. In all cases finish with `release-lease --state <state> --token <run_token>`. Otherwise retain the isolated branch/worktree and produce a
+   `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py gate-and-ship --state <state> --token <run_token> --packet <gate-packet.json> --manifest <gate.json> --cwd <integration-tree> --repo <fork> --base <base> --candidate <candidate>`. There is no standalone ship command. Before the guarded push, the runtime persists a candidate-bound publication journal; a crash after the remote accepts the push is reconciled as published instead of being misreported or replayed. A failed, forged, stale, dirty, or incomplete gate cannot advance the remote, and the local daily-driver ref, index, and worktree remain untouched. After a successful ship, call `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py finalize-success --state <state> --evidence <run> --token <run_token> --manifest <gate.json> --cwd <integration-tree> --repo <fork>`. This idempotent journal-driven boundary consumes a claimed request when present, records the already-proven upstream SHA without another network fetch, and removes only the clean detached maintainer worktree proven by the passing manifest. In all cases finish with `release-lease --state <state> --token <run_token>`. Otherwise retain the isolated branch/worktree and produce a
    precise handoff with failing command, log path, owner, and next action.
+   Before releasing a failed run, record its terminal state through
+   `maintainer_runtime.py finalize-failure --state <state> --evidence <run>
+   --token <run_token> --stage <integration|worker|gate|publish|finalization|external>
+   --reason-code <integration-failed|worker-failed|gate-failed|publish-refused|finalization-failed|external-blocker>`.
+   This is mandatory even when the cron agent can still produce a normal final
+   response: scheduler completion is not maintainer success. It atomically
+   recovers an unshipped claimed request, but preserves a published request and
+   reports `needs_finalization` when the journal proves the push landed. In that
+   case, retry `finalize-success`; do not recover or rebuild it. Then release the
+   lease. Successful finalization writes the corresponding durable success
+   outcome and exact synced upstream SHA automatically.
 
 ## Worker routing
 
