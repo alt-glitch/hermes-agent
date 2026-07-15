@@ -5,6 +5,7 @@ const ImageAttachResponseSchema = Schema.Struct({
   attached: Schema.optionalKey(Schema.Boolean),
   count: Schema.optionalKey(Schema.Number),
   height: Schema.optionalKey(Schema.Number),
+  message: Schema.optionalKey(Schema.String),
   name: Schema.optionalKey(Schema.String),
   path: Schema.optionalKey(Schema.String),
   remainder: Schema.optionalKey(Schema.String),

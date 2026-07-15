@@ -58,7 +58,7 @@ import { BUSY_QUEUE_MAX_CHARS, BUSY_QUEUE_MAX_EDIT_CHARS } from '../logic/busyQu
 import { envComposerRows } from '../logic/env.ts'
 import { createDoublePress } from '../logic/promptHistory.ts'
 import { analyzeSlash, learnableNames, nativeCharOffset } from '../logic/skillMatch.ts'
-import type { CompletionItem } from '../logic/store.ts'
+import type { CompletionItem, PendingImageAttachment } from '../logic/store.ts'
 import type { PromptHistory } from '../logic/history.ts'
 import { type PasteStore, shouldPlaceholder } from '../logic/pastes.ts'
 import { useDimensions } from './dimensions.tsx'
@@ -162,7 +162,9 @@ export function Composer(props: {
   completionFrom?: (() => number) | undefined
   onDismiss?: (() => void) | undefined
   history?: PromptHistory | undefined
-  onImagePaste?: (() => void) | undefined
+  onImagePaste?: ((hotkey?: boolean) => void | string | Promise<void | string | undefined>) | undefined
+  pendingImages?: (() => readonly PendingImageAttachment[]) | undefined
+  onImageDetach?: ((path: string) => void) | undefined
   onOpenEditor?: ((draft: string) => void) | undefined
   pasteStore?: PasteStore | undefined
   /** A paste/programmatic prefill exceeded the bounded retained-input store.
@@ -270,10 +272,12 @@ export function Composer(props: {
   // styling failure must never take the composer down.
   let syntax: SyntaxStyle | undefined
   let tokenStyleId = 0
+  let imageStyleId = 0
   onMount(() => {
     try {
       const style = SyntaxStyle.create()
       tokenStyleId = style.registerStyle('slash-token', { bold: true, fg: theme().color.accent })
+      imageStyleId = style.registerStyle('image-token', { bold: true, fg: theme().color.primary })
       if (ta) ta.syntaxStyle = style
       syntax = style
     } catch {
@@ -286,9 +290,11 @@ export function Composer(props: {
   // the highlight createEffect below re-tracks `theme()` so ranges re-apply.
   createEffect(() => {
     const accent = theme().color.accent
+    const primary = theme().color.primary
     if (!syntax) return
     try {
       tokenStyleId = syntax.registerStyle('slash-token', { bold: true, fg: accent })
+      imageStyleId = syntax.registerStyle('image-token', { bold: true, fg: primary })
     } catch {
       /* cosmetic — never crash on a native restyle */
     }
@@ -321,6 +327,7 @@ export function Composer(props: {
   })
   createEffect(() => {
     const a = analysis()
+    const images = props.pendingImages?.() ?? []
     void theme().color.accent // re-track: re-apply highlights after a live re-theme
     if (!ta || !syntax || ta.isDestroyed) return
     try {
@@ -332,6 +339,18 @@ export function Composer(props: {
           start: nativeCharOffset(text, t.start),
           styleId: tokenStyleId
         })
+      }
+      for (const image of images) {
+        let start = text.indexOf(image.token)
+        while (start >= 0) {
+          const end = start + image.token.length
+          ta.editBuffer.addHighlightByCharRange({
+            end: nativeCharOffset(text, end),
+            start: nativeCharOffset(text, start),
+            styleId: imageStyleId
+          })
+          start = text.indexOf(image.token, end)
+        }
       }
       ta.requestRender()
     } catch {
@@ -395,18 +414,82 @@ export function Composer(props: {
     return token
   }
 
-  const clearBuffer = (discardPastes = false) => {
+  let suppressNextImageReconcile = false
+  const clearBuffer = (discardPastes = false, preserveImages = false) => {
     if (!ta || ta.isDestroyed) return
     if (discardPastes) props.pasteStore?.discard(ta.plainText)
     // OpenTUI's `clear()` is an edit operation and may retain the prior native
     // rope in undo history. This path is a hard ownership boundary (submit,
     // queue-edit cancel, explicit draft clear), so use the documented reset
     // API: it clears history and replaces the reusable mem buffer in place.
+    if (preserveImages) suppressNextImageReconcile = true
     ta.setText('')
     setBufText('')
     props.history?.reset()
     props.onDraftChange?.('')
     props.onDismiss?.()
+  }
+
+  // OpenCode/free-code style inline image references. Store additions are the
+  // trigger (not every text edit), so deleting a token cannot race an effect
+  // that immediately inserts it again.
+  let knownImagePaths = new Set<string>()
+  createEffect(
+    on(
+      () => props.pendingImages?.() ?? [],
+      images => {
+        if (!ta || ta.isDestroyed) return
+        const next = new Set(images.map(image => image.path))
+        for (const image of images) {
+          if (knownImagePaths.has(image.path) || ta.plainText.includes(image.token)) continue
+          const before = ta.plainText
+          const cursor = ta.cursorOffset
+          const prefix = cursor > 0 && !/\s/u.test(before[cursor - 1] ?? '') ? ' ' : ''
+          const suffix = cursor < before.length && !/\s/u.test(before[cursor] ?? '') ? ' ' : ''
+          ta.insertText(`${prefix}${image.token}${suffix}`)
+        }
+        knownImagePaths = next
+      }
+    )
+  )
+
+  const reconcileImages = (text: string): void => {
+    for (const image of props.pendingImages?.() ?? []) {
+      if (!text.includes(image.token)) props.onImageDetach?.(image.path)
+    }
+  }
+
+  const removeImageTokenForKey = (name: string): boolean => {
+    if (!ta || (name !== 'backspace' && name !== 'delete')) return false
+    const text = ta.plainText
+    const cursor = ta.cursorOffset
+    for (const image of props.pendingImages?.() ?? []) {
+      const start = text.indexOf(image.token)
+      if (start < 0) continue
+      const end = start + image.token.length
+      const ownsKey = name === 'backspace' ? cursor > start && cursor <= end : cursor >= start && cursor < end
+      if (!ownsKey) continue
+      props.onImageDetach?.(image.path)
+      ta.setText(`${text.slice(0, start)}${text.slice(end)}`)
+      ta.cursorOffset = start
+      return true
+    }
+    return false
+  }
+
+  const snapImageCursor = (): void => {
+    if (!ta || ta.isDestroyed) return
+    const text = ta.plainText
+    const cursor = ta.cursorOffset
+    for (const image of props.pendingImages?.() ?? []) {
+      const start = text.indexOf(image.token)
+      if (start < 0) continue
+      const end = start + image.token.length
+      if (cursor > start && cursor < end) {
+        ta.cursorOffset = cursor - start < end - cursor ? start : end
+        return
+      }
+    }
   }
 
   /** Ink queue navigation: Up starts at row 1 and advances; Down starts at the
@@ -530,7 +613,7 @@ export function Composer(props: {
     // without violating the measured edit-latency ceiling. Large paste bodies
     // remain in the transcript/session; only local Up-history omits them.
     if (editIndex === undefined && text.length <= BUSY_QUEUE_MAX_EDIT_CHARS) props.history?.push(text)
-    clearBuffer()
+    clearBuffer(false, true)
     if (editIndex !== undefined) props.onQueueEdit?.(undefined)
     props.onDraftChange?.('') // submitted → drop the persisted draft (explicit; don't rely on clear()'s onContentChange)
     props.pasteStore?.clear()
@@ -548,7 +631,7 @@ export function Composer(props: {
   const applyPaste = (text: string, native: boolean): boolean => {
     // An empty bracketed paste = an image-only clipboard (item 1) — read + attach it.
     if (text.trim() === '') {
-      props.onImagePaste?.()
+      void props.onImagePaste?.(false)
       return true
     }
     // A large paste becomes a compact `[Pasted text #N +M lines]` chip instead
@@ -606,6 +689,24 @@ export function Composer(props: {
     // processes the key; the microtask runs after both). Equal-value signal
     // sets are no-ops, so this is cheap on every keystroke.
     queueMicrotask(syncCursorLine)
+    if (key.eventType !== 'release' && key.name === 'v' && (key.ctrl || key.meta || key.super) && !key.option) {
+      key.preventDefault()
+      void Promise.resolve(props.onImagePaste?.(true)).then(text => {
+        if (typeof text === 'string' && text && ta && !ta.isDestroyed) ta.insertText(text)
+      })
+      return
+    }
+    if (
+      key.eventType !== 'release' &&
+      !key.ctrl &&
+      !key.meta &&
+      !key.option &&
+      !key.shift &&
+      removeImageTokenForKey(key.name)
+    ) {
+      key.preventDefault()
+      return
+    }
     if (key.eventType !== 'release' && key.name === 'g' && (key.ctrl || key.meta || key.option)) {
       key.preventDefault()
       props.onOpenEditor?.(ta?.plainText ?? '')
@@ -898,12 +999,17 @@ export function Composer(props: {
             // applyPaste(native=true) only consumes image/large pastes.
             if (applyPaste(new TextDecoder().decode(e.bytes), true)) e.preventDefault()
           }}
-          onCursorChange={() => syncCursorLine()}
+          onCursorChange={() => {
+            snapImageCursor()
+            syncCursorLine()
+          }}
           onContentChange={() => {
             const text = ta?.plainText ?? ''
             setBufText(text) // drives the token analysis (highlight + suggestion)
             props.onDraftChange?.(text) // persist so it survives a clarify-prompt unmount
             reconcilePastesSoon()
+            if (suppressNextImageReconcile) suppressNextImageReconcile = false
+            else reconcileImages(text)
             syncCursorLine()
             props.onType?.(text, ta?.cursorOffset ?? text.length)
           }}

@@ -74,7 +74,8 @@ export interface AppProps {
   readonly onSessionPickerClosed?: () => void
   readonly sessionId?: () => string | undefined
   readonly history?: ComposerHistory
-  readonly onImagePaste?: () => void
+  readonly onImagePaste?: (hotkey?: boolean) => void | string | Promise<void | string | undefined>
+  readonly onImageDetach?: (path: string) => void
   readonly onOpenEditor?: (draft: string) => void
   readonly pasteStore?: PasteStore
   readonly onPasteLimitExceeded?: (maxBytes: number) => void
@@ -233,6 +234,8 @@ export function App(props: AppProps) {
                         onDismiss={() => props.store.clearCompletions()}
                         history={props.history}
                         onImagePaste={props.onImagePaste}
+                        pendingImages={() => props.store.state.pendingImages}
+                        onImageDetach={props.onImageDetach}
                         onOpenEditor={props.onOpenEditor}
                         pasteStore={props.pasteStore}
                         onPasteLimitExceeded={props.onPasteLimitExceeded}

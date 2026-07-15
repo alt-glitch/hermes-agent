@@ -221,6 +221,7 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
     const preservedDraft = options.preserveLocalInput ? store.state.composerDraft : ''
     const preservedQueue = options.preserveLocalInput === 'same-session' ? [...store.state.queuedPrompts] : []
     const preservedEditIndex = options.preserveLocalInput === 'same-session' ? store.state.queueEditIndex : undefined
+    const preservedImages = options.preserveLocalInput === 'same-session' ? [...store.state.pendingImages] : []
     store.commitSessionSnapshot(
       liveSessionId,
       snapshot,
@@ -231,6 +232,7 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
       liveSnapshotStartedAtMs(response)
     )
     for (const text of preservedQueue) store.enqueuePrompt(text)
+    for (const image of preservedImages) store.restorePendingImage(image)
     if (preservedDraft) store.replaceComposerDraft(preservedDraft)
     if (preservedEditIndex !== undefined && preservedEditIndex < store.queuedCount()) {
       store.setQueueEditIndex(preservedEditIndex)

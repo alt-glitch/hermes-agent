@@ -1405,4 +1405,25 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     expect(store.state.info.model).toBe('m')
     expect(store.state.info.cwd).toBe('/x')
   })
+
+  test('pending images survive same-session clear/recovery and reset on detach', () => {
+    const store = createSessionStore()
+    const first = store.addPendingImage({
+      height: 10,
+      path: '/tmp/first.png',
+      token_estimate: 12,
+      width: 20
+    })
+    expect(first).toMatchObject({ id: 1, path: '/tmp/first.png', token: '[Image #1]' })
+    expect(store.addPendingImage({ path: '/tmp/first.png' })).toEqual(first)
+
+    store.clearTranscript()
+    expect(store.state.pendingImages).toHaveLength(1)
+
+    store.commitSnapshot([])
+    expect(store.state.pendingImages).toHaveLength(1)
+
+    store.detachSession()
+    expect(store.state.pendingImages).toEqual([])
+  })
 })

@@ -27,7 +27,7 @@ import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import type { KeyEvent } from '@opentui/core'
 
-import { readClipboardImage, writeClipboard } from '../boundary/clipboard.ts'
+import { readClipboardText, writeClipboard } from '../boundary/clipboard.ts'
 import { launchHermesCommand } from '../boundary/externalCli.ts'
 import { openInEditor } from '../boundary/externalInput.ts'
 import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../boundary/terminalSetup.ts'
@@ -41,11 +41,7 @@ import { startProactiveGc } from '../boundary/proactiveGc.ts'
 import { registerRemoteParsers } from '../boundary/parsers.ts'
 import { acquireRenderer, redrawRenderer, selectionCopyText } from '../boundary/renderer.ts'
 import { decodeSubagentInterruptResponse } from '../boundary/schema/Delegation.ts'
-import {
-  attachedImageNotice,
-  decodeImageAttachResponse,
-  decodeSetupStatusResponse
-} from '../boundary/schema/ExternalInputResponses.ts'
+import { decodeImageAttachResponse, decodeSetupStatusResponse } from '../boundary/schema/ExternalInputResponses.ts'
 import { decodeVoiceRecordResponse } from '../boundary/schema/VoiceResponses.ts'
 import { decodePetGalleryResponse, decodePetSelectResponse } from '../boundary/schema/PetResponses.ts'
 import { decodePluginsListResponse, decodePluginsToggleResponse } from '../boundary/schema/PluginResponses.ts'
@@ -580,6 +576,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         if (queueEditDrain.release()) queueMicrotask(drainQueuedIfIdle)
       }
       let imageAttachInFlight = false
+      const imageDetachInFlight = new Set<string>()
       const transitionSubmissions: TransitionSubmission[] = []
       let activeTransitionOwner: string | undefined
       let heldTransitionOwner: string | undefined
@@ -693,6 +690,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           (event.type === 'message.start' || event.type === 'message.complete') &&
           pendingPromptBoundaryMatches(pendingPrompt.submissionId, event.type, event.payload)
         ) {
+          if (event.type === 'message.start') store.clearPendingImages()
           pendingPrompt = pendingPromptAfterBoundary(pendingPrompt, event.type)
         } else if (
           event.type === 'error' &&
@@ -770,6 +768,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         }
         if (imageAttachInFlight) {
           store.pushSystem('wait for the image attachment before trying to switch sessions')
+          return true
+        }
+        if (imageDetachInFlight.size > 0) {
+          store.pushSystem('wait for the image removal before trying to switch sessions')
+          return true
+        }
+        if (store.state.pendingImages.length > 0) {
+          store.pushSystem('send or remove attached images before trying to switch sessions')
           return true
         }
         if (historyMutationInFlight) {
@@ -1167,44 +1173,86 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         flashHint('Copied selection')
       }
 
-      // Paste an IMAGE (item 1): read the clipboard image and attach it to the
-      // session (image.attach_bytes); the next prompt.submit picks it up.
-      const onImagePaste = () => {
-        void (async () => {
+      // Paste an IMAGE (item 1): reuse the gateway's cross-platform clipboard
+      // implementation (the same path Ink uses), then mirror the queued image
+      // into the composer as an inline, removable token.
+      const onImagePaste = async (hotkey = false): Promise<string | undefined> => {
+        if (imageAttachInFlight) return undefined
+        if (pendingPrompt) {
+          if (hotkey) {
+            const text = await readClipboardText()
+            if (text) return text
+          }
+          flashHint('wait for the pending prompt to start before attaching an image', 2500)
+          return undefined
+        }
+        return (async () => {
           if (isSessionTransitioning()) {
             flashHint('Session switch in progress', 2000)
-            return
-          }
-          const img = await readClipboardImage()
-          if (!img) {
-            flashHint('No image in clipboard', 2000)
-            return
+            return undefined
           }
           const sid = gateway.sessionId()
           if (isSessionTransitioning()) {
             flashHint('Session switch in progress', 2000)
-            return
+            return undefined
           }
           if (!sid) {
             flashHint('No session for image', 2000)
-            return
+            return undefined
           }
           imageAttachInFlight = true
           try {
-            await Effect.runPromise(
-              gateway.request('image.attach_bytes', {
-                content_base64: img.data,
-                filename: 'pasted.png',
+            const raw = await Effect.runPromise(
+              gateway.request<unknown>('clipboard.paste', {
                 session_id: sid
               })
             )
-            flashHint('🖼 image attached — type a message and send', 3000)
+            const response = decodeImageAttachResponse(raw)
+            if (!response) {
+              flashHint('Invalid clipboard response', 2000)
+              return undefined
+            }
+            if (!response.attached || !response.path) {
+              if (hotkey) {
+                const text = await readClipboardText()
+                if (text) return text
+              }
+              flashHint(response.message || 'No image in clipboard', 2000)
+              return undefined
+            }
+            if (gateway.sessionId() !== sid || store.state.sessionId !== sid || isSessionTransitioning()) {
+              await Effect.runPromise(
+                gateway.request('image.detach', {
+                  path: response.path,
+                  session_id: sid
+                })
+              ).catch(() => undefined)
+              return undefined
+            }
+            store.addPendingImage(response)
+            return undefined
           } catch {
             flashHint('Image attach failed', 2000)
+            return undefined
           } finally {
             imageAttachInFlight = false
           }
         })()
+      }
+
+      const onImageDetach = (path: string): void => {
+        const sid = gateway.sessionId()
+        if (!sid) return
+        if (imageDetachInFlight.has(path)) return
+        const removed = store.removePendingImage(path)
+        if (!removed) return
+        imageDetachInFlight.add(path)
+        Effect.runPromise(gateway.request('image.detach', { path, session_id: sid }))
+          .catch(() => {
+            if (gateway.sessionId() === sid && store.state.sessionId === sid) store.restorePendingImage(removed)
+            flashHint('Image detach failed; it may still be sent', 2500)
+          })
+          .finally(() => imageDetachInFlight.delete(path))
       }
 
       // A blocking prompt owns Ctrl+C (→ cancel); otherwise the state machine above runs.
@@ -1471,6 +1519,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       }
 
       sendPromptNow = (text: string, skillCommand?: string): boolean => {
+        if (imageDetachInFlight.size > 0) {
+          store.pushSystem('wait for the image removal before sending')
+          return false
+        }
         const sid = gateway.sessionId()
         if (!sid) {
           getLog().warn('submit', 'no active session', { text })
@@ -1553,6 +1605,22 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // Submit a user turn: transition-safe, policy-aware, and synchronous about
       // whether the composer may clear its uncontrolled textarea.
       const submitPrompt = (text: string): boolean => {
+        if (imageDetachInFlight.size > 0) {
+          store.pushSystem('wait for the image removal before sending')
+          return false
+        }
+        if (store.state.pendingImages.length > 0) {
+          if (
+            isSessionTransitioning() ||
+            (promoteHeldAfterRecovery && transitionSubmissions.length > 0) ||
+            historyMutationInFlight ||
+            isTurnBusy()
+          ) {
+            store.pushSystem('wait for the current session mutation to finish before sending an image prompt')
+            return false
+          }
+          return sendPromptNow(text)
+        }
         if (isSessionTransitioning()) {
           return enqueueTransitionSubmission({ kind: 'prompt', text })
         }
@@ -1998,6 +2066,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       }
 
       const startNewLiveSession = async (message?: string, title?: string): Promise<string | undefined> => {
+        if (imageDetachInFlight.size > 0) {
+          store.pushSystem('wait for the image removal before starting another session')
+          return undefined
+        }
+        if (store.state.pendingImages.length > 0) {
+          store.pushSystem('send or remove attached images before starting another session')
+          return undefined
+        }
         if (isSessionTransitioning()) {
           store.pushSystem('a session switch is already in progress')
           return undefined
@@ -2078,6 +2154,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         }
         if (imageAttachInFlight) {
           store.pushSystem('wait for the image attachment before switching live sessions')
+          return
+        }
+        if (imageDetachInFlight.size > 0) {
+          store.pushSystem('wait for the image removal before switching live sessions')
+          return
+        }
+        if (store.state.pendingImages.length > 0) {
+          store.pushSystem('send or remove attached images before switching live sessions')
           return
         }
         if (historyMutationInFlight) {
@@ -2296,7 +2380,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('error: invalid response: image.attach')
           return
         }
-        store.pushSystem(attachedImageNotice(response))
+        if (response.attached && response.path) store.addPendingImage(response)
+        else store.pushSystem(response.message || 'image attach failed')
         if (response.remainder) store.replaceComposerDraft(response.remainder)
       }
       const configureTerminal = async (target: string): Promise<void> => {
@@ -2451,7 +2536,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         lastUserMessage: () => store.lastUserMessage(),
         trimLastExchange: () => store.trimLastExchange(),
         openExternalEditor,
-        pasteClipboardImage: onImagePaste,
+        pasteClipboardImage: () => void onImagePaste(false),
         attachImage,
         configureTerminal,
         runExternalSetup,
@@ -2541,6 +2626,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // routes through the slash ladder, else a prompt turn.
       const submit = (text: string): boolean => {
         const route = classifySubmit(text)
+        if (route.kind !== 'prompt' && store.state.pendingImages.length > 0) {
+          store.pushSystem('send or remove attached images before running a slash command or shell command')
+          return false
+        }
         if (route.kind === 'shell') {
           runShell(route.payload)
           return true
@@ -2559,6 +2648,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const sendQueuedAt = (index: number): boolean => {
         const sid = gateway.sessionId()
         const queued = store.state.queuedPrompts[index]
+        if (store.state.pendingImages.length > 0) {
+          store.pushSystem('send or remove the composer image before sending queued messages')
+          return false
+        }
         if (
           !sid ||
           store.state.sessionId !== sid ||
@@ -2645,6 +2738,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           !automaticQueueDrain.canDrain() ||
           isSessionTransitioning() ||
           historyMutationInFlight ||
+          store.state.pendingImages.length > 0 ||
           pendingPrompt !== undefined ||
           isTurnBusy() ||
           !gateway.sessionId()
@@ -2786,6 +2880,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   sessionId={() => gateway.sessionId()}
                   history={history}
                   onImagePaste={onImagePaste}
+                  onImageDetach={onImageDetach}
                   onOpenEditor={draft => void openExternalEditor(draft)}
                   pasteStore={pasteStore}
                   onPasteLimitExceeded={showPasteLimit}

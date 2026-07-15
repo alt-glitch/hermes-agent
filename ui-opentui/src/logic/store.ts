@@ -153,6 +153,19 @@ export interface Message {
   timestamp?: number
 }
 
+/** An image queued on the gateway for the next prompt, mirrored locally so the
+ * composer can render and remove it before submission. The literal token is
+ * part of the draft, matching the OpenCode/free-code attachment affordance. */
+export interface PendingImageAttachment {
+  readonly id: number
+  readonly token: string
+  readonly path: string
+  readonly name?: string
+  readonly width?: number
+  readonly height?: number
+  readonly tokenEstimate?: number
+}
+
 /** Local destructive-confirm copy/styling (gateway prompts use their own types). */
 export interface ConfirmSpec {
   readonly title: string
@@ -523,6 +536,9 @@ export interface StoreState {
    *  composer unmounting when a blocking prompt (clarify/approval) replaces it
    *  in the <Switch>. Restored on the next composer mount; cleared on submit. */
   composerDraft: string
+  /** Images queued for this session's next prompt. Session-owned: never carry
+   * them across clear/new/resume boundaries. */
+  pendingImages: PendingImageAttachment[]
   /** Monotonic imperative-clear signal for Ctrl+C. The native textarea is
    * uncontrolled, so changing only composerDraft would leave visible bytes. */
   composerClearVersion: number
@@ -881,6 +897,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     theme: DEFAULT_THEME,
     prompt: undefined,
     composerDraft: '',
+    pendingImages: [],
     composerClearVersion: 0,
     composerReplaceVersion: 0,
     latestTodos: undefined,
@@ -1642,6 +1659,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.dropped = snapshot.length - capped.length
         draft.prompt = undefined
         draft.composerDraft = ''
+        draft.pendingImages = []
         draft.composerClearVersion += 1
         draft.latestTodos = undefined
         draft.pager = undefined
@@ -2867,6 +2885,47 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('commandCatalog', catalog)
   }
 
+  function addPendingImage(info: {
+    readonly path?: string
+    readonly name?: string
+    readonly width?: number
+    readonly height?: number
+    readonly token_estimate?: number
+  }): PendingImageAttachment | undefined {
+    const path = info.path?.trim()
+    if (!path) return undefined
+    const existing = state.pendingImages.find(image => image.path === path)
+    if (existing) return existing
+    const id = state.pendingImages.reduce((max, image) => Math.max(max, image.id), 0) + 1
+    const image: PendingImageAttachment = {
+      id,
+      token: `[Image #${String(id)}]`,
+      path,
+      ...(info.name ? { name: info.name } : {}),
+      ...(info.width ? { width: info.width } : {}),
+      ...(info.height ? { height: info.height } : {}),
+      ...(info.token_estimate ? { tokenEstimate: info.token_estimate } : {})
+    }
+    setState('pendingImages', current => [...current, image])
+    return image
+  }
+
+  function removePendingImage(path: string): PendingImageAttachment | undefined {
+    const image = state.pendingImages.find(candidate => candidate.path === path)
+    if (!image) return undefined
+    setState('pendingImages', current => current.filter(candidate => candidate.path !== path))
+    return image
+  }
+
+  function restorePendingImage(image: PendingImageAttachment): void {
+    if (state.pendingImages.some(candidate => candidate.path === image.path)) return
+    setState('pendingImages', current => [...current, image].sort((a, b) => a.id - b.id))
+  }
+
+  function clearPendingImages(): void {
+    setState('pendingImages', [])
+  }
+
   /** Replace only the active conversation after a fully-decoded same-SID mutation. */
   function replaceConversationSnapshot(
     snapshot: Message[] | undefined,
@@ -2976,6 +3035,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
     applyDelegationPauseResponse,
     setCatalog,
     setCommandCatalog,
+    addPendingImage,
+    removePendingImage,
+    restorePendingImage,
+    clearPendingImages,
     replaceConversationSnapshot,
     setSessionId,
     setResumeId,

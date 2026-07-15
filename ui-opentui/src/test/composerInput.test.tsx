@@ -396,6 +396,151 @@ describe('external draft clear', () => {
   })
 })
 
+describe('clipboard image attachments', () => {
+  test('Ctrl+V inserts usable clipboard text without creating an image token', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    const hotkeys: boolean[] = []
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App
+            store={store}
+            onImagePaste={hotkey => {
+              hotkeys.push(hotkey === true)
+              return Promise.resolve('clipboard text')
+            }}
+          />
+        </ThemeProvider>
+      ),
+      { height: 30, kittyKeyboard: true, width: 70 }
+    )
+    try {
+      probe.keys.pressKey('v', { ctrl: true })
+      await probe.settle()
+      expect(hotkeys).toEqual([true])
+      expect(store.state.composerDraft).toBe('clipboard text')
+      expect(store.state.pendingImages).toEqual([])
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('Ctrl+V attaches once and renders an inline composer token', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    let pasteCalls = 0
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App
+            store={store}
+            onImagePaste={() => {
+              pasteCalls += 1
+              store.addPendingImage({
+                height: 492,
+                name: 'clip.png',
+                path: '/tmp/clip.png',
+                token_estimate: 340,
+                width: 1660
+              })
+            }}
+          />
+        </ThemeProvider>
+      ),
+      { height: 30, kittyKeyboard: true, width: 70 }
+    )
+    try {
+      probe.keys.pressKey('v', { ctrl: true })
+      await probe.settle()
+      expect(pasteCalls).toBe(1)
+      expect(store.state.composerDraft).toContain('[Image #1]')
+      expect(probe.frame()).toContain('[Image #1]')
+      expect(probe.frame()).not.toContain('image attached')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('deleting an inline token detaches the exact queued image', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    const detached: string[] = []
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App
+            store={store}
+            onImageDetach={path => {
+              detached.push(path)
+              store.removePendingImage(path)
+            }}
+          />
+        </ThemeProvider>
+      ),
+      { height: 30, kittyKeyboard: true, width: 70 }
+    )
+    try {
+      store.addPendingImage({ path: '/tmp/remove-me.png' })
+      await probe.settle()
+      expect(probe.frame()).toContain('[Image #1]')
+      probe.keys.pressKey('BACKSPACE')
+      await probe.settle()
+      expect(detached).toEqual(['/tmp/remove-me.png'])
+      expect(store.state.pendingImages).toEqual([])
+      expect(probe.frame()).not.toContain('[Image #1]')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('accepted image-only submit clears the token but retains ownership until admission', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    const submitted: string[] = []
+    const detached: string[] = []
+    let accept = false
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App
+            store={store}
+            onImageDetach={path => void detached.push(path)}
+            onSubmit={text => {
+              submitted.push(text)
+              return accept
+            }}
+          />
+        </ThemeProvider>
+      ),
+      { height: 30, kittyKeyboard: true, width: 70 }
+    )
+    try {
+      store.addPendingImage({ path: '/tmp/submit.png' })
+      await probe.settle()
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(submitted).toEqual(['[Image #1]'])
+      expect(store.state.pendingImages).toHaveLength(1)
+      expect(probe.frame()).toContain('[Image #1]')
+
+      accept = true
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(submitted).toEqual(['[Image #1]', '[Image #1]'])
+      expect(store.state.pendingImages).toHaveLength(1)
+      expect(probe.frame()).not.toContain('[Image #1]')
+      expect(detached).toEqual([])
+
+      // The entry clears this slice only after the correlated message.start.
+      store.clearPendingImages()
+      expect(store.state.pendingImages).toEqual([])
+    } finally {
+      probe.destroy()
+    }
+  })
+})
+
 describe('height cap + internal scroll (Ink parity: 8 rows)', () => {
   const lines = Array.from({ length: 20 }, (_, i) => `q${String(i + 1).padStart(2, '0')}`)
 

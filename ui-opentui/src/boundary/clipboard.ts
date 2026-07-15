@@ -75,6 +75,46 @@ function copyCandidates(): Array<[string, string[]]> {
   return list
 }
 
+function textCandidates(): Array<[string, string[]]> {
+  const os = platform()
+  if (os === 'darwin') return [['pbpaste', []]]
+  if (os === 'win32') {
+    return [['powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard -Raw']]]
+  }
+  const list: Array<[string, string[]]> = []
+  if (process.env.WSL_INTEROP || process.env.WSL_DISTRO_NAME) {
+    list.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard -Raw']])
+  }
+  if (process.env.WAYLAND_DISPLAY) list.push(['wl-paste', ['--type', 'text']])
+  list.push(['xclip', ['-selection', 'clipboard', '-out']])
+  return list
+}
+
+export function isUsableClipboardText(text: string | undefined): text is string {
+  if (!text || !/[^\s]/u.test(text) || text.includes('\u0000')) return false
+  let suspicious = 0
+  for (const ch of text) {
+    const code = ch.charCodeAt(0)
+    if ((code < 0x20 && ch !== '\n' && ch !== '\r' && ch !== '\t') || ch === '\ufffd') suspicious += 1
+  }
+  return suspicious <= Math.max(2, Math.floor(text.length * 0.02))
+}
+
+/** Explicit Ctrl/Cmd+V text fallback. Native bracketed paste remains the fast
+ * path; this covers terminals (notably macOS) that surface only the hotkey. */
+export async function readClipboardText(): Promise<string | undefined> {
+  for (const [cmd, args] of textCandidates()) {
+    if (!commandExists(cmd)) continue
+    try {
+      const text = (await run(cmd, args)).toString('utf8')
+      if (isUsableClipboardText(text)) return text
+    } catch {
+      // try the next backend
+    }
+  }
+  return undefined
+}
+
 /** Copy `text` to the clipboard: OSC 52 (always) + the first native command that works. */
 export async function writeClipboard(text: string): Promise<void> {
   writeOsc52(text) // primary path — SSH/tmux-safe, no subprocess

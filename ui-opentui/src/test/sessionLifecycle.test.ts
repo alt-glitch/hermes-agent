@@ -268,6 +268,7 @@ describe('resumeSession', () => {
           store.enqueuePrompt('queued during recovery')
           store.setQueueEditIndex(0)
           store.setComposerDraft('edited after recovery started')
+          store.addPendingImage({ height: 20, path: '/tmp/recovery.png', width: 40 })
           return { messages: [], resumed: 'durable-key', session_id: 'replacement-live' } as A
         }),
       sessionId: () => 'dead-live',
@@ -283,6 +284,10 @@ describe('resumeSession', () => {
       assert.deepStrictEqual(store.state.queuedPrompts, ['queued during recovery'])
       assert.strictEqual(store.state.queueEditIndex, 0)
       assert.strictEqual(store.state.composerDraft, 'edited after recovery started')
+      assert.deepStrictEqual(
+        store.state.pendingImages.map(image => ({ path: image.path, token: image.token })),
+        [{ path: '/tmp/recovery.png', token: '[Image #1]' }]
+      )
     })
   })
 
