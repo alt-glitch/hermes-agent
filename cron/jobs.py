@@ -214,7 +214,13 @@ def _job_running_in_this_process(job_id: str) -> bool:
         from cron.scheduler import get_running_job_ids
         return job_id in get_running_job_ids()
     except Exception:
-        return False
+        logger.warning(
+            "Cron running-set liveness check failed for job %r; keeping the "
+            "entry to avoid deleting a possibly live one-shot run",
+            job_id,
+            exc_info=True,
+        )
+        return True
 
 
 def _jobs_lock_file() -> Path:
@@ -1702,7 +1708,12 @@ def run_claim_is_owned(job_id: str, *, expected_token: str) -> bool:
     return False
 
 
-def heartbeat_run_claim(job_id: str, *, expected_token: str) -> bool:
+def heartbeat_run_claim(
+    job_id: str,
+    *,
+    expected_token: str | None = None,
+    expected_owner: str | None = None,
+) -> bool:
     """Refresh a one-shot's ``run_claim`` timestamp while its run is alive.
 
     Called periodically from the scheduler's run monitor (#62002) so a
@@ -1712,9 +1723,11 @@ def heartbeat_run_claim(job_id: str, *, expected_token: str) -> bool:
     while the run is in flight. mark_job_run() clears the claim on completion.
 
     ``expected_token`` is the cryptographically random nonce captured from the
-    dispatched job, not its machine/PID attribution. Returns True only when
-    that exact dispatch still owns the one-shot claim. A matching external
-    ``fire_claim`` is refreshed with it so both trigger paths use one fence.
+    dispatched job and is the stronger fence used by current schedulers.
+    ``expected_owner`` remains accepted for callers holding legacy claims that
+    predate dispatch tokens. When both are supplied, both must match. A matching
+    external ``fire_claim`` is refreshed with the run claim so both trigger
+    paths share one lease.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1725,9 +1738,16 @@ def heartbeat_run_claim(job_id: str, *, expected_token: str) -> bool:
                 return False
             claim = job.get("run_claim")
             if (
-                not expected_token
-                or not isinstance(claim, dict)
-                or claim.get("token") != expected_token
+                not isinstance(claim, dict)
+                or (expected_token is None and expected_owner is None)
+                or (
+                    expected_token is not None
+                    and claim.get("token") != expected_token
+                )
+                or (
+                    expected_owner is not None
+                    and claim.get("by") != expected_owner
+                )
             ):
                 return False
             now = _hermes_now().isoformat()
