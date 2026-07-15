@@ -43,6 +43,7 @@ SHA_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHORT_SHA_RE = __import__("re").compile(r"^[0-9a-fA-F]{7,40}$")
 GATE_SCHEMA_VERSION = 3
 LEASE_TTL_SECONDS = 6 * 60 * 60
+POST_PUBLISH_LEASE_TTL_SECONDS = 15 * 60
 PACKET_TIMEOUT_SECONDS = 4 * 60 * 60
 WORKER_SLOT_COUNT = 2
 NODE26_DIR = Path(
@@ -500,6 +501,13 @@ def renew_lease(
     with _lease_lock(state_dir):
         value = _lease_value(state_dir)
         _validate_lease_value(value, token, now)
+        journal = _load_publish_journal(state_dir)
+        if journal is not None and journal["phase"] in {
+            "prepared",
+            "published",
+            "finalizing",
+        }:
+            ttl_seconds = min(ttl_seconds, POST_PUBLISH_LEASE_TTL_SECONDS)
         value["expires_unix"] = now + ttl_seconds
         _atomic_json(state_dir / "run.lease.json", value)
 
@@ -670,19 +678,26 @@ def _is_focused_contract_command(argv: list[str]) -> bool:
             "::" in arg or arg.endswith(".py") or "/tests/" in f"/{arg}"
             for arg in pytest_args
         )
+    # Run the already-installed Vitest entrypoint directly under pinned Node 26.
+    # The runtime supplies ui-opentui as cwd; no candidate-controlled npm script
+    # or npm-exec package resolution participates in this trusted gate.
     vitest_prefix = [
-        str(NPM26),
-        "--prefix",
-        "ui-opentui",
-        "exec",
-        "vitest",
-        "--",
+        str(NODE26),
+        "node_modules/vitest/vitest.mjs",
         "run",
     ]
-    return argv[: len(vitest_prefix)] == vitest_prefix and any(
-        arg.endswith((".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
-        or "/test" in arg
-        for arg in argv[len(vitest_prefix) :]
+    vitest_args = argv[len(vitest_prefix) :]
+    return (
+        argv[: len(vitest_prefix)] == vitest_prefix
+        and bool(vitest_args)
+        and all(
+            not arg.startswith("-")
+            and (
+                arg.endswith((".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
+                or "/test" in arg
+            )
+            for arg in vitest_args
+        )
     )
 
 
@@ -944,7 +959,13 @@ def ship_candidate(
     # The live token is checked at the last possible point and no replacement
     # holder can take ownership between that check and the remote CAS.
     with _lease_lock(state_dir):
-        _validate_lease_value(_lease_value(state_dir), token, int(time.time()))
+        lease = _lease_value(state_dir)
+        _validate_lease_value(lease, token, int(time.time()))
+        # All expensive implementation and acceptance work is complete. Bound
+        # the only remaining crash window before touching the remote so a
+        # post-push process death can be retried after minutes, not six hours.
+        lease["expires_unix"] = int(time.time()) + POST_PUBLISH_LEASE_TTL_SECONDS
+        _atomic_json(state_dir / "run.lease.json", lease)
         prepared = {
             "schema_version": 1,
             "phase": "prepared",
@@ -2211,7 +2232,13 @@ def run_gate(
             gate_env = (
                 {**os.environ, "PATH": CONTROLLED_PATH}
                 if gate_id.startswith("opentui-")
+                or (gate_id == "focused-contracts" and argv[0] == str(NODE26))
                 else None
+            )
+            command_cwd = (
+                cwd / "ui-opentui"
+                if gate_id == "focused-contracts" and argv[0] == str(NODE26)
+                else cwd
             )
             with output_path.open("wb") as output_handle:
                 if gate_id == "opentui-install":
@@ -2220,7 +2247,7 @@ def run_gate(
                     )
                 result = subprocess.run(
                     argv,
-                    cwd=cwd,
+                    cwd=command_cwd,
                     shell=False,
                     stdout=output_handle,
                     stderr=subprocess.STDOUT,
@@ -2663,19 +2690,33 @@ def main(argv: list[str] | None = None) -> int:
         return returncode
     if args.command == "gate-and-ship":
         renew_lease(args.state, args.token)
-        gate_and_ship(
-            args.repo,
-            args.packet,
-            args.manifest,
-            state_dir=args.state,
-            cwd=args.cwd,
-            base_sha=args.base,
-            candidate_sha=args.candidate,
-            token=args.token,
-            remote=args.remote,
-            branch=args.branch,
-        )
-        renew_lease(args.state, args.token)
+        with run_lock(args.state):
+            validate_lease(args.state, args.token)
+            gate_and_ship(
+                args.repo,
+                args.packet,
+                args.manifest,
+                state_dir=args.state,
+                cwd=args.cwd,
+                base_sha=args.base,
+                candidate_sha=args.candidate,
+                token=args.token,
+                remote=args.remote,
+                branch=args.branch,
+            )
+            # Publication and deterministic cleanup are one trusted CLI
+            # transaction. No release can interleave before finalization.
+            finalize_success(
+                args.repo,
+                args.manifest,
+                state_dir=args.state,
+                evidence_dir=args.manifest.parent,
+                cwd=args.cwd,
+                token=args.token,
+                remote=args.remote,
+                branch=args.branch,
+            )
+            release_lease(args.state, args.token)
         return 0
     if args.command == "renew-lease":
         renew_lease(args.state, args.token)

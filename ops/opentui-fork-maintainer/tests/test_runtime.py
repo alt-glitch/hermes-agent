@@ -218,7 +218,6 @@ def test_worker_and_gate_renewals_bypass_nonblocking_run_lock(
         lambda state, token: renewals.append((state, token)),
     )
     monkeypatch.setattr(runtime, "run_packet", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(runtime, "gate_and_ship", lambda *args, **kwargs: {})
 
     state = tmp_path / "state"
     assert (
@@ -234,6 +233,33 @@ def test_worker_and_gate_renewals_bypass_nonblocking_run_lock(
             str(tmp_path),
         ])
         == 0
+    )
+    assert (
+        runtime.main([
+            "renew-lease",
+            "--state",
+            str(state),
+            "--token",
+            "token",
+        ])
+        == 0
+    )
+    assert renewals == [(state, "token")] * 3
+
+
+def test_gate_cli_finalizes_and_releases_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    write_live_lease(state, token="token")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runtime, "gate_and_ship", lambda *args, **kwargs: calls.append("ship")
+    )
+    monkeypatch.setattr(
+        runtime,
+        "finalize_success",
+        lambda *args, **kwargs: calls.append("finalize"),
     )
     assert (
         runtime.main([
@@ -257,17 +283,8 @@ def test_worker_and_gate_renewals_bypass_nonblocking_run_lock(
         ])
         == 0
     )
-    assert (
-        runtime.main([
-            "renew-lease",
-            "--state",
-            str(state),
-            "--token",
-            "token",
-        ])
-        == 0
-    )
-    assert renewals == [(state, "token")] * 5
+    assert calls == ["ship", "finalize"]
+    assert not (state / "run.lease.json").exists()
 
 
 def test_run_packet_is_fixed_argv_and_lease_bounded(
@@ -351,6 +368,33 @@ def test_focused_contracts_accept_fixed_uv_pytest_dependency() -> None:
     ]
     assert runtime._is_focused_contract_command(argv)
     assert runtime._focused_output_proves_execution(argv, "350 passed in 7.5s\n")
+
+
+def test_focused_contracts_require_package_aware_vitest_command() -> None:
+    test_path = "src/test/approval.test.ts"
+    package_aware = [
+        str(runtime.NODE26),
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        test_path,
+    ]
+    wrong_cwd = [
+        str(runtime.NPM26),
+        "--prefix",
+        "ui-opentui",
+        "exec",
+        "vitest",
+        "--",
+        "run",
+        test_path,
+    ]
+    assert runtime._is_focused_contract_command(package_aware)
+    assert runtime._focused_output_proves_execution(
+        package_aware, "Tests  138 passed (138)\n"
+    )
+    assert not runtime._is_focused_contract_command(wrong_cwd)
+    for escaped in ("--watch", "--config", "-c"):
+        assert not runtime._is_focused_contract_command([*package_aware, escaped])
 
 
 def test_recovered_request_records_hashed_prior_gate_context(tmp_path: Path) -> None:
@@ -1279,9 +1323,107 @@ def test_atomic_gate_and_ship_is_only_publish_cli(
         token="test-token",
     )
     assert remote_sha(repo) == candidate
+    runtime.renew_lease(state, "test-token")
+    lease = json.loads((state / "run.lease.json").read_text())
+    remaining = lease["expires_unix"] - int(runtime.time.time())
+    assert 0 < remaining <= runtime.POST_PUBLISH_LEASE_TTL_SECONDS
     for removed in ("ship", "run-gate"):
         with pytest.raises(SystemExit):
             runtime._parser().parse_args([removed])
+
+
+def test_gate_cli_completes_publish_finalization_and_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="opentui-maint-cli"
+    )
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    claim_backport(state, evidence)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest = evidence / "gate.json"
+
+    assert (
+        runtime.main([
+            "gate-and-ship",
+            "--state",
+            str(state),
+            "--token",
+            "test-token",
+            "--packet",
+            str(packet),
+            "--manifest",
+            str(manifest),
+            "--cwd",
+            str(gate_worktree),
+            "--repo",
+            str(repo),
+            "--base",
+            base,
+            "--candidate",
+            candidate,
+        ])
+        == 0
+    )
+    assert remote_sha(repo) == candidate
+    assert not gate_worktree.exists()
+    assert not (state / "run.lease.json").exists()
+    assert not (state / "run-request.inflight.json").exists()
+    assert (
+        json.loads((state / "publish-journal.json").read_text())["phase"] == "finalized"
+    )
+    assert (
+        json.loads((evidence / "success-finalization.json").read_text())[
+            "candidate_sha"
+        ]
+        == candidate
+    )
+
+
+def test_gate_cli_run_lock_blocks_interleaved_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    write_live_lease(state, token="token")
+
+    def attempt_release(*_args: object, **_kwargs: object) -> None:
+        with pytest.raises(runtime.ControlError, match="holds the nonblocking lock"):
+            runtime.main([
+                "release-lease",
+                "--state",
+                str(state),
+                "--token",
+                "token",
+            ])
+
+    monkeypatch.setattr(runtime, "gate_and_ship", attempt_release)
+    monkeypatch.setattr(runtime, "finalize_success", lambda *args, **kwargs: {})
+    assert (
+        runtime.main([
+            "gate-and-ship",
+            "--state",
+            str(state),
+            "--token",
+            "token",
+            "--packet",
+            str(tmp_path / "packet.json"),
+            "--manifest",
+            str(tmp_path / "gate.json"),
+            "--cwd",
+            str(tmp_path),
+            "--repo",
+            str(tmp_path),
+            "--base",
+            "a" * 40,
+            "--candidate",
+            "b" * 40,
+        ])
+        == 0
+    )
+    assert not (state / "run.lease.json").exists()
 
 
 def test_failed_atomic_gate_never_moves_remote(
