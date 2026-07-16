@@ -643,6 +643,20 @@ def test_terminal_task_cwd_ssh_falls_back_to_config(monkeypatch):
     assert server._terminal_task_cwd({"cwd": "/some/host/dir"}) == remote
 
 
+def test_terminal_task_cwd_uses_config_backend_when_env_is_unset(monkeypatch):
+    """In-process dashboard/TUI consumers honor a configured remote backend."""
+    remote = "/remote/workspace/from-config"
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"terminal": {"backend": "ssh", "cwd": remote}},
+    )
+
+    assert server._terminal_task_cwd({"cwd": "/some/host/dir"}) == remote
+
+
 def test_terminal_task_cwd_ssh_sentinel_cwd_falls_back_to_session(monkeypatch):
     """Sentinel/auto cwd values are not real remote paths, so the SSH branch
     must defer to the session cwd rather than registering a meaningless dir."""
