@@ -45,7 +45,7 @@ export const SessionCompressResponseSchema = Schema.StructWithRest(
     messages: opt(Schema.Array(Schema.Unknown)),
     removed: opt(NonNegativeInt),
     session_key: opt(Str),
-    status: opt(Schema.Literal('compressed')),
+    status: opt(Schema.Literals(['compressed', 'aborted'])),
     summary: opt(SummarySchema),
     usage: opt(UsageSchema)
   }),

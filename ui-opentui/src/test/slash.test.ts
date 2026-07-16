@@ -969,6 +969,13 @@ describe('dispatchSlash — client commands', () => {
     ])
     expect(sparse.compressionKeys).toEqual(['durable-rotated'])
     expect(sparse.system).toEqual(['compressed 2 messages · 1.5k tok'])
+
+    const aborted = makeCtx(async () => ({ removed: 0, status: 'aborted' }))
+    aborted.history.value = [{ role: 'user', text: 'unchanged after abort' }]
+    await dispatchSlash('/compress', aborted.ctx)
+    expect(aborted.history.value[0]?.text).toBe('unchanged after abort')
+    expect(aborted.compressionMutations).toEqual([])
+    expect(aborted.system).toEqual(['nothing to compress'])
   })
 
   test('/compress leaves history intact on malformed/error/stale responses and respects guards', async () => {
