@@ -77,7 +77,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
       await h.settle()
       expect(calls).toBe(1)
       resolveResponse?.(true)
-      await new Promise(resolve => setTimeout(resolve, 5))
+      await expect.poll(() => store.state.prompt).toBeUndefined()
       await h.settle()
       expect(store.state.prompt).toBeUndefined()
     } finally {
