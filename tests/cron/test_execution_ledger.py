@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 import os
 import sqlite3
 import subprocess
@@ -237,13 +238,22 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     assert "submit-fail" not in scheduler.get_running_job_ids()
 
 
-def test_ledger_creation_failure_releases_guard_and_allows_retry(monkeypatch, tmp_path):
+def test_ledger_creation_failure_keeps_recurring_job_due_for_retry(monkeypatch, tmp_path):
+    import cron.jobs as jobs
     import cron.scheduler as scheduler
 
-    job = {
-        "id": "ledger-fail",
-        "run_claim": {"token": "one-shot-claim"},
-    }
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+
+    job = jobs.create_job(prompt="ledger retry", schedule="every 1h")
+    stored = jobs.load_jobs()
+    due_at = (jobs._hermes_now() - timedelta(minutes=1)).isoformat()
+    stored[0]["next_run_at"] = due_at
+    jobs.save_jobs(stored)
+    assert [item["id"] for item in jobs.get_due_jobs()] == [job["id"]]
+
     attempts = []
 
     def fail_ledger_creation(job_id, *, source):
@@ -253,22 +263,57 @@ def test_ledger_creation_failure_releases_guard_and_allows_retry(monkeypatch, tm
     monkeypatch.setattr(scheduler, "_running_job_ids", set())
     monkeypatch.setattr(scheduler, "_running_run_claim_tokens", {})
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [job])
-    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
     monkeypatch.setattr(scheduler, "create_execution", fail_ledger_creation)
-    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: object())
 
     for expected_attempts in (1, 2):
         with __import__("pytest").raises(sqlite3.OperationalError, match="database is locked"):
             scheduler.tick(verbose=False, sync=False)
         assert scheduler.get_running_job_ids() == frozenset()
         assert scheduler._running_run_claim_tokens == {}
+        assert jobs.get_job(job["id"])["next_run_at"] == due_at
+        assert [item["id"] for item in jobs.get_due_jobs()] == [job["id"]]
         assert len(attempts) == expected_attempts
 
     assert attempts == [
-        ("ledger-fail", "builtin"),
-        ("ledger-fail", "builtin"),
+        (job["id"], "builtin"),
+        (job["id"], "builtin"),
     ]
+
+
+def test_schedule_advance_failure_finishes_attempt_and_releases_guard(monkeypatch):
+    import cron.scheduler as scheduler
+
+    finished = []
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-advance-fail"},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "advance-fail"}])
+    monkeypatch.setattr(
+        scheduler,
+        "advance_next_run",
+        lambda _job_id: (_ for _ in ()).throw(OSError("jobs store unavailable")),
+    )
+
+    with __import__("pytest").raises(OSError, match="jobs store unavailable"):
+        scheduler.tick(verbose=False, sync=False)
+
+    assert finished == [
+        (
+            "exec-advance-fail",
+            {
+                "success": False,
+                "error": "Schedule advance failed: jobs store unavailable",
+            },
+        )
+    ]
+    assert "advance-fail" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):

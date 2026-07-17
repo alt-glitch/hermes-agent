@@ -3706,9 +3706,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Chronos) run the identical sequence — no duplicated correctness.
 
     It does NOT decide whether the job is due, claim it, or compute the next
-    run — those are the caller's concern (``tick`` advances ``next_run_at``
-    under the file lock before dispatch; an external provider claims via the
-    store CAS). This function only fires the given job once.
+    run — those are the caller's concern (``tick`` records an execution and
+    advances ``next_run_at`` under the file lock before executor dispatch; an
+    external provider claims via the store CAS). This function only fires the
+    given job once.
 
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
@@ -4010,14 +4011,6 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
-        for job in due_jobs:
-            advance_next_run(job["id"])
-
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
@@ -4083,24 +4076,46 @@ def tick(
                     job.get("name", job_id),
                 )
                 return None
+            already_running = False
             with _running_lock:
                 if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                    return None
-                _running_job_ids.add(job_id)
-                run_claim = job.get("run_claim")
-                if isinstance(run_claim, dict) and run_claim.get("token"):
-                    _running_run_claim_tokens[job_id] = str(
-                        run_claim["token"]
-                    )
-            # Record the attempt before executor dispatch. Recovery classifies
-            # abandoned records as unknown; it never automatically retries them.
+                    already_running = True
+                else:
+                    _running_job_ids.add(job_id)
+                    run_claim = job.get("run_claim")
+                    if isinstance(run_claim, dict) and run_claim.get("token"):
+                        _running_run_claim_tokens[job_id] = str(
+                            run_claim["token"]
+                        )
+            if already_running:
+                logger.info("Job %s already running — skipping", job.get("name", job_id))
+                # Keep recurring schedules ahead of the grace window while a
+                # previous invocation is still active. This is not a new
+                # execution attempt, so it intentionally has no new ledger row.
+                advance_next_run(job_id)
+                return None
+
+            # Persist the attempt before mutating its recurring schedule. If the
+            # durable claim cannot be recorded, the job stays due and a later
+            # tick can retry instead of silently skipping an occurrence.
             try:
                 execution = create_execution(job_id, source="builtin")
             except Exception:
                 with _running_lock:
                     _running_job_ids.discard(job_id)
                     _running_run_claim_tokens.pop(job_id, None)
+                raise
+            try:
+                advance_next_run(job_id)
+            except Exception as advance_err:
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                    _running_run_claim_tokens.pop(job_id, None)
+                _finish_execution_best_effort(
+                    execution["id"],
+                    success=False,
+                    error=f"Schedule advance failed: {advance_err}",
+                )
                 raise
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
