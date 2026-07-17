@@ -380,6 +380,10 @@ _running_lock = threading.Lock()
 # plausible-looking final response from truncated output — can never
 # overwrite the interrupted status with a false "ok" (#60432).
 _interrupted_job_ids: set = set()
+_INTERRUPTED_EXECUTION_ERROR = (
+    "Interrupted by gateway shutdown before the run finished "
+    "(tool subprocess was killed mid-flight)."
+)
 
 
 def get_running_job_ids() -> "frozenset[str]":
@@ -3855,10 +3859,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # right before mark_job_run below.
             if success and _is_interrupted(job["id"]):
                 success = False
-                error = (
-                    "Interrupted by gateway shutdown before the run finished "
-                    "(tool subprocess was killed mid-flight)."
-                )
+                error = _INTERRUPTED_EXECUTION_ERROR
 
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
@@ -3925,7 +3926,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             _finish_execution_best_effort(execution_id, success=success, error=error)
             return True
 
-        if not _consume_interrupted_flag(job["id"]):
+        interrupted = _consume_interrupted_flag(job["id"])
+        if interrupted:
+            # Shutdown may land after the earlier delivery-time peek. The
+            # shutdown path already persisted the job-store failure; mirror it
+            # into the immutable execution ledger instead of recording stale
+            # success from the agent result.
+            success = False
+            error = error or _INTERRUPTED_EXECUTION_ERROR
+        else:
             try:
                 _mark_this_dispatch(success, error, delivery_error=delivery_error)
             except Exception as mark_error:
@@ -4130,23 +4139,20 @@ def tick(
                     _running_job_ids.discard(job_id)
                     _running_run_claim_tokens.pop(job_id, None)
                 raise
-            try:
-                advance_next_run(job_id)
-            except Exception as advance_err:
-                with _running_lock:
-                    _running_job_ids.discard(job_id)
-                    _running_run_claim_tokens.pop(job_id, None)
-                _finish_execution_best_effort(
-                    execution["id"],
-                    success=False,
-                    error=f"Schedule advance failed: {advance_err}",
-                )
-                raise
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
+            start_gate = threading.Event()
+            dispatch_cancelled = threading.Event()
 
             def _run_and_release(j=dispatched_job, ctx=_ctx):
                 try:
+                    # ``submit`` must succeed before the recurring schedule is
+                    # advanced, but the worker must not run side effects until
+                    # that advance is durable. This gate closes both crash
+                    # windows without needing an unsafe schedule rollback.
+                    start_gate.wait()
+                    if dispatch_cancelled.is_set():
+                        return False
                     return ctx.run(_process_job, j)
                 finally:
                     with _running_lock:
@@ -4154,7 +4160,7 @@ def tick(
                         _running_run_claim_tokens.pop(j["id"], None)
 
             try:
-                return pool.submit(_run_and_release)
+                future = pool.submit(_run_and_release)
             except Exception as submit_err:
                 with _running_lock:
                     _running_job_ids.discard(job_id)
@@ -4178,6 +4184,23 @@ def tick(
                     submit_err,
                 )
                 return None
+
+            try:
+                advance_next_run(job_id)
+            except BaseException as advance_err:
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                    _running_run_claim_tokens.pop(job_id, None)
+                dispatch_cancelled.set()
+                start_gate.set()
+                _finish_execution_best_effort(
+                    execution["id"],
+                    success=False,
+                    error=f"Schedule advance failed: {advance_err}",
+                )
+                raise
+            start_gate.set()
+            return future
 
         # Sequential pass for env-mutating (workdir) jobs.
         # Queued to a persistent single-thread pool so they run one at a time

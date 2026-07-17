@@ -19,15 +19,32 @@ from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+def _current_executions_file() -> Path:
+    """Resolve the ledger beside the active context-local cron store.
+
+    ``EXECUTIONS_FILE`` remains a compatibility seam for tests/embedders that
+    deliberately re-point the module constant. Otherwise follow
+    ``use_cron_store()`` and late profile changes exactly like jobs.json does.
+    """
+    configured = Path(EXECUTIONS_FILE)
+    if configured != _IMPORT_EXECUTIONS_FILE:
+        return configured
+    from cron.jobs import _current_cron_store
+
+    return _current_cron_store().cron_dir / "executions.db"
+
+
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    executions_file = _current_executions_file()
+    executions_file.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(executions_file, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")

@@ -604,10 +604,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
 def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
-    Atomically claims the job first via ``claim_job_for_fire`` — the same
-    at-most-once CAS the scheduler/external-provider fire path uses — so a
-    concurrently-running gateway ticker cannot also fire it (the claim both
-    blocks a duplicate fire and advances ``next_run_at`` for recurring jobs).
+    Persists an execution attempt before atomically claiming the job via
+    ``claim_job_for_fire`` — the same at-most-once CAS the scheduler and
+    external-provider paths use. This keeps a ledger failure from consuming a
+    recurring occurrence while still preventing concurrent duplicate fires.
     If the claim is lost (another fire is in flight), this is a no-op.
 
     The actual firing is delegated to ``run_one_job`` — the single shared
@@ -618,11 +618,20 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    execution_id = None
     try:
-        from cron.scheduler import run_one_job
+        from cron.executions import create_execution
+        from cron.scheduler import _finish_execution_best_effort, run_one_job
 
+        # Persist the attempt before the CAS can claim or advance the schedule.
+        execution_id = create_execution(job_id, source="manual")["id"]
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
+            _finish_execution_best_effort(
+                execution_id,
+                success=False,
+                error="Dispatch claim rejected; execution was not started.",
+            )
             # claim_job_for_fire returns False for paused/disabled/missing
             # jobs too — don't mislabel those as "already being fired"
             # (#60703): that message sends the user chasing a phantom
@@ -638,7 +647,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        processed = run_one_job(dict(job, execution_id=execution_id))
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -649,6 +658,14 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
+        if execution_id is not None:
+            try:
+                from cron.scheduler import _finish_execution_best_effort
+                _finish_execution_best_effort(
+                    execution_id, success=False, error=str(e)
+                )
+            except Exception:
+                pass
         try:
             mark_job_run(job_id, False, str(e))
         except Exception:

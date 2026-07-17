@@ -102,15 +102,37 @@ class CronScheduler(ABC):
         """
         from cron.jobs import claim_job_for_fire, get_job
         from cron.executions import create_execution
-        from cron.scheduler import run_one_job
+        from cron.scheduler import _finish_execution_best_effort, run_one_job
 
-        if not claim_job_for_fire(job_id):
-            return False  # another machine already claimed this fire
-        job = get_job(job_id)
-        if job is None:
-            return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-        return run_one_job(job, adapters=adapters, loop=loop)
+        # Refuse obviously stale signals before creating audit noise, then persist
+        # the attempt BEFORE the CAS mutates fire_claim/next_run_at. A locked or
+        # corrupt ledger therefore leaves the occurrence untouched and retryable.
+        if get_job(job_id) is None:
+            return False
+        execution = create_execution(job_id, source=self.name)
+        try:
+            if not claim_job_for_fire(job_id):
+                _finish_execution_best_effort(
+                    execution["id"],
+                    success=False,
+                    error="Dispatch claim rejected; execution was not started.",
+                )
+                return False
+            job = get_job(job_id)
+            if job is None:
+                _finish_execution_best_effort(
+                    execution["id"],
+                    success=False,
+                    error="Job disappeared after dispatch claim.",
+                )
+                return False
+            job["execution_id"] = execution["id"]
+            return run_one_job(job, adapters=adapters, loop=loop)
+        except Exception as exc:
+            _finish_execution_best_effort(
+                execution["id"], success=False, error=str(exc)
+            )
+            raise
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):

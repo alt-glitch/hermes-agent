@@ -402,6 +402,32 @@ def test_fire_due_missing_job_does_not_run(monkeypatch):
     assert ran == []
 
 
+def test_fire_due_ledger_failure_does_not_claim_or_advance(monkeypatch, tmp_path):
+    import pytest
+    import cron.executions as executions
+    import cron.jobs as jobs
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    with jobs.use_cron_store(tmp_path):
+        job = jobs.create_job(prompt="external retry", schedule="every 1h")
+        before = jobs.get_job(job["id"])
+        monkeypatch.setattr(
+            executions,
+            "create_execution",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("ledger unavailable")
+            ),
+        )
+
+        with pytest.raises(OSError, match="ledger unavailable"):
+            InProcessCronScheduler().fire_due(job["id"])
+
+        after = jobs.get_job(job["id"])
+        assert after["next_run_at"] == before["next_run_at"]
+        assert after.get("fire_claim") is None
+        assert after.get("run_claim") is None
+
+
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──
 
 

@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 
@@ -16,6 +17,27 @@ def _point_ledger(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
+
+
+def test_execution_ledger_follows_context_local_cron_store(tmp_path):
+    import cron.executions as executions
+    import cron.jobs as jobs
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    with jobs.use_cron_store(profile_a):
+        first = executions.create_execution("job-a", source="builtin")
+        assert [row["id"] for row in executions.list_executions()] == [first["id"]]
+    with jobs.use_cron_store(profile_b):
+        second = executions.create_execution("job-b", source="builtin")
+        assert [row["id"] for row in executions.list_executions()] == [second["id"]]
+
+    assert (profile_a / "cron" / "executions.db").is_file()
+    assert (profile_b / "cron" / "executions.db").is_file()
+    with jobs.use_cron_store(profile_a):
+        assert executions.latest_execution("job-b") is None
+    with jobs.use_cron_store(profile_b):
+        assert executions.latest_execution("job-a") is None
 
 
 def test_execution_transitions_are_durable(monkeypatch, tmp_path):
@@ -208,14 +230,28 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     assert [r["status"] for r in records] == ["unknown"]
 
 
-def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
+def test_generic_submit_failure_keeps_recurring_job_due(monkeypatch, tmp_path):
+    import cron.jobs as jobs
     import cron.scheduler as scheduler
 
     class BrokenPool:
         def submit(self, _callable):
             raise ValueError("executor rejected")
 
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    job = jobs.create_job(prompt="submit retry", schedule="every 1h")
+    stored = jobs.load_jobs()
+    due_at = (jobs._hermes_now() - timedelta(minutes=1)).isoformat()
+    stored[0]["next_run_at"] = due_at
+    jobs.save_jobs(stored)
+
     finished = []
+    monkeypatch.setattr(scheduler, "_running_job_ids", set())
+    monkeypatch.setattr(scheduler, "_running_run_claim_tokens", {})
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
         scheduler, "create_execution",
         lambda *_args, **_kwargs: {"id": "exec-submit-fail"},
@@ -224,18 +260,18 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         scheduler, "finish_execution",
         lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
     )
-    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
-    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
     assert scheduler.tick(verbose=False, sync=False) == 0
+    assert jobs.get_job(job["id"])["next_run_at"] == due_at
+    assert [item["id"] for item in jobs.get_due_jobs()] == [job["id"]]
     assert finished == [
         ("exec-submit-fail", {
             "success": False,
             "error": "Executor dispatch failed: executor rejected",
         })
     ]
-    assert "submit-fail" not in scheduler.get_running_job_ids()
+    assert job["id"] not in scheduler.get_running_job_ids()
 
 
 def test_ledger_creation_failure_keeps_recurring_job_due_for_retry(monkeypatch, tmp_path):
@@ -414,6 +450,71 @@ def test_job_store_double_failure_still_finalizes_execution(monkeypatch):
             {"success": False, "error": "jobs store unavailable"},
         )
     ]
+
+
+def test_late_shutdown_interruption_finalizes_execution_failed(monkeypatch):
+    import cron.scheduler as scheduler
+
+    delivery_entered = threading.Event()
+    release_delivery = threading.Event()
+    marks = []
+    finishes = []
+    results = []
+    job_id = "late-interrupt"
+
+    monkeypatch.setattr(scheduler, "_running_job_ids", {job_id})
+    monkeypatch.setattr(scheduler, "_running_run_claim_tokens", {})
+    monkeypatch.setattr(scheduler, "_interrupted_job_ids", set())
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+
+    def block_delivery(*_args, **_kwargs):
+        delivery_entered.set()
+        assert release_delivery.wait(timeout=5)
+        return None
+
+    monkeypatch.setattr(scheduler, "_deliver_result", block_delivery)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_job_run",
+        lambda jid, success, error=None, **_kwargs: marks.append((jid, success, error)) or True,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finishes.append((execution_id, kwargs)),
+    )
+
+    worker = threading.Thread(
+        target=lambda: results.append(
+            scheduler.run_one_job({"id": job_id, "execution_id": "exec-interrupt"})
+        )
+    )
+    worker.start()
+    assert delivery_entered.wait(timeout=5)
+    assert scheduler.mark_running_jobs_interrupted("gateway shutdown") == [job_id]
+    release_delivery.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    assert results == [True]
+    assert marks == [(job_id, False, "gateway shutdown")]
+    assert finishes == [
+        (
+            "exec-interrupt",
+            {
+                "success": False,
+                "error": scheduler._INTERRUPTED_EXECUTION_ERROR,
+            },
+        )
+    ]
+    assert scheduler._interrupted_job_ids == set()
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
