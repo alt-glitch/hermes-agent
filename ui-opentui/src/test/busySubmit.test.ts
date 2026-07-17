@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from 'vitest'
 
 import { GatewayError } from '../boundary/errors.ts'
 import {
+  acceptedSteerNotice,
   advancePreStartCancellationFence,
   cancelledPreStartInfoIsStale,
   createAutomaticQueueDrainGate,
@@ -53,6 +54,15 @@ function host(overrides: Partial<BusySubmitHost> = {}) {
 const tick = () => new Promise(resolve => setTimeout(resolve, 0))
 
 describe('busy submit policy', () => {
+  test('accepted steer feedback is immediate and bounded while the tool is running', () => {
+    expect(acceptedSteerNotice('check the failing branch')).toBe(
+      'steer accepted — waiting for next tool boundary: "check the failing branch"'
+    )
+    expect(acceptedSteerNotice('x'.repeat(80))).toBe(
+      `steer accepted — waiting for next tool boundary: "${'x'.repeat(50)}…"`
+    )
+  })
+
   test('an explicit clean-row send cannot reopen drain for an uncertain sibling', () => {
     const gate = createAutomaticQueueDrainGate()
 

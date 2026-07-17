@@ -6,6 +6,14 @@ import type { BusyInputMode } from './busyQueue.ts'
 
 export type SteerDelivery = 'accepted' | 'fallback' | 'retained' | 'uncertain'
 
+/** Immediate, bounded feedback while an accepted steer waits for the current
+ * tool/API boundary. The correlation-backed row is retired by the store only
+ * when a lifecycle event carries this steer submission id. */
+export function acceptedSteerNotice(text: string): string {
+  const preview = `${text.slice(0, 50)}${text.length > 50 ? '…' : ''}`
+  return `steer accepted — waiting for next tool boundary: "${preview}"`
+}
+
 export interface AutomaticQueueDrainGate {
   /** False means every retained row requires an explicit user send/delete. */
   readonly canDrain: () => boolean
