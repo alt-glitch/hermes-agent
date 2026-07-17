@@ -3783,17 +3783,6 @@ def _session_info(agent, session: dict | None = None) -> dict:
         yolo = bool(_YOLO_MODE_FROZEN) or session_yolo or approval_mode == "off"
     except Exception:
         yolo = False
-    # Session title (DB row, falling back to a not-yet-applied pending_title).
-    # Drives client window-title chrome (OSC 0/2 in the native TUI); "" until
-    # the first exchange titles the session.
-    title = ""
-    if session is not None:
-        try:
-            title = _session_live_title(
-                session, str(session.get("session_key") or "")
-            )
-        except Exception:
-            title = ""
     info: dict = {
         "model": mirror.get("model", getattr(agent, "model", "")),
         "provider": mirror.get("provider", getattr(agent, "provider", "")),
@@ -3807,7 +3796,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "personality": str(personality or ""),
-        "title": title,
+        "title": _session_live_title(session or {}, session_key) if session_key else "",
         "running": bool((session or {}).get("running")),
         "stored_session_id": session_key or "",
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
@@ -6023,6 +6012,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session["running"] = False
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
+            else:
+                client_submission_ids = list(
+                    queued.get("client_submission_ids") or []
+                )
+                if client_submission_ids:
+                    _emit(
+                        "message.start",
+                        sid,
+                        {"client_submission_ids": client_submission_ids},
+                    )
         else:
             client_submission_ids = list(
                 queued.get("client_submission_ids") or []
