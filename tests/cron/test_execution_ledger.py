@@ -379,6 +379,43 @@ def test_run_one_job_ledger_finish_failure_does_not_rewrite_success(monkeypatch)
     assert finish_attempts == [(True, None)]
 
 
+def test_job_store_double_failure_still_finalizes_execution(monkeypatch):
+    import cron.scheduler as scheduler
+
+    mark_attempts = []
+    finish_attempts = []
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+
+    def fail_mark(_job_id, success, error=None, **_kwargs):
+        mark_attempts.append((success, error))
+        raise OSError("jobs store unavailable")
+
+    monkeypatch.setattr(scheduler, "mark_job_run", fail_mark)
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finish_attempts.append((execution_id, kwargs)),
+    )
+
+    assert scheduler.run_one_job(
+        {"id": "job-store-fail", "execution_id": "exec-store-fail"}
+    ) is False
+    assert mark_attempts == [(True, None)]
+    assert finish_attempts == [
+        (
+            "exec-store-fail",
+            {"success": False, "error": "jobs store unavailable"},
+        )
+    ]
+
+
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
     import cron.scheduler_provider as provider
 

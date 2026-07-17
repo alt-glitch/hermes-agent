@@ -3926,15 +3926,40 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             return True
 
         if not _consume_interrupted_flag(job["id"]):
-            _mark_this_dispatch(success, error, delivery_error=delivery_error)
+            try:
+                _mark_this_dispatch(success, error, delivery_error=delivery_error)
+            except Exception as mark_error:
+                logger.error(
+                    "Failed to persist terminal state for job %s: %s",
+                    job["id"],
+                    mark_error,
+                )
+                _finish_execution_best_effort(
+                    execution_id, success=False, error=str(mark_error)
+                )
+                return False
         _finish_execution_best_effort(execution_id, success=success, error=error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        if not _consume_interrupted_flag(job["id"]):
-            _mark_this_dispatch(False, str(e))
-        _finish_execution_best_effort(execution_id, success=False, error=str(e))
+        try:
+            if not _consume_interrupted_flag(job["id"]):
+                _mark_this_dispatch(False, str(e))
+        except Exception as mark_error:
+            logger.error(
+                "Failed to persist failure state for job %s: %s",
+                job["id"],
+                mark_error,
+            )
+        finally:
+            # The execution ledger must reach a terminal state even when the
+            # jobs store is unavailable. Recovery deliberately leaves records
+            # owned by this live process alone, so skipping this finalization
+            # would strand the attempt as running indefinitely.
+            _finish_execution_best_effort(
+                execution_id, success=False, error=str(e)
+            )
         return False
 
 
