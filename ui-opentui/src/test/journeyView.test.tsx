@@ -33,6 +33,32 @@ const FRAME = {
   summary: ['2 learnings']
 }
 
+const CROWDED_FRAME = {
+  ...FRAME,
+  buckets: [
+    {
+      ...FRAME.buckets[0],
+      nodes: [
+        {
+          glyph: '◆',
+          id: 'm-long',
+          label: `FIRST ROW ${'long label '.repeat(18)}TAIL_SHOULD_BE_CLIPPED`,
+          meta: 'profile memory · 16 Jul 2026',
+          style: 'memory'
+        },
+        { glyph: '✦', id: 's-second', label: 'SECOND ROW', meta: 'skill · 16 Jul 2026', style: 'skill' }
+      ]
+    }
+  ],
+  count: 2,
+  frames: [
+    {
+      grid: [[[` chart ${'━'.repeat(120)}CHART_TAIL_SHOULD_BE_CLIPPED`, 'dim']], [[' chart two', 'dim']]]
+    }
+  ],
+  summary: [`2 learnings · ${'summary '.repeat(20)}SUMMARY_TAIL_SHOULD_BE_CLIPPED`]
+}
+
 interface Harness {
   readonly closed: { value: number }
   readonly deletes: string[]
@@ -120,6 +146,25 @@ describe('JourneyOverlay', () => {
       h.probe.keys.pressEnter()
       await h.probe.settle()
       expect(h.probe.frame()).toContain('detail for s1')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('keeps chart, summary, and timeline entries inside single allocated rows', async () => {
+    const h = await mount({ frames: async () => CROWDED_FRAME }, { height: 24, width: 90 })
+    try {
+      await h.probe.settle()
+      const lines = h.probe.frame().split('\n')
+      const chart = lines.findIndex(line => line.includes('chart '))
+      const chartTwo = lines.findIndex(line => line.includes('chart two'))
+      const first = lines.findIndex(line => line.includes('FIRST ROW'))
+      const second = lines.findIndex(line => line.includes('SECOND ROW'))
+      expect(chartTwo).toBe(chart + 1)
+      expect(lines.filter(line => line.includes('summary')).length).toBe(1)
+      expect(first).toBeGreaterThan(-1)
+      expect(second).toBe(first + 1)
+      expect(lines[second]).not.toContain('FIRST ROW')
     } finally {
       h.probe.destroy()
     }

@@ -44,12 +44,15 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
   const theme = useTheme(),
     dims = useDimensions()
   let root: BoxRenderable | undefined,
+    listBox: BoxRenderable | undefined,
     editor: TextareaRenderable | undefined,
     detailScroll: ScrollBoxRenderable | undefined
   let loadGeneration = 0
   let disposed = false
+  let pendingListHeight: number | undefined
   const [data, setData] = createSignal<JourneyFrames>()
   const [cursor, setCursor] = createSignal(0)
+  const [listHeight, setListHeight] = createSignal(4)
   const [mode, setMode] = createSignal<'timeline' | 'detail' | 'edit'>('timeline')
   const [loading, setLoading] = createSignal(true),
     [busy, setBusy] = createSignal(false),
@@ -237,19 +240,33 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
     }
   })
   const visible = createMemo(() => {
-    const h = Math.max(4, dims().height - 12),
+    const h = Math.max(1, listHeight()),
       s = journeyWindowStart(cursor(), rows().length, h)
     return rows()
       .slice(s, s + h)
       .map((row, i) => ({ row, index: s + i }))
   })
+  const syncListHeight = () => {
+    const measured = Math.floor(listBox?.height ?? 0)
+    const next = Number.isFinite(measured) && measured > 0 ? measured : 1
+    if (next === listHeight() || next === pendingListHeight) return
+    pendingListHeight = next
+    // onSizeChange fires inside Yoga's active layout pass. Mutating the Solid
+    // tree synchronously from that callback can feed negative/transient
+    // coordinates into the native hit grid, so commit after the pass returns.
+    queueMicrotask(() => {
+      const measured = pendingListHeight
+      pendingListHeight = undefined
+      if (!disposed && measured !== undefined && measured !== listHeight()) setListHeight(measured)
+    })
+  }
   return (
     <box
       ref={e => (root = e)}
       border
       style={{ borderColor: theme().color.border, flexDirection: 'column', flexGrow: 1, padding: 1 }}
     >
-      <text fg={theme().color.accent}>
+      <text flexShrink={0} fg={theme().color.accent} truncate wrapMode="none">
         <b>✦ Journey</b>
         <span style={{ fg: theme().color.muted }}> learned skills & memories over time</span>
       </text>
@@ -261,8 +278,8 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
         <text fg={theme().color.muted}>No learning yet — learned skills and memories will map out here.</text>
       </Show>
       <Show when={mode() === 'timeline'}>
-        <box style={{ flexDirection: 'column' }}>
-          <text>
+        <box style={{ flexDirection: 'column', flexShrink: 0, overflow: 'hidden' }}>
+          <text flexShrink={0} truncate wrapMode="none">
             {visual()?.legend.map((item, index) => (
               <span style={{ fg: item.color || theme().color.muted }}>
                 {index ? '   ' : ''}
@@ -271,7 +288,7 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
             ))}
           </text>
           <Show when={visual()?.categories?.length}>
-            <text>
+            <text flexShrink={0} truncate wrapMode="none">
               {visual()?.categories?.map((item, index) => (
                 <span style={{ fg: item.color || theme().color.muted }}>
                   {index ? '  ' : ''}
@@ -281,43 +298,64 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
             </text>
           </Show>
           <Show when={dims().width < 80}>
-            <text fg={theme().color.muted}>starmap hidden below 80 columns · resize to view</text>
+            <text flexShrink={0} fg={theme().color.muted} truncate wrapMode="none">
+              starmap hidden below 80 columns · resize to view
+            </text>
           </Show>
           <For each={chart()}>
             {row => (
-              <text wrapMode="none">
+              <text flexShrink={0} truncate wrapMode="none">
                 {row.map(run => (
                   <span style={{ fg: runColor(run) }}>{run[0]}</span>
                 ))}
               </text>
             )}
           </For>
-          <text wrapMode="none" fg={theme().color.muted}>
-            {visual()?.axis.start}
-            {' '.repeat(
-              Math.max(1, dims().width - 8 - (visual()?.axis.start.length ?? 0) - (visual()?.axis.end.length ?? 0))
-            )}
-            {visual()?.axis.end}
-          </text>
+          <box style={{ flexDirection: 'row', flexShrink: 0, justifyContent: 'space-between', overflow: 'hidden' }}>
+            <text flexShrink={0} fg={theme().color.muted} wrapMode="none">
+              {visual()?.axis.start}
+            </text>
+            <text flexShrink={0} fg={theme().color.muted} wrapMode="none">
+              {visual()?.axis.end}
+            </text>
+          </box>
         </box>
-        <text fg={theme().color.muted}>{data()?.summary.join(' · ')}</text>
-        <For each={visible()}>
-          {item => {
-            const selected = () => item.index === cursor()
-            return (
-              <box
-                onMouseDown={() => setCursor(item.index)}
-                style={{ backgroundColor: selected() ? theme().color.selectionBg : 'transparent' }}
-              >
-                <text fg={selected() ? theme().color.text : theme().color.muted}>
-                  {item.row.kind === 'slice'
-                    ? `${item.row.bucket.label} · ${item.row.bucket.skills} skills · ${item.row.bucket.memories} memories`
-                    : ` ${item.row.last ? '└─' : '├─'} ${item.row.node.glyph} ${item.row.node.fullLabel || item.row.node.label}  ${item.row.node.meta}${item.row.node.body ? ' ›' : ''}`}
-                </text>
-              </box>
-            )
-          }}
-        </For>
+        <text flexShrink={0} fg={theme().color.muted} truncate wrapMode="none">
+          {data()?.summary.join(' · ')}
+        </text>
+        <box
+          ref={e => (listBox = e)}
+          onSizeChange={syncListHeight}
+          style={{ flexDirection: 'column', flexGrow: 1, flexShrink: 1, minHeight: 0, overflow: 'hidden' }}
+        >
+          <For each={visible()}>
+            {item => {
+              const selected = () => item.index === cursor()
+              return (
+                <box
+                  onMouseDown={() => setCursor(item.index)}
+                  style={{
+                    backgroundColor: selected() ? theme().color.selectionBg : 'transparent',
+                    flexShrink: 0,
+                    height: 1,
+                    overflow: 'hidden'
+                  }}
+                >
+                  <text
+                    flexGrow={1}
+                    fg={selected() ? theme().color.text : theme().color.muted}
+                    truncate
+                    wrapMode="none"
+                  >
+                    {item.row.kind === 'slice'
+                      ? `${item.row.bucket.label} · ${item.row.bucket.skills} skills · ${item.row.bucket.memories} memories`
+                      : ` ${item.row.last ? '└─' : '├─'} ${item.row.node.glyph} ${item.row.node.fullLabel || item.row.node.label}  ${item.row.node.meta}${item.row.node.body ? ' ›' : ''}`}
+                  </text>
+                </box>
+              )
+            }}
+          </For>
+        </box>
       </Show>
       <Show when={mode() === 'detail'}>
         <text fg={theme().color.accent}>
@@ -347,7 +385,7 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
         <text fg={theme().color.warn}>Delete “{node()?.fullLabel || node()?.label}”? y confirm · any key cancel</text>
       </Show>
       <Show when={notice()}>{n => <text fg={theme().color.muted}>{n()}</text>}</Show>
-      <text fg={theme().color.muted}>
+      <text flexShrink={0} fg={theme().color.muted} truncate wrapMode="none">
         {mode() === 'timeline'
           ? '↑↓/jk move · Enter open · e edit · d delete · r retry · q close'
           : '↑↓ scroll · e edit · d delete · Esc back · q close'}
