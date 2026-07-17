@@ -673,6 +673,18 @@ def _is_focused_contract_command(argv: list[str]) -> bool:
         # explicit instead of mutating the candidate environment before the
         # trusted gate can run.
         pytest_args = argv[5:]
+    elif argv[:7] == [
+        "uv",
+        "run",
+        "--with",
+        "pytest",
+        "--with",
+        "pytest-asyncio",
+        "pytest",
+    ]:
+        # Async upstream contracts need one additional, fixed plugin. Do not
+        # accept arbitrary repeated --with values at this trust boundary.
+        pytest_args = argv[7:]
     if pytest_args is not None:
         return bool(pytest_args) and any(
             "::" in arg or arg.endswith(".py") or "/tests/" in f"/{arg}"
@@ -711,13 +723,20 @@ def _validate_code_command(gate_id: str, argv: list[str]) -> None:
 
 def _focused_output_proves_execution(argv: list[str], output: str) -> bool:
     plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
-    if argv[:3] == ["uv", "run", "pytest"] or argv[:5] == [
-        "uv",
-        "run",
-        "--with",
-        "pytest",
-        "pytest",
-    ]:
+    if (
+        argv[:3] == ["uv", "run", "pytest"]
+        or argv[:5] == ["uv", "run", "--with", "pytest", "pytest"]
+        or argv[:7]
+        == [
+            "uv",
+            "run",
+            "--with",
+            "pytest",
+            "--with",
+            "pytest-asyncio",
+            "pytest",
+        ]
+    ):
         counts = re.findall(r"\b(\d+)\s+(?:passed|failed|xfailed|xpassed)\b", plain)
         return sum(int(value) for value in counts) > 0
     counts = re.findall(r"\bTests\s+(\d+)\s+(?:passed|failed)\b", plain)

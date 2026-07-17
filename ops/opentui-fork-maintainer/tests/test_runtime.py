@@ -370,6 +370,27 @@ def test_focused_contracts_accept_fixed_uv_pytest_dependency() -> None:
     assert runtime._focused_output_proves_execution(argv, "350 passed in 7.5s\n")
 
 
+def test_focused_contracts_accept_fixed_pytest_asyncio_dependency() -> None:
+    argv = [
+        "uv",
+        "run",
+        "--with",
+        "pytest",
+        "--with",
+        "pytest-asyncio",
+        "pytest",
+        "tests/gateway/test_async.py",
+        "-q",
+    ]
+    assert runtime._is_focused_contract_command(argv)
+    assert runtime._focused_output_proves_execution(argv, "2 passed in 0.2s\n")
+    assert not runtime._is_focused_contract_command([
+        *argv[:5],
+        "arbitrary-package",
+        *argv[6:],
+    ])
+
+
 def test_focused_contracts_require_package_aware_vitest_command() -> None:
     test_path = "src/test/approval.test.ts"
     package_aware = [
