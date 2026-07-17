@@ -237,6 +237,40 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     assert "submit-fail" not in scheduler.get_running_job_ids()
 
 
+def test_ledger_creation_failure_releases_guard_and_allows_retry(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "ledger-fail",
+        "run_claim": {"token": "one-shot-claim"},
+    }
+    attempts = []
+
+    def fail_ledger_creation(job_id, *, source):
+        attempts.append((job_id, source))
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(scheduler, "_running_job_ids", set())
+    monkeypatch.setattr(scheduler, "_running_run_claim_tokens", {})
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [job])
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "create_execution", fail_ledger_creation)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: object())
+
+    for expected_attempts in (1, 2):
+        with __import__("pytest").raises(sqlite3.OperationalError, match="database is locked"):
+            scheduler.tick(verbose=False, sync=False)
+        assert scheduler.get_running_job_ids() == frozenset()
+        assert scheduler._running_run_claim_tokens == {}
+        assert len(attempts) == expected_attempts
+
+    assert attempts == [
+        ("ledger-fail", "builtin"),
+        ("ledger-fail", "builtin"),
+    ]
+
+
 def test_run_one_job_records_running_then_terminal(monkeypatch):
     import cron.scheduler as scheduler
 

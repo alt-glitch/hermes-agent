@@ -4072,7 +4072,13 @@ def tick(
                     )
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except Exception:
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                    _running_run_claim_tokens.pop(job_id, None)
+                raise
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
