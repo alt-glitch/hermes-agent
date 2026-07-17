@@ -313,10 +313,7 @@ export function AgentDetail(props: {
   const filesOverflow = () => Math.max(0, filesRead().length - 8) + Math.max(0, filesWritten().length - 8)
 
   return (
-    <scrollbox
-      ref={props.bindScroll}
-      style={{ flexDirection: 'column', flexGrow: 1, minHeight: 0, paddingBottom: 3, paddingRight: 1 }}
-    >
+    <scrollbox ref={props.bindScroll} style={{ flexGrow: 1, minHeight: 0, paddingBottom: 3, paddingRight: 1 }}>
       <text fg={theme().color.text} wrapMode="word">
         <span style={{ fg: theme().color.accent }}>#{String(props.rowNumber)} </span>
         <span style={{ fg: visual().color }}>{visual().glyph} </span>

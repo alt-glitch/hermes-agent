@@ -364,4 +364,30 @@ describe('native agents dashboard parity', () => {
       probe.destroy()
     }
   })
+
+  test('detail scroll content uses the available tall viewport instead of collapsing trace rows', async () => {
+    const trace = Array.from({ length: 28 }, (_, index) => ({
+      kind: 'progress' as const,
+      text: `TRACE_${String(index).padStart(2, '0')}`
+    }))
+    const probe = await renderProbe(
+      dashboardNode({ subagents: [agent('trace-heavy', 'Inspect the full live trace', { trace })] }),
+      { height: 24, width: 100 }
+    )
+    try {
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect((probe.frame().match(/TRACE_/g) ?? []).length).toBeLessThan(20)
+
+      probe.resize(100, 42)
+      await probe.settle()
+      const frame = probe.frame()
+      expect(frame.match(/TRACE_/g)).toHaveLength(20)
+      expect(frame).toContain('TRACE_08')
+      expect(frame).toContain('TRACE_27')
+      expect(frame).toContain('q close')
+    } finally {
+      probe.destroy()
+    }
+  })
 })
