@@ -53,11 +53,20 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 >
 > **Worktree-aware `hermes`:** the installer writes a regular launcher at
 > `~/.local/bin/hermes` (or the platform command directory). Outside a Hermes
-> checkout it runs the managed install. Inside any Hermes checkout or linked
-> worktree, it runs that exact tree's Python/TUI source, borrowing
-> dependencies from the tree's `.venv`/`venv`, the primary checkout's venv, or
-> finally the managed venv. You do not need to relink `hermes` when switching
-> worktrees; run `hermes --version` from the tree to verify it.
+> checkout it runs the managed install. Inside the explicitly trusted install
+> checkout or any linked worktree, it runs that exact tree's Python/TUI source,
+> borrowing dependencies from the tree's `.venv`/`venv`, the primary checkout's
+> venv, or finally the managed venv. Trust is keyed to Git's common directory,
+> persisted beside the launcher, and never inferred from filenames alone.
+>
+> Register another clone once (for example, an upstream development checkout):
+> ```bash
+> bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
+>   ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes \
+>   ~/github/hermes-agent
+> ```
+> Its linked worktrees then select themselves automatically; unregistered clones
+> continue to use the managed fork.
 >
 > Everything below is the **upstream** install (NousResearch/main — the Ink TUI).
 
@@ -259,11 +268,13 @@ uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
 ```
 
-The installed `~/.local/bin/hermes` launcher is source-aware: after you `cd` into
-this checkout or one of its linked worktrees, bare `hermes` imports that exact
-worktree while reusing an available checkout/managed venv. Outside a Hermes
-checkout it continues to run the managed installation. This makes worktree
-switching automatic without changing global symlinks.
+The installed `~/.local/bin/hermes` launcher explicitly trusts the checkout used
+to install it. After you `cd` into that checkout or one of its linked worktrees,
+bare `hermes` imports that exact tree while reusing an available
+checkout/managed venv. Outside a trusted Hermes checkout it continues to run the
+managed installation. Register a separate clone with
+`scripts/write-hermes-launcher.sh` as shown in Quick Install; trust persists
+across installer reruns.
 
 Manual clone fallback (for throwaway clones/CI where you intentionally do not
 want the managed install layout):

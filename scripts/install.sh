@@ -1761,7 +1761,8 @@ setup_path() {
     # managed install). The generator replaces legacy symlinks without following
     # them, preserving the #21454 symlink-stomp fix.
     bash "$INSTALL_DIR/scripts/write-hermes-launcher.sh" \
-        "$command_link_dir/hermes" "$HERMES_BIN"
+        "$command_link_dir/hermes" "$HERMES_BIN" \
+        "$INSTALL_DIR" "$_SCRIPT_DIR/.."
     log_success "Installed hermes launcher → $command_link_display_dir/hermes"
 
     if [ "$DISTRO" = "termux" ]; then

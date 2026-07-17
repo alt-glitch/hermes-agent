@@ -102,12 +102,14 @@ Do not repoint a global symlink each time you change checkouts. Generate the
 launcher through the same path as `install.sh`:
 ```bash
 bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
-  ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes
+  ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes \
+  /home/daimon/side-quests/hermes-agent /home/daimon/github/hermes-agent
 hash -r
 ```
-Outside a Hermes checkout this runs the managed fork. Inside the primary checkout
-or any linked Hermes worktree it imports that exact tree (including its Python
-gateway and OpenTUI source) while reusing the nearest available venv. Verify with:
+Outside an explicitly trusted Hermes checkout this runs the managed fork. Inside
+the registered fork/upstream clones or any of their linked worktrees it imports
+that exact tree (including its Python gateway and terminal UI source — OpenTUI in
+the fork, Ink upstream) while reusing the nearest available venv. Verify with:
 ```bash
 cd ~/.hermes/hermes-agent && hermes --version
 cd /path/to/a/hermes-worktree && hermes --version

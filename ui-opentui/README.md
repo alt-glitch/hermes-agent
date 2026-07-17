@@ -59,14 +59,22 @@ checkout, install the fork once with `./scripts/install.sh` (or run
 hermes --tui --dev --yolo -w
 ```
 
-The installed launcher is worktree-aware. Inside a Hermes checkout it pins
-`PYTHONPATH`, `HERMES_PYTHON_SRC_ROOT`, and the TUI gateway to that exact tree;
-a linked worktree may reuse the primary checkout's venv, and a tree without a
-local venv may reuse the managed install's interpreter. Outside a Hermes
-checkout the same command runs the managed installation. `-w` separately
-creates an isolated worktree for the *project workspace*; it does not select the
-Hermes runtime. `uv run hermes ...` remains a valid explicit fallback before the
-launcher has been installed.
+The installed launcher is worktree-aware and explicitly trusts the checkout used
+to install it. Inside that checkout or a linked worktree it pins `PYTHONPATH`,
+`HERMES_PYTHON_SRC_ROOT`, and the TUI gateway to that exact tree; a linked
+worktree may reuse the primary checkout's venv, and a tree without a local venv
+may reuse the managed install's interpreter. Unregistered lookalike repositories
+fall back to the managed install. Register a separate upstream clone once with:
+
+```bash
+bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
+  ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes \
+  /path/to/upstream/hermes-agent
+```
+
+`-w` separately creates an isolated worktree for the *project workspace*; it
+does not select the Hermes runtime. `uv run hermes ...` remains a valid explicit
+fallback before the launcher has been installed.
 
 ### Live PTY smoke with terminal-control
 

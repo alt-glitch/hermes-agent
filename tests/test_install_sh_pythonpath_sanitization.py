@@ -26,6 +26,7 @@ def test_hermes_launcher_wrapper_clears_python_env_before_exec() -> None:
     launcher_text = LAUNCHER_GENERATOR.read_text()
 
     assert 'scripts/write-hermes-launcher.sh"' in install_text
+    assert '"$INSTALL_DIR" "$_SCRIPT_DIR/.."' in install_text
     assert "unset PYTHONPATH" in launcher_text
     assert "unset PYTHONHOME" in launcher_text
     assert "export PYTHONSAFEPATH=1" in launcher_text

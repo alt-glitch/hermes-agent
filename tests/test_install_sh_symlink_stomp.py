@@ -19,9 +19,15 @@ def _executable(path: Path, body: str) -> Path:
     return path
 
 
-def _generate(target: Path, managed_cli: Path) -> None:
+def _generate(target: Path, managed_cli: Path, *trusted: Path) -> None:
     subprocess.run(
-        ["bash", str(GENERATOR), str(target), str(managed_cli)],
+        [
+            "bash",
+            str(GENERATOR),
+            str(target),
+            str(managed_cli),
+            *(str(path) for path in trusted),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -30,11 +36,9 @@ def _generate(target: Path, managed_cli: Path) -> None:
 
 def _mark_hermes_checkout(root: Path) -> None:
     (root / "hermes_cli").mkdir(parents=True, exist_ok=True)
-    (root / "ui-opentui").mkdir(parents=True, exist_ok=True)
     (root / "pyproject.toml").write_text('[project]\nname = "hermes-agent"\n')
     (root / "run_agent.py").write_text("")
     (root / "hermes_cli" / "main.py").write_text("")
-    (root / "ui-opentui" / "package.json").write_text("{}")
 
 
 def _capture_python(path: Path) -> Path:
@@ -68,6 +72,8 @@ def test_generator_replaces_old_symlink_without_stomping_entrypoint(
     assert target.is_file()
     assert not target.is_symlink()
     assert target.stat().st_mode & stat.S_IXUSR
+    trust_file = Path(f"{target}.trusted-roots")
+    assert stat.S_IMODE(trust_file.stat().st_mode) == 0o600
 
 
 def test_launcher_uses_current_checkout_python_and_source(tmp_path: Path) -> None:
@@ -81,7 +87,7 @@ def test_launcher_uses_current_checkout_python_and_source(tmp_path: Path) -> Non
         "#!/usr/bin/env bash\nexit 91\n",
     )
     target = tmp_path / "bin" / "hermes"
-    _generate(target, managed_cli)
+    _generate(target, managed_cli, repo)
     nested = repo / "nested"
     nested.mkdir()
     capture = tmp_path / "capture.txt"
@@ -141,6 +147,8 @@ def test_launcher_uses_primary_checkout_venv_for_linked_worktree(
         "#!/usr/bin/env bash\nexit 92\n",
     )
     target = tmp_path / "bin" / "hermes"
+    _generate(target, managed_cli, primary)
+    # Trust is stored beside the launcher and survives a later installer rerun.
     _generate(target, managed_cli)
     capture = tmp_path / "capture.txt"
 
@@ -187,3 +195,36 @@ printf '%s\\n' "$@" > "$CAPTURE"
 
     assert result.returncode == 0, result.stderr
     assert capture.read_text().splitlines() == ["--version"]
+
+
+def test_launcher_does_not_execute_untrusted_lookalike_checkout(tmp_path: Path) -> None:
+    lookalike = tmp_path / "lookalike"
+    lookalike.mkdir()
+    subprocess.run(["git", "init", "-q", str(lookalike)], check=True)
+    _mark_hermes_checkout(lookalike)
+    attacked = tmp_path / "attacked.txt"
+    _executable(
+        lookalike / ".venv" / "bin" / "python",
+        f"#!/usr/bin/env bash\nprintf attacked > {attacked!s}\nexit 93\n",
+    )
+    capture = tmp_path / "managed.txt"
+    managed_cli = _executable(
+        tmp_path / "managed" / "bin" / "hermes",
+        """#!/usr/bin/env bash
+printf 'managed\n' > "$CAPTURE"
+""",
+    )
+    target = tmp_path / "bin" / "hermes"
+    _generate(target, managed_cli)
+
+    result = subprocess.run(
+        [str(target)],
+        cwd=lookalike,
+        env={**os.environ, "CAPTURE": str(capture)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text() == "managed\n"
+    assert not attacked.exists()
