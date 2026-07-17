@@ -440,7 +440,7 @@ is_termux() {
 }
 
 # Decide where the repo checkout + venv live, and where the `hermes` command
-# symlink goes.  Called after detect_os so $OS/$DISTRO are known.
+# launcher goes. Called after detect_os so $OS/$DISTRO are known.
 #
 # Defaults:
 #   - Non-root, any OS:       INSTALL_DIR = $HERMES_HOME/hermes-agent
@@ -1754,22 +1754,14 @@ setup_path() {
     command_link_dir="$(get_command_link_dir)"
     command_link_display_dir="$(get_command_link_display_dir)"
 
-    # Create a user-facing shim for the hermes command.
-    # We intentionally clear PYTHONPATH/PYTHONHOME here so inherited env vars
-    # can't make this launcher import modules from another checkout.
-    mkdir -p "$command_link_dir"
-    # Older installs created this path as a symlink to $HERMES_BIN. Without
-    # the rm, `cat >` follows the symlink and overwrites the venv pip entry
-    # point with this shim — making `exec "$HERMES_BIN"` self-recurse. (#21454)
-    rm -f "$command_link_dir/hermes"
-    cat > "$command_link_dir/hermes" <<EOF
-#!/usr/bin/env bash
-unset PYTHONPATH
-unset PYTHONHOME
-export PYTHONSAFEPATH=1
-exec "$HERMES_BIN" "\$@"
-EOF
-    chmod +x "$command_link_dir/hermes"
+    # Install an atomic, worktree-aware user-facing launcher. Outside a Hermes
+    # source checkout it executes HERMES_BIN. Inside one, the generated launcher
+    # pins Python/TUI imports to that checkout and borrows the nearest available
+    # venv (current checkout, primary checkout for a linked worktree, then the
+    # managed install). The generator replaces legacy symlinks without following
+    # them, preserving the #21454 symlink-stomp fix.
+    bash "$INSTALL_DIR/scripts/write-hermes-launcher.sh" \
+        "$command_link_dir/hermes" "$HERMES_BIN"
     log_success "Installed hermes launcher → $command_link_display_dir/hermes"
 
     if [ "$DISTRO" = "termux" ]; then

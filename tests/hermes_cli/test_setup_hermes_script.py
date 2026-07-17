@@ -7,7 +7,9 @@ SETUP_SCRIPT = REPO_ROOT / "setup-hermes.sh"
 
 
 def test_setup_hermes_script_is_valid_shell():
-    result = subprocess.run(["bash", "-n", str(SETUP_SCRIPT)], capture_output=True, text=True)
+    result = subprocess.run(
+        ["bash", "-n", str(SETUP_SCRIPT)], capture_output=True, text=True
+    )
     assert result.returncode == 0, result.stderr
 
 
@@ -18,3 +20,10 @@ def test_setup_hermes_script_has_termux_path():
     assert ".[termux]" in content
     assert "constraints-termux.txt" in content
     assert "$PREFIX/bin" in content
+
+
+def test_setup_hermes_installs_worktree_aware_launcher():
+    content = SETUP_SCRIPT.read_text(encoding="utf-8")
+
+    assert "scripts/write-hermes-launcher.sh" in content
+    assert 'ln -sf "$HERMES_BIN" "$COMMAND_LINK_DIR/hermes"' not in content
