@@ -5338,6 +5338,16 @@ def _resolve_checkpoint_hash(mgr, cwd: str, ref: str) -> str:
     raise ValueError(f"Invalid checkpoint number. Use 1-{len(checkpoints)}.")
 
 
+def _active_image_routing_identity(agent: Any) -> tuple[str, str]:
+    """Return the live provider/model, falling back before agent startup."""
+    from agent.auxiliary_client import _read_main_model, _read_main_provider
+
+    return (
+        getattr(agent, "provider", "") or _read_main_provider(),
+        getattr(agent, "model", "") or _read_main_model(),
+    )
+
+
 def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     """Pre-analyze attached images via vision and prepend descriptions to user text."""
     import asyncio, json as _json
@@ -6762,7 +6772,11 @@ def _(rid, params: dict) -> dict:
             db.reopen_session(target)
             # The child's OWN conversation only — include_ancestors would prepend
             # the parent's transcript onto the subagent's branch.
-            history = db.get_messages_as_conversation(target)
+            # repair_alternation: this resume feeds LIVE REPLAY (the loaded
+            # history becomes the resumed session record's working conversation),
+            # so heal a durable ``user;user`` violation once here instead of
+            # re-firing the pre-request repair on every subsequent turn.
+            history = db.get_messages_as_conversation(target, repair_alternation=True)
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -6832,7 +6846,11 @@ def _(rid, params: dict) -> dict:
         _enable_gateway_prompts()
         try:
             db.reopen_session(target)
-            raw_history = db.get_messages_as_conversation(target)
+            # repair_alternation on the model-fed copy only: this resume feeds
+            # LIVE REPLAY (raw_history → sanitize_replay_history → the resumed
+            # session's working conversation). display_history stays verbatim —
+            # inspection/export must show what is actually stored.
+            raw_history = db.get_messages_as_conversation(target, repair_alternation=True)
             display_history = db.get_messages_as_conversation(target, include_ancestors=True)
         except Exception as e:
             if lease is not None:
@@ -6910,7 +6928,9 @@ def _(rid, params: dict) -> dict:
     )
     try:
         db.reopen_session(target)
-        raw_history = db.get_messages_as_conversation(target)
+        # repair_alternation on the model-fed copy only (see the interactive
+        # resume above): this loads LIVE REPLAY history; display stays verbatim.
+        raw_history = db.get_messages_as_conversation(target, repair_alternation=True)
         display_history = db.get_messages_as_conversation(
             target, include_ancestors=True
         )
@@ -10551,16 +10571,13 @@ def _run_prompt_submit(
                         decide_image_input_mode,
                         build_native_content_parts,
                     )
-                    from agent.auxiliary_client import (
-                        _read_main_model,
-                        _read_main_provider,
-                    )
                     from hermes_cli.config import load_config as _tui_load_config
 
                     _cfg = _tui_load_config()
+                    _provider, _model = _active_image_routing_identity(agent)
                     _mode = decide_image_input_mode(
-                        _read_main_provider(),
-                        _read_main_model(),
+                        _provider,
+                        _model,
                         _cfg,
                     )
                     if getattr(agent, "api_mode", "") == "codex_app_server":
@@ -10885,6 +10902,11 @@ def _run_prompt_submit(
                     from agent.title_generator import maybe_auto_title
 
                     _title_key = session.get("session_key") or sid
+                    # Snapshot the runtime identity; the validator lets the
+                    # background titler skip its LLM call if the session's
+                    # model changed before it fires (#19027).
+                    _title_model = getattr(agent, "model", None)
+                    _title_provider = getattr(agent, "provider", None)
 
                     def _title_callback(title: str, key: str = _title_key) -> None:
                         # The native TUI derives its OSC title from session.info;
@@ -10904,6 +10926,21 @@ def _run_prompt_submit(
                         text,
                         raw,
                         session.get("history", []),
+                        # Keep auxiliary auto-detection aligned with the active
+                        # Desktop/Webapp session. Without this, providers that
+                        # rely on runtime auth (for example OpenAI Codex OAuth)
+                        # are skipped and the new session remains untitled.
+                        main_runtime={
+                            "model": getattr(agent, "model", None),
+                            "provider": getattr(agent, "provider", None),
+                            "base_url": getattr(agent, "base_url", None),
+                            "api_key": getattr(agent, "api_key", None),
+                            "api_mode": getattr(agent, "api_mode", None),
+                        },
+                        runtime_validator=lambda: (
+                            getattr(agent, "model", None) == _title_model
+                            and getattr(agent, "provider", None) == _title_provider
+                        ),
                         title_callback=_title_callback,
                     )
                 except Exception:
@@ -14017,8 +14054,12 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5008, f"undo: {e}")
         # Reload the active-only transcript into the in-memory session
         # history so subsequent turns see the truncated view.
+        # repair_alternation: this reload feeds LIVE REPLAY — session["history"]
+        # is the working conversation for subsequent turns, and a rewind that
+        # lands on a durable user;user pair would otherwise re-fire the
+        # pre-request repair on every request from here on.
         try:
-            active = db.get_messages_as_conversation(session_key)
+            active = db.get_messages_as_conversation(session_key, repair_alternation=True)
         except Exception:
             active = []
         with session["history_lock"]:

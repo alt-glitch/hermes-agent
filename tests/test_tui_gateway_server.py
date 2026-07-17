@@ -1929,7 +1929,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         def reopen_session(self, target):
             captured["reopened"] = target
 
-        def get_messages_as_conversation(self, target, include_ancestors=False):
+        def get_messages_as_conversation(self, target, include_ancestors=False, repair_alternation=False):
             captured.setdefault("history_calls", []).append((target, include_ancestors))
             return (
                 [
@@ -2098,7 +2098,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
         def reopen_session(self, target):
             pass
 
-        def get_messages_as_conversation(self, target, include_ancestors=False):
+        def get_messages_as_conversation(self, target, include_ancestors=False, repair_alternation=False):
             return [{"role": "user", "content": "hello"}]
 
     def fake_make_agent(sid, key, session_id=None, session_db=None, **kwargs):
@@ -2158,7 +2158,7 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
         def reopen_session(self, _target):
             captured["reopened"] = _target
 
-        def get_messages_as_conversation(self, _target, include_ancestors=False):
+        def get_messages_as_conversation(self, _target, include_ancestors=False, repair_alternation=False):
             return [{"role": "user", "content": "hello"}]
 
         def update_session_cwd(self, *_args):
@@ -6016,7 +6016,7 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
                 "pinned": True,
             }
 
-        def get_messages_as_conversation(self, key, include_ancestors=True):
+        def get_messages_as_conversation(self, key, include_ancestors=True, repair_alternation=False):
             assert key == "session-key"
             assert include_ancestors is True
             return list(history_from_db)
@@ -8467,6 +8467,12 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     """maybe_auto_title is called after a successful (complete) prompt."""
 
     class _Agent:
+        model = "gpt-5.6-sol"
+        provider = "openai-codex"
+        base_url = "https://chatgpt.example.test/backend-api/codex"
+        api_key = object()
+        api_mode = "codex_responses"
+
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None
         ):
@@ -8478,7 +8484,8 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
                 ],
             }
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    agent = _Agent()
+    server._sessions["sid"] = _session(agent=agent)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     emitted = []
     refreshed = []
@@ -8505,6 +8512,21 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     assert args[1] == "session-key"
     assert args[2] == "Tell me about Rome"
     assert args[3] == "Rome was founded in 753 BC."
+    assert mock_title.call_args.kwargs["main_runtime"] == {
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.example.test/backend-api/codex",
+        "api_key": _Agent.api_key,
+        "api_mode": "codex_responses",
+    }
+    runtime_validator = mock_title.call_args.kwargs["runtime_validator"]
+    assert runtime_validator() is True
+    agent.model = "gpt-5.7-switched"
+    assert runtime_validator() is False
+    agent.model = "gpt-5.6-sol"
+    agent.provider = "openrouter"
+    assert runtime_validator() is False
+
     callback = mock_title.call_args.kwargs["title_callback"]
     callback("Rome in Brief")
     assert refreshed == ["sid"]
