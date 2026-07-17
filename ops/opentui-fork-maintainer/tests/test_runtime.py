@@ -660,6 +660,7 @@ def install_success_mocks(
     ) -> subprocess.CompletedProcess[bytes]:
         assert b"REVIEW_SCOPE_SHA256:" in prompt
         assert b"BEGIN BOUNDED EXACT DIFF" in prompt
+        assert b"Do not spawn, delegate to, or invoke other" in prompt
         return subprocess.CompletedProcess(
             argv, 0, b"No blockers.\nVERDICT: APPROVED\n", b""
         )

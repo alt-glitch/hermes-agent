@@ -1825,6 +1825,7 @@ def run_adversarial_review(
                 f"REVIEW_MODE: {scope['mode']}\nREVIEW_SCOPE_SHA256: {scope_hash}\n"
                 f"CHUNK: {index}/{len(chunks)}\n"
                 "Trusted upstream commits are not reproduced here. The runtime proved the exact merge topology and derived the conflict-resolution baseline with git merge-tree.\n"
+                "Perform the review directly in this process. Do not spawn, delegate to, or invoke other Codex, Claude, or agent processes; the parent maintainer already bounded this review and recursive fan-out violates the gate's resource budget.\n"
                 "Find correctness, race, security, UX, and test-fidelity defects. Do not modify files.\n"
                 "For every release-blocking issue emit a line beginning exactly BLOCKER:.\n"
                 "The final non-empty output line must be exactly VERDICT: APPROVED only when no blocker remains; otherwise VERDICT: REJECTED.\n"
