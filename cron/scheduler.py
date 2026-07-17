@@ -289,6 +289,29 @@ from cron.jobs import (
 )
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
+
+def _finish_execution_best_effort(
+    execution_id: str, *, success: bool, error: Optional[str] = None,
+) -> bool:
+    """Finalize audit state without changing the already-decided job outcome.
+
+    The execution ledger is observability, not the execution control plane. A
+    transient SQLite/storage failure here must not enter run_one_job's broad
+    exception handler, overwrite a successful mark as failed, or escape a
+    worker callback after the job side effects have already happened.
+    """
+    try:
+        finish_execution(execution_id, success=success, error=error)
+        return True
+    except Exception as ledger_error:
+        logger.error(
+            "Cron execution ledger finalization failed for %s: %s",
+            execution_id,
+            ledger_error,
+        )
+        return False
+
+
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
@@ -3736,7 +3759,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
-            finish_execution(
+            _finish_execution_best_effort(
                 execution_id,
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
@@ -3887,7 +3910,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if ownership_lost:
-            finish_execution(execution_id, success=success, error=error)
+            _finish_execution_best_effort(execution_id, success=success, error=error)
             return True
 
         if expected_run_claim_token and not run_claim_is_owned(
@@ -3898,19 +3921,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "ownership changed",
                 job.get("name", job["id"]),
             )
-            finish_execution(execution_id, success=success, error=error)
+            _finish_execution_best_effort(execution_id, success=success, error=error)
             return True
 
         if not _consume_interrupted_flag(job["id"]):
             _mark_this_dispatch(success, error, delivery_error=delivery_error)
-        finish_execution(execution_id, success=success, error=error)
+        _finish_execution_best_effort(execution_id, success=success, error=error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
             _mark_this_dispatch(False, str(e))
-        finish_execution(execution_id, success=False, error=str(e))
+        _finish_execution_best_effort(execution_id, success=False, error=str(e))
         return False
 
 
@@ -4096,7 +4119,7 @@ def tick(
                 with _running_lock:
                     _running_job_ids.discard(job_id)
                     _running_run_claim_tokens.pop(job_id, None)
-                finish_execution(
+                _finish_execution_best_effort(
                     execution["id"],
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",

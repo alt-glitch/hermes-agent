@@ -303,6 +303,37 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[-1][2]["success"] is True
 
 
+def test_run_one_job_ledger_finish_failure_does_not_rewrite_success(monkeypatch):
+    import cron.scheduler as scheduler
+
+    marks = []
+    finish_attempts = []
+
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_job_run",
+        lambda _job_id, success, error=None, **_kwargs: marks.append((success, error)) or True,
+    )
+
+    def fail_finish(_execution_id, *, success, error=None):
+        finish_attempts.append((success, error))
+        raise sqlite3.OperationalError("ledger unavailable")
+
+    monkeypatch.setattr(scheduler, "finish_execution", fail_finish)
+
+    assert scheduler.run_one_job({"id": "job-ledger-finish", "execution_id": "exec-ledger-finish"}) is True
+    assert marks == [(True, None)]
+    assert finish_attempts == [(True, None)]
+
+
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
     import cron.scheduler_provider as provider
 
