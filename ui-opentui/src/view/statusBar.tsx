@@ -327,7 +327,11 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     return segs().profile && p && p !== 'default' && p !== 'custom' ? p : ''
   })
   const mcpText = createMemo(() => {
-    const n = info().mcpServers ?? 0
+    // The home catalog contains enabled MCP server names (disabled config
+    // entries are filtered by the gateway). Keep the connected-only session
+    // count as a compatibility fallback for older gateways or a catalog that
+    // has not arrived yet.
+    const n = props.store.state.catalog?.mcp.servers.length ?? info().mcpServers ?? 0
     return segs().mcp && n > 0 ? `mcp: ${n}` : ''
   })
   // `bg: N` — in-flight background-PROMPT tasks (`/bg` → prompt.background,

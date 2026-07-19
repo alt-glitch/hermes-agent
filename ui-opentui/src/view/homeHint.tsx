@@ -175,7 +175,7 @@ export function HomeHint(props: { store: SessionStore }) {
 
               <Section
                 title={`MCP Servers (${c().mcp.servers.length})`}
-                suffix={c().mcp.servers.length ? 'connected' : ''}
+                suffix={c().mcp.servers.length ? 'enabled' : ''}
               >
                 <text selectable={false}>
                   <span style={{ fg: theme().color.muted }}>{c().mcp.servers.join('  ') || 'none configured'}</span>

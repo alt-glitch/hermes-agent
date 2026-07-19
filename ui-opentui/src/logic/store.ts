@@ -490,7 +490,8 @@ export interface SessionInfo {
   updateCommand?: string
   /** Active profile name (`profile_name`); the bar badges it when non-default. */
   profileName?: string
-  /** Count of configured MCP servers (`mcp_servers.length`) for the bar's `N mcp`. */
+  /** Count of connected MCP servers from `session.info`; the status bar uses
+   *  this only as a fallback until the enabled startup catalog is available. */
   mcpServers?: number
   /** Epoch ms when this TUI session started (set once at store creation; never
    *  patched from the wire) — drives the status-bar session duration. */

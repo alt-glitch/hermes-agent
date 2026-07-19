@@ -361,6 +361,32 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     expect(rows.filter(r => r.includes('│')).length).toBe(1)
   })
 
+  test('the MCP segment reports enabled servers while retaining the connected fallback', async () => {
+    const store = seededStore()
+    const probe = await renderProbe(bar(store), { width: 160, height: 3 })
+
+    try {
+      // Before startup.catalog arrives, older gateways still provide the
+      // connected-only session.info count.
+      expect(probe.frame()).toContain('mcp: 2')
+
+      // startup.catalog is authoritative for enabled servers and deliberately
+      // includes enabled-but-not-yet-connected entries. The mounted bar must
+      // repaint as soon as that catalog arrives.
+      store.setCatalog({
+        tools: { total: 0, toolsets: [] },
+        skills: { total: 0, categories: [] },
+        mcp: { servers: ['atlassian', 'betterstack', 'granola', 'linear', 'railway', 'vercel'] }
+      })
+      await probe.settle()
+
+      expect(probe.frame()).toContain('mcp: 6')
+      expect(probe.frame()).not.toContain('mcp: 2')
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('right-pinned cwd (F10) — the path hugs the right edge of the wide row', async () => {
     const width = 220
     const frame = await captureFrame(bar(seededStore()), { width, height: 4 })
