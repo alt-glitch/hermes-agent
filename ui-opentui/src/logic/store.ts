@@ -1079,6 +1079,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return !!left && left === right
   }
 
+  function visibleText(message: Message | undefined): string {
+    return (message?.parts ?? [])
+      .filter(part => part.type === 'text')
+      .map(part => part.text)
+      .join('')
+  }
+
   function appendPart(m: Message, type: 'text' | 'reasoning', text: string): void {
     const parts = (m.parts ??= [])
     const last = parts[parts.length - 1]
@@ -1438,6 +1445,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // server reliably emits that session.info in run()'s finally (server.py ~7227)
   // after EVERY turn (success/error/interrupt), so the drain always fires once.
   let turnInFlight = false
+  // The latest interim assistant text part identifies the provisional answer
+  // that message.complete may settle in place when response_previewed is true.
+  let interimTextPartId: string | undefined
 
   // Separate from `turnInFlight`: message.complete optimistically settles the
   // UI before the authoritative session.info(false), so a child exit in that
@@ -2123,6 +2133,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       case 'message.start':
         settlePendingSteers(event.payload?.client_submission_ids)
+        interimTextPartId = undefined
         clearStatusRestoreTimer()
         lastStatusNote = ''
         // A fresh turn gets one discovery credit. Archive terminal rows left by
@@ -2165,8 +2176,22 @@ export function createSessionStore(options?: SessionStoreOptions) {
         if (!text) break
         setState(
           produce(draft => {
-            const live = liveAssistant(draft, true)
-            if (live) appendPart(live, 'text', text)
+            const live = liveAssistant(draft, true) ?? ensureAssistant(draft)
+            appendPart(live, 'text', text)
+          })
+        )
+        break
+      }
+      case 'message.interim': {
+        const text = event.payload.text.trimStart()
+        if (!text) break
+        setState(
+          produce(draft => {
+            const live = liveAssistant(draft, true) ?? ensureAssistant(draft)
+            reconcileFinalText(live, text)
+            live.streaming = false
+            const textParts = (live.parts ?? []).filter(part => part.type === 'text')
+            interimTextPartId = textParts.at(-1)?.id
           })
         )
         break
@@ -2185,13 +2210,31 @@ export function createSessionStore(options?: SessionStoreOptions) {
             // complete-only gateways may send `message.complete{text}` with no prior
             // start/delta → create the turn so the final text isn't dropped.
             const finalText = event.payload?.text
-            const live = liveAssistant(draft, true) ?? (finalText ? ensureAssistant(draft) : undefined)
+            const interim = interimTextPartId
+              ? draft.messages.find(message => message.parts?.some(part => part.id === interimTextPartId))
+              : undefined
+            const interimText = visibleText(interim).trim()
+            const previewMatches = Boolean(
+              event.payload?.response_previewed &&
+                finalText?.trim() &&
+                interimText &&
+                finalText.trim().startsWith(interimText)
+            )
+            const streaming = liveAssistant(draft, true)
+            if (previewMatches && streaming && streaming !== interim) {
+              const streamingIndex = draft.messages.indexOf(streaming)
+              if (streamingIndex >= 0) draft.messages.splice(streamingIndex, 1)
+            }
+            const live = previewMatches
+              ? interim
+              : (streaming ?? (finalText ? ensureAssistant(draft) : undefined))
             if (!live) return
             reconcileFinalText(live, finalText)
             live.streaming = false
             dropAnswerDuplicateReasoning(live, finalText)
           })
         )
+        interimTextPartId = undefined
         clearStatusRestoreTimer()
         setState('status', undefined)
         // LOCAL optimistic running:false flip — stops the busy spinner INSTANTLY

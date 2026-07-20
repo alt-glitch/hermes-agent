@@ -68,6 +68,11 @@ const MessageDelta = Schema.Struct({
   session_id: opt(Str),
   payload: opt(Schema.Struct({ text: opt(Str), rendered: opt(Str) }))
 })
+const MessageInterim = Schema.Struct({
+  type: Schema.Literal('message.interim'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ text: Str, already_streamed: opt(Schema.Boolean) })
+})
 const MessageComplete = Schema.Struct({
   type: Schema.Literal('message.complete'),
   session_id: opt(Str),
@@ -79,6 +84,7 @@ const MessageComplete = Schema.Struct({
       text: opt(Str),
       rendered: opt(Str),
       reasoning: opt(Str),
+      response_previewed: opt(Schema.Boolean),
       usage: opt(Schema.Record(Str, Schema.Unknown))
     })
   )
@@ -278,6 +284,7 @@ export const GatewayEventSchema = Schema.Union([
   SessionInfoEvent,
   MessageStart,
   MessageDelta,
+  MessageInterim,
   MessageComplete,
   ReasoningDelta,
   ReasoningAvailable,

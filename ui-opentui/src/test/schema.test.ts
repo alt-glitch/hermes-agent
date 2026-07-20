@@ -20,6 +20,27 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
+  test('decodes interim assistant and previewed completion events', () => {
+    const interim = decode({
+      type: 'message.interim',
+      payload: { text: 'candidate answer', already_streamed: true }
+    })
+    expect(Option.isSome(interim)).toBe(true)
+    if (Option.isSome(interim) && interim.value.type === 'message.interim') {
+      expect(interim.value.payload.text).toBe('candidate answer')
+      expect(interim.value.payload.already_streamed).toBe(true)
+    }
+
+    const complete = decode({
+      type: 'message.complete',
+      payload: { text: 'candidate answer', response_previewed: true }
+    })
+    expect(Option.isSome(complete)).toBe(true)
+    if (Option.isSome(complete) && complete.value.type === 'message.complete') {
+      expect(complete.value.payload?.response_previewed).toBe(true)
+    }
+  })
+
   test('preserves correlated prompt lifecycle ids', () => {
     for (const wire of [
       { type: 'message.start', payload: { client_submission_ids: ['send-1'] } },

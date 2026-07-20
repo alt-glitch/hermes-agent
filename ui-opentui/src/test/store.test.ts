@@ -159,6 +159,48 @@ describe('session store — ordered parts (Phase 2b)', () => {
     }
   })
 
+  test('seals interim commentary and keeps a distinct terminal reply', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'interim answer' } })
+    store.apply({ type: 'message.interim', payload: { text: 'interim answer', already_streamed: true } })
+    store.apply({ type: 'message.delta', payload: { text: 'final answer' } })
+    store.apply({ type: 'message.complete', payload: { text: 'final answer' } })
+
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(2)
+    expect(assistants.map(message => message.parts?.find(part => part.type === 'text')?.text)).toEqual([
+      'interim answer',
+      'final answer'
+    ])
+    expect(assistants.every(message => message.streaming === false)).toBe(true)
+  })
+
+  test('settles a previewed final onto its interim without a duplicate bubble', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'same reply' } })
+    store.apply({ type: 'message.interim', payload: { text: 'same reply', already_streamed: true } })
+    store.apply({ type: 'message.complete', payload: { text: 'same reply plus tail', response_previewed: true } })
+
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.parts?.find(part => part.type === 'text')?.text).toBe('same reply plus tail')
+    expect(assistants[0]?.streaming).toBe(false)
+  })
+
+  test('drops a post-interim streaming duplicate when the final was previewed', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.interim', payload: { text: 'preview', already_streamed: true } })
+    store.apply({ type: 'message.delta', payload: { text: ' plus tail' } })
+    store.apply({ type: 'message.complete', payload: { text: 'preview plus tail', response_previewed: true } })
+
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.parts?.find(part => part.type === 'text')?.text).toBe('preview plus tail')
+  })
+
   test('keeps one live assistant across mid-turn shell and notification rows', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start' })
