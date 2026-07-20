@@ -1,10 +1,10 @@
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 
 import type { SubscriptionCtx, SubscriptionOverlayState, SubscriptionStateResponse } from '../boundary/billing.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { SubscriptionOverlay, subscriptionStatusLine } from '../view/overlays/subscription.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
-import { captureFrame } from './lib/render.ts'
+import { captureFrame, renderProbe } from './lib/render.ts'
 
 const state = (over: Partial<SubscriptionStateResponse> = {}): SubscriptionStateResponse => ({
   ok: true,
@@ -243,6 +243,93 @@ describe('subscription native adaptation', () => {
       { until: 'Visa •••• 4242', width: 110, height: 30 }
     )
     expect(frame).toContain('the card on your subscription — will be charged')
+  })
+
+  test('locks confirmation navigation while an upgrade is unresolved', async () => {
+    const upgrade = vi.fn(() => new Promise<never>(() => {}))
+    const store = createSessionStore()
+    store.openSubscription({
+      ctx: { ...ctx, upgrade },
+      screen: 'confirm',
+      state: state(),
+      pending: {
+        idempotencyKey: 'stable-upgrade-key',
+        kind: 'upgrade',
+        targetTierId: 'ultra',
+        preview: { ok: true, effect: 'charge_now', target_tier_name: 'Ultra', amount_due_now_cents: 1234 }
+      }
+    })
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <SubscriptionOverlay
+            overlay={store.state.subscription!}
+            onPatch={next => store.patchSubscription(next)}
+            onClose={() => store.closeSubscription()}
+          />
+        </ThemeProvider>
+      ),
+      { kittyKeyboard: true, width: 100, height: 30 }
+    )
+    try {
+      probe.keys.pressEnter()
+      await probe.settle()
+      probe.keys.pressEscape()
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(upgrade).toHaveBeenCalledTimes(1)
+      expect(upgrade).toHaveBeenCalledWith('ultra', 'stable-upgrade-key')
+      expect(store.state.subscription?.screen).toBe('confirm')
+      expect(store.state.subscription?.pending?.idempotencyKey).toBe('stable-upgrade-key')
+      expect(probe.frame()).toContain('Working')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('locks step-up replay navigation while an upgrade is unresolved', async () => {
+    const upgrade = vi.fn(() => new Promise<never>(() => {}))
+    const store = createSessionStore()
+    store.openSubscription({
+      ctx: { ...ctx, requestRemoteSpending: async () => ({ granted: true }), upgrade },
+      screen: 'stepup',
+      state: state(),
+      stepUpRetry: { kind: 'apply' },
+      pending: {
+        idempotencyKey: 'stable-replay-key',
+        kind: 'upgrade',
+        targetTierId: 'ultra',
+        preview: { ok: true, effect: 'charge_now', target_tier_name: 'Ultra', amount_due_now_cents: 1234 }
+      }
+    })
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <SubscriptionOverlay
+            overlay={store.state.subscription!}
+            onPatch={next => store.patchSubscription(next)}
+            onClose={() => store.closeSubscription()}
+          />
+        </ThemeProvider>
+      ),
+      { kittyKeyboard: true, width: 100, height: 30 }
+    )
+    try {
+      probe.keys.pressEnter()
+      await probe.settle()
+      probe.keys.pressEnter()
+      await probe.settle()
+      probe.keys.pressEscape()
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(upgrade).toHaveBeenCalledTimes(1)
+      expect(upgrade).toHaveBeenCalledWith('ultra', 'stable-replay-key')
+      expect(store.state.subscription?.screen).toBe('stepup')
+      expect(store.state.subscription?.pending?.idempotencyKey).toBe('stable-replay-key')
+      expect(probe.frame()).toContain('Resuming your plan change')
+    } finally {
+      probe.destroy()
+    }
   })
 
   test('blocked and result screens preserve portal recovery and apply state', async () => {

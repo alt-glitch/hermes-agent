@@ -142,7 +142,18 @@ export function SubscriptionOverlay(props: {
 }): JSXElement {
   const theme = useTheme()
   let root: BoxRenderable | undefined
-  useCloseLayer(() => root, props.onClose)
+  useCloseLayer(
+    () => root,
+    () => {
+      if (
+        props.overlay.state.context === 'team' ||
+        props.overlay.screen === 'overview' ||
+        props.overlay.screen === 'result'
+      ) {
+        props.onClose()
+      }
+    }
+  )
   onMount(() => root?.focus())
   return (
     <box
@@ -425,12 +436,14 @@ function Confirm(props: {
   onCleanup(() => {
     cardRequest += 1
   })
-  const back = () => props.onPatch({ pending: null, screen: cancellation() ? 'overview' : 'picker' })
-  let submitting = false
+  const [submitting, setSubmitting] = createSignal(false)
+  const back = () => {
+    if (!submitting()) props.onPatch({ pending: null, screen: cancellation() ? 'overview' : 'picker' })
+  }
   const apply = () => {
     const value = pending()
-    if (!value || submitting) return
-    submitting = true
+    if (!value || submitting()) return
+    setSubmitting(true)
     applyPending(props.overlay, value, props.onPatch)
   }
   const manage = () => {
@@ -457,7 +470,7 @@ function Confirm(props: {
       <text fg={c().accent}>
         <b>{cancellation() ? 'Confirm cancellation' : 'Confirm plan change'}</b>
       </text>
-      <Show when={submitting}>
+      <Show when={submitting()}>
         <text fg={c().muted}>Working…</text>
       </Show>
       <Show when={cancellation()}>
@@ -607,6 +620,7 @@ function StepUp(props: {
     })
   }
   useKeyboard(key => {
+    if (phase() === 'resuming') return
     if (key.name === 'escape') {
       aborted = true
       props.onPatch({ screen: 'overview', stepUpRetry: null })

@@ -244,6 +244,43 @@ describe('billing overlay render (captureCharFrame)', () => {
     expect(frame).toContain('Use your card on file — manage on portal')
   })
 
+  test('locks confirmation navigation while a charge is unresolved', async () => {
+    const charge = vi.fn(() => new Promise<'submitted'>(() => {}))
+    const store = createSessionStore()
+    store.openBilling({
+      ctx: { ...noopCtx, charge },
+      pendingCharge: { amount: '25', idempotencyKey: 'stable-charge-key' },
+      screen: 'confirm',
+      state: fakeState()
+    })
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <BillingOverlay
+            overlay={store.state.billing!}
+            onPatch={next => store.patchBilling(next)}
+            onClose={() => store.closeBilling()}
+          />
+        </ThemeProvider>
+      ),
+      { kittyKeyboard: true, width: 80, height: 30 }
+    )
+    try {
+      probe.keys.pressEnter()
+      await probe.settle()
+      probe.keys.pressEscape()
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(charge).toHaveBeenCalledTimes(1)
+      expect(charge).toHaveBeenCalledWith('25', 'stable-charge-key')
+      expect(store.state.billing?.screen).toBe('confirm')
+      expect(store.state.billing?.pendingCharge?.idempotencyKey).toBe('stable-charge-key')
+      expect(probe.frame()).toContain('Processing payment')
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('turning auto-reload off preserves the required current amounts', async () => {
     const applyAutoReload = vi.fn(async () => true)
     const store = createSessionStore()

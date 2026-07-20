@@ -64,14 +64,15 @@ export function BillingOverlay(props: {
 }): JSXElement {
   const theme = useTheme()
   let rootRef: BoxRenderable | undefined
+  const screen = () => props.overlay.screen
   // Esc/Ctrl+C close via the native keymap, scoped focus-within to the root box.
   useCloseLayer(
     () => rootRef,
-    () => props.onClose()
+    () => {
+      if (screen() === 'overview') props.onClose()
+    }
   )
   onMount(() => rootRef?.focus())
-
-  const screen = () => props.overlay.screen
 
   return (
     <box
@@ -413,11 +414,11 @@ function ConfirmScreen(props: {
   // by the App, so a rapid second Enter/Y (or Enter+Y) could fire a SECOND charge
   // before the overlay unmounts. Guard so a double-press can't double-charge.
   // (The Ink reference lacks this; hardened here because it's a money path.)
-  let paying = false
+  const [paying, setPaying] = createSignal(false)
 
   const pay = () => {
-    if (paying) return
-    paying = true
+    if (paying()) return
+    setPaying(true)
     void ctx()
       .charge(props.amount, props.overlay.pendingCharge?.idempotencyKey)
       .then(outcome => {
@@ -427,6 +428,7 @@ function ConfirmScreen(props: {
   }
 
   useKeyboard(key => {
+    if (paying()) return
     if (key.name === 'escape') return props.onBack()
     if (key.name === 'y') return pay()
     if (key.name === 'n') return props.onBack()
@@ -456,7 +458,7 @@ function ConfirmScreen(props: {
       <ActionRow active={sel() === 0} color={c().ok} label={`Pay $${props.amount} now`} />
       <ActionRow active={sel() === 1} label="Cancel" />
       <text> </text>
-      <Footer text="↑/↓ select · Enter confirm · Y/N quick · Esc back" />
+      <Footer text={paying() ? 'Processing payment…' : '↑/↓ select · Enter confirm · Y/N quick · Esc back'} />
     </box>
   )
 }
@@ -507,7 +509,8 @@ function StepUpScreen(props: { overlay: BillingOverlayState; onClose: () => void
   }
 
   useKeyboard(key => {
-    if (phase() === 'waiting' || phase() === 'resuming') {
+    if (phase() === 'resuming') return
+    if (phase() === 'waiting') {
       if (key.name === 'escape') close()
       return
     }
