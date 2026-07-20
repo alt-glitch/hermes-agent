@@ -489,12 +489,14 @@ describe('/reasoning', () => {
     }
   })
 
-  test('bare /reasoning reads config.get reasoning_full and syncs the flag', async () => {
-    const p = makeCtx(async method => (method === 'config.get' ? { value: 'medium', reasoning_full: true } : {}))
+  test('bare /reasoning reads this session and reports effort, visibility, and native section mode', async () => {
+    const p = makeCtx(async method =>
+      method === 'config.get' ? { value: 'medium', display: 'show', reasoning_full: true } : {}
+    )
     await dispatchSlash('/reasoning', p.ctx)
-    expect(p.calls[0]).toEqual({ method: 'config.get', params: { key: 'reasoning' } })
+    expect(p.calls[0]).toEqual({ method: 'config.get', params: { key: 'reasoning', session_id: 'sid-1' } })
     expect(p.reasoningFullFlag.value).toBe(true)
-    expect(p.system).toEqual(['reasoning: full'])
+    expect(p.system).toEqual(['reasoning: medium · display show · sections full'])
   })
 
   test('bare /reasoning with config.get failing falls back to the live flag', async () => {
@@ -514,6 +516,26 @@ describe('/reasoning', () => {
       { method: 'config.set', params: { key: 'reasoning', value: 'high', session_id: 'sid-1' } }
     ])
     expect(p.system).toEqual(['reasoning: high'])
+  })
+
+  test('reasoning accepts explicit session/global scope without treating flags as the effort', async () => {
+    const session = makeCtx(async () => ({ value: 'medium' }))
+    await dispatchSlash('/reasoning --session medium', session.ctx)
+    expect(session.calls).toEqual([
+      {
+        method: 'config.set',
+        params: { key: 'reasoning', scope: 'session', session_id: 'sid-1', value: 'medium' }
+      }
+    ])
+
+    const global = makeCtx(async () => ({ value: 'low' }))
+    await dispatchSlash('/reasoning --session low --global', global.ctx)
+    expect(global.calls).toEqual([
+      {
+        method: 'config.set',
+        params: { key: 'reasoning', scope: 'global', session_id: 'sid-1', value: 'low' }
+      }
+    ])
   })
 
   test('effort requires an active session', async () => {

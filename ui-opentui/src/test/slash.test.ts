@@ -1544,6 +1544,20 @@ describe('dispatchSlash — client commands', () => {
     })
   })
 
+  test('/model <name> --provider <slug> preserves provider selection for the session-default gateway path', async () => {
+    const p = makeCtx(async () => ({ value: 'claude-opus-4.6' }))
+    await dispatchSlash('/model claude-opus-4.6 --provider anthropic', p.ctx)
+    expect(p.calls[0]).toEqual({
+      method: 'config.set',
+      params: {
+        confirm_expensive_model: false,
+        key: 'model',
+        session_id: 'sid-1',
+        value: 'claude-opus-4.6 --provider anthropic'
+      }
+    })
+  })
+
   test('/model --once routes a one-turn override and labels its ephemeral scope', async () => {
     const p = makeCtx(async () => ({ scope: 'once', value: 'anthropic/claude-opus-4.6' }))
     await dispatchSlash('/model --once anthropic/claude-opus-4.6', p.ctx)

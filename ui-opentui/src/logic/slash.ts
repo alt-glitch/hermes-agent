@@ -1003,9 +1003,9 @@ const detailsCmd: ClientHandler = async (arg, ctx) => {
  * `/reasoning [full|clamp]` — expand/collapse ALL thinking ("Thinking"/"Thought")
  * sections, independently of the global /details mode. Mirrors detailsCmd.
  *
- *   - bare `/reasoning`: `config.get {key:'reasoning'}` → read the persisted
- *     `reasoning_full` boolean (added server-side), sync the local flag, and
- *     report `reasoning: full|clamp`. On error, report the current local flag.
+ *   - bare `/reasoning`: read this session's effort/visibility plus the
+ *     persisted `reasoning_full` boolean, sync the local flag, and report both
+ *     the agent setting and OpenTUI's full/clamp transcript-display setting.
  *   - `full` (alias `all`): expand all → local flag on + persist `value:'full'`.
  *   - `clamp` (aliases `collapse`, `short`): collapse all → flag off + `value:'clamp'`.
  *
@@ -1016,13 +1016,23 @@ const detailsCmd: ClientHandler = async (arg, ctx) => {
 const reasoningCmd: ClientHandler = async (arg, ctx, flight) => {
   const first = arg.trim().toLowerCase().split(/\s+/)[0] ?? ''
   if (!first) {
+    const sid = ctx.sessionId()
     try {
-      const r = await ctx.request('config.get', { key: 'reasoning' })
+      const r = await ctx.request('config.get', { key: 'reasoning', session_id: sid })
+      if (!currentSessionIs(ctx, sid, flight)) return
       const full = !!(r && typeof r === 'object' && (r as { [k: string]: unknown }).reasoning_full)
       ctx.setReasoningFull(full)
-      ctx.pushSystem(`reasoning: ${full ? 'full' : 'clamp'}`)
+      const value = readStr(r, 'value')
+      const display = readStr(r, 'display')
+      ctx.pushSystem(
+        value
+          ? `reasoning: ${value} · display ${display || 'hide'} · sections ${full ? 'full' : 'clamp'}`
+          : `reasoning: ${full ? 'full' : 'clamp'}`
+      )
     } catch {
-      ctx.pushSystem(`reasoning: ${ctx.reasoningFull() ? 'full' : 'clamp'}`)
+      if (currentSessionIs(ctx, sid, flight)) {
+        ctx.pushSystem(`reasoning: ${ctx.reasoningFull() ? 'full' : 'clamp'}`)
+      }
     }
     return
   }
@@ -1045,10 +1055,31 @@ const reasoningCmd: ClientHandler = async (arg, ctx, flight) => {
     ctx.pushSystem('reasoning: no active session')
     return
   }
+  const parts = arg.trim().split(/\s+/).filter(Boolean)
+  let scope: 'global' | 'session' | undefined
+  const valueParts: string[] = []
+  for (const part of parts) {
+    const flag = part.toLowerCase()
+    if (flag === '--global') {
+      scope = 'global'
+    } else if (flag === '--session') {
+      // Session is the gateway default. Preserve an explicit flag for parity
+      // with /model, while allowing --global to win regardless of order.
+      scope ??= 'session'
+    } else {
+      valueParts.push(part)
+    }
+  }
+  const value = valueParts.join(' ')
   try {
-    const r = await ctx.request('config.set', { key: 'reasoning', value: first, session_id: sid })
+    const r = await ctx.request('config.set', {
+      key: 'reasoning',
+      value,
+      session_id: sid,
+      ...(scope ? { scope } : {})
+    })
     if (!currentSessionIs(ctx, sid, flight)) return
-    ctx.pushSystem(`reasoning: ${readStr(r, 'value') || first}`)
+    ctx.pushSystem(`reasoning: ${readStr(r, 'value') || value}`)
   } catch {
     if (currentSessionIs(ctx, sid, flight)) ctx.pushSystem('reasoning: failed to update')
   }
