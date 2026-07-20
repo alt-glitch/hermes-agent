@@ -62,6 +62,18 @@ describe('SessionInfoPatchSchema — chrome wire fields', () => {
   test('all chrome fields absent still decodes (every key optional)', () => {
     expect(Option.isSome(decodeSessionInfoPatch({ model: 'm' }))).toBe(true)
   })
+
+  test('decodes the gateway project identity and its explicit null clearing value', () => {
+    const named = decodeSessionInfoPatch({
+      project: { id: 'p1', name: 'Hermes Agent', primary_path: '/work/hermes', slug: 'hermes-agent' }
+    })
+    expect(Option.isSome(named)).toBe(true)
+    if (Option.isSome(named)) expect(named.value.project?.name).toBe('Hermes Agent')
+
+    const cleared = decodeSessionInfoPatch({ project: null })
+    expect(Option.isSome(cleared)).toBe(true)
+    if (Option.isSome(cleared)) expect(cleared.value.project).toBeNull()
+  })
 })
 
 // ── 2. store applyInfo ───────────────────────────────────────────────────
@@ -303,6 +315,23 @@ function bar(store: SessionStore) {
 }
 
 describe('StatusBar frames (one left-aligned labeled line)', () => {
+  test('named project identity leads the cwd tail and clears on an unowned workspace', async () => {
+    const store = seededStore()
+    store.applyInfo({
+      project: { id: 'p1', name: 'Hermes Agent', primary_path: '/tmp/proj', slug: 'hermes-agent' }
+    })
+    const probe = await renderProbe(bar(store), { width: 220, height: 3 })
+    try {
+      expect(probe.frame()).toContain('Hermes Agent · /tmp/proj (main)')
+      store.applyInfo({ project: null })
+      await probe.settle()
+      expect(probe.frame()).not.toContain('Hermes Agent')
+      expect(probe.frame()).toContain('/tmp/proj (main)')
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('a session.info effort update repaints medium immediately', async () => {
     const store = seededStore()
     const probe = await renderProbe(bar(store), { width: 120, height: 3 })

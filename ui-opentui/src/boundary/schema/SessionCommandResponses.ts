@@ -32,6 +32,7 @@ export type ConfigValueResponse = typeof ConfigValueResponseSchema.Type
 export const ModelSwitchResponseSchema = Schema.Struct({
   confirm_message: opt(Str),
   confirm_required: opt(Schema.Boolean),
+  scope: opt(Schema.Literals(['global', 'once', 'session'])),
   value: opt(Str),
   warning: opt(Str)
 })

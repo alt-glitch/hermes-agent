@@ -37,7 +37,7 @@ import {
 } from '../logic/slash.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
 import type { ConfirmRequest, Message, PickerItem } from '../logic/store.ts'
-import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
+import type { BillingOverlayState, BillingStateResponse, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { SessionCompressResponse } from '../boundary/compression.ts'
 
 // the picker-refresh/tabs/prefetch seams are module-level state — never leak them across tests
@@ -330,6 +330,7 @@ interface Probe {
   resumed: string[]
   pickers: Array<{ title: string; items: PickerItem[]; onPick: (value: string) => void }>
   billed: BillingOverlayState[]
+  subscribed: SubscriptionOverlayState[]
   quit: { value: boolean }
   exitCodes: Array<number | undefined>
   redraws: { value: number }
@@ -384,6 +385,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const resumed: string[] = []
   const pickers: Probe['pickers'] = []
   const billed: Probe['billed'] = []
+  const subscribed: Probe['subscribed'] = []
   const quit = { value: false }
   const exitCodes: Array<number | undefined> = []
   const redraws = { value: 0 }
@@ -528,6 +530,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     openDashboard: () => (dashboard.value = true),
     openBackgroundPanel: () => {},
     openBilling: overlay => billed.push(overlay),
+    openSubscription: overlay => subscribed.push(overlay),
     addBgTask: () => {},
     openPager: (title, text) => paged.push({ text, title }),
     openPicker: p => pickers.push(p),
@@ -585,6 +588,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     paged,
     pickers,
     billed,
+    subscribed,
     cachedCatalog,
     dashboardMode,
     exitCodes,
@@ -1540,6 +1544,28 @@ describe('dispatchSlash — client commands', () => {
     })
   })
 
+  test('/model --once routes a one-turn override and labels its ephemeral scope', async () => {
+    const p = makeCtx(async () => ({ scope: 'once', value: 'anthropic/claude-opus-4.6' }))
+    await dispatchSlash('/model --once anthropic/claude-opus-4.6', p.ctx)
+    expect(p.calls[0]).toEqual({
+      method: 'config.set',
+      params: {
+        confirm_expensive_model: false,
+        key: 'model',
+        session_id: 'sid-1',
+        value: 'anthropic/claude-opus-4.6 --once'
+      }
+    })
+    expect(p.system).toContain('model → anthropic/claude-opus-4.6 (next turn only)')
+  })
+
+  test('/model --once without a model is rejected locally', async () => {
+    const p = makeCtx(async () => ({ value: 'unused' }))
+    await dispatchSlash('/model --once', p.ctx)
+    expect(p.calls).toHaveLength(0)
+    expect(p.system).toEqual(['usage: /model <name> --once'])
+  })
+
   test('/model guards busy sessions and confirms an expensive selection before retrying', async () => {
     const busy = makeCtx(async () => ({ value: 'unused' }))
     busy.busy.value = true
@@ -1845,10 +1871,10 @@ describe('dispatchSlash — client commands', () => {
     expect(invalid.system).toEqual(['usage: /fortune [random|daily]'])
   })
 
-  test('/billing fetches billing.state and opens the overlay on overview', async () => {
+  test('/topup fetches billing.state and opens the overlay on overview', async () => {
     const state = fakeBillingState({ logged_in: true })
     const p = makeCtx(async method => (method === 'billing.state' ? state : {}))
-    await dispatchSlash('/billing', p.ctx)
+    await dispatchSlash('/topup', p.ctx)
     expect(p.calls[0]?.method).toBe('billing.state')
     expect(p.billed).toHaveLength(1)
     expect(p.billed[0]!.screen).toBe('overview')
@@ -1859,20 +1885,43 @@ describe('dispatchSlash — client commands', () => {
     expect(p.billed[0]!.ctx.validate('10').amount).toBe('10')
   })
 
-  test('/billing on a logged-out portal explains how to log in (no overlay)', async () => {
+  test('/topup on a logged-out portal explains how to log in (no overlay)', async () => {
     const p = makeCtx(async method => (method === 'billing.state' ? fakeBillingState({ logged_in: false }) : {}))
-    await dispatchSlash('/billing', p.ctx)
+    await dispatchSlash('/topup', p.ctx)
     expect(p.billed).toHaveLength(0)
     expect(p.system.join('\n')).toContain('Not logged into Nous Portal')
   })
 
-  test('/billing surfaces a request failure instead of throwing', async () => {
+  test('/topup surfaces a request failure instead of throwing', async () => {
     const p = makeCtx(async () => {
       throw new Error('gateway down')
     })
-    await dispatchSlash('/billing', p.ctx)
+    await dispatchSlash('/topup', p.ctx)
     expect(p.billed).toHaveLength(0)
-    expect(p.system.join('\n')).toContain('/billing: gateway down')
+    expect(p.system.join('\n')).toContain('/topup: gateway down')
+  })
+
+  test('/subscription and /upgrade open the native plan overlay', async () => {
+    const state = {
+      ok: true,
+      logged_in: true,
+      is_admin: true,
+      can_change_plan: true,
+      org_name: 'Nous',
+      org_id: 'org-1',
+      role: 'OWNER',
+      context: 'personal' as const,
+      current: null,
+      tiers: [],
+      portal_url: 'https://portal.example/billing'
+    }
+    for (const command of ['/subscription', '/upgrade']) {
+      const p = makeCtx(async method => (method === 'subscription.state' ? state : {}))
+      await dispatchSlash(command, p.ctx)
+      expect(p.calls[0]).toEqual({ method: 'subscription.state', params: {} })
+      expect(p.subscribed).toHaveLength(1)
+      expect(p.subscribed[0]?.state.org_id).toBe('org-1')
+    }
   })
 
   test('/tools enable uses the live configure RPC, resets same-SID state, and reports every result class', async () => {

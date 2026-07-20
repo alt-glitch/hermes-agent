@@ -129,6 +129,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     newLiveSession: () => {},
     openBackgroundPanel: () => {},
     openBilling: () => {},
+    openSubscription: () => {},
     openDashboard: request => opens.push(request),
     openPager: (title, text) => pagers.push({ text, title }),
     openPicker: () => {},

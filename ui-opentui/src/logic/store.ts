@@ -15,7 +15,7 @@ import { Option } from 'effect'
 import { createStore, produce } from 'solid-js/store'
 
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
-import type { BillingOverlayState } from '../boundary/billing.ts'
+import type { BillingOverlayState, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { CommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
 import { decodeSessionActiveListResponse, type ActiveItem } from '../boundary/schema/SessionOrchestratorResponses.ts'
 import {
@@ -469,6 +469,9 @@ export interface SessionInfo {
   provider?: string
   cwd?: string
   branch?: string
+  /** First-class project resolved by the gateway for the active cwd. `null`
+   *  deliberately clears a prior project when the session changes workspace. */
+  projectName?: string | null
   /** Session title (auto-titled after the first exchange / renamed via the
    *  picker) — drives the terminal window-title chrome; unset until titled. */
   title?: string
@@ -600,8 +603,10 @@ export interface StoreState {
   pluginsHub: boolean
   /** Whether the searchable Pet gallery is open. */
   petPicker: boolean
-  /** The open /billing overlay (full-screen modal; undefined when closed). */
+  /** The open /topup overlay (full-screen modal; undefined when closed). */
   billing: BillingOverlayState | undefined
+  /** The open /subscription plan-management overlay. */
+  subscription: SubscriptionOverlayState | undefined
   /** OS background processes (from `agents.list`) — shown in the /processes panel. */
   backgroundProcesses: BackgroundProcess[]
   /** In-flight background-PROMPT task ids (`/bg` → `prompt.background`, cleared on
@@ -739,6 +744,7 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   if (d.provider) patch.provider = d.provider
   if (d.cwd) patch.cwd = d.cwd
   if (d.branch) patch.branch = d.branch
+  if (d.project !== undefined) patch.projectName = d.project?.name.trim() || null
   if (d.title) patch.title = d.title
   if (d.running !== undefined) patch.running = d.running
   // prefer the nested usage.context_* numbers, else the top-level fallback.
@@ -927,6 +933,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     dashboardDiffPair: undefined,
     backgroundPanel: false,
     billing: undefined,
+    subscription: undefined,
     backgroundProcesses: [],
     bgTasks: [],
     voice: { enabled: false, tts: false, recording: false, processing: false, recordKey: 'ctrl+b' },
@@ -1683,6 +1690,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.dashboardDiffPair = undefined
         draft.backgroundPanel = false
         draft.billing = undefined
+        draft.subscription = undefined
         draft.bgTasks = []
         draft.status = undefined
         draft.lastNotification = undefined
@@ -1794,7 +1802,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('backgroundPanel', false)
   }
 
-  /** Open the /billing overlay with the fetched gateway state + ctx bundle. */
+  /** Open the /topup overlay with the fetched gateway state + ctx bundle. */
   function openBilling(overlay: BillingOverlayState) {
     setState('billing', overlay)
   }
@@ -1806,6 +1814,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function patchBilling(next: Partial<BillingOverlayState>) {
     if (!state.billing) return
     setState('billing', prev => (prev ? { ...prev, ...next } : prev))
+  }
+  function openSubscription(overlay: SubscriptionOverlayState) {
+    setState('subscription', overlay)
+  }
+  function closeSubscription() {
+    setState('subscription', undefined)
+  }
+  function patchSubscription(next: Partial<SubscriptionOverlayState>) {
+    if (!state.subscription) return
+    setState('subscription', prev => (prev ? { ...prev, ...next } : prev))
   }
   /** Replace the OS-process snapshot (drives the /processes panel). */
   function setBackgroundProcesses(procs: BackgroundProcess[]) {
@@ -3109,6 +3127,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     openBilling,
     closeBilling,
     patchBilling,
+    openSubscription,
+    closeSubscription,
+    patchSubscription,
     setBackgroundProcesses,
     addBgTask,
     hydrate,

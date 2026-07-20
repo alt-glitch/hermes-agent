@@ -7,14 +7,14 @@
  *   3. render — captureFrame proves the overview screen actually PAINTS (balance,
  *      spend bar, menu) and that a screen patch swaps the rendered screen.
  */
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 
 import type { BillingCtx, BillingStateResponse } from '../boundary/billing.ts'
-import { validateAmount } from '../logic/billing.ts'
+import { buildBillingCtx, validateAmount } from '../logic/billing.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { BillingOverlay } from '../view/overlays/billing.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
-import { captureFrame } from './lib/render.ts'
+import { captureFrame, renderProbe } from './lib/render.ts'
 
 function fakeState(over: Partial<BillingStateResponse> = {}): BillingStateResponse {
   return {
@@ -52,9 +52,11 @@ function fakeState(over: Partial<BillingStateResponse> = {}): BillingStateRespon
 }
 
 const noopCtx: BillingCtx = {
-  charge: () => {},
+  charge: async () => 'submitted',
   applyAutoReload: async () => true,
   openPortal: () => {},
+  refreshState: async () => fakeState(),
+  requestRemoteSpending: async () => true,
   sys: () => {},
   validate: raw => validateAmount(raw, fakeState())
 }
@@ -89,6 +91,41 @@ describe('validateAmount — bounds + 2dp (mirrors the server)', () => {
   test('passes through with no bounds set', () => {
     const open = fakeState({ min_usd: null, max_usd: null })
     expect(validateAmount('1', open).amount).toBe('1')
+  })
+})
+
+describe('billing RPC behavior', () => {
+  test('charge forwards its stable idempotency key and routes scope denial to step-up', async () => {
+    const request = vi.fn(async () => ({ ok: false, error: 'insufficient_scope' }))
+    const lines: string[] = []
+    const billing = buildBillingCtx(
+      { request, pushSystem: text => lines.push(text), confirm: () => {}, sessionId: () => 'sid-1' },
+      fakeState()
+    )
+    await expect(billing.charge('25', 'charge-key-1')).resolves.toBe('needs_remote_spending')
+    expect(request).toHaveBeenCalledWith('billing.charge', { amount_usd: '25', idempotency_key: 'charge-key-1' })
+    expect(lines.join('\n')).not.toContain('billing:manage')
+  })
+
+  test.each([
+    ['consent_required', 'one-time card confirmation'],
+    ['org_access_denied', "isn't bound to an org"],
+    ['upgrade_cap_exceeded', 'Daily plan-change limit reached'],
+    ['auto_top_up_disabled_failures', 'Auto-reload was turned off'],
+    ['idempotency_conflict', 'charge key was already used']
+  ])('maps %s to actionable recovery copy', async (error, copy) => {
+    const lines: string[] = []
+    const billing = buildBillingCtx(
+      {
+        request: async () => ({ ok: false, error }),
+        pushSystem: text => lines.push(text),
+        confirm: () => {},
+        sessionId: () => 'sid-1'
+      },
+      fakeState()
+    )
+    await billing.charge('25')
+    expect(lines.join('\n')).toContain(copy)
   })
 })
 
@@ -133,28 +170,26 @@ function mount(screen: 'overview' | 'buy' | 'autoreload', state = fakeState()) {
 }
 
 describe('billing overlay render (captureCharFrame)', () => {
-  test('overview paints the balance, spend bar, and the admin menu', async () => {
-    const frame = await captureFrame(mount('overview'), { until: 'Usage credits', width: 80, height: 30 })
-    expect(frame).toContain('Usage credits')
-    expect(frame).toContain('Balance: $42.00')
-    expect(frame).toContain('█') // the spend bar painted
-    expect(frame).toContain('Buy credits') // full admin menu (admin + kill-switch on)
+  test('overview leads with dollar balance and the admin menu', async () => {
+    const frame = await captureFrame(mount('overview'), { until: 'Top up · balance', width: 80, height: 30 })
+    expect(frame).toContain('Top up · balance $42.00')
+    expect(frame).toContain('Add funds') // full admin menu (admin + kill-switch on)
     expect(frame).toContain('Manage on portal')
   })
 
   test('a non-admin sees the collapsed menu + the gating note', async () => {
     const frame = await captureFrame(mount('overview', fakeState({ is_admin: false })), {
-      until: 'Usage credits',
+      until: 'Top up · balance',
       width: 80,
       height: 30
     })
     expect(frame).toContain('org admin/owner') // the note
-    expect(frame).not.toContain('Buy credits') // collapsed — no buy row
+    expect(frame).not.toContain('Add funds') // collapsed — no buy row
   })
 
   test('the buy screen paints the presets + payment line', async () => {
-    const frame = await captureFrame(mount('buy'), { until: 'Buy usage credits', width: 80, height: 30 })
-    expect(frame).toContain('Buy usage credits')
+    const frame = await captureFrame(mount('buy'), { until: 'Add funds', width: 80, height: 30 })
+    expect(frame).toContain('Add funds')
     expect(frame).toContain('$10')
     expect(frame).toContain('Custom amount')
     expect(frame).toContain('4242') // the masked card payment line
@@ -186,5 +221,67 @@ describe('billing overlay render (captureCharFrame)', () => {
     expect(frame).toContain('10')
     expect(frame).toContain('50')
     expect(frame).toContain('Turn off') // enabled → the Turn-off action row shows
+  })
+
+  test('auto-reload discloses a distinct charge card and offers portal hand-off', async () => {
+    const frame = await captureFrame(
+      mount(
+        'autoreload',
+        fakeState({
+          auto_reload: {
+            card: { kind: 'distinct', payment_method_id: 'pm-1', brand: 'Mastercard', last4: '9999' },
+            enabled: true,
+            reload_to_display: '$50',
+            reload_to_usd: '50',
+            threshold_display: '$10',
+            threshold_usd: '10'
+          }
+        })
+      ),
+      { width: 100, height: 32 }
+    )
+    expect(frame).toContain('Auto-refill is charging Mastercard ••9999')
+    expect(frame).toContain('Use your card on file — manage on portal')
+  })
+
+  test('turning auto-reload off preserves the required current amounts', async () => {
+    const applyAutoReload = vi.fn(async () => true)
+    const store = createSessionStore()
+    store.openBilling({
+      ctx: { ...noopCtx, applyAutoReload },
+      pendingCharge: null,
+      screen: 'autoreload',
+      state: fakeState({
+        auto_reload: {
+          enabled: true,
+          reload_to_display: '$50',
+          reload_to_usd: '50',
+          threshold_display: '$10',
+          threshold_usd: '10'
+        }
+      })
+    })
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <BillingOverlay
+            overlay={store.state.billing!}
+            onPatch={next => store.patchBilling(next)}
+            onClose={() => store.closeBilling()}
+          />
+        </ThemeProvider>
+      ),
+      { kittyKeyboard: true, width: 80, height: 30 }
+    )
+    try {
+      probe.keys.pressArrow('down')
+      probe.keys.pressArrow('down')
+      probe.keys.pressArrow('down')
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(applyAutoReload).toHaveBeenCalledWith(false, 10, 50)
+    } finally {
+      probe.destroy()
+    }
   })
 })

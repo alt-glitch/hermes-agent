@@ -3,7 +3,7 @@
  * EVERY width (status chrome v3 — user feedback: "everything left-aligned,
  * all on one line, no random scatter"):
  *
- *   ● model ·effort │ ctx: ██████░░░░░░ 42% · 84k │ cost: $0.41 │ up: 23m │ cmp: 2 │ profile │ mcp: 2 │ …/cwd (branch)
+ *   ● model ·effort │ ctx: ██████░░░░░░ 42% · 84k │ cost: $0.41 │ up: 23m │ cmp: 2 │ profile │ mcp: 2 │ project · …/cwd (branch)
  *
  * Design rules (this pass):
  *   - Every segment is LABELED and terse (`ctx:`, `cost:`, `up:`, `cmp:`,
@@ -426,9 +426,14 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     const cwd = info().cwd
     const c = cwd ? shortCwd(cwd) : ''
     if (!c) return ''
-    const full = info().branch ? `${c} (${info().branch})` : c
+    const cwdBranch = info().branch ? `${c} (${info().branch})` : c
+    const project = info().projectName?.trim() ?? ''
     const budget = dims().width - ROW_PADDING - leftLen() - SEP.length
-    return budget >= CWD_MIN ? truncLeft(full, budget) : ''
+    if (budget < CWD_MIN) return ''
+    if (!project) return truncLeft(cwdBranch, budget)
+    const projectLabel = truncRight(project, budget)
+    const remainder = budget - projectLabel.length - DOT_SEP.length
+    return remainder < CWD_MIN ? projectLabel : `${projectLabel}${DOT_SEP}${truncLeft(cwdBranch, remainder)}`
   })
 
   /** A muted label + value span pair (`cost: $0.41`) with its leading ` │ `. */

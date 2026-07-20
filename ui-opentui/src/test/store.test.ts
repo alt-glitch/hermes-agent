@@ -884,6 +884,19 @@ describe('session store — session chrome / status bar (item 14)', () => {
     expect(store.state.info).toMatchObject({ model: 'opus', branch: 'dev', running: true })
   })
 
+  test('session.info project identity survives partial patches and explicit null clears it', () => {
+    const store = createSessionStore()
+    store.applyInfo({
+      cwd: '/work/hermes',
+      project: { id: 'p1', name: 'Hermes Agent', primary_path: '/work/hermes', slug: 'hermes-agent' }
+    })
+    expect(store.state.info.projectName).toBe('Hermes Agent')
+    store.applyInfo({ branch: 'main' })
+    expect(store.state.info.projectName).toBe('Hermes Agent')
+    store.applyInfo({ project: null })
+    expect(store.state.info.projectName).toBeNull()
+  })
+
   test('message.start sets running, message.complete clears it + refreshes usage', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start' })

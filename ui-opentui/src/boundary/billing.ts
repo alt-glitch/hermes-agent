@@ -15,6 +15,28 @@ export interface BillingCardInfo {
   brand: string
   last4: string
   masked: string
+  display?: string
+  resolved_via?: null | string
+}
+
+export interface UsageBarData {
+  kind: 'plan' | 'topup'
+  remaining_display: string
+  total_display: string
+  spent_display: string
+  pct_used: null | number
+  fill_fraction: number
+}
+
+export interface UsageModelData {
+  available: boolean
+  status?: string
+  has_topup?: boolean
+  plan_name?: null | string
+  renews_display?: null | string
+  total_spendable_display?: null | string
+  plan_bar?: null | UsageBarData
+  topup_bar?: null | UsageBarData
 }
 
 export interface BillingMonthlyCap {
@@ -26,6 +48,10 @@ export interface BillingMonthlyCap {
 }
 
 export interface BillingAutoReload {
+  card?:
+    | { kind: 'canonical' }
+    | { kind: 'distinct'; payment_method_id: string; brand: null | string; last4: null | string }
+    | { kind: 'none' }
   enabled: boolean
   reload_to_display: string
   reload_to_usd: string | null
@@ -39,6 +65,7 @@ export interface BillingStateResponse {
   balance_display: string
   balance_usd: string | null
   can_charge: boolean
+  can_change_plan?: boolean
   card: BillingCardInfo | null
   charge_presets: string[]
   charge_presets_display: string[]
@@ -53,6 +80,7 @@ export interface BillingStateResponse {
   org_name: string | null
   portal_url: string | null
   role: string | null
+  usage?: UsageModelData
 }
 
 /** Extra fields a few error codes attach (`_serialize_billing_error`). */
@@ -86,11 +114,13 @@ export interface BillingChargeStatusResponse {
 }
 
 export interface BillingMutationResponse {
+  actor?: string
+  code?: string
   error?: string
   granted?: boolean
   message?: string
   ok: boolean
-  payload?: BillingErrorPayload
+  payload?: BillingErrorPayload | Record<string, unknown>
   portal_url?: string | null
   retry_after?: number | null
 }
@@ -107,10 +137,12 @@ export interface AmountValidation {
  * RPC + error mapping); the overlay only renders + routes keys.
  */
 export interface BillingCtx {
-  /** POST `billing.charge` then poll `billing.charge_status` to settlement (non-blocking). */
-  charge: (amount: string) => void
+  /** POST `billing.charge` then poll `billing.charge_status` to settlement. */
+  charge: (amount: string, idempotencyKey?: string) => Promise<BillingChargeOutcome>
   /** POST `billing.auto_reload`; resolves true on success (false → error already surfaced). */
   applyAutoReload: (enabled: boolean, threshold?: number, topUp?: number) => Promise<boolean>
+  requestRemoteSpending: () => Promise<boolean>
+  refreshState: () => Promise<BillingStateResponse | null>
   /** Open the Nous portal in the browser + note it in the transcript. */
   openPortal: (url: string) => void
   /** Push a system/transcript line (charge progress, errors, confirmations). */
@@ -120,13 +152,107 @@ export interface BillingCtx {
 }
 
 /** The overlay's screens (a self-contained state machine). */
-export type BillingScreen = 'overview' | 'buy' | 'confirm' | 'autoreload' | 'limit'
+export type BillingScreen = 'overview' | 'buy' | 'confirm' | 'autoreload' | 'limit' | 'stepup'
 
-/** The open `/billing` overlay (undefined when closed). */
+export type BillingChargeOutcome = 'submitted' | 'needs_remote_spending' | 'error'
+
+/** The open `/topup` overlay (undefined when closed). */
 export interface BillingOverlayState {
   ctx: BillingCtx
   screen: BillingScreen
   state: BillingStateResponse
   /** The amount carried from Buy → Confirm; null when not confirming. */
-  pendingCharge: { amount: string } | null
+  pendingCharge: { amount: string; idempotencyKey?: string } | null
+}
+
+export interface SubscriptionTierOption {
+  tier_id: string
+  name: string
+  tier_order: number
+  dollars_per_month_display: string
+  monthly_credits: string | null
+  is_current: boolean
+  is_enabled: boolean
+}
+
+export interface SubscriptionStateResponse {
+  ok: boolean
+  logged_in: boolean
+  is_admin: boolean
+  can_change_plan: boolean
+  org_name: string | null
+  org_id: string | null
+  role: string | null
+  context: 'personal' | 'team'
+  current: null | {
+    tier_id: string | null
+    tier_name: string | null
+    monthly_credits: string | null
+    credits_remaining: string | null
+    cycle_ends_at: string | null
+    pending_downgrade_tier_name: string | null
+    pending_downgrade_at: string | null
+    pending_downgrade_display: string | null
+    cancel_at_period_end: boolean
+    cancellation_effective_at: string | null
+    cancellation_effective_display: string | null
+  }
+  tiers: SubscriptionTierOption[]
+  portal_url: string | null
+  error?: string | null
+  usage?: UsageModelData
+}
+
+export interface SubscriptionPreviewResponse extends BillingMutationResponse {
+  effect?: 'charge_now' | 'scheduled' | 'no_op' | 'blocked'
+  reason?: string | null
+  target_tier_id?: string | null
+  target_tier_name?: string | null
+  monthly_credits_delta?: string | null
+  amount_due_now_cents?: number | null
+  effective_at?: string | null
+}
+
+export interface SubscriptionUpgradeResponse extends BillingMutationResponse {
+  status?: 'upgraded' | 'already_on_tier' | 'requires_action' | 'payment_failed'
+  target_tier_name?: string | null
+  recovery_url?: string | null
+  reason?: string | null
+  idempotency_key?: string
+}
+
+export type SubscriptionScreen = 'confirm' | 'overview' | 'picker' | 'result' | 'stepup'
+export type SubscriptionStepUpRetry = { kind: 'apply' } | { kind: 'preview'; tierId: string } | { kind: 'resume' }
+export interface SubscriptionPendingChange {
+  targetTierId: string | null
+  kind: 'cancellation' | 'tier_change' | 'upgrade'
+  preview?: SubscriptionPreviewResponse | null
+  idempotencyKey?: string
+}
+export interface SubscriptionResult {
+  message: string
+  ok: boolean
+  pendingTierId?: string | null
+  recoveryUrl?: string | null
+}
+export interface SubscriptionCtx {
+  fetchCard: () => Promise<BillingCardInfo | null>
+  openManageLink: () => Promise<boolean>
+  openPortal: (url: string) => void
+  preview: (tierId: string) => Promise<SubscriptionPreviewResponse | null>
+  refreshState: () => Promise<SubscriptionStateResponse | null>
+  requestRemoteSpending: () => Promise<{ granted: boolean; error?: string; message?: string }>
+  resume: () => Promise<BillingMutationResponse | null>
+  scheduleCancellation: () => Promise<BillingMutationResponse | null>
+  scheduleChange: (tierId: string) => Promise<BillingMutationResponse | null>
+  sys: (text: string) => void
+  upgrade: (tierId: string, idempotencyKey?: string) => Promise<SubscriptionUpgradeResponse | null>
+}
+export interface SubscriptionOverlayState {
+  ctx: SubscriptionCtx
+  pending?: SubscriptionPendingChange | null
+  result?: SubscriptionResult | null
+  screen: SubscriptionScreen
+  state: SubscriptionStateResponse
+  stepUpRetry?: SubscriptionStepUpRetry | null
 }

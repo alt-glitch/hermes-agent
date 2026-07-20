@@ -2598,6 +2598,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         openPetPicker: () => store.openPetPicker(),
         openBackgroundPanel: () => store.openBackgroundPanel(),
         openBilling: overlay => store.openBilling(overlay),
+        openSubscription: overlay => store.openSubscription(overlay),
         addBgTask: id => store.addBgTask(id),
         openPager: (title, text) => store.openPager(title, text),
         openPicker: picker => store.openPicker(picker),

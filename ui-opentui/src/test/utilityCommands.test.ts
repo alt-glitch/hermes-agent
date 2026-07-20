@@ -145,6 +145,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     openDashboard: () => {},
     openBackgroundPanel: () => {},
     openBilling: () => {},
+    openSubscription: () => {},
     addBgTask: () => {},
     openPager: (title, text) => paged.push({ text, title }),
     openPicker: () => {},
@@ -285,32 +286,65 @@ describe('/fast, /yolo, /reload-mcp', () => {
 })
 
 describe('account, personality, and rollback commands', () => {
-  test('credits and usage render decoded account data locally', async () => {
-    const p = makeCtx(async method =>
-      method === 'credits.view'
-        ? {
-            logged_in: true,
-            balance_lines: ['$4.00'],
-            identity_line: 'user@example.com',
-            topup_url: null,
-            depleted: false
-          }
-        : {
-            calls: 1,
-            input: 10,
-            output: 4,
-            total: 14,
-            model: 'test-model',
-            context_used: 20,
-            context_max: 100,
-            context_percent: 20
-          }
-    )
-    await dispatchSlash('/credits', p.ctx)
+  test('usage renders decoded account data locally and always shows the account CTA', async () => {
+    const p = makeCtx(async () => ({
+      calls: 1,
+      input: 10,
+      output: 4,
+      total: 14,
+      model: 'test-model',
+      context_used: 20,
+      context_max: 100,
+      context_percent: 20
+    }))
     await dispatchSlash('/usage', p.ctx)
-    expect(p.system[0]).toContain('💳 Nous credits')
     expect(p.paged.at(-1)).toMatchObject({ title: 'Usage' })
     expect(p.paged.at(-1)?.text).toContain('Total tokens: 14')
+    expect(p.system).toContain('Run /subscription to change plan · /topup to add to your balance')
+  })
+
+  test('credits is no longer a native alias and follows the gateway dispatch ladder', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'unknown command: credits' } : {}))
+    await dispatchSlash('/credits', p.ctx)
+    expect(p.calls[0]).toEqual({ method: 'slash.exec', params: { command: 'credits', session_id: 'sid-1' } })
+  })
+
+  test('usage renders dollar plan and top-up bars without credits wording', async () => {
+    const p = makeCtx(async () => ({
+      calls: 0,
+      input: 0,
+      output: 0,
+      total: 0,
+      usage: {
+        available: true,
+        status: 'healthy',
+        plan_name: 'Plus',
+        renews_display: 'Aug 1',
+        total_spendable_display: '$26.00',
+        has_topup: true,
+        plan_bar: {
+          kind: 'plan',
+          remaining_display: '$14.00',
+          total_display: '$20.00',
+          spent_display: '$6.00',
+          pct_used: 30,
+          fill_fraction: 0.7
+        },
+        topup_bar: {
+          kind: 'topup',
+          remaining_display: '$12.00',
+          total_display: '$12.00',
+          spent_display: '$0.00',
+          pct_used: null,
+          fill_fraction: 1
+        }
+      }
+    }))
+    await dispatchSlash('/usage', p.ctx)
+    const body = p.paged.at(-1)?.text ?? ''
+    expect(body).toContain('$14.00 left of $20.00')
+    expect(body).toContain('top-up')
+    expect(body.toLowerCase()).not.toContain('credits')
   })
 
   test('personality resets visible history only when the gateway says so', async () => {

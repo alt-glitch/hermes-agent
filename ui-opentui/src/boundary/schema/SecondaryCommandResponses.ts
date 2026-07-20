@@ -6,6 +6,25 @@ const Bool = Schema.Boolean
 const opt = Schema.optionalKey
 const loose = Schema.Struct
 
+const UsageBarSchema = loose({
+  kind: Schema.Literals(['plan', 'topup']),
+  remaining_display: Str,
+  total_display: Str,
+  spent_display: Str,
+  pct_used: Schema.NullOr(Num),
+  fill_fraction: Num
+})
+const UsageModelSchema = loose({
+  available: Bool,
+  status: opt(Str),
+  plan_name: opt(Schema.NullOr(Str)),
+  renews_display: opt(Schema.NullOr(Str)),
+  total_spendable_display: opt(Schema.NullOr(Str)),
+  has_topup: opt(Bool),
+  plan_bar: opt(Schema.NullOr(UsageBarSchema)),
+  topup_bar: opt(Schema.NullOr(UsageBarSchema))
+})
+
 export const SessionUsageResponseSchema = loose({
   calls: opt(Num),
   compressions: opt(Num),
@@ -16,7 +35,8 @@ export const SessionUsageResponseSchema = loose({
   input: opt(Num),
   model: opt(Str),
   output: opt(Num),
-  total: opt(Num)
+  total: opt(Num),
+  usage: opt(UsageModelSchema)
 })
 export type SessionUsageResponse = typeof SessionUsageResponseSchema.Type
 

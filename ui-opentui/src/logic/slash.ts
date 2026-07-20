@@ -33,7 +33,15 @@ import { mapResumeHistory } from './resume.ts'
 import { mapSessionRows, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
 import type { SpawnHistoryState, SpawnSnapshot } from './spawnHistory.ts'
 import type { CompletionItem, ConfirmRequest, CustomModelSetupState, PickerItem, PickerState } from './store.ts'
-import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
+import type {
+  BillingMutationResponse,
+  BillingOverlayState,
+  BillingStateResponse,
+  SubscriptionOverlayState,
+  SubscriptionPreviewResponse,
+  SubscriptionStateResponse,
+  SubscriptionUpgradeResponse
+} from '../boundary/billing.ts'
 import {
   type CommandsCatalogResponse,
   type SessionUndoResponse,
@@ -53,7 +61,6 @@ import { decodeBrowserManageResponse } from '../boundary/schema/BrowserResponses
 import { decodeVoiceToggleResponse } from '../boundary/schema/VoiceResponses.ts'
 import { openExternalUrl } from '../boundary/openExternalUrl.ts'
 import {
-  decodeCreditsViewResponse,
   decodePersonalityResponse,
   decodeRollbackDiffResponse,
   decodeRollbackListResponse,
@@ -194,8 +201,9 @@ export interface SlashContext {
   readonly openJourney?: () => void
   readonly openPluginsHub?: () => void
   readonly openPetPicker?: () => void
-  /** Open the /billing overlay with a fetched state snapshot + ctx bundle. */
+  /** Open the /topup overlay with a fetched state snapshot + ctx bundle. */
   readonly openBilling: (overlay: BillingOverlayState) => void
+  readonly openSubscription: (overlay: SubscriptionOverlayState) => void
   /** Track an in-flight background-prompt task id (`/bg` → prompt.background). */
   readonly addBgTask: (id: string) => void
   /** Commit the authoritative process-global CDP state returned by browser.manage. */
@@ -749,7 +757,7 @@ async function switchModel(
   ctx: SlashContext,
   name: string,
   confirmExpensiveModel = false,
-  sessionScoped = false
+  scope: 'direct' | 'once' | 'session' = 'direct'
 ): Promise<void> {
   if (ctx.guardBusySessionSwitch('change models')) return
   const sid = ctx.sessionId()
@@ -758,7 +766,7 @@ async function switchModel(
       confirm_expensive_model: confirmExpensiveModel,
       key: 'model',
       session_id: sid,
-      value: `${name.trim()}${sessionScoped ? ' --session' : ''}`
+      value: `${name.trim()}${scope === 'session' ? ' --session' : scope === 'once' ? ' --once' : ''}`
     })
     if (ctx.sessionId() !== sid) return
     const response = decodeModelSwitchResponse(raw)
@@ -775,7 +783,7 @@ async function switchModel(
           detail: response.confirm_message || response.warning || 'This model has unusually high known pricing.',
           title: 'Expensive model selection'
         },
-        () => void switchModel(ctx, name, true, sessionScoped)
+        () => void switchModel(ctx, name, true, scope)
       )
       return
     }
@@ -784,7 +792,7 @@ async function switchModel(
       ctx.pushSystem('error: invalid response: model switch')
       return
     }
-    ctx.pushSystem(`model → ${value}`)
+    ctx.pushSystem(`model → ${value}${response.scope === 'once' ? ' (next turn only)' : ''}`)
     if (response.warning) ctx.pushSystem(`warning: ${response.warning}`)
     ctx.setCurrentModel(value)
     void refreshModelItems(ctx).catch(() => {})
@@ -831,13 +839,13 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
           if (ctx.openCustomModelSetup) {
             ctx.openCustomModelSetup({
               request: ctx.request,
-              onSaved: value => void switchModel(ctx, value, false, true)
+              onSaved: value => void switchModel(ctx, value, false, 'session')
             })
           } else {
             ctx.pushSystem('Custom model setup is unavailable in this TUI host.')
           }
         } else {
-          void switchModel(ctx, name, false, true)
+          void switchModel(ctx, name, false, 'session')
         }
       },
       title: 'Switch model'
@@ -851,7 +859,14 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
     return
   }
   if (requested) {
-    await switchModel(ctx, requested)
+    const tokens = requested.split(/\s+/)
+    const once = tokens.includes('--once')
+    const model = tokens.filter(token => token !== '--once').join(' ')
+    if (once && !model) {
+      ctx.pushSystem('usage: /model <name> --once')
+      return
+    }
+    await switchModel(ctx, model, false, once ? 'once' : 'direct')
     return
   }
   if (ctx.guardBusySessionSwitch('change models')) return
@@ -1237,40 +1252,38 @@ const replayCmd: ClientHandler = async (arg, ctx, flight) => {
   }
   ctx.openDashboard({ initialHistoryIndex: index })
 }
-const creditsCmd: ClientHandler = async (_arg, ctx, flight) => {
-  const sid = ctx.sessionId()
-  const response = decodeCreditsViewResponse(await ctx.request('credits.view', { session_id: sid }))
-  if (!currentSessionIs(ctx, sid, flight)) return
-  if (!response) return ctx.pushSystem('error: invalid response: credits.view')
-  if (!response.logged_in) return ctx.pushSystem('💳 Not logged into Nous Portal — run /portal to log in.')
-  const lines = ['💳 Nous credits', ...response.balance_lines]
-  if (response.identity_line) lines.push('', response.identity_line)
-  if (response.topup_url) lines.push('', `Top up: ${response.topup_url}`)
-  ctx.pushSystem(lines.join('\n'))
-  if (response.topup_url) {
-    const url = response.topup_url
-    ctx.confirm(
-      { title: 'Add credits?', detail: url, confirmLabel: 'Open top-up in browser', cancelLabel: 'Cancel' },
-      () => {
-        const opened = openExternalUrl(url)
-        ctx.pushSystem(
-          opened
-            ? 'Complete your top-up in the browser — credits will appear in /credits shortly.'
-            : `Open this URL to top up: ${url}`
-        )
-      }
-    )
-  }
-}
-
 const usageCmd: ClientHandler = async (_arg, ctx, flight) => {
   const sid = ctx.sessionId()
   const response = decodeSessionUsageResponse(await ctx.request('session.usage', { session_id: sid }))
   if (!currentSessionIs(ctx, sid, flight)) return
   if (!response) return ctx.pushSystem('error: invalid response: session.usage')
   const credits = response.credits_lines ?? []
-  if (!(response.calls ?? 0) && !credits.length) return ctx.pushSystem('no API calls yet')
-  const lines = credits.length ? ['Nous credits', ...credits, ''] : []
+  const model = response.usage
+  const bars: string[] = []
+  if (model?.plan_bar) {
+    const b = model.plan_bar
+    const filled = Math.max(0, Math.min(10, Math.round(b.fill_fraction * 10)))
+    bars.push(
+      `${model.plan_name ?? 'plan'} [${'█'.repeat(filled)}${'░'.repeat(10 - filled)}] ${b.remaining_display} left of ${b.total_display}${b.pct_used == null ? '' : ` · ${String(b.pct_used)}% used`}`
+    )
+  }
+  if (model?.topup_bar) bars.push(`top-up [${'█'.repeat(10)}] ${model.topup_bar.remaining_display} · never expires`)
+  if (model?.total_spendable_display && model.has_topup) bars.push(`Total spendable: ${model.total_spendable_display}`)
+  const hasBalance = Boolean((model?.available && (bars.length || model.status === 'free')) || credits.length)
+  if (!(response.calls ?? 0) && !hasBalance) ctx.pushSystem('no API calls yet')
+  const lines = model?.available
+    ? [
+        `Plan: ${model.plan_name ?? (model.status === 'free' ? 'Free' : '')}${model.renews_display ? ` · renews ${model.renews_display}` : ''}`,
+        ...bars,
+        ...(model.status === 'free' ? ['> Free · free models only. Run /subscription to reach paid models.'] : []),
+        ...(model.status === 'low'
+          ? [`! Low balance · ${model.total_spendable_display ?? 'under $5'} left. Run /topup or /subscription.`]
+          : []),
+        ''
+      ]
+    : credits.length
+      ? ['Nous balance', ...credits, '']
+      : []
   if ((response.calls ?? 0) > 0) {
     const f = (value: number | undefined) => (value ?? 0).toLocaleString()
     lines.push(
@@ -1287,7 +1300,8 @@ const usageCmd: ClientHandler = async (_arg, ctx, flight) => {
       )
     if (response.compressions) lines.push(`Compressions: ${String(response.compressions)}`)
   }
-  ctx.openPager('Usage', lines.join('\n').trim())
+  if (lines.length) ctx.openPager('Usage', lines.join('\n').trim())
+  ctx.pushSystem('Run /subscription to change plan · /topup to add to your balance')
 }
 
 const personalityCmd: ClientHandler = async (arg, ctx, flight) => {
@@ -1729,15 +1743,15 @@ const toolsCmd: ClientHandler = async (arg, ctx) => {
   }
 }
 
-/** `/billing` — fetch the gateway billing state and open the interactive overlay
+/** `/topup` — fetch the gateway billing state and open the interactive overlay
  *  (buy credits / auto-reload / monthly limit). ZERO sub-commands (CLI/TUI
  *  parity): any arg is ignored. All RPC + error mapping lives in logic/billing.ts
  *  (`buildBillingCtx`); this handler just fetches state and opens. */
-const billingCmd: ClientHandler = async (_arg, ctx) => {
+const topupCmd: ClientHandler = async (_arg, ctx) => {
   try {
     const s = (await ctx.request('billing.state', {})) as BillingStateResponse
     if (!s.logged_in) {
-      ctx.pushSystem('💳 Not logged into Nous Portal — run /portal to log in, then /billing.')
+      ctx.pushSystem('💳 Not logged into Nous Portal — run /portal to log in, then /topup.')
       return
     }
     const billingHost = {
@@ -1753,7 +1767,105 @@ const billingCmd: ClientHandler = async (_arg, ctx) => {
       state: s
     })
   } catch (error) {
-    ctx.pushSystem(`/billing: ${error instanceof Error ? error.message : 'billing.state failed'}`)
+    ctx.pushSystem(`/topup: ${error instanceof Error ? error.message : 'billing.state failed'}`)
+  }
+}
+
+const subscriptionCmd: ClientHandler = async (_arg, ctx) => {
+  try {
+    const state = (await ctx.request('subscription.state', {})) as SubscriptionStateResponse
+    if (!state.logged_in) {
+      ctx.pushSystem('Not logged into Nous Portal — run /portal to log in, then /subscription.')
+      return
+    }
+    const openPortal = (url: string) => {
+      const opened = openExternalUrl(url)
+      ctx.pushSystem(opened ? `Opening portal: ${url}` : `Could not open browser — visit ${url}`)
+    }
+    const manageUrl = () => {
+      try {
+        if (!state.portal_url) return null
+        const url = new URL('/manage-subscription', new URL(state.portal_url).origin)
+        if (state.org_id) url.searchParams.set('org_id', state.org_id)
+        return url.toString()
+      } catch {
+        return null
+      }
+    }
+    ctx.openSubscription({
+      ctx: {
+        fetchCard: () =>
+          ctx
+            .request('billing.state', {})
+            .then(raw => (raw as BillingStateResponse).card ?? null)
+            .catch(() => null),
+        openManageLink: () => {
+          const url = manageUrl()
+          if (!url) {
+            ctx.pushSystem('Could not build manage URL — is your portal configured?')
+            return Promise.resolve(false)
+          }
+          const opened = openExternalUrl(url)
+          ctx.pushSystem(
+            opened
+              ? 'Opening your subscription page in the browser — finish there, then re-run /subscription.'
+              : `Could not open browser — visit ${url}`
+          )
+          return Promise.resolve(opened)
+        },
+        openPortal,
+        preview: tierId =>
+          ctx
+            .request('subscription.preview', { subscription_type_id: tierId })
+            .then(raw => raw as SubscriptionPreviewResponse)
+            .catch(() => null),
+        refreshState: () =>
+          ctx
+            .request('subscription.state', {})
+            .then(raw => raw as SubscriptionStateResponse)
+            .catch(() => null),
+        requestRemoteSpending: () =>
+          ctx
+            .request('billing.step_up', { session_id: ctx.sessionId() })
+            .then(raw => {
+              const r = raw as BillingMutationResponse
+              return {
+                ...(r.error ? { error: r.error } : {}),
+                granted: Boolean(r.ok && r.granted),
+                ...(r.message ? { message: r.message } : {})
+              }
+            })
+            .catch(() => ({ granted: false, message: 'Could not reach the billing service.' })),
+        resume: () =>
+          ctx
+            .request('subscription.resume', {})
+            .then(raw => raw as BillingMutationResponse)
+            .catch(() => null),
+        scheduleCancellation: () =>
+          ctx
+            .request('subscription.change', { cancel: true })
+            .then(raw => raw as BillingMutationResponse)
+            .catch(() => null),
+        scheduleChange: tierId =>
+          ctx
+            .request('subscription.change', { subscription_type_id: tierId })
+            .then(raw => raw as BillingMutationResponse)
+            .catch(() => null),
+        sys: ctx.pushSystem,
+        upgrade: (tierId, idempotencyKey) =>
+          ctx
+            .request('subscription.upgrade', {
+              subscription_type_id: tierId,
+              ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {})
+            })
+            .then(raw => raw as SubscriptionUpgradeResponse)
+            .catch(() => null)
+      },
+      screen: 'overview',
+      state
+    })
+  } catch (error) {
+    ctx.pushSystem(`/subscription: ${error instanceof Error ? error.message : 'subscription.state failed'}`)
   }
 }
 
@@ -2479,13 +2591,13 @@ const CLIENT: Record<string, ClientHandler> = {
   agents: agentsCmd,
   background: backgroundCmd,
   bg: backgroundCmd,
-  billing: billingCmd,
+  subscription: subscriptionCmd,
+  upgrade: subscriptionCmd,
   browser: browserCmd,
   busy: busyCmd,
   btw: backgroundCmd,
   clear: freshSessionCmd(false),
   compact: compactCmd,
-  credits: creditsCmd,
   compress: compressCmd,
   branch: branchCmd,
   fork: branchCmd,
@@ -2543,6 +2655,7 @@ const CLIENT: Record<string, ClientHandler> = {
   stop: stopCmd,
   tasks: agentsCmd,
   timestamps: timestampsCmd,
+  topup: topupCmd,
   title: titleCmd,
   ts: timestampsCmd,
   tools: toolsCmd,

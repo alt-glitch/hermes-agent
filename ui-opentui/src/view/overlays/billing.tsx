@@ -1,5 +1,5 @@
 /**
- * BillingOverlay — the `/billing` modal, ported from the Ink TUI
+ * BillingOverlay — the `/topup` modal, ported from the Ink TUI
  * (`components/billingOverlay.tsx`) onto OpenTUI Solid. A self-contained state
  * machine: overview → buy → confirm, plus autoreload + limit. Esc from a
  * sub-screen returns to overview; Esc from overview closes.
@@ -15,6 +15,8 @@
  * `<input>`s with the picker's global-key-handler `preventDefault` pattern so
  * navigation keys never double as cursor edits.
  */
+import { randomUUID } from 'node:crypto'
+
 import type { BoxRenderable, InputRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { createMemo, createSignal, For, type JSXElement, onMount, Show } from 'solid-js'
@@ -22,8 +24,7 @@ import { createMemo, createSignal, For, type JSXElement, onMount, Show } from 's
 import type { BillingOverlayState, BillingStateResponse } from '../../boundary/billing.ts'
 import { useCloseLayer } from '../keymap.tsx'
 import { useTheme } from '../theme.tsx'
-
-const SPEND_BAR_CELLS = 10
+import { UsageBars } from './usageBars.tsx'
 
 /** A numbered menu row with the ▸ cursor. */
 function MenuRow(props: { active: boolean; index: number; label: string }): JSXElement {
@@ -47,21 +48,6 @@ function ActionRow(props: { active: boolean; label: string; color?: string }): J
       <span style={{ fg: props.active ? (props.color ?? c().text) : c().muted }}>{props.label}</span>
     </text>
   )
-}
-
-/** 10-cell spend bar + percent (null when there's no usable cap). */
-function spendBar(s: BillingStateResponse): null | string {
-  const cap = s.monthly_cap
-  if (!cap || cap.limit_usd == null) return null
-  const limit = Number(cap.limit_usd)
-  const spent = Number(cap.spent_this_month_usd ?? '0')
-  if (!(limit > 0) || Number.isNaN(spent)) return null
-  const ratio = Math.max(0, Math.min(1, spent / limit))
-  const filled = Math.round(ratio * SPEND_BAR_CELLS)
-  const bar = '█'.repeat(filled) + '░'.repeat(SPEND_BAR_CELLS - filled)
-  const pct = Math.round(ratio * 100)
-  const ceiling = cap.is_default_ceiling ? ' (default ceiling)' : ''
-  return `${cap.spent_display} of ${cap.limit_display} used   ${bar} ${pct}%${ceiling}`
 }
 
 function autoReloadLine(s: BillingStateResponse): null | string {
@@ -113,6 +99,7 @@ export function BillingOverlay(props: {
           overlay={props.overlay}
           onBack={() => props.onPatch({ pendingCharge: null, screen: 'buy' })}
           onClose={props.onClose}
+          onPatch={props.onPatch}
         />
       </Show>
       <Show when={screen() === 'autoreload'}>
@@ -120,6 +107,9 @@ export function BillingOverlay(props: {
       </Show>
       <Show when={screen() === 'limit'}>
         <LimitScreen overlay={props.overlay} onPatch={props.onPatch} onClose={props.onClose} />
+      </Show>
+      <Show when={screen() === 'stepup'}>
+        <StepUpScreen overlay={props.overlay} onClose={props.onClose} />
       </Show>
     </box>
   )
@@ -158,12 +148,8 @@ function OverviewScreen(props: ScreenProps): JSXElement {
       : !state().cli_billing_enabled
         ? 'Terminal billing is off for this org — enable it on the portal.'
         : null
-  const cardHint = () =>
-    full() && !state().card ? 'No saved card for terminal charges yet — set one up on the portal first.' : null
   const items = createMemo(() =>
-    full()
-      ? ['Buy credits', 'Adjust auto-reload', 'Adjust monthly limit', 'Manage on portal', 'Cancel']
-      : ['Manage on portal', 'Cancel']
+    full() ? ['Add funds', 'Auto-reload', 'Monthly limit', 'Manage on portal', 'Close'] : ['Manage on portal', 'Cancel']
   )
 
   const [sel, setSel] = createSignal(0)
@@ -193,20 +179,14 @@ function OverviewScreen(props: ScreenProps): JSXElement {
     if (n >= 1 && n <= items().length) return choose(n - 1)
   })
 
-  const bar = createMemo(() => spendBar(state()))
   const auto = createMemo(() => autoReloadLine(state()))
 
   return (
     <box style={{ flexDirection: 'column' }}>
       <text fg={c().accent} selectable={false}>
-        <b>Usage credits</b>
+        <b>{`Top up · balance ${state().balance_display}`}</b>
       </text>
-      <Show when={bar()}>
-        <text fg={c().text} selectable={false}>
-          {bar()}
-        </text>
-      </Show>
-      <text fg={c().text} selectable={false}>{`Balance: ${state().balance_display}`}</text>
+      <UsageBars model={state().usage} />
       <Show when={auto()}>
         <text fg={c().muted} selectable={false}>
           {auto()}
@@ -223,13 +203,12 @@ function OverviewScreen(props: ScreenProps): JSXElement {
           {note()}
         </text>
       </Show>
-      <Show when={cardHint()}>
-        <text fg={c().warn} selectable={false}>
-          {cardHint()}
+      <Show when={full()}>
+        <text fg={c().muted} selectable={false}>
+          {state().card
+            ? `Card: ${state().card?.display ?? state().card?.masked}`
+            : 'No saved card on file — “Add funds” walks you through adding one.'}
         </text>
-      </Show>
-      <Show when={cardHint() && state().portal_url}>
-        <text fg={c().muted} selectable={false}>{`Portal: ${state().portal_url}`}</text>
       </Show>
       <text> </text>
       <For each={items()}>{(label, i) => <MenuRow active={sel() === i()} index={i() + 1} label={label} />}</For>
@@ -247,16 +226,23 @@ function BuyScreen(props: ScreenProps): JSXElement {
   const ctx = () => props.overlay.ctx
   const presets = () => state().charge_presets_display
   const rawPresets = () => state().charge_presets
-  const rows = createMemo(() => [...presets(), 'Custom amount…', 'Cancel'])
+  const noCard = () => !state().card
+  const rows = createMemo(() =>
+    noCard()
+      ? ['Add a card on the portal', 'I’ve added it — check again', 'Back']
+      : [...presets(), 'Custom amount…', 'Cancel']
+  )
   const customIdx = () => presets().length
 
   const [sel, setSel] = createSignal(0)
   const [typing, setTyping] = createSignal(false)
   const [custom, setCustom] = createSignal('')
   const [error, setError] = createSignal<null | string>(null)
+  const [checking, setChecking] = createSignal(false)
   let inputRef: InputRenderable | undefined
 
-  const toConfirm = (amount: string) => props.onPatch({ pendingCharge: { amount }, screen: 'confirm' })
+  const toConfirm = (amount: string) =>
+    props.onPatch({ pendingCharge: { amount, idempotencyKey: randomUUID() }, screen: 'confirm' })
 
   const pickPreset = (i: number) => {
     const raw = (rawPresets()[i] ?? presets()[i] ?? '').replace(/^\$/, '').trim()
@@ -278,6 +264,38 @@ function BuyScreen(props: ScreenProps): JSXElement {
   }
 
   const choose = (i: number) => {
+    if (noCard()) {
+      if (i === 0) {
+        const portalUrl = state().portal_url
+        if (portalUrl) {
+          ctx().openPortal(portalUrl)
+          ctx().sys('Add a card on the billing page, then come back and pick “check again”.')
+        } else setError('Could not build the portal link — is your portal configured?')
+        return
+      }
+      if (i === 1) {
+        if (checking()) return
+        setChecking(true)
+        void ctx()
+          .refreshState()
+          .then(fresh => {
+            setChecking(false)
+            if (!fresh) {
+              setError('Could not refresh billing state — try again in a moment.')
+              return
+            }
+            props.onPatch({ state: fresh })
+            ctx().sys(
+              fresh.card
+                ? `✓ Card found: ${fresh.card.display ?? fresh.card.masked} — pick an amount.`
+                : 'Still no card on file — finish adding it on the portal, then check again.'
+            )
+          })
+        return
+      }
+      props.onPatch({ screen: 'overview' })
+      return
+    }
     if (i < presets().length) pickPreset(i)
     else if (i === customIdx()) {
       setError(null)
@@ -318,11 +336,14 @@ function BuyScreen(props: ScreenProps): JSXElement {
   return (
     <box style={{ flexDirection: 'column' }}>
       <text fg={c().accent} selectable={false}>
-        <b>Buy usage credits</b>
+        <b>Add funds</b>
       </text>
       <text fg={c().muted} selectable={false}>
         {payLine()}
       </text>
+      <Show when={noCard()}>
+        <text fg={c().muted}>Add a card once on the portal; after that you can top up here.</text>
+      </Show>
       <text> </text>
       <Show
         when={typing()}
@@ -335,7 +356,13 @@ function BuyScreen(props: ScreenProps): JSXElement {
               </text>
             </Show>
             <text> </text>
-            <Footer text={`↑/↓ select · 1-${rows().length} quick pick · Enter confirm · Esc back`} />
+            <Footer
+              text={
+                checking()
+                  ? 'Checking for a card…'
+                  : `↑/↓ select · 1-${rows().length} quick pick · Enter confirm · Esc back`
+              }
+            />
           </>
         }
       >
@@ -376,6 +403,7 @@ function ConfirmScreen(props: {
   overlay: BillingOverlayState
   onBack: () => void
   onClose: () => void
+  onPatch: (next: Partial<BillingOverlayState>) => void
 }): JSXElement {
   const c = () => useTheme()().color
   const state = () => props.overlay.state
@@ -390,9 +418,12 @@ function ConfirmScreen(props: {
   const pay = () => {
     if (paying) return
     paying = true
-    ctx().charge(props.amount)
-    // Settlement is reported via transcript lines; close the overlay now.
-    props.onClose()
+    void ctx()
+      .charge(props.amount, props.overlay.pendingCharge?.idempotencyKey)
+      .then(outcome => {
+        if (outcome === 'needs_remote_spending') props.onPatch({ screen: 'stepup' })
+        else props.onClose()
+      })
   }
 
   useKeyboard(key => {
@@ -432,6 +463,108 @@ function ConfirmScreen(props: {
 
 // ── Screen 4: Auto-reload (the 2-field form) ────────────────────────────
 
+function StepUpScreen(props: { overlay: BillingOverlayState; onClose: () => void }): JSXElement {
+  const c = () => useTheme()().color
+  const ctx = () => props.overlay.ctx
+  const amount = () => props.overlay.pendingCharge?.amount ?? ''
+  const [phase, setPhase] = createSignal<'granted' | 'prompt' | 'resuming' | 'waiting'>('prompt')
+  const [sel, setSel] = createSignal(0)
+  let aborted = false
+
+  const close = (message?: string) => {
+    aborted = true
+    if (message) ctx().sys(message)
+    props.onClose()
+  }
+  const allow = () => {
+    if (phase() !== 'prompt') return
+    setPhase('waiting')
+    ctx().sys('Opening your browser to enable terminal billing…')
+    void ctx()
+      .requestRemoteSpending()
+      .then(granted => {
+        if (aborted) return
+        if (granted) setPhase('granted')
+        else
+          close(
+            "! Couldn't enable terminal billing — someone with billing permissions must approve it. Your card was not charged."
+          )
+      })
+  }
+  const resume = () => {
+    if (phase() !== 'granted') return
+    setPhase('resuming')
+    ctx().sys('✓ Terminal billing enabled — resuming your purchase.')
+    void ctx()
+      .charge(amount(), props.overlay.pendingCharge?.idempotencyKey)
+      .then(outcome => {
+        if (aborted) return
+        if (outcome === 'needs_remote_spending') {
+          ctx().sys('! Terminal billing still needs approval — run /topup to try again. Your card was not charged.')
+        }
+        props.onClose()
+      })
+  }
+
+  useKeyboard(key => {
+    if (phase() === 'waiting' || phase() === 'resuming') {
+      if (key.name === 'escape') close()
+      return
+    }
+    if (phase() === 'granted') {
+      if (key.name === 'escape') close('No charge made. Run /topup when you want to continue.')
+      else if (key.name === 'return') resume()
+      return
+    }
+    if (key.name === 'escape' || key.name === 'n') {
+      close('No charge made. Run /topup when you want to enable terminal billing.')
+      return
+    }
+    if (key.name === 'y') return allow()
+    if (key.name === 'up') return setSel(0)
+    if (key.name === 'down') return setSel(1)
+    if (key.name === 'return') return sel() === 0 ? allow() : close('No charge made.')
+  })
+
+  return (
+    <box style={{ flexDirection: 'column' }}>
+      <Show when={phase() === 'prompt'}>
+        <text fg={c().warn}>
+          <b>One-time setup</b>
+        </text>
+        <text fg={c().text}>To charge this terminal, enable terminal billing once.</text>
+        <text fg={c().muted}>{`It opens your browser to authorize, then your $${amount()} top-up resumes here.`}</text>
+        <text> </text>
+        <ActionRow active={sel() === 0} color={c().ok} label="Enable terminal billing" />
+        <ActionRow active={sel() === 1} label="Not now" />
+        <Footer text="↑/↓ select · Enter confirm · Y/N quick · Esc cancel" />
+      </Show>
+      <Show when={phase() === 'waiting'}>
+        <text fg={c().accent}>
+          <b>Enable terminal billing</b>
+        </text>
+        <text fg={c().warn}>Waiting for your browser…</text>
+        <text fg={c().muted}>{`Your $${amount()} top-up is held here and resumes when you’re done.`}</text>
+        <Footer text="Esc cancel" />
+      </Show>
+      <Show when={phase() === 'granted'}>
+        <text fg={c().ok}>
+          <b>Terminal billing enabled</b>
+        </text>
+        <text fg={c().text}>{`Your $${amount()} top-up is ready to finish.`}</text>
+        <ActionRow active color={c().ok} label="Press Enter to resume" />
+        <Footer text="Enter resume · Esc cancel" />
+      </Show>
+      <Show when={phase() === 'resuming'}>
+        <text fg={c().accent}>
+          <b>Enable terminal billing</b>
+        </text>
+        <text fg={c().muted}>{`Resuming your $${amount()} top-up…`}</text>
+      </Show>
+    </box>
+  )
+}
+
 function AutoReloadScreen(props: ScreenProps): JSXElement {
   const c = () => useTheme()().color
   const state = () => props.overlay.state
@@ -439,6 +572,16 @@ function AutoReloadScreen(props: ScreenProps): JSXElement {
   const ar = () => state().auto_reload
   const enabled = () => Boolean(ar()?.enabled)
   const noCard = () => !state().card
+  const distinctCard = () => {
+    const card = ar()?.card
+    return card?.kind === 'distinct' ? card : null
+  }
+  const distinctCardName = () => {
+    const card = distinctCard()
+    if (!card) return null
+    return [card.brand, card.last4 ? `••${card.last4}` : null].filter(Boolean).join(' ') || 'a different card'
+  }
+  const manageCardLabel = 'Use your card on file — manage on portal'
 
   const prefill = (raw?: null | string) => (raw == null ? '' : String(raw).replace(/^\$/, '').trim())
   // Seed the field signals from the existing config ONCE at construction (the
@@ -447,9 +590,12 @@ function AutoReloadScreen(props: ScreenProps): JSXElement {
   const [reloadTo, setReloadTo] = createSignal(prefill(ar()?.reload_to_usd))
   const [error, setError] = createSignal<null | string>(null)
   const FIELD_ROWS = 2
-  const actionRows = createMemo(() =>
-    enabled() ? ['Agree and turn on', 'Turn off', 'Cancel'] : ['Agree and turn on', 'Cancel']
-  )
+  const actionRows = createMemo(() => {
+    const manage = distinctCard() && state().portal_url ? [manageCardLabel] : []
+    return enabled()
+      ? ['Agree and turn on', 'Turn off', ...manage, 'Cancel']
+      : ['Agree and turn on', ...manage, 'Cancel']
+  })
   // row: 0=threshold field, 1=reloadTo field, 2..=action rows
   const [row, setRow] = createSignal(0)
   let thresholdRef: InputRenderable | undefined
@@ -504,8 +650,10 @@ function AutoReloadScreen(props: ScreenProps): JSXElement {
   }
 
   const turnOff = () => {
+    const currentThreshold = Number(prefill(ar()?.threshold_usd)) || 0
+    const currentReloadTo = Number(prefill(ar()?.reload_to_usd)) || 0
     void ctx()
-      .applyAutoReload(false)
+      .applyAutoReload(false, currentThreshold, currentReloadTo)
       .then(ok => {
         if (ok) ctx().sys('✅ Auto-reload turned off.')
       })
@@ -515,7 +663,11 @@ function AutoReloadScreen(props: ScreenProps): JSXElement {
   const onAction = (label: string) => {
     if (label === 'Agree and turn on') turnOn()
     else if (label === 'Turn off') turnOff()
-    else props.onPatch({ screen: 'overview' })
+    else if (label === manageCardLabel) {
+      const url = state().portal_url
+      if (url) ctx().openPortal(url)
+      props.onClose()
+    } else props.onPatch({ screen: 'overview' })
   }
 
   onMount(() => focusRow(0))
@@ -567,10 +719,10 @@ function AutoReloadScreen(props: ScreenProps): JSXElement {
 
   const cardLine = () => {
     const card = state().card
-    return card ? `Card on file: ${card.masked}` : 'No saved card on file'
+    return card ? `Card on file: ${card.display ?? card.masked}` : 'No saved card on file'
   }
 
-  const chargeTarget = () => state().card?.masked ?? 'your card'
+  const chargeTarget = () => distinctCardName() ?? state().card?.display ?? state().card?.masked ?? 'your card'
 
   const fieldBox = (
     label: string,
@@ -618,6 +770,9 @@ function AutoReloadScreen(props: ScreenProps): JSXElement {
       <text fg={c().muted} selectable={false}>
         {cardLine()}
       </text>
+      <Show when={distinctCardName()}>
+        {name => <text fg={c().warn}>{`⚠ Auto-refill is charging ${name()} — not your card on file.`}</text>}
+      </Show>
       <text> </text>
       {fieldBox(
         'When balance falls below:',

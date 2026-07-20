@@ -32,6 +32,7 @@ import { QueuedMessages } from './queuedMessages.tsx'
 import { AgentsDashboard } from './overlays/agentsDashboard.tsx'
 import { BackgroundPanel } from './overlays/backgroundPanel.tsx'
 import { BillingOverlay } from './overlays/billing.tsx'
+import { SubscriptionOverlay } from './overlays/subscription.tsx'
 import { Pager } from './overlays/pager.tsx'
 import { JourneyOverlay, type JourneyOps } from './overlays/journey.tsx'
 import { PetPicker, type PetOps } from './overlays/petPicker.tsx'
@@ -137,6 +138,7 @@ export function App(props: AppProps) {
   const dashboard = () => props.store.state.dashboard
   const backgroundPanel = () => props.store.state.backgroundPanel
   const billing = () => props.store.state.billing
+  const subscription = () => props.store.state.subscription
   const sessionPicker = () => props.store.state.sessionPicker
   const picker = () => props.store.state.picker
   const customModelSetup = () => props.store.state.customModelSetup
@@ -162,6 +164,7 @@ export function App(props: AppProps) {
   const closeDashboard = () => deferClose(() => props.store.closeDashboard())
   const closeBackgroundPanel = () => deferClose(() => props.store.closeBackgroundPanel())
   const closeBilling = () => deferClose(() => props.store.closeBilling())
+  const closeSubscription = () => deferClose(() => props.store.closeSubscription())
   const closeJourney = () => deferClose(() => props.store.closeJourney())
   const closePluginsHub = () => deferClose(() => props.store.closePluginsHub())
   const closePetPicker = () => deferClose(() => props.store.closePetPicker())
@@ -374,6 +377,15 @@ export function App(props: AppProps) {
             <Match when={billing()}>
               {b => (
                 <BillingOverlay overlay={b()} onPatch={next => props.store.patchBilling(next)} onClose={closeBilling} />
+              )}
+            </Match>
+            <Match when={subscription()}>
+              {s => (
+                <SubscriptionOverlay
+                  overlay={s()}
+                  onPatch={next => props.store.patchSubscription(next)}
+                  onClose={closeSubscription}
+                />
               )}
             </Match>
           </Switch>
