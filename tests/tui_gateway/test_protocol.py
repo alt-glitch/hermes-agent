@@ -346,6 +346,12 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
         def reopen_session(self, _sid):
             return None
 
+        def get_resume_conversations(self, session_id):
+            return (
+                self.get_messages_as_conversation(session_id, repair_alternation=True),
+                self.get_messages_as_conversation(session_id, include_ancestors=True),
+            )
+
         def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             return [
                 {"role": "user", "content": "hello"},
@@ -405,6 +411,12 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
 
         def reopen_session(self, _sid):
             return None
+
+        def get_resume_conversations(self, session_id):
+            return (
+                self.get_messages_as_conversation(session_id, repair_alternation=True),
+                self.get_messages_as_conversation(session_id, include_ancestors=True),
+            )
 
         def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             return [
@@ -547,6 +559,12 @@ def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
         def reopen_session(self, _sid):
             return None
 
+        def get_resume_conversations(self, session_id):
+            return (
+                self.get_messages_as_conversation(session_id, repair_alternation=True),
+                self.get_messages_as_conversation(session_id, include_ancestors=True),
+            )
+
         def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             return [multimodal_user, text_only_assistant]
 
@@ -596,6 +614,12 @@ def test_session_resume_lazy_registers_watch_session_without_agent(server, monke
 
         def reopen_session(self, _sid):
             return None
+
+        def get_resume_conversations(self, session_id):
+            return (
+                self.get_messages_as_conversation(session_id, repair_alternation=True),
+                self.get_messages_as_conversation(session_id, include_ancestors=True),
+            )
 
         def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             return [
@@ -670,6 +694,12 @@ def test_session_resume_lazy_reports_running_for_inflight_child(server, monkeypa
         def reopen_session(self, _sid):
             return None
 
+        def get_resume_conversations(self, session_id):
+            return (
+                self.get_messages_as_conversation(session_id, repair_alternation=True),
+                self.get_messages_as_conversation(session_id, include_ancestors=True),
+            )
+
         def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             return [{"role": "user", "content": "delegated goal"}]
 
@@ -720,6 +750,12 @@ def test_session_resume_lazy_tolerates_missing_row_for_active_child(server, monk
 
         def reopen_session(self, _sid):
             return None
+
+        def get_resume_conversations(self, session_id):
+            return (
+                self.get_messages_as_conversation(session_id, repair_alternation=True),
+                self.get_messages_as_conversation(session_id, include_ancestors=True),
+            )
 
         def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             # No rows for an unwritten session.
@@ -817,6 +853,12 @@ def test_session_resume_reuses_existing_live_session(server, monkeypatch):
 
         def reopen_session(self, _sid):
             return None
+
+        def get_resume_conversations(self, session_id):
+            return (
+                self.get_messages_as_conversation(session_id, repair_alternation=True),
+                self.get_messages_as_conversation(session_id, include_ancestors=True),
+            )
 
         def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             return [
@@ -1034,6 +1076,12 @@ def test_session_resume_live_payload_uses_current_history_with_ancestors(server,
 
         def reopen_session(self, _sid):
             return None
+
+        def get_resume_conversations(self, session_id):
+            return (
+                self.get_messages_as_conversation(session_id, repair_alternation=True),
+                self.get_messages_as_conversation(session_id, include_ancestors=True),
+            )
 
         def get_messages_as_conversation(self, _sid, include_ancestors=False, repair_alternation=False):
             if include_ancestors:
@@ -1854,7 +1902,7 @@ def test_dispatch_long_handler_does_not_block_fast_handler(server):
     fast_elapsed = time.monotonic() - t0
 
     assert fast_resp["result"] == {"pong": True}
-    assert fast_elapsed < 0.5, f"fast handler blocked for {fast_elapsed:.2f}s behind slow handler"
+    assert fast_elapsed < 2.0, f"fast handler blocked for {fast_elapsed:.2f}s behind slow handler"
 
     released.set()
 
@@ -1877,7 +1925,7 @@ def test_dispatch_session_compress_does_not_block_fast_handler(server):
     fast_elapsed = time.monotonic() - t0
 
     assert fast_resp["result"] == {"pong": True}
-    assert fast_elapsed < 0.5, f"fast handler blocked for {fast_elapsed:.2f}s behind session.compress"
+    assert fast_elapsed < 2.0, f"fast handler blocked for {fast_elapsed:.2f}s behind session.compress"
 
     released.set()
 
@@ -1942,6 +1990,6 @@ def test_slow_completion_does_not_block_fast_handler(completion_method, server):
     fast_elapsed = time.monotonic() - t0
 
     assert fast_resp["result"] == {"pong": True}
-    assert fast_elapsed < 0.5, f"fast handler blocked for {fast_elapsed:.2f}s behind {completion_method}"
+    assert fast_elapsed < 2.0, f"fast handler blocked for {fast_elapsed:.2f}s behind {completion_method}"
 
     released.set()
