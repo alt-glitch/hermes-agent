@@ -2216,18 +2216,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
             const interimText = visibleText(interim).trim()
             const previewMatches = Boolean(
               event.payload?.response_previewed &&
-                finalText?.trim() &&
-                interimText &&
-                finalText.trim().startsWith(interimText)
+              finalText?.trim() &&
+              interimText &&
+              finalText.trim().startsWith(interimText)
             )
             const streaming = liveAssistant(draft, true)
             if (previewMatches && streaming && streaming !== interim) {
               const streamingIndex = draft.messages.indexOf(streaming)
               if (streamingIndex >= 0) draft.messages.splice(streamingIndex, 1)
             }
-            const live = previewMatches
-              ? interim
-              : (streaming ?? (finalText ? ensureAssistant(draft) : undefined))
+            const live = previewMatches ? interim : (streaming ?? (finalText ? ensureAssistant(draft) : undefined))
             if (!live) return
             reconcileFinalText(live, finalText)
             live.streaming = false
