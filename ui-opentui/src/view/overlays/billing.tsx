@@ -632,31 +632,29 @@ function AutoReloadScreen(props: ScreenProps): JSXElement {
   }
 
   const turnOn = () => {
+    const billingCtx = ctx()
     if (noCard()) {
-      ctx().sys('🔴 No saved card — set one up on the portal first.')
+      billingCtx.sys('🔴 No saved card — set one up on the portal first.')
       const url = state().portal_url
-      if (url) ctx().openPortal(url)
+      if (url) billingCtx.openPortal(url)
       props.onClose()
       return
     }
     const pair = validatePair()
     if (!pair) return
-    void ctx()
-      .applyAutoReload(true, Number(pair.threshold), Number(pair.reloadTo))
-      .then(ok => {
-        if (ok) ctx().sys(`✅ Auto-reload on: below $${pair.threshold} → reload to $${pair.reloadTo}.`)
-      })
+    void billingCtx.applyAutoReload(true, Number(pair.threshold), Number(pair.reloadTo)).then(ok => {
+      if (ok) billingCtx.sys(`✅ Auto-reload on: below $${pair.threshold} → reload to $${pair.reloadTo}.`)
+    })
     props.onClose()
   }
 
   const turnOff = () => {
+    const billingCtx = ctx()
     const currentThreshold = Number(prefill(ar()?.threshold_usd)) || 0
     const currentReloadTo = Number(prefill(ar()?.reload_to_usd)) || 0
-    void ctx()
-      .applyAutoReload(false, currentThreshold, currentReloadTo)
-      .then(ok => {
-        if (ok) ctx().sys('✅ Auto-reload turned off.')
-      })
+    void billingCtx.applyAutoReload(false, currentThreshold, currentReloadTo).then(ok => {
+      if (ok) billingCtx.sys('✅ Auto-reload turned off.')
+    })
     props.onClose()
   }
 
