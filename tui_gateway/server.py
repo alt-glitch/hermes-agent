@@ -12750,9 +12750,15 @@ def _(rid, params: dict) -> dict:
             # build ("switch one session, switches everywhere"). Pin the
             # create override so lazily-built sessions and rebuilds (/new,
             # deferred resume) keep the choice; "" pins normal explicitly.
-            session["create_service_tier_override"] = (
-                "priority" if nv == "fast" else ""
+            pinned_tier = "priority" if nv == "fast" else ""
+            runtime_lock = session.setdefault(
+                "runtime_override_lock", threading.Lock()
             )
+            with runtime_lock:
+                session["create_service_tier_override"] = pinned_tier
+                resume_overrides = session.get("resume_runtime_overrides")
+                if isinstance(resume_overrides, dict):
+                    resume_overrides["service_tier_override"] = pinned_tier
         else:
             _write_config_key("agent.service_tier", nv)
         if agent is not None:

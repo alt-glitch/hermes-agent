@@ -264,6 +264,14 @@ describe('/fast, /yolo, /reload-mcp', () => {
     ])
   })
 
+  test('fast refuses to mutate global config before a session exists', async () => {
+    const p = makeCtx(async () => ({ value: 'fast' }))
+    p.sessionId.value = undefined
+    await dispatchSlash('/fast fast', p.ctx)
+    expect(p.calls).toHaveLength(0)
+    expect(p.system).toEqual(['fast mode: no active session'])
+  })
+
   test('yolo toggles only the live session', async () => {
     const p = makeCtx(async () => ({ value: '1' }))
     await dispatchSlash('/yolo', p.ctx)

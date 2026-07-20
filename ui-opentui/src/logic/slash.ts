@@ -1437,6 +1437,10 @@ const fastCmd: ClientHandler = async (arg, ctx, flight) => {
     return
   }
   const sid = ctx.sessionId()
+  if (!sid && mode !== '' && mode !== 'status') {
+    ctx.pushSystem('fast mode: no active session')
+    return
+  }
   const response = decodeConfigValueResponse(
     await ctx.request(mode === '' || mode === 'status' ? 'config.get' : 'config.set', {
       key: 'fast',

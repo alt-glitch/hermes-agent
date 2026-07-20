@@ -100,6 +100,29 @@ class TestConfigSetFastSessionScope:
         assert session["create_service_tier_override"] == "priority"
         write_key.assert_not_called()
 
+    def test_lazy_resume_syncs_service_tier_override(self) -> None:
+        """A deferred resume splats resume_runtime_overrides after the ordinary
+        create pins, so a live /fast change must update that authoritative map."""
+        session = {
+            "session_key": "k3-resume",
+            "agent": None,
+            "model_override": {"model": "gpt-6", "provider": "openai"},
+            "resume_runtime_overrides": {"service_tier_override": ""},
+        }
+        with patch.dict(server._sessions, {"s3-resume": session}, clear=False), \
+                patch.object(server, "_write_config_key") as write_key, \
+                patch(
+                    "hermes_cli.models.resolve_fast_mode_overrides",
+                    return_value=FAST_OVERRIDES,
+                ):
+            resp = _set(
+                {"key": "fast", "session_id": "s3-resume", "value": "fast"}
+            )
+        assert resp["result"]["value"] == "fast"
+        assert session["create_service_tier_override"] == "priority"
+        assert session["resume_runtime_overrides"]["service_tier_override"] == "priority"
+        write_key.assert_not_called()
+
     def test_lazy_session_validates_fast_against_session_model(self) -> None:
         """Fast support is checked against the session's picked model, not the
         global default the session will never use."""
