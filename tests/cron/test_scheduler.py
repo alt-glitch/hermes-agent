@@ -1701,6 +1701,71 @@ class TestRunJobSessionPersistence:
             "heartbeat-job", expected_owner="owner-token"
         )
 
+    @pytest.mark.parametrize("job_timeout", [18000, 0])
+    def test_run_job_uses_per_job_inactivity_timeout(
+        self, tmp_path, monkeypatch, job_timeout
+    ):
+        """Production run_job must prefer the stored job budget over env."""
+        job = {
+            "id": "custom-timeout-job",
+            "name": "custom-timeout",
+            "prompt": "hello",
+            "schedule": {"kind": "interval", "minutes": 60},
+            "inactivity_timeout_seconds": job_timeout,
+        }
+        fake_db = MagicMock()
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                self.interrupted = False
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+            def get_activity_summary(self):
+                # This exceeds the env limit below. The run succeeds only if
+                # run_job consults the per-job override (or disables it for 0).
+                return {"seconds_since_activity": 2.0}
+
+            def interrupt(self, _reason):
+                self.interrupted = True
+
+        class FakeFuture:
+            def result(self):
+                return {"final_response": "ok"}
+
+        fake_future = FakeFuture()
+        fake_pool = MagicMock()
+        fake_pool.submit.return_value = fake_future
+        wait_results = [(set(), set()), ({fake_future}, set())]
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent), \
+             patch(
+                 "cron.scheduler.concurrent.futures.ThreadPoolExecutor",
+                 return_value=fake_pool,
+             ), \
+             patch(
+                 "cron.scheduler.concurrent.futures.wait",
+                 side_effect=wait_results,
+             ):
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+
     def test_run_job_resets_secret_source_cache_before_reload(self, tmp_path, monkeypatch):
         """Each run must clear the secret-source cache before re-reading the
         env, so a long-running gateway re-resolves Bitwarden/BSM-backed secrets

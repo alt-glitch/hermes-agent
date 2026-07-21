@@ -70,6 +70,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
+    cron_create.add_argument(
+        "--inactivity-timeout",
+        dest="inactivity_timeout_seconds",
+        help=(
+            "Per-job agent inactivity watchdog in seconds (LLM jobs only). "
+            "Use 0 for unlimited; omit to inherit the global default."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -133,6 +141,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--inactivity-timeout",
+        dest="inactivity_timeout_seconds",
+        help=(
+            "Per-job agent inactivity watchdog in seconds (LLM jobs only). "
+            "Use 0 for unlimited or 'inherit' to restore the global default."
+        ),
     )
 
     # lifecycle actions

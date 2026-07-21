@@ -284,6 +284,7 @@ from cron.jobs import (
     get_job,
     heartbeat_run_claim,
     mark_job_run,
+    resolve_cron_inactivity_timeout_seconds,
     run_claim_is_owned,
     save_job_output,
 )
@@ -3432,23 +3433,12 @@ def run_job(
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
         # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
+        # override globally via HERMES_CRON_TIMEOUT or for this job via
+        # inactivity_timeout_seconds.  0 = unlimited.
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-        if _raw_cron_timeout:
-            try:
-                _cron_timeout = float(_raw_cron_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
-                    _raw_cron_timeout,
-                )
-                _cron_timeout = 600.0
-        else:
-            _cron_timeout = 600.0
-        _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+        _cron_inactivity_limit = resolve_cron_inactivity_timeout_seconds(job)
         _POLL_INTERVAL = 5.0
         # Keep the one-shot run_claim fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a

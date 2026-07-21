@@ -163,6 +163,10 @@ def cron_list(show_all: bool = False):
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
+        if "inactivity_timeout_seconds" in job:
+            timeout = job["inactivity_timeout_seconds"]
+            timeout_display = "unlimited" if timeout == 0 else f"{timeout}s"
+            print(f"    Agent idle limit: {timeout_display}")
 
         # Execution history
         last_status = job.get("last_status")
@@ -335,6 +339,7 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        inactivity_timeout_seconds=getattr(args, "inactivity_timeout_seconds", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -351,6 +356,9 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if "inactivity_timeout_seconds" in job_data:
+        timeout = job_data["inactivity_timeout_seconds"]
+        print(f"  Agent inactivity timeout: {'unlimited' if timeout == 0 else f'{timeout}s'}")
     print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()
     return 0
@@ -398,6 +406,7 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        inactivity_timeout_seconds=getattr(args, "inactivity_timeout_seconds", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -417,6 +426,11 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if "inactivity_timeout_seconds" in updated:
+        timeout = updated["inactivity_timeout_seconds"]
+        print(f"  Agent inactivity timeout: {'unlimited' if timeout == 0 else f'{timeout}s'}")
+    elif getattr(args, "inactivity_timeout_seconds", None) is not None:
+        print("  Agent inactivity timeout: inherited")
     return 0
 
 

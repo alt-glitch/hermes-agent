@@ -198,12 +198,97 @@ _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 _DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
 
 
-def _oneshot_run_claim_ttl_seconds() -> float:
+def _normalize_inactivity_timeout_seconds(value: Any) -> Optional[int]:
+    """Normalize a per-job inactivity budget.
+
+    ``None`` and the explicit CLI/tool sentinel ``"inherit"`` mean that the
+    job should use the process-wide ``HERMES_CRON_TIMEOUT`` fallback. ``0``
+    disables the inactivity watchdog for this job. Positive values are stored
+    as whole seconds so jobs.json remains stable and human-editable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if value.lower() in {"inherit", "default"}:
+            return None
+        if not value:
+            raise ValueError(
+                "inactivity_timeout_seconds must be a non-negative integer "
+                "or 'inherit'"
+            )
+    if isinstance(value, bool):
+        raise ValueError(
+            "inactivity_timeout_seconds must be a non-negative integer or 'inherit'"
+        )
+    if isinstance(value, int):
+        timeout = value
+    elif isinstance(value, str):
+        try:
+            timeout = int(value, 10)
+        except ValueError as exc:
+            raise ValueError(
+                "inactivity_timeout_seconds must be a non-negative integer or 'inherit'"
+            ) from exc
+    elif isinstance(value, float) and value.is_integer():
+        timeout = int(value)
+    else:
+        raise ValueError(
+            "inactivity_timeout_seconds must be a non-negative integer or 'inherit'"
+        )
+    if timeout < 0:
+        raise ValueError(
+            "inactivity_timeout_seconds must be a non-negative integer or 'inherit'"
+        )
+    return timeout
+
+
+def resolve_cron_inactivity_timeout_seconds(
+    job: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """Return the effective inactivity watchdog budget for ``job``.
+
+    A valid per-job value wins. Legacy jobs inherit the existing environment
+    setting (default 600 seconds); ``0`` at either layer means unlimited.
+    Invalid hand-edited job values fail safely back to the inherited setting.
+    """
+    if job is not None and "inactivity_timeout_seconds" in job:
+        try:
+            configured = _normalize_inactivity_timeout_seconds(
+                job.get("inactivity_timeout_seconds")
+            )
+        except ValueError:
+            logger.warning(
+                "Invalid inactivity_timeout_seconds=%r for cron job %r; "
+                "using inherited timeout",
+                job.get("inactivity_timeout_seconds"),
+                job.get("id") or job.get("name"),
+            )
+        else:
+            if configured is not None:
+                return configured if configured > 0 else None
+
+    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+    timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
+    if raw:
+        try:
+            timeout = float(raw)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_TIMEOUT=%r; using default %ss",
+                raw,
+                int(_DEFAULT_CRON_INACTIVITY_TIMEOUT),
+            )
+            timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
+    return timeout if timeout > 0 else None
+
+
+def _oneshot_run_claim_ttl_seconds(job: Optional[Dict[str, Any]] = None) -> float:
     """Resolve the one-shot running-claim stale-recovery TTL.
 
-    Derived from ``HERMES_CRON_TIMEOUT`` (the cron inactivity timeout the
-    scheduler enforces on each run) so the safety valve tracks how long a run
-    is actually allowed to go quiet, instead of a magic constant:
+    Derived from the effective per-job inactivity timeout (falling back to
+    ``HERMES_CRON_TIMEOUT``) so the safety valve tracks how long a run is
+    actually allowed to go quiet, instead of a magic constant:
 
     - unset / invalid → default 600s inactivity limit → TTL = 1800s
     - ``0`` (unlimited runs) → no finite bound to derive from → fall back to
@@ -211,14 +296,8 @@ def _oneshot_run_claim_ttl_seconds() -> float:
     - positive N → ``max(N * headroom, ONESHOT_RUN_CLAIM_TTL_SECONDS)`` so a
       tiny configured timeout can never expire a claim mid-run.
     """
-    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-    timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
-    if raw:
-        try:
-            timeout = float(raw)
-        except (ValueError, TypeError):
-            timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
-    if timeout <= 0:
+    timeout = resolve_cron_inactivity_timeout_seconds(job)
+    if timeout is None:
         # Unlimited runs — cannot bound; use the fixed fallback floor.
         return float(ONESHOT_RUN_CLAIM_TTL_SECONDS)
     return max(
@@ -1112,6 +1191,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    inactivity_timeout_seconds: Optional[Union[int, str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1156,6 +1236,9 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        inactivity_timeout_seconds: Optional per-job inactivity watchdog in
+                seconds. ``0`` disables it for this job. Omit to inherit the
+                process-wide default (600s unless HERMES_CRON_TIMEOUT is set).
 
     Returns:
         The created job dict
@@ -1188,6 +1271,9 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_inactivity_timeout = _normalize_inactivity_timeout_seconds(
+        inactivity_timeout_seconds
+    )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1283,6 +1369,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_inactivity_timeout is not None:
+        job["inactivity_timeout_seconds"] = normalized_inactivity_timeout
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1360,7 +1448,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
-    bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
+    updates = dict(updates or {})
+    bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates)
     if bad_fields:
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
@@ -1381,8 +1470,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            clear_inactivity_timeout = False
+            if "inactivity_timeout_seconds" in updates:
+                normalized_timeout = _normalize_inactivity_timeout_seconds(
+                    updates["inactivity_timeout_seconds"]
+                )
+                if normalized_timeout is None:
+                    updates.pop("inactivity_timeout_seconds")
+                    clear_inactivity_timeout = True
+                else:
+                    updates["inactivity_timeout_seconds"] = normalized_timeout
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if clear_inactivity_timeout:
+                updated.pop("inactivity_timeout_seconds", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -2039,10 +2141,6 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 rj.pop("last_run_at", None)
                 needs_save = True
 
-    # Resolve the one-shot running-claim stale-recovery TTL once per scan
-    # (derived from HERMES_CRON_TIMEOUT). See _oneshot_run_claim_ttl_seconds.
-    _run_claim_ttl = _oneshot_run_claim_ttl_seconds()
-
     for job in jobs:
         # Per-job containment (structural guard): one malformed or
         # unexpected job record must never abort the whole scan. The id /
@@ -2063,6 +2161,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # through so the job is recovered rather than wedged forever.
             existing_claim = job.get("run_claim")
             if existing_claim and job.get("schedule", {}).get("kind") == "once":
+                _run_claim_ttl = _oneshot_run_claim_ttl_seconds(job)
                 try:
                     claimed_at = _ensure_aware(
                         datetime.fromisoformat(existing_claim["at"])
