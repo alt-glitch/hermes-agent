@@ -163,8 +163,6 @@ export function App(props: AppProps) {
   const closePager = () => deferClose(() => props.store.closePager())
   const closeDashboard = () => deferClose(() => props.store.closeDashboard())
   const closeBackgroundPanel = () => deferClose(() => props.store.closeBackgroundPanel())
-  const closeBilling = () => deferClose(() => props.store.closeBilling())
-  const closeSubscription = () => deferClose(() => props.store.closeSubscription())
   const closeJourney = () => deferClose(() => props.store.closeJourney())
   const closePluginsHub = () => deferClose(() => props.store.closePluginsHub())
   const closePetPicker = () => deferClose(() => props.store.closePetPicker())
@@ -375,18 +373,34 @@ export function App(props: AppProps) {
               <JourneyOverlay ops={props.journeyOps ?? NOOP_JOURNEY_OPS} onClose={closeJourney} />
             </Match>
             <Match when={billing()}>
-              {b => (
-                <BillingOverlay overlay={b()} onPatch={next => props.store.patchBilling(next)} onClose={closeBilling} />
-              )}
+              <Show when={billing()?.owner} keyed>
+                {owner => (
+                  <Show when={billing()}>
+                    {b => (
+                      <BillingOverlay
+                        overlay={b()}
+                        onPatch={next => props.store.patchBilling(owner, next)}
+                        onClose={() => deferClose(() => props.store.closeBilling(owner))}
+                      />
+                    )}
+                  </Show>
+                )}
+              </Show>
             </Match>
             <Match when={subscription()}>
-              {s => (
-                <SubscriptionOverlay
-                  overlay={s()}
-                  onPatch={next => props.store.patchSubscription(next)}
-                  onClose={closeSubscription}
-                />
-              )}
+              <Show when={subscription()?.owner} keyed>
+                {owner => (
+                  <Show when={subscription()}>
+                    {s => (
+                      <SubscriptionOverlay
+                        overlay={s()}
+                        onPatch={next => props.store.patchSubscription(owner, next)}
+                        onClose={() => deferClose(() => props.store.closeSubscription(owner))}
+                      />
+                    )}
+                  </Show>
+                )}
+              </Show>
             </Match>
           </Switch>
         </box>

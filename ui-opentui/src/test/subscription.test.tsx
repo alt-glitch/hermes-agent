@@ -84,13 +84,13 @@ const ctx: SubscriptionCtx = {
 
 function mount(overlay: SubscriptionOverlayState) {
   const store = createSessionStore()
-  store.openSubscription(overlay)
+  const owner = store.openSubscription(overlay)
   return () => (
     <ThemeProvider theme={() => store.state.theme}>
       <SubscriptionOverlay
         overlay={store.state.subscription!}
-        onPatch={next => store.patchSubscription(next)}
-        onClose={() => store.closeSubscription()}
+        onPatch={next => store.patchSubscription(owner, next)}
+        onClose={() => store.closeSubscription(owner)}
       />
     </ThemeProvider>
   )
@@ -110,11 +110,25 @@ describe('subscription native adaptation', () => {
 
   test('store owns open, patch, and close lifecycle', () => {
     const store = createSessionStore()
-    store.openSubscription({ ctx, screen: 'overview', state: state() })
-    store.patchSubscription({ screen: 'picker' })
+    const owner = store.openSubscription({ ctx, screen: 'overview', state: state() })
+    store.patchSubscription(owner, { screen: 'picker' })
     expect(store.state.subscription?.screen).toBe('picker')
-    store.closeSubscription()
+    store.closeSubscription(owner)
     expect(store.state.subscription).toBeUndefined()
+  })
+
+  test('an old session owner cannot patch or close a successor subscription overlay', () => {
+    const store = createSessionStore()
+    const oldOwner = store.openSubscription({ ctx, screen: 'overview', state: state() })
+    store.adoptFreshSession('sid-2')
+    const currentOwner = store.openSubscription({ ctx, screen: 'overview', state: state() })
+
+    store.patchSubscription(oldOwner, { screen: 'picker' })
+    store.closeSubscription(oldOwner)
+
+    expect(currentOwner).not.toBe(oldOwner)
+    expect(store.state.subscription?.owner).toBe(currentOwner)
+    expect(store.state.subscription?.screen).toBe('overview')
   })
 
   test('overview paints plan identity and native plan actions', async () => {
@@ -248,7 +262,7 @@ describe('subscription native adaptation', () => {
   test('locks confirmation navigation while an upgrade is unresolved', async () => {
     const upgrade = vi.fn(() => new Promise<never>(() => {}))
     const store = createSessionStore()
-    store.openSubscription({
+    const owner = store.openSubscription({
       ctx: { ...ctx, upgrade },
       screen: 'confirm',
       state: state(),
@@ -264,8 +278,8 @@ describe('subscription native adaptation', () => {
         <ThemeProvider theme={() => store.state.theme}>
           <SubscriptionOverlay
             overlay={store.state.subscription!}
-            onPatch={next => store.patchSubscription(next)}
-            onClose={() => store.closeSubscription()}
+            onPatch={next => store.patchSubscription(owner, next)}
+            onClose={() => store.closeSubscription(owner)}
           />
         </ThemeProvider>
       ),
@@ -290,7 +304,7 @@ describe('subscription native adaptation', () => {
   test('locks step-up replay navigation while an upgrade is unresolved', async () => {
     const upgrade = vi.fn(() => new Promise<never>(() => {}))
     const store = createSessionStore()
-    store.openSubscription({
+    const owner = store.openSubscription({
       ctx: { ...ctx, requestRemoteSpending: async () => ({ granted: true }), upgrade },
       screen: 'stepup',
       state: state(),
@@ -307,8 +321,8 @@ describe('subscription native adaptation', () => {
         <ThemeProvider theme={() => store.state.theme}>
           <SubscriptionOverlay
             overlay={store.state.subscription!}
-            onPatch={next => store.patchSubscription(next)}
-            onClose={() => store.closeSubscription()}
+            onPatch={next => store.patchSubscription(owner, next)}
+            onClose={() => store.closeSubscription(owner)}
           />
         </ThemeProvider>
       ),

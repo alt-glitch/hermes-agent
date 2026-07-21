@@ -12,6 +12,7 @@ import { describe, expect, test, vi } from 'vitest'
 import type { BillingCtx, BillingStateResponse } from '../boundary/billing.ts'
 import { buildBillingCtx, validateAmount } from '../logic/billing.ts'
 import { createSessionStore } from '../logic/store.ts'
+import { App } from '../view/App.tsx'
 import { BillingOverlay } from '../view/overlays/billing.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { captureFrame, renderProbe } from './lib/render.ts'
@@ -135,21 +136,40 @@ describe('store — billing overlay lifecycle', () => {
   test('openBilling sets the overlay; patchBilling transitions screens; closeBilling clears', () => {
     const store = createSessionStore()
     expect(store.state.billing).toBeUndefined()
-    store.openBilling({ ctx: noopCtx, pendingCharge: null, screen: 'overview', state: fakeState() })
+    const owner = store.openBilling({ ctx: noopCtx, pendingCharge: null, screen: 'overview', state: fakeState() })
     expect(store.state.billing?.screen).toBe('overview')
-    store.patchBilling({ screen: 'buy' })
+    store.patchBilling(owner, { screen: 'buy' })
     expect(store.state.billing?.screen).toBe('buy')
-    store.patchBilling({ pendingCharge: { amount: '25' }, screen: 'confirm' })
+    store.patchBilling(owner, { pendingCharge: { amount: '25' }, screen: 'confirm' })
     expect(store.state.billing?.screen).toBe('confirm')
     expect(store.state.billing?.pendingCharge?.amount).toBe('25')
-    store.closeBilling()
+    store.closeBilling(owner)
     expect(store.state.billing).toBeUndefined()
   })
 
   test('patchBilling is a no-op when no overlay is open', () => {
     const store = createSessionStore()
-    store.patchBilling({ screen: 'buy' })
+    store.patchBilling(1, { screen: 'buy' })
     expect(store.state.billing).toBeUndefined()
+  })
+
+  test('an old session owner cannot patch or close a successor billing overlay', () => {
+    const store = createSessionStore()
+    const oldOwner = store.openBilling({ ctx: noopCtx, pendingCharge: null, screen: 'overview', state: fakeState() })
+    store.adoptFreshSession('sid-2')
+    const currentOwner = store.openBilling({
+      ctx: noopCtx,
+      pendingCharge: null,
+      screen: 'overview',
+      state: fakeState()
+    })
+
+    store.patchBilling(oldOwner, { screen: 'buy' })
+    store.closeBilling(oldOwner)
+
+    expect(currentOwner).not.toBe(oldOwner)
+    expect(store.state.billing?.owner).toBe(currentOwner)
+    expect(store.state.billing?.screen).toBe('overview')
   })
 })
 
@@ -157,13 +177,13 @@ describe('store — billing overlay lifecycle', () => {
 
 function mount(screen: 'overview' | 'buy' | 'autoreload', state = fakeState()) {
   const store = createSessionStore()
-  store.openBilling({ ctx: noopCtx, pendingCharge: null, screen, state })
+  const owner = store.openBilling({ ctx: noopCtx, pendingCharge: null, screen, state })
   return () => (
     <ThemeProvider theme={() => store.state.theme}>
       <BillingOverlay
         overlay={store.state.billing!}
-        onPatch={next => store.patchBilling(next)}
-        onClose={() => store.closeBilling()}
+        onPatch={next => store.patchBilling(owner, next)}
+        onClose={() => store.closeBilling(owner)}
       />
     </ThemeProvider>
   )
@@ -247,7 +267,7 @@ describe('billing overlay render (captureCharFrame)', () => {
   test('locks confirmation navigation while a charge is unresolved', async () => {
     const charge = vi.fn(() => new Promise<'submitted'>(() => {}))
     const store = createSessionStore()
-    store.openBilling({
+    const owner = store.openBilling({
       ctx: { ...noopCtx, charge },
       pendingCharge: { amount: '25', idempotencyKey: 'stable-charge-key' },
       screen: 'confirm',
@@ -258,8 +278,8 @@ describe('billing overlay render (captureCharFrame)', () => {
         <ThemeProvider theme={() => store.state.theme}>
           <BillingOverlay
             overlay={store.state.billing!}
-            onPatch={next => store.patchBilling(next)}
-            onClose={() => store.closeBilling()}
+            onPatch={next => store.patchBilling(owner, next)}
+            onClose={() => store.closeBilling(owner)}
           />
         </ThemeProvider>
       ),
@@ -281,10 +301,52 @@ describe('billing overlay render (captureCharFrame)', () => {
     }
   })
 
+  test('a deferred charge completion cannot close the next session billing overlay', async () => {
+    let resolveCharge!: (value: 'submitted') => void
+    const charge = vi.fn(() => new Promise<'submitted'>(resolve => (resolveCharge = resolve)))
+    const store = createSessionStore()
+    store.adoptFreshSession('sid-1')
+    store.openBilling({
+      ctx: { ...noopCtx, charge },
+      pendingCharge: { amount: '25', idempotencyKey: 'session-a-charge' },
+      screen: 'confirm',
+      state: fakeState()
+    })
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { kittyKeyboard: true, width: 100, height: 34 }
+    )
+    try {
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(charge).toHaveBeenCalledTimes(1)
+
+      store.adoptFreshSession('sid-2')
+      const currentOwner = store.openBilling({
+        ctx: noopCtx,
+        pendingCharge: null,
+        screen: 'overview',
+        state: fakeState()
+      })
+      resolveCharge('submitted')
+      await new Promise<void>(done => setTimeout(done, 0))
+      await probe.settle()
+
+      expect(store.state.billing?.owner).toBe(currentOwner)
+      expect(store.state.billing?.screen).toBe('overview')
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('turning auto-reload off preserves the required current amounts', async () => {
     const applyAutoReload = vi.fn(async () => true)
     const store = createSessionStore()
-    store.openBilling({
+    const owner = store.openBilling({
       ctx: { ...noopCtx, applyAutoReload },
       pendingCharge: null,
       screen: 'autoreload',
@@ -303,8 +365,8 @@ describe('billing overlay render (captureCharFrame)', () => {
         <ThemeProvider theme={() => store.state.theme}>
           <BillingOverlay
             overlay={store.state.billing!}
-            onPatch={next => store.patchBilling(next)}
-            onClose={() => store.closeBilling()}
+            onPatch={next => store.patchBilling(owner, next)}
+            onClose={() => store.closeBilling(owner)}
           />
         </ThemeProvider>
       ),

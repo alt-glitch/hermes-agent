@@ -2034,6 +2034,70 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     ]
 
 
+def test_cold_then_live_resume_keeps_verbatim_verification_history(
+    monkeypatch, tmp_path
+):
+    """The live fast path must return the same durable display projection as
+    the cold resume, even when model-history repair collapsed an interim row."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("verified-session", "tui")
+    db.append_message("verified-session", role="user", content="check this")
+    db.append_message(
+        "verified-session",
+        role="assistant",
+        content="verification candidate",
+        finish_reason="verification_required",
+    )
+    db.append_message(
+        "verified-session",
+        role="assistant",
+        content="verified final",
+        finish_reason="stop",
+    )
+
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_a, **_k: None)
+
+    try:
+        cold = server.handle_request(
+            {
+                "id": "cold",
+                "method": "session.resume",
+                "params": {"session_id": "verified-session"},
+            }
+        )
+        live = server.handle_request(
+            {
+                "id": "live",
+                "method": "session.resume",
+                "params": {"session_id": "verified-session"},
+            }
+        )
+        live_session = server._sessions[cold["result"]["session_id"]]
+        with live_session["history_lock"]:
+            # Simulate /undo, /retry, or composer edit truncating/replacing the
+            # repaired working history after resume.
+            live_session["history"] = [{"role": "user", "content": "check this"}]
+            live_session["history_version"] += 1
+        truncated = server._live_session_payload(
+            cold["result"]["session_id"], live_session
+        )
+    finally:
+        db.close()
+
+    assert live["result"]["session_id"] == cold["result"]["session_id"]
+    assert live["result"]["messages"] == cold["result"]["messages"]
+    assert [message["text"] for message in live["result"]["messages"]] == [
+        "check this",
+        "verification candidate",
+        "verified final",
+    ]
+    assert truncated["messages"] == [{"role": "user", "text": "check this"}]
+
+
 def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     """Resuming a rotated-out parent id must load the continuation's messages.
 
@@ -6136,6 +6200,75 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
         assert session["one_turn_model_restore"]["model"] == "old/model"
         assert os.environ["HERMES_INFERENCE_PROVIDER"] == "openrouter"
         assert os.environ["HERMES_MODEL"] == "old/model"
+    finally:
+        server._sessions.clear()
+
+
+def test_config_set_repeated_model_once_preserves_original_restore(monkeypatch):
+    class Agent:
+        model = "old/model"
+        provider = "openrouter"
+        base_url = "https://openrouter.ai/api/v1"
+        api_key = "sk-old"
+        api_mode = "chat_completions"
+
+        def switch_model(self, **kwargs):
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            self.api_key = kwargs["api_key"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+
+    results = iter(
+        [
+            types.SimpleNamespace(
+                success=True,
+                new_model="first/temp",
+                target_provider="anthropic",
+                api_key="sk-first",
+                base_url="https://api.anthropic.com",
+                api_mode="anthropic_messages",
+                warning_message="",
+            ),
+            types.SimpleNamespace(
+                success=True,
+                new_model="second/temp",
+                target_provider="openrouter",
+                api_key="sk-second",
+                base_url="https://openrouter.ai/api/v1",
+                api_mode="chat_completions",
+                warning_message="",
+            ),
+        ]
+    )
+    session = _session(agent=Agent())
+    server._sessions["sid"] = session
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model", lambda **_kwargs: next(results)
+    )
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    try:
+        for rid, value in (
+            ("first", "first/temp --provider anthropic --once"),
+            ("second", "second/temp --provider openrouter --once"),
+        ):
+            response = server.handle_request(
+                {
+                    "id": rid,
+                    "method": "config.set",
+                    "params": {
+                        "session_id": "sid",
+                        "key": "model",
+                        "value": value,
+                    },
+                }
+            )
+            assert response["result"]["scope"] == "once"
+
+        assert session["agent"].model == "second/temp"
+        assert session["one_turn_model_restore"]["model"] == "old/model"
     finally:
         server._sessions.clear()
 
@@ -11319,6 +11452,36 @@ def test_make_agent_uses_session_runtime_overrides(monkeypatch):
     assert mock_agent.call_args.kwargs["provider"] == "openai-codex"
     assert mock_agent.call_args.kwargs["reasoning_config"] == {"enabled": True, "effort": "high"}
     assert mock_agent.call_args.kwargs["service_tier"] == "priority"
+
+
+def test_make_agent_applies_inherited_fast_request_overrides(monkeypatch):
+    """The common constructor must make profile/compute-host fast effective,
+    not merely expose priority in session metadata."""
+    _setup_make_agent_mocks(monkeypatch, {})
+    monkeypatch.setattr(server, "_load_service_tier", lambda: "priority")
+    monkeypatch.setattr(
+        "hermes_cli.models.resolve_fast_mode_overrides",
+        lambda model: {"service_tier": "priority", "speed": "fast"}
+        if model == "test-model"
+        else None,
+    )
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.service_tier = kwargs["service_tier"]
+            self.request_overrides = {"unrelated": "kept"}
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+
+    agent = server._make_agent("sid-fast", "key-fast")
+
+    assert agent.service_tier == "priority"
+    assert agent.request_overrides == {
+        "service_tier": "priority",
+        "speed": "fast",
+        "unrelated": "kept",
+    }
 
 
 def test_make_agent_handles_null_agent_config(monkeypatch):

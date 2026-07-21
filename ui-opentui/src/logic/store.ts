@@ -74,6 +74,19 @@ import {
 } from './subagentTree.ts'
 import { approvalPolicy, type ApprovalChoicePolicy } from './approval.ts'
 
+/** Monotonic identity for one concrete overlay instance. Async work must carry
+ * this token back to patch/close so a completion from an old session cannot
+ * mutate a successor overlay. */
+export type OverlayOwner = number
+
+export interface OwnedBillingOverlayState extends BillingOverlayState {
+  readonly owner: OverlayOwner
+}
+
+export interface OwnedSubscriptionOverlayState extends SubscriptionOverlayState {
+  readonly owner: OverlayOwner
+}
+
 /** A tool call inside an assistant turn (matched start↔complete by `id`=tool_id). */
 export interface ToolPartState {
   type: 'tool'
@@ -604,9 +617,9 @@ export interface StoreState {
   /** Whether the searchable Pet gallery is open. */
   petPicker: boolean
   /** The open /topup overlay (full-screen modal; undefined when closed). */
-  billing: BillingOverlayState | undefined
+  billing: OwnedBillingOverlayState | undefined
   /** The open /subscription plan-management overlay. */
-  subscription: SubscriptionOverlayState | undefined
+  subscription: OwnedSubscriptionOverlayState | undefined
   /** OS background processes (from `agents.list`) — shown in the /processes panel. */
   backgroundProcesses: BackgroundProcess[]
   /** In-flight background-PROMPT task ids (`/bg` → `prompt.background`, cleared on
@@ -855,6 +868,7 @@ export interface SessionStoreOptions {
 }
 
 export function createSessionStore(options?: SessionStoreOptions) {
+  let overlayOwnerSequence = 0
   // Rolling cap on retained transcript rows. OpenTUI lays out via Yoga (WASM), whose
   // linear memory is grow-only — every live `<For>` row is a Yoga-node subtree, so an
   // uncapped `messages[]` ratchets the high-water mark up over a long session and never
@@ -1813,26 +1827,32 @@ export function createSessionStore(options?: SessionStoreOptions) {
   }
 
   /** Open the /topup overlay with the fetched gateway state + ctx bundle. */
-  function openBilling(overlay: BillingOverlayState) {
-    setState('billing', overlay)
+  function openBilling(overlay: BillingOverlayState): OverlayOwner {
+    const owner = ++overlayOwnerSequence
+    setState('billing', { ...overlay, owner })
+    return owner
   }
-  function closeBilling() {
+  function closeBilling(owner: OverlayOwner) {
+    if (state.billing?.owner !== owner) return
     setState('billing', undefined)
   }
   /** Patch the open billing overlay (screen transitions + pending charge). The
    *  overlay is a state machine; the view drives transitions through this. */
-  function patchBilling(next: Partial<BillingOverlayState>) {
-    if (!state.billing) return
+  function patchBilling(owner: OverlayOwner, next: Partial<BillingOverlayState>) {
+    if (state.billing?.owner !== owner) return
     setState('billing', prev => (prev ? { ...prev, ...next } : prev))
   }
-  function openSubscription(overlay: SubscriptionOverlayState) {
-    setState('subscription', overlay)
+  function openSubscription(overlay: SubscriptionOverlayState): OverlayOwner {
+    const owner = ++overlayOwnerSequence
+    setState('subscription', { ...overlay, owner })
+    return owner
   }
-  function closeSubscription() {
+  function closeSubscription(owner: OverlayOwner) {
+    if (state.subscription?.owner !== owner) return
     setState('subscription', undefined)
   }
-  function patchSubscription(next: Partial<SubscriptionOverlayState>) {
-    if (!state.subscription) return
+  function patchSubscription(owner: OverlayOwner, next: Partial<SubscriptionOverlayState>) {
+    if (state.subscription?.owner !== owner) return
     setState('subscription', prev => (prev ? { ...prev, ...next } : prev))
   }
   /** Replace the OS-process snapshot (drives the /processes panel). */

@@ -2206,9 +2206,53 @@ def update_version_files(semver: str, calver_date: str):
         )
         desktop_pkg.write_text(pkg_text, encoding="utf-8")
 
+    # OpenTUI ships inside the Python release and is version-locked to it.
+    # Update both npm metadata files here so release bumps cannot leave the
+    # portable engine on the previous Hermes version.
+    _update_opentui_package_versions(semver)
+
     # Update ACP Registry manifest + npm launcher (must stay version-locked
     # with pyproject — enforced by tests/acp/test_registry_manifest.py).
     _update_acp_registry_versions(semver)
+
+
+def _update_opentui_package_versions(semver: str) -> None:
+    """Bump the bundled OpenTUI package and lockfile root versions together."""
+    app_dir = REPO_ROOT / "ui-opentui"
+    if not app_dir.exists():
+        # Older release branches predate the native OpenTUI engine.
+        return
+
+    package_path = app_dir / "package.json"
+    lock_path = app_dir / "package-lock.json"
+
+    # Parse and validate both files before writing either one so malformed or
+    # incomplete npm metadata cannot leave a partially bumped release tree.
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    if not isinstance(package, dict):
+        raise ValueError("ui-opentui/package.json must contain a JSON object")
+    if not isinstance(lock, dict):
+        raise ValueError("ui-opentui/package-lock.json must contain a JSON object")
+    lock_packages = lock.get("packages")
+    lock_root = lock_packages.get("") if isinstance(lock_packages, dict) else None
+    if not isinstance(lock_root, dict):
+        raise ValueError(
+            "ui-opentui/package-lock.json must contain a root packages entry"
+        )
+
+    package["version"] = semver
+    lock["version"] = semver
+    lock_root["version"] = semver
+
+    package_path.write_text(
+        json.dumps(package, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    lock_path.write_text(
+        json.dumps(lock, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _update_acp_registry_versions(semver: str) -> None:

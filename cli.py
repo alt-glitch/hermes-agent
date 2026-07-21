@@ -8404,7 +8404,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Update requested_provider so _ensure_runtime_credentials() doesn't
         # overwrite the switch on the next turn (it re-resolves from this).
         old_model = self.model
-        _one_turn_restore_snapshot = self._snapshot_model_runtime() if one_turn else None
+        _one_turn_restore_snapshot = None
+        if one_turn:
+            # Multiple temporary switches before the next prompt still restore
+            # the original runtime that preceded the first --once.
+            _one_turn_restore_snapshot = getattr(
+                self, "_pending_one_turn_model_restore", None
+            )
+            if _one_turn_restore_snapshot is None:
+                _one_turn_restore_snapshot = self._snapshot_model_runtime()
         # Snapshot CLI-level fields before mutation so a failed in-place swap
         # rolls the whole CLI back to the old working model (#50163).
         _cli_snapshot = {

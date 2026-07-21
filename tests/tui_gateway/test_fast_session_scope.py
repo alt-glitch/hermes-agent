@@ -20,6 +20,7 @@ Contract under test:
 from __future__ import annotations
 
 from types import SimpleNamespace
+import threading
 from unittest.mock import patch
 
 import tui_gateway.server as server
@@ -160,6 +161,65 @@ class TestConfigSetFastSessionScope:
         assert resp["result"]["value"] == "normal"
         write_key.assert_called_once_with("agent.service_tier", "normal")
 
+    def test_deferred_publication_race_applies_pin_to_new_agent(self) -> None:
+        """A config request that observed agent=None must re-read after taking
+        the runtime lock, because the deferred build can publish meanwhile."""
+        backing_lock = threading.Lock()
+        attempted = threading.Event()
+
+        class SignalingLock:
+            def __enter__(self):
+                attempted.set()
+                backing_lock.acquire()
+
+            def __exit__(self, *_exc):
+                backing_lock.release()
+
+        built_agent = _agent(service_tier="priority")
+        built_agent.request_overrides = {
+            "service_tier": "priority",
+            "speed": "fast",
+            "unrelated": "kept",
+        }
+        session = {
+            "session_key": "k-race",
+            "agent": None,
+            "runtime_override_lock": SignalingLock(),
+        }
+        result = {}
+
+        with patch.dict(server._sessions, {"s-race": session}, clear=False), \
+                patch.object(server, "_persist_live_session_runtime"), \
+                patch.object(server, "_emit"):
+            backing_lock.acquire()
+            thread = threading.Thread(
+                target=lambda: result.setdefault(
+                    "response",
+                    _set(
+                        {
+                            "key": "fast",
+                            "session_id": "s-race",
+                            "value": "normal",
+                        }
+                    ),
+                ),
+                daemon=True,
+            )
+            thread.start()
+            try:
+                assert attempted.wait(timeout=1)
+                # Simulate deferred publication after config.set's initial
+                # agent snapshot but before it acquires the runtime lock.
+                session["agent"] = built_agent
+            finally:
+                backing_lock.release()
+            thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert result["response"]["result"]["value"] == "normal"
+        assert built_agent.service_tier is None
+        assert built_agent.request_overrides == {"unrelated": "kept"}
+
 
 class TestConfigGetFastSessionScope:
     def test_reads_prebuild_pin(self) -> None:
@@ -178,7 +238,42 @@ class TestConfigGetFastSessionScope:
             resp = _get({"key": "fast", "session_id": "s7"})
         assert resp["result"]["value"] == "fast"
 
+    def test_explicit_normal_pin_beats_live_agent_and_global_fast(self) -> None:
+        session = {
+            "session_key": "k-explicit-normal",
+            "agent": _agent(service_tier=None),
+            "create_service_tier_override": "",
+        }
+        with patch.dict(server._sessions, {"s-normal": session}, clear=False), \
+                patch.object(server, "_load_service_tier", return_value="priority"):
+            resp = _get({"key": "fast", "session_id": "s-normal"})
+        assert resp["result"]["value"] == "normal"
+
     def test_falls_back_to_global(self) -> None:
         with patch.object(server, "_load_service_tier", return_value="priority"):
             resp = _get({"key": "fast"})
         assert resp["result"]["value"] == "fast"
+
+
+def test_install_deferred_agent_reconciles_latest_fast_request_overrides() -> None:
+    session = {
+        "agent": None,
+        "create_service_tier_override": "priority",
+    }
+    built_agent = _agent(service_tier=None)
+    built_agent.request_overrides = {"speed": "standard", "unrelated": "kept"}
+
+    with patch(
+        "hermes_cli.models.resolve_fast_mode_overrides",
+        return_value={"service_tier": "priority", "speed": "fast"},
+    ):
+        changed = server._install_deferred_agent_runtime(session, built_agent)
+
+    assert changed is True
+    assert session["agent"] is built_agent
+    assert built_agent.service_tier == "priority"
+    assert built_agent.request_overrides == {
+        "service_tier": "priority",
+        "speed": "fast",
+        "unrelated": "kept",
+    }

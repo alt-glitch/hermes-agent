@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -1652,11 +1653,39 @@ def _install_deferred_agent_runtime(session: dict, agent) -> bool:
     """Install an agent without losing session overrides changed mid-build."""
     runtime_lock = session.setdefault("runtime_override_lock", threading.Lock())
     with runtime_lock:
+        runtime_changed = False
         latest_reasoning = session.get("create_reasoning_override")
         if latest_reasoning is not None:
             agent.reasoning_config = latest_reasoning
+            runtime_changed = True
+        latest_tier = session.get("create_service_tier_override")
+        if latest_tier is not None:
+            _apply_service_tier_override(agent, latest_tier)
+            runtime_changed = True
         session["agent"] = agent
-    return latest_reasoning is not None
+    return runtime_changed
+
+
+def _apply_service_tier_override(agent, pinned_tier: str) -> None:
+    """Apply a session's fast/normal pin to an already-constructed agent.
+
+    Deferred construction snapshots its kwargs before the comparatively slow
+    agent build. A concurrent fast-mode change may therefore change the session
+    pin while construction is in flight. Reconcile both the public tier and
+    provider request overrides before publishing the agent.
+    """
+    fast = pinned_tier == "priority"
+    agent.service_tier = "priority" if fast else None
+    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    request_overrides.pop("service_tier", None)
+    request_overrides.pop("speed", None)
+    if fast:
+        from hermes_cli.models import resolve_fast_mode_overrides
+
+        resolved = resolve_fast_mode_overrides(getattr(agent, "model", None))
+        if isinstance(resolved, dict):
+            request_overrides.update(resolved)
+    agent.request_overrides = request_overrides
 
 
 def _start_agent_build(sid: str, session: dict) -> None:
@@ -3424,7 +3453,14 @@ def _apply_model_switch(
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
-    restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
+    restore_snapshot = None
+    if one_turn and agent:
+        # Repeating model --once before sending the turn must still return to
+        # the runtime that preceded the first temporary switch, not to the
+        # first temporary model.
+        restore_snapshot = session.get("one_turn_model_restore")
+        if restore_snapshot is None:
+            restore_snapshot = _snapshot_agent_model_runtime(agent)
 
     if agent:
         try:
@@ -5353,7 +5389,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 90),
         provider=runtime.get("provider"),
@@ -5400,6 +5436,14 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    # Fast mode is a two-part runtime contract: service_tier drives status and
+    # persistence, while provider-specific request_overrides drive the actual
+    # API request. Apply them at the common constructor boundary so inherited
+    # profile fast mode and compute-host construction cannot publish an agent
+    # that says fast while sending normal requests.
+    if getattr(agent, "service_tier", None) == "priority":
+        _apply_service_tier_override(agent, "priority")
+    return agent
 
 
 def _make_agent_with_mcp_registry_fence(*args, **kwargs):
@@ -6845,6 +6889,21 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
     return info
 
 
+def _display_history_model_fingerprint(history: list) -> str:
+    """Compact identity for the repaired model prefix behind a display copy."""
+    try:
+        payload = json.dumps(
+            history,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        payload = repr(history)
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+
 def _deferred_session_record(
     session_key: str,
     *,
@@ -6855,6 +6914,7 @@ def _deferred_session_record(
     source: str = "tui",
     close_on_disconnect: bool = False,
     display_history_prefix: list | None = None,
+    display_history: list | None = None,
     profile_home: Path | None = None,
     lazy: bool = False,
     model_override=None,
@@ -6863,7 +6923,7 @@ def _deferred_session_record(
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
     now = time.time()
-    return {
+    record = {
         "agent": None,
         "agent_error": None,
         "agent_ready": threading.Event(),
@@ -6897,6 +6957,17 @@ def _deferred_session_record(
         "tool_started_at": {},
         "transport": current_transport() or _stdio_transport,
     }
+    if display_history is not None:
+        # Keep the durable transcript separate from the alternation-repaired
+        # model history. The latter can collapse verification/interim assistant
+        # rows, so reconstructing display from it makes an immediate live
+        # resume differ from the preceding cold resume.
+        record["display_history"] = list(display_history)
+        record["display_history_model_length"] = len(history)
+        record["display_history_model_fingerprint"] = (
+            _display_history_model_fingerprint(history)
+        )
+    return record
 
 
 def _claim_or_reuse_live(
@@ -7150,6 +7221,7 @@ def _(rid, params: dict) -> dict:
             source=source,
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             display_history_prefix=prefix,
+            display_history=display_history,
             profile_home=profile_home,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
@@ -7298,6 +7370,11 @@ def _(rid, params: dict) -> dict:
                         "model_override"
                     ]
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
+                _sessions[sid]["display_history"] = list(display_history)
+                _sessions[sid]["display_history_model_length"] = len(history)
+                _sessions[sid]["display_history_model_fingerprint"] = (
+                    _display_history_model_fingerprint(history)
+                )
                 # Remember the profile home so each turn re-binds HERMES_HOME (the
                 # agent persists to its own db, but mid-turn home reads — memory,
                 # skills — must resolve to the resumed profile too).
@@ -7487,9 +7564,29 @@ def _live_session_payload(
             session["transport"] = transport
         if touch:
             session["last_active"] = time.time()
-        history = list(session.get("display_history_prefix") or []) + list(
-            session.get("history") or []
+        model_history = list(session.get("history") or [])
+        durable_display = session.get("display_history")
+        display_model_length = session.get("display_history_model_length")
+        display_model_fingerprint = session.get("display_history_model_fingerprint")
+        prefix_unchanged = (
+            isinstance(display_model_length, int)
+            and len(model_history) >= display_model_length
+            and isinstance(display_model_fingerprint, str)
+            and _display_history_model_fingerprint(
+                model_history[:display_model_length]
+            )
+            == display_model_fingerprint
         )
+        if isinstance(durable_display, list) and prefix_unchanged:
+            # The immutable durable projection preserves rows intentionally
+            # omitted from the repaired model history. Messages produced after
+            # resume are appended from the working history's suffix. The
+            # fingerprint guard deliberately abandons the copy after undo,
+            # retry, edit, or any other prefix rewrite so removed rows cannot
+            # reappear in a later live-resume payload.
+            history = list(durable_display) + model_history[display_model_length:]
+        else:
+            history = list(session.get("display_history_prefix") or []) + model_history
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)
         running = bool(session.get("running"))
@@ -12684,13 +12781,13 @@ def _(rid, params: dict) -> dict:
     if key == "fast":
         raw = str(value or "").strip().lower()
         agent = session.get("agent") if session else None
-        if agent is not None:
-            current_fast = getattr(agent, "service_tier", None) == "priority"
-        elif session is not None and session.get("create_service_tier_override") is not None:
+        if session is not None and session.get("create_service_tier_override") is not None:
             # Pre-build session with a pinned tier (desktop draft pick or an
             # earlier session-scoped toggle) — report/toggle from the pin, not
             # the global default.
             current_fast = session["create_service_tier_override"] == "priority"
+        elif agent is not None:
+            current_fast = getattr(agent, "service_tier", None) == "priority"
         else:
             current_fast = _load_service_tier() == "priority"
 
@@ -12757,16 +12854,18 @@ def _(rid, params: dict) -> dict:
                 resume_overrides = session.get("resume_runtime_overrides")
                 if isinstance(resume_overrides, dict):
                     resume_overrides["service_tier_override"] = pinned_tier
+                # Re-read under the same lock used by deferred publication. If
+                # construction completed after the pre-lock agent snapshot,
+                # this still applies the user's choice to the newly-published
+                # runtime instead of acknowledging a change that was dropped.
+                agent = session.get("agent")
+                if agent is not None:
+                    _apply_service_tier_override(agent, pinned_tier)
         else:
             _write_config_key("agent.service_tier", nv)
         if agent is not None:
-            agent.service_tier = "priority" if nv == "fast" else None
-            current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-            current_overrides.pop("service_tier", None)
-            current_overrides.pop("speed", None)
-            if nv == "fast":
-                current_overrides.update(overrides)
-            agent.request_overrides = current_overrides
+            if session is None:
+                _apply_service_tier_override(agent, "priority" if nv == "fast" else "")
             _persist_live_session_runtime(session)
             _emit(
                 "session.info",
@@ -13768,11 +13867,12 @@ def _(rid, params: dict) -> dict:
         session = _sessions.get(params.get("session_id", ""))
         tier = None
         if session is not None:
-            agent = session.get("agent")
-            if agent is not None:
-                tier = getattr(agent, "service_tier", None)
-            elif session.get("create_service_tier_override") is not None:
+            if session.get("create_service_tier_override") is not None:
                 tier = session["create_service_tier_override"]
+            else:
+                agent = session.get("agent")
+                if agent is not None:
+                    tier = getattr(agent, "service_tier", None)
         if tier is None:
             tier = _load_service_tier()
         return _ok(rid, {"value": "fast" if tier == "priority" else "normal"})

@@ -1782,18 +1782,29 @@ const toolsCmd: ClientHandler = async (arg, ctx) => {
  *  (buy credits / auto-reload / monthly limit). ZERO sub-commands (CLI/TUI
  *  parity): any arg is ignored. All RPC + error mapping lives in logic/billing.ts
  *  (`buildBillingCtx`); this handler just fetches state and opens. */
-const topupCmd: ClientHandler = async (_arg, ctx) => {
+const topupCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const expectedSid = ctx.sessionId()
+  const pushInitialSystem = (text: string) => {
+    if (currentSessionIs(ctx, expectedSid, flight)) ctx.pushSystem(text)
+  }
+  // Billing actions outlive the slash-command flight: charge settlement is
+  // polled after the overlay closes. Keep those outcomes session-scoped so a
+  // later same-session slash command cannot suppress success/failure copy.
+  const pushSessionSystem = (text: string) => {
+    if (ctx.sessionId() === expectedSid) ctx.pushSystem(text)
+  }
   try {
     const s = (await ctx.request('billing.state', {})) as BillingStateResponse
+    if (!currentSessionIs(ctx, expectedSid, flight)) return
     if (!s.logged_in) {
-      ctx.pushSystem('💳 Not logged into Nous Portal — run /portal to log in, then /topup.')
+      pushInitialSystem('💳 Not logged into Nous Portal — run /portal to log in, then /topup.')
       return
     }
     const billingHost = {
       request: ctx.request,
-      pushSystem: ctx.pushSystem,
+      pushSystem: pushSessionSystem,
       confirm: ctx.confirm,
-      sessionId: ctx.sessionId
+      sessionId: () => expectedSid
     }
     ctx.openBilling({
       ctx: buildBillingCtx(billingHost, s),
@@ -1802,20 +1813,30 @@ const topupCmd: ClientHandler = async (_arg, ctx) => {
       state: s
     })
   } catch (error) {
-    ctx.pushSystem(`/topup: ${error instanceof Error ? error.message : 'billing.state failed'}`)
+    if (currentSessionIs(ctx, expectedSid, flight)) {
+      pushInitialSystem(`/topup: ${error instanceof Error ? error.message : 'billing.state failed'}`)
+    }
   }
 }
 
-const subscriptionCmd: ClientHandler = async (_arg, ctx) => {
+const subscriptionCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const expectedSid = ctx.sessionId()
+  const pushInitialSystem = (text: string) => {
+    if (currentSessionIs(ctx, expectedSid, flight)) ctx.pushSystem(text)
+  }
+  const pushSessionSystem = (text: string) => {
+    if (ctx.sessionId() === expectedSid) ctx.pushSystem(text)
+  }
   try {
     const state = (await ctx.request('subscription.state', {})) as SubscriptionStateResponse
+    if (!currentSessionIs(ctx, expectedSid, flight)) return
     if (!state.logged_in) {
-      ctx.pushSystem('Not logged into Nous Portal — run /portal to log in, then /subscription.')
+      pushInitialSystem('Not logged into Nous Portal — run /portal to log in, then /subscription.')
       return
     }
     const openPortal = (url: string) => {
       const opened = openExternalUrl(url)
-      ctx.pushSystem(opened ? `Opening portal: ${url}` : `Could not open browser — visit ${url}`)
+      pushSessionSystem(opened ? `Opening portal: ${url}` : `Could not open browser — visit ${url}`)
     }
     const manageUrl = () => {
       try {
@@ -1837,11 +1858,11 @@ const subscriptionCmd: ClientHandler = async (_arg, ctx) => {
         openManageLink: () => {
           const url = manageUrl()
           if (!url) {
-            ctx.pushSystem('Could not build manage URL — is your portal configured?')
+            pushSessionSystem('Could not build manage URL — is your portal configured?')
             return Promise.resolve(false)
           }
           const opened = openExternalUrl(url)
-          ctx.pushSystem(
+          pushSessionSystem(
             opened
               ? 'Opening your subscription page in the browser — finish there, then re-run /subscription.'
               : `Could not open browser — visit ${url}`
@@ -1861,7 +1882,7 @@ const subscriptionCmd: ClientHandler = async (_arg, ctx) => {
             .catch(() => null),
         requestRemoteSpending: () =>
           ctx
-            .request('billing.step_up', { session_id: ctx.sessionId() })
+            .request('billing.step_up', { session_id: expectedSid })
             .then(raw => {
               const r = raw as BillingMutationResponse
               return {
@@ -1886,7 +1907,7 @@ const subscriptionCmd: ClientHandler = async (_arg, ctx) => {
             .request('subscription.change', { subscription_type_id: tierId })
             .then(raw => raw as BillingMutationResponse)
             .catch(() => null),
-        sys: ctx.pushSystem,
+        sys: pushSessionSystem,
         upgrade: (tierId, idempotencyKey) =>
           ctx
             .request('subscription.upgrade', {
@@ -1900,7 +1921,9 @@ const subscriptionCmd: ClientHandler = async (_arg, ctx) => {
       state
     })
   } catch (error) {
-    ctx.pushSystem(`/subscription: ${error instanceof Error ? error.message : 'subscription.state failed'}`)
+    if (currentSessionIs(ctx, expectedSid, flight)) {
+      pushInitialSystem(`/subscription: ${error instanceof Error ? error.message : 'subscription.state failed'}`)
+    }
   }
 }
 

@@ -1897,6 +1897,44 @@ describe('dispatchSlash — client commands', () => {
     // the ctx bundle is wired (RPC + validation reachable from the overlay)
     expect(typeof p.billed[0]!.ctx.charge).toBe('function')
     expect(p.billed[0]!.ctx.validate('10').amount).toBe('10')
+    p.session.value = 'sid-2'
+    await p.billed[0]!.ctx.requestRemoteSpending()
+    expect(p.calls.at(-1)).toEqual({ method: 'billing.step_up', params: { session_id: 'sid-1' } })
+  })
+
+  test('/topup drops a deferred response after a newer same-session slash flight', async () => {
+    let resolve!: (value: unknown) => void
+    const pending = new Promise<unknown>(done => (resolve = done))
+    const p = makeCtx(async () => pending)
+    const run = dispatchSlash('/topup', p.ctx)
+
+    await dispatchSlash('/fortune', p.ctx)
+    resolve(fakeBillingState({ logged_in: true }))
+    await run
+
+    expect(p.billed).toHaveLength(0)
+    expect(p.system).toHaveLength(1)
+    expect(p.system[0]).toMatch(/^(?:🔮|🌟) /u)
+  })
+
+  test('/topup still reports deferred settlement after a newer same-session slash flight', async () => {
+    let resolveStatus!: (value: unknown) => void
+    const pendingStatus = new Promise<unknown>(done => (resolveStatus = done))
+    const p = makeCtx(async method => {
+      if (method === 'billing.state') return fakeBillingState({ logged_in: true })
+      if (method === 'billing.charge') return { ok: true, charge_id: 'charge-1' }
+      if (method === 'billing.charge_status') return pendingStatus
+      return {}
+    })
+
+    await dispatchSlash('/topup', p.ctx)
+    await expect(p.billed[0]!.ctx.charge('25', 'stable-key')).resolves.toBe('submitted')
+    await dispatchSlash('/fortune', p.ctx)
+    resolveStatus({ ok: true, status: 'settled', amount_usd: '25' })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(p.system).toContain('✅ $25 added.')
   })
 
   test('/topup on a logged-out portal explains how to log in (no overlay)', async () => {
@@ -1936,6 +1974,44 @@ describe('dispatchSlash — client commands', () => {
       expect(p.subscribed).toHaveLength(1)
       expect(p.subscribed[0]?.state.org_id).toBe('org-1')
     }
+  })
+
+  test('/subscription drops an old-session fetch and freezes step-up to its opening SID', async () => {
+    let resolve!: (value: unknown) => void
+    const pending = new Promise<unknown>(done => (resolve = done))
+    const stale = makeCtx(async () => pending)
+    const run = dispatchSlash('/subscription', stale.ctx)
+    stale.session.value = 'sid-2'
+    resolve({
+      ok: true,
+      logged_in: true,
+      is_admin: true,
+      can_change_plan: true,
+      context: 'personal',
+      current: null,
+      tiers: []
+    })
+    await run
+    expect(stale.subscribed).toHaveLength(0)
+    expect(stale.system).toEqual([])
+
+    const current = makeCtx(async method =>
+      method === 'subscription.state'
+        ? {
+            ok: true,
+            logged_in: true,
+            is_admin: true,
+            can_change_plan: true,
+            context: 'personal',
+            current: null,
+            tiers: []
+          }
+        : { ok: true, granted: true }
+    )
+    await dispatchSlash('/subscription', current.ctx)
+    current.session.value = 'sid-2'
+    await current.subscribed[0]?.ctx.requestRemoteSpending()
+    expect(current.calls.at(-1)).toEqual({ method: 'billing.step_up', params: { session_id: 'sid-1' } })
   })
 
   test('/tools enable uses the live configure RPC, resets same-SID state, and reports every result class', async () => {

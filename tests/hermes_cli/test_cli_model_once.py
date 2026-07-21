@@ -78,6 +78,64 @@ def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
     assert "next turn only" in printed[-1]
 
 
+def test_cli_repeated_model_once_preserves_original_restore(monkeypatch):
+    import cli as cli_mod
+
+    stub = _StubCLI()
+    stub.agent = _FakeAgent()
+    stub._snapshot_model_runtime = cli_mod.HermesCLI._snapshot_model_runtime.__get__(stub)
+    results = iter(
+        [
+            ModelSwitchResult(
+                success=True,
+                new_model="first/temp",
+                target_provider="anthropic",
+                api_key="sk-first",
+                base_url="https://api.anthropic.com",
+                api_mode="anthropic_messages",
+                provider_label="Anthropic",
+            ),
+            ModelSwitchResult(
+                success=True,
+                new_model="second/temp",
+                target_provider="openrouter",
+                api_key="sk-second",
+                base_url="https://openrouter.ai/api/v1",
+                api_mode="chat_completions",
+                provider_label="OpenRouter",
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("should not persist")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None, custom_providers=None
+            ),
+        ),
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_: next(results))
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *_a, **_k: None,
+    )
+
+    cli_mod.HermesCLI._handle_model_switch(stub, "/model first/temp --once")
+    cli_mod.HermesCLI._handle_model_switch(stub, "/model second/temp --once")
+
+    assert stub.model == "second/temp"
+    assert stub._pending_one_turn_model_restore["model"] == "old/model"
+
+
 def test_cli_restore_model_runtime_snapshot_restores_agent():
     import cli as cli_mod
 
