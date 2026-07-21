@@ -1,4 +1,4 @@
-import type { BoxRenderable, ScrollBoxRenderable, TextareaRenderable } from '@opentui/core'
+import type { BoxRenderable, MouseEvent, ScrollBoxRenderable, TextareaRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from 'solid-js'
 import {
@@ -260,10 +260,21 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
       if (!disposed && measured !== undefined && measured !== listHeight()) setListHeight(measured)
     })
   }
+  const scrollTimeline = (event: MouseEvent) => {
+    if (mode() !== 'timeline') return
+    const direction = event.scroll?.direction
+    if (direction !== 'up' && direction !== 'down') return
+    event.preventDefault()
+    event.stopPropagation()
+    if (busy() || confirm()) return
+    const distance = Math.max(1, Math.ceil(Math.abs(event.scroll?.delta ?? 1)))
+    setCursor(index => journeyStep(rows(), index, direction === 'up' ? -distance : distance))
+  }
   return (
     <box
       ref={e => (root = e)}
       border
+      onMouseScroll={scrollTimeline}
       style={{ borderColor: theme().color.border, flexDirection: 'column', flexGrow: 1, padding: 1 }}
     >
       <text flexShrink={0} fg={theme().color.accent} truncate wrapMode="none">
@@ -387,7 +398,7 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
       <Show when={notice()}>{n => <text fg={theme().color.muted}>{n()}</text>}</Show>
       <text flexShrink={0} fg={theme().color.muted} truncate wrapMode="none">
         {mode() === 'timeline'
-          ? '↑↓/jk move · Enter open · e edit · d delete · r retry · q close'
+          ? 'wheel/↑↓/jk move · Enter open · e edit · d delete · r retry · q close'
           : '↑↓ scroll · e edit · d delete · Esc back · q close'}
       </text>
     </box>
