@@ -18,6 +18,13 @@ Widgets are plain ESM files the TUI loads at startup — no build step, no
 repo changes. This skill does not cover desktop-app or web-dashboard
 widgets.
 
+Both TUI engines run the same widget files: the Ink engine executes them as
+real React components; the native OpenTUI engine runs them in a compatible
+widget runtime that implements the documented sdk surface (`h`, the hooks,
+and the components below). Author against this skill's contract and the file
+works on either engine — engine differences are called out inline under
+"Engine notes".
+
 ## When to Use
 
 - The user asks for a live panel in the TUI (ticker, clock, countdown,
@@ -130,6 +137,28 @@ Contract essentials:
    ambient widget.
 4. Iterate: edit the file — it hot-reloads on save (last-writer-wins, the
    fresh definition shadows the old one). Relaunch `/<id>` to remount.
+
+## Engine notes (OpenTUI)
+
+The native OpenTUI engine (the default on Node ≥ 26.3) runs widget files in
+a bounded compatibility runtime rather than real React. Honest limits:
+
+- `sdk.React` implements the documented hook surface: `useState`,
+  `useEffect`, `useMemo`, `useRef`, `useCallback` (+ `createElement`/
+  `Fragment`). Other React APIs (context, refs-to-elements, class
+  components) are Ink-only — stay on the documented surface.
+- Placement reserves in-flow dock rows only: rail/corner zones (`top-*`,
+  `bottom-*`) map to the nearest dock (`dock-top` / `dock-bottom`).
+- Modal apps render as a centered panel that replaces the composer above
+  the status bar (they still own every keypress); Ink centers them over the
+  transcript instead. `Overlay` is a plain wrapper natively — the host owns
+  placement.
+- `WidgetGrid`/`GridAreas` are flex approximations natively (fine for
+  cards; the measured grid demos are Ink-only).
+- A widget that throws in render shows a compact `⚠ /<id>: <message>` chip
+  instead of its card; a throwing reducer closes the app with a transcript
+  notice; a runaway setState loop freezes the widget. The TUI itself never
+  goes down.
 
 ## Pitfalls
 

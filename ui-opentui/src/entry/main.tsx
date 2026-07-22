@@ -155,6 +155,10 @@ import {
 import { App } from '../view/App.tsx'
 import { refreshLearnedNames, seedLearnedNames } from '../view/composer.tsx'
 import { TerminalChrome } from '../view/terminalChrome.tsx'
+import { mergeWidgetCompletionItems } from '../widgets/completion.ts'
+import { registerWidgetNotifier } from '../widgets/host.ts'
+import { listWidgetApps } from '../widgets/registry.ts'
+import { loadUserWidgets, onUserWidgets, watchUserWidgets } from '../widgets/userWidgets.ts'
 
 // Syntax-highlighting language expansion: register the remote tree-sitter
 // grammars (python/rust/go/bash/json/c/html/css/yaml/toml) before the first
@@ -1305,6 +1309,28 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // diagnostic dump. No auto heap-snapshot (memlog is the diagnosis path).
       const stopMemoryMonitor = startMemoryMonitor(line => store.pushSystem(line))
       yield* Effect.addFinalizer(() => Effect.sync(stopMemoryMonitor))
+      // User widget apps ($HERMES_HOME/tui-widgets): initial scan is silent
+      // (boot inventory, like Ink), then hot-loads announce themselves in the
+      // transcript — a silently-registered widget is indistinguishable from a
+      // failed one. Watcher + announce subscription release with the scope.
+      registerWidgetNotifier(text => store.pushSystem(text))
+      const stopWidgetWatch = watchUserWidgets()
+      yield* Effect.addFinalizer(() => Effect.sync(stopWidgetWatch))
+      let unsubscribeWidgets: () => void = () => {}
+      void loadUserWidgets()
+        .then(() => {
+          seedLearnedNames(listWidgetApps().map(app => ({ text: `/${app.id}` })))
+          unsubscribeWidgets = onUserWidgets(({ added, errors, removed }) => {
+            for (const id of added) {
+              store.pushSystem(`widget /${id} is live — type /${id} to open`)
+              seedLearnedNames([{ text: `/${id}` }])
+            }
+            for (const id of removed) store.pushSystem(`widget /${id} removed (file deleted)`)
+            for (const err of errors) store.pushSystem(`widget ${err.file} failed to load: ${err.message}`)
+          })
+        })
+        .catch(() => {})
+      yield* Effect.addFinalizer(() => Effect.sync(() => unsubscribeWidgets()))
       // HERMES_HEAPDUMP_ON_START (Ink parity): a deliberate baseline snapshot at
       // boot. Bypasses the diagnostics master switch (you set it on purpose).
       // Best-effort + synchronous (writeHeapSnapshot blocks V8) — a failure must
@@ -2819,11 +2845,21 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         Effect.runPromise(gateway.request(plan.method, plan.params))
           .then(result => {
             if (!completionGate.isCurrent(token)) return // a newer keystroke superseded this query
-            store.setCompletions(mapCompletions(result), readReplaceFrom(result, plan.from))
+            // Client-side widget apps live in the TUI registry, not the
+            // gateway — merge their ids/help into slash-name completions.
+            const items =
+              plan.method === 'complete.slash'
+                ? mergeWidgetCompletionItems(text, mapCompletions(result))
+                : mapCompletions(result)
+            store.setCompletions(items, readReplaceFrom(result, plan.from))
           })
           .catch(() => {
             if (!completionGate.isCurrent(token)) return
-            store.clearCompletions()
+            // Widget commands stay completable even when the gateway RPC fails
+            // (they dispatch client-side and never need the server).
+            const items = plan.method === 'complete.slash' ? mergeWidgetCompletionItems(text, []) : []
+            if (items.length) store.setCompletions(items, plan.from)
+            else store.clearCompletions()
           })
       }
 

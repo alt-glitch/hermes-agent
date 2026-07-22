@@ -49,6 +49,8 @@ import { TodoPanel } from './todoPanel.tsx'
 import { StatusLine } from './statusLine.tsx'
 import { useTheme } from './theme.tsx'
 import { Transcript } from './transcript.tsx'
+import { WidgetDock, WidgetModal } from '../widgets/dock.tsx'
+import { modalWidget } from '../widgets/host.ts'
 
 export interface AppProps {
   readonly store: SessionStore
@@ -208,6 +210,9 @@ export function App(props: AppProps) {
           <Switch
             fallback={
               <>
+                {/* ambient widget rail under the header — in-flow chrome OUTSIDE
+                    the transcript scrollbox/windowing boundary, bounded rows. */}
+                <WidgetDock placement="dock-top" />
                 <Transcript store={props.store} />
                 {/* transient busy face floats at the bottom of the transcript area */}
                 <StatusLine store={props.store} />
@@ -224,6 +229,9 @@ export function App(props: AppProps) {
                     queued={props.store.state.queuedPrompts}
                     editIndex={props.store.state.queueEditIndex}
                   />
+                  {/* ambient widget dock — reserves ≤6 rows directly above the
+                      status bar; the composer below stays mounted + focused. */}
+                  <WidgetDock placement="dock-bottom" />
                   <StatusBar store={props.store} subagentsVisible={subagentsVisible()} />
                   <Switch
                     fallback={
@@ -269,6 +277,9 @@ export function App(props: AppProps) {
                         sessionId={props.sessionId ?? NO_SESSION}
                       />
                     </Match>
+                    {/* modal widget app: owns every keypress while open (the
+                        composer is replaced, Picker-style); its reducer closes it. */}
+                    <Match when={modalWidget()}>{active => <WidgetModal active={active()} />}</Match>
                     <Match when={sessionPicker()}>
                       <SessionOrchestrator
                         ops={props.sessionOps ?? NOOP_OPS}

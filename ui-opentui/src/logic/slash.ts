@@ -74,6 +74,9 @@ import { decodeProcessStopResponse } from '../boundary/schema/ProcessResponses.t
 import { buildBillingCtx } from './billing.ts'
 import { dailyFortune, randomFortune } from './fortunes.ts'
 import { formatHelp } from './help.ts'
+import { launchWidget } from '../widgets/host.ts'
+import { getWidgetApp } from '../widgets/registry.ts'
+import { loadUserWidgets } from '../widgets/userWidgets.ts'
 import type { Message } from './store.ts'
 import { normalizeBusyInputMode, type BusyInputMode } from './busyQueue.ts'
 import { batteryInfoFromResponse, batteryLabel } from './battery.ts'
@@ -2418,6 +2421,17 @@ const redrawCmd: ClientHandler = (_arg, ctx) => {
   ctx.pushSystem('ui redrawn')
 }
 
+/** Rescan $HERMES_HOME/tui-widgets (Ink `widgets-reload` parity). The watcher
+ *  hot-loads automatically; this is the explicit "prove it" path. */
+const widgetsReloadCmd: ClientHandler = async (_arg, ctx) => {
+  const { errors, loaded } = await loadUserWidgets()
+  const parts = [
+    loaded.length ? `loaded: ${loaded.join(', ')}` : 'no user widgets found',
+    ...errors.map(e => `${e.file}: ${e.message}`)
+  ]
+  ctx.pushSystem(`widgets — ${parts.join(' · ')}`)
+}
+
 const fortuneCmd: ClientHandler = (arg, ctx) => {
   const key = arg.trim().toLowerCase()
   if (!arg || key === 'random') {
@@ -2807,7 +2821,9 @@ const CLIENT: Record<string, ClientHandler> = {
   steer: steerCmd,
   undo: undoCmd,
   usage: usageCmd,
-  update: updateCmd
+  update: updateCmd,
+  'widgets-reload': widgetsReloadCmd,
+  widgets_reload: widgetsReloadCmd
 }
 
 /** The registered client-command names (catalog introspection — tests/menus). */
@@ -2901,6 +2917,16 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
         ctx.pushSystem(`/${parsed.name}: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
+    return
+  }
+
+  // Registry-first widget fallback (Ink createSlashHandler parity): user
+  // widgets hot-loaded from $HERMES_HOME/tui-widgets dispatch straight off
+  // the live registry — `/<id>` opens (or toggles) the app client-side, no
+  // gateway round-trip. launchWidget fails closed with a printable line.
+  if (getWidgetApp(parsed.name)) {
+    const err = launchWidget(parsed.name, parsed.arg)
+    if (err) ctx.pushSystem(err)
     return
   }
 
