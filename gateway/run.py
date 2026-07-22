@@ -359,6 +359,7 @@ def _format_exec_approval_fallback(
     command_prefix: str,
     *,
     allow_permanent: bool = True,
+    allow_session: bool = True,
     smart_denied: bool = False,
 ) -> str:
     """Render the text fallback from approval capabilities, not platform names."""
@@ -368,7 +369,7 @@ def _format_exec_approval_fallback(
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
     choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
-    if not smart_denied:
+    if not smart_denied and allow_session:
         choices.append(
             f"`{command_prefix}approve session` to approve this pattern for the session"
         )
@@ -3096,6 +3097,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _loop_heartbeat_task: Optional["asyncio.Task"] = None
     _gateway_started_at: float = 0.0
     _shutdown_watchdog_done: Optional["threading.Event"] = None
+    _platform_lock_takeover_on_start: bool = False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -3255,6 +3257,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # with the synthetic resume turns for the same session.  The queued
         # events drain only after all startup resume tasks have finished.
         self._startup_restore_in_progress = False
+        # Set by start_gateway() only for an explicit ``--replace`` launch.
+        # _connect_initial_adapter_with_timeout scopes it to each adapter's
+        # cold-start connect and removes it before any reconnect can run.
+        self._platform_lock_takeover_on_start = False
         self._startup_restore_queue: List[MessageEvent] = []
         self._startup_restore_tasks: List[asyncio.Task] = []
         # LRU cache of live SessionSources keyed by session_key. Used by
@@ -3321,6 +3327,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
+
+        # Strong refs to detached fatal-error handler tasks (see
+        # _handle_adapter_fatal_error) so the event loop can't GC them mid-run.
+        self._fatal_handler_tasks: set = set()
 
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
@@ -3840,6 +3850,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"{platform.value} connect timed out after {timeout:g}s"
             ) from exc
 
+    async def _connect_initial_adapter_with_timeout(self, adapter, platform) -> bool:
+        """Connect one cold-start adapter with tightly scoped replace intent.
+
+        The capability is visible only while this initial connect is awaited.
+        Reconnects call ``_connect_adapter_with_timeout`` directly and adapters
+        also default to deny, so a later network recovery can never evict a
+        healthy token holder.
+        """
+        adapter._platform_lock_takeover_allowed = bool(
+            self._platform_lock_takeover_on_start
+        )
+        try:
+            return await self._connect_adapter_with_timeout(adapter, platform)
+        finally:
+            adapter._platform_lock_takeover_allowed = False
+
     @property
     def should_exit_cleanly(self) -> bool:
         return self._exit_cleanly
@@ -4356,7 +4382,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         If the error is retryable (e.g. network blip, DNS failure), queue the
         platform for background reconnection instead of giving up permanently.
+
+        The notification arrives on the failing adapter's own polling task,
+        and the disconnect inside the handler can cancel that task mid-flight:
+        disconnect()'s current-task guard misses it because
+        _safe_adapter_disconnect runs the close in a wrapper task. A cancelled
+        handler dies between the fatal log and the reconnect queue, silently
+        stranding the platform (observed 2026-07-21: telegram popped from
+        adapters but never queued after a travel network outage). Run the real
+        work in a detached task that adapter teardown cannot cancel.
         """
+        tasks = getattr(self, "_fatal_handler_tasks", None)
+        if tasks is None:
+            tasks = self._fatal_handler_tasks = set()
+        task = asyncio.create_task(self._handle_adapter_fatal_error_detached(adapter))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        # Await so callers that expect completion still get it — but through
+        # shield(): Task.cancel() on the caller also cancels the future it is
+        # awaiting (_fut_waiter), so a plain `await task` would tunnel the
+        # cancellation straight into the "detached" task. shield() absorbs
+        # it: the caller sees CancelledError, the handler runs to completion.
+        await asyncio.shield(task)
+
+    async def _handle_adapter_fatal_error_detached(
+        self, adapter: BasePlatformAdapter
+    ) -> None:
+        """Run the fatal handler; if the platform still ends up stranded
+        (not reconnected, not queued, not intentionally disabled), exit the
+        gateway with failure so the service manager restarts it instead of
+        leaving a silent partial outage."""
+        try:
+            await self._handle_adapter_fatal_error_impl(adapter)
+        except Exception:
+            logger.exception(
+                "Fatal-error handling for %s raised unexpectedly",
+                adapter.platform.value,
+            )
+        finally:
+            platform = adapter.platform
+            shutdown_event = getattr(self, "_shutdown_event", None)
+            stranded = (
+                adapter.fatal_error_retryable
+                and platform not in self.adapters
+                and platform not in getattr(self, "_failed_platforms", {})
+                and not (shutdown_event is not None and shutdown_event.is_set())
+            )
+            if stranded:
+                logger.error(
+                    "%s adapter was lost without entering the reconnection "
+                    "queue; exiting gateway so the service manager restarts it.",
+                    platform.value,
+                )
+                self._exit_reason = (
+                    f"{platform.value} adapter lost without reconnection queue"
+                )
+                self._exit_with_failure = True
+                await self.stop()
+
+    async def _handle_adapter_fatal_error_impl(self, adapter: BasePlatformAdapter) -> None:
         # Snapshot the current owner of this platform slot before doing
         # anything else. If it's neither this adapter nor empty, a different
         # adapter has already taken over (e.g. this is a delayed notification
@@ -7696,7 +7780,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 error_message=None,
             )
             try:
-                success = await self._connect_adapter_with_timeout(adapter, platform)
+                success = await self._connect_initial_adapter_with_timeout(
+                    adapter, platform
+                )
                 if await self._abort_startup_if_shutdown_requested(adapter, platform):
                     return True
                 if success:
@@ -7804,6 +7890,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         except Exception as e:
             logger.error("Secondary-profile adapter startup failed: %s", e, exc_info=True)
+        finally:
+            # Startup authority is one phase, not a persistent runner mode.
+            # From this point onward every adapter retry is non-evicting.
+            self._platform_lock_takeover_on_start = False
 
         # A platform we skipped on the primary for a missing credential was
         # supposed to be picked up by a secondary profile that owns the token.
@@ -9502,7 +9592,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 with _profile_runtime_scope(profile_home):
-                    success = await self._connect_adapter_with_timeout(adapter, platform)
+                    success = await self._connect_initial_adapter_with_timeout(
+                        adapter, platform
+                    )
                 if success:
                     profile_map[platform] = adapter
                     connected += 1
@@ -20706,6 +20798,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 description=desc,
                                 metadata=_status_thread_metadata,
                                 allow_permanent=approval_data.get("allow_permanent", True),
+                                allow_session=approval_data.get("allow_session", True),
                                 smart_denied=approval_data.get("smart_denied", False),
                             ),
                             _loop_for_step,
@@ -20736,6 +20829,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     desc,
                     _p,
                     allow_permanent=approval_data.get("allow_permanent", True),
+                    allow_session=approval_data.get("allow_session", True),
                     smart_denied=approval_data.get("smart_denied", False),
                 )
                 try:
@@ -22480,6 +22574,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 write_takeover_marker(existing_pid)
             except Exception as e:
                 logger.debug("Could not write takeover marker: %s", e)
+            # Snapshot the old gateway's child processes BEFORE signalling it:
+            # once it exits, orphans are reparented and can no longer be found
+            # by a parent walk. On POSIX, adapter subprocesses that outlive
+            # the gateway keep holding scoped token locks and block the
+            # replacement (Windows terminate_pid(force=True) already
+            # tree-kills via taskkill /T). Best-effort — [] on any failure.
+            try:
+                from gateway.status import _snapshot_gateway_children
+                _old_gateway_children = _snapshot_gateway_children(existing_pid)
+            except Exception:
+                _old_gateway_children = []
             try:
                 terminate_pid(existing_pid, force=False)
             except ProcessLookupError:
@@ -22543,6 +22648,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     except Exception:
                         pass
                     return False
+            # Old gateway confirmed dead — reap any orphaned child processes
+            # it left behind (POSIX; mirrors Windows taskkill /T tree-kill).
+            # Orphaned adapter subprocesses would otherwise keep holding
+            # scoped token locks against us. Best-effort, never raises.
+            try:
+                from gateway.status import reap_gateway_children
+                reap_gateway_children(
+                    _old_gateway_children, parent_pid=existing_pid
+                )
+            except Exception:
+                logger.debug(
+                    "Child reap for replaced gateway PID %d failed",
+                    existing_pid,
+                    exc_info=True,
+                )
             remove_pid_file()
             # remove_pid_file() is a no-op when the PID doesn't match.
             # Force-unlink to cover the old-process-crashed case.
@@ -22634,6 +22754,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logging.getLogger().setLevel(_stderr_level)
 
     runner = GatewayRunner(config)
+    # ``--replace`` is explicit startup authority, not a durable reconnect
+    # policy. GatewayRunner scopes this bit to cold adapter connects and clears
+    # it before the background reconnect watcher starts.
+    runner._platform_lock_takeover_on_start = bool(replace)
     
     # Track whether an unexpected signal initiated the shutdown. When an
     # unexpected SIGTERM kills the gateway, we exit non-zero so service
