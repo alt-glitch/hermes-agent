@@ -2203,7 +2203,15 @@ def _persist_branch_seed(session: dict) -> None:
             return
         try:
             for msg in seed:
-                db.append_message(session_id=key, role=msg.get("role", "user"), content=msg.get("content"))
+                db.append_message(
+                    session_id=key,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                    # Preserve the parent's original message timestamps —
+                    # append_message would otherwise stamp time.time() and the
+                    # branch's copied history would all appear authored "now".
+                    timestamp=msg.get("timestamp"),
+                )
             session["_branch_seed_persisted"] = True
         except Exception:
             logger.debug("branch seed persist failed", exc_info=True)
@@ -3729,6 +3737,9 @@ def _compress_session_history(
     before_messages: list | None = None,
     history_version: int | None = None,
 ) -> tuple[int, dict]:
+    from agent.conversation_compression import (
+        finalize_context_engine_compression_notification,
+    )
     from agent.model_metadata import estimate_request_tokens_rough
 
     agent = session["agent"]
@@ -3757,16 +3768,28 @@ def _compress_session_history(
     # cached prompt (which already contains the agent identity block)
     # makes the rebuild append the identity a second time. Mirrors the
     # CLI's _manual_compress fix for issue #15281.
-    compressed, _ = agent._compress_context(
-        history,
-        None,
-        approx_tokens=approx_tokens,
-        focus_topic=focus_topic or None,
-    )
+    try:
+        compressed, _ = agent._compress_context(
+            history,
+            None,
+            approx_tokens=approx_tokens,
+            focus_topic=focus_topic or None,
+            defer_context_engine_notification=True,
+        )
+    except Exception:
+        finalize_context_engine_compression_notification(
+            agent,
+            committed=False,
+        )
+        raise
     with session["history_lock"]:
         if int(session.get("history_version", 0)) != history_version:
             # External mutation during compaction — drop the compressed
             # result so we don't clobber concurrent edits.
+            finalize_context_engine_compression_notification(
+                agent,
+                committed=False,
+            )
             usage = _get_usage(agent)
             return 0, usage
         session["history"] = compressed
@@ -9906,6 +9929,10 @@ def _(rid, params: dict) -> dict:
         return _err(
             rid, 4009, "session busy — /interrupt the current turn before /compress"
         )
+    from agent.conversation_compression import (
+        finalize_context_engine_compression_notification,
+    )
+
     sid = params.get("session_id", "")
     focus_topic = str(params.get("focus_topic", "") or "").strip()
     try:
@@ -9973,6 +10000,10 @@ def _(rid, params: dict) -> dict:
             )
             info = _session_info(agent, session)
             _emit("session.info", sid, info)
+            finalize_context_engine_compression_notification(
+                agent,
+                committed=True,
+            )
             return _ok(
                 rid,
                 {
@@ -9995,6 +10026,10 @@ def _(rid, params: dict) -> dict:
             # no-op, or raised.
             _status_update(sid, "ready")
     except Exception as e:
+        finalize_context_engine_compression_notification(
+            session["agent"],
+            committed=False,
+        )
         return _err(rid, 5005, str(e))
 
 
@@ -10115,6 +10150,7 @@ def _(rid, params: dict) -> dict:
                 session_id=new_key,
                 role=msg.get("role", "user"),
                 content=msg.get("content"),
+                timestamp=msg.get("timestamp"),
             )
         db.set_session_title(new_key, title)
     except Exception as e:
@@ -13365,7 +13401,7 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"key": key, "value": nv})
 
-    if key == "compact":
+    if key == "density":
         raw = str(value or "").strip().lower()
         cfg0 = _load_cfg()
         d0 = cfg0.get("display") if isinstance(cfg0.get("display"), dict) else {}
@@ -13377,7 +13413,7 @@ def _(rid, params: dict) -> dict:
         elif raw == "off":
             nv_b = False
         else:
-            return _err(rid, 4002, f"unknown compact value: {value}")
+            return _err(rid, 4002, f"unknown density value: {value}")
         _write_config_key("display.tui_compact", nv_b)
         return _ok(rid, {"key": key, "value": "on" if nv_b else "off"})
 
@@ -14257,7 +14293,7 @@ def _(rid, params: dict) -> dict:
             )
             nv = "full" if dm == "expanded" else "collapsed"
         return _ok(rid, {"value": nv})
-    if key == "compact":
+    if key == "density":
         on = bool((_load_cfg().get("display") or {}).get("tui_compact", False))
         return _ok(rid, {"value": "on" if on else "off"})
     if key == "theme":
@@ -14750,7 +14786,7 @@ _TUI_HIDDEN: frozenset[str] = frozenset(
 )
 
 _TUI_EXTRA: list[tuple[str, str, str]] = [
-    ("/compact", "Toggle compact display mode", "TUI"),
+    ("/density", "Toggle compact display mode", "TUI"),
     ("/logs", "Show recent gateway log lines", "TUI"),
     (
         "/mouse",
@@ -14819,6 +14855,13 @@ def _(rid, params: dict) -> dict:
             cat_map[cat].append([c, desc])
 
         for name, desc, cat in _TUI_EXTRA:
+            # Dedup guard: skip TUI extras that collide with a registry
+            # command or one of its aliases (e.g. the historical /compact
+            # collision, #57133, or /sessions which the registry also
+            # advertises). The registry entry is canonical.
+            if name.lower() in canon:
+                continue
+            canon[name.lower()] = name
             all_pairs.append([name, desc])
             if cat not in cat_map:
                 cat_map[cat] = []
@@ -15420,6 +15463,10 @@ def _(rid, params: dict) -> dict:
             return _err(
                 rid, 4009, "session busy — /interrupt the current turn before /compress"
             )
+        from agent.conversation_compression import (
+            finalize_context_engine_compression_notification,
+        )
+
         sid = params.get("session_id", "")
         if _session_uses_compute_host(session):
             command = f"/{name}" + (f" {arg}" if arg else "")
@@ -15493,6 +15540,10 @@ def _(rid, params: dict) -> dict:
                 compression_state=getattr(_agent, "context_compressor", None),
             )
             _emit("session.info", sid, _session_info(session.get("agent"), session))
+            finalize_context_engine_compression_notification(
+                _agent,
+                committed=True,
+            )
             return _ok(
                 rid,
                 {
@@ -15503,6 +15554,10 @@ def _(rid, params: dict) -> dict:
                 },
             )
         except Exception as exc:
+            finalize_context_engine_compression_notification(
+                session["agent"],
+                committed=False,
+            )
             return _err(rid, 5009, f"compress failed: {exc}")
 
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
@@ -15975,8 +16030,8 @@ def _(rid, params: dict) -> dict:
         text_lower = text.lower()
         extras = [
             {
-                "text": "/compact",
-                "display": "/compact",
+                "text": "/density",
+                "display": "/density",
                 "meta": "Toggle compact display mode",
             },
             {
@@ -16024,10 +16079,42 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5020, str(e))
 
 
+def _model_picker_context(agent):
+    """Layer live session state onto config without losing custom identity."""
+    from hermes_cli.inventory import load_picker_context
+
+    ctx = load_picker_context()
+    provider = getattr(agent, "provider", "") if agent else ""
+    base_url = getattr(agent, "base_url", "") if agent else ""
+    if str(provider or "").strip().lower() == "custom":
+        try:
+            from hermes_cli.runtime_provider import canonical_custom_identity
+
+            provider = (
+                canonical_custom_identity(
+                    base_url=base_url or None,
+                    config_provider=ctx.current_provider,
+                )
+                or provider
+            )
+        except Exception:
+            logger.debug(
+                "custom provider identity recovery failed (model picker)",
+                exc_info=True,
+            )
+
+    return ctx.with_overrides(
+        current_provider=provider,
+        current_model=(getattr(agent, "model", "") if agent else "")
+        or _resolve_model(),
+        current_base_url=base_url,
+    )
+
+
 @method("model.options")
 def _(rid, params: dict) -> dict:
     try:
-        from hermes_cli.inventory import build_models_payload, load_picker_context
+        from hermes_cli.inventory import build_models_payload
 
         session = _sessions.get(params.get("session_id", ""))
         agent = session.get("agent") if session else None
@@ -16035,13 +16122,7 @@ def _(rid, params: dict) -> dict:
         # is spawned, IT owns the live provider/model/base_url. Empty
         # agent attributes must NOT clobber disk config (with_overrides
         # is truthy-only).
-        ctx = load_picker_context().with_overrides(
-            current_provider=getattr(agent, "provider", "") if agent else "",
-            current_model=(
-                (getattr(agent, "model", "") if agent else "") or _resolve_model()
-            ),
-            current_base_url=getattr(agent, "base_url", "") if agent else "",
-        )
+        ctx = _model_picker_context(agent)
         # picker_hints + canonical_order produce the TUI/desktop picker shape:
         # `authenticated`/`auth_type`/`key_env`/`warning` per row, in
         # CANONICAL_PROVIDERS declaration order. Desktop pickers default to the
@@ -16197,7 +16278,7 @@ def _(rid, params: dict) -> dict:
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
         from hermes_cli.config import is_managed
-        from hermes_cli.inventory import build_models_payload, load_picker_context
+        from hermes_cli.inventory import build_models_payload
 
         slug = (params.get("slug") or "").strip()
         api_key = (params.get("api_key") or "").strip()
@@ -16238,13 +16319,7 @@ def _(rid, params: dict) -> dict:
         # carries `authenticated` for the TUI frontend.
         session = _sessions.get(params.get("session_id", ""))
         agent = session.get("agent") if session else None
-        ctx = load_picker_context().with_overrides(
-            current_provider=getattr(agent, "provider", "") if agent else "",
-            current_model=(
-                (getattr(agent, "model", "") if agent else "") or _resolve_model()
-            ),
-            current_base_url=getattr(agent, "base_url", "") if agent else "",
-        )
+        ctx = _model_picker_context(agent)
         payload = build_models_payload(
             ctx, picker_hints=True, max_models=50,
         )
@@ -16584,6 +16659,13 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         (parts[1].strip() if len(parts) > 1 else ""),
         session.get("agent"),
     )
+    if name == "compact":
+        # /compact is an alias of /compress in every host. The compute-host
+        # slash.compress control forwards the user's raw alias verbatim, so
+        # without normalizing here the child mirror silently no-ops — the
+        # session never compresses and the deferred context-engine
+        # notification wiring below is never exercised for that route.
+        name = "compress"
 
     # Reject agent-mutating commands during an in-flight turn.  These
     # all do read-then-mutate on live agent/session state that the
@@ -16634,6 +16716,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             # while CLI and gateway both did.
             from agent.manual_compression_feedback import summarize_manual_compression
             from agent.model_metadata import estimate_request_tokens_rough
+            from agent.conversation_compression import (
+                finalize_context_engine_compression_notification,
+            )
 
             with session["history_lock"]:
                 _before_messages = list(session.get("history", []))
@@ -16673,6 +16758,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _lines = [_fb["headline"], _fb["token_line"]]
             if _fb.get("note"):
                 _lines.append(_fb["note"])
+            finalize_context_engine_compression_notification(
+                agent,
+                committed=True,
+            )
             return "\n".join(_lines)
         elif name == "fast" and agent:
             mode = arg.lower()
@@ -16822,6 +16911,15 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
 
             process_registry.kill_all()
     except Exception as e:
+        if name == "compress" and agent:
+            from agent.conversation_compression import (
+                finalize_context_engine_compression_notification,
+            )
+
+            finalize_context_engine_compression_notification(
+                agent,
+                committed=False,
+            )
         return f"live session sync failed: {e}"
     return ""
 
