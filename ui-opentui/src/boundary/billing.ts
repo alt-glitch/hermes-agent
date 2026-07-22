@@ -203,6 +203,20 @@ export interface SubscriptionStateResponse {
   usage?: UsageModelData
 }
 
+/** Build the browser hand-off URL without trusting the gateway's billing path.
+ * org_id and an optional plan tier coexist as ordinary query parameters. */
+export function buildManageSubscriptionUrl(state: SubscriptionStateResponse, tierId?: string): string | null {
+  try {
+    if (!state.portal_url) return null
+    const url = new URL('/manage-subscription', new URL(state.portal_url).origin)
+    if (state.org_id) url.searchParams.set('org_id', state.org_id)
+    if (tierId) url.searchParams.set('plan', tierId)
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
 export interface SubscriptionPreviewResponse extends BillingMutationResponse {
   effect?: 'charge_now' | 'scheduled' | 'no_op' | 'blocked'
   reason?: string | null
@@ -237,7 +251,7 @@ export interface SubscriptionResult {
 }
 export interface SubscriptionCtx {
   fetchCard: () => Promise<BillingCardInfo | null>
-  openManageLink: () => Promise<boolean>
+  openManageLink: (tierId?: string) => Promise<boolean>
   openPortal: (url: string) => void
   preview: (tierId: string) => Promise<SubscriptionPreviewResponse | null>
   refreshState: () => Promise<SubscriptionStateResponse | null>

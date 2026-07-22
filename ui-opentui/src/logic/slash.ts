@@ -14,6 +14,7 @@
 import { Option } from 'effect'
 
 import { decodeSessionCompressResponse } from '../boundary/compression.ts'
+import { buildManageSubscriptionUrl } from '../boundary/billing.ts'
 
 import { delegationStatusText, type DelegationState } from './agentStatus.ts'
 import { diagnosticsEnabled } from './env.ts'
@@ -75,6 +76,7 @@ import { dailyFortune, randomFortune } from './fortunes.ts'
 import { formatHelp } from './help.ts'
 import type { Message } from './store.ts'
 import { normalizeBusyInputMode, type BusyInputMode } from './busyQueue.ts'
+import { batteryInfoFromResponse, batteryLabel } from './battery.ts'
 
 export interface ParsedSlash {
   name: string
@@ -218,6 +220,9 @@ export interface SlashContext {
   /** Read / set the compact-transcript display flag (/compact — Epic 3). */
   readonly compact: () => boolean
   readonly setCompact: (on: boolean) => void
+  /** Read / set the persisted, launch-level status-bar battery indicator. */
+  readonly batteryEnabled: () => boolean
+  readonly setBatteryEnabled: (on: boolean) => void
   /** Read / set the global tool/reasoning detail mode (/details — Epic 3). */
   readonly details: () => DetailsMode
   readonly setDetails: (mode: DetailsMode, commandOverride?: boolean) => void
@@ -1110,6 +1115,81 @@ const skinCmd: ClientHandler = async (arg, ctx) => {
   }
 }
 
+/** `/theme [auto|light|dark]` stays client-owned so it persists through the
+ * config RPC instead of falling through to the slash-worker subprocess. */
+const themeCmd: ClientHandler = async (arg, ctx) => {
+  const value = arg.trim().toLowerCase()
+  if (!value) {
+    try {
+      const response = decodeConfigValueResponse(await ctx.request('config.get', { key: 'theme' }))
+      ctx.pushSystem(`theme: ${response?.value || 'auto'}`)
+    } catch {
+      ctx.pushSystem('theme: auto')
+    }
+    return
+  }
+  if (value !== 'auto' && value !== 'light' && value !== 'dark') {
+    ctx.pushSystem('usage: /theme [auto|light|dark]')
+    return
+  }
+  try {
+    const response = decodeConfigValueResponse(await ctx.request('config.set', { key: 'theme', value }))
+    if (!response) {
+      ctx.pushSystem('/theme: invalid config.set response')
+      return
+    }
+    ctx.pushSystem(`theme → ${response.value || value}`)
+  } catch (error) {
+    ctx.pushSystem(`/theme: ${error instanceof Error ? error.message : 'config.set failed'}`)
+  }
+}
+
+/** `/battery [on|off|status]` owns both persistence and the native poller.
+ * Bare/toggle parity with the classic CLI is retained. */
+const batteryCmd: ClientHandler = async (arg, ctx, flight) => {
+  const mode = arg.trim().toLowerCase()
+  const sid = ctx.sessionId()
+  if (mode === 'status' || mode === 'show') {
+    const state = ctx.batteryEnabled() ? 'on' : 'off'
+    try {
+      const raw = await ctx.request('system.battery', {})
+      if (!currentSessionIs(ctx, sid, flight)) return
+      const reading = batteryInfoFromResponse(raw)
+      ctx.pushSystem(
+        reading?.available
+          ? `battery indicator ${state} — currently ${batteryLabel(reading)}`
+          : `battery indicator ${state} — no battery detected on this machine`
+      )
+    } catch {
+      if (currentSessionIs(ctx, sid, flight)) ctx.pushSystem(`battery indicator ${state}`)
+    }
+    return
+  }
+
+  const next = flagFromArg(arg, ctx.batteryEnabled())
+  if (next === null) {
+    ctx.pushSystem('usage: /battery [on|off|status]')
+    return
+  }
+  try {
+    const response = decodeConfigValueResponse(
+      await ctx.request('config.set', { key: 'battery', value: next ? 'on' : 'off' })
+    )
+    if (!currentSessionIs(ctx, sid, flight)) return
+    if (!response) {
+      ctx.pushSystem('/battery: invalid config.set response')
+      return
+    }
+    const enabled = response.value === 'on'
+    ctx.setBatteryEnabled(enabled)
+    ctx.pushSystem(`battery indicator ${enabled ? 'on' : 'off'}`)
+  } catch (error) {
+    if (currentSessionIs(ctx, sid, flight)) {
+      ctx.pushSystem(`/battery: ${error instanceof Error ? error.message : 'config.set failed'}`)
+    }
+  }
+}
+
 const EMPTY_DELEGATION: DelegationState = Object.freeze({
   maxConcurrentChildren: null,
   maxSpawnDepth: null,
@@ -1838,16 +1918,6 @@ const subscriptionCmd: ClientHandler = async (_arg, ctx, flight) => {
       const opened = openExternalUrl(url)
       pushSessionSystem(opened ? `Opening portal: ${url}` : `Could not open browser — visit ${url}`)
     }
-    const manageUrl = () => {
-      try {
-        if (!state.portal_url) return null
-        const url = new URL('/manage-subscription', new URL(state.portal_url).origin)
-        if (state.org_id) url.searchParams.set('org_id', state.org_id)
-        return url.toString()
-      } catch {
-        return null
-      }
-    }
     ctx.openSubscription({
       ctx: {
         fetchCard: () =>
@@ -1855,8 +1925,8 @@ const subscriptionCmd: ClientHandler = async (_arg, ctx, flight) => {
             .request('billing.state', {})
             .then(raw => (raw as BillingStateResponse).card ?? null)
             .catch(() => null),
-        openManageLink: () => {
-          const url = manageUrl()
+        openManageLink: (tierId?: string) => {
+          const url = buildManageSubscriptionUrl(state, tierId)
           if (!url) {
             pushSessionSystem('Could not build manage URL — is your portal configured?')
             return Promise.resolve(false)
@@ -2648,6 +2718,7 @@ async function browserCmd(arg: string, ctx: SlashContext, flight: number): Promi
 const CLIENT: Record<string, ClientHandler> = {
   agents: agentsCmd,
   background: backgroundCmd,
+  battery: batteryCmd,
   bg: backgroundCmd,
   subscription: subscriptionCmd,
   upgrade: subscriptionCmd,
@@ -2712,6 +2783,7 @@ const CLIENT: Record<string, ClientHandler> = {
   switch: sessionsCmd,
   stop: stopCmd,
   tasks: agentsCmd,
+  theme: themeCmd,
   timestamps: timestampsCmd,
   topup: topupCmd,
   title: titleCmd,

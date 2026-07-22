@@ -1,6 +1,11 @@
 import { describe, expect, test, vi } from 'vitest'
 
-import type { SubscriptionCtx, SubscriptionOverlayState, SubscriptionStateResponse } from '../boundary/billing.ts'
+import {
+  buildManageSubscriptionUrl,
+  type SubscriptionCtx,
+  type SubscriptionOverlayState,
+  type SubscriptionStateResponse
+} from '../boundary/billing.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { SubscriptionOverlay, subscriptionStatusLine } from '../view/overlays/subscription.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
@@ -97,6 +102,23 @@ function mount(overlay: SubscriptionOverlayState) {
 }
 
 describe('subscription native adaptation', () => {
+  test('manage URL appends a plan tier without losing org routing or legacy URL behavior', () => {
+    const withPlan = buildManageSubscriptionUrl(state(), 'ultra')
+    expect(withPlan).not.toBeNull()
+    const planned = new URL(withPlan!)
+    expect(planned.origin + planned.pathname).toBe('https://portal.example/manage-subscription')
+    expect(planned.searchParams.get('org_id')).toBe('org-1')
+    expect(planned.searchParams.get('plan')).toBe('ultra')
+
+    const legacy = new URL(buildManageSubscriptionUrl(state())!)
+    expect(legacy.searchParams.get('org_id')).toBe('org-1')
+    expect(legacy.searchParams.has('plan')).toBe(false)
+
+    const noOrg = new URL(buildManageSubscriptionUrl(state({ org_id: null }), 'plus')!)
+    expect(noOrg.searchParams.has('org_id')).toBe(false)
+    expect(noOrg.searchParams.get('plan')).toBe('plus')
+  })
+
   test('status names a pending plan transition', () => {
     expect(subscriptionStatusLine(state())).toContain('Plan: Plus')
     expect(

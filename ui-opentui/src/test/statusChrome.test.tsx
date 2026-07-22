@@ -12,6 +12,7 @@
  *      the line.
  */
 import { Option } from 'effect'
+import { RGBA } from '@opentui/core'
 import { describe, expect, test } from 'vitest'
 
 import { decodeSessionInfoPatch } from '../boundary/schema/SessionInfo.ts'
@@ -315,6 +316,52 @@ function bar(store: SessionStore) {
 }
 
 describe('StatusBar frames (one left-aligned labeled line)', () => {
+  test('battery is the first category-coloured chip, uses -- for unknown percent, and hides off', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.applyInfo({ model: 'm' })
+    store.setBatteryEnabled(true)
+    store.setBatteryStatus({ available: true, category: 'critical', percent: null, plugged: false })
+    const probe = await renderProbe(bar(store), { width: 60, height: 3 })
+    try {
+      const row =
+        probe
+          .frame()
+          .split('\n')
+          .find(value => value.includes('🔋')) ?? ''
+      expect(row).toContain('🔋 --% │ ● m')
+      const chip = probe
+        .spans()
+        .lines.flatMap(line => line.spans)
+        .find(span => span.text.includes('🔋 --%'))
+      expect(chip).toBeDefined()
+      expect(chip?.fg.toInts().slice(0, 3)).toEqual(
+        RGBA.fromHex(store.state.theme.color.statusCritical).toInts().slice(0, 3)
+      )
+
+      store.setBatteryEnabled(false)
+      await probe.settle()
+      expect(probe.frame()).not.toContain('🔋')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('battery chip stays on one physical status row across narrow widths', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.applyInfo({ model: 'm' })
+    store.setBatteryEnabled(true)
+    store.setBatteryStatus({ available: true, category: 'good', percent: 82, plugged: true })
+
+    for (const width of [20, 24, 30, 40, 60]) {
+      const frame = await captureFrame(bar(store), { width, height: 3 })
+      const rows = frame.split('\n').filter(row => row.trim())
+      expect(rows, `width ${String(width)}`).toHaveLength(1)
+      expect(rows[0], `width ${String(width)}`).toContain('⚡ 82%')
+    }
+  })
+
   test('named project identity leads the cwd tail and clears on an unowned workspace', async () => {
     const store = seededStore()
     store.applyInfo({

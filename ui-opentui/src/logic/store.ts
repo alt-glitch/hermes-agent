@@ -31,6 +31,7 @@ import {
   type SessionInfoPatchDecoded
 } from '../boundary/schema/SessionInfo.ts'
 import type { DetailsMode, DetailsSection, DetailsSections } from './details.ts'
+import type { BatteryInfo } from './battery.ts'
 import {
   applyDelegationState,
   clearAgentsNudgeTurn,
@@ -692,6 +693,11 @@ export interface StoreState {
   reasoningFull: boolean
   /** Persisted display.busy_input_mode mirrored into the live submit policy. */
   busyInputMode: BusyInputMode
+  /** Launch-level display.battery preference. It deliberately survives every
+   * session-owned reset; the poller is armed only while this is true. */
+  batteryEnabled: boolean
+  /** Latest host reading. Cleared immediately when the indicator is disabled. */
+  batteryStatus: BatteryInfo | null
 }
 
 export interface VoiceState {
@@ -973,7 +979,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     detailsSections: {},
     timestamps: false,
     reasoningFull: false,
-    busyInputMode: DEFAULT_BUSY_INPUT_MODE
+    busyInputMode: DEFAULT_BUSY_INPUT_MODE,
+    batteryEnabled: false,
+    batteryStatus: null
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
@@ -1989,6 +1997,39 @@ export function createSessionStore(options?: SessionStoreOptions) {
   let busyInputModeRevision = 0
   let compactRevision = 0
   let detailsRevision = 0
+  let batteryRevision = 0
+  let onBatteryEnabled = (_enabled: boolean) => {}
+
+  function registerBatteryEnabledHandler(handler: (enabled: boolean) => void): void {
+    onBatteryEnabled = handler
+    handler(state.batteryEnabled)
+  }
+
+  function commitBatteryEnabled(enabled: boolean): void {
+    setState('batteryEnabled', enabled)
+    if (!enabled) setState('batteryStatus', null)
+    onBatteryEnabled(enabled)
+  }
+
+  function setBatteryEnabled(enabled: boolean): void {
+    batteryRevision += 1
+    commitBatteryEnabled(enabled)
+  }
+
+  function hydrateBatteryEnabled(enabled: boolean, expectedRevision: number): boolean {
+    if (batteryRevision !== expectedRevision) return false
+    commitBatteryEnabled(enabled)
+    return true
+  }
+
+  function getBatteryRevision(): number {
+    return batteryRevision
+  }
+
+  function setBatteryStatus(reading: BatteryInfo | null): void {
+    if (!state.batteryEnabled && reading) return
+    setState('batteryStatus', reading)
+  }
 
   /** /compact — set the compact-transcript display flag (Epic 3). */
   function setCompact(on: boolean): void {
@@ -3163,6 +3204,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setVoiceMode,
     setVoiceActivity,
     setBrowserState,
+    registerBatteryEnabledHandler,
+    setBatteryEnabled,
+    hydrateBatteryEnabled,
+    getBatteryRevision,
+    setBatteryStatus,
     setCompact,
     hydrateCompact,
     getCompactRevision,

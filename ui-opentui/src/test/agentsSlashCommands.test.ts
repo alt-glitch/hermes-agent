@@ -101,6 +101,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   const ctx: SlashContext = {
     addBgTask: () => {},
     agentsControl,
+    batteryEnabled: () => false,
     beginHistoryMutation: () => true,
     beginToolsConfigure: () => {},
     busyInputMode: () => 'queue',
@@ -156,6 +157,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     setVoiceMode: () => {},
     setBusyInputMode: () => {},
     setCompact: () => {},
+    setBatteryEnabled: () => {},
     setDetails: () => {},
     setDetailSection: () => {},
     setModelItems: () => {},

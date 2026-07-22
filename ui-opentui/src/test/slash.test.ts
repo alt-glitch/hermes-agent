@@ -357,6 +357,7 @@ interface Probe {
   modelCache: { value: PickerItem[] | undefined }
   /** Display flags (/compact, /details — Epic 3). */
   compactFlag: { value: boolean }
+  batteryFlag: { value: boolean }
   detailsFlag: { value: DetailsMode }
   /** /timestamps display flag — show [HH:MM] on messages (port of 5ff11a689). */
   timestampsFlag: { value: boolean }
@@ -410,6 +411,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const copySelection: Probe['copySelection'] = { value: undefined }
   const modelCache: Probe['modelCache'] = { value: undefined }
   const compactFlag: Probe['compactFlag'] = { value: false }
+  const batteryFlag: Probe['batteryFlag'] = { value: false }
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
   const detailSections = { value: {} as DetailsSections }
   const timestampsFlag: Probe['timestampsFlag'] = { value: false }
@@ -456,6 +458,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     dashboardMode: () => dashboardMode.value,
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
+    batteryEnabled: () => batteryFlag.value,
+    setBatteryEnabled: on => (batteryFlag.value = on),
     details: () => detailsFlag.value,
     setDetails: mode => (detailsFlag.value = mode),
     detailSections: () => detailSections.value,
@@ -588,6 +592,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     paged,
     pickers,
     billed,
+    batteryFlag,
     subscribed,
     cachedCatalog,
     dashboardMode,
@@ -1192,6 +1197,46 @@ describe('dispatchSlash — client commands', () => {
     const get = p.calls.find(c => c.method === 'config.get')
     expect(get?.params).toMatchObject({ key: 'skin' })
     expect(p.system.at(-1)).toContain('poseidon')
+  })
+
+  test('/theme is client-owned, validates modes, and persists through config.set', async () => {
+    const p = makeCtx(async (method, params) => (method === 'config.set' ? { value: params.value } : { value: 'auto' }))
+    await dispatchSlash('/theme dark', p.ctx)
+    await dispatchSlash('/theme', p.ctx)
+    await dispatchSlash('/theme sepia', p.ctx)
+
+    expect(p.calls).toEqual([
+      { method: 'config.set', params: { key: 'theme', value: 'dark' } },
+      { method: 'config.get', params: { key: 'theme' } }
+    ])
+    expect(p.system).toEqual(['theme → dark', 'theme: auto', 'usage: /theme [auto|light|dark]'])
+  })
+
+  test('/battery persists on/off and status reads live battery without enabling its poller', async () => {
+    const p = makeCtx(async (method, params) => {
+      if (method === 'config.set') return { value: params.value }
+      if (method === 'system.battery') {
+        return { available: true, category: 'good', percent: 82, plugged: true }
+      }
+      return {}
+    })
+
+    await dispatchSlash('/battery on', p.ctx)
+    expect(p.batteryFlag.value).toBe(true)
+    await dispatchSlash('/battery status', p.ctx)
+    await dispatchSlash('/battery off', p.ctx)
+    expect(p.batteryFlag.value).toBe(false)
+
+    expect(p.calls).toEqual([
+      { method: 'config.set', params: { key: 'battery', value: 'on' } },
+      { method: 'system.battery', params: {} },
+      { method: 'config.set', params: { key: 'battery', value: 'off' } }
+    ])
+    expect(p.system).toEqual([
+      'battery indicator on',
+      'battery indicator on — currently ⚡ 82%',
+      'battery indicator off'
+    ])
   })
 
   test('/resume <id|name> keeps the DIRECT path: resolves against session.list and resumes', async () => {

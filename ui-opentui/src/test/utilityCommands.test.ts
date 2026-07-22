@@ -81,6 +81,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const compressionMutations: Probe['compressionMutations'] = []
   const trimCalls = { value: 0 }
   const ctx: SlashContext = {
+    batteryEnabled: () => false,
     guardBusySessionSwitch: () => false,
     newSession: () => {},
     newLiveSession: () => {},
@@ -98,6 +99,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     dashboardMode: () => false,
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
+    setBatteryEnabled: () => {},
     details: () => detailsFlag.value,
     setDetails: (mode, commandOverride) => {
       detailsFlag.value = mode

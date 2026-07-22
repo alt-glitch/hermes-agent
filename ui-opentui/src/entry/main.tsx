@@ -61,7 +61,8 @@ import {
   replaceSession,
   resumeSession
 } from '../boundary/sessionLifecycle.ts'
-import { configSyncBlocked, createConfigSyncTracker, mcpReloadSucceeded } from '../logic/configSync.ts'
+import { configSyncBlocked, createConfigSyncTracker } from '../logic/configSync.ts'
+import { batteryEnabledFromConfig, createBatteryPoller } from '../logic/battery.ts'
 import { compactFromConfig, detailsFromConfig } from '../logic/details.ts'
 import {
   createDelegationStatusRefresher,
@@ -333,6 +334,7 @@ const postSessionSetup = (
     const busyModeRevision = store.getBusyInputModeRevision()
     const compactRevision = store.getCompactRevision()
     const detailsRevision = store.getDetailsRevision()
+    const batteryRevision = store.getBatteryRevision()
 
     // Claim model hydration for this SID before the first async yield. Session
     // transitions clear the previous claim, so an immediate `/model` can only
@@ -393,6 +395,7 @@ const postSessionSetup = (
       store.hydrateCompact(compactFromConfig(decodedBusyConfig.config), compactRevision)
       const details = detailsFromConfig(decodedBusyConfig.config)
       store.hydrateDetails(details.mode, details.sections, detailsRevision)
+      store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedBusyConfig.config), batteryRevision)
       store.configureAgentsNudge(tuiAgentsNudgeConfigValue(decodedBusyConfig.config))
       store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedBusyConfig.config) })
     }
@@ -542,6 +545,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // the session so the transcript continues. The INITIAL gateway.ready has
       // `recoverSid === undefined`, so the normal bootstrap path is untouched.
       const gateway = yield* GatewayService
+
+      const batteryPoller = createBatteryPoller({
+        apply: reading => store.setBatteryStatus(reading),
+        request: () => Effect.runPromise(gateway.request('system.battery', {}))
+      })
+      store.registerBatteryEnabledHandler(enabled => batteryPoller.setEnabled(enabled))
+      yield* Effect.addFinalizer(() => Effect.sync(() => batteryPoller.dispose()))
 
       let sessionTransitionInFlight = false
       let gatewayUnavailable = false
@@ -972,21 +982,32 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                 .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
               const decodedMtime = decodeConfigMtimeResponse(rawMtime)
               const nextMtime = decodedMtime?.mtime ?? 0
+              const nextMcpRev = decodedMtime?.mcp_rev ?? ''
               // `isTurnBusy` includes the server-confirmed-idle settle latch,
               // not just the optimistic spinner flag. A changed mtime remains
               // pending until an idle poll can safely request the global MCP
               // mutation; a server-side 4009 closes the final admission race.
-              const plan = configSync.plan(nextMtime, configSyncBlocked(isTurnBusy(), isSessionTransitioning()))
+              const plan = configSync.plan(
+                nextMtime,
+                nextMcpRev,
+                configSyncBlocked(isTurnBusy(), isSessionTransitioning())
+              )
               if (!plan) return
               const busyModeRevision = store.getBusyInputModeRevision()
               const compactRevision = store.getCompactRevision()
               const detailsRevision = store.getDetailsRevision()
+              const batteryRevision = store.getBatteryRevision()
 
               if (plan.reload) {
                 const reload = yield* gateway
-                  .request<unknown>('reload.mcp', { confirm: true, session_id: sid })
+                  .request<unknown>('reload.mcp', {
+                    confirm: true,
+                    session_id: sid,
+                    ...(plan.mcpRev ? { rev: plan.mcpRev } : {})
+                  })
                   .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-                if (!configSync.completeReload(plan, mcpReloadSucceeded(reload))) return
+                if (!configSync.completeReload(plan, reload)) return
+                store.pushSystem('MCP reloaded after config change')
               }
 
               const rawConfig = yield* gateway
@@ -1000,10 +1021,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               store.hydrateCompact(compactFromConfig(decodedConfig.config), compactRevision)
               const details = detailsFromConfig(decodedConfig.config)
               store.hydrateDetails(details.mode, details.sections, detailsRevision)
+              store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedConfig.config), batteryRevision)
               store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedConfig.config) })
-              if (configSync.completeHydration(plan, true) && plan.kind === 'change') {
-                store.pushSystem('MCP reloaded after config change')
-              }
+              configSync.completeHydration(plan, true)
             })
           )
         })
@@ -2485,6 +2505,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         dashboardMode: () => hostedDashboard,
         compact: () => store.state.compact,
         setCompact: on => store.setCompact(on),
+        batteryEnabled: () => store.state.batteryEnabled,
+        setBatteryEnabled: on => store.setBatteryEnabled(on),
         details: () => store.state.details,
         setDetails: (mode, commandOverride) => store.setDetails(mode, commandOverride),
         detailSections: () => store.state.detailsSections,

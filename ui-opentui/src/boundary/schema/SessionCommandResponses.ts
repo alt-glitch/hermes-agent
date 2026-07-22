@@ -21,6 +21,7 @@ export type SessionSaveResponse = typeof SessionSaveResponseSchema.Type
 export const ReloadEnvResponseSchema = Schema.Struct({ updated: Num })
 export type ReloadEnvResponse = typeof ReloadEnvResponseSchema.Type
 export const ReloadMcpResponseSchema = Schema.Struct({
+  loaded_rev: opt(Str),
   message: opt(Str),
   status: Schema.Literals(['confirm_required', 'reloaded'])
 })
@@ -43,8 +44,16 @@ export const ConfigFullResponseSchema = Schema.Struct({
 })
 export type ConfigFullResponse = typeof ConfigFullResponseSchema.Type
 
-export const ConfigMtimeResponseSchema = Schema.Struct({ mtime: Num })
+export const ConfigMtimeResponseSchema = Schema.Struct({ mcp_rev: opt(Str), mtime: Num })
 export type ConfigMtimeResponse = typeof ConfigMtimeResponseSchema.Type
+
+export const SystemBatteryResponseSchema = Schema.Struct({
+  available: Schema.Boolean,
+  category: opt(Str),
+  percent: opt(Schema.NullOr(Num)),
+  plugged: opt(Schema.NullOr(Schema.Boolean))
+})
+export type SystemBatteryResponse = typeof SystemBatteryResponseSchema.Type
 
 export const SessionSteerResponseSchema = Schema.Struct({
   status: Schema.Literals(['queued', 'rejected']),
@@ -96,6 +105,7 @@ const decodeConfigValue = Schema.decodeUnknownOption(ConfigValueResponseSchema)
 const decodeModelSwitch = Schema.decodeUnknownOption(ModelSwitchResponseSchema)
 const decodeConfigFull = Schema.decodeUnknownOption(ConfigFullResponseSchema)
 const decodeConfigMtime = Schema.decodeUnknownOption(ConfigMtimeResponseSchema)
+const decodeSystemBattery = Schema.decodeUnknownOption(SystemBatteryResponseSchema)
 const decodeSessionSteer = Schema.decodeUnknownOption(SessionSteerResponseSchema)
 const decodeSessionUndo = Schema.decodeUnknownOption(SessionUndoResponseSchema)
 const decodeSkillsReload = Schema.decodeUnknownOption(SkillsReloadResponseSchema)
@@ -125,6 +135,9 @@ export const decodeConfigFullResponse = (value: unknown): ConfigFullResponse | u
 
 export const decodeConfigMtimeResponse = (value: unknown): ConfigMtimeResponse | undefined =>
   some(decodeConfigMtime(value))
+
+export const decodeSystemBatteryResponse = (value: unknown): SystemBatteryResponse | undefined =>
+  some(decodeSystemBattery(value))
 
 export const decodeSessionSteerResponse = (value: unknown): SessionSteerResponse | undefined =>
   some(decodeSessionSteer(value))

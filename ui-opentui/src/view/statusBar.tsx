@@ -3,7 +3,7 @@
  * EVERY width (status chrome v3 — user feedback: "everything left-aligned,
  * all on one line, no random scatter"):
  *
- *   ● model ·effort │ ctx: ██████░░░░░░ 42% · 84k │ cost: $0.41 │ up: 23m │ cmp: 2 │ profile │ mcp: 2 │ project · …/cwd (branch)
+ *   🔋 82% │ ● model ·effort │ ctx: ██████░░░░░░ 42% · 84k │ cost: $0.41 │ up: 23m │ cmp: 2 │ profile │ mcp: 2 │ project · …/cwd (branch)
  *
  * Design rules (this pass):
  *   - Every segment is LABELED and terse (`ctx:`, `cost:`, `up:`, `cmp:`,
@@ -50,6 +50,7 @@ import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, onCleanup, Show } from 'solid-js'
 
 import { delegationPressure, idleSubagentResumeStatus, type DelegationState } from '../logic/agentStatus.ts'
+import { batteryLabel, type BatteryCategory } from '../logic/battery.ts'
 import type { SessionStore, SubagentInfo } from '../logic/store.ts'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../logic/subagentTree.ts'
 import { truncLeft, truncRight } from '../logic/truncate.ts'
@@ -246,6 +247,16 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     const level = cmpLevel(n)
     return level === 'bad' ? theme().color.error : level === 'warn' ? theme().color.warn : theme().color.muted
   }
+  const batteryColorOf = (category: BatteryCategory) =>
+    category === 'good'
+      ? theme().color.statusGood
+      : category === 'warn'
+        ? theme().color.statusWarn
+        : category === 'bad'
+          ? theme().color.statusBad
+          : category === 'critical'
+            ? theme().color.statusCritical
+            : theme().color.muted
 
   const dot = () => (info().running ? '◐' : props.store.state.ready ? '●' : '○')
   const dotColor = () =>
@@ -375,12 +386,21 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     if (!snap || snap.counts.total === 0) return ''
     return `☑ ${snap.counts.completed}/${snap.counts.total}`
   })
+  const batteryText = createMemo(() => {
+    const reading = props.store.state.batteryStatus
+    return props.store.state.batteryEnabled && reading?.available ? batteryLabel(reading) : ''
+  })
+  const batteryColor = () => {
+    const reading = props.store.state.batteryStatus
+    return reading ? batteryColorOf(reading.category) : theme().color.muted
+  }
 
   // Fixed/higher-priority left run. The parked-subagent reassurance is
   // variable-width, so it budgets against this real length instead of gaining
   // a brittle fixed-column breakpoint.
   const baseLeftLen = createMemo(() => {
     let len = 1 // dot
+    if (batteryText()) len += batteryText().length + SEP.length
     if (model()) len += 1 + model().length + effort().length
     for (const seg of [
       agentsText(),
@@ -469,6 +489,10 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
         {/* ONE left-flowing text run: dot+model, then the labeled segments in
             priority order, the (pre-truncated) cwd last. No spacers, no pinning. */}
         <text selectable={false} wrapMode="none">
+          <Show when={batteryText()}>
+            <span style={{ fg: batteryColor() }}>{batteryText()}</span>
+            <span style={{ fg: theme().color.border }}>{SEP}</span>
+          </Show>
           <span style={{ fg: dotColor() }}>{dot()}</span>
           <Show when={model()}>
             <span style={{ fg: theme().color.statusFg }}>{` ${model()}`}</span>
