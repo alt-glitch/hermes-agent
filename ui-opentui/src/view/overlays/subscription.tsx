@@ -225,6 +225,13 @@ function TeamScreen(props: { overlay: SubscriptionOverlayState; onClose: () => v
   )
 }
 
+/** `· $1,000 credits/mo` row suffix for a catalog plan. NAS sends a bare decimal
+ *  string (tolerate pre-grouped "1,000" too); monthly credits are DOLLARS. */
+function creditsSuffix(monthlyCredits: null | string): string {
+  const credits = Number((monthlyCredits ?? '').replace(/,/g, ''))
+  return Number.isFinite(credits) && credits > 0 ? ` · $${credits.toLocaleString('en-US')} credits/mo` : ''
+}
+
 function Overview(props: {
   overlay: SubscriptionOverlayState
   onPatch: (next: Partial<SubscriptionOverlayState>) => void
@@ -235,6 +242,15 @@ function Overview(props: {
   const current = () => state().current
   const transition = () => pendingTransition(current())
   const isFree = () => !current()?.tier_id
+  // On Free the catalog renders inline; picking a plan hands off to the portal,
+  // where starting a subscription needs card capture + checkout (the upgrade
+  // RPC requires an existing subscription).
+  const freePlans = () =>
+    isFree()
+      ? state()
+          .tiers.filter(tier => tier.is_enabled && tier.tier_order > 0)
+          .sort((a, b) => a.tier_order - b.tier_order)
+      : []
   const rows = () => {
     const values: Array<{ label: string; run: () => void }> = []
     if (state().can_change_plan && !isFree()) {
@@ -249,13 +265,35 @@ function Overview(props: {
         })
       }
     }
-    values.push({ label: isFree() ? 'Start a subscription' : 'Manage on portal', run: manage })
+    for (const tier of freePlans()) {
+      values.push({
+        label: `${tier.name} · ${tier.dollars_per_month_display}/mo${creditsSuffix(tier.monthly_credits)}`,
+        run: () => {
+          // Arm the busy guard BEFORE the portal handoff — a double-Enter must
+          // not open the portal twice. openManageLink narrates the handoff.
+          if (busy) return
+          busy = true
+          void openManage(tier.tier_id)
+          props.onClose()
+        }
+      })
+    }
+    // The inline plan rows are the subscribe path; only a catalog-less free
+    // state still needs the generic portal row.
+    if (!isFree() || freePlans().length === 0) {
+      values.push({ label: isFree() ? 'Start a subscription' : 'Manage on portal', run: manage })
+    }
     values.push({ label: 'Close', run: props.onClose })
     return values
   }
   let busy = false
+  // The boundary ctx may not yet accept a tier id (the core worker owns that
+  // contract) — a zero-arg openManageLink is assignable here and safely ignores
+  // the extra argument; once the ctx learns `tierId`, the row deep-links its
+  // plan via `?plan=<tier_id>`.
+  const openManage: (tierId?: string) => Promise<boolean> = props.overlay.ctx.openManageLink
   const manage = () => {
-    void props.overlay.ctx.openManageLink()
+    void openManage()
     props.onClose()
   }
   const resume = () => {
@@ -384,7 +422,11 @@ function applyPending(
     allowStepUp
       ? patch({ screen: 'stepup', stepUpRetry: { kind: 'apply' } })
       : patch({
-          result: { message: 'Terminal billing still isn’t enabled for this org.', ok: false },
+          result: {
+            message:
+              'Remote Spending still isn’t active for this terminal — the authorization didn’t take. Retry, or make this change on the portal.',
+            ok: false
+          },
           screen: 'result'
         })
   if (pending.kind === 'upgrade') {
@@ -573,7 +615,8 @@ function StepUp(props: {
         ? 'Your session expired — run /portal to log in again.'
         : value.error === 'rate_limited'
           ? 'Too many attempts — wait a moment, then try again.'
-          : value.message || 'Someone with billing permissions must approve terminal billing.',
+          : value.message ||
+            'Remote Spending was not allowed — someone with billing permissions must approve it. You can also make this change on the portal.',
     ok: false
   })
   const enable = () => {
@@ -632,18 +675,18 @@ function StepUp(props: {
   return (
     <box style={{ flexDirection: 'column' }}>
       <text fg={phase() === 'granted' ? c().ok : c().accent}>
-        <b>{phase() === 'granted' ? 'Terminal billing enabled' : 'Enable terminal billing'}</b>
+        <b>{phase() === 'granted' ? 'Remote Spending allowed' : 'Allow Remote Spending'}</b>
       </text>
       <text fg={c().text}>
         {phase() === 'prompt'
-          ? 'Approve terminal billing once in your browser; the held plan change stays here.'
+          ? 'Allow Remote Spending once in your browser; the held plan change stays here.'
           : phase() === 'waiting'
             ? 'Waiting for your browser…'
             : phase() === 'granted'
               ? 'Press Enter to continue the held change.'
               : 'Resuming your plan change…'}
       </text>
-      <Footer text={phase() === 'granted' ? 'Enter continue · Esc cancel' : 'Enter enable · Esc cancel'} />
+      <Footer text={phase() === 'granted' ? 'Enter continue · Esc cancel' : 'Enter allow · Esc cancel'} />
     </box>
   )
 }

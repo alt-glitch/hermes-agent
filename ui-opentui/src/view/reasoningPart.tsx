@@ -102,7 +102,9 @@ export function ReasoningPart(props: { text: string; streaming?: boolean; sectio
             border={['left']}
             borderColor={theme().color.muted}
           >
-            <Markdown text={summary().body} streaming={props.streaming ?? false} fg={theme().color.muted} />
+            {/* body rides the `thinking` token (theme-sdk `ui_thinking`) — it
+                defaults to muted, so a skin without it paints unchanged. */}
+            <Markdown text={summary().body} streaming={props.streaming ?? false} fg={theme().color.thinking} />
           </box>
         </Show>
       </box>

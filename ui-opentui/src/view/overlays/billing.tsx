@@ -147,7 +147,7 @@ function OverviewScreen(props: ScreenProps): JSXElement {
     !state().is_admin
       ? 'Billing actions need an org admin/owner.'
       : !state().cli_billing_enabled
-        ? 'Terminal billing is off for this org — enable it on the portal.'
+        ? "Remote spending is off for this org — a billing admin can turn it on from the portal's Hermes Agent page."
         : null
   const items = createMemo(() =>
     full() ? ['Add funds', 'Auto-reload', 'Monthly limit', 'Manage on portal', 'Close'] : ['Manage on portal', 'Cancel']
@@ -481,7 +481,7 @@ function StepUpScreen(props: { overlay: BillingOverlayState; onClose: () => void
   const allow = () => {
     if (phase() !== 'prompt') return
     setPhase('waiting')
-    ctx().sys('Opening your browser to enable terminal billing…')
+    ctx().sys('Opening your browser to allow Remote Spending…')
     void ctx()
       .requestRemoteSpending()
       .then(granted => {
@@ -489,20 +489,20 @@ function StepUpScreen(props: { overlay: BillingOverlayState; onClose: () => void
         if (granted) setPhase('granted')
         else
           close(
-            "! Couldn't enable terminal billing — someone with billing permissions must approve it. Your card was not charged."
+            "! Couldn't allow Remote Spending — someone with billing permissions must approve it. Your card was not charged."
           )
       })
   }
   const resume = () => {
     if (phase() !== 'granted') return
     setPhase('resuming')
-    ctx().sys('✓ Terminal billing enabled — resuming your purchase.')
+    ctx().sys('✓ Remote Spending allowed — resuming your purchase.')
     void ctx()
       .charge(amount(), props.overlay.pendingCharge?.idempotencyKey)
       .then(outcome => {
         if (aborted) return
         if (outcome === 'needs_remote_spending') {
-          ctx().sys('! Terminal billing still needs approval — run /topup to try again. Your card was not charged.')
+          ctx().sys('! Remote Spending still needs approval — run /topup to try again. Your card was not charged.')
         }
         props.onClose()
       })
@@ -520,7 +520,7 @@ function StepUpScreen(props: { overlay: BillingOverlayState; onClose: () => void
       return
     }
     if (key.name === 'escape' || key.name === 'n') {
-      close('No charge made. Run /topup when you want to enable terminal billing.')
+      close('No charge made. Run /topup when you want to allow Remote Spending.')
       return
     }
     if (key.name === 'y') return allow()
@@ -535,16 +535,16 @@ function StepUpScreen(props: { overlay: BillingOverlayState; onClose: () => void
         <text fg={c().warn}>
           <b>One-time setup</b>
         </text>
-        <text fg={c().text}>To charge this terminal, enable terminal billing once.</text>
+        <text fg={c().text}>To charge from this terminal, allow Remote Spending once.</text>
         <text fg={c().muted}>{`It opens your browser to authorize, then your $${amount()} top-up resumes here.`}</text>
         <text> </text>
-        <ActionRow active={sel() === 0} color={c().ok} label="Enable terminal billing" />
+        <ActionRow active={sel() === 0} color={c().ok} label="Allow Remote Spending" />
         <ActionRow active={sel() === 1} label="Not now" />
         <Footer text="↑/↓ select · Enter confirm · Y/N quick · Esc cancel" />
       </Show>
       <Show when={phase() === 'waiting'}>
         <text fg={c().accent}>
-          <b>Enable terminal billing</b>
+          <b>Allow Remote Spending</b>
         </text>
         <text fg={c().warn}>Waiting for your browser…</text>
         <text fg={c().muted}>{`Your $${amount()} top-up is held here and resumes when you’re done.`}</text>
@@ -552,7 +552,7 @@ function StepUpScreen(props: { overlay: BillingOverlayState; onClose: () => void
       </Show>
       <Show when={phase() === 'granted'}>
         <text fg={c().ok}>
-          <b>Terminal billing enabled</b>
+          <b>Remote Spending allowed</b>
         </text>
         <text fg={c().text}>{`Your $${amount()} top-up is ready to finish.`}</text>
         <ActionRow active color={c().ok} label="Press Enter to resume" />
@@ -560,7 +560,7 @@ function StepUpScreen(props: { overlay: BillingOverlayState; onClose: () => void
       </Show>
       <Show when={phase() === 'resuming'}>
         <text fg={c().accent}>
-          <b>Enable terminal billing</b>
+          <b>Allow Remote Spending</b>
         </text>
         <text fg={c().muted}>{`Resuming your $${amount()} top-up…`}</text>
       </Show>

@@ -128,6 +128,46 @@ describe('billing RPC behavior', () => {
     await billing.charge('25')
     expect(lines.join('\n')).toContain(copy)
   })
+
+  // The capability is "Remote Spending" on the portal (consent CTA: "Allow
+  // Remote Spending"; per-terminal states Granted/Stopped) — every scope/kill-
+  // switch denial must speak that vocabulary, never the retired "terminal
+  // billing" (upstream b0da653a rename).
+  test.each([
+    ['insufficient_scope', 'This needs Remote Spending allowed'],
+    ['remote_spending_revoked', 'stopped remote spending for this terminal'],
+    ['cli_billing_disabled', "a billing admin can turn it on from the portal's Hermes Agent page"],
+    ['remote_spending_disabled', "a billing admin can turn it on from the portal's Hermes Agent page"]
+  ])('%s speaks Remote Spending, never the retired feature name', async (error, copy) => {
+    const lines: string[] = []
+    const billing = buildBillingCtx(
+      {
+        request: async () => ({ ok: false, error }),
+        pushSystem: text => lines.push(text),
+        confirm: () => {},
+        sessionId: () => 'sid-1'
+      },
+      fakeState()
+    )
+    await billing.applyAutoReload(true, 10, 50)
+    expect(lines.join('\n')).toContain(copy)
+    expect(lines.join('\n')).not.toMatch(/terminal billing/i)
+  })
+
+  test('a per-terminal revoke distinguishes the admin actor', async () => {
+    const lines: string[] = []
+    const billing = buildBillingCtx(
+      {
+        request: async () => ({ ok: false, error: 'remote_spending_revoked', actor: 'admin' }),
+        pushSystem: text => lines.push(text),
+        confirm: () => {},
+        sessionId: () => 'sid-1'
+      },
+      fakeState()
+    )
+    await billing.applyAutoReload(true, 10, 50)
+    expect(lines.join('\n')).toContain('An admin stopped remote spending for this terminal')
+  })
 })
 
 // ── 2. store wiring ──────────────────────────────────────────────────────
@@ -175,9 +215,13 @@ describe('store — billing overlay lifecycle', () => {
 
 // ── 3. render ────────────────────────────────────────────────────────────
 
-function mount(screen: 'overview' | 'buy' | 'autoreload', state = fakeState()) {
+function mount(
+  screen: 'overview' | 'buy' | 'autoreload' | 'stepup',
+  state = fakeState(),
+  pendingCharge: { amount: string; idempotencyKey?: string } | null = null
+) {
   const store = createSessionStore()
-  const owner = store.openBilling({ ctx: noopCtx, pendingCharge: null, screen, state })
+  const owner = store.openBilling({ ctx: noopCtx, pendingCharge, screen, state })
   return () => (
     <ThemeProvider theme={() => store.state.theme}>
       <BillingOverlay
@@ -195,6 +239,28 @@ describe('billing overlay render (captureCharFrame)', () => {
     expect(frame).toContain('Top up · balance $42.00')
     expect(frame).toContain('Add funds') // full admin menu (admin + kill-switch on)
     expect(frame).toContain('Manage on portal')
+  })
+
+  test('the kill-switch-off note points at the actual portal control', async () => {
+    const frame = await captureFrame(mount('overview', fakeState({ cli_billing_enabled: false })), {
+      until: 'Top up · balance',
+      width: 110,
+      height: 30
+    })
+    expect(frame).toContain("a billing admin can turn it on from the portal's Hermes Agent page")
+    expect(frame).not.toMatch(/terminal billing/i)
+  })
+
+  test('the step-up flow starts AND finishes in Remote Spending vocabulary', async () => {
+    const prompt = await captureFrame(mount('stepup', fakeState(), { amount: '25' }), {
+      until: 'One-time setup',
+      width: 90,
+      height: 30
+    })
+    expect(prompt).toContain('To charge from this terminal, allow Remote Spending once.')
+    expect(prompt).toContain('Allow Remote Spending')
+    expect(prompt).toContain('$25')
+    expect(prompt).not.toMatch(/terminal billing/i)
   })
 
   test('a non-admin sees the collapsed menu + the gating note', async () => {

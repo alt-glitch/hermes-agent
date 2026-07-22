@@ -25,6 +25,11 @@ export const GatewaySkinSchema = Schema.Struct({
   banner_logo: opt(Str),
   branding: opt(Schema.Record(Str, Str)),
   colors: opt(Schema.Record(Str, Str)),
+  // Paired polarity palettes (theme-sdk): hand-tuned overlays the engine picks
+  // by the terminal's detected polarity (light_colors on light terminals,
+  // dark_colors on dark). Additive + optional (back-compat with older gateways).
+  light_colors: opt(Schema.Record(Str, Str)),
+  dark_colors: opt(Schema.Record(Str, Str)),
   help_header: opt(Str),
   tool_prefix: opt(Str),
   // Spinner animation data (faces/verbs/wings) — mixed array/tuple shapes, kept

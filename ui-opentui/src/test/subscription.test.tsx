@@ -160,7 +160,7 @@ describe('subscription native adaptation', () => {
     expect(frame).toContain('Cancel subscription')
   })
 
-  test('free, low-balance, and read-only states keep their recovery copy', async () => {
+  test('free overview lists the paid catalog inline (name · $/mo · $credits/mo)', async () => {
     const free = await captureFrame(
       mount({
         ctx,
@@ -170,9 +170,67 @@ describe('subscription native adaptation', () => {
       { width: 100, height: 30 }
     )
     expect(free).toContain('Plan: Free · free models only')
-    expect(free).toContain('Start a subscription')
-    expect(free.toLowerCase()).not.toContain('credits')
+    // enabled paid tiers render as pickable rows — monthly credits are DOLLARS
+    expect(free).toContain('Plus · $20/mo · $2,000 credits/mo')
+    expect(free).toContain('Ultra · $40/mo · $5,000 credits/mo')
+    // the free tier itself (tier_order 0) never appears as a row
+    expect(free).not.toContain('Free · $0/mo')
+    // the inline rows ARE the subscribe path — no generic portal row
+    expect(free).not.toContain('Start a subscription')
+    // Free has nothing to move from: no change-plan machinery, no direction hints
+    expect(free).not.toContain('Change plan')
+    expect(free).not.toContain('upgrade')
+  })
 
+  test('free overview keeps the generic start row only when the catalog is empty', async () => {
+    const disabled = state().tiers.map(tier => ({ ...tier, is_enabled: tier.tier_order === 0 }))
+    const free = await captureFrame(
+      mount({
+        ctx,
+        screen: 'overview',
+        state: state({ current: null, tiers: disabled, usage: { available: true, status: 'free', plan_name: null } })
+      }),
+      { width: 100, height: 30 }
+    )
+    expect(free).toContain('Start a subscription')
+    expect(free).not.toContain('credits/mo')
+  })
+
+  test('a plan row hands off to the portal with ITS tier id, once, then closes', async () => {
+    const openManageLink = vi.fn((..._args: unknown[]) => Promise.resolve(true))
+    const store = createSessionStore()
+    const owner = store.openSubscription({
+      ctx: { ...ctx, openManageLink },
+      screen: 'overview',
+      state: state({ current: null, usage: { available: true, status: 'free', plan_name: null } })
+    })
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <SubscriptionOverlay
+            overlay={store.state.subscription!}
+            onPatch={next => store.patchSubscription(owner, next)}
+            onClose={() => store.closeSubscription(owner)}
+          />
+        </ThemeProvider>
+      ),
+      { kittyKeyboard: true, width: 100, height: 30 }
+    )
+    try {
+      // row 1 = Plus (the catalog leads the menu on Free); double-Enter must
+      // not open the portal twice (the busy guard arms BEFORE the handoff)
+      probe.keys.pressEnter()
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(openManageLink).toHaveBeenCalledTimes(1)
+      expect(openManageLink).toHaveBeenCalledWith('plus')
+      expect(store.state.subscription).toBeUndefined()
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('low-balance and read-only states keep their recovery copy', async () => {
     const low = await captureFrame(
       mount({
         ctx,
@@ -419,12 +477,15 @@ describe('subscription native adaptation', () => {
     expect(frame).not.toContain('Change plan')
   })
 
-  test('scope denial renders a resumable terminal-billing screen without raw scope names', async () => {
+  test('scope denial renders a resumable Remote Spending screen without raw scope names', async () => {
     const frame = await captureFrame(mount({ ctx, screen: 'stepup', state: state(), stepUpRetry: { kind: 'apply' } }), {
       width: 100,
       height: 30
     })
-    expect(frame).toContain('Enable terminal billing')
+    expect(frame).toContain('Allow Remote Spending')
     expect(frame).not.toContain('billing:manage')
+    // the capability was renamed Remote Spending on the portal — no screen may
+    // keep the retired "terminal billing" vocabulary
+    expect(frame).not.toMatch(/terminal billing/i)
   })
 })

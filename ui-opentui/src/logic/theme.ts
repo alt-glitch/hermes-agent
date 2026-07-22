@@ -43,6 +43,20 @@ export interface ThemeColors {
   error: string
   warn: string
 
+  /** Tool-call markers (running ⚡ / tool spinner heat). Defaults to `accent`
+   *  (theme-sdk `ui_tool`); settled machinery stays `shellDollar` by design. */
+  tool: string
+  /** Reasoning/thinking body text. Defaults to `muted` (theme-sdk `ui_thinking`). */
+  thinking: string
+
+  /** Code-syntax tokens (theme-sdk `syntax_*`). Default to the brand tokens the
+   *  native highlighter already used (string→label, number/keyword→accent,
+   *  comment→muted) so a skin without them paints unchanged. */
+  syntaxString: string
+  syntaxNumber: string
+  syntaxKeyword: string
+  syntaxComment: string
+
   prompt: string
   sessionLabel: string
   sessionBorder: string
@@ -99,6 +113,11 @@ export interface GatewaySkin {
   banner_logo?: string
   branding?: Record<string, string>
   colors?: Record<string, string>
+  /** Paired polarity palettes (theme-sdk): hand-tuned OVERLAYS applied on top of
+   *  `colors` when the terminal's detected polarity matches — `light_colors` on
+   *  light terminals, `dark_colors` on dark ones (mirror Ink's `themeForSkin`). */
+  light_colors?: Record<string, string>
+  dark_colors?: Record<string, string>
   help_header?: string
   tool_prefix?: string
   /** Spinner animation data (faces/verbs/wings) — loose; SpinnerConfig narrows it. */
@@ -177,10 +196,11 @@ const ANSI_NORMALIZED_FOREGROUNDS: readonly (keyof ThemeColors)[] = [
   'statusWarn',
   'statusBad',
   'statusCritical',
-  'shellDollar'
+  'shellDollar',
+  'tool'
 ]
 
-const ANSI_MUTED_FOREGROUNDS: readonly (keyof ThemeColors)[] = ['muted', 'sessionLabel', 'sessionBorder']
+const ANSI_MUTED_FOREGROUNDS: readonly (keyof ThemeColors)[] = ['muted', 'sessionLabel', 'sessionBorder', 'thinking']
 
 function xtermEightBitRgb(colorNumber: number): [number, number, number] {
   if (colorNumber >= 232) {
@@ -325,6 +345,18 @@ export const DARK_THEME: Theme = {
     error: '#ef5350',
     warn: '#ffa726',
 
+    // Element tokens default to their semantic parents (tool→accent,
+    // thinking→muted); independently settable via ui_tool/ui_thinking.
+    tool: '#FFBF00',
+    thinking: '#808080',
+
+    // Code-syntax tokens default to what the highlighter already painted
+    // (string→label, number/keyword→accent, comment→muted) — see markdown.tsx.
+    syntaxString: '#DAA520',
+    syntaxNumber: '#FFBF00',
+    syntaxKeyword: '#FFBF00',
+    syntaxComment: '#808080',
+
     prompt: '#FFF8DC',
     // session chrome rides the same neutral muted family (was gold #CC9B1F).
     sessionLabel: '#808080',
@@ -372,6 +404,14 @@ export const LIGHT_THEME: Theme = {
     ok: '#2E7D32',
     error: '#C62828',
     warn: '#E65100',
+
+    tool: '#A0651C',
+    thinking: '#696969',
+
+    syntaxString: '#7A5A0F',
+    syntaxNumber: '#A0651C',
+    syntaxKeyword: '#A0651C',
+    syntaxComment: '#696969',
 
     prompt: '#2B2014',
     sessionLabel: '#696969',
@@ -502,6 +542,7 @@ export function fromSkin(
   const hasSkinColors = Object.keys(colors).length > 0
 
   const accent = c('ui_accent') ?? c('banner_accent') ?? d.color.accent
+  const label = c('ui_label') ?? d.color.label
   const bannerAccent = c('banner_accent') ?? c('banner_title') ?? d.color.accent
   // Design pass (Appendix C precondition): `muted` is the transcript's "merely
   // happened" NEUTRAL — it must NOT borrow `banner_dim` (the stock skin's dim
@@ -527,17 +568,34 @@ export function fromSkin(
         border: c('ui_border') ?? c('banner_border') ?? d.color.border,
         text: c('ui_text') ?? c('banner_text') ?? d.color.text,
         muted,
-        // root canvas — skins may override (`ui_bg`); default true black/white.
-        bg: c('ui_bg') ?? d.color.bg,
+        // root canvas — skins may override; the engine's `ui_bg` stays the more
+        // specific key, with theme-sdk's cross-surface `background` as the alias
+        // (the seed the Ink TUI/desktop paint their canvas from). Default stays
+        // `transparent` (the terminal's own background shows through).
+        bg: c('ui_bg') ?? c('background') ?? d.color.bg,
         completionBg,
         completionCurrentBg,
         completionMetaBg,
         completionMetaCurrentBg,
 
-        label: c('ui_label') ?? d.color.label,
+        label,
         ok: c('ui_ok') ?? d.color.ok,
         error: c('ui_error') ?? d.color.error,
         warn: c('ui_warn') ?? d.color.warn,
+
+        // Element tokens (theme-sdk): overridable, else their semantic parents.
+        // `thinking` tracks the EFFECTIVE muted (ui_muted override included) so
+        // recoloring muted carries the reasoning body with it. It deliberately
+        // does NOT borrow `banner_dim` (see the muted divergence note above).
+        tool: c('ui_tool') ?? accent,
+        thinking: c('ui_thinking') ?? muted,
+
+        // Code-syntax tokens (theme-sdk): overridable, else the brand tokens the
+        // native highlighter already used — a skin without them paints unchanged.
+        syntaxString: c('syntax_string') ?? label,
+        syntaxNumber: c('syntax_number') ?? accent,
+        syntaxKeyword: c('syntax_keyword') ?? accent,
+        syntaxComment: c('syntax_comment') ?? muted,
 
         prompt: c('prompt') ?? c('banner_text') ?? d.color.prompt,
         sessionLabel: c('session_label') ?? muted,
@@ -554,12 +612,17 @@ export function fromSkin(
           c('completion_menu_current_bg') ??
           (hasSkinColors ? completionCurrentBg : d.color.selectionBg),
 
-        diffAdded: d.color.diffAdded,
-        diffRemoved: d.color.diffRemoved,
-        diffAddedWord: d.color.diffAddedWord,
-        diffRemovedWord: d.color.diffRemovedWord,
-        diffAddedBg: c('diff_added_bg') ?? d.color.diffAddedBg,
-        diffRemovedBg: c('diff_removed_bg') ?? d.color.diffRemovedBg,
+        // Skinnable diffs (theme-sdk `diff_*`): the cross-surface keys land on
+        // the Ink-parity tokens AND alias onto the native `<diff>` line
+        // backgrounds, where the engine-specific `diff_*_bg` keys stay the more
+        // specific override. Word-level foregrounds have no native `<diff>` seam
+        // in @opentui/core 0.4.x — carried on the theme for the seams that do.
+        diffAdded: c('diff_added') ?? d.color.diffAdded,
+        diffRemoved: c('diff_removed') ?? d.color.diffRemoved,
+        diffAddedWord: c('diff_added_word') ?? d.color.diffAddedWord,
+        diffRemovedWord: c('diff_removed_word') ?? d.color.diffRemovedWord,
+        diffAddedBg: c('diff_added_bg') ?? c('diff_added') ?? d.color.diffAddedBg,
+        diffRemovedBg: c('diff_removed_bg') ?? c('diff_removed') ?? d.color.diffRemovedBg,
         shellDollar: c('shell_dollar') ?? d.color.shellDollar
       },
 
@@ -583,11 +646,24 @@ export function fromSkin(
   )
 }
 
+/**
+ * Polarity overlay (theme-sdk paired palettes; mirrors Ink's `themeForSkin`):
+ * the matching hand-tuned block OVERLAYS the base palette, it doesn't replace
+ * it — a skin can ship a fills-only `light_colors` while its foregrounds keep
+ * coming from `colors`. A full paired block still works — it just overrides
+ * every key it lists. Pure so the selection rule is unit-testable.
+ */
+export function skinColorsForPolarity(skin: GatewaySkin, isLight: boolean): Record<string, string> {
+  const base = skin.colors ?? {}
+  const paired = isLight ? skin.light_colors : skin.dark_colors
+  return paired && Object.keys(paired).length > 0 ? { ...base, ...paired } : base
+}
+
 /** Convenience: map a GatewaySkin payload straight to a Theme (defaults if empty). */
 export function themeFromSkin(skin: GatewaySkin | undefined): Theme {
   if (!skin) return DEFAULT_THEME
   return fromSkin(
-    skin.colors ?? {},
+    skinColorsForPolarity(skin, detectLightMode()),
     skin.branding ?? {},
     skin.banner_logo ?? '',
     skin.banner_hero ?? '',

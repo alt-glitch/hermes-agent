@@ -1,5 +1,5 @@
 /**
- * Terminal billing — the SOLID-side RPC + error-mapping logic (mirrors Ink
+ * Remote Spending / billing — the SOLID-side RPC + error-mapping logic (mirrors Ink
  * `app/slash/commands/billing.ts`). Plain functions; the slash opener injects a
  * Promise-returning `request` (the gateway RPC), `pushSystem` (transcript
  * lines), `confirm` (the step-up Y/N), and `sessionId`.
@@ -49,13 +49,13 @@ function renderBillingError(host: BillingHost, env: BillingErrorEnvelope): void 
 
   switch (env.error) {
     case 'insufficient_scope':
-      sys('This needs terminal billing enabled. Start a top-up to enable it, then retry.')
+      sys('This needs Remote Spending allowed. Start a top-up to allow it, then retry.')
       break
     case 'remote_spending_revoked':
       sys(
         env.actor === 'admin'
-          ? 'An admin turned off terminal billing for this terminal. Reconnect with /portal to restore it.'
-          : 'You turned off terminal billing for this terminal. Reconnect with /portal to restore it.'
+          ? 'An admin stopped remote spending for this terminal. Reconnect with /portal to restore it.'
+          : 'You stopped remote spending for this terminal. Reconnect with /portal to restore it.'
       )
       break
     case 'session_revoked':
@@ -68,7 +68,9 @@ function renderBillingError(host: BillingHost, env: BillingErrorEnvelope): void 
       break
     case 'cli_billing_disabled':
     case 'remote_spending_disabled':
-      sys('🔴 Terminal billing is turned off for this account — an admin must enable it on the portal.')
+      sys(
+        "🔴 Remote spending is off for this account — a billing admin can turn it on from the portal's Hermes Agent page."
+      )
       break
     case 'role_required':
       sys('Adding funds needs someone with billing permissions (owner, admin, or finance admin).')
