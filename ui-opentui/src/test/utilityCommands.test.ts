@@ -188,37 +188,37 @@ const tick = () => new Promise(r => setTimeout(r, 0))
 describe('client command catalog (registration)', () => {
   test('all five utility commands (and the /detail alias) are registered', () => {
     const names = clientCommandNames()
-    for (const name of ['compact', 'details', 'detail', 'replay', 'heapdump', 'mem', 'verbose']) {
+    for (const name of ['density', 'details', 'detail', 'replay', 'heapdump', 'mem', 'verbose']) {
       expect(names).toContain(name)
     }
   })
 })
 
-describe('/compact', () => {
-  test('bare /compact toggles on, persists via config.set, reports', async () => {
+describe('/density', () => {
+  test('bare /density toggles on, persists via config.set, reports', async () => {
     const p = makeCtx(async () => ({}))
-    await dispatchSlash('/compact', p.ctx)
+    await dispatchSlash('/density', p.ctx)
     expect(p.compactFlag.value).toBe(true)
-    expect(p.system).toEqual(['compact on'])
-    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'compact', value: 'on' } }])
+    expect(p.system).toEqual(['density on'])
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'density', value: 'on' } }])
   })
 
-  test('/compact on|off|toggle set explicitly', async () => {
+  test('/density on|off|toggle set explicitly', async () => {
     const p = makeCtx(async () => ({}))
-    await dispatchSlash('/compact on', p.ctx)
+    await dispatchSlash('/density on', p.ctx)
     expect(p.compactFlag.value).toBe(true)
-    await dispatchSlash('/compact off', p.ctx)
+    await dispatchSlash('/density off', p.ctx)
     expect(p.compactFlag.value).toBe(false)
-    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'compact', value: 'off' } })
-    await dispatchSlash('/compact toggle', p.ctx)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'density', value: 'off' } })
+    await dispatchSlash('/density toggle', p.ctx)
     expect(p.compactFlag.value).toBe(true)
-    expect(p.system).toEqual(['compact on', 'compact off', 'compact on'])
+    expect(p.system).toEqual(['density on', 'density off', 'density on'])
   })
 
-  test('/compact garbage → usage line, no flag change, no RPC', async () => {
+  test('/density garbage → usage line, no flag change, no RPC', async () => {
     const p = makeCtx(async () => ({}))
-    await dispatchSlash('/compact sideways', p.ctx)
-    expect(p.system).toEqual(['usage: /compact [on|off|toggle]'])
+    await dispatchSlash('/density sideways', p.ctx)
+    expect(p.system).toEqual(['usage: /density [on|off|toggle]'])
     expect(p.compactFlag.value).toBe(false)
     expect(p.calls).toHaveLength(0)
   })
@@ -227,10 +227,10 @@ describe('/compact', () => {
     const p = makeCtx(async () => {
       throw new Error('gateway down')
     })
-    await dispatchSlash('/compact on', p.ctx)
+    await dispatchSlash('/density on', p.ctx)
     await tick()
     expect(p.compactFlag.value).toBe(true)
-    expect(p.system).toEqual(['compact on'])
+    expect(p.system).toEqual(['density on'])
   })
 })
 
