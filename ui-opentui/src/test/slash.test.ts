@@ -355,7 +355,7 @@ interface Probe {
   copySelection: { value: string | undefined }
   /** The cached /model rows (Epic 7) — seed to simulate a prefetched catalog. */
   modelCache: { value: PickerItem[] | undefined }
-  /** Display flags (/compact, /details — Epic 3). */
+  /** Display flags (/density, /details — Epic 3). */
   compactFlag: { value: boolean }
   batteryFlag: { value: boolean }
   detailsFlag: { value: DetailsMode }
@@ -1022,6 +1022,37 @@ describe('dispatchSlash — client commands', () => {
     expect(stale.compressionMutations).toEqual([])
     expect(stale.history.value[0]?.text).toBe('old visible')
     expect(stale.historyMutation.ends).toBe(1)
+  })
+
+  test('/density toggles local compact state and persists the density key', async () => {
+    const p = makeCtx(async () => ({}))
+
+    await dispatchSlash('/density', p.ctx)
+    expect(p.compactFlag.value).toBe(true)
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'density', value: 'on' } }])
+    expect(p.system).toEqual(['density on'])
+
+    await dispatchSlash('/density off', p.ctx)
+    expect(p.compactFlag.value).toBe(false)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'density', value: 'off' } })
+    expect(p.system.at(-1)).toBe('density off')
+
+    await dispatchSlash('/density crowded', p.ctx)
+    expect(p.compactFlag.value).toBe(false)
+    expect(p.calls).toHaveLength(2)
+    expect(p.system.at(-1)).toBe('usage: /density [on|off|toggle]')
+  })
+
+  test('/compact is not a native display handler and falls through to the registry alias', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'compression alias handled' } : {}))
+
+    expect(clientCommandNames()).toContain('density')
+    expect(clientCommandNames()).not.toContain('compact')
+    await dispatchSlash('/compact', p.ctx)
+
+    expect(p.compactFlag.value).toBe(false)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'compact', session_id: 'sid-1' } }])
+    expect(p.system).toEqual(['compression alias handled'])
   })
 
   test('/undo rewinds gateway + visible exchange and guards no-session/busy/malformed cases', async () => {

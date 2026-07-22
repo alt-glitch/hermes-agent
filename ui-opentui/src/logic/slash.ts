@@ -220,7 +220,7 @@ export interface SlashContext {
   /** Update the cached `/model` picker rows. */
   readonly setModelItems: (items: PickerItem[]) => void
   readonly setCurrentModel: (model: string) => void
-  /** Read / set the compact-transcript display flag (/compact — Epic 3). */
+  /** Read / set the compact-transcript display flag (/density — Epic 3). */
   readonly compact: () => boolean
   readonly setCompact: (on: boolean) => void
   /** Read / set the persisted, launch-level status-bar battery indicator. */
@@ -917,20 +917,20 @@ function flagFromArg(arg: string, current: boolean): boolean | null {
   return null
 }
 
-/** `/compact [on|off|toggle]` — compact transcript spacing. The flag flips locally
+/** `/density [on|off|toggle]` — compact transcript spacing. The flag flips locally
  *  (the store drives the render); persistence mirrors Ink: a fire-and-forget
- *  `config.set {key:'compact'}` so the Ink TUI + future launches share the pref
+ *  `config.set {key:'density'}` so the Ink TUI + future launches share the pref
  *  (the gateway does NOT send the persisted value to this TUI, so each launch
  *  starts off — see store.ts `compact`). */
-const compactCmd: ClientHandler = (arg, ctx) => {
+const densityCmd: ClientHandler = (arg, ctx) => {
   const next = flagFromArg(arg, ctx.compact())
   if (next === null) {
-    ctx.pushSystem('usage: /compact [on|off|toggle]')
+    ctx.pushSystem('usage: /density [on|off|toggle]')
     return
   }
   ctx.setCompact(next)
-  void ctx.request('config.set', { key: 'compact', value: next ? 'on' : 'off' }).catch(() => {})
-  ctx.pushSystem(`compact ${next ? 'on' : 'off'}`)
+  void ctx.request('config.set', { key: 'density', value: next ? 'on' : 'off' }).catch(() => {})
+  ctx.pushSystem(`density ${next ? 'on' : 'off'}`)
 }
 
 /** `/timestamps [on|off|status]` (alias `/ts`) — toggle the muted `[HH:MM]` shown
@@ -940,10 +940,10 @@ const compactCmd: ClientHandler = (arg, ctx) => {
  *  JUDGMENT CALLS:
  *  - `status` (or `?`) reports `Message timestamps: ON|OFF` WITHOUT toggling.
  *  - Otherwise `flagFromArg` parses on/off/toggle (bare = toggle); garbage → usage.
- *  - Persisted via the same fire-and-forget `config.set` seam as /compact, with
- *    key `timestamps` (matching compactCmd's `key: 'compact'` convention — the
+ *  - Persisted via the same fire-and-forget `config.set` seam as /density, with
+ *    key `timestamps` (matching densityCmd's `key: 'density'` convention — the
  *    classic CLI's `display.timestamps` is its dotted config path, but this RPC
- *    uses the short flag name, so we mirror compact). The flag flips locally
+ *    uses the short flag name, so we mirror density). The flag flips locally
  *    regardless (the store drives the render); each launch starts OFF (the
  *    persisted pref doesn't reach this TUI via session.info — see store.ts). */
 const timestampsCmd: ClientHandler = (arg, ctx) => {
@@ -2740,7 +2740,7 @@ const CLIENT: Record<string, ClientHandler> = {
   busy: busyCmd,
   btw: backgroundCmd,
   clear: freshSessionCmd(false),
-  compact: compactCmd,
+  density: densityCmd,
   compress: compressCmd,
   branch: branchCmd,
   fork: branchCmd,
