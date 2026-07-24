@@ -527,6 +527,25 @@ export const DEFAULT_THEME: Theme = normalizeThemeForAnsiLightTerminal(
 
 // ── Skin → Theme ─────────────────────────────────────────────────────
 
+/**
+ * A skin that authors a background owns its polarity (upstream e762ea174):
+ * the engine paints the root canvas with it, so paired-palette selection,
+ * default fallbacks, and Apple-Terminal ANSI normalization must all follow
+ * that canvas rather than the host profile it covers. Host detection still
+ * governs skins without a parseable background.
+ *
+ * This uses the same precedence as the painted `bg` token below: OpenTUI's
+ * `ui_bg` is more specific than theme-sdk's cross-surface `background`.
+ */
+export function skinIsLight(
+  colors: Record<string, string>,
+  env: Record<string, string | undefined> = process.env
+): boolean {
+  const authored = backgroundLuminance(colors['ui_bg'] ?? colors['background'] ?? '')
+
+  return authored === null ? detectLightMode(env) : authored >= LUMA_LIGHT_THRESHOLD
+}
+
 export function fromSkin(
   colors: Record<string, string>,
   branding: Record<string, string>,
@@ -537,7 +556,10 @@ export function fromSkin(
   spinner: Record<string, unknown> | undefined = undefined,
   toolEmojis: Record<string, string> | undefined = undefined
 ): Theme {
-  const d = DEFAULT_THEME
+  // Resolve this on every skin application so live skin changes cannot retain
+  // either the host's module-load polarity or the previous skin's polarity.
+  const isLight = skinIsLight(colors)
+  const d = isLight ? LIGHT_THEME : DARK_THEME
   const c = (k: string) => colors[k]
   const hasSkinColors = Object.keys(colors).length > 0
 
@@ -642,7 +664,7 @@ export function fromSkin(
       toolEmojis: toolEmojis ?? {}
     },
     process.env,
-    DEFAULT_LIGHT_MODE
+    isLight
   )
 }
 
@@ -662,8 +684,10 @@ export function skinColorsForPolarity(skin: GatewaySkin, isLight: boolean): Reco
 /** Convenience: map a GatewaySkin payload straight to a Theme (defaults if empty). */
 export function themeFromSkin(skin: GatewaySkin | undefined): Theme {
   if (!skin) return DEFAULT_THEME
+  // Resolve polarity from the base palette before choosing its paired overlay;
+  // an authored canvas wins, while a background-less skin keeps host behavior.
   return fromSkin(
-    skinColorsForPolarity(skin, detectLightMode()),
+    skinColorsForPolarity(skin, skinIsLight(skin.colors ?? {})),
     skin.branding ?? {},
     skin.banner_logo ?? '',
     skin.banner_hero ?? '',

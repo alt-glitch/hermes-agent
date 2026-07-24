@@ -20,11 +20,20 @@
  */
 import { RGBA } from '@opentui/core'
 import { Schema } from 'effect'
-import { describe, expect, test, vi } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { GatewayEventSchema } from '../boundary/schema/GatewayEvent.ts'
 import { createSessionStore } from '../logic/store.ts'
-import { DARK_THEME, fromSkin, skinColorsForPolarity, themeFromSkin } from '../logic/theme.ts'
+import {
+  DARK_THEME,
+  detectLightMode,
+  fromSkin,
+  LIGHT_THEME,
+  normalizeThemeForAnsiLightTerminal,
+  skinColorsForPolarity,
+  skinIsLight,
+  themeFromSkin
+} from '../logic/theme.ts'
 import { App } from '../view/App.tsx'
 import { syntaxStyleFor } from '../view/markdown.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
@@ -89,6 +98,87 @@ describe('polarity palette selection — paired light_colors/dark_colors overlay
     } finally {
       vi.unstubAllEnvs()
     }
+  })
+})
+
+describe('authored-background polarity — the skin owns its canvas (upstream e762ea174)', () => {
+  const stubHostEnv = (overrides: Record<string, string> = {}) => {
+    for (const key of [
+      'HERMES_TUI_LIGHT',
+      'HERMES_TUI_THEME',
+      'HERMES_TUI_BACKGROUND',
+      'COLORFGBG',
+      'TERM_PROGRAM',
+      'COLORTERM'
+    ]) {
+      vi.stubEnv(key, overrides[key] ?? '')
+    }
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  test('a dark skin on a light host selects dark fallbacks and skips light-host ANSI bucketing', () => {
+    stubHostEnv({ HERMES_TUI_LIGHT: '1', TERM_PROGRAM: 'Apple_Terminal' })
+    const theme = fromSkin({ background: '#000000', ui_text: '#ffa726' }, {})
+
+    expect(theme.color.statusBg).toBe(DARK_THEME.color.statusBg)
+    expect(theme.color.text).toBe('#ffa726')
+    expect(theme.color.prompt).not.toMatch(/^ansi256/)
+  })
+
+  test('a light skin on a dark host selects light fallbacks and the light paired palette', () => {
+    stubHostEnv({ HERMES_TUI_LIGHT: '0' })
+    const skin = {
+      colors: { background: '#f5f5f5' },
+      dark_colors: { ui_accent: '#333333' },
+      light_colors: { ui_accent: '#222222' }
+    }
+    const theme = themeFromSkin(skin)
+
+    expect(theme.color.statusBg).toBe(LIGHT_THEME.color.statusBg)
+    expect(theme.color.accent).toBe('#222222')
+  })
+
+  test('ui_bg has polarity precedence over background, matching the painted canvas', () => {
+    stubHostEnv({ HERMES_TUI_LIGHT: '1' })
+    const skin = {
+      colors: { background: '#ffffff', ui_bg: '#000000' },
+      dark_colors: { ui_accent: '#333333' },
+      light_colors: { ui_accent: '#222222' }
+    }
+    const theme = themeFromSkin(skin)
+
+    expect(skinIsLight(skin.colors)).toBe(false)
+    expect(theme.color.accent).toBe('#333333')
+    expect(theme.color.statusBg).toBe(DARK_THEME.color.statusBg)
+  })
+
+  test('background-less skins preserve host-derived colors byte-for-byte', () => {
+    stubHostEnv({ HERMES_TUI_LIGHT: '1', TERM_PROGRAM: 'Apple_Terminal' })
+    const lightExpected = normalizeThemeForAnsiLightTerminal(LIGHT_THEME, process.env, true)
+    expect(skinIsLight({})).toBe(detectLightMode())
+    expect(fromSkin({}, {}).color).toEqual(lightExpected.color)
+
+    stubHostEnv({ HERMES_TUI_LIGHT: '0', TERM_PROGRAM: 'Apple_Terminal' })
+    const darkExpected = normalizeThemeForAnsiLightTerminal(DARK_THEME, process.env, false)
+    expect(skinIsLight({})).toBe(detectLightMode())
+    expect(fromSkin({}, {}).color).toEqual(darkExpected.color)
+  })
+
+  test('live skin changes recompute polarity from the new authored canvas', () => {
+    stubHostEnv({ HERMES_TUI_LIGHT: '0' })
+    const store = createSessionStore()
+
+    store.apply({ type: 'skin.changed', payload: { colors: { background: '#ffffff' } } })
+    expect(store.state.theme.color.statusBg).toBe(LIGHT_THEME.color.statusBg)
+
+    store.apply({
+      type: 'skin.changed',
+      payload: { colors: { background: '#ffffff', ui_bg: '#000000' } }
+    })
+    expect(store.state.theme.color.statusBg).toBe(DARK_THEME.color.statusBg)
   })
 })
 
