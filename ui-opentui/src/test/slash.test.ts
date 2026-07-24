@@ -987,6 +987,27 @@ describe('dispatchSlash — client commands', () => {
     expect(aborted.system).toEqual(['nothing to compress'])
   })
 
+  test('/compress shows the exact lock-holder message and never no-op copy', async () => {
+    const message =
+      '⏳ Compression already in progress for this session (holder: pid=4242). Please wait for it to finish.'
+    const locked = makeCtx(async () => ({ compressed: false, lock_held: true, message }))
+    locked.history.value = [{ role: 'user', text: 'keep this transcript' }]
+
+    await dispatchSlash('/compress   retain partial focus  ', locked.ctx)
+
+    expect(locked.calls).toEqual([
+      {
+        method: 'session.compress',
+        params: { focus_topic: 'retain partial focus', session_id: 'sid-1' }
+      }
+    ])
+    expect(locked.history.value).toEqual([{ role: 'user', text: 'keep this transcript' }])
+    expect(locked.compressionMutations).toEqual([])
+    expect(locked.compressionKeys).toEqual([])
+    expect(locked.system).toEqual([message])
+    expect(locked.system).not.toContain('nothing to compress')
+  })
+
   test('/compress leaves history intact on malformed/error/stale responses and respects guards', async () => {
     const malformed = makeCtx(async () => ({ ...fakeCompressResponse(), messages: 'bad' }))
     malformed.history.value = [{ role: 'user', text: 'untouched' }]

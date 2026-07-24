@@ -41,7 +41,10 @@ export const SessionCompressResponseSchema = Schema.StructWithRest(
     after_tokens: opt(NonNegativeInt),
     before_messages: opt(NonNegativeInt),
     before_tokens: opt(NonNegativeInt),
+    compressed: opt(Schema.Boolean),
     info: opt(SessionInfoPatchSchema),
+    lock_held: opt(Schema.Boolean),
+    message: opt(Str),
     messages: opt(Schema.Array(Schema.Unknown)),
     removed: opt(NonNegativeInt),
     session_key: opt(Str),
@@ -60,6 +63,9 @@ export function decodeSessionCompressResponse(value: unknown): SessionCompressRe
   const response = decoded.value
   if (response.session_key !== undefined && !response.session_key.trim()) return undefined
   const meaningful =
+    response.compressed !== undefined ||
+    response.lock_held !== undefined ||
+    response.message !== undefined ||
     response.status !== undefined ||
     response.messages !== undefined ||
     response.info !== undefined ||

@@ -2215,7 +2215,15 @@ const compressCmd: ClientHandler = async (arg, ctx) => {
     }
     const sessionKey = response.session_key?.trim()
     if (sessionKey) ctx.setCompressedSessionKey(sessionKey)
-    if (response.summary?.headline) {
+    const lockSkipMessage =
+      response.lock_held === true
+        ? response.message?.trim()
+          ? response.message
+          : '/compress: compression lock held'
+        : undefined
+    if (lockSkipMessage) {
+      ctx.pushSystem(lockSkipMessage)
+    } else if (response.summary?.headline) {
       ctx.pushSystem((response.summary.noop ? '' : '✓ ') + response.summary.headline)
       if (response.summary.token_line) ctx.pushSystem('  ' + response.summary.token_line)
       if (response.summary.note) ctx.pushSystem('  ' + response.summary.note)

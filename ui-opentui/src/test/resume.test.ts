@@ -142,4 +142,66 @@ describe('mapResumeHistory (Phase 4b)', () => {
     expect(message?.notification?.detail).toBe(detail)
     expect(message?.notification?.alwaysVisible).toBe(true)
   })
+
+  test('skips hidden persisted display rows without changing ordinary history', () => {
+    const msgs = mapResumeHistory([
+      { role: 'user', text: 'real question' },
+      { role: 'user', text: '[CONTEXT COMPACTION — REFERENCE ONLY]', display_kind: 'hidden' },
+      { role: 'assistant', text: 'real answer' }
+    ])
+
+    expect(msgs.map(message => [message.role, message.text])).toEqual([
+      ['user', 'real question'],
+      ['assistant', 'real answer']
+    ])
+  })
+
+  test('maps delegation completions to dim system markers with robust count fallback', () => {
+    const msgs = mapResumeHistory([
+      {
+        role: 'user',
+        text: '[IMPORTANT: internal delegation prompt]',
+        display_kind: 'async_delegation_complete',
+        display_metadata: { task_count: 3 },
+        timestamp: 1_753_300_000
+      },
+      {
+        role: 'user',
+        text: '[IMPORTANT: internal single delegation prompt]',
+        display_kind: 'async_delegation_complete',
+        display_metadata: { task_count: 1 }
+      },
+      {
+        role: 'user',
+        text: '[IMPORTANT: malformed delegation prompt]',
+        display_kind: 'async_delegation_complete',
+        display_metadata: { task_count: 'many' }
+      },
+      {
+        role: 'user',
+        text: '[IMPORTANT: missing delegation metadata]',
+        display_kind: 'async_delegation_complete'
+      }
+    ])
+
+    expect(msgs).toEqual([
+      { role: 'system', text: '◈ 3 background agents finished', timestamp: 1_753_300_000 },
+      { role: 'system', text: '◈ 1 background agent finished' },
+      { role: 'system', text: '◈ background agent work finished' },
+      { role: 'system', text: '◈ background agent work finished' }
+    ])
+  })
+
+  test('keeps model-switch bookkeeping hidden instead of resurrecting a user bubble', () => {
+    const msgs = mapResumeHistory([
+      { role: 'user', text: 'before' },
+      { role: 'user', text: '[System: model changed to gpt-5]', display_kind: 'model_switch' },
+      { role: 'assistant', text: 'after' }
+    ])
+
+    expect(msgs.map(message => [message.role, message.text])).toEqual([
+      ['user', 'before'],
+      ['assistant', 'after']
+    ])
+  })
 })

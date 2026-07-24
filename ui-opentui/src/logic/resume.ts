@@ -80,6 +80,13 @@ function readOptNum(value: unknown, key: string): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined
 }
 
+function delegationEventLabel(metadata: unknown): string {
+  const raw = metadata && typeof metadata === 'object' ? (metadata as { task_count?: unknown }).task_count : undefined
+  const count = typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : undefined
+  if (count === undefined) return 'background agent work finished'
+  return `${count} background agent${count === 1 ? '' : 's'} finished`
+}
+
 /** Map a `session.list` result into switcher rows (loose-typed read). */
 export function mapSessionList(result: unknown): SessionItem[] {
   if (!result || typeof result !== 'object') return []
@@ -112,6 +119,23 @@ export function mapResumeHistory(history: unknown): Message[] {
     // Optional stored send/receive time (unix seconds). Carried onto the produced
     // Message so /timestamps can render [HH:MM]; undefined when the entry lacks it.
     const ts = readOptNum(raw, 'timestamp')
+
+    // Persisted display-only rows are not ordinary conversation turns. Hidden
+    // handoffs and model-switch bookkeeping follow the gateway's current
+    // transcript policy and stay invisible. Delegation completions remain
+    // useful timeline facts, rendered through the existing dim system-row
+    // surface as a typed ◈ marker instead of resurrecting their raw user prompt.
+    const displayKind = readStr(raw, 'display_kind')
+    if (displayKind === 'hidden' || displayKind === 'model_switch') continue
+    if (displayKind === 'async_delegation_complete') {
+      const metadata =
+        raw && typeof raw === 'object' ? (raw as { display_metadata?: unknown }).display_metadata : undefined
+      const message: Message = { role: 'system', text: `◈ ${delegationEventLabel(metadata)}` }
+      if (ts !== undefined) message.timestamp = ts
+      out.push(message)
+      pendingTools = []
+      continue
+    }
 
     if (role === 'notification') {
       const payload = raw && typeof raw === 'object' ? (raw as { notification?: unknown }).notification : undefined
