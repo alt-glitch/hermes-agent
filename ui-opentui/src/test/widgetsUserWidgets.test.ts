@@ -16,9 +16,11 @@ import type { RBox } from '../widgets/runtime.ts'
 import { loadUserWidgets, resetUserWidgetFiles } from '../widgets/userWidgets.ts'
 import { DARK_THEME } from '../logic/theme.ts'
 
+// Upstream e3d524b482d absorbed skills/productivity/tui-widgets into the
+// hermes-agent hub skill; the shipped clock template lives there now.
 const TEMPLATE = join(
   fileURLToPath(new URL('.', import.meta.url)),
-  '../../../skills/productivity/tui-widgets/templates/clock.mjs'
+  '../../../skills/autonomous-ai-agents/hermes-agent/templates/clock.mjs'
 )
 
 const widgetFile = (id: string, help = `${id} help`) => `
