@@ -136,8 +136,12 @@ export function collapseHiddenPartsBy(
   const out: DisplayPart[] = []
   let run: HiddenRun | undefined
   for (const part of parts) {
-    const section =
-      part.type === 'tool' ? 'tools' : part.type === 'reasoning' ? 'thinking' : part.type === 'moa' ? 'subagents' : null
+    // MoA reference parts NEVER fold: they are the mixture-of-agents process
+    // the user explicitly opted into, not private model reasoning, so they
+    // stay visible even when every section is hidden (upstream #64657 —
+    // 07a732c2e5b's shouldShowThinkingTrail override, folded into the one
+    // hidden-mode seam this engine has).
+    const section = part.type === 'tool' ? 'tools' : part.type === 'reasoning' ? 'thinking' : null
     if (!section || !hidden(section)) {
       run = undefined
       out.push(part)

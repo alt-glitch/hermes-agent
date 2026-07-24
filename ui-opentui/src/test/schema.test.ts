@@ -196,6 +196,77 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
+  test('decodes the message.complete billing wall block + failure_reason (upstream 960d339f86f)', () => {
+    const ev = decode({
+      type: 'message.complete',
+      session_id: 'live-1',
+      payload: {
+        billing: {
+          billing_url: 'https://openrouter.ai/settings/credits',
+          is_nous: false,
+          message: 'out of credits',
+          model: 'anthropic/claude-fable-5',
+          provider: 'openrouter',
+          provider_label: 'OpenRouter'
+        },
+        failure_reason: 'billing',
+        text: 'Billing or credits exhausted: full provider guidance…'
+      }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'message.complete') {
+      expect(ev.value.payload?.billing?.provider_label).toBe('OpenRouter')
+      expect(ev.value.payload?.billing?.billing_url).toBe('https://openrouter.ai/settings/credits')
+      expect(ev.value.payload?.billing?.is_nous).toBe(false)
+      expect(ev.value.payload?.failure_reason).toBe('billing')
+      // the full transcript guidance rides the same payload — never dropped
+      expect(ev.value.payload?.text).toContain('full provider guidance')
+    }
+  })
+
+  test('decodes a Nous billing block with a null billing_url (in-app recovery route)', () => {
+    const ev = decode({
+      type: 'message.complete',
+      payload: {
+        billing: { billing_url: null, is_nous: true, message: 'out', model: 'm', provider: 'nous' },
+        text: 'guidance'
+      }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'message.complete') {
+      expect(ev.value.payload?.billing?.billing_url).toBeNull()
+      expect(ev.value.payload?.billing?.is_nous).toBe(true)
+    }
+  })
+
+  test('decodes moa.progress and moa.phase, bare payloads included (upstream 89e6f4c989a)', () => {
+    const progress = decode({
+      type: 'moa.progress',
+      session_id: 's1',
+      payload: { label: 'provider/model-a', refs_done: 2, refs_total: 3 }
+    })
+    expect(Option.isSome(progress)).toBe(true)
+    if (Option.isSome(progress) && progress.value.type === 'moa.progress') {
+      expect(progress.value.payload?.refs_done).toBe(2)
+      expect(progress.value.payload?.refs_total).toBe(3)
+      expect(progress.value.payload?.label).toBe('provider/model-a')
+    }
+
+    const phase = decode({
+      type: 'moa.phase',
+      payload: { aggregator: 'provider/model-z', phase: 'aggregator', refs_done: 3, refs_total: 3 }
+    })
+    expect(Option.isSome(phase)).toBe(true)
+    if (Option.isSome(phase) && phase.value.type === 'moa.phase') {
+      expect(phase.value.payload?.phase).toBe('aggregator')
+      expect(phase.value.payload?.aggregator).toBe('provider/model-z')
+    }
+
+    // payloads are optional — a bare frame still decodes (the reducer is inert)
+    expect(Option.isSome(decode({ type: 'moa.progress' }))).toBe(true)
+    expect(Option.isSome(decode({ type: 'moa.phase' }))).toBe(true)
+  })
+
   test('SKIPS an unrecognized event type (Option.none, no throw)', () => {
     expect(Option.isNone(decode({ type: 'totally.unknown.event', foo: 1 }))).toBe(true)
   })

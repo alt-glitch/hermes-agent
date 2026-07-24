@@ -2849,6 +2849,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         return submitPrompt(route.payload)
       }
 
+      // Billing-wall confirm recovery (store `message.complete{billing}` →
+      // ConfirmPrompt): Yes routes through the SAME slash ladder as the
+      // composer — `/topup` opens the native billing overlay, `/model` the
+      // picker. URL recovery stays inside logic/billingWall.ts via the safe
+      // external-URL boundary; only the slash capability is entry-owned.
+      store.registerBillingWallHost({ submitSlash: command => void submit(command) })
+
       // Drain ONE row per authoritative settle. Queue editing pins the selected
       // row; ending that edit while already idle retries this same drain seam.
       const sendQueuedAt = (index: number): boolean => {

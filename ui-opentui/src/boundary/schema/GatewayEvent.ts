@@ -78,6 +78,24 @@ const MessageInterim = Schema.Struct({
   session_id: opt(Str),
   payload: Schema.Struct({ text: Str, already_streamed: opt(Schema.Boolean) })
 })
+// Structured billing-wall descriptor forwarded on `message.complete` when an
+// inference call failed because the account is out of credits / payment is
+// required (upstream 960d339f86f — mirrors the Python
+// `agent/billing_links.py::BillingBlock` and `@hermes/shared` BillingBlock).
+// Detection is backend-only; the TUI renders from this one signal and never
+// re-classifies free-form error text. Fields are typed but individually
+// optional so a partial block from an older gateway can never drop the whole
+// completion event (the final answer text rides the same payload).
+export const BillingBlockSchema = Schema.Struct({
+  provider: opt(Str),
+  provider_label: opt(Str),
+  model: opt(Str),
+  billing_url: opt(Schema.NullOr(Str)),
+  is_nous: opt(Schema.Boolean),
+  message: opt(Str)
+})
+export type BillingBlockDecoded = typeof BillingBlockSchema.Type
+
 const MessageComplete = Schema.Struct({
   type: Schema.Literal('message.complete'),
   session_id: opt(Str),
@@ -86,6 +104,8 @@ const MessageComplete = Schema.Struct({
   payload: opt(
     Schema.Struct({
       client_submission_ids: ClientSubmissionIds,
+      billing: opt(BillingBlockSchema),
+      failure_reason: opt(Str),
       text: opt(Str),
       rendered: opt(Str),
       reasoning: opt(Str),
@@ -119,6 +139,27 @@ const MoaAggregating = Schema.Struct({
   type: Schema.Literal('moa.aggregating'),
   session_id: opt(Str),
   payload: opt(Schema.Struct({ aggregator: opt(Str) }))
+})
+// Live MoA fan-out progress (upstream 89e6f4c989a/ad6a2ae401e): `moa.progress`
+// fires once per reference completion; `moa.phase` marks phase transitions
+// (currently the single phase="aggregator" edge once the fan-out finishes).
+// The legacy moa.reference/moa.aggregating pair above is unchanged.
+const MoaProgress = Schema.Struct({
+  type: Schema.Literal('moa.progress'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ label: opt(Str), refs_done: opt(Schema.Number), refs_total: opt(Schema.Number) }))
+})
+const MoaPhase = Schema.Struct({
+  type: Schema.Literal('moa.phase'),
+  session_id: opt(Str),
+  payload: opt(
+    Schema.Struct({
+      aggregator: opt(Str),
+      phase: opt(Str),
+      refs_done: opt(Schema.Number),
+      refs_total: opt(Schema.Number)
+    })
+  )
 })
 const ThinkingDelta = Schema.Struct({
   type: Schema.Literal('thinking.delta'),
@@ -295,6 +336,8 @@ export const GatewayEventSchema = Schema.Union([
   ReasoningAvailable,
   MoaReference,
   MoaAggregating,
+  MoaProgress,
+  MoaPhase,
   ThinkingDelta,
   ToolStart,
   ToolComplete,

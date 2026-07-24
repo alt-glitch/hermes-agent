@@ -74,6 +74,7 @@ import {
   type SubagentStatus
 } from './subagentTree.ts'
 import { approvalPolicy, type ApprovalChoicePolicy } from './approval.ts'
+import { billingWallAction, billingWallCopy, runBillingWallAction, type BillingWallHost } from './billingWall.ts'
 
 /** Monotonic identity for one concrete overlay instance. Async work must carry
  * this token back to patch/close so a completion from an old session cannot
@@ -1020,6 +1021,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   function registerCommittedEventHandler(handler: (event: GatewayEvent) => void): void {
     onCommittedEvent = handler
+  }
+
+  // The billing-wall confirm's recovery routes through the composer's slash
+  // ladder (`/topup` opens the native billing overlay, `/model` the picker) —
+  // entry-owned, like the busy-queue drain. Registered once at boot; without a
+  // registration (bare logic tests) the action degrades to an honest
+  // transcript hint via runBillingWallAction's fallback.
+  let billingWallHost: Omit<BillingWallHost, 'pushSystem'> | undefined
+  function registerBillingWallHost(host: Omit<BillingWallHost, 'pushSystem'>): void {
+    billingWallHost = host
   }
 
   // Chrome-notice TTL timer (NOT store state — a transient handle, not reactive
@@ -2311,6 +2322,28 @@ export function createSessionStore(options?: SessionStoreOptions) {
         flushPendingNotice()
         // message.complete carries the latest usage/context — refresh the bar.
         if (event.payload) applyInfo(event.payload)
+        // Billing wall (out of credits / payment required — upstream
+        // 9c274db89ff): open the shared ConfirmPrompt with the ONE recovery
+        // action instead of a truncating status notice. The transcript already
+        // carries the full provider guidance (it rides this payload's `text`,
+        // settled above); the dialog is the concise actionable layer. Opened
+        // LAST in this case — after the turn settle, notice flush, and info
+        // refresh — mirroring Ink's set-after-recordMessageComplete ordering so
+        // no same-event reset can wipe it. Stale-session safety is upstreamed:
+        // live events are SID-filtered before apply (eventScope) and buffered
+        // resume events are filtered at commit (commitSessionSnapshot), so a
+        // rejected event never reaches this reducer; session replacement
+        // (resetSessionOwnedState) clears `prompt`, so an old wall can't bleed
+        // into a successor session. The confirm itself has NO external side
+        // effect — only an explicit Yes runs the recovery action.
+        {
+          const billing = event.payload?.billing
+          if (billing) {
+            setConfirm(billingWallCopy(billing), () =>
+              runBillingWallAction(billingWallAction(billing), { pushSystem, ...billingWallHost })
+            )
+          }
+        }
         break
       // thinking.delta / status.update are the TRANSIENT busy indicator (kaomoji
       // face/verb) — route them to the status line, NOT the transcript (gotcha: Ink
@@ -2467,6 +2500,29 @@ export function createSessionStore(options?: SessionStoreOptions) {
       case 'moa.aggregating': {
         const aggregator = event.payload?.aggregator?.trim()
         setState('status', aggregator ? `aggregating with ${aggregator}…` : 'aggregating references…')
+        break
+      }
+      // Live MoA fan-out progress (upstream 89e6f4c989a/ad6a2ae401e): ONE
+      // status line replaced in place as each reference completes ("MoA: refs
+      // 2/3") so the user sees movement during the (potentially long)
+      // reference phase — never transcript rows, never one line per event.
+      case 'moa.progress': {
+        const done = event.payload?.refs_done
+        const total = event.payload?.refs_total
+        if (typeof done === 'number' && typeof total === 'number') {
+          clearStatusRestoreTimer()
+          setState('status', `MoA: refs ${done}/${total}`)
+        }
+        break
+      }
+      // Phase transition — currently only phase="aggregator" (fan-out done,
+      // aggregator acting). Swap the same status line for aggregator copy;
+      // unknown future phases are ignored (Ink parity).
+      case 'moa.phase': {
+        if (event.payload?.phase === 'aggregator') {
+          clearStatusRestoreTimer()
+          setState('status', 'MoA: aggregating…')
+        }
         break
       }
       case 'tool.progress': {
@@ -3158,6 +3214,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     queuedCount,
     registerTurnCompleteHandler,
     registerCommittedEventHandler,
+    registerBillingWallHost,
     nextSpawnTreeSaveIntent,
     settleSpawnTreeSaveIntent,
     loadSpawnTreeSnapshot,

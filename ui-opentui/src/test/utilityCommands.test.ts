@@ -800,6 +800,22 @@ describe('details logic (pure)', () => {
     expect(out[1]).toMatchObject({ thoughts: 0, tools: 1 })
   })
 
+  test('MoA reference parts NEVER fold, even when every section is hidden (#64657)', () => {
+    const parts: Part[] = [
+      { id: 'p1', name: 'bash', state: 'complete', type: 'tool' },
+      { id: 'p2', text: '**Reference 1/2 — provider/model-a**\n\nadvice-a', type: 'moa' },
+      { id: 'p3', text: 'mull', type: 'reasoning' }
+    ]
+    // /details hidden — global fold of every section
+    const out = collapseHiddenParts(parts)
+    expect(out.map(part => part.type)).toEqual(['hiddenRun', 'moa', 'hiddenRun'])
+    // identity preserved → the reference block does not remount
+    expect(out[1]).toBe(parts[1])
+    // hidden-run counts exclude the visible MoA part
+    expect(out[0]).toMatchObject({ thoughts: 0, tools: 1 })
+    expect(out[2]).toMatchObject({ thoughts: 1, tools: 0 })
+  })
+
   test('hiddenRunLabel pluralizes honestly and points back to /details', () => {
     expect(hiddenRunLabel({ id: 'h', thoughts: 0, tools: 3, type: 'hiddenRun' })).toBe(
       '3 tools hidden — /details collapsed to show'

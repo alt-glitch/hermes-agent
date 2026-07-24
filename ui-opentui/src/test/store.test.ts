@@ -7,8 +7,10 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { approvalChoices } from '../logic/approval.ts'
+import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { DEFAULT_THEME } from '../logic/theme.ts'
 import { createSessionStore, startupCatalogRetryDelay, type Message } from '../logic/store.ts'
+import type { BillingBlockDecoded } from '../boundary/schema/GatewayEvent.ts'
 
 describe('session store — theming / dedup / hydrate (Phase 1)', () => {
   test('gateway.ready{skin} re-themes; default before', () => {
@@ -737,6 +739,174 @@ describe('session store — blocking prompts (Phase 3)', () => {
     expect(store.state.prompt).toMatchObject({ kind: 'sudo', requestId: 'sudo-new' })
     store.apply({ type: 'sudo.expire', payload: { request_id: 'sudo-new' } })
     expect(store.state.prompt).toBeUndefined()
+  })
+})
+
+describe('session store — billing wall confirm (upstream 960d339f86f + 9c274db89ff)', () => {
+  const nousBlock: BillingBlockDecoded = {
+    billing_url: null,
+    is_nous: true,
+    message: 'out of credits',
+    model: 'nous/hermes-4',
+    provider: 'nous',
+    provider_label: 'Nous Portal'
+  }
+  const openRouterBlock: BillingBlockDecoded = {
+    billing_url: 'https://openrouter.ai/settings/credits',
+    is_nous: false,
+    message: 'out of credits',
+    model: 'anthropic/claude-fable-5',
+    provider: 'openrouter',
+    provider_label: 'OpenRouter'
+  }
+
+  /** The active confirm prompt, asserted into its narrowed shape. */
+  function activeConfirm(store: ReturnType<typeof createSessionStore>) {
+    const prompt = store.state.prompt
+    if (prompt?.kind !== 'confirm') throw new Error(`expected a confirm prompt, got ${prompt?.kind ?? 'none'}`)
+    return prompt
+  }
+
+  test('live completion settles the turn FIRST, keeps the full guidance, then opens the confirm', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'partial…' } })
+    store.apply({
+      type: 'message.complete',
+      payload: { billing: nousBlock, failure_reason: 'billing', text: 'Billing or credits exhausted: full guidance' }
+    })
+    // turn-completion ordering: spinner stopped, turn settled, no streaming row
+    expect(store.state.info.running).toBe(false)
+    expect(store.state.status).toBeUndefined()
+    const assistant = store.state.messages.at(-1)
+    expect(assistant?.streaming).toBe(false)
+    // the FULL provider guidance stays in the transcript…
+    expect(assistant?.parts?.some(part => part.type === 'text' && part.text.includes('full guidance'))).toBe(true)
+    // …and the concise actionable dialog sits on top (Ink billingDialog copy)
+    const confirm = activeConfirm(store)
+    expect(confirm.spec).toMatchObject({
+      cancelLabel: 'Dismiss',
+      confirmLabel: 'Top up',
+      title: 'Out of Nous credits'
+    })
+    expect(confirm.spec.detail).toContain('top up to keep going')
+  })
+
+  test('confirm Yes routes Nous → /topup through the registered slash seam', () => {
+    const store = createSessionStore()
+    const submitSlash = vi.fn()
+    store.registerBillingWallHost({ submitSlash })
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { billing: nousBlock, text: 'guidance' } })
+    activeConfirm(store).onConfirm()
+    expect(submitSlash).toHaveBeenCalledWith('/topup')
+  })
+
+  test('confirm Yes deep-links a third-party billing page via the safe opener', () => {
+    const store = createSessionStore()
+    const submitSlash = vi.fn()
+    const openUrl = vi.fn(() => true)
+    store.registerBillingWallHost({ openUrl, submitSlash })
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { billing: openRouterBlock, text: 'guidance' } })
+    const confirm = activeConfirm(store)
+    expect(confirm.spec.confirmLabel).toBe('Open billing page')
+    confirm.onConfirm()
+    expect(openUrl).toHaveBeenCalledWith('https://openrouter.ai/settings/credits')
+    expect(submitSlash).not.toHaveBeenCalled()
+  })
+
+  test('confirm Yes with no billing URL recovers via /model', () => {
+    const store = createSessionStore()
+    const submitSlash = vi.fn()
+    store.registerBillingWallHost({ submitSlash })
+    store.apply({ type: 'message.start' })
+    store.apply({
+      type: 'message.complete',
+      payload: { billing: { ...openRouterBlock, billing_url: null }, text: 'guidance' }
+    })
+    const confirm = activeConfirm(store)
+    expect(confirm.spec.confirmLabel).toBe('Switch provider')
+    confirm.onConfirm()
+    expect(submitSlash).toHaveBeenCalledWith('/model')
+  })
+
+  test('a stale-session buffered completion is filtered at commit — no overlay bleed', () => {
+    const store = createSessionStore()
+    store.beginBuffer()
+    store.apply({
+      type: 'message.complete',
+      session_id: 'old-session',
+      payload: { billing: nousBlock, text: 'stale wall' }
+    })
+    store.commitSessionSnapshot('new-live', [], {}, event => eventBelongsToSession(event, 'new-live'))
+    expect(store.state.prompt).toBeUndefined()
+    // the rejected event was dropped whole: no replayed turn, no transcript row
+    expect(store.state.messages).toHaveLength(0)
+  })
+
+  test('a buffered completion for the COMMITTED session replays and opens the confirm', () => {
+    const store = createSessionStore()
+    store.beginBuffer()
+    store.apply({
+      type: 'message.complete',
+      session_id: 'new-live',
+      payload: { billing: nousBlock, text: 'real wall' }
+    })
+    store.commitSessionSnapshot('new-live', [], {}, event => eventBelongsToSession(event, 'new-live'))
+    expect(activeConfirm(store).spec.title).toBe('Out of Nous credits')
+  })
+
+  test('session replacement clears an open billing confirm (no cross-session bleed)', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { billing: nousBlock, text: 'guidance' } })
+    expect(store.state.prompt).toMatchObject({ kind: 'confirm' })
+    store.adoptFreshSession('successor')
+    expect(store.state.prompt).toBeUndefined()
+  })
+
+  test('a completion without billing never opens a confirm', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { text: 'ordinary answer' } })
+    expect(store.state.prompt).toBeUndefined()
+  })
+})
+
+describe('session store — MoA fan-out progress (upstream 89e6f4c989a/ad6a2ae401e)', () => {
+  test('moa.progress maintains ONE replace-in-place status line, then phase swaps to aggregating', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    const rowsBefore = store.state.messages.length
+    store.apply({ type: 'moa.progress', payload: { label: 'provider/model-a', refs_done: 1, refs_total: 3 } })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.progress', payload: { label: 'provider/model-b', refs_done: 2, refs_total: 3 } })
+    // replaced in place — the same single status line, never appended
+    expect(store.state.status).toBe('MoA: refs 2/3')
+    store.apply({ type: 'moa.phase', payload: { aggregator: 'provider/model-z', phase: 'aggregator' } })
+    expect(store.state.status).toBe('MoA: aggregating…')
+    // no transcript spam: progress/phase events add zero rows and zero parts
+    expect(store.state.messages.length).toBe(rowsBefore)
+    expect(store.state.messages.at(-1)?.parts).toHaveLength(0)
+    // the completed turn clears the line like every other transient status
+    store.apply({ type: 'message.complete', payload: { text: 'final' } })
+    expect(store.state.status).toBeUndefined()
+  })
+
+  test('incomplete progress payloads and unknown phases are inert', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'moa.progress', payload: { refs_done: 1, refs_total: 3 } })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.progress', payload: { label: 'no numbers' } })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.progress' })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.phase', payload: { phase: 'warmup' } })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.phase' })
+    expect(store.state.status).toBe('MoA: refs 1/3')
   })
 })
 
