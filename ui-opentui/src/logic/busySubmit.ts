@@ -5,6 +5,17 @@ import type { GatewayError } from '../boundary/errors.ts'
 import type { BusyInputMode } from './busyQueue.ts'
 
 export type SteerDelivery = 'accepted' | 'fallback' | 'retained' | 'uncertain'
+export type InterruptCorrectionDelivery = 'redirected' | 'queued' | 'fallback' | 'retained' | 'uncertain'
+
+/** Busy prompt.submit only has two positive admission outcomes. Anything else
+ * is a definite non-admission response and must use the legacy fallback. */
+export function classifyBusyPromptSubmitResponse(response: unknown): 'redirected' | 'queued' | 'rejected' {
+  if (response === null || typeof response !== 'object') return 'rejected'
+  if (!('status' in response)) return 'rejected'
+  const status = response.status
+  if (status === 'redirected' || status === 'queued') return status
+  return 'rejected'
+}
 
 /** Immediate, bounded feedback while an accepted steer waits for the current
  * tool/API boundary. The correlation-backed row is retired by the store only
@@ -231,6 +242,13 @@ export interface BusySubmitHost {
   readonly sessionId: () => string | undefined
   readonly enqueue: (text: string, front: boolean) => boolean
   readonly interrupt: () => void
+  /** False for media-bearing input and while another correction owns the one
+   * bounded, correlation-backed recovery slot. */
+  readonly canRedirect: (text: string, front: boolean) => boolean
+  /** Submit a text correction through prompt.submit. The entry preserves one
+   * recovery copy until a correlated terminal lifecycle event; definite RPC
+   * rejection is totalized into the legacy interrupt + enqueue fallback. */
+  readonly redirect: (sessionId: string, text: string, front: boolean) => Promise<InterruptCorrectionDelivery>
   /** Synchronous guard for the bounded set of in-flight steer requests. */
   readonly canSteer: (text: string, front: boolean) => boolean
   /** The entry resolves definite rejection into `fallback` and ambiguous
@@ -307,9 +325,46 @@ export function submitWhileBusy(host: BusySubmitHost, text: string, front = fals
   if (!sid) return host.enqueue(text, front)
 
   if (mode === 'interrupt') {
-    if (!host.enqueue(text, front)) return false
-    host.setStatus('interrupting…')
-    host.interrupt()
+    if (!host.canRedirect(text, front)) {
+      if (!host.enqueue(text, front)) return false
+      host.setStatus('interrupting…')
+      host.interrupt()
+      return true
+    }
+
+    let request: Promise<InterruptCorrectionDelivery>
+    try {
+      request = host.redirect(sid, text, front)
+    } catch {
+      if (!host.enqueue(text, front)) return false
+      host.setStatus('interrupting…')
+      host.interrupt()
+      return true
+    }
+
+    void request.then(
+      outcome => {
+        if (outcome === 'fallback') {
+          host.setStatus('interrupting…')
+        } else if (outcome === 'uncertain') {
+          host.haltAutomaticDrain()
+          host.pushSystem('correction delivery uncertain — message retained; send it explicitly to retry')
+        } else if (outcome === 'retained') {
+          host.pushSystem('correction fallback queue is full — input remains retained')
+        }
+      },
+      () => {
+        // Production totalizes typed gateway failures. Fail closed if an
+        // unexpected promise defect escapes: retain locally and require an
+        // explicit retry rather than risking a duplicate active-turn send.
+        if (host.enqueue(text, front)) {
+          host.haltAutomaticDrain()
+          host.pushSystem('correction delivery uncertain — message retained; send it explicitly to retry')
+        } else {
+          host.pushSystem('correction delivery uncertain and queue is full — input remains retained')
+        }
+      }
+    )
     return true
   }
 

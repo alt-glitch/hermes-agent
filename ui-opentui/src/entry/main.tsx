@@ -130,6 +130,7 @@ import { coordinatePromptLiveSession } from '../logic/promptLiveSession.ts'
 import {
   acceptedSteerNotice,
   advancePreStartCancellationFence,
+  classifyBusyPromptSubmitResponse,
   createAutomaticQueueDrainGate,
   createPreAdmissionRetryTimer,
   createQueueEditDrainGate,
@@ -143,6 +144,7 @@ import {
   steerSlotAvailable,
   submitWhileBusy,
   takeSettledSteerPrefix,
+  type InterruptCorrectionDelivery,
   type SteerDelivery
 } from '../logic/busySubmit.ts'
 import {
@@ -199,6 +201,15 @@ interface PendingPrompt {
   readonly clientMessageId: string
   readonly retryDeadlineAt: number
   retryNoticeShown: boolean
+  readonly submissionId: string
+  readonly sessionId: string
+  readonly text: string
+}
+
+interface PendingCorrection {
+  admission?: 'queued' | 'redirected'
+  readonly clientMessageId: string
+  readonly front: boolean
   readonly submissionId: string
   readonly sessionId: string
   readonly text: string
@@ -572,6 +583,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       let promoteHeldTransitionSubmissions = () => {}
       let promoteHeldAfterRecovery = false
       let pendingPrompt: PendingPrompt | undefined
+      let pendingCorrection: PendingCorrection | undefined
+      const hasPendingDelivery = () => pendingPrompt !== undefined || pendingCorrection !== undefined
       const pendingPromptRetry = createPreAdmissionRetryTimer()
       const cancelPendingPromptRetry = pendingPromptRetry.cancel
       // A deferred-build interrupt can receive its ACK before the Python build
@@ -637,6 +650,25 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         return true
       }
 
+      /** Retain one interrupt-mode correction without touching the primary
+       * prompt's independently correlated recovery copy. */
+      const retainPendingCorrectionForRetry = (current: PendingCorrection, notice: string): boolean => {
+        if (pendingCorrection !== current) return false
+        pendingCorrection = undefined
+        if (!store.enqueuePrompt(current.text, current.front)) {
+          pendingCorrection = current
+          getLog().error('submit', 'reserved correction queue insertion failed')
+          store.pushSystem(
+            'correction delivery uncertain — input is retained internally; clear queue capacity to retry'
+          )
+          return false
+        }
+        store.removeClientMessage(current.clientMessageId)
+        automaticQueueDrain.halt()
+        if (notice) store.pushSystem(notice)
+        return true
+      }
+
       const spawnTreeSaveDrainer = createSpawnTreeSaveDrainer({
         next: () => store.nextSpawnTreeSaveIntent(),
         settle: id => store.settleSpawnTreeSaveIntent(id),
@@ -699,30 +731,60 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             store.clearComposerDraft()
             queueMicrotask(() => submitVoiceTranscript(text))
           }
-        } else if (
-          pendingPrompt &&
-          (event.type === 'message.start' || event.type === 'message.complete') &&
-          pendingPromptBoundaryMatches(pendingPrompt.submissionId, event.type, event.payload)
-        ) {
-          if (event.type === 'message.start') store.clearPendingImages()
-          pendingPrompt = pendingPromptAfterBoundary(pendingPrompt, event.type)
-        } else if (
-          event.type === 'error' &&
-          pendingPrompt &&
-          pendingPromptBoundaryMatches(pendingPrompt.submissionId, event.type, event.payload)
-        ) {
-          if (pendingPromptDecision(event.type) === 'retain') {
+        }
+
+        if (event.type === 'message.start' || event.type === 'message.complete') {
+          if (pendingPrompt && pendingPromptBoundaryMatches(pendingPrompt.submissionId, event.type, event.payload)) {
+            if (event.type === 'message.start') store.clearPendingImages()
+            pendingPrompt = pendingPromptAfterBoundary(pendingPrompt, event.type)
+          }
+          if (
+            pendingCorrection &&
+            pendingPromptBoundaryMatches(pendingCorrection.submissionId, event.type, event.payload)
+          ) {
+            pendingCorrection = pendingPromptAfterBoundary(pendingCorrection, event.type)
+          }
+        } else if (event.type === 'error') {
+          // Restore in reverse insertion order so two correlated build-window
+          // failures remain [primary, correction] after front insertion.
+          const failedCorrection = pendingCorrection
+          if (
+            failedCorrection &&
+            pendingPromptBoundaryMatches(failedCorrection.submissionId, event.type, event.payload) &&
+            pendingPromptDecision(event.type) === 'retain'
+          ) {
+            retainPendingCorrectionForRetry(
+              failedCorrection,
+              'correction failed before it settled — message retained; send it explicitly to retry'
+            )
+          }
+          const failedPrompt = pendingPrompt
+          if (
+            failedPrompt &&
+            pendingPromptBoundaryMatches(failedPrompt.submissionId, event.type, event.payload) &&
+            pendingPromptDecision(event.type) === 'retain'
+          ) {
             retainPendingPromptForRetry(
-              pendingPrompt,
+              failedPrompt,
               'prompt failed before it started — message retained; send it explicitly to retry'
             )
           }
-        } else if (event.type === 'gateway.exited' && pendingPrompt) {
-          if (pendingPromptDecision(event.type) === 'retain') {
-            retainPendingPromptForRetry(
-              pendingPrompt,
-              'prompt delivery uncertain after gateway exit — message retained; send it explicitly to retry'
+        } else if (event.type === 'gateway.exited') {
+          const exitedCorrection = pendingCorrection
+          if (exitedCorrection && pendingPromptDecision(event.type) === 'retain') {
+            retainPendingCorrectionForRetry(
+              exitedCorrection,
+              'correction delivery uncertain after gateway exit — message retained; send it explicitly to retry'
             )
+          }
+          const exitedPrompt = pendingPrompt
+          if (pendingPromptDecision(event.type) === 'retain') {
+            if (exitedPrompt) {
+              retainPendingPromptForRetry(
+                exitedPrompt,
+                'prompt delivery uncertain after gateway exit — message retained; send it explicitly to retry'
+              )
+            }
           }
         }
 
@@ -796,7 +858,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem(`wait for the history update before trying to ${what}`)
           return true
         }
-        if (pendingPrompt) {
+        if (hasPendingDelivery()) {
           store.pushSystem(`wait for the pending prompt request before trying to ${what}`)
           return true
         }
@@ -1062,6 +1124,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         cancelPendingPromptRetry()
         const interruptedBeforeStart = !store.isTurnInFlight()
         const interruptedPrompt = pendingPrompt
+        const interruptedCorrection = pendingCorrection
         Effect.runFork(
           gateway.request('session.interrupt', { session_id: sid }).pipe(
             Effect.tap(() =>
@@ -1097,6 +1160,26 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                     )
                   }
                 }
+                if (
+                  pendingCorrection === interruptedCorrection &&
+                  interruptedCorrection?.sessionId === sid &&
+                  gateway.sessionId() === sid
+                ) {
+                  if (interruptedCorrection.admission === 'redirected') {
+                    // The correction already entered the active turn; the hard
+                    // stop is its explicit cancellation boundary. Keep the
+                    // visible user bubble, matching the durable checkpoint.
+                    pendingCorrection = undefined
+                  } else {
+                    // queued (build window) and not-yet-ACKed corrections are
+                    // cleared server-side by session.interrupt. Restore the
+                    // sole local copy for an explicit retry.
+                    retainPendingCorrectionForRetry(
+                      interruptedCorrection,
+                      'queued correction cancelled with the interrupted turn — message retained; send it explicitly to retry'
+                    )
+                  }
+                }
               })
             ),
             Effect.catchCause(cause =>
@@ -1109,6 +1192,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   retainPendingPromptForRetry(
                     interruptedPrompt,
                     'prompt cancellation uncertain — message retained; verify the turn state before retrying'
+                  )
+                }
+                if (
+                  pendingCorrection === interruptedCorrection &&
+                  interruptedCorrection?.sessionId === sid &&
+                  gateway.sessionId() === sid
+                ) {
+                  retainPendingCorrectionForRetry(
+                    interruptedCorrection,
+                    'correction cancellation uncertain — message retained; verify the turn state before retrying'
                   )
                 }
                 getLog().warn('interrupt', 'failed', { cause: String(cause) })
@@ -1202,7 +1295,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // into the composer as an inline, removable token.
       const onImagePaste = async (hotkey = false): Promise<string | undefined> => {
         if (imageAttachInFlight) return undefined
-        if (pendingPrompt) {
+        if (hasPendingDelivery()) {
           if (hotkey) {
             const text = await readClipboardText()
             if (text) return text
@@ -1386,8 +1479,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // close (and confirm) layers against it through useCloseLayer/useBindings.
       const keymap = createDefaultOpenTuiKeymap(renderer)
 
-      const nonTransitionReservedQueueItems = () => pendingSteerCount + (pendingPrompt ? 1 : 0)
-      const nonTransitionReservedQueueChars = () => pendingSteerCharacters + (pendingPrompt?.text.length ?? 0)
+      const nonTransitionReservedQueueItems = () =>
+        pendingSteerCount + (pendingPrompt ? 1 : 0) + (pendingCorrection ? 1 : 0)
+      const nonTransitionReservedQueueChars = () =>
+        pendingSteerCharacters + (pendingPrompt?.text.length ?? 0) + (pendingCorrection?.text.length ?? 0)
       const heldQueueReservation = () =>
         promoteHeldAfterRecovery ? transitionQueueReservation(transitionSubmissions) : { chars: 0, count: 0 }
       const reservedQueueItems = () => nonTransitionReservedQueueItems() + heldQueueReservation().count
@@ -1411,6 +1506,72 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         if (store.enqueuePrompt(text, front)) return true
         store.pushSystem(BUSY_QUEUE_FULL_MESSAGE)
         return false
+      }
+
+      const canRedirectCorrection = (text: string, _front = false): boolean =>
+        pendingCorrection === undefined &&
+        store.state.pendingImages.length === 0 &&
+        text.length <= BUSY_QUEUE_MAX_CHARS &&
+        queueAccepts(store.state.queuedPrompts, text, undefined, reservedQueueItems(), reservedQueueChars())
+
+      /** Interrupt-mode text corrections use prompt.submit so the gateway can
+       * atomically redirect a capable active agent or queue the build-window
+       * race. The optimistic user row remains paired with exactly one local
+       * recovery copy until a lifecycle event names this submission id. */
+      const issueInterruptCorrection = (
+        sessionId: string,
+        text: string,
+        front = false
+      ): Promise<InterruptCorrectionDelivery> => {
+        if (!canRedirectCorrection(text, front)) throw new Error('correction reservation unavailable')
+        const current: PendingCorrection = {
+          clientMessageId: store.pushUser(text),
+          front,
+          submissionId: randomUUID(),
+          sessionId,
+          text
+        }
+        pendingCorrection = current
+
+        const fallback = (): InterruptCorrectionDelivery => {
+          // A correlated lifecycle event can settle before this continuation
+          // runs. That is stronger admission proof than the RPC result.
+          if (pendingCorrection !== current) return 'redirected'
+          pendingCorrection = undefined
+          if (!enqueueClientPrompt(current.text, current.front)) {
+            pendingCorrection = current
+            return 'retained'
+          }
+          store.removeClientMessage(current.clientMessageId)
+          interruptTurn()
+          return 'fallback'
+        }
+
+        const retain = (): InterruptCorrectionDelivery => {
+          if (pendingCorrection !== current) return 'redirected'
+          return retainPendingCorrectionForRetry(current, '') ? 'uncertain' : 'retained'
+        }
+
+        return Effect.runPromise(
+          gateway
+            .request<unknown>('prompt.submit', {
+              client_submission_id: current.submissionId,
+              session_id: current.sessionId,
+              text: current.text
+            })
+            .pipe(
+              Effect.map(response => {
+                const disposition = classifyBusyPromptSubmitResponse(response)
+                if (disposition === 'rejected') return fallback()
+                current.admission = disposition
+                return disposition
+              }),
+              Effect.catchTag('GatewayError', error =>
+                Effect.sync(() => (deliveryFailureIsUncertain(error) ? retain() : fallback()))
+              ),
+              Effect.catchCause(() => Effect.sync(retain))
+            )
+        )
       }
 
       /** Best-effort steer admission. Pending text reserves bounded fallback
@@ -1572,7 +1733,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('no active session — run /new to retry')
           return false
         }
-        if (pendingPrompt) {
+        if (hasPendingDelivery()) {
           store.pushSystem('a prompt is still waiting for gateway acceptance — input retained')
           return false
         }
@@ -1615,6 +1776,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         submitWhileBusy(
           {
             enqueue: enqueueClientPrompt,
+            canRedirect: canRedirectCorrection,
             canSteer,
             haltAutomaticDrain: () => {
               automaticQueueDrain.halt()
@@ -1622,6 +1784,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             interrupt: interruptTurn,
             mode: () => store.state.busyInputMode,
             pushSystem: message => store.pushSystem(message),
+            redirect: issueInterruptCorrection,
             sessionId: () => gateway.sessionId(),
             setStatus: message => store.setStatus(message),
             steer: issueSteer
@@ -2118,7 +2281,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('a session switch is already in progress')
           return undefined
         }
-        if (imageAttachInFlight || historyMutationInFlight || pendingPrompt || pendingSteerCount > 0) {
+        if (imageAttachInFlight || historyMutationInFlight || hasPendingDelivery() || pendingSteerCount > 0) {
           store.pushSystem('finish the current session mutation before starting a live sibling')
           return undefined
         }
@@ -2208,7 +2371,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('wait for the history update before switching live sessions')
           return
         }
-        if (pendingPrompt) {
+        if (hasPendingDelivery()) {
           store.pushSystem('wait for the pending prompt request before switching live sessions')
           return
         }
@@ -2719,7 +2882,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           return accepted
         }
 
-        if (pendingPrompt) return false
+        if (hasPendingDelivery()) return false
         const removed = store.removeQueuedPrompt(index)
         if (removed === undefined) return false
         // Explicit queue submission is the retry boundary after ambiguous
@@ -2782,7 +2945,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           isSessionTransitioning() ||
           historyMutationInFlight ||
           store.state.pendingImages.length > 0 ||
-          pendingPrompt !== undefined ||
+          hasPendingDelivery() ||
           isTurnBusy() ||
           !gateway.sessionId()
         )
