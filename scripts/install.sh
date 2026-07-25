@@ -76,7 +76,7 @@ BRANCH_EXPLICIT=false
 REPO_EXPLICIT=false
 INSTALL_COMMIT=""
 ENSURE_DEPS=""
-POSTINSTALL_MODE=false
+
 MANIFEST_MODE=false
 STAGE_NAME=""
 JSON_OUTPUT=false
@@ -174,10 +174,7 @@ while [[ $# -gt 0 ]]; do
             ENSURE_DEPS="$2"
             shift 2
             ;;
-        --postinstall)
-            POSTINSTALL_MODE=true
-            shift
-            ;;
+
         -h|--help)
             echo "Hermes Agent Installer"
             echo ""
@@ -217,9 +214,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --ensure DEPS  Install only specified deps (comma-separated)"
             echo "                   Supported: node, browser, ripgrep, ffmpeg"
             echo "                   Does NOT clone repo or create venv"
-            echo "  --postinstall  Run post-install setup only (for pip users)"
-            echo "                   Installs optional deps + runs hermes setup"
-            echo "                   Does NOT clone repo or create venv"
+
             exit 0
             ;;
         *)
@@ -2820,29 +2815,6 @@ ensure_mode() {
     done
 }
 
-postinstall_mode() {
-    print_banner
-    detect_os
-
-    log_info "Post-install mode: setting up Hermes for pip install"
-
-    check_node
-    check_network_prerequisites
-    install_system_packages
-
-    if [ "$HAS_NODE" = true ] && [ "$SKIP_BROWSER" = false ]; then
-        ensure_browser
-    fi
-
-    HERMES_CMD="$(command -v hermes 2>/dev/null || echo "")"
-    if [ -n "$HERMES_CMD" ]; then
-        log_info "Running hermes setup..."
-        "$HERMES_CMD" setup
-    else
-        log_warn "hermes command not found on PATH"
-        log_info "Try: python -m hermes_cli.main setup"
-    fi
-}
 
 # Clear the cached Electron download + any half-written unpacked output so the
 # next `npm run pack` re-downloads and re-stages from scratch. A corrupt zip in
@@ -3393,8 +3365,6 @@ elif [ -n "$STAGE_NAME" ]; then
     run_stage_protocol "$STAGE_NAME"
 elif [ -n "$ENSURE_DEPS" ]; then
     ensure_mode
-elif [ "$POSTINSTALL_MODE" = true ]; then
-    postinstall_mode
 else
     main
 fi

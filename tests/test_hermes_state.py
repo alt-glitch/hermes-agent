@@ -402,6 +402,44 @@ class TestSessionLifecycle:
         child = db.get_session("child")
         assert child["git_branch"] == "feature-x"
 
+    def test_child_session_inherits_profile_name_from_parent(self, db):
+        """A parented child born without profile_name (compression rotation,
+        /branch) must inherit its parent's owning profile — otherwise the
+        lineage silently migrates to the launch/default profile in unified
+        session lists (the cross-profile session-jump bug)."""
+        db.create_session(session_id="parent", source="cli", profile_name="ai-engineer")
+        # Rotation path: parent is ended with 'compression' BEFORE the child
+        # row is created (agent/conversation_compression.py).
+        db.end_session("parent", "compression")
+
+        db.create_session(session_id="child", source="cli", parent_session_id="parent")
+
+        assert db.get_session("child")["profile_name"] == "ai-engineer"
+
+    def test_child_session_explicit_profile_name_is_not_overwritten(self, db):
+        """Inheritance only fills NULLs — an explicit profile_name on the
+        child is never clobbered by the parent's."""
+        db.create_session(session_id="parent", source="cli", profile_name="ai-engineer")
+
+        db.create_session(
+            session_id="child", source="cli", parent_session_id="parent",
+            profile_name="other",
+        )
+
+        assert db.get_session("child")["profile_name"] == "other"
+
+    def test_multi_generation_lineage_inherits_profile_name(self, db):
+        """profile_name survives a compress-then-branch chain (root -> rotation
+        child -> branch tip) — the exact lineage that used to land on default."""
+        db.create_session(session_id="root", source="cli", profile_name="ai-engineer")
+        db.end_session("root", "compression")
+
+        db.create_session(session_id="gen1", source="cli", parent_session_id="root")
+        db.create_session(session_id="gen2", source="cli", parent_session_id="gen1")
+
+        assert db.get_session("gen1")["profile_name"] == "ai-engineer"
+        assert db.get_session("gen2")["profile_name"] == "ai-engineer"
+
     def test_compression_child_inherits_gateway_origin_columns(self, db):
         """A compression fork's child inherits gateway routing metadata
         (session_key/chat_id/...) from the ended parent, so a crash before
@@ -537,6 +575,58 @@ class TestSessionLifecycle:
         assert session["end_reason"] == "compression"
         assert session["ended_at"] == first_ended_at
 
+    def test_end_session_first_reason_wins_across_concurrent_connections(
+        self, db
+    ):
+        """Concurrent finalizers perform one transition, not last-write-wins."""
+        import threading
+
+        db.create_session(session_id="s1", source="cron")
+        db._conn.execute(
+            "CREATE TABLE session_end_audit (reason TEXT NOT NULL)"
+        )
+        db._conn.execute(
+            """
+            CREATE TRIGGER audit_session_end
+            AFTER UPDATE OF ended_at ON sessions
+            WHEN OLD.ended_at IS NULL AND NEW.ended_at IS NOT NULL
+            BEGIN
+                INSERT INTO session_end_audit(reason) VALUES (NEW.end_reason);
+            END
+            """
+        )
+
+        peer = SessionDB(db_path=db.db_path)
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def _end(session_db, reason):
+            try:
+                barrier.wait(timeout=5)
+                session_db.end_session("s1", reason)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_end, args=(db, "compression")),
+            threading.Thread(target=_end, args=(peer, "cron_complete")),
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert errors == []
+            audit_rows = db._conn.execute(
+                "SELECT reason FROM session_end_audit"
+            ).fetchall()
+            assert len(audit_rows) == 1
+            assert db.get_session("s1")["end_reason"] == audit_rows[0]["reason"]
+        finally:
+            peer.close()
+
     def test_end_session_after_reopen_allows_re_end(self, db):
         """reopen_session() is the explicit escape hatch for re-ending a
         closed session. After reopen, end_session() takes effect again.
@@ -660,6 +750,30 @@ class TestSessionLifecycle:
         db.update_token_counts("s1", input_tokens=10, output_tokens=5,
                                model="xiaomi/mimo-v2.5-pro")
         assert db.get_session("s1")["model"] == "xiaomi/mimo-v2.5"
+
+    def test_update_session_model_clears_browser_lock_and_preserves_lineage(self, db):
+        """A later /model switch must replace, not compete with, a Browser lock."""
+        db.create_session(
+            session_id="s1",
+            source="hermes_browser",
+            model="x-ai/grok-4.5",
+            model_config={
+                "_branched_from": "parent-session",
+                "browser_model_lock": {
+                    "provider": "nous",
+                    "model": "x-ai/grok-4.5",
+                    "confirmed": True,
+                },
+            },
+        )
+
+        db.update_session_model("s1", "anthropic/claude-opus-4.8")
+
+        session = db.get_session("s1")
+        model_config = json.loads(session["model_config"])
+        assert session["model"] == "anthropic/claude-opus-4.8"
+        assert "browser_model_lock" not in model_config
+        assert model_config["_branched_from"] == "parent-session"
 
     def test_update_session_billing_route_overwrites_after_switch(self, db):
         """A mid-session provider switch must overwrite the billing route.
@@ -3987,9 +4101,15 @@ class TestSanitizeTitle:
 
 class TestSchemaInit:
     def test_wal_mode(self, db):
+        """Prefer WAL on fixed SQLite; DELETE on WAL-reset-vulnerable builds (#69784)."""
+        from hermes_state import is_sqlite_wal_reset_vulnerable
+
         cursor = db._conn.execute("PRAGMA journal_mode")
-        mode = cursor.fetchone()[0]
-        assert mode == "wal"
+        mode = cursor.fetchone()[0].lower()
+        if is_sqlite_wal_reset_vulnerable():
+            assert mode == "delete"
+        else:
+            assert mode == "wal"
 
     def test_foreign_keys_enabled(self, db):
         cursor = db._conn.execute("PRAGMA foreign_keys")
@@ -4781,13 +4901,13 @@ class TestListSessionsRich:
         """
         t0 = 1709500000.0
         db.create_session("root1", "cli")
+        db.append_message("root1", "user", "old ask")
         with db._lock:
             db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root1"))
             db._conn.execute(
                 "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
                 (t0 + 100, "compression", "root1"),
             )
-        db.append_message("root1", "user", "old ask")
 
         # Continuation tip created after root ended; last activity much later.
         db.create_session("tip1", "cli", parent_session_id="root1")
@@ -4904,6 +5024,39 @@ class TestListSessionsRich:
 
         assert db.delete_session("parent") is True
         assert db.get_session("delegate") is None
+        assert db.get_session("branch") is not None
+
+    def test_delete_session_expected_targets_fail_closed_on_new_delegate(self, db):
+        db.create_session("parent", "cli")
+        db.create_session(
+            "delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+        db.create_session(
+            "branch",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_branched_from": "parent"},
+        )
+
+        expected_ids = db.get_session_delete_targets("parent")
+        assert expected_ids == ["parent", "delegate"]
+
+        db.create_session(
+            "late-delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+
+        assert (
+            db.delete_session("parent", expected_delete_ids=expected_ids) is False
+        )
+        assert db.get_session("parent") is not None
+        assert db.get_session("delegate") is not None
+        assert db.get_session("late-delegate") is not None
         assert db.get_session("branch") is not None
 
     def test_v16_migration_tags_linked_delegate_rows(self, tmp_path):
@@ -5984,6 +6137,93 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_optimize_fts_storage_vacuum_reports_truthful_size(self, tmp_path):
+        """``logical_size_bytes()`` must be truthful the moment optimize returns.
+
+        In WAL mode VACUUM's rewrite lands in the ``-wal`` file, and the
+        checkpoint that folds it back is REFUSED (SQLITE_BUSY) while another
+        connection — a live gateway — holds a read-mark. A caller that sizes
+        the result with ``os.path.getsize()`` therefore reads the stale,
+        still-growing main file: that is how `hermes sessions optimize-storage`
+        reported "reclaimed -3820.1 MB" on a DB that had actually shrunk 60%.
+        SQLite's own page accounting is correct immediately.
+        """
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        # Bulk the DB up so VACUUM actually has pages to move: with only a
+        # handful of rows the whole file fits in the WAL's first frames and the
+        # stale-stat() bug is invisible.
+        bulk = sqlite3.connect(str(db_path))
+        bulk.executemany(
+            "INSERT INTO messages (session_id, timestamp, role, content) "
+            "VALUES ('s1', ?, 'user', ?)",
+            [(time.time(), "filler " + "q" * 2000) for _ in range(4000)],
+        )
+        bulk.commit()
+        bulk.close()
+
+        db = SessionDB(db_path=db_path)
+        reader = None
+        try:
+            if db._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                pytest.skip("WAL unavailable on this SQLite build")
+
+            # A live gateway/CLI session pinning a WAL read-mark, which is what
+            # blocks the post-VACUUM checkpoint.
+            reader = sqlite3.connect(str(db_path))
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM messages").fetchone()
+
+            assert db.optimize_fts_storage(vacuum=True)["ok"] is True
+
+            reported = db.logical_size_bytes()
+            assert reported is not None
+            stat_size = db_path.stat().st_size
+
+            # Settle for real: release the reader, then checkpoint.
+            reader.rollback()
+            reader.close()
+            reader = None
+            db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            settled = db_path.stat().st_size
+
+            page_size = db._conn.execute("PRAGMA page_size").fetchone()[0]
+
+            # Precondition for this test to mean anything: stat() must actually
+            # be lagging here, otherwise it isn't exercising the bug.
+            assert stat_size > settled + page_size, (
+                "test precondition failed: stat() did not lag the settled size, "
+                "so this case does not exercise the reporting bug"
+            )
+
+            # The contract: the reported size tracks where the file lands, not
+            # the stale on-disk size.
+            assert abs(reported - settled) <= page_size, (
+                f"logical_size_bytes() reported {reported} but the file settled "
+                f"at {settled} (stale stat() read {stat_size}) — a "
+                f"reclaimed-bytes delta built on this would be wrong"
+            )
+        finally:
+            if reader is not None:
+                reader.close()
+            db.close()
+
+    def test_logical_size_bytes_matches_page_accounting(self, tmp_path):
+        """Sanity: the helper returns page_count * page_size, or None if closed."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+        db = SessionDB(db_path=db_path)
+        try:
+            pc = db._conn.execute("PRAGMA page_count").fetchone()[0]
+            ps = db._conn.execute("PRAGMA page_size").fetchone()[0]
+            assert db.logical_size_bytes() == pc * ps
+        finally:
+            db.close()
+        # After close the connection is gone — must degrade to None, not raise,
+        # so callers can fall back to stat().
+        assert db.logical_size_bytes() is None
+
     def test_optimize_fts_storage_resumable_after_interrupt(self, tmp_path):
         """A partially-completed optimize resumes on re-run: after demote +
         one chunk, re-invoking finishes without duplicating rows."""
@@ -6178,6 +6418,15 @@ class TestFTSExternalContentMigration:
 
 class TestApplyWalProbe:
     """Unit tests for the journal_mode probe in apply_wal_with_fallback."""
+
+    @pytest.fixture(autouse=True)
+    def _assume_fixed_sqlite(self, monkeypatch):
+        """These cases cover the fixed-SQLite WAL path (not the #69784 gate)."""
+        import hermes_state
+
+        monkeypatch.setattr(
+            hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: False
+        )
 
     def test_skips_set_pragma_when_already_wal(self, tmp_path):
         """Already-WAL connection must not trigger the set-pragma."""
@@ -6590,6 +6839,133 @@ class TestSessionArchive:
         assert both == {"live", "hidden"}
         assert db.session_count(include_archived=True) == 2
 
+
+class TestSessionPinAndStaleArchive:
+    """Pin as a durable keep flag + last-activity-based stale auto-archive."""
+
+    def _pinned(self, db, sid):
+        row = db._conn.execute(
+            "SELECT pinned FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        return row["pinned"] if row is not None else None
+
+    def _make_idle(self, db, sid, *, days_idle, source="cli"):
+        """A session whose latest activity was ``days_idle`` days ago."""
+        db.create_session(session_id=sid, source=source)
+        db.append_message(session_id=sid, role="user", content=f"msg {sid}")
+        old = time.time() - days_idle * 86400
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (old, sid))
+        db._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE session_id = ?", (old, sid)
+        )
+        db._conn.commit()
+
+    # ── pin flag ──────────────────────────────────────────────────────────
+    def test_set_session_pinned_roundtrip(self, db):
+        db.create_session(session_id="s1", source="cli")
+        assert db.set_session_pinned("s1", True) is True
+        assert self._pinned(db, "s1") == 1
+        assert db.set_session_pinned("s1", False) is True
+        assert self._pinned(db, "s1") == 0
+
+    def test_set_session_pinned_missing_row(self, db):
+        assert db.set_session_pinned("nope", True) is False
+
+    def test_pin_propagates_across_compression_lineage(self, db):
+        db.create_session(session_id="root", source="cli")
+        db.end_session("root", end_reason="compression")
+        db.create_session(session_id="tip", source="cli", parent_session_id="root")
+
+        # Pinning the surfaced tip pins the compressed-away root too.
+        assert db.set_session_pinned("tip", True) is True
+        assert self._pinned(db, "root") == 1
+        assert self._pinned(db, "tip") == 1
+
+    # ── stale archive ─────────────────────────────────────────────────────
+    def test_archives_only_sessions_idle_past_threshold(self, db):
+        self._make_idle(db, "stale", days_idle=5)
+        self._make_idle(db, "fresh", days_idle=1)
+
+        assert db.archive_stale_sessions(3) == 1
+        assert db.get_session("stale")["archived"] == 1
+        assert db.get_session("fresh")["archived"] == 0
+
+    def test_recency_uses_last_activity_not_creation(self, db):
+        # Created long ago, but a message landed today -> not stale.
+        db.create_session(session_id="old_but_active", source="cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 60 * 86400, "old_but_active"),
+        )
+        db._conn.commit()
+        db.append_message(
+            session_id="old_but_active", role="user", content="fresh activity"
+        )
+
+        assert db.archive_stale_sessions(3) == 0
+        assert db.get_session("old_but_active")["archived"] == 0
+
+    def test_pinned_sessions_are_spared(self, db):
+        self._make_idle(db, "keep", days_idle=10)
+        db.set_session_pinned("keep", True)
+
+        assert db.archive_stale_sessions(3) == 0
+        assert db.get_session("keep")["archived"] == 0
+        # Opting out of the pin guard sweeps it.
+        assert db.archive_stale_sessions(3, exclude_pinned=False) == 1
+        assert db.get_session("keep")["archived"] == 1
+
+    def test_already_archived_is_idempotent(self, db):
+        self._make_idle(db, "stale", days_idle=5)
+        assert db.archive_stale_sessions(3) == 1
+        assert db.archive_stale_sessions(3) == 0
+
+    def test_stale_tip_archives_whole_compression_chain(self, db):
+        # A compressed-away root is never a candidate on its own (its live
+        # continuation may be fresh); the tip drives the decision and archives
+        # the chain as a unit.
+        db.create_session(session_id="root", source="cli")
+        db.end_session("root", end_reason="compression")
+        db.create_session(session_id="tip", source="cli", parent_session_id="root")
+        old = time.time() - 9 * 86400
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id IN ('root', 'tip')", (old,)
+        )
+        db._conn.commit()
+
+        assert db.archive_stale_sessions(3) == 1  # one candidate (the tip)
+        assert db.get_session("root")["archived"] == 1
+        assert db.get_session("tip")["archived"] == 1
+
+    def test_non_positive_threshold_archives_nothing(self, db):
+        self._make_idle(db, "stale", days_idle=100)
+        assert db.archive_stale_sessions(-1) == 0
+        assert db.get_session("stale")["archived"] == 0
+
+    # ── throttled wrapper ─────────────────────────────────────────────────
+    def test_maybe_auto_archive_runs_then_throttles(self, db):
+        self._make_idle(db, "stale", days_idle=5)
+        first = db.maybe_auto_archive(idle_days=3, min_interval_hours=24)
+        assert first["skipped"] is False
+        assert first["archived"] == 1
+        assert db.get_meta("last_auto_archive") is not None
+
+        # A newly-stale session within the interval is left untouched.
+        self._make_idle(db, "stale2", days_idle=5)
+        second = db.maybe_auto_archive(idle_days=3, min_interval_hours=24)
+        assert second["skipped"] is True
+        assert second["archived"] == 0
+        assert db.get_session("stale2")["archived"] == 0
+
+    def test_maybe_auto_archive_reruns_after_interval(self, db):
+        self._make_idle(db, "stale", days_idle=5)
+        db.maybe_auto_archive(idle_days=3, min_interval_hours=24)
+        db.set_meta("last_auto_archive", str(time.time() - 48 * 3600))
+
+        self._make_idle(db, "stale2", days_idle=5)
+        result = db.maybe_auto_archive(idle_days=3, min_interval_hours=24)
+        assert result["skipped"] is False
+        assert result["archived"] == 1
 
 
 class TestSessionIdSearch:
@@ -7044,6 +7420,22 @@ def test_compression_fallback_streak_round_trips(db):
     assert db.get_compression_fallback_streak("s1") == 2
 
 
+def test_compression_ineffective_count_round_trips(db):
+    db.create_session("s1", "cli")
+
+    assert db.get_compression_ineffective_count("s1") == 0
+    db.set_compression_ineffective_count("s1", 2)
+    assert db.get_compression_ineffective_count("s1") == 2
+    # Clearing (real usage dipped below the threshold) round-trips too.
+    db.set_compression_ineffective_count("s1", 0)
+    assert db.get_compression_ineffective_count("s1") == 0
+    # Negative and missing-session inputs are normalized/ignored.
+    db.set_compression_ineffective_count("s1", -3)
+    assert db.get_compression_ineffective_count("s1") == 0
+    assert db.get_compression_ineffective_count("nope") == 0
+    assert db.get_compression_ineffective_count("") == 0
+
+
 def test_refresh_compression_lock_requires_holder_and_preserves_reclaimability(db, monkeypatch):
     db.create_session("s1", "cli")
 
@@ -7311,4 +7703,159 @@ class TestLoneSurrogatePersistence:
         db.create_session("s1", source="cli")
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
+
+
+class TestDisplayMetadataPersistence:
+    """Round-trip display_kind/display_metadata through every write path."""
+
+    def test_append_message_round_trips_display_fields(self, db):
+        db.create_session("s1", source="cli")
+        meta = {"task_count": 2, "delegation_id": "del-1"}
+        db.append_message(
+            "s1", "user", "event text",
+            display_kind="async_delegation_complete",
+            display_metadata=meta,
+        )
+        conv = db.get_messages_as_conversation("s1")
+        assert conv[0]["display_kind"] == "async_delegation_complete"
+        assert conv[0]["display_metadata"] == meta
+
+    def test_replace_messages_preserves_display_metadata(self, db):
+        db.create_session("s1", source="cli")
+        meta = {"task_count": 3, "delegation_id": "del-2", "duration_seconds": 12.5}
+        db.append_message(
+            "s1", "user", "event",
+            display_kind="async_delegation_complete",
+            display_metadata=meta,
+        )
+        # Reload via get_messages_as_conversation (which decodes display fields)
+        # then replace_messages (which re-inserts via _insert_message_rows).
+        conv = db.get_messages_as_conversation("s1")
+        db.replace_messages("s1", conv)
+        reloaded = db.get_messages_as_conversation("s1")
+        assert reloaded[0]["display_kind"] == "async_delegation_complete"
+        assert reloaded[0]["display_metadata"] == meta
+
+    def test_archive_and_compact_preserves_display_metadata(self, db):
+        db.create_session("s1", source="cli")
+        meta = {"model": "test-model", "provider": "test-provider"}
+        db.append_message(
+            "s1", "user", "switch event",
+            display_kind="model_switch",
+            display_metadata=meta,
+        )
+        db.append_message("s1", "assistant", "reply")
+        conv = db.get_messages_as_conversation("s1")
+        db.archive_and_compact("s1", conv)
+        reloaded = db.get_messages_as_conversation("s1")
+        switched = [m for m in reloaded if m.get("display_kind") == "model_switch"]
+        assert len(switched) == 1
+        assert switched[0]["display_metadata"] == meta
+
+
+class TestDisplayMetadataReadPaths:
+    """Every message read path must hand back the decoded dict.
+
+    Returning the raw column instead reaches the desktop as a string, where
+    ``'task_count' in meta`` throws and fails the whole session resume.
+    """
+
+    META = {
+        "delegation_id": "deleg_0d84d484",
+        "task_count": 1,
+        "completed_count": 1,
+        "failed_count": 0,
+        "duration_seconds": 193.55,
+    }
+
+    @staticmethod
+    def _seed(db):
+        db.create_session("s1", source="desktop")
+        message_id = db.append_message(
+            "s1", "user", "event",
+            display_kind="async_delegation_complete",
+            display_metadata=TestDisplayMetadataReadPaths.META,
+        )
+        return message_id, db.append_message("s1", "assistant", "anchor")
+
+    @staticmethod
+    def _read(db, reader, message_id, anchor_id):
+        if reader == "get_messages":
+            return db.get_messages("s1")[0]
+        if reader == "get_messages_around":
+            return db.get_messages_around("s1", message_id, window=0)["window"][0]
+        if reader == "get_anchored_view":
+            view = db.get_anchored_view("s1", anchor_id, window=0, bookend=1)
+            return view["bookend_start"][0]
+        return db.get_messages_as_conversation("s1")[0]
+
+    READERS = ("get_messages", "get_messages_around", "get_anchored_view", "conversation")
+
+    @pytest.mark.parametrize("reader", READERS)
+    def test_every_reader_decodes_display_metadata(self, db, reader):
+        message_id, anchor_id = self._seed(db)
+        assert self._read(db, reader, message_id, anchor_id)["display_metadata"] == self.META
+
+    @pytest.mark.parametrize("reader", READERS)
+    def test_every_reader_unwraps_historically_double_encoded_rows(self, db, reader):
+        """Rows written before the encode guard landed carry a second JSON layer."""
+        message_id, anchor_id = self._seed(db)
+
+        def _corrupt(conn):
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (json.dumps(json.dumps(self.META)), message_id),
+            )
+
+        db._execute_write(_corrupt)
+        assert self._read(db, reader, message_id, anchor_id)["display_metadata"] == self.META
+
+    @pytest.mark.parametrize("reader", READERS)
+    @pytest.mark.parametrize("raw", ["", "{not-json", "[]", '"text"', "0"])
+    def test_every_reader_drops_unusable_display_metadata(self, db, reader, raw):
+        """Bad presentation metadata must not take the message down with it."""
+        message_id, anchor_id = self._seed(db)
+
+        def _corrupt(conn):
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (raw, message_id),
+            )
+
+        db._execute_write(_corrupt)
+        message = self._read(db, reader, message_id, anchor_id)
+        assert message.get("display_metadata") is None
+        assert message["content"] == "event"
+
+    def test_export_import_round_trip_keeps_metadata_decodable(self, db, tmp_path):
+        """The read leak used to write a permanently double-encoded row here.
+
+        ``export_session`` reads through ``get_messages``, so an undecoded
+        string went back through ``_insert_message_rows`` and got re-dumped.
+        """
+        self._seed(db)
+        blob = db.export_session("s1")
+        assert isinstance(blob["messages"][0]["display_metadata"], dict)
+
+        target = SessionDB(db_path=tmp_path / "imported.db")
+        try:
+            target.import_sessions([json.loads(json.dumps(blob))])
+            assert target.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
+            assert target.get_messages("s1")[0]["display_metadata"] == self.META
+        finally:
+            target.close()
+
+    def test_write_paths_do_not_double_encode_serialized_metadata(self, db):
+        """Import/replace can hand us metadata that is already a JSON string."""
+        db.create_session("s1", source="cli")
+        db.replace_messages(
+            "s1",
+            [{
+                "role": "user",
+                "content": "event",
+                "display_kind": "async_delegation_complete",
+                "display_metadata": json.dumps(self.META),
+            }],
+        )
+        assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
 

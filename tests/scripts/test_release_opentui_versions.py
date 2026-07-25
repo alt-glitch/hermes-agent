@@ -23,11 +23,6 @@ def _load_release_module(monkeypatch, tmp_root: Path):
         tmp_root / "hermes_cli" / "__init__.py",
     )
     monkeypatch.setattr(module, "PYPROJECT_FILE", tmp_root / "pyproject.toml")
-    monkeypatch.setattr(
-        module,
-        "ACP_REGISTRY_MANIFEST",
-        tmp_root / "acp_registry" / "agent.json",
-    )
     return module
 
 

@@ -215,6 +215,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # OpenRouter-prefixed models resolve via OpenRouter live API or models.dev.
     "claude-fable-5": 1000000,
     "claude-fable": 1000000,
+    "claude-opus-5": 1000000,
     "claude-sonnet-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4.8": 1000000,
@@ -2201,11 +2202,18 @@ def get_model_context_length(
     # acting context, so they're ignored here.
     if (provider or "").strip().lower() == "moa":
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config import (
+                get_compatible_custom_providers,
+                load_config,
+            )
             from hermes_cli.moa_config import resolve_moa_preset
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
-            preset = resolve_moa_preset(load_config().get("moa") or {}, model)
+            config = load_config()
+            effective_custom_providers = custom_providers
+            if effective_custom_providers is None:
+                effective_custom_providers = get_compatible_custom_providers(config)
+            preset = resolve_moa_preset(config.get("moa") or {}, model)
             agg = preset.get("aggregator") or {}
             agg_provider = str(agg.get("provider") or "").strip()
             agg_model = str(agg.get("model") or "").strip()
@@ -2215,7 +2223,8 @@ def get_model_context_length(
                     agg_model,
                     base_url=rt.get("base_url", "") or "",
                     api_key=rt.get("api_key", "") or "",
-                    provider=agg_provider,
+                    provider=rt.get("provider") or agg_provider,
+                    custom_providers=effective_custom_providers,
                 )
         except Exception:
             logger.debug("MoA aggregator context-length resolution failed", exc_info=True)

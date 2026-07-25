@@ -129,6 +129,42 @@ def _render_relay_context(context: Any) -> Optional[str]:
     return f"[Recent channel messages]\n{body}"
 
 
+def _normalize_slack_parent_command(
+    text: str,
+    message_type: MessageType,
+) -> tuple[str, MessageType]:
+    """Mirror native Slack ``/hermes`` routing for authenticated relay text."""
+    stripped = text.strip()
+    parent_parts = stripped.split(maxsplit=1)
+    if not parent_parts or parent_parts[0] != "/hermes":
+        return text, message_type
+
+    from hermes_cli.commands import slack_subcommand_map
+
+    payload = parent_parts[1].strip() if len(parent_parts) > 1 else ""
+    subcommand_map = slack_subcommand_map()
+    subcommand_map["compact"] = "/compress"
+    payload_parts = payload.split() if payload else []
+    first_word = payload_parts[0] if payload_parts else ""
+
+    if first_word in subcommand_map:
+        rest = payload[len(first_word) :].strip()
+        normalized = (
+            f"{subcommand_map[first_word]} {rest}".strip()
+            if rest
+            else subcommand_map[first_word]
+        )
+    elif payload:
+        normalized = payload
+    else:
+        normalized = "/help"
+
+    normalized_type = (
+        MessageType.COMMAND if normalized.startswith("/") else MessageType.TEXT
+    )
+    return normalized, normalized_type
+
+
 def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
     """Rebuild a MessageEvent from the connector's normalized inbound payload.
 
@@ -150,7 +186,17 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         chat_type=src.get("chat_type", "dm"),
         chat_name=src.get("chat_name"),
         user_id=src.get("user_id"),
-        user_name=src.get("user_name"),
+        # Native adapters surface the human-facing DISPLAY name as user_name
+        # (e.g. Discord `message.author.display_name`); the connector sends the
+        # raw platform username as user_name plus optional user_display_name /
+        # user_handle enrichments (contract §3). Prefer the display name for
+        # parity with native lanes — session keys derive from user_id, never
+        # user_name, so this is presentation-only and key-stable.
+        user_name=(
+            src.get("user_display_name")
+            or src.get("user_name")
+            or src.get("user_handle")
+        ),
         thread_id=src.get("thread_id"),
         chat_topic=src.get("chat_topic"),
         user_id_alt=src.get("user_id_alt"),
@@ -181,8 +227,16 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
     except ValueError:
         msg_type = MessageType.TEXT
 
+    text = raw.get("text", "")
+    if platform_enum == Platform.SLACK:
+        # Team Gateway carries Slack slash text over the authenticated message
+        # relay, bypassing Hermes' native Slack command callback. Normalize at
+        # the wire boundary so adapter-level active-session gates see the real
+        # gateway command rather than the legacy `hermes` parent name.
+        text, msg_type = _normalize_slack_parent_command(text, msg_type)
+
     return MessageEvent(
-        text=raw.get("text", ""),
+        text=text,
         message_type=msg_type,
         source=source,
         message_id=raw.get("message_id"),

@@ -85,7 +85,7 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
         heartbeat_seen.set()
         return updated
 
-    def _blocking_script(_script_path: str) -> tuple[bool, str]:
+    def _blocking_script(_script_path: str, **kwargs) -> tuple[bool, str]:
         assert heartbeat_seen.wait(timeout=2), (
             "claim was not refreshed while script blocked"
         )
@@ -158,7 +158,7 @@ def test_script_heartbeat_stops_when_captured_token_loses_ownership(
         heartbeat_seen.set()
         return updated
 
-    def _blocking_script(_script_path: str) -> tuple[bool, str]:
+    def _blocking_script(_script_path: str, **kwargs) -> tuple[bool, str]:
         assert heartbeat_seen.wait(timeout=2)
         return True, "done"
 

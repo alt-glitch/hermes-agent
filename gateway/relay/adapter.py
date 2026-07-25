@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, Optional
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.relay.descriptor import CapabilityDescriptor
+from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
 from gateway.session import SessionSource
 
@@ -87,6 +88,13 @@ class RelayAdapter(BasePlatformAdapter):
         # non-retryable "relay disabled" fatal so the dashboard stops showing a
         # red "retrying" spin against a dead credential.
         self._revocation_monitor: Optional[asyncio.Task[None]] = None
+        # Phase 2 media: the authenticated client for the connector's
+        # /relay/media routes (upload for send_media source_url; download for
+        # inbound re-hosted attachments → local paths the vision/file tools
+        # consume). Built lazily from the relay dial URL + per-gateway creds;
+        # None when either is absent (media lanes then degrade to the
+        # pre-media text fallbacks).
+        self._media_client: Optional["RelayMediaClient"] = None
 
     # ── capability surface (from descriptor) ─────────────────────────────
     @property
@@ -227,7 +235,48 @@ class RelayAdapter(BasePlatformAdapter):
     async def _on_inbound(self, event) -> None:
         """Bridge a connector-delivered MessageEvent into the normal adapter path."""
         self._capture_scope(event)
+        await self._localize_inbound_media(event)
         await self.handle_message(event)
+
+    async def _localize_inbound_media(self, event) -> None:
+        """Download connector re-hosted attachments to local temp paths.
+
+        The wire's ``media_urls`` name connector re-hosts
+        (``{connector}/relay/media/{id}``, per-gateway-bearer-authenticated) or
+        public platform CDN URLs (Discord pass-through). Every NATIVE adapter
+        presents inbound media to the agent as LOCAL FILE PATHS (the vision /
+        file tools consume paths, and an authenticated URL would be useless in
+        the agent's context anyway) — so mirror that here: fetch each URL and
+        swap the list entries for temp paths. Best-effort per entry: a failed
+        download drops that entry (never the message); no client ⇒ only
+        re-host URLs are dropped (they'd 401 for every consumer downstream),
+        public URLs stay.
+        """
+        try:
+            urls = list(getattr(event, "media_urls", None) or [])
+            if not urls:
+                return
+            client = self._get_media_client()
+            localized: list[str] = []
+            for url in urls:
+                if not isinstance(url, str) or not url:
+                    continue
+                if client is None:
+                    # No authenticated client: keep public URLs, drop re-hosts.
+                    if "/relay/media/" not in url:
+                        localized.append(url)
+                    continue
+                path = await client.download(url)
+                if path:
+                    localized.append(path)
+                elif "/relay/media/" not in url:
+                    # A public URL that failed to download still has value as
+                    # a URL (native adapters pass URLs to vision in some
+                    # lanes); a dead re-host reference does not.
+                    localized.append(url)
+            event.media_urls = localized
+        except Exception:  # noqa: BLE001 - media localization must never break inbound
+            logger.debug("relay inbound media localization failed", exc_info=True)
 
     def _capture_scope(self, event) -> None:
         """Remember a chat_id's egress discriminator from an inbound event so our
@@ -319,16 +368,24 @@ class RelayAdapter(BasePlatformAdapter):
                 meta["user_id"] = author
         return meta
 
-    def _platform_is_fronted(self, platform: str) -> bool:
-        """Whether ``platform`` is one of the platforms this gateway fronts over
-        the relay (Phase 1.5). Reads the transport's advertised identity set; used
-        to decide whether a follow-up's platform-prefixed `kind` names a real
-        fronted platform worth tagging on the frame (vs. leaving egress to the
-        session default). Safe when the transport is absent or single-identity."""
+    def fronts_platform(self, platform: Any) -> bool:
+        """Whether the authenticated relay transport advertises ``platform``.
+
+        This is the restart-safe delivery ownership signal: it comes from the
+        configured identity set sent during handshake, not from an inbound
+        chat cache learned only after a user sends another message.
+        """
+        platform_value = getattr(platform, "value", platform)
+        if not platform_value:
+            return False
         ids = getattr(self._transport, "_identities", None)
         if not ids:
             return False
-        return any(p == platform for p, _ in ids)
+        return any(p == str(platform_value) for p, _ in ids)
+
+    def _platform_is_fronted(self, platform: str) -> bool:
+        """Backward-compatible internal alias for follow-up routing."""
+        return self.fronts_platform(platform)
 
     async def on_interrupt(self, session_key: str, chat_id: str) -> None:
         """Bridge a connector-delivered /stop into the adapter's interrupt path.
@@ -361,12 +418,13 @@ class RelayAdapter(BasePlatformAdapter):
 
         NEVER raises: a malformed forward must not kill the read loop.
 
-        NOTE (open semantic sub-design, flagged for review): the interaction ->
-        MessageEvent mapping below is the v1 default. The exact agent UX for a
-        slash-command / button interaction (vs. a plain message) — command name
-        surfacing, option rendering, deferred-vs-immediate response — is the open
-        piece tracked in the spec; the TRANSPORT + receive mechanism (this whole
-        path) is settled.
+        Interaction -> MessageEvent command mapping (formerly flagged here as an
+        open sub-design, now implemented): an APPLICATION_COMMAND interaction is
+        normalized to a leading-slash COMMAND event ("/name arg…", mirroring the
+        connector's Slack slash-command lane, normalizeSlackCommand), so the
+        dispatcher routes it as a command instead of plain chat. Component
+        interactions (custom_id) still surface as best-effort TEXT; the
+        deferred-vs-immediate response UX remains connector-side.
         """
         try:
             platform = getattr(forward, "platform", "") or ""
@@ -409,8 +467,21 @@ class RelayAdapter(BasePlatformAdapter):
         # 3 = MESSAGE_COMPONENT; 5 = MODAL_SUBMIT. Surface a best-effort text.
         itype = payload.get("type")
         data = payload.get("data") or {}
+        message_type = MessageType.TEXT
         if itype == 2:
-            text = str(data.get("name") or "")
+            # Normalize a real slash-command interaction to a leading-slash
+            # command string — the shape the dispatcher (MessageEvent.is_command:
+            # text.startswith("/")) and the native Discord adapter's
+            # _run_simple_slash lane (f"/model {name}".strip()) both expect.
+            # Options render space-separated: scalar options contribute their
+            # value; SUB_COMMAND/SUB_COMMAND_GROUP (types 1/2) contribute their
+            # name then their nested options. Mirrors the connector's Slack
+            # slash lane (normalizeSlackCommand: `${command} ${args}`.trim()).
+            text = ("/" + str(data.get("name") or "")).rstrip("/") or ""
+            if text:
+                parts = [text] + self._render_interaction_options(data.get("options"))
+                text = " ".join(parts).strip()
+                message_type = MessageType.COMMAND
         elif itype == 3:
             text = str(data.get("custom_id") or "")
         else:
@@ -428,7 +499,36 @@ class RelayAdapter(BasePlatformAdapter):
             scope_id=str(guild_id) if guild_id else None,  # Discord guild → generic scope slot
             message_id=str(payload.get("id")) if payload.get("id") else None,
         )
-        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+        return MessageEvent(text=text, message_type=message_type, source=source)
+
+    @staticmethod
+    def _render_interaction_options(options) -> list:
+        """Render Discord interaction options to space-separated text parts.
+
+        Discord's `data.options` is a list of {name, value, type}. Scalar
+        options (STRING/INTEGER/BOOLEAN/…) contribute just their value —
+        matching the native adapter's `f"/model {name}".strip()` shape, where
+        only the value follows the command. SUB_COMMAND (1) and
+        SUB_COMMAND_GROUP (2) contribute their *name* then recurse into their
+        nested `options` list (one level of nesting per Discord's schema:
+        group -> subcommand -> scalars).
+        """
+        parts: list = []
+        if not isinstance(options, list):
+            return parts
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            if opt.get("type") in (1, 2):  # SUB_COMMAND / SUB_COMMAND_GROUP
+                sub_name = str(opt.get("name") or "").strip()
+                if sub_name:
+                    parts.append(sub_name)
+                parts.extend(RelayAdapter._render_interaction_options(opt.get("options")))
+            else:
+                value = opt.get("value")
+                if value is not None and str(value).strip():
+                    parts.append(str(value).strip())
+        return parts
 
     async def disconnect(self) -> None:
         # Phase 7 Unit 7d-B: stop the revocation monitor first so it can't fire a
@@ -488,13 +588,27 @@ class RelayAdapter(BasePlatformAdapter):
             logger.debug("relay go_dormant failed", exc_info=True)
             return False
 
-    async def send(
+    async def send_for_platform(
         self,
+        logical_platform: Any,
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        """Send to an explicitly advertised logical platform over Relay.
+
+        Scheduled and persisted-home deliveries have no fresh inbound event to
+        populate ``_platform_by_chat``. The shared delivery resolver calls this
+        method only after ``fronts_platform`` succeeds, and this method repeats
+        that check fail-closed before stamping the outbound frame.
+        """
+        platform_value = getattr(logical_platform, "value", logical_platform)
+        if not self.fronts_platform(platform_value):
+            return SendResult(
+                success=False,
+                error=f"relay does not front platform {platform_value}",
+            )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._transport.send_outbound(
@@ -505,6 +619,42 @@ class RelayAdapter(BasePlatformAdapter):
                 "reply_to": reply_to,
                 "metadata": self._with_scope(chat_id, metadata),
             },
+            platform=str(platform_value),
+        )
+        return SendResult(
+            success=bool(result.get("success")),
+            message_id=result.get("message_id"),
+            error=result.get("error"),
+            raw_response=result,
+        )
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        send_metadata = dict(metadata or {})
+        explicit_platform = send_metadata.pop("_relay_logical_platform", None)
+        if explicit_platform:
+            return await self.send_for_platform(
+                explicit_platform,
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=send_metadata or None,
+            )
+        if self._transport is None:
+            return SendResult(success=False, error="no transport")
+        result = await self._transport.send_outbound(
+            {
+                "op": "send",
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": self._with_scope(chat_id, send_metadata),
+            },
             platform=self._platform_by_chat.get(str(chat_id)),
         )
         return SendResult(
@@ -513,9 +663,119 @@ class RelayAdapter(BasePlatformAdapter):
             error=result.get("error"),
         )
 
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Edit a relayed message through the connector-owned platform API."""
+        if self._transport is None:
+            return SendResult(success=False, error="no transport")
+        result = await self._transport.send_outbound(
+            {
+                "op": "edit",
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": self._with_scope(chat_id, metadata),
+            },
+            platform=self._platform_by_chat.get(str(chat_id)),
+        )
+        return SendResult(
+            success=bool(result.get("success")),
+            message_id=result.get("message_id") or message_id,
+            error=result.get("error"),
+        )
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Egress a typing indicator through the connector.
+
+        The base class spawns ``_keep_typing`` for every adapter (a 2s refresh
+        loop for the life of the turn), but the relay adapter inherited the
+        base no-op ``send_typing`` — so hosted/relay chats never showed
+        "is typing…" even though the wire contract (``OutboundOp "typing"``)
+        and every connector-side sender (Discord ``POST /channels/{id}/typing``,
+        Telegram ``sendChatAction``, Signal ``sendTyping``, Slack assistant
+        status) already implement it. This bridges the loop's tick onto the
+        existing outbound frame.
+
+        Two details are load-bearing, mirroring ``send()``:
+          - ``_with_scope``: the connector's egress guard wraps ALL ops
+            (routedEgressGuard), so a typing frame without a resolvable tenant
+            discriminator (metadata.scope_id, or user_id for DMs) is declined
+            exactly like a bare send would be.
+          - the per-frame ``platform`` tag (Phase 1.5): a multi-platform
+            gateway must egress typing through the platform the chat lives on.
+
+        Best-effort: failures are swallowed (``_keep_typing`` already treats
+        send_typing errors as non-fatal, and an older connector that rejects
+        the op just returns an unsuccessful result we ignore). Each call is
+        one-shot — Discord/Telegram indicators self-expire and need no cleanup;
+        Slack Assistant status persists, so ``stop_typing`` below sends an
+        explicit clear for Slack only.
+        """
+        if self._transport is None:
+            return
+        try:
+            await self._transport.send_outbound(
+                {
+                    "op": "typing",
+                    "chat_id": chat_id,
+                    "metadata": self._with_scope(chat_id, metadata),
+                },
+                platform=self._platform_by_chat.get(str(chat_id)),
+            )
+        except Exception:  # noqa: BLE001 - typing is cosmetic, never breaks a turn
+            logger.debug("relay send_typing failed for %s", chat_id, exc_info=True)
+
+    async def stop_typing(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Forward an explicit typing/status clear to the connector.
+
+        Slack Assistant status persists until explicitly cleared (empty
+        ``content`` on the ``typing`` op). Other relay senders expose only
+        one-shot typing heartbeats; sending an empty heartbeat there would
+        incorrectly re-trigger typing at completion, so this is Slack-gated.
+
+        NOTE (deploy order): a connector older than gateway-gateway #154
+        hardcodes ``status: "is typing…"`` for the typing op, so an empty
+        clear frame would SET the status instead of clearing it. Deploy the
+        connector first. Best-effort like ``send_typing``: status clearing is
+        cosmetic and must never break turn completion.
+        """
+        if self._transport is None:
+            return
+        platform = self._platform_by_chat.get(str(chat_id))
+        if platform != Platform.SLACK.value:
+            return
+        try:
+            await self._transport.send_outbound(
+                {
+                    "op": "typing",
+                    "chat_id": chat_id,
+                    "content": "",
+                    "metadata": self._with_scope(chat_id, metadata),
+                },
+                platform=platform,
+            )
+        except Exception:  # noqa: BLE001 - status clear is cosmetic, never breaks a turn
+            logger.debug("relay stop_typing failed for %s", chat_id, exc_info=True)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         # Proxied to the connector (it owns the platform connection / cache).
-        if self._transport is None:
+        # Gated on op-level capability discovery: a connector that doesn't
+        # advertise get_chat_info in supported_ops (including every legacy
+        # connector, where supported_ops is empty and the LEGACY_OPS set
+        # applies) would only return "unsupported op", so skip the round trip
+        # and answer with the same local fallback the error path produced.
+        if self._transport is None or not self.descriptor.supports_op("get_chat_info"):
             return {"name": chat_id, "type": "dm"}
         return await self._transport.get_chat_info(chat_id)
 
@@ -560,4 +820,234 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
             error=result.get("error"),
+        )
+
+    # ── Phase 2 media ─────────────────────────────────────────────────────
+
+    def _get_media_client(self) -> Optional[RelayMediaClient]:
+        """Lazily build the authenticated /relay/media client.
+
+        Uses the SAME connector base URL the WS dials and the SAME per-gateway
+        (id, secret) the upgrade authenticates with — no new configuration.
+        None when either is unavailable (unenrolled/dev), and every media lane
+        then degrades to its pre-media fallback.
+        """
+        if self._media_client is not None:
+            return self._media_client
+        try:
+            from gateway.relay import relay_connection_auth, relay_url
+            from gateway.relay.media import media_base_url
+
+            url = relay_url()
+            gateway_id, secret = relay_connection_auth()
+            if not url:
+                return None
+            client = RelayMediaClient(media_base_url(url), gateway_id, secret)
+            if not client.enabled:
+                return None
+            self._media_client = client
+            return client
+        except Exception:  # noqa: BLE001 - media plumbing must never break the adapter
+            logger.debug("relay media client init failed", exc_info=True)
+            return None
+
+    async def _send_media(
+        self,
+        chat_id: str,
+        *,
+        media_kind: str,
+        source: str,
+        source_is_path: bool,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Egress one media object via the connector's ``send_media`` op.
+
+        ``source`` is either a LOCAL file path (uploaded to the connector's
+        /relay/media first — the connector cannot reach our filesystem) or an
+        already-public URL (fal.media output etc. — passed through; the
+        connector downloads it directly).
+
+        Returns None when the lane is unavailable (op not advertised, no
+        transport, upload failed) so each caller can fall back to its
+        pre-media behaviour — media delivery is progressive enhancement,
+        never a regression when the connector predates the op.
+        """
+        if self._transport is None or not self.descriptor.supports_op("send_media"):
+            return None
+        source_url = source
+        if source_is_path:
+            client = self._get_media_client()
+            if client is None:
+                return None
+            uploaded = await client.upload(source, filename=filename)
+            if not uploaded:
+                return None
+            source_url = uploaded
+        action: Dict[str, Any] = {
+            "op": "send_media",
+            "chat_id": chat_id,
+            "media_kind": media_kind,
+            "source_url": source_url,
+            "content": caption or "",
+            "reply_to": reply_to,
+            "metadata": self._with_scope(chat_id, metadata),
+        }
+        if filename:
+            action["filename"] = filename
+        try:
+            result = await self._transport.send_outbound(
+                action,
+                platform=self._platform_by_chat.get(str(chat_id)),
+            )
+        except Exception:  # noqa: BLE001 - transport failure degrades to the caller's fallback
+            logger.debug("relay send_media transport failure", exc_info=True)
+            return None
+        if not result.get("success"):
+            # A structured connector decline (size cap, platform rejection).
+            # Surface it as a failed lane so the caller's fallback still
+            # delivers SOMETHING (the caption/notice), mirroring native
+            # adapters' upload-failure paths.
+            logger.warning(
+                "relay send_media declined for %s: %s",
+                chat_id,
+                result.get("error"),
+            )
+            return None
+        return SendResult(
+            success=True,
+            message_id=result.get("message_id"),
+            raw_response=result,
+        )
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an image (public URL) as a native attachment via the connector."""
+        result = await self._send_media(
+            chat_id,
+            media_kind="image",
+            source=image_url,
+            source_is_path=False,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if result is not None:
+            return result
+        return await super().send_image(
+            chat_id, image_url, caption=caption, reply_to=reply_to, metadata=metadata
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local image file natively (upload → send_media)."""
+        result = await self._send_media(
+            chat_id,
+            media_kind="image",
+            source=image_path,
+            source_is_path=True,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if result is not None:
+            return result
+        return await super().send_image_file(
+            chat_id, image_path, caption=caption, reply_to=reply_to,
+            metadata=metadata, **kwargs,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local audio file as a native voice message (upload → send_media)."""
+        result = await self._send_media(
+            chat_id,
+            media_kind="voice",
+            source=audio_path,
+            source_is_path=True,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if result is not None:
+            return result
+        return await super().send_voice(
+            chat_id, audio_path, caption=caption, reply_to=reply_to,
+            metadata=metadata, **kwargs,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local video file natively (upload → send_media)."""
+        result = await self._send_media(
+            chat_id,
+            media_kind="video",
+            source=video_path,
+            source_is_path=True,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if result is not None:
+            return result
+        return await super().send_video(
+            chat_id, video_path, caption=caption, reply_to=reply_to,
+            metadata=metadata, **kwargs,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local file as a downloadable attachment (upload → send_media)."""
+        result = await self._send_media(
+            chat_id,
+            media_kind="document",
+            source=file_path,
+            source_is_path=True,
+            caption=caption,
+            filename=file_name,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if result is not None:
+            return result
+        return await super().send_document(
+            chat_id, file_path, caption=caption, file_name=file_name,
+            reply_to=reply_to, metadata=metadata, **kwargs,
         )

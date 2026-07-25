@@ -316,6 +316,35 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     )
 
 
+def test_durable_message_committed_before_lease_aborts_stale_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A durable row absent from the caller snapshot must survive in the parent."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "PRE_LEASE_DURABLE_RACE"
+    db.create_session(parent_sid, source="webui")
+    db.append_message(parent_sid, "user", "old durable")
+
+    # Frontend takes its snapshot, then another producer commits before this
+    # compressor acquires the lease.
+    stale_snapshot = [{"role": "user", "content": "old durable"}]
+    db.append_message(parent_sid, "assistant", "late committed before lease")
+    agent = _build_agent_with_db(db, parent_sid)
+
+    returned, _system_prompt = agent._compress_context(
+        stale_snapshot, "sys", approx_tokens=120_000
+    )
+
+    assert returned is stale_snapshot
+    assert agent.session_id == parent_sid
+    assert db.find_live_compression_child(parent_sid) is None
+    assert [m["content"] for m in db.get_messages_as_conversation(parent_sid)] == [
+        "old durable",
+        "late committed before lease",
+    ]
+    agent.context_compressor.compress.assert_not_called()
+
+
 def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     """The loser of the lock race must return its input messages verbatim.
 
@@ -342,6 +371,229 @@ def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     assert compressed is messages or compressed == messages
     assert agent.session_id == parent_sid
     # Compressor was never called (the skip happens before .compress())
+    agent.context_compressor.compress.assert_not_called()
+
+
+def test_cancelled_commit_fence_blocks_late_session_db_compaction(
+    tmp_path: Path,
+) -> None:
+    """A worker cancelled during summarization must not mutate SessionDB later."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "HYGIENE_TIMEOUT_SESSION"
+    db.create_session(session_id, source="telegram")
+
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+    agent._cached_system_prompt = "sys"
+    agent._last_compaction_in_place = True
+    summary_started = threading.Event()
+    release_summary = threading.Event()
+
+    def _slow_summary(*_args, **_kwargs):
+        summary_started.set()
+        assert release_summary.wait(timeout=5)
+        return [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "tail"},
+        ]
+
+    agent.context_compressor.compress.side_effect = _slow_summary
+    archive_spy = MagicMock(wraps=db.archive_and_compact)
+    db.archive_and_compact = archive_spy
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    fence = CompressionCommitFence()
+    result = {}
+    errors = []
+
+    def _run_compression() -> None:
+        try:
+            result["value"] = agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=120_000,
+                commit_fence=fence,
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    worker = threading.Thread(target=_run_compression, name="timed-out-hygiene")
+    worker.start()
+    assert summary_started.wait(timeout=2)
+
+    assert fence.cancel_before_commit() is True
+    release_summary.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert errors == []
+    compressed, _prompt = result["value"]
+    assert compressed is messages
+    assert agent.session_id == session_id
+    assert agent._last_compaction_in_place is False
+    archive_spy.assert_not_called()
+    assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) -> None:
+    """A fence-cancelled attempt must not poison the per-session lock.
+
+    Lock-release verification for the hygiene-timeout path: after the gateway
+    times out and cancels a hygiene compression at the commit fence, the very
+    next attempt on the same session (e.g. the user running ``/compress``)
+    must acquire the compression lock and commit normally. A leaked lock here
+    would silently block every future compaction for the session until TTL
+    expiry.
+    """
+    from agent.conversation_compression import CompressionCommitFence
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "HYGIENE_LOCK_REACQUIRE"
+    db.create_session(session_id, source="telegram")
+
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+    agent._cached_system_prompt = "sys"
+    summary_started = threading.Event()
+    release_summary = threading.Event()
+
+    def _slow_summary(*_args, **_kwargs):
+        summary_started.set()
+        assert release_summary.wait(timeout=5)
+        return [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "tail"},
+        ]
+
+    agent.context_compressor.compress.side_effect = _slow_summary
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    fence = CompressionCommitFence()
+    result = {}
+
+    def _run_compression() -> None:
+        result["value"] = agent._compress_context(
+            messages,
+            "sys",
+            approx_tokens=120_000,
+            commit_fence=fence,
+        )
+
+    worker = threading.Thread(target=_run_compression, name="fenced-hygiene")
+    worker.start()
+    assert summary_started.wait(timeout=2)
+    assert fence.cancel_before_commit() is True
+    release_summary.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    # Cancelled attempt: no mutation, and — the invariant under test — the
+    # per-session compression lock is fully released.
+    assert result["value"][0] is messages
+    assert db.get_compression_lock_holder(session_id) is None
+
+    # The NEXT attempt (no fence — a manual /compress retry) must be able to
+    # acquire the lock and commit an in-place compaction normally.
+    agent.context_compressor.compress.side_effect = lambda *_a, **_kw: [
+        {"role": "user", "content": "[CONTEXT COMPACTION] retry summary"},
+        {"role": "user", "content": "tail"},
+    ]
+    retried, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    assert retried is not messages
+    assert len(retried) < len(messages)
+    assert agent.session_id == session_id  # in-place: same session id
+    assert agent._last_compaction_in_place is True
+    assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_commit_fence_waits_for_an_active_commit() -> None:
+    """A timeout that loses the fence race cannot overlap the live turn."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    fence = CompressionCommitFence()
+    assert fence.begin_commit() is True
+    assert fence.try_cancel_before_commit() is None
+    cancel_started = threading.Event()
+    cancel_finished = threading.Event()
+    result = {}
+
+    def _cancel() -> None:
+        cancel_started.set()
+        result["cancelled"] = fence.cancel_before_commit()
+        cancel_finished.set()
+
+    waiter = threading.Thread(target=_cancel, name="hygiene-timeout-fence")
+    waiter.start()
+    try:
+        assert cancel_started.wait(timeout=2)
+        assert not cancel_finished.is_set()
+    finally:
+        fence.finish_commit()
+    waiter.join(timeout=2)
+
+    assert not waiter.is_alive()
+    assert result["cancelled"] is False
+
+
+def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
+    """A stale agent must continue on the winner's compacted child transcript."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "STALE_PARENT"
+    child_sid = "CANONICAL_CHILD"
+    db.create_session(parent_sid, source="webui")
+    db.end_session(parent_sid, "compression")
+    db.create_session(child_sid, source="webui", parent_session_id=parent_sid)
+    compacted = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+        {"role": "assistant", "content": "compacted tail"},
+    ]
+    db.replace_messages(child_sid, compacted)
+
+    agent = _build_agent_with_db(db, parent_sid)
+    stale_messages = [
+        {"role": "user", "content": "stale"},
+        {"role": "assistant", "content": "x" * 1000},
+    ]
+    recovered, _system_prompt = agent._compress_context(
+        stale_messages, "sys", approx_tokens=120_000
+    )
+
+    assert agent.session_id == child_sid
+    assert [(m["role"], m["content"]) for m in recovered] == [
+        ("user", "[CONTEXT COMPACTION] summary"),
+        ("assistant", "compacted tail"),
+    ]
+    assert agent._session_db_created is True
+    assert agent._flushed_db_message_session_id == child_sid
+    assert agent._last_flushed_db_idx == len(recovered)
+    agent.context_compressor.compress.assert_not_called()
+    lifecycle_args, lifecycle_kwargs = agent.context_compressor.on_session_start.call_args
+    assert lifecycle_args == (child_sid,)
+    assert lifecycle_kwargs["boundary_reason"] == "compression"
+    assert lifecycle_kwargs["old_session_id"] == parent_sid
+    assert lifecycle_kwargs["session_db"] is db
+
+
+def test_delayed_contender_fails_closed_without_unique_child(tmp_path: Path) -> None:
+    """Missing or ambiguous lineage must not silently select a continuation."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "AMBIGUOUS_PARENT"
+    db.create_session(parent_sid, source="webui")
+    db.end_session(parent_sid, "compression")
+    db.create_session("CHILD_A", source="webui", parent_session_id=parent_sid)
+    db.create_session("CHILD_B", source="webui", parent_session_id=parent_sid)
+    db.replace_messages("CHILD_A", [{"role": "user", "content": "a"}])
+    db.replace_messages("CHILD_B", [{"role": "user", "content": "b"}])
+    agent = _build_agent_with_db(db, parent_sid)
+    stale_messages = [{"role": "user", "content": "stale"}]
+
+    returned, _system_prompt = agent._compress_context(
+        stale_messages, "sys", approx_tokens=120_000
+    )
+
+    assert returned is stale_messages or returned == stale_messages
+    assert agent.session_id == parent_sid
     agent.context_compressor.compress.assert_not_called()
 
 
