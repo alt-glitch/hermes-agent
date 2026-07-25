@@ -773,15 +773,23 @@ describe('session store — billing wall confirm (upstream 960d339f86f + 9c274db
     store.apply({ type: 'message.delta', payload: { text: 'partial…' } })
     store.apply({
       type: 'message.complete',
-      payload: { billing: nousBlock, failure_reason: 'billing', text: 'Billing or credits exhausted: full guidance' }
+      payload: {
+        billing: nousBlock,
+        error: 'insufficient credits',
+        failure_reason: 'billing',
+        recoverable: true,
+        status: 'error',
+        text: 'Billing or credits exhausted: full guidance'
+      }
     })
     // turn-completion ordering: spinner stopped, turn settled, no streaming row
     expect(store.state.info.running).toBe(false)
     expect(store.state.status).toBeUndefined()
-    const assistant = store.state.messages.at(-1)
+    const assistant = store.state.messages.find(message => message.role === 'assistant')
     expect(assistant?.streaming).toBe(false)
     // the FULL provider guidance stays in the transcript…
     expect(assistant?.parts?.some(part => part.type === 'text' && part.text.includes('full guidance'))).toBe(true)
+    expect(store.state.messages.some(message => message.text === 'error: insufficient credits')).toBe(true)
     // …and the concise actionable dialog sits on top (Ink billingDialog copy)
     const confirm = activeConfirm(store)
     expect(confirm.spec).toMatchObject({

@@ -2273,13 +2273,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // Terminal error frame (upstream 57b351d3689/b8675a18990): the
         // structured status/error/partial fields drive the failure state —
         // free-form text is never re-classified. `partial` marks `text` as
-        // streamed output to keep visible; without it, `text` is the gateway's
-        // "Error: <detail>" string and must NOT settle as a healthy reply.
+        // streamed output to keep visible. Billing failures are the other
+        // structured exception: their `billing` descriptor proves the frame's
+        // `text` is full recovery guidance, while `error` carries the short
+        // failure detail. Other non-partial error text must NOT settle as a
+        // healthy reply.
         const failure =
           event.payload?.status === 'error'
             ? {
                 message: event.payload.error?.trim() || event.payload.text?.trim() || 'turn failed',
-                partialText: event.payload.partial === true ? event.payload.text : undefined
+                partialText:
+                  event.payload.partial === true || event.payload.billing !== undefined ? event.payload.text : undefined
               }
             : undefined
         if (event.payload?.reasoning) {
