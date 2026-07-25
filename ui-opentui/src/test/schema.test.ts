@@ -224,6 +224,40 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
+  test('decodes terminal error frame fields on message.complete (upstream 57b351d3689)', () => {
+    const ev = decode({
+      type: 'message.complete',
+      session_id: 'live-1',
+      payload: {
+        error: 'provider exploded',
+        partial: true,
+        recoverable: true,
+        status: 'error',
+        text: 'streamed partial output',
+        usage: { total: 12 }
+      }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'message.complete') {
+      expect(ev.value.payload?.status).toBe('error')
+      expect(ev.value.payload?.error).toBe('provider exploded')
+      expect(ev.value.payload?.recoverable).toBe(true)
+      expect(ev.value.payload?.partial).toBe(true)
+      // partial output + usage ride the same payload — never dropped
+      expect(ev.value.payload?.text).toBe('streamed partial output')
+    }
+  })
+
+  test('message.complete without terminal error fields still decodes (older gateways)', () => {
+    const ev = decode({ type: 'message.complete', payload: { text: 'healthy answer' } })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'message.complete') {
+      expect(ev.value.payload?.status).toBeUndefined()
+      expect(ev.value.payload?.error).toBeUndefined()
+      expect(ev.value.payload?.partial).toBeUndefined()
+    }
+  })
+
   test('decodes a Nous billing block with a null billing_url (in-app recovery route)', () => {
     const ev = decode({
       type: 'message.complete',

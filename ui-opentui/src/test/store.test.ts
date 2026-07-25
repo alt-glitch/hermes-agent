@@ -1290,6 +1290,98 @@ describe('session store — gateway lifecycle / transport errors (auto-heal foun
   })
 })
 
+describe('session store — terminal error frames (upstream 57b351d3689/b8675a18990)', () => {
+  test('a status:error frame never settles the error text as a healthy reply', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({
+      type: 'message.complete',
+      payload: { error: 'provider exploded', recoverable: true, status: 'error', text: 'Error: provider exploded' }
+    })
+    // the empty caret row is removed, not filled with the "Error: …" string
+    expect(store.state.messages.some(message => message.role === 'assistant')).toBe(false)
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: provider exploded' })
+    expect(store.state.info.running).toBe(false)
+    expect(store.state.status).toBeUndefined()
+  })
+
+  test('a partial failure keeps its streamed text visible as a settled failed turn', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'partial answer' } })
+    store.apply({
+      type: 'message.complete',
+      payload: { error: 'stream cut', partial: true, recoverable: true, status: 'error', text: 'partial answer' }
+    })
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    // no duplicate assistant turn — the live row settles in place
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]).toMatchObject({ role: 'assistant', streaming: false })
+    expect(assistants[0]?.parts).toEqual([expect.objectContaining({ type: 'text', text: 'partial answer' })])
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: stream cut' })
+  })
+
+  test('an error frame after message.start leaves the drain to authoritative session.info (once)', () => {
+    const store = createSessionStore()
+    const settled = vi.fn()
+    store.registerTurnCompleteHandler(settled)
+    store.apply({ type: 'message.start' })
+    store.apply({
+      type: 'message.complete',
+      payload: { error: 'turn failed', recoverable: true, status: 'error', text: 'Error: turn failed' }
+    })
+    expect(store.state.info.running).toBe(false)
+    expect(store.isTurnInFlight()).toBe(true)
+    expect(settled).not.toHaveBeenCalled()
+    store.apply({ type: 'session.info', payload: { running: false } })
+    expect(settled).toHaveBeenCalledTimes(1)
+  })
+
+  test('a pre-start terminal error frame settles optimistic busy and drains exactly once', () => {
+    const store = createSessionStore()
+    const settled = vi.fn()
+    store.registerTurnCompleteHandler(settled)
+    store.applyInfo({ running: true }) // optimistic submit flag; agent build failed before message.start
+    store.apply({
+      type: 'message.complete',
+      payload: {
+        error: 'agent initialization failed',
+        recoverable: true,
+        status: 'error',
+        text: 'Error: agent initialization failed'
+      }
+    })
+    expect(store.state.info.running).toBe(false)
+    expect(store.isTurnInFlight()).toBe(false)
+    expect(settled).toHaveBeenCalledTimes(1)
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: agent initialization failed' })
+    // the trailing session.info the gateway emits after this frame must not double-drain
+    store.apply({ type: 'session.info', payload: { running: false } })
+    expect(settled).toHaveBeenCalledTimes(1)
+  })
+
+  test('an error frame with no error field falls back to the frame text for the failure row', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { status: 'error', text: 'Error: boom' } })
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: Error: boom' })
+  })
+
+  test('a healthy message.complete is untouched by the terminal-frame path', () => {
+    const store = createSessionStore()
+    const settled = vi.fn()
+    store.registerTurnCompleteHandler(settled)
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { text: 'all good' } })
+    const assistant = store.state.messages.find(message => message.role === 'assistant')
+    expect(assistant).toMatchObject({ role: 'assistant', streaming: false })
+    expect(assistant?.parts).toEqual([expect.objectContaining({ type: 'text', text: 'all good' })])
+    expect(store.state.messages.filter(message => message.role === 'system')).toHaveLength(0)
+    // healthy completes never fire the pre-start drain; session.info owns it
+    expect(settled).not.toHaveBeenCalled()
+  })
+})
+
 describe('session store — resume hydrate (Phase 4b)', () => {
   test('beginBuffer + commitSnapshot replaces history then replays events buffered across the resume', () => {
     const store = createSessionStore()

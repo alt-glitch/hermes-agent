@@ -110,6 +110,16 @@ const MessageComplete = Schema.Struct({
       rendered: opt(Str),
       reasoning: opt(Str),
       response_previewed: opt(Schema.Boolean),
+      // Terminal error frame (upstream 57b351d3689): status "error" closes a
+      // failed turn through the SAME message.complete shape as success. `error`
+      // is the failure message; `partial` marks `text` as streamed output to
+      // keep visible (not the error string); `recoverable` says the gateway
+      // retained the failed turn for session.resume replay. All additive +
+      // optional — an older gateway's frames decode unchanged.
+      status: opt(Str),
+      error: opt(Str),
+      partial: opt(Schema.Boolean),
+      recoverable: opt(Schema.Boolean),
       usage: opt(Schema.Record(Str, Schema.Unknown))
     })
   )

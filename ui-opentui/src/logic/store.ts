@@ -2268,8 +2268,20 @@ export function createSessionStore(options?: SessionStoreOptions) {
         )
         break
       }
-      case 'message.complete':
+      case 'message.complete': {
         settlePendingSteers(event.payload?.client_submission_ids)
+        // Terminal error frame (upstream 57b351d3689/b8675a18990): the
+        // structured status/error/partial fields drive the failure state —
+        // free-form text is never re-classified. `partial` marks `text` as
+        // streamed output to keep visible; without it, `text` is the gateway's
+        // "Error: <detail>" string and must NOT settle as a healthy reply.
+        const failure =
+          event.payload?.status === 'error'
+            ? {
+                message: event.payload.error?.trim() || event.payload.text?.trim() || 'turn failed',
+                partialText: event.payload.partial === true ? event.payload.text : undefined
+              }
+            : undefined
         if (event.payload?.reasoning) {
           setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning, event.payload?.text)))
         }
@@ -2277,36 +2289,67 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // before session.info(false); `agentsTurnArchived` prevents a duplicate.
         archiveAndClearSubagents(!agentsTurnArchived, true)
         agentsTurnArchived = true
-        setState(
-          produce(draft => {
-            // complete-only gateways may send `message.complete{text}` with no prior
-            // start/delta → create the turn so the final text isn't dropped.
-            const finalText = event.payload?.text
-            const interim = interimTextPartId
-              ? draft.messages.find(message => message.parts?.some(part => part.id === interimTextPartId))
-              : undefined
-            const interimText = visibleText(interim).trim()
-            const previewMatches = Boolean(
-              event.payload?.response_previewed &&
-              finalText?.trim() &&
-              interimText &&
-              finalText.trim().startsWith(interimText)
-            )
-            const streaming = liveAssistant(draft, true)
-            if (previewMatches && streaming && streaming !== interim) {
-              const streamingIndex = draft.messages.indexOf(streaming)
-              if (streamingIndex >= 0) draft.messages.splice(streamingIndex, 1)
-            }
-            const live = previewMatches ? interim : (streaming ?? (finalText ? ensureAssistant(draft) : undefined))
-            if (!live) return
-            reconcileFinalText(live, finalText)
-            live.streaming = false
-            dropAnswerDuplicateReasoning(live, finalText)
-          })
-        )
+        if (failure) {
+          setState(
+            produce(draft => {
+              // A partial failure keeps its streamed text visible as a settled
+              // non-streaming turn (the frame's `text` IS the partial). A
+              // text-less failure settles like an `error` event: retain any
+              // streamed content, drop a wholly empty caret row.
+              const partial = failure.partialText?.trim() ? failure.partialText : undefined
+              if (partial) {
+                const live = liveAssistant(draft, true) ?? ensureAssistant(draft)
+                reconcileFinalText(live, partial)
+                live.streaming = false
+              } else {
+                settleFailedAssistant(draft)
+              }
+            })
+          )
+          // The visible failure marker — same system-row surface as the bare
+          // `error` event, so a failed turn never reads as a healthy reply.
+          pushSystem(`error: ${failure.message}`)
+        } else {
+          setState(
+            produce(draft => {
+              // complete-only gateways may send `message.complete{text}` with no prior
+              // start/delta → create the turn so the final text isn't dropped.
+              const finalText = event.payload?.text
+              const interim = interimTextPartId
+                ? draft.messages.find(message => message.parts?.some(part => part.id === interimTextPartId))
+                : undefined
+              const interimText = visibleText(interim).trim()
+              const previewMatches = Boolean(
+                event.payload?.response_previewed &&
+                finalText?.trim() &&
+                interimText &&
+                finalText.trim().startsWith(interimText)
+              )
+              const streaming = liveAssistant(draft, true)
+              if (previewMatches && streaming && streaming !== interim) {
+                const streamingIndex = draft.messages.indexOf(streaming)
+                if (streamingIndex >= 0) draft.messages.splice(streamingIndex, 1)
+              }
+              const live = previewMatches ? interim : (streaming ?? (finalText ? ensureAssistant(draft) : undefined))
+              if (!live) return
+              reconcileFinalText(live, finalText)
+              live.streaming = false
+              dropAnswerDuplicateReasoning(live, finalText)
+            })
+          )
+        }
         interimTextPartId = undefined
         clearStatusRestoreTimer()
         setState('status', undefined)
+        // A terminal error frame can close a turn that never reached
+        // message.start (agent-init failure — upstream run_after_agent_ready
+        // now emits this frame instead of a bare `error` event). turnInFlight
+        // was never armed, so the authoritative session.info drain in applyInfo
+        // cannot fire; settle the optimistic busy flag and drain exactly once,
+        // mirroring the pre-start branch of the `error` case. For a turn that
+        // DID start, turnInFlight stays armed and session.info(false) owns the
+        // drain — never both.
+        const preStartFailure = failure !== undefined && state.info.running === true && !turnInFlight
         // LOCAL optimistic running:false flip — stops the busy spinner INSTANTLY
         // (statusLineSpinner.test.tsx) without waiting for the server's
         // session.info round-trip. NOTE: this does NOT drain the busy queue. The
@@ -2344,7 +2387,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
             )
           }
         }
+        // Pre-start terminal error frame: fire the queue drain exactly once
+        // (see the preStartFailure comment above). Ordered LAST so the drained
+        // prompt submits against fully-settled local state.
+        if (preStartFailure) onTurnComplete?.()
         break
+      }
       // thinking.delta / status.update are the TRANSIENT busy indicator (kaomoji
       // face/verb) — route them to the status line, NOT the transcript (gotcha: Ink
       // shows these as a FaceTicker, not message content).

@@ -36,6 +36,14 @@ export type SessionActiveListResponse = typeof SessionActiveListResponseSchema.T
 export const SessionInflightSchema = Schema.StructWithRest(
   Schema.Struct({
     assistant: opt(Str),
+    // Retained failed turn (upstream 57b351d3689): the gateway keeps a compact
+    // error snapshot when the terminal frame may have been lost to a
+    // disconnect. `error` is the failure message; `status` is "error";
+    // `recoverable` marks it replayable. All additive + optional — an older
+    // gateway's live-turn snapshots decode unchanged.
+    error: opt(Str),
+    recoverable: opt(Bool),
+    status: opt(Str),
     streaming: opt(Bool),
     user: opt(Str)
   }),

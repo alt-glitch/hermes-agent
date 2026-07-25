@@ -192,6 +192,29 @@ describe('mapResumeHistory (Phase 4b)', () => {
     ])
   })
 
+  test('maps auto-continued interruption notes to a concise system row (upstream 082bd17122d)', () => {
+    const msgs = mapResumeHistory([
+      { role: 'user', text: 'original prompt' },
+      { role: 'assistant', text: 'recovered partial' },
+      {
+        role: 'user',
+        text: '[System note: Your previous turn was interrupted mid-run — …The interrupted request was:]\n\noriginal prompt',
+        display_kind: 'auto_continue',
+        timestamp: 1_753_400_000
+      },
+      { role: 'assistant', text: 'finished after the crash' }
+    ])
+
+    expect(msgs).toEqual([
+      { role: 'user', text: 'original prompt' },
+      expect.objectContaining({ role: 'assistant', text: 'recovered partial' }),
+      { role: 'system', text: '↻ resumed interrupted turn', timestamp: 1_753_400_000 },
+      expect.objectContaining({ role: 'assistant', text: 'finished after the crash' })
+    ])
+    // the raw interruption note never renders as a user bubble
+    expect(msgs.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
   test('keeps model-switch bookkeeping hidden instead of resurrecting a user bubble', () => {
     const msgs = mapResumeHistory([
       { role: 'user', text: 'before' },

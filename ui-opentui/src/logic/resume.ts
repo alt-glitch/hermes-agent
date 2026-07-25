@@ -127,6 +127,17 @@ export function mapResumeHistory(history: unknown): Message[] {
     // surface as a typed ◈ marker instead of resurrecting their raw user prompt.
     const displayKind = readStr(raw, 'display_kind')
     if (displayKind === 'hidden' || displayKind === 'model_switch') continue
+    // A crash-interrupted turn the gateway auto-continued (upstream
+    // 082bd17122d): the stored user row is the synthesized interruption note
+    // (system note + embedded original prompt). Render the timeline fact as a
+    // concise system row instead of resurrecting the raw note as a user bubble.
+    if (displayKind === 'auto_continue') {
+      const message: Message = { role: 'system', text: '↻ resumed interrupted turn' }
+      if (ts !== undefined) message.timestamp = ts
+      out.push(message)
+      pendingTools = []
+      continue
+    }
     if (displayKind === 'async_delegation_complete') {
       const metadata =
         raw && typeof raw === 'object' ? (raw as { display_metadata?: unknown }).display_metadata : undefined
