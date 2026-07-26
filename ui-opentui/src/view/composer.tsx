@@ -53,7 +53,7 @@ import { SyntaxStyle, type PasteEvent, type TextareaRenderable } from '@opentui/
 import { useKeyboard, useRenderer } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
-import { MENU_MAX, acceptChangesToken, applyCompletion, routeMenuKey } from '../logic/completionMenu.ts'
+import { MENU_MAX, acceptChangesToken, completionEdit, routeMenuKey } from '../logic/completionMenu.ts'
 import { BUSY_QUEUE_MAX_CHARS, BUSY_QUEUE_MAX_EDIT_CHARS } from '../logic/busyQueue.ts'
 import { envComposerRows } from '../logic/env.ts'
 import { createDoublePress } from '../logic/promptHistory.ts'
@@ -160,6 +160,7 @@ export function Composer(props: {
   onType?: ((text: string, cursor: number) => void) | undefined
   completions?: (() => CompletionItem[]) | undefined
   completionFrom?: (() => number) | undefined
+  completionEnd?: (() => number | undefined) | undefined
   onDismiss?: (() => void) | undefined
   history?: PromptHistory | undefined
   onImagePaste?: ((hotkey?: boolean) => void | string | Promise<void | string | undefined>) | undefined
@@ -383,11 +384,12 @@ export function Composer(props: {
     })
   }
 
-  /** Replace the textarea content and park the cursor at the end (history recall). */
-  const setBuffer = (text: string): boolean => {
+  /** Replace the textarea content and park the cursor at the requested offset
+   * (history recall defaults to the end). */
+  const setBuffer = (text: string, cursor: number = text.length): boolean => {
     if (!ta || text.length > BUSY_QUEUE_MAX_EDIT_CHARS) return false
     ta.setText(text)
-    ta.cursorOffset = text.length
+    ta.cursorOffset = Math.min(Math.max(0, cursor), text.length)
     // Programmatic replacement/history recall abandons every retained paste
     // token not reachable from the new buffer. Restoring the same token across
     // a session clear→restore keeps it live.
@@ -555,7 +557,9 @@ export function Composer(props: {
     // the `/` (its own `from`); gateway rows keep the store's replace_from.
     const synthetic = storeItems().length === 0
     const from = synthetic ? (suggested()?.from ?? 1) : (props.completionFrom?.() ?? 0)
-    setBuffer(applyCompletion(ta.plainText, item.text, from))
+    const end = synthetic ? undefined : props.completionEnd?.()
+    const edit = completionEdit(ta.plainText, item.text, from, end)
+    setBuffer(edit.text, edit.cursor)
     props.onDismiss?.()
   }
 
@@ -570,7 +574,8 @@ export function Composer(props: {
     if (!item || !ta) return false
     const synthetic = storeItems().length === 0
     const from = synthetic ? (suggested()?.from ?? 1) : (props.completionFrom?.() ?? 0)
-    return acceptChangesToken(ta.plainText, item.text, from)
+    const end = synthetic ? undefined : props.completionEnd?.()
+    return acceptChangesToken(ta.plainText, item.text, from, end)
   }
 
   // Esc+Esc → session prompt history (Epic 5; free-code's double-press model).

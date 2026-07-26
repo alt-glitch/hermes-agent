@@ -290,9 +290,10 @@ describe('planCompletion (items 5 + 13)', () => {
 describe('planCompletion — inline skill references (Ink useCompletion parity)', () => {
   test('a whitespace-preceded `/token` at the cursor → skills-only complete.slash on the synthetic query', () => {
     expect(planCompletion('please run /cle')).toEqual({
+      end: 15,
       from: 12, // absolute buffer offset just past the `/` — NOT an offset into the synthetic query
       method: 'complete.slash',
-      params: { text: '/cle' },
+      params: { skills_only: true, text: '/cle' },
       skillsOnly: true
     })
     // the plan's `from` replaces exactly the typed name, leaving the prose intact
@@ -303,18 +304,30 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
 
   test('a bare `/` after whitespace fires with an empty query (browse skills)', () => {
     expect(planCompletion('please run /')).toEqual({
+      end: 12,
       from: 12,
       method: 'complete.slash',
-      params: { text: '/' },
+      params: { skills_only: true, text: '/' },
       skillsOnly: true
     })
   })
 
   test('fires after a newline, not just a space', () => {
     expect(planCompletion('text\n/skill')).toEqual({
+      end: 11,
       from: 6,
       method: 'complete.slash',
-      params: { text: '/skill' },
+      params: { skills_only: true, text: '/skill' },
+      skillsOnly: true
+    })
+  })
+
+  test('fires after NBSP with the same whitespace grammar as sent inline refs', () => {
+    expect(planCompletion('text\u00a0/skill')).toEqual({
+      end: 11,
+      from: 6,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/skill' },
       skillsOnly: true
     })
   })
@@ -338,13 +351,25 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
   test('cursor-aware: an inline token mid-buffer completes from the text through the cursor', () => {
     const text = 'run /cle and more'
     expect(planCompletion(text, 8)).toEqual({
+      end: 8,
       from: 5,
       method: 'complete.slash',
-      params: { text: '/cle' },
+      params: { skills_only: true, text: '/cle' },
       skillsOnly: true
     })
     // same position but the cursor past the following space → the token ended
     expect(planCompletion(text, 9)).toBeNull()
+  })
+
+  test('a mid-token cursor replaces the complete inline name token, not only the typed prefix', () => {
+    const text = 'run /clean and more'
+    expect(planCompletion(text, 7)).toEqual({
+      end: 10,
+      from: 5,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/cl' },
+      skillsOnly: true
+    })
   })
 
   test('an @-mention token still wins path completion over the inline trigger', () => {

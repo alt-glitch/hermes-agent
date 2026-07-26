@@ -240,6 +240,7 @@ export function App(props: AppProps) {
                         onType={props.onType}
                         completions={() => props.store.state.completions ?? []}
                         completionFrom={() => props.store.state.completionFrom}
+                        completionEnd={() => props.store.state.completionEnd}
                         onDismiss={() => props.store.clearCompletions()}
                         history={props.history}
                         onImagePaste={props.onImagePaste}

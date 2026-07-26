@@ -3031,7 +3031,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             // An inline plan replaces its own token: the gateway's
             // `replace_from` indexes the synthetic `/query` it was sent, so
             // the plan's absolute buffer offset is authoritative.
-            store.setCompletions(items, plan.skillsOnly ? plan.from : readReplaceFrom(result, plan.from))
+            store.setCompletions(items, plan.skillsOnly ? plan.from : readReplaceFrom(result, plan.from), plan.end)
           })
           .catch(() => {
             if (!completionGate.isCurrent(token)) return
@@ -3040,7 +3040,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             // never back-fill an inline skills-only plan.
             const items =
               plan.method === 'complete.slash' && !plan.skillsOnly ? mergeWidgetCompletionItems(text, []) : []
-            if (items.length) store.setCompletions(items, plan.from)
+            if (items.length) store.setCompletions(items, plan.from, plan.end)
             else store.clearCompletions()
           })
       }

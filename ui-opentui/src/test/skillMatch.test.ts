@@ -194,6 +194,7 @@ describe('splitSlashSkillRefs — sent-message inline reference runs', () => {
       [plain('run '), ref('/clean'), plain(' then '), ref('/work'), plain(' ok')]
     ],
     ['reference after a newline', 'first\n/clean rest', [plain('first\n'), ref('/clean'), plain(' rest')]],
+    ['reference after NBSP', 'first\u00a0/clean rest', [plain('first\u00a0'), ref('/clean'), plain(' rest')]],
     ['trailing punctuation stays prose', 'try /clean.', [plain('try '), ref('/clean'), plain('.')]],
     ['leading slash is a command, not a reference', '/clean', [plain('/clean')]],
     ['lead command with args stays plain', '/clean src now', [plain('/clean src now')]],

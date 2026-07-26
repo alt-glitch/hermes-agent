@@ -51,6 +51,7 @@ export interface SlashAnalysis {
 const NAME_RE = /^[A-Za-z0-9][\w.-]*$/
 
 const isSpace = (ch: string | undefined): boolean => ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
+const isInlineRefSpace = (ch: string | undefined): boolean => ch !== undefined && /\s/u.test(ch)
 
 /**
  * Extract every standalone `/name` token. Boundary rules:
@@ -176,7 +177,7 @@ export function splitSlashSkillRefs(text: string): SkillRefSegment[] {
   let last = 0
   for (let i = 0; i < text.length; i++) {
     if (text[i] !== '/') continue
-    if (i === 0 || !isSpace(text[i - 1])) continue
+    if (i === 0 || !isInlineRefSpace(text[i - 1])) continue
     const name = REF_NAME_RE.exec(text.slice(i + 1))?.[0]
     if (!name) continue
     const end = i + 1 + name.length

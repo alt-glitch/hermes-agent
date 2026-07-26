@@ -289,10 +289,13 @@ export interface CompletionPlan {
   method: 'complete.slash' | 'complete.path'
   params: Record<string, unknown>
   from: number
+  /** Exclusive buffer offset for an inline token replacement. Omitted on
+   * legacy slash/path plans, which continue replacing through buffer end. */
+  end?: number
   /** Inline `/skill`-reference query (a whitespace-preceded `/token` in prose,
-   *  Ink `useCompletion` parity): the consumer keeps only `kind === 'skill'`
-   *  rows, and `from` is AUTHORITATIVE — the gateway's `replace_from` indexes
-   *  the synthetic `/query` sent in `params`, not the composer buffer. */
+   *  Ink `useCompletion` parity): `skills_only` makes the gateway enumerate
+   *  authoritative skill/bundle sources, and `from`/`end` bound the real
+   *  composer token rather than the synthetic `/query` sent in `params`. */
   skillsOnly?: boolean
 }
 
@@ -371,7 +374,17 @@ export function planCompletion(text: string, cursor: number = text.length): Comp
   const inline = INLINE_SLASH_RE.exec(head)
   if (inline) {
     const query = inline[1] ?? ''
-    return { from: pos - query.length, method: 'complete.slash', params: { text: `/${query}` }, skillsOnly: true }
+    const tail = /^[\w-]*/.exec(text.slice(pos))?.[0] ?? ''
+    const fullName = query + tail
+    const end = pos + tail.length
+    if ((fullName && !/^[A-Za-z][\w-]*$/.test(fullName)) || text[end] === '/') return null
+    return {
+      end,
+      from: pos - query.length,
+      method: 'complete.slash',
+      params: { skills_only: true, text: `/${query}` },
+      skillsOnly: true
+    }
   }
   return null
 }

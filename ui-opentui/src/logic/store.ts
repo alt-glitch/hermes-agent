@@ -594,6 +594,9 @@ export interface StoreState {
   /** Char offset in the input where an accepted completion should start replacing
    *  (gateway `replace_from` for slash args; the path-token start for @-mentions). */
   completionFrom: number
+  /** Exclusive inline-token replacement end. Undefined keeps the legacy
+   * replace-through-buffer-end behavior for callers that only provide `from`. */
+  completionEnd: number | undefined
   /** Delegated subagents (from `subagent.*`), shown in the agents dashboard. */
   subagents: SubagentInfo[]
   /** Process-global newest-first in-memory archives (Ink `/replay` parity). */
@@ -943,6 +946,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     promptHistory: false,
     completions: undefined,
     completionFrom: 0,
+    completionEnd: undefined,
     subagents: [],
     spawnHistory: emptySpawnHistory(),
     spawnTreeSaveIntents: [],
@@ -1725,6 +1729,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.promptHistory = false
         draft.completions = undefined
         draft.completionFrom = 0
+        draft.completionEnd = undefined
         draft.subagents = []
         draft.agentsNudge = clearAgentsNudgeTurn(draft.agentsNudge)
         draft.agentsNudgePending = false
@@ -2172,15 +2177,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
     }
   }
 
-  /** Set / clear the live completion candidates (composer dropdown). `from` is the
-   *  input char offset an accepted item replaces from (slash-arg / @-mention splice). */
-  function setCompletions(items: CompletionItem[], from = 0) {
+  /** Set / clear the live completion candidates (composer dropdown). `from` and
+   *  optional exclusive `end` bound the accepted item's buffer splice. */
+  function setCompletions(items: CompletionItem[], from = 0, end?: number) {
     setState('completions', items.length ? items : undefined)
     setState('completionFrom', items.length ? Math.max(0, from) : 0)
+    setState('completionEnd', items.length && typeof end === 'number' ? Math.max(from, end) : undefined)
   }
   function clearCompletions() {
     setState('completions', undefined)
     setState('completionFrom', 0)
+    setState('completionEnd', undefined)
   }
 
   /** Reduce a decoded gateway event into the store. The sole boundary->Solid sink. */

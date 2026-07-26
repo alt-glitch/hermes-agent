@@ -119,6 +119,12 @@ describe('acceptChangesToken — Enter-accept vs. submit (trailing-space guard)'
     // from past the end clamps to length; `/exit` + 'exit' → `/exitexit ` (a change).
     expect(acceptChangesToken('/exit', 'exit', 999)).toBe(true)
   })
+
+  test('an explicit replacement end preserves the suffix without doubling its separator', () => {
+    expect(applyCompletion('run /cle and more', 'clean', 5, 8)).toBe('run /clean and more')
+    expect(applyCompletion('run /cle\u00a0and more', 'clean', 5, 8)).toBe('run /clean\u00a0and more')
+    expect(acceptChangesToken('run /cle and more', 'clean', 5, 8)).toBe(true)
+  })
 })
 
 // ── layer 2: headless frames with a simulated keyboard ─────────────────
@@ -184,6 +190,38 @@ describe('slash menu — opens on the first slash, hydrating the full command li
       expect(frame).toContain('Esc dismiss')
     } finally {
       h.probe.destroy()
+    }
+  })
+
+  test('inline accept preserves suffix and leaves the cursor after the existing separator', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    const submitted: string[] = []
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} onSubmit={text => void submitted.push(text)} history={createPromptHistory({})} />
+        </ThemeProvider>
+      ),
+      { height: 24, kittyKeyboard: true, width: 70 }
+    )
+    try {
+      store.replaceComposerDraft('run /cle and more')
+      await probe.settle()
+      for (let i = 0; i < ' and more'.length; i++) probe.keys.pressArrow('left')
+      store.setCompletions([{ display: '/clean', kind: 'skill', meta: 'skill', text: 'clean' }], 5, 8)
+      await probe.settle()
+
+      probe.keys.pressTab()
+      await probe.settle()
+      expect(store.state.composerDraft).toBe('run /clean and more')
+
+      await probe.keys.typeText('X')
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(submitted).toEqual(['run /clean Xand more'])
+    } finally {
+      probe.destroy()
     }
   })
 
