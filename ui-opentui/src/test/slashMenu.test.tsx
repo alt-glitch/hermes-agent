@@ -152,7 +152,11 @@ async function mountComposer(historyEntries: string[] = []): Promise<Harness> {
       return
     }
     const q = String(plan.params.text).toLowerCase()
-    const items = CATALOG.filter(c => c.text.startsWith(q) && c.text !== q)
+    // entry parity (inline skill references): a skills-only plan keeps only
+    // `kind === 'skill'` rows — this command-only catalog yields none, so a
+    // mid-prose `/` opens no COMMAND menu (an inline reference offers skills).
+    const rows = plan.skillsOnly ? CATALOG.filter(c => c.kind === 'skill') : CATALOG
+    const items = rows.filter(c => c.text.startsWith(q) && c.text !== q)
     if (items.length) store.setCompletions(items, plan.from)
     else store.clearCompletions()
   }

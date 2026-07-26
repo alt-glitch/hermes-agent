@@ -34,6 +34,7 @@ import { For, Match, Show, Switch } from 'solid-js'
 
 import { copyBlock } from '../logic/blockCopy.ts'
 import { collapseHiddenPartsBy, hiddenRunLabel, sectionMode } from '../logic/details.ts'
+import { splitSlashSkillRefs, type SkillRefSegment } from '../logic/skillMatch.ts'
 import type { Message, Part } from '../logic/store.ts'
 import type { ThemeColors } from '../logic/theme.ts'
 import { useDisplay } from './display.tsx'
@@ -178,6 +179,14 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
     const ts = m().timestamp
     return display().timestamps && ts != null ? formatTimestamp(ts) : undefined
   }
+
+  // Inline `/skill` references in a SENT user message keep the accent they
+  // wore as completions in the composer instead of flattening into the body
+  // (Ink messageLine parity). Splitting is render-only: the segments
+  // concatenate back to m().text exactly, so CopyChip / selection / the wire
+  // text stay the untouched source. Other roles stay one plain run.
+  const bodySegments = (): SkillRefSegment[] =>
+    m().role === 'user' ? splitSlashSkillRefs(m().text) : [{ ref: false, text: m().text }]
   return (
     <Show
       when={skillRow()}
@@ -229,7 +238,15 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                             <Show when={tsLabel()}>
                               {label => <span style={{ fg: theme().color.muted }}>{label() + ' '}</span>}
                             </Show>
-                            <span style={{ fg: bodyFg() }}>{m().text}</span>
+                            {/* flat SIBLING spans (OpenTUI <text> is flat spans, not nested
+                        text): inline /skill references accent, prose keeps bodyFg. */}
+                            <For each={bodySegments()}>
+                              {segment => (
+                                <span style={{ fg: segment.ref ? theme().color.accent : bodyFg() }}>
+                                  {segment.text}
+                                </span>
+                              )}
+                            </For>
                           </text>
                           <Show when={m().role !== 'system' && m().text.trim() && !display().compact}>
                             <CopyChip source={() => m().text} />

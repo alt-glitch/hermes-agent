@@ -272,6 +272,10 @@ export interface CompletionItem {
   text: string
   display: string
   meta: string
+  /** Row class from the gateway (`skill` | `command`); absent on rows that
+   *  predate the field (and on TUI-local widget extras). Inline `/skill`
+   *  reference plans keep only `kind === 'skill'` rows. */
+  kind?: string
 }
 
 /** One typed entry in a subagent's activity trace — `kind` drives glyph + color

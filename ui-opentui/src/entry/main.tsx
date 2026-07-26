@@ -3017,17 +3017,29 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             if (!completionGate.isCurrent(token)) return // a newer keystroke superseded this query
             // Client-side widget apps live in the TUI registry, not the
             // gateway — merge their ids/help into slash-name completions.
+            // An INLINE skill reference (`plan.skillsOnly`) offers skills
+            // only: a built-in `/model` or a widget app acts on the app, so
+            // it's meaningless as a reference inside prose — filter to the
+            // gateway's `kind === 'skill'` rows and never merge widgets.
+            const mapped = mapCompletions(result)
             const items =
               plan.method === 'complete.slash'
-                ? mergeWidgetCompletionItems(text, mapCompletions(result))
-                : mapCompletions(result)
-            store.setCompletions(items, readReplaceFrom(result, plan.from))
+                ? plan.skillsOnly
+                  ? mapped.filter(item => item.kind === 'skill')
+                  : mergeWidgetCompletionItems(text, mapped)
+                : mapped
+            // An inline plan replaces its own token: the gateway's
+            // `replace_from` indexes the synthetic `/query` it was sent, so
+            // the plan's absolute buffer offset is authoritative.
+            store.setCompletions(items, plan.skillsOnly ? plan.from : readReplaceFrom(result, plan.from))
           })
           .catch(() => {
             if (!completionGate.isCurrent(token)) return
             // Widget commands stay completable even when the gateway RPC fails
-            // (they dispatch client-side and never need the server).
-            const items = plan.method === 'complete.slash' ? mergeWidgetCompletionItems(text, []) : []
+            // (they dispatch client-side and never need the server) — but they
+            // never back-fill an inline skills-only plan.
+            const items =
+              plan.method === 'complete.slash' && !plan.skillsOnly ? mergeWidgetCompletionItems(text, []) : []
             if (items.length) store.setCompletions(items, plan.from)
             else store.clearCompletions()
           })

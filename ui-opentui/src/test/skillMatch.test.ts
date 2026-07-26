@@ -13,6 +13,8 @@ import {
   learnableNames,
   nativeCharOffset,
   slashTokens,
+  splitSlashSkillRefs,
+  type SkillRefSegment,
   type SlashToken
 } from '../logic/skillMatch.ts'
 
@@ -176,5 +178,50 @@ describe('nativeCharOffset — newline exclusion for native highlight ranges', (
     ['offset past end clamps newline scan', 'a\nb', 5, 4]
   ])('%s', (_name, text, offset, expected) => {
     expect(nativeCharOffset(text, offset)).toBe(expected)
+  })
+})
+
+describe('splitSlashSkillRefs — sent-message inline reference runs', () => {
+  const plain = (text: string): SkillRefSegment => ({ ref: false, text })
+  const ref = (text: string): SkillRefSegment => ({ ref: true, text })
+
+  test.each<[string, string, SkillRefSegment[]]>([
+    ['mid-prose reference at the end', 'clean this up with /clean', [plain('clean this up with '), ref('/clean')]],
+    ['prose on both sides', 'run /clean then ship', [plain('run '), ref('/clean'), plain(' then ship')]],
+    [
+      'multiple references',
+      'run /clean then /work ok',
+      [plain('run '), ref('/clean'), plain(' then '), ref('/work'), plain(' ok')]
+    ],
+    ['reference after a newline', 'first\n/clean rest', [plain('first\n'), ref('/clean'), plain(' rest')]],
+    ['trailing punctuation stays prose', 'try /clean.', [plain('try '), ref('/clean'), plain('.')]],
+    ['leading slash is a command, not a reference', '/clean', [plain('/clean')]],
+    ['lead command with args stays plain', '/clean src now', [plain('/clean src now')]],
+    ['absolute path', 'look at /usr/local/bin', [plain('look at /usr/local/bin')]],
+    ['relative path', 'check src/foo/bar', [plain('check src/foo/bar')]],
+    ['glued slash', 'and/or', [plain('and/or')]],
+    ['arithmetic', 'a 3 /4 b', [plain('a 3 /4 b')]],
+    ['bare slash is nothing', 'say / something', [plain('say / something')]],
+    ['empty text still yields one segment', '', [plain('')]]
+  ])('%s', (_name, text, expected) => {
+    expect(splitSlashSkillRefs(text)).toEqual(expected)
+  })
+
+  test('segments concatenate byte-for-byte back to the input', () => {
+    const cases = [
+      'run /clean then /work ok',
+      'plain text',
+      '',
+      'look at /usr/local/bin',
+      'multi\nline with /skill refs\nand paths a/b',
+      '  /lead-after-spaces plus /tail'
+    ]
+    for (const text of cases) {
+      expect(
+        splitSlashSkillRefs(text)
+          .map(segment => segment.text)
+          .join('')
+      ).toBe(text)
+    }
   })
 })

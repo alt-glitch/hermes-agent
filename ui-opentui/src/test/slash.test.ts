@@ -146,6 +146,19 @@ describe('mapCompletions', () => {
     expect(mapCompletions({ items: [] })).toEqual([])
     expect(mapCompletions(null)).toEqual([])
   })
+
+  test('carries the gateway row `kind` through; rows without one stay kind-less', () => {
+    const items = mapCompletions({
+      items: [
+        { kind: 'skill', meta: '⚡ skill', text: '/clean' },
+        { kind: 'command', meta: 'switch model', text: '/model' },
+        { meta: 'legacy row', text: '/fortune' }
+      ]
+    })
+    expect(items.map(i => i.kind)).toEqual(['skill', 'command', undefined])
+    // absent, not `kind: undefined` — exactOptionalPropertyTypes-clean shape
+    expect('kind' in (items[2] ?? {})).toBe(false)
+  })
 })
 
 describe('catalogCommandItems (slash-highlight boot seed — glitch 2026-06-14)', () => {
@@ -271,6 +284,75 @@ describe('planCompletion (items 5 + 13)', () => {
   test('plain prose → no completion', () => {
     expect(planCompletion('just some words')).toBeNull()
     expect(planCompletion('hello')).toBeNull()
+  })
+})
+
+describe('planCompletion — inline skill references (Ink useCompletion parity)', () => {
+  test('a whitespace-preceded `/token` at the cursor → skills-only complete.slash on the synthetic query', () => {
+    expect(planCompletion('please run /cle')).toEqual({
+      from: 12, // absolute buffer offset just past the `/` — NOT an offset into the synthetic query
+      method: 'complete.slash',
+      params: { text: '/cle' },
+      skillsOnly: true
+    })
+    // the plan's `from` replaces exactly the typed name, leaving the prose intact
+    const text = 'please run /cle'
+    const plan = planCompletion(text)
+    expect(text.slice(0, plan?.from ?? -1)).toBe('please run /')
+  })
+
+  test('a bare `/` after whitespace fires with an empty query (browse skills)', () => {
+    expect(planCompletion('please run /')).toEqual({
+      from: 12,
+      method: 'complete.slash',
+      params: { text: '/' },
+      skillsOnly: true
+    })
+  })
+
+  test('fires after a newline, not just a space', () => {
+    expect(planCompletion('text\n/skill')).toEqual({
+      from: 6,
+      method: 'complete.slash',
+      params: { text: '/skill' },
+      skillsOnly: true
+    })
+  })
+
+  test('position 0 keeps the FULL command plan — an invocation, not a reference', () => {
+    expect(planCompletion('/cle')).toEqual({ from: 0, method: 'complete.slash', params: { text: '/cle' } })
+    expect(planCompletion('/')).toEqual({ from: 0, method: 'complete.slash', params: { text: '/' } })
+  })
+
+  test('rejects paths and arithmetic', () => {
+    expect(planCompletion('look at /usr/local/bin')).toBeNull()
+    expect(planCompletion('check src/foo/bar')).toBeNull()
+    expect(planCompletion('and/or')).toBeNull()
+    expect(planCompletion('3 /4')).toBeNull()
+  })
+
+  test('the token must END at the cursor — a reference takes no args', () => {
+    expect(planCompletion('hello there /personality alic')).toBeNull()
+  })
+
+  test('cursor-aware: an inline token mid-buffer completes from the text through the cursor', () => {
+    const text = 'run /cle and more'
+    expect(planCompletion(text, 8)).toEqual({
+      from: 5,
+      method: 'complete.slash',
+      params: { text: '/cle' },
+      skillsOnly: true
+    })
+    // same position but the cursor past the following space → the token ended
+    expect(planCompletion(text, 9)).toBeNull()
+  })
+
+  test('an @-mention token still wins path completion over the inline trigger', () => {
+    expect(planCompletion('explain @src/fo')).toEqual({
+      from: 8,
+      method: 'complete.path',
+      params: { word: '@src/fo' }
+    })
   })
 })
 

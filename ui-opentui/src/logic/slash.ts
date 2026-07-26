@@ -289,6 +289,11 @@ export interface CompletionPlan {
   method: 'complete.slash' | 'complete.path'
   params: Record<string, unknown>
   from: number
+  /** Inline `/skill`-reference query (a whitespace-preceded `/token` in prose,
+   *  Ink `useCompletion` parity): the consumer keeps only `kind === 'skill'`
+   *  rows, and `from` is AUTHORITATIVE — the gateway's `replace_from` indexes
+   *  the synthetic `/query` sent in `params`, not the composer buffer. */
+  skillsOnly?: boolean
 }
 
 /** The command-name grammar for the lead `/token` (mirrors skillMatch NAME_RE):
@@ -303,6 +308,15 @@ function isPathLike(word: string): boolean {
   return word.startsWith('@')
 }
 
+/** An inline `/skill` reference being typed in prose: a whitespace-preceded
+ *  slash whose (possibly empty) name runs to the cursor — `run /cle▌`. The
+ *  name grammar (`[A-Za-z][\w-]*`, Ink INLINE_SLASH_RE parity) is tighter than
+ *  SLASH_NAME_RE: a reference reads as a word, never a version/number. The
+ *  required single bare segment keeps real paths and arithmetic out —
+ *  `/usr/local/bin`, `src/foo/bar`, `and/or` and `3 /4` never match, and
+ *  typing a second `/` flips a bare `/us` straight back out of the trigger. */
+const INLINE_SLASH_RE = /\s\/([A-Za-z][\w-]*)?$/
+
 /**
  * Decide what to complete for the composer text + cursor offset:
  *   - the text is a slash command — `/` at the very start → `complete.slash
@@ -311,6 +325,12 @@ function isPathLike(word: string): boolean {
  *     isn't a valid name (F2) → no slash menu.
  *   - the WORD under the cursor is an `@`-mention → `complete.path {word}` for
  *     file/dir tagging (F8b).
+ *   - a whitespace-preceded `/token` ENDING AT THE CURSOR is an inline skill
+ *     reference dropped into prose (`clean this up with /cle`) → a synthetic
+ *     `complete.slash {text: '/cle'}` marked `skillsOnly` (Ink useCompletion
+ *     parity). Only the token queries the gateway, so the plan's `from` (just
+ *     past the slash, absolute in the buffer) is where an accepted skill
+ *     replaces — the RPC's own `replace_from` indexes the synthetic query.
  *   - otherwise nothing.
  *
  * Cursor-aware (F7/F8): completion is computed from the line/token at the cursor,
@@ -345,6 +365,14 @@ export function planCompletion(text: string, cursor: number = text.length): Comp
   if (isPathLike(word)) {
     return { from: tokenStart, method: 'complete.path', params: { word } }
   }
+  // Inline skill reference: the slash token must END at the cursor (the text
+  // submits as an ordinary message, so a reference takes no args — once a
+  // space follows the name the trigger is over).
+  const inline = INLINE_SLASH_RE.exec(head)
+  if (inline) {
+    const query = inline[1] ?? ''
+    return { from: pos - query.length, method: 'complete.slash', params: { text: `/${query}` }, skillsOnly: true }
+  }
   return null
 }
 
@@ -357,7 +385,9 @@ export function readReplaceFrom(result: unknown, fallback: number): number {
   return fallback
 }
 
-/** Map a `complete.slash`/`complete.path` result ({items:[{text,display,meta}]}) into candidates. */
+/** Map a `complete.slash`/`complete.path` result ({items:[{text,display,meta,kind?}]})
+ *  into candidates. `kind` (`skill` | `command`) rides along when the gateway
+ *  sends it — the inline skill-reference plan filters on it. */
 export function mapCompletions(result: unknown): CompletionItem[] {
   if (!result || typeof result !== 'object') return []
   const items = (result as { items?: unknown }).items
@@ -366,7 +396,10 @@ export function mapCompletions(result: unknown): CompletionItem[] {
   for (const it of items) {
     const text = readStr(it, 'text')
     if (!text) continue
-    out.push({ display: readStr(it, 'display') ?? text, meta: readStr(it, 'meta') ?? '', text })
+    const item: CompletionItem = { display: readStr(it, 'display') ?? text, meta: readStr(it, 'meta') ?? '', text }
+    const kind = readStr(it, 'kind')
+    if (kind) item.kind = kind
+    out.push(item)
   }
   return out
 }

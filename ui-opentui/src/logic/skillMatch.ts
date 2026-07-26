@@ -148,6 +148,48 @@ export function learnableNames(text: string, items: ReadonlyArray<{ text: string
   return out
 }
 
+/** Inline skill-REFERENCE name grammar — the sent-text mirror of the composer
+ *  trigger's `[A-Za-z][\w-]*` (slash.ts INLINE_SLASH_RE): starts with a
+ *  letter, then word chars / `-`. Tighter than NAME_RE (no digit start, no
+ *  dots) because a reference reads as a word, never a version or a number. */
+const REF_NAME_RE = /^[A-Za-z][\w-]*/
+
+/** One run of a sent user message: plain prose, or an inline `/skill`
+ *  reference the transcript accents. Concatenating every `text` reproduces the
+ *  message byte-for-byte — styling never rewrites the source. */
+export interface SkillRefSegment {
+  ref: boolean
+  text: string
+}
+
+/**
+ * Split a SENT user message into alternating plain / `/skill`-reference runs
+ * (Ink `splitSlashSkillRefs` parity — the transcript half of the inline
+ * completion trigger). Boundary rules match `slashTokens`: the `/` must be
+ * preceded by whitespace (`a/b`, `and/or`, `3 /4` are prose) — but NOT at
+ * offset 0: a leading `/command` is an invocation, never a reference. The name
+ * follows REF_NAME_RE, and a token that continues into another `/` is a path
+ * (`/usr/local/bin` marks nothing). Always returns at least one segment.
+ */
+export function splitSlashSkillRefs(text: string): SkillRefSegment[] {
+  const out: SkillRefSegment[] = []
+  let last = 0
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '/') continue
+    if (i === 0 || !isSpace(text[i - 1])) continue
+    const name = REF_NAME_RE.exec(text.slice(i + 1))?.[0]
+    if (!name) continue
+    const end = i + 1 + name.length
+    if (text[end] === '/') continue // continues into a path segment
+    if (i > last) out.push({ ref: false, text: text.slice(last, i) })
+    out.push({ ref: true, text: text.slice(i, end) })
+    last = end
+    i = end - 1
+  }
+  if (last < text.length || !out.length) out.push({ ref: false, text: text.slice(last) })
+  return out
+}
+
 /**
  * Convert a JS string offset into the native highlight char offset: the native
  * char-range counter skips newlines (mirror of ExtmarksController.
