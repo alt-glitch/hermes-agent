@@ -33,6 +33,21 @@ def _session(agent=None, **extra):
     }
 
 
+def _drain_registered(rid, sid, session):
+    with server._sessions_lock:
+        previous = server._sessions.get(sid)
+        server._sessions[sid] = session
+    try:
+        return server._drain_queued_prompt(rid, sid, session)
+    finally:
+        with server._sessions_lock:
+            if previous is None:
+                if server._sessions.get(sid) is session:
+                    server._sessions.pop(sid, None)
+            else:
+                server._sessions[sid] = previous
+
+
 # ── _enqueue_prompt ────────────────────────────────────────────────────────
 
 def test_enqueue_pins_text_and_transport():
@@ -63,7 +78,7 @@ def test_enqueue_preserves_correlations_until_the_merged_turn_starts(monkeypatch
         ),
     )
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
+    assert _drain_registered("r1", "sid", session) is True
     assert fired["text"] == "first\n\nsecond"
     assert fired["client_submission_ids"] == ["send-1", "send-2"]
     assert session["queued_prompt"] is None
@@ -389,6 +404,189 @@ def test_busy_interrupt_does_not_hold_history_lock_or_delay_queue(monkeypatch):
     release_interrupt.set()
 
 
+def test_delayed_busy_interrupt_blocks_early_drain(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    interrupt_started = threading.Event()
+    release_interrupt = threading.Event()
+    successor_started = threading.Event()
+
+    def blocking_interrupt():
+        interrupt_started.set()
+        release_interrupt.wait(timeout=2)
+
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: successor_started.set(),
+    )
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=blocking_interrupt),
+        running=True,
+    )
+    server._sessions["sid"] = session
+    try:
+        response = server._handle_busy_submit(
+            "r1", "sid", session, "run after interrupt", "ws-1"
+        )
+        assert response["result"]["status"] == "queued"
+        assert interrupt_started.wait(timeout=1)
+
+        with session["history_lock"]:
+            session["running"] = False
+        assert server._drain_queued_prompt("r1", "sid", session) is False
+        assert not successor_started.is_set()
+        assert session["queued_prompt"]["text"] == "run after interrupt"
+
+        release_interrupt.set()
+        assert successor_started.wait(timeout=1)
+        assert session.get("_busy_interrupt_pending") is False
+        assert session["queued_prompt"] is None
+        assert session["running"] is True
+    finally:
+        release_interrupt.set()
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize("lifecycle", ["close", "replace"])
+def test_delayed_busy_interrupt_cannot_dispatch_detached_session(
+    monkeypatch, lifecycle
+):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    interrupt_started = threading.Event()
+    release_interrupt = threading.Event()
+    drain_finished = threading.Event()
+    successor_started = threading.Event()
+
+    def blocking_interrupt():
+        interrupt_started.set()
+        release_interrupt.wait(timeout=2)
+
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: successor_started.set(),
+    )
+    monkeypatch.setattr(
+        server,
+        "_teardown_session",
+        lambda current, **_kwargs: current.__setitem__("_finalized", True),
+    )
+    real_drain = server._drain_queued_prompt
+
+    def observed_drain(*args, **kwargs):
+        try:
+            return real_drain(*args, **kwargs)
+        finally:
+            drain_finished.set()
+
+    monkeypatch.setattr(server, "_drain_queued_prompt", observed_drain)
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=blocking_interrupt),
+        running=True,
+    )
+    server._sessions["sid"] = session
+    try:
+        response = server._handle_busy_submit(
+            "r1", "sid", session, "never resurrect", "ws-1"
+        )
+        assert response["result"]["status"] == "queued"
+        assert interrupt_started.wait(timeout=1)
+
+        with session["history_lock"]:
+            session["running"] = False
+        if lifecycle == "close":
+            assert server._close_session_by_id("sid") is True
+            assert session["_finalized"] is True
+        else:
+            with server._sessions_lock:
+                server._sessions["sid"] = _session()
+
+        release_interrupt.set()
+        assert drain_finished.wait(timeout=1)
+        assert not successor_started.is_set()
+        assert session["running"] is False
+        assert session["queued_prompt"]["text"] == "never resurrect"
+    finally:
+        release_interrupt.set()
+        server._sessions.pop("sid", None)
+
+
+def test_idle_submit_joins_pending_interrupt_queue_with_correlations(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    interrupt_started = threading.Event()
+    release_interrupt = threading.Event()
+    successor_started = threading.Event()
+    dispatched = {}
+
+    def blocking_interrupt():
+        interrupt_started.set()
+        release_interrupt.wait(timeout=2)
+
+    def run_successor(rid, sid, current, text, **kwargs):
+        dispatched.update(
+            rid=rid,
+            sid=sid,
+            session=current,
+            text=text,
+            **kwargs,
+        )
+        successor_started.set()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_successor)
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=blocking_interrupt),
+        running=True,
+    )
+    server._sessions["sid"] = session
+    try:
+        first = server._handle_busy_submit(
+            "r1",
+            "sid",
+            session,
+            "first accepted",
+            "ws-1",
+            ["send-1"],
+        )
+        assert first["result"]["status"] == "queued"
+        assert interrupt_started.wait(timeout=1)
+
+        with session["history_lock"]:
+            session["running"] = False
+        second = server.handle_request(
+            {
+                "id": "r2",
+                "method": "prompt.submit",
+                "params": {
+                    "client_submission_id": "send-2",
+                    "session_id": "sid",
+                    "text": "second accepted",
+                },
+            }
+        )
+
+        assert second["result"]["status"] == "queued"
+        assert not successor_started.is_set()
+        assert session["running"] is False
+        assert session["queued_prompt"]["text"] == (
+            "first accepted\n\nsecond accepted"
+        )
+        assert session["queued_prompt"]["client_submission_ids"] == [
+            "send-1",
+            "send-2",
+        ]
+
+        release_interrupt.set()
+        assert successor_started.wait(timeout=1)
+        assert dispatched["text"] == "first accepted\n\nsecond accepted"
+        assert dispatched["client_submission_ids"] == ["send-1", "send-2"]
+    finally:
+        release_interrupt.set()
+        server._sessions.pop("sid", None)
+
+
 def test_busy_helper_retries_when_turn_finished(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
     session = _session(running=False)
@@ -468,7 +666,7 @@ def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
     )
     session = _session(queued_prompt={"text": "go", "transport": "ws-9"})
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
+    assert _drain_registered("r1", "sid", session) is True
     assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
     assert session["running"] is True
     assert session["queued_prompt"] is None
@@ -478,7 +676,7 @@ def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
 def test_drain_noop_when_nothing_queued(monkeypatch):
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fire")))
     session = _session()
-    assert server._drain_queued_prompt("r1", "sid", session) is False
+    assert _drain_registered("r1", "sid", session) is False
     assert session["running"] is False
 
 
@@ -487,7 +685,7 @@ def test_drain_noop_when_session_already_running(monkeypatch):
     the drain leaves it for that turn's own tail."""
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fire")))
     session = _session(running=True, queued_prompt={"text": "go", "transport": None})
-    assert server._drain_queued_prompt("r1", "sid", session) is False
+    assert _drain_registered("r1", "sid", session) is False
     assert session["queued_prompt"]["text"] == "go"
 
 
@@ -512,7 +710,7 @@ def test_unrelated_turn_then_queued_ack_keeps_client_correlation_until_drain(mon
     fired = {}
     session["running"] = False
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *args, **kwargs: fired.update(kwargs))
-    assert server._drain_queued_prompt("r-user", "sid", session) is True
+    assert _drain_registered("r-user", "sid", session) is True
     assert fired["client_submission_ids"] == ["send-user"]
 
 
@@ -522,6 +720,6 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     monkeypatch.setattr(server, "_run_prompt_submit", _boom)
     session = _session(queued_prompt={"text": "go", "transport": None})
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
+    assert _drain_registered("r1", "sid", session) is True
     # Failure must not leave the session wedged as running.
     assert session["running"] is False

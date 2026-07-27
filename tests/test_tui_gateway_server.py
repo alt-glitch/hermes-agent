@@ -12089,6 +12089,11 @@ def test_prompt_submit_reports_leftover_retained_when_queue_is_full(monkeypatch)
                     self.consumed.append(self._pending_steer)
                     self._pending_steer = None
                 return {"final_response": "second done", "messages": []}
+            # Fill the next-turn slot while this turn is active. An idle
+            # session with an existing queue is now a deferred boundary,
+            # so a direct submit must not jump ahead merely to construct
+            # this overflow state.
+            server._enqueue_prompt(session, "x" * 16, None)
             return {
                 "final_response": "done",
                 "messages": [],
@@ -12099,7 +12104,6 @@ def test_prompt_submit_reports_leftover_retained_when_queue_is_full(monkeypatch)
     agent = _Agent()
     session = _session(
         agent=agent,
-        queued_prompt={"text": "x" * 16, "transport": None},
         _pending_steer_submission_ids=["steer-overflow"],
     )
     server._sessions["sid"] = session

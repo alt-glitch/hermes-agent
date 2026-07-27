@@ -7174,6 +7174,14 @@ def _interrupt_busy_session(
         finally:
             with session["history_lock"]:
                 session["_busy_interrupt_pending"] = False
+                drain_after_interrupt = bool(
+                    session.get("queued_prompt") and not session.get("running")
+                )
+            # The old turn's finalizer may have reached its drain while this
+            # provider interrupt was still blocked. Whichever side finishes
+            # second owns the single fenced drain claim.
+            if drain_after_interrupt:
+                _drain_queued_prompt(None, sid, session)
 
     threading.Thread(
         target=interrupt,
@@ -7212,7 +7220,13 @@ def _handle_busy_submit(
     should_interrupt = False
 
     with lock_context:
-        if not session.get("running"):
+        interrupt_live_turn = bool(session.get("running"))
+        deferred_boundary = bool(
+            interrupt_live_turn
+            or session.get("_busy_interrupt_pending")
+            or session.get("queued_prompt")
+        )
+        if not deferred_boundary:
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
@@ -7225,7 +7239,8 @@ def _handle_busy_submit(
         # fence, so redirect and its inflight/correlation update form one
         # atomic critical section.
         if (
-            mode == "interrupt"
+            interrupt_live_turn
+            and mode == "interrupt"
             and text_only
             and plain_text
             and agent is not None
@@ -7263,7 +7278,9 @@ def _handle_busy_submit(
             session,
             extra_steer_text=incoming,
         )
-        if not queue_capacity or (mode == "steer" and not steer_capacity):
+        if not queue_capacity or (
+            mode == "steer" and interrupt_live_turn and not steer_capacity
+        ):
             return _err(
                 rid,
                 4009,
@@ -7271,7 +7288,8 @@ def _handle_busy_submit(
             )
 
         if (
-            mode == "steer"
+            interrupt_live_turn
+            and mode == "steer"
             and not steer_admission_closed
             and text_only
             and plain_text
@@ -7322,7 +7340,11 @@ def _handle_busy_submit(
         except OverflowError as exc:
             return _err(rid, 4009, str(exc))
         session["last_active"] = time.time()
-        should_interrupt = mode != "queue" and not steer_admission_closed
+        should_interrupt = (
+            interrupt_live_turn
+            and mode != "queue"
+            and not steer_admission_closed
+        )
 
     if should_interrupt:
         _interrupt_busy_session(
@@ -7337,15 +7359,29 @@ def _handle_busy_submit(
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """Fire a queued next-turn prompt if one is waiting and the session is idle."""
 
-    with _mcp_reload_admission_lock, session["history_lock"]:
-        queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
-            return False
-        session["queued_prompt"] = None
-        session["running"] = True
-        session["_turn_cancel_requested"] = False
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+    # Keep the claim atomic against close, replacement, tools.configure, and
+    # MCP reload. Dispatch happens only after every lifecycle/history lock is
+    # released, so no provider or compute-host call runs inside the fence.
+    with _mcp_reload_admission_lock, _session_mutation_lock(session):
+        with _sessions_lock:
+            if (
+                _sessions.get(sid) is not session
+                or session.get("_finalized")
+            ):
+                return False
+            with session["history_lock"]:
+                queued = session.get("queued_prompt")
+                if (
+                    not queued
+                    or session.get("running")
+                    or session.get("_busy_interrupt_pending")
+                ):
+                    return False
+                session["queued_prompt"] = None
+                session["running"] = True
+                session["_turn_cancel_requested"] = False
+                if queued.get("transport") is not None:
+                    session["transport"] = queued["transport"]
     try:
         if _session_uses_compute_host(session):
             resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
@@ -11870,7 +11906,11 @@ def _(rid, params: dict) -> dict:
                 4009,
                 "session tools are being reconfigured — wait for it to finish",
             )
-        if session.get("running"):
+        if (
+            session.get("running")
+            or session.get("_busy_interrupt_pending")
+            or session.get("queued_prompt")
+        ):
             # Don't reject a mid-turn prompt — queue it (and, by default,
             # interrupt the live turn) so it runs as the next turn. See
             # _handle_busy_submit for why the old "session busy" rejection
