@@ -234,6 +234,9 @@ export interface SlashContext {
   /** Read / set the show-[HH:MM] display flag (/timestamps — port of upstream 5ff11a689). */
   readonly timestamps: () => boolean
   readonly setTimestamps: (on: boolean) => void
+  /** Read / set the focus-view display flag (/focus — port of upstream d6fa2709de6). */
+  readonly focusView: () => boolean
+  readonly setFocusView: (on: boolean) => void
   /** Read / set the expand-all-thinking display flag (/reasoning full|clamp). */
   readonly reasoningFull: () => boolean
   readonly setReasoningFull: (on: boolean) => void
@@ -327,7 +330,9 @@ const INLINE_SLASH_RE = /\s\/([A-Za-z][\w-]*)?$/
  *     2026-06-13); `/m`, `/model foo` narrow it. A `/abs/path` whose first token
  *     isn't a valid name (F2) → no slash menu.
  *   - the WORD under the cursor is an `@`-mention → `complete.path {word}` for
- *     file/dir tagging (F8b).
+ *     file/dir tagging (F8b). The plan carries `from`/`end` bounding the whole
+ *     token (through the cursor to the next whitespace), so accepting a
+ *     mid-buffer mention preserves the rest of the draft.
  *   - a whitespace-preceded `/token` ENDING AT THE CURSOR is an inline skill
  *     reference dropped into prose (`clean this up with /cle`) → a synthetic
  *     `complete.slash {text: '/cle'}` marked `skillsOnly` (Ink useCompletion
@@ -366,7 +371,13 @@ export function planCompletion(text: string, cursor: number = text.length): Comp
   if (tokenStart === -1) return null
   const word = head.slice(tokenStart)
   if (isPathLike(word)) {
-    return { from: tokenStart, method: 'complete.path', params: { word } }
+    // Exclusive end at the real @-token boundary PAST the cursor (stop at
+    // whitespace): a mid-buffer mention accepted via completionEdit replaces
+    // only its own token and re-appends the suffix. Without it the plan fell
+    // back to replace-to-buffer-end, deleting everything after the token
+    // (recalled prompt tails, later lines).
+    const tail = /^\S*/.exec(text.slice(pos))?.[0] ?? ''
+    return { end: pos + tail.length, from: tokenStart, method: 'complete.path', params: { word } }
   }
   // Inline skill reference: the slash token must END at the cursor (the text
   // submits as an ordinary message, so a reference takes no args — once a
@@ -1006,6 +1017,30 @@ const timestampsCmd: ClientHandler = (arg, ctx) => {
   ctx.setTimestamps(next)
   void ctx.request('config.set', { key: 'timestamps', value: next ? 'on' : 'off' }).catch(() => {})
   ctx.pushSystem(`timestamps ${next ? 'on' : 'off'}`)
+}
+
+/** `/focus [on|off|status]` — display-only reduced-output view (port of upstream
+ *  d6fa2709de6; Ink core.ts `focus`). The flag flips locally FIRST so the pinned
+ *  `◉ focus` badge repaints on the same frame; persistence AND the
+ *  tool_progress stash/restore live gateway-side behind `config.set
+ *  {key:'focus'}` — the same state machine the Ink TUI and classic CLI use, so
+ *  nothing about it is duplicated here. `status`/`show`/`?` reports without
+ *  writing, matching the CLI surface. */
+const focusCmd: ClientHandler = (arg, ctx) => {
+  const mode = arg.trim().toLowerCase()
+  const current = ctx.focusView()
+  if (mode === 'status' || mode === 'show' || mode === '?') {
+    ctx.pushSystem(current ? 'focus view on — only your prompt and the final response' : 'focus view off')
+    return
+  }
+  const next = flagFromArg(mode, current)
+  if (next === null) {
+    ctx.pushSystem('usage: /focus [on|off|status]')
+    return
+  }
+  ctx.setFocusView(next)
+  void ctx.request('config.set', { key: 'focus', value: next ? 'on' : 'off' }).catch(() => {})
+  ctx.pushSystem(next ? 'focus view enabled — just your prompt and the final response' : 'focus view disabled')
 }
 
 /**
@@ -2816,6 +2851,7 @@ const CLIENT: Record<string, ClientHandler> = {
   detail: detailsCmd,
   details: detailsCmd,
   exit: quitCmd,
+  focus: focusCmd,
   fortune: fortuneCmd,
   fast: fastCmd,
   heapdump: heapdumpCmd,

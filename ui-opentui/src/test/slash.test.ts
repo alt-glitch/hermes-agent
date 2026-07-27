@@ -253,28 +253,57 @@ describe('planCompletion (items 5 + 13)', () => {
 
   test('@-mention is the only path trigger (F8b) — `~`/`./`/bare paths no longer fire', () => {
     expect(planCompletion('explain @src/fo')).toEqual({
+      end: 'explain @src/fo'.length,
       from: 'explain '.length,
       method: 'complete.path',
       params: { word: '@src/fo' }
     })
-    expect(planCompletion('@foo')).toEqual({ from: 0, method: 'complete.path', params: { word: '@foo' } })
+    expect(planCompletion('@foo')).toEqual({ end: 4, from: 0, method: 'complete.path', params: { word: '@foo' } })
     // dropped triggers:
     expect(planCompletion('cat ./rea')).toBeNull()
     expect(planCompletion('open ~/proj')).toBeNull()
     expect(planCompletion('see path/to/x')).toBeNull()
   })
 
+  test('a mid-buffer @-mention carries the exclusive token end — accept must not eat the suffix', () => {
+    // cursor at the end of the token, prose after it: `end` stops AT the
+    // cursor (the following whitespace opens the preserved suffix).
+    expect(planCompletion('see @fo and more', 'see @fo'.length)).toEqual({
+      end: 'see @fo'.length,
+      from: 4,
+      method: 'complete.path',
+      params: { word: '@fo' }
+    })
+    // cursor INSIDE the token: `end` extends PAST the cursor to the token's
+    // whitespace boundary, so accepting replaces the whole token.
+    expect(planCompletion('see @foo.ts rest', 'see @fo'.length)).toEqual({
+      end: 'see @foo.ts'.length,
+      from: 4,
+      method: 'complete.path',
+      params: { word: '@fo' }
+    })
+    // a newline is whitespace too — the token never spans lines.
+    expect(planCompletion('see @fo\nmore', 'see @fo'.length)).toEqual({
+      end: 'see @fo'.length,
+      from: 4,
+      method: 'complete.path',
+      params: { word: '@fo' }
+    })
+  })
+
   test('completion survives newlines, computed at the cursor (F7/F8)', () => {
     // a `@`-mention on a later line (after Shift+Enter) still completes
     const text = 'first line\nexplain @src/fo'
     expect(planCompletion(text, text.length)).toEqual({
+      end: text.length,
       from: 'first line\nexplain '.length,
       method: 'complete.path',
       params: { word: '@src/fo' }
     })
-    // mid-buffer: cursor inside the @token on line 2
+    // mid-buffer: cursor inside the @token on line 2 — the end runs to the
+    // token's real boundary (the newline), never into the next line.
     const t2 = 'see @foo\nmore'
-    expect(planCompletion(t2, 8)).toEqual({ from: 4, method: 'complete.path', params: { word: '@foo' } })
+    expect(planCompletion(t2, 8)).toEqual({ end: 8, from: 4, method: 'complete.path', params: { word: '@foo' } })
   })
 
   test('a `/` after a newline is prose, never a slash command', () => {
@@ -374,6 +403,7 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
 
   test('an @-mention token still wins path completion over the inline trigger', () => {
     expect(planCompletion('explain @src/fo')).toEqual({
+      end: 'explain @src/fo'.length,
       from: 8,
       method: 'complete.path',
       params: { word: '@src/fo' }
@@ -468,6 +498,8 @@ interface Probe {
   detailsFlag: { value: DetailsMode }
   /** /timestamps display flag — show [HH:MM] on messages (port of 5ff11a689). */
   timestampsFlag: { value: boolean }
+  /** /focus display flag — reduced-output view badge (port of d6fa2709de6). */
+  focusFlag: { value: boolean }
   /** /reasoning full|clamp display flag — expand all thinking. */
   reasoningFullFlag: { value: boolean }
   busyMode: { value: BusyInputMode }
@@ -522,6 +554,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
   const detailSections = { value: {} as DetailsSections }
   const timestampsFlag: Probe['timestampsFlag'] = { value: false }
+  const focusFlag: Probe['focusFlag'] = { value: false }
   const reasoningFullFlag: Probe['reasoningFullFlag'] = { value: false }
   const busyMode: Probe['busyMode'] = { value: 'queue' }
   const queued: string[] = []
@@ -576,6 +609,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     },
     timestamps: () => timestampsFlag.value,
     setTimestamps: on => (timestampsFlag.value = on),
+    focusView: () => focusFlag.value,
+    setFocusView: on => (focusFlag.value = on),
     reasoningFull: () => reasoningFullFlag.value,
     setReasoningFull: on => (reasoningFullFlag.value = on),
     isBusy: () => busy.value,
@@ -688,6 +723,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     dashboard,
     detailsFlag,
     timestampsFlag,
+    focusFlag,
     reasoningFullFlag,
     busyMode,
     browserStates,

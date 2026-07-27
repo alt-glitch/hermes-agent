@@ -684,6 +684,14 @@ export interface StoreState {
    *  Defaults OFF — the persisted `display.tui_compact` config doesn't reach the
    *  TUI via session.info, so the flag starts false each launch. */
   compact: boolean
+  /** Focus view (/focus — port of upstream d6fa2709de6): display-only
+   *  reduced-output mode, driving the pinned `◉ focus` status-bar badge. The
+   *  gateway owns the actual tool_progress stash/restore behind `config.set
+   *  {key:'focus'}`. Hydrated from the persisted `display.focus_view` on both
+   *  `config.get full` entry paths (boot + config-mtime refresh); like
+   *  `compact`/`batteryEnabled` it deliberately survives session resets — the
+   *  persisted config, not the session, owns it. */
+  focusView: boolean
   /** Global tool/reasoning detail mode (/details): collapsed (default) /
    *  expanded (bodies default-open) / hidden (runs fold to one muted line). */
   details: DetailsMode
@@ -983,6 +991,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     sessionId: undefined,
     resumeId: undefined,
     compact: false,
+    focusView: false,
     details: 'collapsed',
     detailsCommandOverride: false,
     detailsSections: {},
@@ -2016,6 +2025,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // this revision; the older hydration applies only if no command superseded it.
   let busyInputModeRevision = 0
   let compactRevision = 0
+  let focusViewRevision = 0
   let detailsRevision = 0
   let batteryRevision = 0
   let onBatteryEnabled = (_enabled: boolean) => {}
@@ -2065,6 +2075,22 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   function getCompactRevision(): number {
     return compactRevision
+  }
+
+  /** /focus — set the focus-view display flag (port of upstream d6fa2709de6). */
+  function setFocusView(on: boolean): void {
+    focusViewRevision += 1
+    setState('focusView', on)
+  }
+
+  function hydrateFocusView(on: boolean, expectedRevision: number): boolean {
+    if (focusViewRevision !== expectedRevision) return false
+    setState('focusView', on)
+    return true
+  }
+
+  function getFocusViewRevision(): number {
+    return focusViewRevision
   }
 
   /** /details — set the global tool/reasoning detail mode (Epic 3). */
@@ -3332,6 +3358,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setCompact,
     hydrateCompact,
     getCompactRevision,
+    setFocusView,
+    hydrateFocusView,
+    getFocusViewRevision,
     openJourney,
     openPluginsHub,
     closePluginsHub,

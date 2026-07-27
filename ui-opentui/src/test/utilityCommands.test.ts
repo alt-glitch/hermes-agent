@@ -54,6 +54,7 @@ interface Probe {
   detailsFlag: { value: DetailsMode }
   detailSections: { value: DetailsSections }
   timestampsFlag: { value: boolean }
+  focusFlag: { value: boolean }
   reasoningFullFlag: { value: boolean }
   renderables: { value: number | undefined }
   sessionId: { value: string | undefined }
@@ -73,6 +74,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
   const detailSections: Probe['detailSections'] = { value: {} }
   const timestampsFlag = { value: false }
+  const focusFlag = { value: false }
   const reasoningFullFlag = { value: false }
   const busyMode: { value: BusyInputMode } = { value: 'queue' }
   const queue: string[] = []
@@ -112,6 +114,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     },
     timestamps: () => timestampsFlag.value,
     setTimestamps: on => (timestampsFlag.value = on),
+    focusView: () => focusFlag.value,
+    setFocusView: on => (focusFlag.value = on),
     reasoningFull: () => reasoningFullFlag.value,
     setReasoningFull: on => (reasoningFullFlag.value = on),
     isBusy: () => false,
@@ -178,7 +182,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     reasoningFullFlag,
     sessionId,
     system,
-    timestampsFlag
+    timestampsFlag,
+    focusFlag
   }
 }
 
@@ -231,6 +236,69 @@ describe('/density', () => {
     await tick()
     expect(p.compactFlag.value).toBe(true)
     expect(p.system).toEqual(['density on'])
+  })
+})
+
+describe('/focus (port of upstream d6fa2709de6)', () => {
+  test('registered as a client command (catalog/completion discovery)', () => {
+    expect(clientCommandNames()).toContain('focus')
+  })
+
+  test('/focus on flips the flag optimistically and writes config.set {key:focus, value:on}', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/focus on', p.ctx)
+    expect(p.focusFlag.value).toBe(true)
+    expect(p.system).toEqual(['focus view enabled — just your prompt and the final response'])
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'focus', value: 'on' } }])
+  })
+
+  test('/focus off and bare toggle write the exact on/off values', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/focus on', p.ctx)
+    await dispatchSlash('/focus off', p.ctx)
+    expect(p.focusFlag.value).toBe(false)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'focus', value: 'off' } })
+    await dispatchSlash('/focus', p.ctx)
+    expect(p.focusFlag.value).toBe(true)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'focus', value: 'on' } })
+    expect(p.system).toEqual([
+      'focus view enabled — just your prompt and the final response',
+      'focus view disabled',
+      'focus view enabled — just your prompt and the final response'
+    ])
+  })
+
+  test('/focus status (and show/?) reports the current state WITHOUT a config write', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/focus status', p.ctx)
+    p.focusFlag.value = true
+    await dispatchSlash('/focus show', p.ctx)
+    await dispatchSlash('/focus ?', p.ctx)
+    expect(p.system).toEqual([
+      'focus view off',
+      'focus view on — only your prompt and the final response',
+      'focus view on — only your prompt and the final response'
+    ])
+    expect(p.calls).toHaveLength(0)
+    expect(p.focusFlag.value).toBe(true)
+  })
+
+  test('/focus garbage → usage line, no flag change, no RPC', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/focus sideways', p.ctx)
+    expect(p.system).toEqual(['usage: /focus [on|off|status]'])
+    expect(p.focusFlag.value).toBe(false)
+    expect(p.calls).toHaveLength(0)
+  })
+
+  test('a failing config.set never breaks the local optimistic flip', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('gateway down')
+    })
+    await dispatchSlash('/focus on', p.ctx)
+    await tick()
+    expect(p.focusFlag.value).toBe(true)
+    expect(p.system).toEqual(['focus view enabled — just your prompt and the final response'])
   })
 })
 

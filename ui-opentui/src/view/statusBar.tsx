@@ -18,8 +18,10 @@
  *   - Responsive = drop, don't restack: as the terminal narrows, tail segments
  *     drop WHOLE in reverse priority (mcp → bg → profile → cmp → up → cost →
  *     ctx detail collapsing to a bare `ctx: 42%`, then the `⛓ agents` chip) via
- *     the pure, table-tested `statusSegments` ladder. The health dot, model and
- *     ctx % are pinned. Nothing truncates mid-segment, so the row NEVER wraps.
+ *     the pure, table-tested `statusSegments` ladder. The health dot, model,
+ *     the `◉ focus` badge (/focus — reduced-output mode must never be active
+ *     invisibly) and ctx % are pinned. Nothing truncates mid-segment, so the
+ *     row NEVER wraps.
  *
  * A pending update (`info.update_behind > 0`) BORROWS the whole line as a
  * transient notice; it dismisses on Esc or after NOTICE_TTL_MS.
@@ -74,8 +76,8 @@ const NOTICE_TTL_MS = 30_000
 /** Which tail segments are visible at a given column count. Drop order as the
  *  terminal narrows (reverse priority): mcp → bg → profile → cmp → up →
  *  cost → ctxDetail (the bar+token read-out collapses to a bare `ctx: 42%`).
- *  Dot+model and the ctx % are pinned and never gated here; the cwd is gated
- *  by its own leftover-width budget instead. */
+ *  Dot+model, the `◉ focus` badge and the ctx % are pinned and never gated
+ *  here; the cwd is gated by its own leftover-width budget instead. */
 export interface StatusSegments {
   /** Active-background-delegations `⛓ N` chip — survives narrowest (drops last). */
   agents: boolean
@@ -386,6 +388,13 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     if (!snap || snap.counts.total === 0) return ''
     return `☑ ${snap.counts.completed}/${snap.counts.total}`
   })
+  // `◉ focus` — the /focus reduced-output badge (Ink StatusRule parity:
+  // flexShrink=0, warn-tinted). PINNED on purpose — never width-gated in the
+  // statusSegments ladder and never truncated: the whole point of the
+  // indicator is that the user can never be in reduced-output mode without
+  // seeing it. It's short + fixed-width, so instead of dropping it the
+  // variable-width tail (resume hint, cwd) budgets around it via baseLeftLen.
+  const focusText = createMemo(() => (props.store.state.focusView ? '◉ focus' : ''))
   const batteryText = createMemo(() => {
     const reading = props.store.state.batteryStatus
     return props.store.state.batteryEnabled && reading?.available ? batteryLabel(reading) : ''
@@ -403,6 +412,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     if (batteryText()) len += batteryText().length + SEP.length
     if (model()) len += 1 + model().length + effort().length
     for (const seg of [
+      focusText(),
       agentsText(),
       todoText(),
       ctxText(),
@@ -498,6 +508,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
             <span style={{ fg: theme().color.statusFg }}>{` ${model()}`}</span>
             <span style={{ fg: theme().color.muted }}>{effort()}</span>
           </Show>
+          <Seg text={focusText()} fg={theme().color.warn} />
           <Seg text={agentsText()} fg={theme().color.accent} />
           <Seg text={todoText()} fg={theme().color.statusGood} />
           <Show when={ctxText()}>

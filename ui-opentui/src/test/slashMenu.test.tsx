@@ -225,6 +225,49 @@ describe('slash menu — opens on the first slash, hydrating the full command li
     }
   })
 
+  test('accepting a mid-buffer @ mention preserves the multi-line suffix (plan end → completionEdit)', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    const submitted: string[] = []
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} onSubmit={text => void submitted.push(text)} history={createPromptHistory({})} />
+        </ThemeProvider>
+      ),
+      { height: 24, kittyKeyboard: true, width: 70 }
+    )
+    try {
+      // A recalled draft with prose AND a second line after the @token — the
+      // exact shape the old replace-to-buffer-end accept used to truncate.
+      const draft = 'see @comp and more\nsecond line'
+      store.replaceComposerDraft(draft)
+      await probe.settle()
+      // Park the cursor right after `@comp` (mid-buffer).
+      for (let i = 0; i < ' and more\nsecond line'.length; i++) probe.keys.pressArrow('left')
+      // Entry parity: the REAL plan for this text+cursor supplies from/end.
+      const plan = planCompletion(draft, 'see @comp'.length)
+      expect(plan?.method).toBe('complete.path')
+      store.setCompletions(
+        [{ display: 'composer.tsx', meta: 'file', text: '@src/view/composer.tsx' }],
+        plan?.from ?? 0,
+        plan?.end
+      )
+      await probe.settle()
+
+      probe.keys.pressTab()
+      await probe.settle()
+      expect(store.state.composerDraft).toBe('see @src/view/composer.tsx and more\nsecond line')
+
+      // The cursor sits after the completed token's separator, not at the end.
+      await probe.keys.typeText('X')
+      await probe.settle()
+      expect(store.state.composerDraft).toBe('see @src/view/composer.tsx Xand more\nsecond line')
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('`/c` shows the matching candidates + the nav hint', async () => {
     const h = await mountComposer()
     try {

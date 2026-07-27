@@ -45,6 +45,7 @@ export interface DetailsConfig {
 
 const DetailsDisplayConfigSchema = Schema.Struct({
   details_mode: Schema.optionalKey(Schema.Unknown),
+  focus_view: Schema.optionalKey(Schema.Unknown),
   tui_compact: Schema.optionalKey(Schema.Unknown),
   sections: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
   thinking_mode: Schema.optionalKey(Schema.Unknown)
@@ -56,6 +57,13 @@ const decodeDetailsRootConfig = Schema.decodeUnknownOption(DetailsRootConfigSche
 export function compactFromConfig(config: unknown): boolean {
   const decoded = decodeDetailsRootConfig(config)
   return Option.isSome(decoded) && Boolean(decoded.value.display?.tui_compact)
+}
+
+/** Decode the persisted focus-view flag (`display.focus_view`, /focus) from
+ * `config.get full` — Ink applyDisplay's `!!d.focus_view` parity. */
+export function focusViewFromConfig(config: unknown): boolean {
+  const decoded = decodeDetailsRootConfig(config)
+  return Option.isSome(decoded) && Boolean(decoded.value.display?.focus_view)
 }
 
 /** Decode the display subset of `config.get full`; invalid overrides are ignored. */

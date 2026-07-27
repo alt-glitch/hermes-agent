@@ -63,7 +63,7 @@ import {
 } from '../boundary/sessionLifecycle.ts'
 import { configSyncBlocked, createConfigSyncTracker } from '../logic/configSync.ts'
 import { batteryEnabledFromConfig, createBatteryPoller } from '../logic/battery.ts'
-import { compactFromConfig, detailsFromConfig } from '../logic/details.ts'
+import { compactFromConfig, detailsFromConfig, focusViewFromConfig } from '../logic/details.ts'
 import {
   createDelegationStatusRefresher,
   createSpawnTreeSaveDrainer,
@@ -348,6 +348,7 @@ const postSessionSetup = (
     const isActive = () => gateway.sessionId() === sid && store.state.sessionId === sid
     const busyModeRevision = store.getBusyInputModeRevision()
     const compactRevision = store.getCompactRevision()
+    const focusViewRevision = store.getFocusViewRevision()
     const detailsRevision = store.getDetailsRevision()
     const batteryRevision = store.getBatteryRevision()
 
@@ -408,6 +409,7 @@ const postSessionSetup = (
     if (isActive() && decodedBusyConfig) {
       store.hydrateBusyInputMode(busyInputModeFromConfig(decodedBusyConfig.config), busyModeRevision)
       store.hydrateCompact(compactFromConfig(decodedBusyConfig.config), compactRevision)
+      store.hydrateFocusView(focusViewFromConfig(decodedBusyConfig.config), focusViewRevision)
       const details = detailsFromConfig(decodedBusyConfig.config)
       store.hydrateDetails(details.mode, details.sections, detailsRevision)
       store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedBusyConfig.config), batteryRevision)
@@ -1061,6 +1063,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               if (!plan) return
               const busyModeRevision = store.getBusyInputModeRevision()
               const compactRevision = store.getCompactRevision()
+              const focusViewRevision = store.getFocusViewRevision()
               const detailsRevision = store.getDetailsRevision()
               const batteryRevision = store.getBatteryRevision()
 
@@ -1085,6 +1088,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
               store.hydrateBusyInputMode(busyInputModeFromConfig(decodedConfig.config), busyModeRevision)
               store.hydrateCompact(compactFromConfig(decodedConfig.config), compactRevision)
+              store.hydrateFocusView(focusViewFromConfig(decodedConfig.config), focusViewRevision)
               const details = detailsFromConfig(decodedConfig.config)
               store.hydrateDetails(details.mode, details.sections, detailsRevision)
               store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedConfig.config), batteryRevision)
@@ -2702,6 +2706,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         setDetailSection: (section, mode) => store.setDetailSection(section, mode),
         timestamps: () => store.state.timestamps,
         setTimestamps: on => store.setTimestamps(on),
+        focusView: () => store.state.focusView,
+        setFocusView: on => store.setFocusView(on),
         reasoningFull: () => store.state.reasoningFull,
         setReasoningFull: on => store.setReasoningFull(on),
         isBusy: isTurnBusy,
