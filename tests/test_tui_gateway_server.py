@@ -9504,7 +9504,9 @@ def test_slow_agent_build_emits_keyed_progress_notice(monkeypatch):
 def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
     """When the build itself FAILS (agent_error set when ready fires), the
     prompt must not run and the failure must reach the client as a visible
-    error event — never a silent drop."""
+    error event — never a silent drop. Corrections queued during startup have
+    no agent turn to drain them, so failure must clear the queue and leave the
+    next submit free to claim a fresh turn."""
     threads = []
     emitted = []
     calls = {"run_prompt": 0}
@@ -9549,11 +9551,24 @@ def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
             }
         )
         assert submit.get("result"), f"got error: {submit.get('error')}"
+        redirect = server.handle_request(
+            {
+                "id": "redirect-1",
+                "method": "session.redirect",
+                "params": {
+                    "session_id": "sid",
+                    "text": "wait, use SQLite",
+                },
+            }
+        )
+        assert redirect["result"]["status"] == "queued"
+        assert session["queued_prompt"]["text"] == "wait, use SQLite"
 
         threads[0].target()
 
         assert calls["run_prompt"] == 0
         assert session["running"] is False
+        assert session["queued_prompt"] is None
         # #71184 upgraded failure delivery from a bare "error" event to a
         # terminal message.complete frame (status=error, recoverable) so
         # failed turns are retained as replayable inflight snapshots. The
@@ -9575,6 +9590,18 @@ def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
         frame = failure_frames[0]
         if frame[0] == "message.complete":
             assert frame[2].get("status") == "error"
+
+        retry = server.handle_request(
+            {
+                "id": "2",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "retry fresh"},
+            }
+        )
+        assert retry["result"]["status"] == "streaming"
+        assert session["running"] is True
+        assert session["queued_prompt"] is None
+        assert len(threads) == 2
     finally:
         server._sessions.pop("sid", None)
 

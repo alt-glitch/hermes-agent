@@ -12034,11 +12034,10 @@ def _(rid, params: dict) -> dict:
                     if isinstance(queued, dict)
                     else []
                 )
-                if queued_submission_ids:
-                    # These clients retain a process-local recovery copy until
-                    # their own correlated start. Settle that copy explicitly;
-                    # there is no agent turn available to drain this slot.
-                    session["queued_prompt"] = None
+                # No agent turn exists to drain anything accepted into this
+                # slot during startup. Clear every orphaned queue entry; IDs,
+                # when present, are still settled by the terminal frame below.
+                session["queued_prompt"] = None
                 failed_submission_ids = list(
                     dict.fromkeys(
                         [
