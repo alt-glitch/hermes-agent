@@ -2348,7 +2348,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         {
             "role": "tool",
             "name": "search_files",
-            "context": "Searching files for resume",
+            "context": "resume",
             "args": {"pattern": "resume"},
             "result_text": "found the persisted result",
         },
