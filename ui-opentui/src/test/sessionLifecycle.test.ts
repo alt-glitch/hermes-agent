@@ -489,6 +489,26 @@ describe('branchSession', () => {
       assert.strictEqual(store.state.resumeId, 'child-key')
     })
   })
+
+  it.effect('adopts the shared stored identity when session_key is absent', () => {
+    const store = createSessionStore()
+    store.setSessionId('parent-live')
+    const fake = fakeGateway(
+      method =>
+        Effect.succeed(
+          method === 'session.branch'
+            ? { parent: 'parent-key', session_id: 'child-live', stored_session_id: 'child-stored', title: 'forked' }
+            : { closed: true }
+        ),
+      'parent-live'
+    )
+    return Effect.gen(function* () {
+      const result = yield* branchSession(fake.service, store, { name: 'forked' })
+      assert.strictEqual(result.resumeId, 'child-stored')
+      assert.strictEqual(store.state.resumeId, 'child-stored')
+    })
+  })
+
   it('preserves composer edits authored while the branch RPC is pending', async () => {
     let release: ((value: unknown) => void) | undefined
     const pending = new Promise<unknown>(resolve => (release = resolve))

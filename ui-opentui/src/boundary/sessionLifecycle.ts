@@ -369,7 +369,7 @@ export const branchSession = Effect.fn('SessionLifecycle.branch')(function* (
         method: 'session.branch'
       })
     }
-    const resumeId = response.session_key?.trim() || childSessionId
+    const resumeId = response.stored_session_id?.trim() || response.session_key?.trim() || childSessionId
     const preservedDraft = store.state.composerDraft
     store.commitSessionSnapshot(
       childSessionId,

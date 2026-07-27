@@ -75,7 +75,13 @@ export type SessionActivateResponse = LiveSessionSnapshot
 export const SessionResumeResponseSchema = LiveSessionSnapshotSchema
 export type SessionResumeResponse = LiveSessionSnapshot
 export const SessionBranchResponseSchema = Schema.StructWithRest(
-  Schema.Struct({ parent: opt(Str), session_id: Str, session_key: opt(Str), title: Str }),
+  Schema.Struct({
+    parent: opt(Str),
+    session_id: Str,
+    session_key: opt(Str),
+    stored_session_id: opt(Str),
+    title: Str
+  }),
   [UnknownFields]
 )
 export type SessionBranchResponse = typeof SessionBranchResponseSchema.Type

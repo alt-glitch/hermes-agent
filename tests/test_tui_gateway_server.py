@@ -11186,6 +11186,8 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         assert seen.get("launch") is None
         assert seen.get("launch_create") is None
         child_sid = resp["result"]["session_id"]
+        assert resp["result"]["stored_session_id"] == seen["created"]
+        assert resp["result"]["session_key"] == seen["created"]
         assert server._sessions[child_sid]["profile_home"] == str(profile_home)
         # The branched AGENT must be bound to the parent profile's state.db —
         # not just the row. Otherwise its own flushes (and a later compression
