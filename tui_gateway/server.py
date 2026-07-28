@@ -17699,6 +17699,31 @@ def _fuzzy_basename_rank(name: str, query: str) -> tuple[int, int] | None:
     return None
 
 
+def _abs_completion_prefix_exists(path_part: str) -> bool:
+    """True when ``path_part`` reads sensibly as an absolute path.
+
+    A leading `/` is only meant literally if something is actually there:
+    the parent directory has to exist, and a partially-typed final segment
+    has to match at least one of its entries. Used to decide whether
+    `@/foo` is the absolute `/foo` or shorthand for `foo` under the cwd.
+    """
+    expanded = _normalize_completion_path(path_part)
+    parent = os.path.dirname(expanded.rstrip("/")) or "/"
+    tail = os.path.basename(expanded.rstrip("/"))
+
+    if not os.path.isdir(parent):
+        return False
+
+    if not tail or expanded.endswith("/"):
+        return os.path.isdir(expanded) or expanded == "/"
+
+    try:
+        tail_lower = tail.lower()
+        return any(e.lower().startswith(tail_lower) for e in os.listdir(parent))
+    except OSError:
+        return False
+
+
 @method("complete.path")
 def _(rid, params: dict) -> dict:
     word = params.get("word", "")
@@ -17734,6 +17759,21 @@ def _(rid, params: dict) -> dict:
             prefix_tag = ""
             path_part = query if is_context else query
 
+        # `@/foo` almost always means "foo, from here" rather than the absolute
+        # `/foo`: the `@` already says "this is a path", so the slash reads as a
+        # separator people type out of habit. Take the absolute reading only
+        # when something is actually there, else drop the slash and resolve
+        # relative to the cwd — otherwise `@/Desktop` dead-ends on a directory
+        # that exists one level down. Real absolute paths (`@/usr/local`,
+        # `@/etc/hosts`) still resolve, since those prefixes do exist.
+        if (
+            is_context
+            and path_part.startswith("/")
+            and not path_part.startswith("//")
+            and not _abs_completion_prefix_exists(path_part)
+        ):
+            path_part = path_part.lstrip("/")
+
         # Fuzzy basename search across the repo when the user types a bare
         # name with no path separator — `@appChrome` surfaces every file
         # whose basename matches, regardless of directory depth. Matches what
@@ -17747,24 +17787,54 @@ def _(rid, params: dict) -> dict:
             and "/" not in path_part
             and prefix_tag != "folder"
         ):
-            ranked: list[tuple[tuple[int, int], str, str]] = []
-            for rel in _list_repo_files(root):
-                basename = os.path.basename(rel)
-                if basename.startswith(".") and not path_part.startswith("."):
-                    continue
-                rank = _fuzzy_basename_rank(basename, path_part)
-                if rank is None:
-                    continue
-                ranked.append((rank, rel, basename))
+            ranked: list[tuple[tuple[int, int], str, str, bool]] = []
+            walked_dirs: set[str] = set()
+            seen: set[str] = set()
+            want_hidden = path_part.startswith(".")
 
-            ranked.sort(key=lambda r: (r[0], len(r[1]), r[1]))
+            def _consider(rel: str, name: str, is_dir: bool) -> None:
+                if rel in seen or (name.startswith(".") and not want_hidden):
+                    return
+                rank = _fuzzy_basename_rank(name, path_part)
+                if rank is not None:
+                    seen.add(rel)
+                    ranked.append((rank, rel, name, is_dir))
+
+            # Seed with root's immediate children. `_list_repo_files` is capped
+            # at _FUZZY_CACHE_MAX_FILES, and outside a git repo the fallback
+            # walk can burn that whole budget on one deep subtree before ever
+            # reaching a sibling — which is why `@Desk` in a non-repo $HOME
+            # found nothing. One listdir keeps the top level always reachable.
+            try:
+                for entry in os.listdir(root):
+                    if entry not in _FUZZY_FALLBACK_EXCLUDES:
+                        _consider(entry, entry, os.path.isdir(os.path.join(root, entry)))
+            except OSError:
+                pass
+
+            for rel in _list_repo_files(root):
+                _consider(rel, os.path.basename(rel), False)
+
+                # Directories are only implied by the file listing, so rank each
+                # ancestor too. Without this a bare `@Desktop` finds nothing —
+                # a folder with no name-matching file inside it is invisible to
+                # a file-only scan, which is the "can't @ a folder by name" bug.
+                parent = os.path.dirname(rel)
+                while parent and parent not in walked_dirs:
+                    walked_dirs.add(parent)
+                    _consider(parent, os.path.basename(parent), True)
+                    parent = os.path.dirname(parent)
+
+            # Same rank tier: folders first, so `@Desktop` leads with the folder
+            # rather than a file that merely fuzzy-matches the same letters.
+            ranked.sort(key=lambda r: (r[0], not r[3], len(r[1]), r[1]))
             tag = prefix_tag or "file"
-            for _, rel, basename in ranked[:30]:
+            for _, rel, basename, is_dir in ranked[:30]:
                 items.append(
                     {
-                        "text": f"@{tag}:{rel}",
-                        "display": basename,
-                        "meta": os.path.dirname(rel),
+                        "text": f"@{'folder' if is_dir else tag}:{rel}{'/' if is_dir else ''}",
+                        "display": basename + ("/" if is_dir else ""),
+                        "meta": "dir" if is_dir else os.path.dirname(rel),
                     }
                 )
 

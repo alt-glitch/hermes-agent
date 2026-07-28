@@ -7,7 +7,7 @@ import {
   type SyntaxHighlighterProps,
   tailBoundedRemend
 } from '@assistant-ui/react-streamdown'
-import { code } from '@streamdown/code'
+import type { code as streamdownCode } from '@streamdown/code'
 import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
@@ -51,6 +51,41 @@ import { detectEmbed, extractAlert, MarkdownAlert, RichCodeBlock, UrlEmbed } fro
 // `singleDollarTextMath: true` enables `$x^2$` for inline math (de-facto
 // LLM convention). The default false-setting only accepts `$$...$$`.
 const mathPlugin = createMemoizedMathPlugin({ singleDollarTextMath: true })
+
+// `@streamdown/code` statically imports ALL of shiki (every grammar + theme —
+// the single largest chunk in the renderer), so it must never sit on the
+// entry graph. Load it on first markdown mount and swap it into the plugin
+// table when it lands; until then fenced code renders through the
+// `SyntaxHighlighter` override's plain path (same output Shiki's own
+// `delay` fallback shows), so nothing flashes or reflows unexpectedly.
+type CodePlugin = typeof streamdownCode
+let codePluginCache: CodePlugin | null = null
+
+function useCodePlugin(): CodePlugin | null {
+  const [plugin, setPlugin] = useState(codePluginCache)
+
+  useEffect(() => {
+    if (plugin) {
+      return
+    }
+
+    let cancelled = false
+
+    void import('@streamdown/code').then(({ code }) => {
+      codePluginCache = code
+
+      if (!cancelled) {
+        setPlugin(code)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [plugin])
+
+  return plugin
+}
 
 // Replaces Streamdown's `parseIncompleteMarkdown` (full-text remend per
 // flush) with a tail-bounded repair. Must stay module-scope so the prop
@@ -198,7 +233,7 @@ function MediaAttachment({ path }: { path: string }) {
   return (
     <span className="wrap-anywhere">
       <a
-        className="link-chip font-semibold wrap-anywhere"
+        className="link-chip wrap-anywhere"
         href="#"
         onClick={event => {
           event.preventDefault()
@@ -248,7 +283,7 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
   if (!target || !/^https?:\/\//i.test(target)) {
     return (
       <a
-        className={cn('link-chip font-semibold wrap-anywhere', className)}
+        className={cn('link-chip wrap-anywhere', className)}
         href={href}
         rel="noopener noreferrer"
         target="_blank"
@@ -338,14 +373,18 @@ function MarkdownImage({ className, src, alt, ...props }: ComponentProps<'img'>)
     return <span className="my-2 block text-sm text-muted-foreground">Loading {name}...</span>
   }
 
+  // The width cap belongs on the container, not the <img>: a percentage
+  // max-width resolves to none while the container measures its fit-content
+  // width, so the box overshoots the rendered image and strands the download
+  // button — which anchors to the container — out in the margin.
   return (
     <ZoomableImage
       alt={alt}
       className={cn(
-        'm-0 block h-auto w-auto max-h-(--image-preview-height) max-w-[min(100%,var(--image-preview-max-width))] rounded-lg object-contain shadow-[0_0.0625rem_0.125rem_color-mix(in_srgb,#000_4%,transparent),0_0.625rem_1.5rem_color-mix(in_srgb,#000_5%,transparent)]',
+        'm-0 block h-auto w-auto max-h-(--image-preview-height) max-w-full rounded-lg object-contain shadow-[0_0.0625rem_0.125rem_color-mix(in_srgb,#000_4%,transparent),0_0.625rem_1.5rem_color-mix(in_srgb,#000_5%,transparent)]',
         className
       )}
-      containerClassName="my-2 block w-fit max-w-full"
+      containerClassName="my-2 block w-fit max-w-[min(100%,var(--image-preview-max-width))]"
       slot="aui_markdown-image"
       src={resolvedSrc}
       {...props}
@@ -419,8 +458,10 @@ function MarkdownTextSurface({
 
   // Keep code parsing enabled while streaming so incomplete fenced blocks still
   // render as code cards. The expensive Shiki pass is deferred by
-  // `SyntaxHighlighter` below when `isStreaming` is true.
-  const plugins = useMemo(() => ({ math: mathPlugin, code }), [])
+  // `SyntaxHighlighter` below when `isStreaming` is true, and the code plugin
+  // itself arrives async (useCodePlugin) so shiki never blocks cold start.
+  const code = useCodePlugin()
+  const plugins = useMemo(() => (code ? { math: mathPlugin, code } : { math: mathPlugin }), [code])
 
   const components = useMemo(
     () =>

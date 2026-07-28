@@ -1713,19 +1713,27 @@ stt:
   enabled: true                # Auto-transcribe inbound voice messages (default: true)
   echo_transcripts: true       # Post raw transcripts back to the chat as 🎙️ "..." (default: true)
   provider: "local"            # "local" | "groq" | "openai" | "mistral"
+  language: ""                 # GLOBAL language hint for every provider (ISO-639-1, e.g. "en", "he", "uk"); blank = auto-detect
   local:
     model: "base"              # tiny, base, small, medium, large-v3
+    language: ""               # per-provider override of stt.language
+    initial_prompt: ""         # optional whisper prompt to bias vocabulary/script (e.g. Simplified Chinese)
+  groq:
+    language: ""               # per-provider override of stt.language
   openai:
     model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
+    language: ""               # per-provider override of stt.language
   # model: "whisper-1"         # Legacy fallback key still respected
 ```
+
+Language resolution is the same for **every** STT provider (local, groq, openai, mistral, xai, elevenlabs, deepinfra, command providers, and plugins): `stt.<provider>.language` → `stt.language` → `HERMES_LOCAL_STT_LANGUAGE` env var → provider auto-detect. Setting `stt.language` once fixes the common "my voice notes get transcribed in the wrong language" problem regardless of which provider is active.
 
 Set `stt.echo_transcripts: false` when the gateway should transcribe voice notes for the agent but must not post the raw transcript back to the chat (for example, customer-facing WhatsApp bots).
 
 Provider behavior:
 
 - `local` uses `faster-whisper` running on your machine. Install it separately with `pip install faster-whisper`.
-- `groq` uses Groq's Whisper-compatible endpoint and reads `GROQ_API_KEY`.
+- `groq` uses Groq's Whisper-compatible endpoint and reads `GROQ_API_KEY`. Pass `stt.groq.language` (or the global `HERMES_LOCAL_STT_LANGUAGE` env var) to skip auto-detection and reduce latency.
 - `openai` uses the OpenAI speech API and reads `VOICE_TOOLS_OPENAI_KEY`.
 
 If the requested provider is unavailable, Hermes falls back automatically in this order: `local` → `groq` → `openai`.
