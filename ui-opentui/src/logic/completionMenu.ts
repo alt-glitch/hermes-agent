@@ -101,7 +101,12 @@ export interface CompletionEdit {
  *
  * A preserved whitespace suffix is already the completion separator. Reusing
  * it avoids `"/clean  and"` while placing the cursor after that separator so
- * the next typed character lands before the remaining prose. */
+ * the next typed character lands before the remaining prose.
+ *
+ * A replacement ending in `/` is a folder row (`@folder:docs/`, Ink parity):
+ * the accept is a drill-in, not a finished token, so no separator is added and
+ * the cursor parks right after the `/` — planCompletion re-queries inside the
+ * folder instead of seeing a space-terminated dead token. */
 export function completionEdit(
   bufText: string,
   itemText: string,
@@ -114,6 +119,9 @@ export function completionEdit(
   const suffix = bufText.slice(to)
   const replacement = before.endsWith('/') && itemText.startsWith('/') ? itemText.slice(1) : itemText
   const replacementEnd = before.length + replacement.length
+  if (replacement.startsWith('@folder:') && replacement.endsWith('/')) {
+    return { cursor: replacementEnd, text: `${before}${replacement}${suffix}` }
+  }
   if (/^\s/u.test(suffix)) {
     return { cursor: replacementEnd + 1, text: `${before}${replacement}${suffix}` }
   }

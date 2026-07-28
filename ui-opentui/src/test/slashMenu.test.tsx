@@ -22,6 +22,7 @@ import {
   MENU_MAX,
   acceptChangesToken,
   applyCompletion,
+  completionEdit,
   routeMenuKey,
   type MenuKeyContext
 } from '../logic/completionMenu.ts'
@@ -124,6 +125,49 @@ describe('acceptChangesToken — Enter-accept vs. submit (trailing-space guard)'
     expect(applyCompletion('run /cle and more', 'clean', 5, 8)).toBe('run /clean and more')
     expect(applyCompletion('run /cle\u00a0and more', 'clean', 5, 8)).toBe('run /clean\u00a0and more')
     expect(acceptChangesToken('run /cle and more', 'clean', 5, 8)).toBe(true)
+  })
+})
+
+describe('completionEdit — folder rows drill in instead of terminating the token', () => {
+  test('a folder row (`@folder:docs/`) gets NO separator; the cursor parks on its end', () => {
+    // Gateway b378cc0 folder rows end in `/`. The old unconditional space made
+    // the buffer `@folder:docs/ ` — planCompletion saw a dead token and the
+    // menu closed instead of drilling into the folder (Ink inserts verbatim).
+    expect(completionEdit('@docs', '@folder:docs/', 0, 5)).toEqual({
+      cursor: '@folder:docs/'.length,
+      text: '@folder:docs/'
+    })
+  })
+
+  test('planCompletion on the accepted folder text re-queries inside the folder', () => {
+    const accepted = completionEdit('@docs', '@folder:docs/', 0, 5)
+    const plan = planCompletion(accepted.text, accepted.cursor)
+    expect(plan?.method).toBe('complete.path')
+    expect(plan?.params).toEqual({ word: '@folder:docs/' })
+  })
+
+  test('a mid-buffer folder accept keeps the existing whitespace suffix untouched', () => {
+    // `see @docs and more` with the token at [4, 9): the drill-in adds no
+    // separator of its own — the pre-existing ` and more` stays as-is and the
+    // cursor sits on the trailing `/`, not past the space.
+    expect(completionEdit('see @docs and more', '@folder:docs/', 4, 9)).toEqual({
+      cursor: 'see @folder:docs/'.length,
+      text: 'see @folder:docs/ and more'
+    })
+  })
+
+  test('a non-folder file row still appends the separator with the cursor after it', () => {
+    expect(completionEdit('@comp', '@src/view/composer.tsx', 0, 5)).toEqual({
+      cursor: '@src/view/composer.tsx '.length,
+      text: '@src/view/composer.tsx '
+    })
+  })
+
+  test('an unrelated slash-ending command row still gets a separator', () => {
+    expect(completionEdit('/op', '/ops/', 0, 3)).toEqual({
+      cursor: '/ops/ '.length,
+      text: '/ops/ '
+    })
   })
 })
 

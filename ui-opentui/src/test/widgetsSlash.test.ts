@@ -8,7 +8,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, test } from 'vitest'
 
-import { clientCommandNames, dispatchSlash, type SlashContext } from '../logic/slash.ts'
+import { completionEdit } from '../logic/completionMenu.ts'
+import { clientCommandNames, dispatchSlash, parseSlash, type SlashContext } from '../logic/slash.ts'
 import { mergeWidgetCompletionItems } from '../widgets/completion.ts'
 import { ambientWidgets, disposeAllWidgets } from '../widgets/host.ts'
 import { defineWidgetApp, listWidgetApps, removeWidgetApp } from '../widgets/registry.ts'
@@ -160,6 +161,17 @@ describe('widget completion merge', () => {
   test('arg position (a space) never merges widget names', () => {
     registerAmbient('wargs')
     expect(mergeWidgetCompletionItems('/wargs UTC', [])).toEqual([])
+  })
+
+  test('a slash-ending widget completion keeps its argument separator', () => {
+    registerAmbient('ops/')
+    const [row] = mergeWidgetCompletionItems('/op', [])
+    expect(row).toEqual({ display: '/ops/', meta: 'ops/ help', text: '/ops/' })
+    if (!row) return
+
+    const accepted = completionEdit('/op', row.text, 0, 3)
+    expect(accepted).toEqual({ cursor: '/ops/ '.length, text: '/ops/ ' })
+    expect(parseSlash(`${accepted.text}status`)).toEqual({ arg: 'status', name: 'ops/' })
   })
 
   test('a non-matching prefix contributes nothing', () => {
