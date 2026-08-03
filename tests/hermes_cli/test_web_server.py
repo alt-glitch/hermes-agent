@@ -3476,6 +3476,9 @@ class TestPtyWebSocket:
         q = {"token": tok, **params}
         return f"/api/pty?{urlencode(q)}"
 
+    def test_resolve_chat_argv_uses_dashboard_scroll_env(self, monkeypatch):
+        """Dashboard chat runs the TUI in browser-scrollback mode."""
+        import hermes_cli.main as main_mod
 
         monkeypatch.setattr(
             main_mod,
