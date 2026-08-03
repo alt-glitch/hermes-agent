@@ -550,6 +550,37 @@ def _claim_active_session_slot(
         return None, None
 
 
+_SESSION_CLOSED_DURING_ADMISSION = (
+    "session closed while starting the turn — create or resume a session and retry"
+)
+
+
+def _session_registry_matches(sid: str, session: dict) -> bool:
+    """Whether ``sid`` still names this exact live session record."""
+
+    with _sessions_lock:
+        return _sessions.get(sid) is session
+
+
+def _session_is_detached(sid: str, session: dict) -> bool:
+    """Detect lifecycle detachment while tolerating direct unit callers.
+
+    Production sessions are registry-owned. Some focused unit tests invoke
+    turn helpers with a never-registered record, so an absent registry entry
+    alone is not proof of teardown. ``_pop_session_by_id`` stamps ``_sid``
+    before finalization; that stamp, ``_finalized``, or a replacement record is
+    stable proof that this particular object no longer owns ``sid``.
+    """
+
+    if session.get("_finalized"):
+        return True
+    with _sessions_lock:
+        current = _sessions.get(sid)
+    return current is not session and (
+        current is not None or str(session.get("_sid") or "") == str(sid)
+    )
+
+
 def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     """Claim this session's cap slot on its first real turn; None when ok.
 
@@ -569,10 +600,9 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     # checks make the in-memory ownership transition atomic while allowing
     # unrelated lifecycle work to proceed.
     with _session_mutation_lock(session):
-        if (
-            session.get("active_session_lease") is not None
-            or session.get("_finalized")
-        ):
+        if not _session_registry_matches(sid, session) or session.get("_finalized"):
+            return _SESSION_CLOSED_DURING_ADMISSION
+        if session.get("active_session_lease") is not None:
             return None
     lease, limit_message = _claim_active_session_slot(
         str(session.get("session_key") or ""),
@@ -581,13 +611,14 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     )
     result = limit_message
     with _session_mutation_lock(session):
-        if (
-            session.get("active_session_lease") is not None
-            or session.get("_finalized")
-        ):
-            # A concurrent first submission installed the lease, or teardown
-            # finished while this claim was in flight. Its result wins over a
-            # stale cap error from this redundant attempt.
+        if not _session_registry_matches(sid, session) or session.get("_finalized"):
+            # Teardown detached/finalized this exact record while the
+            # cross-process lease claim was in flight. This is not the same as
+            # a concurrent successful claimant: prompt.submit must stop here.
+            result = _SESSION_CLOSED_DURING_ADMISSION
+        elif session.get("active_session_lease") is not None:
+            # A concurrent first submission installed the lease. Its result
+            # wins over a stale cap error from this redundant attempt.
             result = None
         elif limit_message is None:
             session["active_session_lease"] = lease
@@ -721,12 +752,42 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         return
     session["_finalized"] = True
     _release_active_session_slot(session)
+    # A close is terminal for every already-accepted input owned by this
+    # record. Drain the complete queue (head + image-bearing tail), fence any
+    # claimed drain by advancing its generation, and correlate one terminal
+    # failure with every accepted client submission id. ``_pop_session_by_id``
+    # stamps _sid before teardown; direct finalizers can still be located while
+    # registered.
+    failure_sid = str(session.get("_sid") or "")
+    if not failure_sid:
+        with _sessions_lock:
+            failure_sid = next(
+                (
+                    candidate_sid
+                    for candidate_sid, candidate in _sessions.items()
+                    if candidate is session
+                ),
+                "",
+            )
+    lock = session.get("history_lock")
+    lock_context = lock if lock is not None else contextlib.nullcontext()
+    with lock_context:
+        failed_submission_ids = _settle_pending_input_ids_locked(session)
+        session["running"] = False
+        session["_turn_cancel_requested"] = True
+        if failed_submission_ids:
+            _emit_terminal_turn_error(
+                failure_sid,
+                session,
+                "session closed before accepted input could run",
+                client_submission_ids=failed_submission_ids,
+                history_lock_owned=True,
+            )
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
 
     agent = session.get("agent")
-    lock = session.get("history_lock")
     if lock is not None:
         with lock:
             history = list(session.get("history", []))
@@ -1975,7 +2036,7 @@ def _serialize_mcp_reload(fn):
 
 
 @contextlib.contextmanager
-def _try_mcp_turn_admission(session: dict):
+def _try_mcp_turn_admission(session: dict, *, sid: str | None = None):
     """Nonblocking prompt claim against the process-global MCP reload fence.
 
     The prompt RPC runs on the reader thread, so it must never wait behind MCP
@@ -1988,8 +2049,23 @@ def _try_mcp_turn_admission(session: dict):
         yield False
         return
     try:
-        with session["history_lock"]:
-            yield True
+        mutation_context = (
+            _session_mutation_lock(session)
+            if sid is not None
+            else contextlib.nullcontext()
+        )
+        # Global order: MCP admission -> session mutation -> registry ->
+        # history. A close cannot detach this record between its identity
+        # check and running=True.
+        with mutation_context:
+            if sid is not None and (
+                not _session_registry_matches(sid, session)
+                or session.get("_finalized")
+            ):
+                yield False
+                return
+            with session["history_lock"]:
+                yield True
     finally:
         _mcp_reload_admission_lock.release()
 
@@ -2252,14 +2328,22 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # prompt/RPC builds the agent normally so the user can talk to the session.
     if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
         return
-    lock = session.setdefault("agent_build_lock", threading.Lock())
-    with lock:
-        if ready.is_set() or session.get("agent_build_started"):
+    # Serialize the registry identity check and build-thread publication with
+    # close. A detached record must not even spawn a build worker whose first
+    # action is discovering that the registry entry vanished.
+    mutation_lock = _session_mutation_lock(session)
+    with mutation_lock:
+        if _session_is_detached(sid, session):
+            ready.set()
             return
-        session["agent_build_started"] = True
-        # An upgrading lazy session is now genuinely mid-construction — restore
-        # its "still starting" eviction exemption.
-        session.pop("lazy", None)
+        lock = session.setdefault("agent_build_lock", threading.Lock())
+        with lock:
+            if ready.is_set() or session.get("agent_build_started"):
+                return
+            session["agent_build_started"] = True
+            # An upgrading lazy session is now genuinely mid-construction — restore
+            # its "still starting" eviction exemption.
+            session.pop("lazy", None)
     key = session["session_key"]
 
     def _build() -> None:
@@ -2433,8 +2517,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # Handle for _wait_agent_for_prompt: a dead build thread with agent_ready
     # still unset means the build died hard — waiters must not sit out the
     # full cap on a corpse.
-    session["_agent_build_thread"] = build_thread
-    build_thread.start()
+    with mutation_lock:
+        if _session_is_detached(sid, session):
+            ready.set()
+            return
+        session["_agent_build_thread"] = build_thread
+        build_thread.start()
 
 
 def _sess_nowait(params, rid):
@@ -7425,6 +7513,95 @@ _MAX_CLIENT_SUBMISSION_ID_CHARS = 128
 _MAX_QUEUED_SUBMISSION_IDS = 1024
 
 
+def _queued_prompt_envelopes(session: dict) -> list[dict]:
+    """Return the pending queue in drain order, with the head exactly once."""
+
+    envelopes: list[dict] = []
+    head = session.get("queued_prompt")
+    if isinstance(head, dict):
+        envelopes.append(head)
+    tail = session.get("queued_prompts")
+    if isinstance(tail, list):
+        envelopes.extend(item for item in tail if isinstance(item, dict))
+    return envelopes
+
+
+def _queued_input_chars(
+    session: dict,
+    *,
+    extra_queue_text: Any = None,
+) -> int:
+    """Conservative text footprint for the complete pending queue."""
+
+    texts = [
+        item.get("text")
+        for item in _queued_prompt_envelopes(session)
+        if isinstance(item.get("text"), str) and item.get("text")
+    ]
+    if extra_queue_text is not None:
+        incoming = (
+            extra_queue_text
+            if isinstance(extra_queue_text, str)
+            else str(extra_queue_text)
+        )
+        if incoming:
+            texts.append(incoming)
+    return sum(len(text) for text in texts) + max(0, len(texts) - 1) * 2
+
+
+def _queued_submission_ids(session: dict) -> list[str]:
+    """Unique accepted queue correlations across head and tail."""
+
+    return list(
+        dict.fromkeys(
+            submission_id
+            for item in _queued_prompt_envelopes(session)
+            for submission_id in list(item.get("client_submission_ids") or [])
+        )
+    )
+
+
+def _clear_queued_prompts_locked(session: dict) -> list[str]:
+    """Clear the full queue and fence already-claimed drains.
+
+    Caller holds ``history_lock`` (or is in single-owner teardown before the
+    lock exists). The returned ids are captured before mutation so terminal
+    failure paths can settle every accepted client submission.
+    """
+
+    queued_ids = _queued_submission_ids(session)
+    had_queue = bool(session.get("queued_prompt") or session.get("queued_prompts"))
+    session["queued_prompt"] = None
+    session.pop("queued_prompts", None)
+    if had_queue:
+        session["_queued_prompt_generation"] = int(
+            session.get("_queued_prompt_generation", 0)
+        ) + 1
+    return queued_ids
+
+
+def _settle_pending_input_ids_locked(
+    session: dict,
+    direct_submission_ids: list[str] | None = None,
+) -> list[str]:
+    """Clear all accepted pending-input correlations and return them once."""
+
+    settled = list(
+        dict.fromkeys(
+            [
+                *list(direct_submission_ids or []),
+                *_clear_queued_prompts_locked(session),
+                *list(session.get("_pending_steer_submission_ids") or []),
+                *list(session.get("_active_client_submission_ids") or []),
+            ]
+        )
+    )
+    session["_active_client_submission_ids"] = []
+    session["_pending_steer_submission_ids"] = []
+    session["pending_steer_chars"] = 0
+    return settled
+
+
 def _pending_steer_chars(session: dict) -> int:
     try:
         return max(0, int(session.get("pending_steer_chars") or 0))
@@ -7440,22 +7617,10 @@ def _pending_input_chars(
 ) -> int:
     """Worst-case queued text if every accepted steer misses the turn."""
 
-    queued = session.get("queued_prompt")
-    queued_text = (
-        queued.get("text")
-        if isinstance(queued, dict) and isinstance(queued.get("text"), str)
-        else ""
+    total = _queued_input_chars(
+        session,
+        extra_queue_text=extra_queue_text,
     )
-    total = len(queued_text)
-    if extra_queue_text is not None:
-        incoming = (
-            extra_queue_text
-            if isinstance(extra_queue_text, str)
-            else str(extra_queue_text)
-        )
-        total += len(incoming)
-        if queued_text and incoming:
-            total += 2
 
     steer_chars = _pending_steer_chars(session)
     if extra_steer_text is not None:
@@ -7760,22 +7925,23 @@ def _enqueue_prompt(
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
-    existing_text = (
-        existing.get("text")
-        if isinstance(existing, dict) and isinstance(existing.get("text"), str)
-        else ""
-    )
-    incoming_text = text if isinstance(text, str) else str(text)
-    merged_chars = len(existing_text) + len(incoming_text)
-    if existing_text and incoming_text:
-        merged_chars += 2
+    if (
+        _queued_input_chars(session, extra_queue_text=text)
+        > _MAX_PENDING_INPUT_CHARS
+    ):
+        # Check before allocating a merged string: malformed/legacy callers
+        # must not turn the safety assertion itself into a memory spike.
+        raise OverflowError("queued input text capacity invariant exceeded")
     existing_ids = (
         list(existing.get("client_submission_ids") or [])
         if isinstance(existing, dict)
         else []
     )
-    incoming_ids = list(client_submission_ids or [])
-    if len(existing_ids) + len(incoming_ids) > _MAX_QUEUED_SUBMISSION_IDS:
+    incoming_ids = list(dict.fromkeys(client_submission_ids or []))
+    pending_ids = list(
+        dict.fromkeys([*_queued_submission_ids(session), *incoming_ids])
+    )
+    if len(pending_ids) > _MAX_QUEUED_SUBMISSION_IDS:
         raise OverflowError("queued input submission count capacity invariant exceeded")
     if front:
         merged_ids = [*incoming_ids, *existing_ids]
@@ -7784,10 +7950,6 @@ def _enqueue_prompt(
     # Retries can repeat an id after an ambiguous ACK. Preserve text verbatim
     # but correlate the merged lifecycle with each logical client send once.
     merged_ids = list(dict.fromkeys(merged_ids))
-    if merged_chars > _MAX_PENDING_INPUT_CHARS:
-        # Check before allocating the concatenated string: malformed/legacy
-        # callers must not turn the safety assertion itself into a memory spike.
-        raise OverflowError("queued input text capacity invariant exceeded")
     if (
         existing
         and isinstance(existing.get("text"), str)
@@ -7807,8 +7969,8 @@ def _enqueue_prompt(
         session["queued_prompt"] = queued
         return
     if existing:
-        if merged_ids:
-            queued["client_submission_ids"] = merged_ids
+        if incoming_ids:
+            queued["client_submission_ids"] = incoming_ids
         if front:
             session.setdefault("queued_prompts", []).insert(0, existing)
             session["queued_prompt"] = queued
@@ -8172,6 +8334,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     dispatch_failed = False
+    dispatch_error = "queued prompt dispatch failed"
     try:
         if use_compute_host:
             if queued.get("image_paths"):
@@ -8195,7 +8358,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 with session["history_lock"]:
                     session["running"] = False
                     _clear_inflight_turn(session)
-                _emit("error", sid, {"message": message})
+                dispatch_error = message
                 dispatch_failed = True
             else:
                 client_submission_ids = list(
@@ -8227,8 +8390,22 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         with session["history_lock"]:
             session["running"] = False
             _clear_inflight_turn(session)
+        dispatch_error = str(exc) or type(exc).__name__
         dispatch_failed = True
     if dispatch_failed:
+        # The head was already accepted and removed from the queue. Settle its
+        # own correlation before advancing to the tail; a bare stderr/error
+        # event leaves the client's optimistic user bubble pending forever.
+        with session["history_lock"]:
+            session["_active_client_submission_ids"] = []
+        _emit_terminal_turn_error(
+            sid,
+            session,
+            dispatch_error,
+            client_submission_ids=list(
+                queued.get("client_submission_ids") or []
+            ),
+        )
         with session["history_lock"]:
             drain_next = bool(session.get("queued_prompt")) and not session.get(
                 "_turn_cancel_requested"
@@ -11783,6 +11960,12 @@ def _(rid, params: dict) -> dict:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    # The lease helper already fences its slow claim window. Revalidate at the
+    # handler boundary as well so a close/replacement between lookup and turn
+    # admission gets the same stable non-success result.
+    with _session_mutation_lock(session):
+        if not _session_registry_matches(sid, session) or session.get("_finalized"):
+            return _err(rid, 4090, _SESSION_CLOSED_DURING_ADMISSION)
     if truncate_user_ordinal is not None and isinstance(text, str):
         text = _expand_skill_invocation_for_replay(
             text, str(session.get("session_key") or "")
@@ -11794,8 +11977,13 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
-    with _try_mcp_turn_admission(session) as admitted:
+    with _try_mcp_turn_admission(session, sid=sid) as admitted:
         if not admitted:
+            if (
+                not _session_registry_matches(sid, session)
+                or session.get("_finalized")
+            ):
+                return _err(rid, 4090, _SESSION_CLOSED_DURING_ADMISSION)
             return _err(
                 rid,
                 4009,
@@ -11918,7 +12106,15 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        with _session_mutation_lock(session):
+            if not _session_registry_matches(sid, session) or session.get("_finalized"):
+                with session["history_lock"]:
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+                return _err(rid, 4090, _SESSION_CLOSED_DURING_ADMISSION)
+            isolated_response = _submit_prompt_to_compute_host(
+                rid, sid, session, text
+            )
         if not isolated_response.get("error"):
             return isolated_response
         logger.warning(
@@ -11968,34 +12164,13 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
-                queued = session.get("queued_prompt")
-                queued_submission_ids = (
-                    list(queued.get("client_submission_ids") or [])
-                    if isinstance(queued, dict)
-                    else []
-                )
                 # No agent turn exists to drain anything accepted into this
                 # slot during startup. Clear every orphaned queue entry; IDs,
                 # when present, are still settled by the terminal frame below.
-                session["queued_prompt"] = None
-                failed_submission_ids = list(
-                    dict.fromkeys(
-                        [
-                            *client_submission_ids,
-                            *queued_submission_ids,
-                            *list(
-                                session.get("_pending_steer_submission_ids")
-                                or []
-                            ),
-                            *list(
-                                session.get("_active_client_submission_ids")
-                                or []
-                            ),
-                        ]
-                    )
+                failed_submission_ids = _settle_pending_input_ids_locked(
+                    session,
+                    client_submission_ids,
                 )
-                session["_active_client_submission_ids"] = []
-                session["_pending_steer_submission_ids"] = []
                 # Terminal frame + retained snapshot (not a bare "error" event
                 # + cleared inflight): if the client is disconnected right
                 # now, the retained snapshot is the only way resume can show
@@ -12037,11 +12212,17 @@ def _(rid, params: dict) -> dict:
         else:
             _run_prompt_submit(rid, sid, session, text)
 
-    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
-    # Keep a handle so session.interrupt can tell a live turn from a stuck
-    # `running` flag (a turn that died without clearing it) and recover the latter.
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    with _session_mutation_lock(session):
+        if not _session_registry_matches(sid, session) or session.get("_finalized"):
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            return _err(rid, 4090, _SESSION_CLOSED_DURING_ADMISSION)
+        run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+        # Keep a handle so session.interrupt can tell a live turn from a stuck
+        # `running` flag (a turn that died without clearing it) and recover the latter.
+        session["_run_thread"] = run_thread
+        run_thread.start()
     return _ok(rid, {"status": "streaming"})
 
 
@@ -12912,7 +13093,24 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
 ) -> None:
     client_submission_ids = list(client_submission_ids or [])
-    agent = session["agent"]
+    if _session_is_detached(sid, session):
+        with session["history_lock"]:
+            session["running"] = False
+            session["_active_client_submission_ids"] = []
+            _clear_inflight_turn(session)
+        return
+    agent = session.get("agent")
+    if agent is None:
+        with session["history_lock"]:
+            session["running"] = False
+            _emit_terminal_turn_error(
+                sid,
+                session,
+                "session agent unavailable before turn start",
+                client_submission_ids=client_submission_ids,
+                history_lock_owned=True,
+            )
+        return
     with session["history_lock"]:
         # Claim start atomically against session.interrupt. The start event is
         # written while holding the same lock, so the interrupt response can
@@ -13931,9 +14129,20 @@ def _run_prompt_submit(
                 file=sys.stderr,
             )
 
-    run_thread = threading.Thread(target=run, daemon=True)
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    # Defense-in-depth for close/build races after the deferred waiter handed
+    # off to this helper. Publish and start the prompt worker while close is
+    # excluded by the per-session mutation lock; a popped/finalized record
+    # never starts a ghost worker.
+    with _session_mutation_lock(session):
+        if _session_is_detached(sid, session):
+            with session["history_lock"]:
+                session["running"] = False
+                session["_active_client_submission_ids"] = []
+                _clear_inflight_turn(session)
+            return
+        run_thread = threading.Thread(target=run, daemon=True)
+        session["_run_thread"] = run_thread
+        run_thread.start()
 
 
 # Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25

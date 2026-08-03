@@ -462,6 +462,7 @@ def test_concurrent_first_turn_keeps_one_lease_through_transfer_and_release(
     claimed = []
     claimed_lock = threading.Lock()
     real_claim = server._claim_active_session_slot
+    server._sessions["live-sid"] = session
 
     def claim_together(*args, **kwargs):
         barrier.wait(timeout=5)
@@ -501,6 +502,8 @@ def test_concurrent_first_turn_keeps_one_lease_through_transfer_and_release(
         assert active_session_registry_snapshot() == []
     finally:
         server._release_active_session_slot(session)
+        if server._sessions.get("live-sid") is session:
+            server._sessions.pop("live-sid", None)
         server._cfg_cache = None
         server._cfg_mtime = None
         server._cfg_path = None
@@ -508,6 +511,7 @@ def test_concurrent_first_turn_keeps_one_lease_through_transfer_and_release(
 
 def test_concurrent_first_turn_ignores_limit_after_peer_installs_lease(monkeypatch):
     session = {"session_key": "concurrent-limit", "source": "desktop"}
+    server._sessions["live-sid"] = session
     lease = Mock()
     barrier = threading.Barrier(2)
     lease_installed = threading.Event()
@@ -533,13 +537,91 @@ def test_concurrent_first_turn_ignores_limit_after_peer_installs_lease(monkeypat
 
     monkeypatch.setattr(server, "_claim_active_session_slot", coordinated_claim)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(ensure_and_signal) for _ in range(2)]
-        results = [future.result(timeout=5) for future in futures]
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(ensure_and_signal) for _ in range(2)]
+            results = [future.result(timeout=5) for future in futures]
 
-    assert results == [None, None]
-    assert session["active_session_lease"] is lease
-    server._release_active_session_slot(session)
+        assert results == [None, None]
+        assert session["active_session_lease"] is lease
+        server._release_active_session_slot(session)
+    finally:
+        if server._sessions.get("live-sid") is session:
+            server._sessions.pop("live-sid", None)
+    lease.release.assert_called_once_with()
+
+
+def test_prompt_submit_losing_lease_claim_to_close_is_rejected(monkeypatch):
+    """A close that wins the claim window must fence the ghost first turn."""
+
+    import contextlib
+
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+    lease = Mock()
+    agent_builds = []
+    prompt_workers = []
+    response = {}
+    session = _session(agent=None, source="desktop")
+    server._sessions["closing-first-turn"] = session
+    real_thread = threading.Thread
+
+    class _CapturedThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+
+        def start(self):
+            prompt_workers.append(self.target)
+
+        def is_alive(self):
+            return True
+
+    def _blocked_claim(*_args, **_kwargs):
+        claim_entered.set()
+        assert release_claim.wait(timeout=5)
+        return lease, None
+
+    @contextlib.contextmanager
+    def _no_session_db(_session):
+        yield None
+
+    def _submit():
+        response.update(
+            server._methods["prompt.submit"](
+                "submit",
+                {"session_id": "closing-first-turn", "text": "ghost turn"},
+            )
+        )
+
+    monkeypatch.setattr(server, "_claim_active_session_slot", _blocked_claim)
+    monkeypatch.setattr(server, "_session_db", _no_session_db)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda *args: agent_builds.append(args),
+    )
+    monkeypatch.setattr(server.threading, "Thread", _CapturedThread)
+
+    submit_thread = real_thread(target=_submit)
+    submit_thread.start()
+    try:
+        assert claim_entered.wait(timeout=5)
+        assert server._close_session_by_id("closing-first-turn") is True
+        release_claim.set()
+        submit_thread.join(timeout=5)
+    finally:
+        release_claim.set()
+        submit_thread.join(timeout=5)
+        server._sessions.pop("closing-first-turn", None)
+
+    assert not submit_thread.is_alive()
+    assert response["error"]["code"] == 4090
+    assert "closed" in response["error"]["message"]
+    assert agent_builds == []
+    assert prompt_workers == []
     lease.release.assert_called_once_with()
 
 
@@ -13514,6 +13596,133 @@ def test_deferred_init_error_settles_correlated_busy_queue(monkeypatch):
     assert session["queued_prompt"] is None
     assert session["running"] is False
     assert session["inflight_turn"]["status"] == "error"
+
+
+def test_deferred_init_error_settles_every_image_queue_envelope(monkeypatch):
+    threads = []
+
+    class _DeferredThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    session = _session(agent=None)
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _DeferredThread)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        server,
+        "_wait_agent_for_prompt",
+        lambda *_a, **_kw: {"error": {"message": "agent init failed"}},
+    )
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+
+    try:
+        direct = server._methods["prompt.submit"](
+            "direct",
+            {
+                "client_submission_id": "direct-send",
+                "session_id": "sid",
+                "text": "build the agent",
+            },
+        )
+        session["attached_images"] = ["/tmp/head.png"]
+        head = server._methods["prompt.submit"](
+            "head",
+            {
+                "client_submission_id": "head-send",
+                "session_id": "sid",
+                "text": "queued head",
+            },
+        )
+        session["attached_images"] = ["/tmp/tail.png"]
+        tail = server._methods["prompt.submit"](
+            "tail",
+            {
+                "client_submission_id": "tail-send",
+                "session_id": "sid",
+                "text": "queued tail",
+            },
+        )
+
+        assert [
+            direct["result"]["status"],
+            head["result"]["status"],
+            tail["result"]["status"],
+        ] == ["streaming", "queued", "queued"]
+        threads[0].target()
+    finally:
+        server._sessions.pop("sid", None)
+
+    terminal = next(
+        payload
+        for event, _sid, payload in emitted
+        if event == "message.complete"
+    )
+    assert terminal["client_submission_ids"] == [
+        "direct-send",
+        "head-send",
+        "tail-send",
+    ]
+    assert session.get("queued_prompt") is None
+    assert session.get("queued_prompts") is None
+
+
+def test_session_close_fails_and_clears_every_accepted_queue_id(monkeypatch):
+    emitted = []
+    session = _session(
+        queued_prompt={
+            "text": "head",
+            "transport": None,
+            "client_submission_ids": ["head-send"],
+        },
+        queued_prompts=[
+            {
+                "text": "tail",
+                "image_paths": ["/tmp/tail.png"],
+                "transport": None,
+                "client_submission_ids": ["tail-send"],
+            }
+        ],
+    )
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+
+    try:
+        closed = server._methods["session.close"]("close", {"session_id": "sid"})
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert closed["result"]["closed"] is True
+    terminal = next(
+        payload
+        for event, _sid, payload in emitted
+        if event == "message.complete"
+    )
+    assert terminal["client_submission_ids"] == ["head-send", "tail-send"]
+    assert terminal["status"] == "error"
+    assert session.get("queued_prompt") is None
+    assert session.get("queued_prompts") is None
 
 
 

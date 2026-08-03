@@ -131,6 +131,80 @@ def test_enqueue_text_capacity_rejects_overflow_without_mutation():
     assert session["queued_prompt"] == before
 
 
+def test_image_envelopes_share_one_text_capacity_budget(monkeypatch):
+    """Every queued envelope counts, not just the image-bearing head."""
+
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(server, "_MAX_PENDING_INPUT_CHARS", 20)
+    session = _session(running=True)
+
+    for index, text in enumerate(("a" * 6, "b" * 6)):
+        session["attached_images"] = [f"/tmp/{index}.png"]
+        response = server._handle_busy_submit(
+            f"r{index}",
+            "sid",
+            session,
+            text,
+            "ws-1",
+            [f"send-{index}"],
+        )
+        assert response["result"]["status"] == "queued"
+
+    session["attached_images"] = ["/tmp/overflow.png"]
+    rejected = server._handle_busy_submit(
+        "overflow",
+        "sid",
+        session,
+        "c" * 6,
+        "ws-1",
+        ["send-overflow"],
+    )
+
+    assert rejected["error"]["code"] == 4009
+    assert session["attached_images"] == ["/tmp/overflow.png"]
+    envelopes = [
+        session["queued_prompt"],
+        *(session.get("queued_prompts") or []),
+    ]
+    assert [envelope["text"] for envelope in envelopes] == ["a" * 6, "b" * 6]
+
+
+def test_image_envelopes_share_one_submission_id_budget(monkeypatch):
+    """Tail IDs consume the same bounded budget as the queue head."""
+
+    monkeypatch.setattr(server, "_MAX_QUEUED_SUBMISSION_IDS", 2)
+    session = _session()
+    server._enqueue_prompt(
+        session,
+        "A",
+        "ws-1",
+        image_paths=["/tmp/a.png"],
+        client_submission_ids=["send-a"],
+    )
+    server._enqueue_prompt(
+        session,
+        "B",
+        "ws-1",
+        image_paths=["/tmp/b.png"],
+        client_submission_ids=["send-b"],
+    )
+
+    with pytest.raises(OverflowError, match="submission count"):
+        server._enqueue_prompt(
+            session,
+            "C",
+            "ws-1",
+            image_paths=["/tmp/c.png"],
+            client_submission_ids=["send-c"],
+        )
+
+    envelopes = [session["queued_prompt"], *session["queued_prompts"]]
+    assert [envelope["client_submission_ids"] for envelope in envelopes] == [
+        ["send-a"],
+        ["send-b"],
+    ]
+
+
 def test_leftover_promotion_restores_agent_when_queue_is_full():
     session = _session(
         queued_prompt={
@@ -832,8 +906,20 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
         session["running"] = False
 
     monkeypatch.setattr(server, "_run_prompt_submit", _run)
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append(
+            (event, sid, payload or {})
+        ),
+    )
     session = _session(
-        queued_prompt={"text": "broken", "transport": None},
+        queued_prompt={
+            "text": "broken",
+            "transport": None,
+            "client_submission_ids": ["broken-send"],
+        },
         queued_prompts=[{"text": "next", "image_paths": ["/tmp/next.png"], "transport": None}],
     )
 
@@ -841,3 +927,9 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert calls == ["broken", "next"]
     assert session["queued_prompt"] is None
     assert session.get("queued_prompts") is None
+    failed = next(
+        payload
+        for event, _sid, payload in emitted
+        if event == "message.complete" and payload.get("status") == "error"
+    )
+    assert failed["client_submission_ids"] == ["broken-send"]
