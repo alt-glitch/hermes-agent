@@ -3534,6 +3534,25 @@ def run_job(
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
+        # Resolve the job-scoped tool policy before performing MCP discovery.
+        # In particular, ``no_mcp`` is an execution boundary: discovering
+        # servers first can trigger OAuth or spawn stdio children even though
+        # none of their tools will be exposed to this job.
+        _cron_enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+        try:
+            from hermes_cli.tools_config import enabled_mcp_server_names
+            _configured_mcp_names = enabled_mcp_server_names(_cfg)
+        except Exception as _mcp_names_exc:
+            logger.warning(
+                "Job '%s': MCP policy resolution failed (non-fatal): %s",
+                job_id, _mcp_names_exc,
+            )
+            _configured_mcp_names = set()
+        _should_discover_mcp = (
+            _cron_enabled_toolsets is None
+            or bool(set(_cron_enabled_toolsets) & _configured_mcp_names)
+        )
+
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
         # this, cron jobs never saw any MCP tools — only the gateway / CLI
@@ -3541,19 +3560,20 @@ def run_job(
         # ticks short-circuit on already-connected servers inside
         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
         # shouldn't kill an otherwise-working cron job. See #4219.
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
-            if _mcp_tools:
-                logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+        if _should_discover_mcp:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                _mcp_tools = discover_mcp_tools()
+                if _mcp_tools:
+                    logger.info(
+                        "Job '%s': %d MCP tool(s) available",
+                        job_id, len(_mcp_tools),
+                    )
+            except Exception as _mcp_exc:
+                logger.warning(
+                    "Job '%s': MCP initialization failed (non-fatal): %s",
+                    job_id, _mcp_exc,
                 )
-        except Exception as _mcp_exc:
-            logger.warning(
-                "Job '%s': MCP initialization failed (non-fatal): %s",
-                job_id, _mcp_exc,
-            )
 
         agent = AIAgent(
             model=model,
@@ -3574,7 +3594,7 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=_cron_enabled_toolsets,
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from

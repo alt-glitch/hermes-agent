@@ -533,6 +533,62 @@ class TestRunJobSessionPersistence:
             mock_agent_cls = entered[-1]  # the AIAgent patch
             yield fake_db, mock_agent_cls
 
+    def test_run_job_no_mcp_skips_discovery_and_strips_sentinel(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "mcp_servers:\n  linear:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "no-mcp-job",
+            "name": "test",
+            "prompt": "hello",
+            "enabled_toolsets": ["terminal", "no_mcp"],
+        }
+        discover = patch(
+            "tools.mcp_tool.discover_mcp_tools",
+            side_effect=AssertionError("no_mcp job attempted MCP discovery"),
+        )
+        with self._run_job_patches(tmp_path, extra=[discover]) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        assert mock_agent_cls.call_args.kwargs["enabled_toolsets"] == ["terminal"]
+
+    def test_run_job_platform_policy_without_mcp_skips_discovery(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "mcp_servers:\n  linear:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        job = {"id": "platform-no-mcp-job", "name": "test", "prompt": "hello"}
+        extra = [
+            patch("hermes_cli.tools_config._get_platform_tools", return_value={"terminal"}),
+            patch(
+                "tools.mcp_tool.discover_mcp_tools",
+                side_effect=AssertionError("MCP discovery escaped platform policy"),
+            ),
+        ]
+        with self._run_job_patches(tmp_path, extra=extra) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        assert mock_agent_cls.call_args.kwargs["enabled_toolsets"] == ["terminal"]
+
+    def test_run_job_selected_mcp_initializes_discovery(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "mcp_servers:\n  linear:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "selected-mcp-job",
+            "name": "test",
+            "prompt": "hello",
+            "enabled_toolsets": ["terminal", "linear"],
+        }
+        with patch("tools.mcp_tool.discover_mcp_tools", return_value=[]) as discover:
+            with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+                run_job(job)
+
+        discover.assert_called_once_with()
+        assert mock_agent_cls.call_args.kwargs["enabled_toolsets"] == ["terminal", "linear"]
+
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
