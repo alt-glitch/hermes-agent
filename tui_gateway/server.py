@@ -564,17 +564,46 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     contract _ensure_session_db_row already uses for the row itself, and keeps
     the invariant that anything holding a slot is something the user can see.
     """
-    if session.get("active_session_lease") is not None:
-        return None
+    # Keep registry I/O outside the per-session mutation lock: claiming may
+    # block on the cross-process active-session file lock. The two locked
+    # checks make the in-memory ownership transition atomic while allowing
+    # unrelated lifecycle work to proceed.
+    with _session_mutation_lock(session):
+        if (
+            session.get("active_session_lease") is not None
+            or session.get("_finalized")
+        ):
+            return None
     lease, limit_message = _claim_active_session_slot(
         str(session.get("session_key") or ""),
         live_session_id=sid,
         surface=_session_source(session),
     )
-    if limit_message is not None:
-        return limit_message
-    session["active_session_lease"] = lease
-    return None
+    result = limit_message
+    with _session_mutation_lock(session):
+        if (
+            session.get("active_session_lease") is not None
+            or session.get("_finalized")
+        ):
+            # A concurrent first submission installed the lease, or teardown
+            # finished while this claim was in flight. Its result wins over a
+            # stale cap error from this redundant attempt.
+            result = None
+        elif limit_message is None:
+            session["active_session_lease"] = lease
+            lease = None  # ownership transferred to the session
+            result = None
+
+    # A concurrent winner may have installed its lease after this thread
+    # claimed another slot. Never leave that redundant registry entry behind.
+    if lease is not None:
+        try:
+            lease.release()
+        except Exception:
+            logger.debug(
+                "Failed to release redundant active session slot", exc_info=True
+            )
+    return result
 
 
 def _release_active_session_slot(session: dict | None) -> None:
