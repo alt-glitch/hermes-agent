@@ -2,10 +2,12 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useEffect, useRef, useState } from 'react'
 
+import { openSession } from '@/app/open-session'
 import {
   closeAllTreeTabs,
   closeOtherTreeTabs,
   closeTreeTabsToRight,
+  reloadTreePane,
   treeTabCloseTargets
 } from '@/components/pane-shell/tree/store'
 import {
@@ -37,8 +39,8 @@ import {
   setSessions
 } from '@/store/session'
 import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
-import { $sessionTiles, openSessionTile } from '@/store/session-states'
-import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
+import { $sessionTiles } from '@/store/session-states'
+import { canOpenSessionWindow } from '@/store/windows'
 
 import type { SessionTitleResponse } from '../../types'
 
@@ -169,8 +171,9 @@ function useSessionActions({
             onSelect: () => {
               triggerHaptic('selection')
               // Stack into the MAIN zone as a tab (center dock; the strip
-              // sticky-shows on gain) — the door to the tab bar.
-              openSessionTile(sessionId, 'center')
+              // sticky-shows on gain) — the door to the tab bar. Focuses first
+              // if the session is already on screen.
+              openSession(sessionId, () => undefined, 'tab')
             }
           })
         ]
@@ -183,7 +186,7 @@ function useSessionActions({
             label: r.newWindow,
             onSelect: () => {
               triggerHaptic('selection')
-              void openSessionInNewWindow(sessionId)
+              openSession(sessionId, () => undefined, 'window')
             }
           })
         ]
@@ -237,12 +240,24 @@ function useSessionActions({
     })
   ]
 
-  // TAB — close verbs that act on the strip (tabs only; a row isn't a tab).
+  // TAB — verbs that act on the strip (tabs only; a row isn't a tab).
   const closeTargets = surface === 'tab' && tabPaneId ? treeTabCloseTargets(tabPaneId) : null
 
-  const tabCloseItems: ActionItemSpec[] =
+  const tabItems: ActionItemSpec[] =
     surface === 'tab'
       ? [
+          ...(tabPaneId
+            ? [
+                spec({
+                  icon: 'refresh',
+                  label: t.zones.reload,
+                  onSelect: () => {
+                    triggerHaptic('selection')
+                    reloadTreePane(tabPaneId)
+                  }
+                })
+              ]
+            : []),
           ...(onClose
             ? [
                 spec({
@@ -340,10 +355,10 @@ function useSessionActions({
       />
       <kit.Separator />
       {workItems.map(item => renderActionItem(kit, item))}
-      {tabCloseItems.length > 0 && (
+      {tabItems.length > 0 && (
         <>
           <kit.Separator />
-          {tabCloseItems.map(item => renderActionItem(kit, item))}
+          {tabItems.map(item => renderActionItem(kit, item))}
         </>
       )}
       <kit.Separator />

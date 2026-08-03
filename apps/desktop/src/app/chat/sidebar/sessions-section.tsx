@@ -1,6 +1,6 @@
 import type { useSensors } from '@dnd-kit/core'
 import type * as React from 'react'
-import { useMemo } from 'react'
+import { useCallback, useMemo } from 'react'
 
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
@@ -64,7 +64,9 @@ function SidebarSectionHeader({
     <div className="group/section flex shrink-0 items-center justify-between gap-1 pb-1 pt-1.5">
       {collapsible ? (
         <button
-          className="group/section-label flex w-fit items-center gap-1 bg-transparent text-left leading-none"
+          // min-w-0 lets the label truncate at narrow sidebar widths instead of
+          // pushing the header's trailing action icons out of view.
+          className="group/section-label flex w-fit min-w-0 items-center gap-1 bg-transparent text-left leading-none"
           onClick={onToggle}
           type="button"
         >
@@ -75,7 +77,7 @@ function SidebarSectionHeader({
           />
         </button>
       ) : (
-        <div className="flex w-fit items-center gap-1 leading-none">{labelBody}</div>
+        <div className="flex w-fit min-w-0 items-center gap-1 leading-none">{labelBody}</div>
       )}
       {action}
     </div>
@@ -197,7 +199,14 @@ export function SidebarSessionsSection({
   // A defined project list is itself content (even an empty project should
   // render as a drill-in row so the user can see it exists).
   const hasProjectOverview = Boolean(projectOverview?.length)
-  const hasProjectContent = Boolean(projectContent && projectContent.sessionCount > 0)
+
+  // Lanes count as content even with no rows left in them: the backend only
+  // emits a lane that has sessions, so a lane surviving with zero rows means
+  // they were filtered out (pinned) — the branch is real and must still render.
+  // A genuinely empty project has no lanes at all and keeps its empty state.
+  const hasProjectContent = Boolean(
+    projectContent && (projectContent.sessionCount > 0 || projectContent.repos.some(repo => repo.groups.length > 0))
+  )
 
   const showEmptyState =
     forceEmptyState || (!hasGroupedSessions && !hasProjectOverview && !hasProjectContent && sessions.length === 0)
@@ -216,52 +225,77 @@ export function SidebarSessionsSection({
     [sessions, preserveInputOrder]
   )
 
-  const renderRow = (session: SessionInfo, draggable: boolean, branchStem?: string) => {
-    const rowProps = {
-      branchStem,
-      isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
-      onArchive: () => onArchiveSession(session.id),
-      onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id),
-      onPin: () => onTogglePin(sessionPinId(session)),
-      onResume: () => onResumeSession(session.id),
-      reorderable: draggable && !branchStem,
-      session,
-      showProfile: showProfileTags
-    }
+  const renderRow = useCallback(
+    (session: SessionInfo, draggable: boolean, branchStem?: string) => {
+      const rowProps = {
+        branchStem,
+        isPinned: pinned,
+        isSelected: session.id === activeSessionId,
+        isWorking: workingSessionIdSet.has(session.id),
+        onArchive: () => onArchiveSession(session.id),
+        onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
+        onDelete: () => onDeleteSession(session.id),
+        onPin: () => onTogglePin(sessionPinId(session)),
+        onResume: () => onResumeSession(session.id),
+        reorderable: draggable && !branchStem,
+        session,
+        showProfile: showProfileTags
+      }
 
-    return draggable && !branchStem ? (
-      <SortableSidebarSessionRow key={session.id} {...rowProps} />
-    ) : (
-      <SidebarSessionRow key={session.id} {...rowProps} />
-    )
-  }
+      return draggable && !branchStem ? (
+        <SortableSidebarSessionRow key={session.id} {...rowProps} />
+      ) : (
+        <SidebarSessionRow key={session.id} {...rowProps} />
+      )
+    },
+    [
+      activeSessionId,
+      onArchiveSession,
+      onBranchSession,
+      onDeleteSession,
+      onResumeSession,
+      onTogglePin,
+      pinned,
+      showProfileTags,
+      workingSessionIdSet
+    ]
+  )
 
   // A single flat/virtual/lane list row — either a date divider or a session.
-  const renderListRow = (row: SidebarListRow, draggable: boolean) =>
-    row.kind === 'divider' ? (
-      <SidebarDateDivider key={row.key} label={sessionBucketLabel(row.bucket, dividerLabels)} />
-    ) : (
-      renderRow(row.entry.session, draggable, row.entry.branchStem)
-    )
+  const renderListRow = useCallback(
+    (row: SidebarListRow, draggable: boolean) =>
+      row.kind === 'divider' ? (
+        <SidebarDateDivider key={row.key} label={sessionBucketLabel(row.bucket, dividerLabels)} />
+      ) : (
+        renderRow(row.entry.session, draggable, row.entry.branchStem)
+      ),
+    [dividerLabels, renderRow]
+  )
 
   // Sessions inside repos/worktrees are date-ordered and static.
-  const renderRows = (items: SessionInfo[]) =>
-    flattenSessionsWithBranches(items).map(({ branchStem, session }) => renderRow(session, false, branchStem))
+  const renderRows = useCallback(
+    (items: SessionInfo[]) =>
+      flattenSessionsWithBranches(items).map(({ branchStem, session }) => renderRow(session, false, branchStem)),
+    [renderRow]
+  )
 
   // Same as `renderRows`, but with date dividers folded in — used for
   // entered-project lanes so a lane spanning multiple days reads
   // chronologically, matching the flat recents list.
-  const renderRowsDated = (items: SessionInfo[]) => {
-    const entries = flattenSessionsWithBranches(items)
+  const renderRowsDated = useCallback(
+    (items: SessionInfo[]) => {
+      const entries = flattenSessionsWithBranches(items)
 
-    return (dateGrouped ? groupEntriesByRecency(entries) : toSessionRows(entries)).map(row => renderListRow(row, false))
-  }
+      return (dateGrouped ? groupEntriesByRecency(entries) : toSessionRows(entries)).map(row => renderListRow(row, false))
+    },
+    [dateGrouped, renderListRow]
+  )
 
   // Flat recents as list rows: grouped by recency when enabled, plain otherwise.
-  const flatRows: SidebarListRow[] = dateGrouped ? groupEntriesByRecency(displayEntries) : toSessionRows(displayEntries)
+  const flatRows: SidebarListRow[] = useMemo(
+    () => (dateGrouped ? groupEntriesByRecency(displayEntries) : toSessionRows(displayEntries)),
+    [dateGrouped, displayEntries]
+  )
 
   const flatVirtualized =
     !showEmptyState &&

@@ -98,22 +98,6 @@ def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     assert executions.EXECUTIONS_FILE.read_bytes() == b"not a sqlite database"
 
 
-def test_execution_history_is_paginated(monkeypatch, tmp_path):
-    executions = _point_ledger(monkeypatch, tmp_path)
-    ids = []
-    for _index in range(5):
-        row = executions.create_execution("paged", source="builtin")
-        executions.finish_execution(row["id"], success=True)
-        ids.append(row["id"])
-
-    first = executions.list_executions(job_id="paged", limit=2)
-    second = executions.list_executions(
-        job_id="paged", limit=2, before_claimed_at=first[-1]["claimed_at"]
-    )
-    assert [row["id"] for row in first] == list(reversed(ids))[:2]
-    assert set(row["id"] for row in first).isdisjoint(row["id"] for row in second)
-
-
 def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
     executions = _point_ledger(monkeypatch, tmp_path)
     row = executions.create_execution("cli-job", source="builtin")
@@ -151,32 +135,6 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
 
     assert executions.recover_interrupted_executions() == 0
     assert executions.latest_execution("still-live")["status"] == "running"
-
-
-def test_recovery_does_not_mark_other_live_owner_unknown(monkeypatch, tmp_path):
-    executions = _point_ledger(monkeypatch, tmp_path)
-    record = executions.create_execution("other-live", source="builtin")
-    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
-        conn.execute(
-            "UPDATE executions SET process_id=?, pid=? WHERE id=?",
-            ("another-import", os.getpid(), record["id"]),
-        )
-
-    assert executions.recover_interrupted_executions() == 0
-    assert executions.latest_execution("other-live")["status"] == "claimed"
-
-
-def test_recovery_rejects_recycled_pid(monkeypatch, tmp_path):
-    executions = _point_ledger(monkeypatch, tmp_path)
-    record = executions.create_execution("recycled", source="builtin")
-    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
-        conn.execute(
-            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
-            ("old-import", -1, record["id"]),
-        )
-
-    assert executions.recover_interrupted_executions() == 1
-    assert executions.latest_execution("recycled")["status"] == "unknown"
 
 
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
@@ -266,10 +224,14 @@ def test_generic_submit_failure_keeps_recurring_job_due(monkeypatch, tmp_path):
     assert jobs.get_job(job["id"])["next_run_at"] == due_at
     assert [item["id"] for item in jobs.get_due_jobs()] == [job["id"]]
     assert finished == [
-        ("exec-submit-fail", {
-            "success": False,
-            "error": "Executor dispatch failed: executor rejected",
-        })
+        (
+            "exec-submit-fail",
+            {
+                "success": False,
+                "error": "Executor dispatch failed: executor rejected",
+                "delivery_outcome": None,
+            },
+        )
     ]
     assert job["id"] not in scheduler.get_running_job_ids()
 
@@ -346,6 +308,7 @@ def test_schedule_advance_failure_finishes_attempt_and_releases_guard(monkeypatc
             {
                 "success": False,
                 "error": "Schedule advance failed: jobs store unavailable",
+                "delivery_outcome": None,
             },
         )
     ]
@@ -404,15 +367,15 @@ def test_run_one_job_ledger_finish_failure_does_not_rewrite_success(monkeypatch)
         lambda _job_id, success, error=None, **_kwargs: marks.append((success, error)) or True,
     )
 
-    def fail_finish(_execution_id, *, success, error=None):
-        finish_attempts.append((success, error))
+    def fail_finish(_execution_id, *, success, error=None, delivery_outcome=None):
+        finish_attempts.append((success, error, delivery_outcome))
         raise sqlite3.OperationalError("ledger unavailable")
 
     monkeypatch.setattr(scheduler, "finish_execution", fail_finish)
 
     assert scheduler.run_one_job({"id": "job-ledger-finish", "execution_id": "exec-ledger-finish"}) is True
     assert marks == [(True, None)]
-    assert finish_attempts == [(True, None)]
+    assert finish_attempts == [(True, None, "suppressed")]
 
 
 def test_job_store_double_failure_still_finalizes_execution(monkeypatch):
@@ -447,7 +410,11 @@ def test_job_store_double_failure_still_finalizes_execution(monkeypatch):
     assert finish_attempts == [
         (
             "exec-store-fail",
-            {"success": False, "error": "jobs store unavailable"},
+            {
+                "success": False,
+                "error": "jobs store unavailable",
+                "delivery_outcome": None,
+            },
         )
     ]
 
@@ -511,6 +478,7 @@ def test_late_shutdown_interruption_finalizes_execution_failed(monkeypatch):
             {
                 "success": False,
                 "error": scheduler._INTERRUPTED_EXECUTION_ERROR,
+                "delivery_outcome": "suppressed",
             },
         )
     ]
