@@ -27,6 +27,7 @@ import { ThemeProvider } from '../view/theme.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
 interface Harness {
+  history: ReturnType<typeof createPromptHistory>
   probe: RenderProbe
   store: ReturnType<typeof createSessionStore>
   submitted: string[]
@@ -45,8 +46,133 @@ async function mountComposer(opts?: { kitty?: boolean; history?: string[] }): Pr
     ),
     { height: 30, kittyKeyboard: opts?.kitty ?? false, width: 70 }
   )
-  return { probe, store, submitted }
+  return { history, probe, store, submitted }
 }
+
+async function pressDoubleEsc(h: Harness): Promise<void> {
+  h.probe.keys.pressEscape()
+  await h.probe.settle()
+  h.probe.keys.pressEscape()
+  await h.probe.settle()
+}
+
+describe('readline line editing parity', () => {
+  test('Super+Backspace kills to the current line start', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressBackspace({ super: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('one\n')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('Super+Delete kills to line end and joins the next line at EOL', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('DELETE', { super: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('one\n')
+
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('DELETE', { super: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('onetwo')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('Ctrl+K joins the next line at EOL while Ctrl+U stays current-line scoped', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('k', { ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('onetwo')
+
+      h.probe.keys.pressKey('u', { ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('two')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('Ctrl+Backspace and Option+Backspace remain delete-word', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('alpha beta')
+      h.probe.keys.pressBackspace({ ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('alpha ')
+
+      await h.probe.keys.typeText('gamma')
+      h.probe.keys.pressBackspace({ meta: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('alpha ')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+})
+
+describe('double Escape draft discard', () => {
+  test('discards a non-empty draft, records it first, and Up recalls it', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('recover this draft')
+      await pressDoubleEsc(h)
+      expect(h.store.state.composerDraft).toBe('')
+      expect(h.history.entries()).toEqual(['recover this draft'])
+
+      h.probe.keys.pressArrow('up')
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('recover this draft')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('still discards while a turn is streaming', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      h.store.apply({ type: 'message.start' })
+      await h.probe.keys.typeText('mid-stream draft')
+      await pressDoubleEsc(h)
+      expect(h.store.state.info.running).toBe(true)
+      expect(h.store.state.composerDraft).toBe('')
+      expect(h.history.entries()).toEqual(['mid-stream draft'])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('keeps empty-buffer double Escape opening the prompt-history viewer', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      h.store.pushUser('session prompt')
+      await pressDoubleEsc(h)
+      expect(h.store.state.promptHistory).toBe(true)
+    } finally {
+      h.probe.destroy()
+    }
+  })
+})
 
 /** Row index of the first frame line containing `text` (-1 when absent). */
 function rowOf(frame: string, text: string): number {

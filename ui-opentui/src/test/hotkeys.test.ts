@@ -56,6 +56,13 @@ describe('platform action hotkeys', () => {
       'Enter Enter (empty)',
       'stop the turn / force the next queued message'
     ])
+    expect(openTuiHotkeys('linux')).toContainEqual(['Cmd/Super+Backspace/Delete', 'kill to current line start / end'])
+    expect(openTuiHotkeys('darwin')).toContainEqual(['Option/Ctrl+Backspace', 'delete word'])
+    expect(openTuiHotkeys('linux')).toContainEqual(['Ctrl+U/K', 'kill to line start / end (repeat across lines)'])
+    expect(openTuiHotkeys('darwin')).toContainEqual([
+      'Esc Esc',
+      'discard draft (recall with ↑) / open prompt history when empty'
+    ])
   })
 
   test.each(['prompt', 'pager', 'sessionPicker', 'picker', 'billing'] as const)(

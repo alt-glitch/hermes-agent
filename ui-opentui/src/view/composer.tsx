@@ -578,11 +578,12 @@ export function Composer(props: {
     return acceptChangesToken(ta.plainText, item.text, from, end)
   }
 
-  // Esc+Esc → session prompt history (Epic 5; free-code's double-press model).
+  // Esc+Esc → discard a draft (recallable with Up), or open session prompt
+  // history when the buffer is empty. Match the upstream Ink/CLI 500ms window.
   // ONLY an Esc that nothing else consumed counts: the dropdown-dismiss branch
   // returns before press() is reached (so a dismissing Esc never arms), and any
   // other key resets the window (intervening keys disarm).
-  const doubleEsc = createDoublePress()
+  const doubleEsc = createDoublePress(500)
   const doubleEmptyEnter = createDoublePress(450)
 
   const submit = () => {
@@ -717,6 +718,23 @@ export function Composer(props: {
       props.onOpenEditor?.(ta?.plainText ?? '')
       return
     }
+    // OpenTUI 0.4.1 already exposes the native line-kill actions used below,
+    // but its delete-to-line-end action is a no-op at EOL. Readline Ctrl+K
+    // consumes that newline, as does upstream Ink's Cmd/Super+Delete path.
+    // Intercept only this boundary case; every non-boundary kill stays native.
+    const lineEndKill =
+      key.eventType !== 'release' &&
+      ((key.name === 'k' && key.ctrl && !key.meta && !key.option && !key.super) ||
+        (key.name === 'delete' && key.super === true))
+    if (lineEndKill && ta?.focused) {
+      const cursor = ta.logicalCursor
+      if (cursor.col === ta.editBuffer.getEOL().col && cursor.row < ta.lineCount - 1) {
+        key.preventDefault()
+        ta.deleteRange(cursor.row, cursor.col, cursor.row + 1, 0)
+        props.history?.reset()
+        return
+      }
+    }
     // 0) double-Esc bookkeeping: any non-Esc press is an intervening key and
     // disarms the pending Esc (free-code resets on every other input).
     if (key.eventType !== 'release' && key.name !== 'escape') doubleEsc.reset()
@@ -823,13 +841,22 @@ export function Composer(props: {
         return
       }
     }
-    // 1.5) Esc+Esc on an EMPTY, FOCUSED composer (no dropdown — the dismiss
-    // branch returned above) opens the session prompt-history viewer (Epic 5).
-    // With text in the buffer the Esc is just an intervening key (disarms);
-    // unfocused (e.g. the agents tray owns the keys) it never counts.
+    // 1.5) Esc+Esc on a FOCUSED composer with no dropdown. A non-empty draft
+    // is recorded before it is discarded so Up recalls it; an empty buffer
+    // keeps the existing session prompt-history viewer behavior. The history
+    // guard reflects the production contract: without a recall sink, do not
+    // destructively clear a caller's draft.
     if (key.name === 'escape' && key.eventType !== 'release' && !key.ctrl && !key.meta && !key.option) {
-      if (ta?.focused === true && ta.plainText === '' && !key.defaultPrevented) {
-        if (doubleEsc.press()) props.onDoubleEsc?.()
+      if (ta?.focused === true && !key.defaultPrevented) {
+        if (doubleEsc.press()) {
+          const draft = ta.plainText
+          if (draft !== '' && props.history) {
+            props.history.push(draft)
+            clearBuffer(true)
+          } else if (draft === '') {
+            props.onDoubleEsc?.()
+          }
+        }
       } else {
         doubleEsc.reset()
       }
@@ -995,7 +1022,12 @@ export function Composer(props: {
             { action: 'select-line-home', name: 'home', shift: true },
             { action: 'select-line-end', name: 'end', shift: true },
             { action: 'buffer-home', ctrl: true, name: 'home' },
-            { action: 'buffer-end', ctrl: true, name: 'end' }
+            { action: 'buffer-end', ctrl: true, name: 'end' },
+            // Only the explicit Super bit means Cmd here. OpenTUI reports
+            // macOS Option as meta, and Ctrl+Backspace is also delete-word, so
+            // neither modifier may be broadened into a line kill.
+            { action: 'delete-to-line-start', name: 'backspace', super: true },
+            { action: 'delete-to-line-end', name: 'delete', super: true }
           ]}
           onMouseDown={() => ta?.focus()}
           onSubmit={submit}
