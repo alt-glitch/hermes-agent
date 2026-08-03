@@ -308,6 +308,89 @@ describe('busy submit policy', () => {
     expect(classifyBusyPromptSubmitResponse(undefined)).toBe('rejected')
   })
 
+  test('a consumed voice-stop ack is neither an admission nor a rejection', () => {
+    // {voice_stopped:true} (upstream ba13132298) means the gateway ended the
+    // voice chat with a typed bare stop phrase; NO turn starts, so it must not
+    // be totalized into the interrupt + enqueue rejection fallback.
+    expect(classifyBusyPromptSubmitResponse({ voice_stopped: true })).toBe('voice-stopped')
+    // Genuine non-admissions still reject so real failures keep the fallback.
+    expect(classifyBusyPromptSubmitResponse({ voice_stopped: false })).toBe('rejected')
+    expect(classifyBusyPromptSubmitResponse({ voice_stopped: 'yes' })).toBe('rejected')
+    expect(classifyBusyPromptSubmitResponse({ status: 'streaming', voice_stopped: false })).toBe('rejected')
+  })
+
+  test('interrupt: a consumed voice-stop redirect neither requeues, interrupts, nor notifies', async () => {
+    // The entry maps a `voice-stopped` classification to a `consumed` delivery
+    // (drop the optimistic row, keep the live turn). submitWhileBusy must treat
+    // that terminal ack as a clean no-op.
+    const redirect = vi.fn(async () => 'consumed' as const)
+    const h = host({ redirect })
+    h.mode.value = 'interrupt'
+    expect(submitWhileBusy(h.value, 'stop')).toBe(true)
+    await tick()
+    expect(redirect).toHaveBeenCalledWith('sid-1', 'stop', false)
+    expect(h.queued).toEqual([])
+    expect(h.interrupts).not.toHaveBeenCalled()
+    expect(h.notes).toEqual([])
+    expect(h.statuses).toEqual([])
+  })
+
+  test('interrupt: the entry redirect consumes a voice stop but still falls back on a genuine rejection', async () => {
+    // Faithfully model the entry's redirect: classify the raw prompt.submit
+    // response, consume a voice stop, and only interrupt + enqueue on a real
+    // rejection. This pins both branches of the fix at once.
+    const requeued: string[] = []
+    const interruptedFor: string[] = []
+    const redirect = (response: unknown) =>
+      host({
+        interrupt: () => interruptedFor.push('x'),
+        redirect: async (_sid, text, front) => {
+          const disposition = classifyBusyPromptSubmitResponse(response)
+          if (disposition === 'voice-stopped') return 'consumed'
+          if (front) requeued.unshift(text)
+          else requeued.push(text)
+          interruptedFor.push(text)
+          return 'fallback'
+        }
+      })
+
+    const stopHost = redirect({ voice_stopped: true })
+    stopHost.mode.value = 'interrupt'
+    expect(submitWhileBusy(stopHost.value, 'stop')).toBe(true)
+    await tick()
+    expect(requeued).toEqual([])
+    expect(interruptedFor).toEqual([])
+
+    const failHost = redirect({ status: 'streaming' })
+    failHost.mode.value = 'interrupt'
+    expect(submitWhileBusy(failHost.value, 'real correction')).toBe(true)
+    await tick()
+    expect(requeued).toEqual(['real correction'])
+    expect(interruptedFor).toEqual(['real correction'])
+  })
+
+  test('queue: a queued voice-stop phrase is consumed on drain, never run as a normal prompt', () => {
+    const h = host()
+    // While busy the client cannot know a typed phrase is a stop phrase without
+    // a round-trip, so queue mode enqueues it. This preserved behavior stands.
+    expect(submitWhileBusy(h.value, 'stop')).toBe(true)
+    expect(h.queued).toEqual(['stop'])
+
+    // On drain the entry submits the row and classifies the ack. A
+    // {voice_stopped:true} ack is consumed: the row leaves the queue and is
+    // NOT resubmitted or re-run as a model prompt.
+    const drained = h.queued.shift()
+    expect(drained).toBe('stop')
+    const submittedAsPrompt: string[] = []
+    const disposition = classifyBusyPromptSubmitResponse({ voice_stopped: true })
+    if (disposition !== 'voice-stopped' && drained !== undefined) submittedAsPrompt.push(drained)
+    expect(disposition).toBe('voice-stopped')
+    expect(submittedAsPrompt).toEqual([])
+    expect(h.queued).toEqual([])
+    expect(h.interrupts).not.toHaveBeenCalled()
+    expect(h.notes).toEqual([])
+  })
+
   test('accepted steer does not create a separate queued turn', async () => {
     const h = host()
     h.mode.value = 'steer'

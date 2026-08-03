@@ -1593,6 +1593,18 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           return retainPendingCorrectionForRetry(current, '') ? 'uncertain' : 'retained'
         }
 
+        const consume = (): InterruptCorrectionDelivery => {
+          // The gateway consumed a typed bare voice stop phrase server-side
+          // (upstream ba13132298): the voice chat ended and NO turn starts, so
+          // no message.start/complete/error will ever correlate. This is NOT a
+          // rejection — retire the optimistic user row and the one recovery
+          // slot WITHOUT queuing the phrase or interrupting the live turn. The
+          // voice.transcript {stop_phrase} event owns the mode flags + notice.
+          if (pendingCorrection === current) pendingCorrection = undefined
+          store.removeClientMessage(current.clientMessageId)
+          return 'consumed'
+        }
+
         return Effect.runPromise(
           gateway
             .request<unknown>('prompt.submit', {
@@ -1603,6 +1615,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             .pipe(
               Effect.map(response => {
                 const disposition = classifyBusyPromptSubmitResponse(response)
+                if (disposition === 'voice-stopped') return consume()
                 if (disposition === 'rejected') return fallback()
                 current.admission = disposition
                 return disposition
@@ -1729,6 +1742,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   // {stop_phrase} event owns the mode flags + notice.
                   if (decodePromptSubmitAck(response)?.voice_stopped) {
                     if (pendingPrompt === current) pendingPrompt = undefined
+                    // A queued phrase drained into this submission carries an
+                    // optimistic user row; the stop is consumed, never a turn,
+                    // so retire the row rather than leaving a phantom prompt.
+                    store.removeClientMessage(current.clientMessageId)
                     store.applyInfo({ running: false })
                     queueMicrotask(drainQueuedIfIdle)
                     return

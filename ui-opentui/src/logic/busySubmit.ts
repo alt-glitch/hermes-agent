@@ -5,12 +5,20 @@ import type { GatewayError } from '../boundary/errors.ts'
 import type { BusyInputMode } from './busyQueue.ts'
 
 export type SteerDelivery = 'accepted' | 'fallback' | 'retained' | 'uncertain'
-export type InterruptCorrectionDelivery = 'redirected' | 'queued' | 'fallback' | 'retained' | 'uncertain'
+export type InterruptCorrectionDelivery = 'redirected' | 'queued' | 'consumed' | 'fallback' | 'retained' | 'uncertain'
 
-/** Busy prompt.submit only has two positive admission outcomes. Anything else
- * is a definite non-admission response and must use the legacy fallback. */
-export function classifyBusyPromptSubmitResponse(response: unknown): 'redirected' | 'queued' | 'rejected' {
+/** Busy prompt.submit has two positive admission outcomes plus one terminal
+ * non-turn acknowledgement. A `{voice_stopped:true}` response (upstream
+ * ba13132298) means the gateway consumed a typed bare voice stop phrase and
+ * ended the voice chat: the request succeeded but NO turn starts, so it must
+ * NOT be totalized into the rejection/interrupt+enqueue fallback — that would
+ * requeue the literal phrase and interrupt the live turn. Anything else is a
+ * definite non-admission response and must use the legacy fallback. */
+export function classifyBusyPromptSubmitResponse(
+  response: unknown
+): 'redirected' | 'queued' | 'voice-stopped' | 'rejected' {
   if (response === null || typeof response !== 'object') return 'rejected'
+  if ((response as { readonly voice_stopped?: unknown }).voice_stopped === true) return 'voice-stopped'
   if (!('status' in response)) return 'rejected'
   const status = response.status
   if (status === 'redirected' || status === 'queued') return status
