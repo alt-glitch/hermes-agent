@@ -14385,9 +14385,14 @@ _npm_manifest_paths = _update_cmd._npm_manifest_paths
 _npm_manifests_digest = _update_cmd._npm_manifests_digest
 _npm_lockfile_changed = _update_cmd._npm_lockfile_changed
 _record_npm_lockfile_hash = _update_cmd._record_npm_lockfile_hash
-_update_workspace_node_dependencies = _update_cmd._update_node_dependencies
+_update_workspace_node_dependencies = getattr(
+    _update_cmd._update_node_dependencies,
+    "__wrapped__",
+    _update_cmd._update_node_dependencies,
+)
 
 
+@_functools.wraps(_update_workspace_node_dependencies)
 def _update_node_dependencies() -> list[str]:
     """Run upstream's workspace refresh, then hydrate the OpenTUI engine."""
     failures = _update_workspace_node_dependencies() or []

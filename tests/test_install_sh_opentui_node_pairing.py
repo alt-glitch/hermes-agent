@@ -35,6 +35,12 @@ def _bash(
     )
 
 
+def _write_executable(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+
+
 def test_installer_script_is_valid_bash() -> None:
     result = subprocess.run(
         ["bash", "-n", str(INSTALL_SH)],
@@ -69,8 +75,8 @@ def test_node26_provision_failure_keeps_real_node22_fallback(tmp_path: Path) -> 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     node = fake_bin / "node"
-    node.write_text("#!/bin/sh\nprintf 'v22.12.0\\n'\n", encoding="utf-8")
-    node.chmod(0o755)
+    _write_executable(node, "printf 'v22.12.0\\n'")
+    _write_executable(fake_bin / "npm", "printf '11.9.0\\n'")
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
 
@@ -80,6 +86,8 @@ def test_node26_provision_failure_keeps_real_node22_fallback(tmp_path: Path) -> 
             "node_satisfies_build",
             "node_satisfies_opentui",
             "opentui_host_supported",
+            "npm_supports_npmrc",
+            "node_runtime_npm_usable",
             "check_node",
         )
     )
@@ -110,12 +118,9 @@ def test_check_node_honors_valid_hermes_node_before_path_or_provisioning(
     env_npm = env_node.with_name("npm")
     env_npx = env_node.with_name("npx")
     for node, version in ((env_node, "v26.3.0"), (path_node, "v22.12.0")):
-        node.parent.mkdir(parents=True, exist_ok=True)
-        node.write_text(f"#!/bin/sh\nprintf '{version}\\n'\n", encoding="utf-8")
-        node.chmod(0o755)
-    for shim in (env_npm, env_npx):
-        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        shim.chmod(0o755)
+        _write_executable(node, f"printf '{version}\\n'")
+    _write_executable(env_npm, "printf '11.9.0\\n'")
+    _write_executable(env_npx, "exit 0")
 
     marker = tmp_path / "provisioned"
     env = os.environ.copy()
@@ -127,6 +132,8 @@ def test_check_node_honors_valid_hermes_node_before_path_or_provisioning(
             "node_satisfies_build",
             "node_satisfies_opentui",
             "opentui_host_supported",
+            "npm_supports_npmrc",
+            "node_runtime_npm_usable",
             "check_node",
         )
     )
@@ -159,6 +166,48 @@ check_node
         str(env_npx),
         env=env,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_node_runtime_rejects_missing_paired_npm(tmp_path: Path) -> None:
+    node = tmp_path / "selected" / "node"
+    _write_executable(node, "printf 'v26.3.0\\n'")
+    probe = "\n".join(
+        (_function("npm_supports_npmrc"), _function("node_runtime_npm_usable"))
+    )
+
+    result = _bash(f'{probe}\nnode_runtime_npm_usable "$1"', str(node))
+
+    assert result.returncode != 0
+
+
+def test_node_runtime_rejects_unrelated_ambient_npm(tmp_path: Path) -> None:
+    node = tmp_path / "selected" / "node"
+    ambient_npm = tmp_path / "ambient" / "npm"
+    _write_executable(node, "printf 'v26.3.0\\n'")
+    _write_executable(ambient_npm, "printf '11.9.0\\n'")
+    env = os.environ.copy()
+    env["PATH"] = f"{ambient_npm.parent}:/usr/bin:/bin"
+    probe = "\n".join(
+        (_function("npm_supports_npmrc"), _function("node_runtime_npm_usable"))
+    )
+
+    result = _bash(f'{probe}\nnode_runtime_npm_usable "$1"', str(node), env=env)
+
+    assert result.returncode != 0
+
+
+def test_node_runtime_accepts_usable_paired_npm(tmp_path: Path) -> None:
+    node = tmp_path / "selected" / "node"
+    paired_npm = node.with_name("npm")
+    _write_executable(node, "printf 'v26.3.0\\n'")
+    _write_executable(paired_npm, "printf '11.9.0\\n'")
+    probe = "\n".join(
+        (_function("npm_supports_npmrc"), _function("node_runtime_npm_usable"))
+    )
+
+    result = _bash(f'{probe}\nnode_runtime_npm_usable "$1"', str(node))
+
     assert result.returncode == 0, result.stdout + result.stderr
 
 

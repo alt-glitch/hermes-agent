@@ -887,11 +887,10 @@ npm_supports_npmrc() {
 
 node_runtime_npm_usable() {
     local node_bin="$1"
-    local npm_bin="$(dirname "$node_bin")/npm"
-    if [ ! -x "$npm_bin" ]; then
-        npm_bin="$(command -v npm 2>/dev/null || true)"
-    fi
-    [ -z "$npm_bin" ] || npm_supports_npmrc "$("$npm_bin" --version 2>/dev/null)"
+    local node_dir="$(dirname "$node_bin")"
+    local npm_bin="$node_dir/npm"
+    [ -x "$npm_bin" ] \
+        && npm_supports_npmrc "$(PATH="$node_dir:$PATH" "$npm_bin" --version 2>/dev/null)"
 }
 
 check_node() {
@@ -929,7 +928,12 @@ check_node() {
     if [ -n "$path_node" ] \
         && node_satisfies_build "$("$path_node" --version 2>/dev/null)" \
         && ! node_runtime_npm_usable "$path_node"; then
-        log_warn "npm $(npm --version) cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
+        local path_npm="$(dirname "$path_node")/npm"
+        local path_npm_version="missing"
+        if [ -x "$path_npm" ]; then
+            path_npm_version="$("$path_npm" --version 2>/dev/null || echo unknown)"
+        fi
+        log_warn "npm $path_npm_version paired with $path_node cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
         log_warn "min-release-age-exclude) — installing Hermes-managed Node $NODE_VERSION instead..."
     fi
 
