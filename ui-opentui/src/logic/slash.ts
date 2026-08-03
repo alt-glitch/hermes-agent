@@ -55,7 +55,10 @@ import {
   decodeSessionStatusResponse,
   decodeSessionTitleResponse,
   decodeSessionUndoResponse,
-  decodeSkillsReloadResponse
+  decodeSkillsReloadResponse,
+  decodeWakeStartResponse,
+  decodeWakeStatusResponse,
+  decodeWakeStopResponse
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { decodeToolsConfigureResponse } from '../boundary/schema/ToolsConfigureResponse.ts'
 import { decodeBrowserManageResponse } from '../boundary/schema/BrowserResponses.ts'
@@ -69,6 +72,7 @@ import {
   decodeSessionUsageResponse
 } from '../boundary/schema/SecondaryCommandResponses.ts'
 import { formatVoiceRecordKey } from './voiceKey.ts'
+import { isWakeSub, setWakeUserDisabled, WAKE_USAGE, wakeStartLine, wakeStatusLine, wakeStopLine } from './wake.ts'
 import { decodeDelegationPauseResponse, decodeSpawnTreeListResponse } from '../boundary/schema/Delegation.ts'
 import { decodeProcessStopResponse } from '../boundary/schema/ProcessResponses.ts'
 import { buildBillingCtx } from './billing.ts'
@@ -349,6 +353,33 @@ const INLINE_SLASH_RE = /\s\/([A-Za-z][\w-]*)?$/
  * Returns null when there's no completion to run (so the dropdown clears).
  */
 export function planCompletion(text: string, cursor: number = text.length): CompletionPlan | null {
+  const pos = Math.max(0, Math.min(cursor, text.length))
+  const head = text.slice(0, pos)
+  // Inline skill reference — detected BEFORE the leading-command branch because
+  // only the FIRST slash can be an invocation (upstream 40ec9834b2): `/work /cle`
+  // is a command whose argument names a skill, and routing the whole line to the
+  // gateway's completer offered nothing at all. The trigger requires a
+  // whitespace-preceded slash token ENDING at the caret (the text submits as an
+  // ordinary message, so a reference takes no args — once a space follows the
+  // name the trigger is over), so ordinary argument completion (`/cron ad`,
+  // `/personality alic`) is untouched. An invalid token (a second `/`, a
+  // non-name) falls through so the leading-command branch can still claim it.
+  const inline = INLINE_SLASH_RE.exec(head)
+  if (inline) {
+    const query = inline[1] ?? ''
+    const tail = /^[\w-]*/.exec(text.slice(pos))?.[0] ?? ''
+    const fullName = query + tail
+    const end = pos + tail.length
+    if (!((fullName && !/^[A-Za-z][\w-]*$/.test(fullName)) || text[end] === '/')) {
+      return {
+        end,
+        from: pos - query.length,
+        method: 'complete.slash',
+        params: { skills_only: true, text: `/${query}` },
+        skillsOnly: true
+      }
+    }
+  }
   // Slash command: only when the WHOLE buffer's lead token is a command. A `/`
   // after a newline is prose, so a slash command never spans lines.
   if (text.startsWith('/') && !text.includes('\n')) {
@@ -365,8 +396,6 @@ export function planCompletion(text: string, cursor: number = text.length): Comp
     return null
   }
   // @-mention: the whitespace-delimited token the cursor sits in/just after.
-  const pos = Math.max(0, Math.min(cursor, text.length))
-  const head = text.slice(0, pos)
   const tokenStart = head.search(/\S+$/)
   if (tokenStart === -1) return null
   const word = head.slice(tokenStart)
@@ -378,24 +407,6 @@ export function planCompletion(text: string, cursor: number = text.length): Comp
     // (recalled prompt tails, later lines).
     const tail = /^\S*/.exec(text.slice(pos))?.[0] ?? ''
     return { end: pos + tail.length, from: tokenStart, method: 'complete.path', params: { word } }
-  }
-  // Inline skill reference: the slash token must END at the cursor (the text
-  // submits as an ordinary message, so a reference takes no args — once a
-  // space follows the name the trigger is over).
-  const inline = INLINE_SLASH_RE.exec(head)
-  if (inline) {
-    const query = inline[1] ?? ''
-    const tail = /^[\w-]*/.exec(text.slice(pos))?.[0] ?? ''
-    const fullName = query + tail
-    const end = pos + tail.length
-    if ((fullName && !/^[A-Za-z][\w-]*$/.test(fullName)) || text[end] === '/') return null
-    return {
-      end,
-      from: pos - query.length,
-      method: 'complete.slash',
-      params: { skills_only: true, text: `/${query}` },
-      skillsOnly: true
-    }
   }
   return null
 }
@@ -824,7 +835,11 @@ async function switchModel(
   confirmExpensiveModel = false,
   scope: 'direct' | 'once' | 'session' = 'direct'
 ): Promise<void> {
-  if (ctx.guardBusySessionSwitch('change models')) return
+  // No busy guard here (unlike session switching — upstream f27d45e288). A
+  // model change is a session-scoped config.set: idle it switches immediately;
+  // mid-turn the gateway QUEUES it and applies it at the next turn start
+  // (returning deferred:true) instead of rejecting with 4009. Either way the
+  // pick sticks without interrupting the stream or waiting on the swap.
   const sid = ctx.sessionId()
   try {
     const raw = await ctx.request('config.set', {
@@ -857,7 +872,11 @@ async function switchModel(
       ctx.pushSystem('error: invalid response: model switch')
       return
     }
-    ctx.pushSystem(`model → ${value}${response.scope === 'once' ? ' (next turn only)' : ''}`)
+    // A deferred pick is queued server-side and applied at the next turn start
+    // (the in-flight turn keeps streaming on the old model) — paint it
+    // optimistically but say so.
+    const suffix = response.deferred ? ' (applies next turn)' : response.scope === 'once' ? ' (next turn only)' : ''
+    ctx.pushSystem(`model → ${value}${suffix}`)
     if (response.warning) ctx.pushSystem(`warning: ${response.warning}`)
     ctx.setCurrentModel(value)
     void refreshModelItems(ctx).catch(() => {})
@@ -918,7 +937,6 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
   }
   const requested = arg.trim()
   if (requested === '--refresh') {
-    if (ctx.guardBusySessionSwitch('change models')) return
     const items = await refreshModelItems(ctx, true)
     open(items)
     return
@@ -934,7 +952,6 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
     await switchModel(ctx, model, false, once ? 'once' : 'direct')
     return
   }
-  if (ctx.guardBusySessionSwitch('change models')) return
   const cached = ctx.modelItems()
   if (cached?.length) {
     open(cached)
@@ -943,6 +960,24 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
   // Paint the complete picker shell now. Mount-time hydration reuses the
   // in-flight prefetch and only falls back to one model.options RPC.
   open([], true)
+}
+
+/** Ctrl+O — reach the model picker without wrecking a typed draft (upstream
+ *  f27d45e288): the same overlay `/model` opens, but reachable without clearing
+ *  what you've typed to run the command. Works mid-stream: picking a model
+ *  writes the session model (config.set), which the next turn reads while the
+ *  in-flight turn keeps streaming. Structural key shape matches @opentui/core's
+ *  KeyEvent; release/shift'd events never match (isVoiceRecordKey convention). */
+export function isModelPickerKey(key: {
+  readonly ctrl: boolean
+  readonly name: string
+  readonly eventType?: string
+  readonly shift?: boolean
+  readonly option?: boolean
+  readonly super?: boolean
+}): boolean {
+  if (key.eventType === 'release' || key.shift) return false
+  return key.ctrl && !key.option && key.super !== true && key.name.toLowerCase() === 'o'
 }
 
 /** `/skills` — open the skills hub; picking a skill shows its info in the pager. */
@@ -2768,8 +2803,44 @@ async function voiceCmd(arg: string, ctx: SlashContext, flight: number): Promise
   }
   ctx.pushSystem(`Voice mode enabled${tts ? ' (TTS enabled)' : ''}`)
   ctx.pushSystem(`  Press ${keyLabel} to start/stop recording`)
+  // Spoken-stop hint (upstream 6fdfdc1597) — gateway-sourced from
+  // voice.stop_phrases so a custom phrase renders correctly; absent/empty means
+  // the feature is disabled (stop_phrases: []) or an older gateway — no hint.
+  // Rides the toggle response's additive rest fields (VoiceToggleResponse
+  // StructWithRest), so no schema change is needed for back-compat.
+  const stopHint = readStr(response, 'stop_hint')?.trim()
+  if (stopHint) ctx.pushSystem(`  ${stopHint}`)
   ctx.pushSystem('  /voice tts  to toggle speech output')
   ctx.pushSystem('  /voice off  to disable voice mode')
+}
+
+/** `/wake [on|off|status]` — the "Hey Hermes" listener (upstream 71a2feeade).
+ *  TUI-local handler over the wake.start/stop/status RPCs with friendly
+ *  transcript one-liners. `/wake off` sets a process-scoped opt-out the
+ *  gateway.ready auto-arm respects (logic/wake.ts), and both explicit gestures
+ *  pass `persist: true` so the choice is written to config wake_word.enabled. */
+async function wakeCmd(arg: string, ctx: SlashContext): Promise<void> {
+  const sub = arg.trim().toLowerCase() || 'status'
+  if (!isWakeSub(sub)) {
+    ctx.pushSystem(WAKE_USAGE)
+    return
+  }
+  if (sub === 'on') {
+    setWakeUserDisabled(false)
+    const response = decodeWakeStartResponse(await ctx.request('wake.start', { persist: true, surface: 'tui' }))
+    ctx.pushSystem(response ? wakeStartLine(response) : 'error: invalid response: wake.start')
+    return
+  }
+  if (sub === 'off') {
+    // Remember the explicit opt-out BEFORE the RPC so a reconnect racing the
+    // stop can't re-arm the listener behind the user's back.
+    setWakeUserDisabled(true)
+    const response = decodeWakeStopResponse(await ctx.request('wake.stop', { persist: true }))
+    ctx.pushSystem(response ? wakeStopLine(response) : 'error: invalid response: wake.stop')
+    return
+  }
+  const response = decodeWakeStatusResponse(await ctx.request('wake.status', {}))
+  ctx.pushSystem(response ? wakeStatusLine(response) : 'error: invalid response: wake.status')
 }
 
 async function browserCmd(arg: string, ctx: SlashContext, flight: number): Promise<void> {
@@ -2895,6 +2966,7 @@ const CLIENT: Record<string, ClientHandler> = {
   tools: toolsCmd,
   verbose: verboseCmd,
   voice: voiceCmd,
+  wake: wakeCmd,
   yolo: yoloCmd,
   status: statusCmd,
   setup: setupCmd,

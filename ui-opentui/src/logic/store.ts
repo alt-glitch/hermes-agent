@@ -2648,6 +2648,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'voice.transcript': {
+        // Explicit user-intent stop: the user said (or typed) a bare stop
+        // phrase (upstream ba13132298). The backend already halted the capture
+        // loop and flipped voice mode off — mirror it here like a manual
+        // /voice off, and say so (this is intent, not the no-speech timeout
+        // below). The entry's transcript-submission side effect skips this
+        // event too: a stop phrase is never a turn.
+        if (event.payload?.stop_phrase) {
+          setVoiceMode({ enabled: false })
+          pushSystem('voice: stop phrase — voice chat ended')
+          break
+        }
         if (!event.payload?.no_speech_limit) break
         // Exact-f7 only drops the umbrella mode/activity here; TTS state is
         // retained until an explicit `/voice off` or gateway lifecycle reset.

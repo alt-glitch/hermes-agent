@@ -266,7 +266,34 @@ const VoiceStatus = Schema.Struct({
 const VoiceTranscript = Schema.Struct({
   type: Schema.Literal('voice.transcript'),
   session_id: opt(Str),
-  payload: opt(Schema.Struct({ no_speech_limit: opt(Schema.Boolean), text: opt(Str) }))
+  // `stop_phrase` marks explicit user intent to END the voice chat (a bare
+  // configured stop phrase, spoken or typed — upstream ba13132298). The server
+  // already tore the capture loop down; the client mirrors /voice off and MUST
+  // NOT submit the text as a turn. `typed` distinguishes the prompt.submit
+  // consumption path from a spoken transcript.
+  payload: opt(
+    Schema.Struct({
+      no_speech_limit: opt(Schema.Boolean),
+      stop_phrase: opt(Schema.Boolean),
+      text: opt(Str),
+      typed: opt(Schema.Boolean)
+    })
+  )
+})
+// "Hey Hermes" fired on the gateway's shared listener (upstream 86d5b8b90f):
+// the client opens a fresh session (unless start_new_session:false) and arms
+// voice capture. `profile` routes multi-profile engines — a phrase enrolled by
+// another profile is surfaced, never answered by this process.
+const WakeDetected = Schema.Struct({
+  type: Schema.Literal('wake.detected'),
+  session_id: opt(Str),
+  payload: opt(
+    Schema.Struct({
+      phrase: opt(Str),
+      profile: opt(Schema.NullOr(Str)),
+      start_new_session: opt(Schema.Boolean)
+    })
+  )
 })
 const BrowserProgress = Schema.Struct({
   type: Schema.Literal('browser.progress'),
@@ -365,6 +392,7 @@ export const GatewayEventSchema = Schema.Union([
   BillingStepUpVerification,
   VoiceStatus,
   VoiceTranscript,
+  WakeDetected,
   BrowserProgress,
   BackgroundComplete,
   ReviewSummary,

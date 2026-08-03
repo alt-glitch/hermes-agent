@@ -2,7 +2,7 @@
  * Slash dispatch test (spec §5 Layer 3/4). Pure logic: parse + the dispatch
  * ladder (client → slash.exec → command.dispatch) against a fake SlashContext.
  */
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import type { DetailsMode, DetailsSections } from '../logic/details.ts'
 import type { BusyInputMode } from '../logic/busyQueue.ts'
@@ -18,6 +18,7 @@ import {
   DASHBOARD_UPDATE_DISABLED_MESSAGE,
   dispatchSlash,
   formatHistory,
+  isModelPickerKey,
   HISTORY_MAX_MESSAGES,
   HISTORY_MAX_PAGER_CHARS,
   HISTORY_MAX_PREVIEW,
@@ -36,6 +37,7 @@ import {
   type SlashContext
 } from '../logic/slash.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
+import { isWakeUserDisabled, setWakeUserDisabled } from '../logic/wake.ts'
 import type { ConfirmRequest, Message, PickerItem } from '../logic/store.ts'
 import type { BillingOverlayState, BillingStateResponse, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { SessionCompressResponse } from '../boundary/compression.ts'
@@ -407,6 +409,44 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
       from: 8,
       method: 'complete.path',
       params: { word: '@src/fo' }
+    })
+  })
+
+  test('completes a second slash in a line that starts with a command (upstream 40ec9834b2)', () => {
+    // Only the first slash is an invocation. Routing the whole line to the
+    // gateway completer offered nothing, so `/work /cle` went dead while
+    // `do /work then /cle` completed fine.
+    expect(planCompletion('/work /cle')).toEqual({
+      end: 10,
+      from: 7,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/cle' },
+      skillsOnly: true
+    })
+    // a bare trailing inline slash browses skills, same as in prose
+    expect(planCompletion('/help /')).toEqual({
+      end: 7,
+      from: 7,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/' },
+      skillsOnly: true
+    })
+  })
+
+  test("leaves a command's own arguments to the command (`/cron ad` unchanged)", () => {
+    for (const input of ['/personality alic', '/cron ad', '/details ']) {
+      expect(planCompletion(input)).toEqual({ from: 0, method: 'complete.slash', params: { text: input } })
+    }
+  })
+
+  test('an invalid inline token inside a command line falls back to the command plan', () => {
+    // `/cle/x` is a path-shaped token, not a skill reference — the caret sits
+    // before the second `/`, so the leading-command branch reclaims the line.
+    const text = '/work /cle/x'
+    expect(planCompletion(text, '/work /cle'.length)).toEqual({
+      from: 0,
+      method: 'complete.slash',
+      params: { text }
     })
   })
 })
@@ -802,6 +842,106 @@ describe('voice command parity', () => {
     const p = makeCtx(async () => ({ enabled: 'yes' }))
     await dispatchSlash('/voice', p.ctx)
     expect(p.system).toEqual(['error: invalid response: voice.toggle'])
+  })
+
+  test('/voice on renders the gateway-sourced stop hint between the key line and the tips (6fdfdc1597)', async () => {
+    const p = makeCtx(async () => ({
+      enabled: true,
+      record_key: 'ctrl+b',
+      stop_hint: 'Say "stop" to end the voice chat',
+      tts: false
+    }))
+    await dispatchSlash('/voice on', p.ctx)
+    expect(p.system).toEqual([
+      'Voice mode enabled',
+      '  Press Ctrl+B to start/stop recording',
+      '  Say "stop" to end the voice chat',
+      '  /voice tts  to toggle speech output',
+      '  /voice off  to disable voice mode'
+    ])
+  })
+
+  test('an absent/empty stop hint (older gateway, stop_phrases: []) shows no hint line', async () => {
+    const p = makeCtx(async () => ({ enabled: true, record_key: 'ctrl+b', stop_hint: '', tts: false }))
+    await dispatchSlash('/voice on', p.ctx)
+    expect(p.system).toEqual([
+      'Voice mode enabled',
+      '  Press Ctrl+B to start/stop recording',
+      '  /voice tts  to toggle speech output',
+      '  /voice off  to disable voice mode'
+    ])
+  })
+})
+
+describe('wake command parity (upstream 71a2feeade)', () => {
+  beforeEach(() => setWakeUserDisabled(false))
+
+  test('/wake on clears the opt-out and arms with the explicit-gesture persist flag', async () => {
+    setWakeUserDisabled(true)
+    const p = makeCtx(async () => ({ phrase: 'hey hermes', provider: 'openwakeword', started: true }))
+    await dispatchSlash('/wake on', p.ctx)
+    expect(isWakeUserDisabled()).toBe(false)
+    expect(p.calls).toEqual([{ method: 'wake.start', params: { persist: true, surface: 'tui' } }])
+    expect(p.system).toEqual(['wake: listening for “hey hermes” · openwakeword'])
+  })
+
+  test('/wake off records the opt-out (reconnects must not re-arm) and stops with persist', async () => {
+    const p = makeCtx(async () => ({ disabled_persisted: true, stopped: true }))
+    await dispatchSlash('/wake off', p.ctx)
+    expect(isWakeUserDisabled()).toBe(true)
+    expect(p.calls).toEqual([{ method: 'wake.stop', params: { persist: true } }])
+    expect(p.system).toEqual(['wake: listener off · disabled in config'])
+  })
+
+  test('bare /wake reports status without changing the opt-out', async () => {
+    const p = makeCtx(async () => ({ listening: false, phrase: 'hey hermes' }))
+    await dispatchSlash('/wake', p.ctx)
+    expect(p.calls).toEqual([{ method: 'wake.status', params: {} }])
+    expect(p.system).toEqual(['wake: off for “hey hermes” · /wake on to arm'])
+    expect(isWakeUserDisabled()).toBe(false)
+  })
+
+  test('a refusal renders the friendly reason; garbage args show usage without an RPC', async () => {
+    const refused = makeCtx(async () => ({ reason: 'disabled_for_surface', started: false }))
+    await dispatchSlash('/wake on', refused.ctx)
+    expect(refused.system).toEqual(['wake: not started — scoped to another surface (config wake_word.surface)'])
+
+    const garbage = makeCtx(async () => ({}))
+    await dispatchSlash('/wake maybe', garbage.ctx)
+    expect(garbage.calls).toHaveLength(0)
+    expect(garbage.system).toEqual(['usage: /wake [on|off|status]'])
+  })
+
+  test('a malformed wake response is visible, and the opt-out set by /wake off sticks', async () => {
+    const p = makeCtx(async () => 'not-an-object')
+    await dispatchSlash('/wake off', p.ctx)
+    expect(p.system).toEqual(['error: invalid response: wake.stop'])
+    expect(isWakeUserDisabled()).toBe(true)
+  })
+})
+
+describe('Ctrl+O model picker (upstream f27d45e288)', () => {
+  test('matches plain Ctrl+O presses only — never releases, shifted chords, or other modifiers', () => {
+    expect(isModelPickerKey({ ctrl: true, name: 'o' })).toBe(true)
+    expect(isModelPickerKey({ ctrl: true, name: 'O' })).toBe(true)
+    expect(isModelPickerKey({ ctrl: true, name: 'o', eventType: 'release' })).toBe(false)
+    expect(isModelPickerKey({ ctrl: true, name: 'o', shift: true })).toBe(false)
+    expect(isModelPickerKey({ ctrl: true, name: 'o', option: true })).toBe(false)
+    expect(isModelPickerKey({ ctrl: true, name: 'o', super: true })).toBe(false)
+    expect(isModelPickerKey({ ctrl: false, name: 'o' })).toBe(false)
+    expect(isModelPickerKey({ ctrl: true, name: 'x' })).toBe(false)
+  })
+
+  test('opening the picker never prefill/clears the composer or submits — the draft survives', async () => {
+    // Ctrl+O routes through this same bare `/model` open; the whole point is
+    // reaching the picker WITHOUT wiping a half-typed draft the way typing
+    // `/model` over it would. The open must not touch any composer seam.
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : {}))
+    await dispatchSlash('/model', p.ctx)
+    expect(p.pickers).toHaveLength(1)
+    expect(p.prefills).toEqual([])
+    expect(p.submitted).toEqual([])
+    expect(p.skillSubmitted).toEqual([])
   })
 })
 
@@ -1492,12 +1632,14 @@ describe('dispatchSlash — client commands', () => {
     ).toBe(true)
   })
 
-  test('/model --refresh busy-guards, refetches, and opens the picker without config.set', async () => {
+  test('/model --refresh refetches and opens the picker without config.set — even mid-turn (f27d45e288)', async () => {
+    // No busy guard: refreshing the catalog and opening the picker are
+    // read-only; a pick made mid-turn defers server-side instead of rejecting.
     const busy = makeCtx(async () => MODEL_OPTIONS)
     busy.busy.value = true
     await dispatchSlash('/model --refresh', busy.ctx)
-    expect(busy.calls).toHaveLength(0)
-    expect(busy.pickers).toHaveLength(0)
+    expect(busy.calls.map(call => call.method)).toEqual(['model.options'])
+    expect(busy.pickers).toHaveLength(1)
 
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : {}))
     p.modelCache.value = [{ label: 'stale', value: 'stale' }]
@@ -1820,11 +1962,20 @@ describe('dispatchSlash — client commands', () => {
     expect(p.system).toEqual(['usage: /model <name> --once'])
   })
 
-  test('/model guards busy sessions and confirms an expensive selection before retrying', async () => {
-    const busy = makeCtx(async () => ({ value: 'unused' }))
+  test('/model switches DURING a busy turn — the gateway queues it and answers deferred (f27d45e288)', async () => {
+    // The old 4009 busy guard is gone: a mid-turn pick is a session-scoped
+    // config.set the gateway QUEUES and applies at the next turn start.
+    const busy = makeCtx(async method =>
+      method === 'config.set' ? { deferred: true, scope: 'session', value: 'claude-opus' } : MODEL_OPTIONS
+    )
     busy.busy.value = true
-    await dispatchSlash('/model claude-opus', busy.ctx)
-    expect(busy.calls).toHaveLength(0)
+    const models: string[] = []
+    await dispatchSlash('/model claude-opus', { ...busy.ctx, setCurrentModel: model => models.push(model) })
+    expect(busy.calls.some(call => call.method === 'config.set')).toBe(true)
+    // deferred:true is decoded and surfaced — the pick paints optimistically
+    // but the transcript says it applies at the NEXT turn, not the live one.
+    expect(busy.system).toContain('model → claude-opus (applies next turn)')
+    expect(models).toEqual(['claude-opus'])
 
     const expensive = makeCtx(async (_method, params) =>
       params.confirm_expensive_model

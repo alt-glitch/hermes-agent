@@ -51,6 +51,7 @@ import {
   decodeConfigFullResponse,
   decodeConfigMtimeResponse,
   decodeConfigValueResponse,
+  decodePromptSubmitAck,
   type SessionSteerDisposition
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
@@ -112,6 +113,7 @@ import {
   clientCommandNames,
   createCompletionGate,
   dispatchSlash,
+  isModelPickerKey,
   mapCompletions,
   mapModelOptions,
   modelOptionsParams,
@@ -120,6 +122,7 @@ import {
   startModelPrefetch,
   type SlashContext
 } from '../logic/slash.ts'
+import { handleWakeDetected, isWakeUserDisabled, type WakeDetectedPayload } from '../logic/wake.ts'
 import {
   busyInputModeFromConfig,
   BUSY_QUEUE_MAX_CHARS,
@@ -724,15 +727,29 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // delayed until SID filtering accepts it; stale-session events never open
       // a browser or leak their code into the successor transcript.
       let submitVoiceTranscript: (text: string) => void = () => {}
+      // Late-bound: wake.detected needs startNewSession/slash wiring declared
+      // further down; events can arrive as soon as the subscription opens, so
+      // the handler indirects through this assignable seam (the same pattern
+      // as submitVoiceTranscript above).
+      let onWakeDetected: (payload: WakeDetectedPayload) => void = () => {}
       store.registerCommittedEventHandler(event => {
         if (event.type === 'billing.step_up.verification') {
           presentBillingVerification(event.payload, { pushSystem: text => store.pushSystem(text) })
-        } else if (event.type === 'voice.transcript' && !event.payload?.no_speech_limit) {
+        } else if (
+          event.type === 'voice.transcript' &&
+          !event.payload?.no_speech_limit &&
+          // A bare stop phrase (spoken or typed) is user intent to END the
+          // voice chat (upstream ba13132298) — the store reducer prints the
+          // "voice chat ended" notice; it MUST NOT submit as an agent turn.
+          !event.payload?.stop_phrase
+        ) {
           const text = event.payload?.text?.trim()
           if (text) {
             store.clearComposerDraft()
             queueMicrotask(() => submitVoiceTranscript(text))
           }
+        } else if (event.type === 'wake.detected') {
+          onWakeDetected(event.payload ?? {})
         }
 
         if (event.type === 'message.start' || event.type === 'message.complete') {
@@ -799,6 +816,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         } else if (event.type === 'gateway.ready') {
           void delegationStatusRefresher.refresh(true)
           if (gateway.sessionId()) void activeSessionsRefresher.refresh(true)
+          // Arm "Hey Hermes" if this surface owns it (the server gates on
+          // config — upstream 86d5b8b90f). Fire-and-forget + idempotent
+          // server-side, so recovery reconnects are harmless. Skipped when the
+          // user explicitly ran `/wake off` this process — an explicit opt-out
+          // must survive gateway reconnects (logic/wake.ts).
+          if (!isWakeUserDisabled()) {
+            void Effect.runPromise(gateway.request('wake.start', { surface: 'tui' })).catch(() => undefined)
+          }
         }
         void spawnTreeSaveDrainer.drain()
       })
@@ -1449,6 +1474,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // interpret them. Redraw invalidates buffers without resetting the input
       // parser; action+D shares Ink's local-exit / hosted-new-chat contract.
       let toggleVoiceRecording: () => void = () => {}
+      let openModelPicker: () => void = () => {}
       const onGlobalAction = (key: KeyEvent) => {
         if (
           isVoiceRecordKey(key, store.state.voice.recordKey) &&
@@ -1459,6 +1485,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         ) {
           key.preventDefault()
           toggleVoiceRecording()
+          return
+        }
+        // Ctrl+O opens the model picker without disturbing a typed draft
+        // (upstream f27d45e288): the same overlay `/model` opens, but reachable
+        // without clearing what you've typed to run the command. Consumed here
+        // (pre-composer, like the voice record key) so the textarea never sees
+        // the byte; the composer draft is untouched. Works mid-stream — the
+        // gateway queues a busy-session pick and applies it next turn.
+        if (isModelPickerKey(key) && !actionExitBlocked(store.state)) {
+          key.preventDefault()
+          openModelPicker()
           return
         }
         if (isRedrawHotkey(key)) {
@@ -1682,8 +1719,20 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               text: current.text
             })
             .pipe(
-              Effect.tap(() =>
+              Effect.tap(response =>
                 Effect.sync(() => {
+                  // The gateway consumed a typed bare voice stop phrase
+                  // server-side (upstream ba13132298): the voice chat ended and
+                  // NO turn starts, so no message.start/complete/error will
+                  // ever correlate with this submission. Release the pending
+                  // body and the optimistic spinner here; the voice.transcript
+                  // {stop_phrase} event owns the mode flags + notice.
+                  if (decodePromptSubmitAck(response)?.voice_stopped) {
+                    if (pendingPrompt === current) pendingPrompt = undefined
+                    store.applyInfo({ running: false })
+                    queueMicrotask(drainQueuedIfIdle)
+                    return
+                  }
                   if (pendingPrompt === current) {
                     pendingPrompt = pendingPromptAfterBoundary(current, 'rpc-ack')
                   }
@@ -2149,8 +2198,12 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
-      const startNewSession = (message?: string, title?: string): void => {
-        if (guardBusySessionSwitch('start a new session', 'new')) return
+      // Resolves with whether a fresh session was actually adopted, so callers
+      // that must sequence on the replacement (the wake.detected voice arm) can
+      // await it; fire-and-forget callers just drop the promise. The pipeline
+      // below totalizes its own failures, so the promise never rejects.
+      const startNewSession = (message?: string, title?: string): Promise<boolean> => {
+        if (guardBusySessionSwitch('start a new session', 'new')) return Promise.resolve(false)
         clearModelPrefetch()
         activeTransitionOwner = 'new'
         sessionTransitionInFlight = true
@@ -2158,7 +2211,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         const previousLiveSessionId = gateway.sessionId()
         let transitionSucceeded = false
 
-        Effect.runFork(
+        return Effect.runPromise(
           Effect.gen(function* () {
             const result = yield* replaceSession(gateway, {
               activeSessionId: previousLiveSessionId,
@@ -2269,6 +2322,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               })
             )
           )
+        ).then(
+          () => transitionSucceeded,
+          () => transitionSucceeded
         )
       }
 
@@ -2633,14 +2689,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           return
         }
         store.pushSystem('setup complete — starting session…')
-        startNewSession('new session started')
+        void startNewSession('new session started')
       }
 
       // Slash dispatch context (Solid logic; the boundary just hands it a
       // Promise-returning `request` + the host capabilities it needs).
       const slashCtx: SlashContext = {
         guardBusySessionSwitch,
-        newSession: startNewSession,
+        newSession: (message, title) => void startNewSession(message, title),
         branchSession: startBranchSession,
         newLiveSession: (message, title) => void startNewLiveSession(message, title),
         beginToolsConfigure: () => {
@@ -2861,6 +2917,32 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // picker. URL recovery stays inside logic/billingWall.ts via the safe
       // external-URL boundary; only the slash capability is entry-owned.
       store.registerBillingWallHost({ submitSlash: command => void submit(command) })
+
+      // Ctrl+O (bound in onGlobalAction above) routes through the SAME slash
+      // ladder as typing /model, so picker caching/refresh seams are shared —
+      // but without ever touching the composer's half-typed draft.
+      openModelPicker = () => {
+        void dispatchSlash('/model', slashCtx).catch(error => {
+          store.pushSystem(`model picker failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+      }
+
+      // "Hey Hermes" (upstream 86d5b8b90f): open a fresh session (unless the
+      // gateway says start_new_session:false), then arm voice capture. All the
+      // orchestration lives in logic/wake.ts; this wires the entry capabilities.
+      onWakeDetected = payload => {
+        void handleWakeDetected(
+          {
+            request: (method, params) => Effect.runPromise(gateway.request(method, params)),
+            sessionId: () => gateway.sessionId(),
+            ownProfile: () => store.state.info.profileName,
+            newSession: () => startNewSession(),
+            setVoiceEnabled: () => store.setVoiceMode({ enabled: true }),
+            pushSystem: text => store.pushSystem(text)
+          },
+          payload
+        )
+      }
 
       // Drain ONE row per authoritative settle. Queue editing pins the selected
       // row; ending that edit while already idle retries this same drain seam.

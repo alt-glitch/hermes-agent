@@ -7,6 +7,7 @@ import {
   decodeConfigMtimeResponse,
   decodeModelSwitchResponse,
   decodeCommandsCatalogResponse,
+  decodePromptSubmitAck,
   decodeReloadEnvResponse,
   decodeReloadMcpResponse,
   decodeSessionSaveResponse,
@@ -41,6 +42,14 @@ describe('session-maintenance RPC Effect boundaries', () => {
     ).toEqual({ confirm_message: 'premium pricing', confirm_required: true, warning: 'high cost' })
     expect(decodeModelSwitchResponse({ value: 'anthropic/claude-opus' })).toEqual({
       value: 'anthropic/claude-opus'
+    })
+    // Mid-turn switch: the gateway queues the pick and answers deferred:true
+    // (upstream f27d45e288) — decoded so the handler can say "applies next turn".
+    expect(decodeModelSwitchResponse({ deferred: true, scope: 'session', value: 'claude-opus', warning: '' })).toEqual({
+      deferred: true,
+      scope: 'session',
+      value: 'claude-opus',
+      warning: ''
     })
     expect(decodeConfigFullResponse({ config: { display: { busy_input_mode: 'steer' } } })).toEqual({
       config: { display: { busy_input_mode: 'steer' } }
@@ -115,6 +124,17 @@ describe('session-maintenance RPC Effect boundaries', () => {
     expect(
       decodeCommandsCatalogResponse({ categories: [{ name: 'Bad', pairs: [['/ok', 1]] }], pairs: [] })
     ).toBeUndefined()
+  })
+
+  test('prompt.submit ack: only an explicit voice_stopped:true marks a consumed no-turn stop phrase', () => {
+    // {voice_stopped:true} (upstream ba13132298) means the gateway ended the
+    // voice chat instead of starting a turn — the entry releases the pending
+    // prompt on this signal, so a plain ack must NOT look like one.
+    expect(decodePromptSubmitAck({ voice_stopped: true })).toEqual({ voice_stopped: true })
+    expect(decodePromptSubmitAck({ ok: true })?.voice_stopped).toBeUndefined()
+    expect(decodePromptSubmitAck({})?.voice_stopped).toBeUndefined()
+    expect(decodePromptSubmitAck(undefined)).toBeUndefined()
+    expect(decodePromptSubmitAck({ voice_stopped: 'yes' })).toBeUndefined()
   })
 
   test('only an explicit steer rejection proves non-admission', () => {
