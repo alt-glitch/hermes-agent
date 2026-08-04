@@ -113,6 +113,27 @@ describe('readline line editing parity', () => {
     }
   })
 
+  test('Ctrl+K on an earlier unequal-length line only joins at that line EOL', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('abcdef')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('xy')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('HOME')
+      for (let i = 0; i < 4; i++) h.probe.keys.pressArrow('left')
+      h.probe.keys.pressKey('k', { ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('ab\nxy')
+
+      h.probe.keys.pressKey('k', { ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('abxy')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
   test('Ctrl+Backspace and Option+Backspace remain delete-word', async () => {
     const h = await mountComposer({ kitty: true })
     try {

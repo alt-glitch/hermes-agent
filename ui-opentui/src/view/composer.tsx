@@ -732,7 +732,8 @@ export function Composer(props: {
         (key.name === 'delete' && key.super === true))
     if (lineEndKill && ta?.focused) {
       const cursor = ta.logicalCursor
-      if (cursor.col === ta.editBuffer.getEOL().col && cursor.row < ta.lineCount - 1) {
+      const eol = ta.editBuffer.getEOL()
+      if (cursor.row === eol.row && cursor.col === eol.col && cursor.row < ta.lineCount - 1) {
         key.preventDefault()
         ta.deleteRange(cursor.row, cursor.col, cursor.row + 1, 0)
         props.history?.reset()

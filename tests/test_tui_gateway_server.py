@@ -3215,7 +3215,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
         {"id": "1", "method": "session.resume", "params": params}
     )
 
-    expected = [] if omit_messages else [
+    full_display = [
         {"role": "user", "text": "root prompt"},
         {
             "role": "tool",
@@ -3226,10 +3226,11 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
         },
         {"role": "assistant", "text": "root answer"},
     ]
+    expected = [] if omit_messages else full_display
     assert resp["result"]["messages"] == expected
-    assert resp["result"]["message_count"] == (1 if omit_messages else 3)
+    assert resp["result"]["message_count"] == 3
     assert resp["result"]["messages_omitted"] is omit_messages
-    expected_calls = [(target, False)] if omit_messages else [
+    expected_calls = [
         (target, False),
         (target, True),
     ]
@@ -3238,6 +3239,42 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
     assert server._sessions[live_sid]["history"] == [
         {"role": "user", "content": "tip prompt"}
     ]
+    assert server._sessions[live_sid]["display_history"] == [
+        {"role": "user", "content": "root prompt"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "search_files",
+                        "arguments": json.dumps({"pattern": "resume"}),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "found the persisted result",
+            "tool_call_id": "call_1",
+        },
+        {"role": "assistant", "content": "root answer"},
+    ]
+    if omit_messages:
+        warm = server.handle_request(
+            {
+                "id": "2",
+                "method": "session.activate",
+                "params": {"session_id": live_sid, "with_ui_chrome": True},
+            }
+        )
+        assert warm["result"]["messages"] == [
+            {"role": "user", "text": "root prompt"},
+            {"role": "tool", "name": "search_files", "context": "resume"},
+            {"role": "assistant", "text": "root answer"},
+        ]
+        assert warm["result"]["message_count"] == 3
 
 
 def test_cold_then_live_resume_keeps_verbatim_verification_history(
@@ -13558,6 +13595,39 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     assert payload.get("status") == "error"
     assert payload.get("text", "").startswith("Error:")
     assert "kimi-k2.6" in payload.get("text", "")
+
+
+def test_prompt_submit_accepts_legacy_string_result(monkeypatch):
+    """A legacy/custom agent may return reply text instead of a result mapping."""
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            return "plain legacy reply"
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    emitted: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hello"},
+        }
+    )
+
+    complete = [event for event in emitted if event[0] == "message.complete"][-1][2]
+    assert complete["status"] == "complete"
+    assert complete["text"] == "plain legacy reply"
+    assert "response_previewed" not in complete
 
 
 def test_prompt_submit_clears_running_before_deferred_init_error(monkeypatch):
