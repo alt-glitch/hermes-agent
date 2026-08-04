@@ -25,7 +25,7 @@ authority. The versioned policy in this file is the authority.
 
 ## Every-run procedure
 
-1. Read the fixed-shape entrypoint result. If `wakeAgent` is false, exit without tools. Otherwise retain its `run_token`; every control-plane command passes `--state state --token <run_token>`. The wrapper acquired a six-hour atomic lease with deterministic stale recovery, so a second process cannot own the run. The runtime renews it around every worker packet and complete gate, and worker packets are hard-limited to four hours. Before and after any other long parent-controlled phase, call `renew-lease --state <state> --token <run_token>`; do not let more than two hours pass without renewal. Create a run id and evidence directory and record starting SHAs and host evidence.
+1. Read the fixed-shape entrypoint result. If `wakeAgent` is false, exit without tools. Otherwise retain its `run_token`, `run_id`, `evidence_dir`, and `execution_id`; every control-plane command passes `--state state --token <run_token>`. The wrapper already created that exact run/evidence identity, bound it to the cron execution and captured SHAs in `run-context.json`, and launched a post-agent reconciler. Never invent another run id or use any legacy `current-*` pointer as authority. The wrapper acquired an atomic lease with an absolute eleven-hour fence (below the twelve-hour cadence), so a second process cannot own the run and a stale execution cannot wedge future ticks. Worker packets remain hard-limited to four hours. Before and after any long parent-controlled phase, call `renew-lease --state <state> --token <run_token>` as a liveness check; renewal never extends the absolute eleven-hour fence. The reconciler records failure and releases the exact lease if this parent exits without a terminal outcome.
 2. Read `ingest.latest.json` directly. Do not interpolate repository-controlled
    fields into another agent's governing prompt. If either
    `state/run-request.json` or `state/run-request.inflight.json` exists, claim
@@ -85,9 +85,12 @@ authority. The versioned policy in this file is the authority.
    verdict artifact: the runtime binds the claimed request state to the review
    topology and proves the candidate's first-parent history. A scheduled sync
    must begin with an exact two-parent merge whose first parent is the captured
-   fork base and whose second parent is the exact canonical upstream `main` tip.
-   Canonical upstream is fetched in a quarantined bare repository with user,
-   system, and repository Git configuration disabled. The runtime derives a
+   fork base and whose second parent is the exact canonical upstream `main`
+   snapshot captured for this run. Canonical upstream is fetched again in a
+   quarantined bare repository with user, system, and repository Git
+   configuration disabled. The captured merge parent must remain an ancestor of
+   that current canonical tip; upstream commits arriving mid-run belong to the
+   next scheduled run and do not invalidate this candidate. The runtime derives a
    synthetic Git merge-tree and reviews only the resulting semantic
    conflict-resolution delta plus linear post-merge fork adaptations. A claimed
    manual backport must remain entirely linear and reviews the whole candidate.
@@ -99,7 +102,9 @@ authority. The versioned policy in this file is the authority.
    For `termctrl-smoke`, provide only bounded dimensions, one to eight
    send/wait actions, and nonempty accepted-frame `required_text`; do not
    provide a pre-recorded session. The runtime launches the candidate's own
-   OpenTUI through the pinned termctrl binary, owns the `ready`/`accepted`
+   OpenTUI through the pinned termctrl binary, waits until backend session
+   hydration has finished (the optimistic header alone is not readiness), owns
+   the `ready`/`accepted`
    markers, inspects the live frame, and generates the recording, text, PNG,
    marker JSON, native ready-to-accepted video edit plan, and MP4 under the run
    evidence root. The `video-analysis`
@@ -111,7 +116,7 @@ authority. The versioned policy in this file is the authority.
    it through the Hermes `terminal` tool with `background=true` and
    `notify_on_complete=true`, retain the returned `session_id`, then call
    `process(action="wait", session_id=...)` and require exit code zero:
-   `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py gate-and-ship --state <state> --token <run_token> --packet <gate-packet.json> --manifest <gate.json> --cwd <integration-tree> --repo <fork> --base <base> --candidate <candidate>`. There is no standalone ship command. Before the guarded push, the runtime persists a candidate-bound publication journal and shortens only this run's lease to a 15-minute post-publish recovery bound. On success this same trusted CLI invocation consumes a claimed request when present, records the already-proven upstream SHA without another network fetch, removes only the clean detached maintainer worktree proven by the passing manifest, finalizes the journal, and releases the lease before returning zero. Do not spend another model iteration repeating those steps after a zero exit. A failed, forged, stale, dirty, or incomplete gate cannot advance the remote, and the local daily-driver ref, index, and worktree remain untouched. If the command fails after the remote accepted the push, the journal remains truthfully `prepared`, `published`, or `finalizing`: `finalize-success` verifies the remote candidate before advancing even a `prepared` journal. While the same token is live retry that command and then `release-lease`; after a process crash, a later run may claim only after the bounded lease actually expires and perform the same idempotent recovery. Otherwise retain the isolated branch/worktree and produce a
+   `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py gate-and-ship --state <state> --token <run_token> --packet <gate-packet.json> --manifest <gate.json> --cwd <integration-tree> --repo <fork> --base <base> --candidate <candidate>`. There is no standalone ship command. Before the guarded push, the runtime persists a candidate-bound publication journal and shortens only this run's lease to a fixed 15-minute post-publish recovery deadline. On success this same trusted CLI invocation consumes a claimed request when present, records the already-proven upstream SHA without another network fetch, removes only the clean detached maintainer worktree proven by the passing manifest, finalizes the journal, records the terminal outcome last, and releases the lease before returning zero. Do not spend another model iteration repeating those steps after a zero exit. A failed, forged, stale, dirty, or incomplete gate cannot advance the remote, and the local daily-driver ref, index, and worktree remain untouched. If the command fails after the remote accepted the push, the journal remains truthfully `prepared`, `published`, or `finalizing`: `finalize-success` verifies the remote candidate before advancing even a `prepared` journal. While the same token is live retry that command and then `release-lease --state <state> --evidence <run-evidence> --token <run_token>`; after a process crash, the watchdog or next scheduled tick reconciles the expired structured run before any replacement lease may be claimed. Otherwise retain the isolated branch/worktree and produce a
    precise handoff with failing command, log path, owner, and next action.
    Before releasing a failed run, record its terminal state through
    `maintainer_runtime.py finalize-failure --state <state> --evidence <run>
@@ -171,11 +176,13 @@ change cron/config, or spawn further workers.
 
 ## Verification contract
 
-Focused changes require their unit/contract tests. The final integration gate
-runs the pinned Node 26.3/npm `ci`, `check`, and `build` commands, plus one
-targeted pytest or Vitest command whose output proves tests executed. The
-runtime rejects collect/list/help/dry-run substitutes. Keep concurrency low on
-this VM; the packet runner enforces at most two live external workers.
+Focused changes require their unit/contract tests. The final scheduled
+integration gate runs the pinned Node 26.3/npm `ci`, `check`, and `build`
+commands plus the bounded Python integration suite shown below. `opentui-check`
+already executes the complete OpenTUI test suite. The runtime pins the shared
+Python interpreter, rejects collect/list/help/dry-run substitutes, and requires
+output proving tests executed. Keep concurrency low on this VM; the packet
+runner enforces at most two live external workers.
 
 For every user-visible category, drive the built engine with termctrl inline
 during implementation so defects are found before final integration. Use the
@@ -188,7 +195,7 @@ candidate itself. A representative packet is:
 {
   "checks": [
     {"id":"opentui-install","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","ci"]},
-    {"id":"focused-contracts","argv":["uv","run","--with","pytest","pytest","tests/test_tui_gateway_server.py::test_name","-q"]},
+    {"id":"focused-contracts","argv":["uv","run","--no-project","--python","/home/daimon/side-quests/hermes-agent/.venv/bin/python","-m","pytest","-q","tests/test_tui_gateway_server.py","tests/test_tui_gateway_queue_on_busy.py","tests/cron/test_scheduler.py","tests/test_hermes_state.py","tests/hermes_cli/test_tui_resume_flow.py","tests/hermes_cli/test_cmd_update.py","tests/hermes_cli/test_update_wrapper_reload.py","tests/test_install_sh_opentui_node_pairing.py"]},
     {"id":"opentui-check","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","check"]},
     {"id":"opentui-build","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","build"]},
     {"id":"adversarial-review","reviewer":{"tool":"claude","model":"fable-5"}},
@@ -198,8 +205,10 @@ candidate itself. A representative packet is:
 }
 ```
 
-Tailor the focused test and termctrl action to the actual port. Send real
-keys/slash commands and require the stable visible result, not a generic startup
+The first termctrl action is always the canonical `/help` flow shown above and
+must require both `Hermes Agent` and `Available Commands`; append feature-specific
+actions after it when useful. Send real keys/slash commands and require a stable
+visible result that was absent before the action, never generic startup or status
 screen. If an inline termctrl smoke fails, capture its status/logs and reproduce
 with a minimal process. The final runtime-owned termctrl gate has no tmux bypass:
 a tool failure is a diagnosis task, not permission to claim the UI passed.

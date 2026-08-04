@@ -18,9 +18,17 @@ assert SPEC and SPEC.loader
 wrapper = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(wrapper)
 
+BASE_SHA = "a" * 40
+UPSTREAM_SHA = "b" * 40
+
 
 def _run_with_payload(tmp_path: Path, payload: dict) -> tuple[dict, dict]:
     state = tmp_path / "state"
+    payload = {
+        "branch_sha": BASE_SHA,
+        "upstream_sha": UPSTREAM_SHA,
+        **payload,
+    }
     with (
         patch.object(wrapper, "PROJECT_HOME", tmp_path),
         patch.object(wrapper, "STATE_DIR", state),
@@ -70,6 +78,9 @@ def test_repository_metadata_never_reaches_cron_stdout(tmp_path: Path) -> None:
         "needs_port_count": 1,
         "probe_failures": 0,
         "run_token": summary["run_token"],
+        "run_id": summary["run_id"],
+        "execution_id": summary["execution_id"],
+        "evidence_dir": summary["evidence_dir"],
         "wakeAgent": True,
     }
     assert ingest["commits"][0]["subject"] == hostile_subject
@@ -170,7 +181,7 @@ def test_probe_failure_holds_lease_through_bookkeeping_and_stdout(
         assert wrapper._release_lease(next_token) is True
 
 
-def test_whole_run_lease_denies_overlap_and_recovers_expiry(tmp_path: Path) -> None:
+def test_whole_run_lease_denies_overlap_and_reconciles_expiry(tmp_path: Path) -> None:
     state = tmp_path / "state"
     with patch.object(wrapper, "STATE_DIR", state):
         first = wrapper._claim_lease(now=100)
@@ -179,6 +190,14 @@ def test_whole_run_lease_denies_overlap_and_recovers_expiry(tmp_path: Path) -> N
         value = json.loads((state / "run.lease.json").read_text())
         value["expires_unix"] = 99
         (state / "run.lease.json").write_text(json.dumps(value))
+        assert wrapper._claim_lease(now=101) is None
+
+        def reconcile(*_args: object, **_kwargs: object):
+            (state / "run.lease.json").unlink()
+            return CompletedProcess([], 0, '{"status":"failed"}', "")
+
+        with patch.object(wrapper, "_invoke_reconcile", side_effect=reconcile):
+            assert wrapper._reconcile_stale_lease(now=101) is True
         second = wrapper._claim_lease(now=101)
         assert second is not None and second != first
         wrapper._release_lease(second)
@@ -207,6 +226,12 @@ def test_lease_renewal_and_release_are_token_gated(tmp_path: Path) -> None:
         assert wrapper._claim_lease(now=120) is None
         assert wrapper.renew_lease(first, now=121, ttl_seconds=20) is False
 
+        def reconcile(*_args: object, **_kwargs: object):
+            (state / "run.lease.json").unlink()
+            return CompletedProcess([], 0, '{"status":"failed"}', "")
+
+        with patch.object(wrapper, "_invoke_reconcile", side_effect=reconcile):
+            assert wrapper._reconcile_stale_lease(now=121) is True
         second = wrapper._claim_lease(now=121)
         assert second is not None and second != first
         assert wrapper._release_lease(first) is False
@@ -247,7 +272,16 @@ def test_pre_handoff_baseexception_releases_success_probe_lease(
             patch.object(
                 wrapper.subprocess,
                 "run",
-                return_value=CompletedProcess([], 0, json.dumps({"status": "ok"}), ""),
+                return_value=CompletedProcess(
+                    [],
+                    0,
+                    json.dumps({
+                        "status": "ok",
+                        "branch_sha": BASE_SHA,
+                        "upstream_sha": UPSTREAM_SHA,
+                    }),
+                    "",
+                ),
             )
         )
         if failure_stage == "failure_count":
