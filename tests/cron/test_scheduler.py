@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _should_discover_cron_mcp
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -47,6 +47,24 @@ class TestPerJobToolsetMcpMerge:
         result = _merge_mcp_into_per_job_toolsets(["web", "no_mcp"], self.CFG)
         assert result == ["web"]
         assert not (set(result) & self._enabled_names())
+
+    def test_discovery_uncertainty_preserves_resolved_tool_boundary(self):
+        with patch(
+            "hermes_cli.tools_config.enabled_mcp_server_names",
+            side_effect=RuntimeError("temporary config read failure"),
+        ):
+            assert not _should_discover_cron_mcp({}, self.CFG, ["terminal"])
+            assert _should_discover_cron_mcp({}, self.CFG, None)
+            assert not _should_discover_cron_mcp(
+                {"enabled_toolsets": ["terminal", "no_mcp"]},
+                self.CFG,
+                ["terminal"],
+            )
+            platform_cfg = {
+                **self.CFG,
+                "platform_toolsets": {"cron": ["terminal", "no_mcp"]},
+            }
+            assert not _should_discover_cron_mcp({}, platform_cfg, ["terminal"])
 
 
     def test_resolver_empty_per_job_falls_through_to_platform(self):

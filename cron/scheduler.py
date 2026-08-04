@@ -244,6 +244,35 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+def _should_discover_cron_mcp(
+    job: dict,
+    cfg: dict,
+    enabled_toolsets: list[str] | None,
+) -> bool:
+    """Decide whether this run may initialize MCP servers.
+
+    Explicit ``no_mcp`` is a side-effect boundary and always wins. On lookup
+    uncertainty, preserve an already-resolved tool boundary; only unresolved
+    legacy/full-tool runs retain MCP discovery.
+    """
+    per_job = job.get("enabled_toolsets") or []
+    platform = ((cfg or {}).get("platform_toolsets") or {}).get("cron") or []
+    if "no_mcp" in per_job or (not per_job and "no_mcp" in platform):
+        return False
+    if enabled_toolsets is None:
+        return True
+    try:
+        from hermes_cli.tools_config import enabled_mcp_server_names
+        configured = enabled_mcp_server_names(cfg or {})
+    except Exception as exc:
+        logger.warning(
+            "Cron MCP membership lookup failed; preserving resolved tool boundary: %s",
+            exc,
+        )
+        return False
+    return bool(set(enabled_toolsets) & configured)
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -3539,18 +3568,8 @@ def run_job(
         # servers first can trigger OAuth or spawn stdio children even though
         # none of their tools will be exposed to this job.
         _cron_enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
-        try:
-            from hermes_cli.tools_config import enabled_mcp_server_names
-            _configured_mcp_names = enabled_mcp_server_names(_cfg)
-        except Exception as _mcp_names_exc:
-            logger.warning(
-                "Job '%s': MCP policy resolution failed (non-fatal): %s",
-                job_id, _mcp_names_exc,
-            )
-            _configured_mcp_names = set()
-        _should_discover_mcp = (
-            _cron_enabled_toolsets is None
-            or bool(set(_cron_enabled_toolsets) & _configured_mcp_names)
+        _should_discover_mcp = _should_discover_cron_mcp(
+            job, _cfg, _cron_enabled_toolsets
         )
 
         # Initialize MCP servers so configured mcp_servers are available to

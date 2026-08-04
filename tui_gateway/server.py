@@ -12851,6 +12851,8 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit_process_completion_card(sid, evt, text)
@@ -12940,6 +12942,8 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit_process_completion_card(sid, evt, text)
@@ -13547,13 +13551,47 @@ def _run_prompt_submit(
                                 # turn-start history.  Guard against
                                 # auto-compression making result["messages"]
                                 # shorter than history (#77274 review).
-                                if len(result["messages"]) > len(history):
+                                append_only = (
+                                    len(result["messages"]) >= len(history)
+                                    and result["messages"][:len(history)] == history
+                                )
+                                if append_only:
                                     new_messages = result["messages"][len(history):]
                                 else:
                                     # Compression rebound the messages list —
-                                    # use the full result as the base.
-                                    new_messages = list(result["messages"])
-                                session["history"] = current_history + new_messages
+                                    # use the full result as the base instead of
+                                    # appending it to the pre-compression
+                                    # history. Preserve the newest switch marker
+                                    # immediately before this turn's user row.
+                                    rebased = [
+                                        entry
+                                        for entry in result["messages"]
+                                        if not _is_model_switch_marker(entry)
+                                    ]
+                                    marker = next(
+                                        (
+                                            entry
+                                            for entry in reversed(current_history)
+                                            if _is_model_switch_marker(entry)
+                                        ),
+                                        None,
+                                    )
+                                    if marker is not None:
+                                        marker_index = len(rebased)
+                                        for index in range(len(rebased) - 1, -1, -1):
+                                            entry = rebased[index]
+                                            # Compression may normalize the
+                                            # current user content (notably
+                                            # multimodal attachments), so use
+                                            # the final user row rather than
+                                            # exact string equality.
+                                            if isinstance(entry, dict) and entry.get("role") == "user":
+                                                marker_index = index
+                                                break
+                                        rebased.insert(marker_index, marker)
+                                    session["history"] = rebased
+                                if append_only:
+                                    session["history"] = current_history + new_messages
                                 session["history_version"] = current_version + 1
                             else:
                                 # Genuine desync (undo/compress/retry/rollback).
@@ -14110,6 +14148,11 @@ def _run_prompt_submit(
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    # Another delivery path won the claim after this loop had
+                    # reserved the session. Release that reservation or the
+                    # session stays permanently busy with no turn to clear it.
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit_process_completion_card(sid, _evt, synth)

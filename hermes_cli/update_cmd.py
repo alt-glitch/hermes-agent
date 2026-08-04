@@ -3733,6 +3733,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
         branch = _m()._resolve_update_branch(args)
+        branch_explicit = bool((getattr(args, "branch", None) or "").strip())
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
@@ -3741,6 +3742,52 @@ def _cmd_update_impl(args, gateway_mode: bool):
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
+        # A bare update follows the checkout branch when it exists remotely.
+        # Keep local-only branches usable by falling back to main, but never
+        # change the target of an explicit --branch request.
+        fetch_stderr = (fetch_result.stderr or "").lower()
+        if (
+            fetch_result.returncode != 0
+            and not branch_explicit
+            and branch != "main"
+            and (
+                "couldn't find remote ref" in fetch_stderr
+                or "could not find remote ref" in fetch_stderr
+            )
+        ):
+            print(f"  ⚠ Branch '{branch}' is local-only — falling back to main...")
+            branch = "main"
+            fetch_result = subprocess.run(
+                git_cmd + ["fetch", "origin", branch],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+        verify_result = None
+        if fetch_result.returncode == 0:
+            verify_result = subprocess.run(
+                git_cmd + ["rev-parse", "--verify", f"origin/{branch}"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+        if (
+            verify_result is not None
+            and verify_result.returncode != 0
+            and not branch_explicit
+            and branch != "main"
+        ):
+            print(f"  ⚠ Branch '{branch}' is local-only — falling back to main...")
+            branch = "main"
+            fetch_result = subprocess.run(
+                git_cmd + ["fetch", "origin", branch],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+        elif verify_result is not None and verify_result.returncode != 0:
+            print(f"✗ Branch '{branch}' not found on origin.")
+            _m().sys.exit(1)
         if fetch_result.returncode != 0:
             stderr = fetch_result.stderr.strip()
             if "Could not resolve host" in stderr or "unable to access" in stderr:

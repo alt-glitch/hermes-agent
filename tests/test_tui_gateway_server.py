@@ -5654,6 +5654,39 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         process_registry._poll_observed.discard(event["session_id"])
 
 
+def test_post_turn_lost_notification_claim_releases_session(monkeypatch, tmp_path):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+    session = _session(
+        session_key="session-a",
+        agent=_RecordingAgent(turns),
+        running=True,
+    )
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put({
+        "type": "completion",
+        "session_id": "lost-claim",
+        "session_key": "session-a",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "already claimed elsewhere",
+    })
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_a: None)
+    server._sessions["sid_a"] = session
+    try:
+        server._run_prompt_submit("rid-a", "sid_a", session, "direct turn")
+        assert turns == ["direct turn"]
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("sid_a", None)
+
+
 def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
     monkeypatch, tmp_path
 ):
@@ -10219,6 +10252,75 @@ def test_prompt_submit_merges_on_model_switch_marker(monkeypatch):
             )
         finally:
             server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_rebases_compressed_history_on_model_switch(monkeypatch):
+    from tui_gateway.server import _MODEL_SWITCH_MARKER_PREFIX, _is_model_switch_marker
+
+    session_ref = {"s": None}
+    marker = {
+        "role": "user",
+        "content": f"{_MODEL_SWITCH_MARKER_PREFIX}new-model.]",
+        "display_kind": "model_switch",
+    }
+
+    class _CompressedMarkerAgent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            with session_ref["s"]["history_lock"]:
+                session_ref["s"]["history"].append(marker)
+                session_ref["s"]["history_version"] += 1
+            return {
+                "final_response": "compressed reply",
+                "messages": [
+                    {"role": "system", "content": "compressed summary"},
+                    {"role": "assistant", "content": "compressed tool call"},
+                    {"role": "tool", "content": "compressed tool result"},
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "compressed reply"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    old_history = [
+        {"role": "user", "content": "old one"},
+        {"role": "assistant", "content": "old two"},
+        {"role": "user", "content": "old three"},
+        {"role": "assistant", "content": "old four"},
+    ]
+    session = _session(agent=_CompressedMarkerAgent(), history=list(old_history))
+    session_ref["s"] = session
+    server._sessions["sid"] = session
+    emits = []
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+
+        response = server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hi"},
+        })
+        assert response.get("result")
+        final = session["history"]
+        assert all(entry not in final for entry in old_history)
+        assert [entry["role"] for entry in final] == [
+            "system", "assistant", "tool", "user", "user", "assistant"
+        ]
+        assert final[0]["content"] == "compressed summary"
+        assert _is_model_switch_marker(final[3])
+        assert final[4]["content"] == "hi"
+        assert final[5]["content"] == "compressed reply"
+        assert "warning" not in [a for a in emits if a[0] == "message.complete"][0][2]
+    finally:
+        server._sessions.pop("sid", None)
 
 
 def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
@@ -16101,6 +16203,41 @@ def test_notification_poller_skips_consumed(monkeypatch):
         process_registry._completion_consumed.discard("proc_already_done")
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+@pytest.mark.parametrize("shutdown_drain", [False, True])
+def test_notification_poller_lost_claim_releases_session(monkeypatch, shutdown_drain):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    session = _session()
+    server._sessions["sid_lost_claim"] = session
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put({
+        "type": "completion",
+        "session_id": f"lost-claim-{shutdown_drain}",
+        "command": "echo safe",
+        "exit_code": 0,
+        "output": "done",
+    })
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_kw: None)
+    stop = threading.Event()
+    if shutdown_drain:
+        stop.set()
+
+    def _lose_claim(*_args):
+        stop.set()
+        return None
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _lose_claim)
+    try:
+        server._notification_poller_loop(stop, "sid_lost_claim", session)
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("sid_lost_claim", None)
 
 
 def test_notification_poller_requeues_when_busy(monkeypatch):

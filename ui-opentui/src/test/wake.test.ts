@@ -205,6 +205,32 @@ function makeHost(overrides?: {
 }
 
 describe('handleWakeDetected', () => {
+  test('an explicit opt-out ignores an already queued detector event', async () => {
+    const p = makeHost()
+    setWakeUserDisabled(true)
+    await handleWakeDetected(p.host, { phrase: 'hey hermes' })
+    expect(p.newSessions.count).toBe(0)
+    expect(p.voiceEnabled.count).toBe(0)
+    expect(p.calls).toEqual([])
+  })
+
+  test('an opt-out while a fresh session opens stops before voice activation', async () => {
+    let release!: (value: boolean) => void
+    const opened = new Promise<boolean>(resolve => {
+      release = resolve
+    })
+    const p = makeHost()
+    const host: WakeHost = { ...p.host, newSession: () => opened }
+
+    const handling = handleWakeDetected(host, {})
+    setWakeUserDisabled(true)
+    release(true)
+    await handling
+
+    expect(p.voiceEnabled.count).toBe(0)
+    expect(p.calls).toEqual([])
+  })
+
   test('opens a fresh session, then arms voice capture on the new sid', async () => {
     const p = makeHost()
     await handleWakeDetected(p.host, { phrase: 'hey hermes' })

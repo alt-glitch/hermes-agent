@@ -135,6 +135,10 @@ export interface WakeHost {
  * resumes the gateway's paused detector so the listener never goes deaf. */
 export async function handleWakeDetected(host: WakeHost, payload: WakeDetectedPayload | undefined): Promise<void> {
   const resume = () => host.request('wake.resume', {}).catch(() => undefined)
+  // `/wake off` is authoritative. A detector event may already be queued or
+  // an earlier handler may still be crossing an async boundary when the user
+  // opts out, so check both before and after every awaited activation step.
+  if (isWakeUserDisabled()) return
   try {
     const plan = planWakeDetected(payload, host.ownProfile())
     if (plan.kind === 'foreign-profile') {
@@ -142,9 +146,12 @@ export async function handleWakeDetected(host: WakeHost, payload: WakeDetectedPa
       await resume()
       return
     }
-    if (plan.newSession && !(await host.newSession())) {
-      await resume()
-      return
+    if (plan.newSession) {
+      if (!(await host.newSession())) {
+        await resume()
+        return
+      }
+      if (isWakeUserDisabled()) return
     }
     const sid = host.sessionId()
     if (!sid) {
@@ -153,6 +160,7 @@ export async function handleWakeDetected(host: WakeHost, payload: WakeDetectedPa
     }
     host.setVoiceEnabled()
     await host.request('voice.toggle', { action: 'on' })
+    if (isWakeUserDisabled()) return
     await host.request('voice.record', { action: 'start', session_id: sid })
   } catch (error) {
     host.pushSystem(`wake: ${error instanceof Error ? error.message : String(error)}`)

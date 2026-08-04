@@ -206,6 +206,41 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    def test_update_falls_back_to_main_when_current_branch_is_local_only(
+        self, mock_run, _mock_which, mock_args
+    ):
+        mock_run.side_effect = _make_run_side_effect(
+            branch="local/experiment", verify_ok=False, commit_count="3"
+        )
+
+        cmd_update(mock_args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        rev_list = next(c for c in commands if "rev-list" in c)
+        merge = next(c for c in commands if "merge --ff-only" in c)
+        assert "origin/main" in rev_list
+        assert "local/experiment" not in rev_list
+        assert "origin/main" in merge
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_bare_update_follows_remote_fork_branch(
+        self, mock_run, _mock_which, mock_args
+    ):
+        mock_run.side_effect = _make_run_side_effect(
+            branch="sid/opentui", verify_ok=True, commit_count="2"
+        )
+
+        cmd_update(mock_args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        rev_list = next(c for c in commands if "rev-list" in c)
+        merge = next(c for c in commands if "merge --ff-only" in c)
+        assert "origin/sid/opentui" in rev_list
+        assert "origin/sid/opentui" in merge
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
     def test_update_on_fork_checks_upstream_when_origin_up_to_date(
         self, mock_run, _mock_which, mock_args, capsys
     ):

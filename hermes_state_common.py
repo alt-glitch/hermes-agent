@@ -357,6 +357,19 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+
+CREATE TABLE IF NOT EXISTS model_picker_usage (
+    provider_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    base_url TEXT NOT NULL DEFAULT '',
+    last_used_at REAL NOT NULL,
+    activation_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider_id, model, base_url)
+);
+CREATE INDEX IF NOT EXISTS idx_model_picker_usage_recent
+    ON model_picker_usage(last_used_at DESC);
+CREATE INDEX IF NOT EXISTS idx_model_picker_usage_frequent
+    ON model_picker_usage(activation_count DESC, last_used_at DESC);
 """
 
 

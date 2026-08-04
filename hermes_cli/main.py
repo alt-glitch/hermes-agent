@@ -10023,8 +10023,29 @@ def _finalize_update_output(state):
 
 
 def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` into a non-empty branch name."""
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    """Use an explicit branch, otherwise follow the install checkout.
+
+    Fork installs must update their current branch by default; silently
+    switching a ``sid/opentui`` install to upstream ``main`` removes the TUI
+    fork. Detached HEADs and detection failures safely fall back to ``main``.
+    """
+    explicit = getattr(args, "branch", None)
+    if explicit and explicit.strip():
+        return explicit.strip()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        current = result.stdout.strip()
+        if current and current != "HEAD":
+            return current
+    except Exception:
+        pass
+    return "main"
 
 
 def _size_delta_label(saved_mb: float) -> str:

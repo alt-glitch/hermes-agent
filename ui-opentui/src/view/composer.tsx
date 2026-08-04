@@ -695,6 +695,10 @@ export function Composer(props: {
     // processes the key; the microtask runs after both). Equal-value signal
     // sets are no-ops, so this is cheap on every keystroke.
     queueMicrotask(syncCursorLine)
+    // Any real non-Esc press is an intervening key for the double-Esc
+    // gesture. Do this before handlers that return early (paste, line kill,
+    // queue editing, etc.) so Esc -> action -> Esc cannot discard a draft.
+    if (key.eventType !== 'release' && key.name !== 'escape') doubleEsc.reset()
     if (key.eventType !== 'release' && key.name === 'v' && (key.ctrl || key.meta || key.super) && !key.option) {
       key.preventDefault()
       void Promise.resolve(props.onImagePaste?.(true)).then(text => {
@@ -735,9 +739,6 @@ export function Composer(props: {
         return
       }
     }
-    // 0) double-Esc bookkeeping: any non-Esc press is an intervening key and
-    // disarms the pending Esc (free-code resets on every other input).
-    if (key.eventType !== 'release' && key.name !== 'escape') doubleEsc.reset()
     // 1) Queue edit owns Esc/Ctrl+X before completion dismissal. Ink's queue
     // header promises one-press "Esc cancel", including slash-like rows whose
     // body opened a completion menu.
@@ -846,7 +847,15 @@ export function Composer(props: {
     // keeps the existing session prompt-history viewer behavior. The history
     // guard reflects the production contract: without a recall sink, do not
     // destructively clear a caller's draft.
-    if (key.name === 'escape' && key.eventType !== 'release' && !key.ctrl && !key.meta && !key.option) {
+    if (
+      key.name === 'escape' &&
+      key.eventType !== 'release' &&
+      key.repeated !== true &&
+      !key.ctrl &&
+      !key.meta &&
+      !key.option &&
+      !key.super
+    ) {
       if (ta?.focused === true && !key.defaultPrevented) {
         if (doubleEsc.press()) {
           const draft = ta.plainText

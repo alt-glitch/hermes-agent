@@ -2067,29 +2067,9 @@ BEGIN
 END;
 """
 
-# Upstream moved the canonical schema into hermes_state_common while the fork
-# added profile-local model-picker usage in the former in-file schema. Compose
-# that one fork table onto the upstream definition and update the schema mixin's
-# imported binding so initialization and reconciliation see the same contract.
-from hermes_state_common import SCHEMA_SQL as _UPSTREAM_SCHEMA_SQL
-import hermes_state_schema as _hermes_state_schema
-
-_MODEL_PICKER_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS model_picker_usage (
-    provider_id TEXT NOT NULL,
-    model TEXT NOT NULL,
-    base_url TEXT NOT NULL DEFAULT '',
-    last_used_at REAL NOT NULL,
-    activation_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (provider_id, model, base_url)
-);
-CREATE INDEX IF NOT EXISTS idx_model_picker_usage_recent
-    ON model_picker_usage(last_used_at DESC);
-CREATE INDEX IF NOT EXISTS idx_model_picker_usage_frequent
-    ON model_picker_usage(activation_count DESC, last_used_at DESC);
-"""
-SCHEMA_SQL = _UPSTREAM_SCHEMA_SQL + "\n" + _MODEL_PICKER_SCHEMA_SQL
-_hermes_state_schema.SCHEMA_SQL = SCHEMA_SQL
+# Keep one canonical schema binding for SessionDB, schema mixins, portability,
+# and direct schema consumers. Fork-owned tables belong in common.py too.
+from hermes_state_common import SCHEMA_SQL
 
 # ── CJK-bigram FTS index (replaces the trigram index when available) ────
 #

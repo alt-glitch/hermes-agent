@@ -162,6 +162,43 @@ describe('double Escape draft discard', () => {
     }
   })
 
+  test('an EOL Ctrl+K between Esc presses disarms draft discard', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressArrow('up')
+      h.probe.keys.pressEscape()
+      h.probe.keys.pressKey('k', { ctrl: true })
+      h.probe.keys.pressEscape()
+      await h.probe.settle()
+
+      expect(h.store.state.composerDraft).toBe('onetwo')
+      expect(h.history.entries()).toEqual([])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('a kitty repeat Escape is ignored instead of becoming the second press', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('keep until a real second press')
+      h.probe.keys.pressEscape()
+      h.probe.renderer.stdin.emit('data', Buffer.from('\x1b[27;1:2u'))
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('keep until a real second press')
+
+      h.probe.keys.pressEscape()
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('')
+      expect(h.history.entries()).toEqual(['keep until a real second press'])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
   test('keeps empty-buffer double Escape opening the prompt-history viewer', async () => {
     const h = await mountComposer({ kitty: true })
     try {
