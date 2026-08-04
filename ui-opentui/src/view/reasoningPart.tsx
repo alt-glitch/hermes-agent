@@ -16,6 +16,7 @@
 import { createMemo, createSignal, Show } from 'solid-js'
 
 import { sectionMode } from '../logic/details.ts'
+import { reasoningSummary } from '../logic/reasoningTail.ts'
 import type { ThemeColors } from '../logic/theme.ts'
 import { useDisplay } from './display.tsx'
 import { Markdown } from './markdown.tsx'
@@ -36,15 +37,6 @@ const INDENT = 2
  */
 export function reasoningLabelStyle(color: ThemeColors): { fg: string; italic: boolean } {
   return { fg: color.muted, italic: true }
-}
-
-/** Split a leading `**Title**\n\n body` into {title, body} (opencode reasoningSummary). */
-function reasoningSummary(text: string): { title?: string; body: string } {
-  const s = (text ?? '').replace('[REDACTED]', '').trim()
-  const m = s.match(/^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)/)
-  const title = m?.[1]?.trim()
-  if (!m || !title) return { body: s }
-  return { title, body: s.slice(m[0].length).trimStart() }
 }
 
 export function ReasoningPart(props: { text: string; streaming?: boolean; section?: 'thinking' | 'subagents' }) {
@@ -68,6 +60,9 @@ export function ReasoningPart(props: { text: string; streaming?: boolean; sectio
       ) === 'expanded' ||
       display().reasoningFull)
   const toggle = () => anchor(() => setOverride(!expanded()))
+  // Tail-bounded (logic/reasoningTail.ts): the memo re-runs on every streamed
+  // delta, so the body handed to <Markdown> stays a bounded newest-tail window
+  // while the store keeps the full text.
   const summary = createMemo(() => reasoningSummary(props.text))
   const label = () => (props.streaming ? 'Thinking' : 'Thought')
 
