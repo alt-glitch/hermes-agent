@@ -105,6 +105,29 @@ def test_enqueue_front_preserves_leftover_steer_before_later_prompt():
     assert queued["transport"] == "ws-live"
 
 
+def test_enqueue_front_separate_envelope_keeps_submission_ids_isolated():
+    """The promoted turn must not settle the still-queued turn's client id."""
+
+    session = _session()
+    server._enqueue_prompt(
+        session,
+        "later image prompt",
+        "ws-later",
+        client_submission_ids=["later-send"],
+        image_paths=["/tmp/later.png"],
+    )
+    server._enqueue_prompt(
+        session,
+        "leftover steer",
+        "ws-live",
+        front=True,
+        client_submission_ids=["steer-send"],
+    )
+
+    assert session["queued_prompt"]["client_submission_ids"] == ["steer-send"]
+    assert session["queued_prompts"][0]["client_submission_ids"] == ["later-send"]
+
+
 def test_busy_retry_is_best_effort_and_can_queue_duplicate(monkeypatch):
     """A lost ACK is ambiguous: retrying may enqueue the body twice."""
 
@@ -372,6 +395,48 @@ def test_busy_prompt_rpc_reuses_the_admission_lock_without_deadlock(monkeypatch)
         assert session["_pending_steer_submission_ids"] == ["send-lock"]
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_busy_prompt_rpc_honors_explicit_queue_drain_override(monkeypatch):
+    """A client-drained queue item must never steer or interrupt a live turn."""
+
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    calls = {"steer": 0, "interrupt": 0}
+    session = _session(
+        agent=types.SimpleNamespace(
+            steer=lambda _text: calls.__setitem__("steer", calls["steer"] + 1)
+            or True,
+            interrupt=lambda: calls.__setitem__(
+                "interrupt", calls["interrupt"] + 1
+            ),
+        ),
+        running=True,
+    )
+    server._sessions["sid"] = session
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "r-queued",
+                "method": "prompt.submit",
+                "params": {
+                    "client_submission_id": "send-queued",
+                    "session_id": "sid",
+                    "text": "run after the current turn",
+                    "queued": True,
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["result"]["status"] == "queued"
+    assert calls == {"steer": 0, "interrupt": 0}
+    assert session["queued_prompt"] == {
+        "client_submission_ids": ["send-queued"],
+        "text": "run after the current turn",
+        "transport": None,
+    }
 
 
 def test_busy_steer_rejects_before_correlation_id_capacity(monkeypatch):

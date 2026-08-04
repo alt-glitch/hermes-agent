@@ -202,6 +202,7 @@ const PENDING_STEER_MAX_CHARS = 4 * 1024 * 1024
 
 interface PendingPrompt {
   readonly clientMessageId: string
+  readonly queued: boolean
   readonly retryDeadlineAt: number
   retryNoticeShown: boolean
   readonly submissionId: string
@@ -584,7 +585,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const isTurnBusy = () => store.state.info.running === true || store.isTurnInFlight()
       const configSync = createConfigSyncTracker()
       let drainQueuedIfIdle = () => {}
-      let sendPromptNow: (text: string, skillCommand?: string) => boolean = () => false
+      let sendPromptNow: (text: string, skillCommand?: string, queued?: boolean) => boolean = () => false
       let promoteHeldTransitionSubmissions = () => {}
       let promoteHeldAfterRecovery = false
       let pendingPrompt: PendingPrompt | undefined
@@ -1728,6 +1729,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           gateway
             .request('prompt.submit', {
               client_submission_id: current.submissionId,
+              queued: current.queued,
               session_id: current.sessionId,
               text: current.text
             })
@@ -1792,7 +1794,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
-      sendPromptNow = (text: string, skillCommand?: string): boolean => {
+      sendPromptNow = (text: string, skillCommand?: string, queued = false): boolean => {
         if (imageDetachInFlight.size > 0) {
           store.pushSystem('wait for the image removal before sending')
           return false
@@ -1827,6 +1829,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         const clientMessageId = skillCommand ? store.pushSkill(skillCommand, text) : store.pushUser(text)
         const current: PendingPrompt = {
           clientMessageId,
+          queued,
           retryDeadlineAt: Date.now() + PRE_ADMISSION_RETRY_WINDOW_MS,
           retryNoticeShown: false,
           submissionId: randomUUID(),
@@ -3001,7 +3004,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         // delivery. Because rows are still plain strings, one successful send
         // cannot prove that every sibling row is safe to auto-replay: the drain
         // gate stays explicit-only until this queue provenance epoch is empty.
-        const accepted = sendPromptNow(removed)
+        const accepted = sendPromptNow(removed, undefined, true)
         if (!accepted) enqueueClientPrompt(removed, true)
         else automaticQueueDrain.resetIfEmpty(store.queuedCount())
         return accepted

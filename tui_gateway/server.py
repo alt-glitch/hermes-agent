@@ -11948,6 +11948,10 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4004, "invalid client_submission_id")
     else:
         client_submission_ids = [client_submission_id]
+    # Desktop/OpenTUI queue drains mark their resubmission explicitly.  Keep
+    # this a strict JSON boolean: a string such as ``"false"`` must not
+    # silently acquire queue-only semantics.
+    queued_submission = params.get("queued") is True
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     if params.get("interrupted"):
         # Client-side barge-in (desktop VAD / typing over playback) — latch it
@@ -12016,6 +12020,7 @@ def _(rid, params: dict) -> dict:
                 t or session.get("transport"),
                 client_submission_ids,
                 history_lock_owned=True,
+                queued=queued_submission,
             )
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
