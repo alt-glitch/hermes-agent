@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import contextlib
 import contextvars
 import fnmatch
 import functools
@@ -2208,6 +2209,157 @@ _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
+
+# =========================================================================
+# Human-wait accounting (per session)
+# =========================================================================
+# Tracks the wall-clock time the agent spends verifiably blocked on a HUMAN
+# prompt (CLI approval prompt, gateway approval round-trip). The concurrent
+# tool batch deadline in agent/tool_executor.py excludes this time so a slow
+# human answer never times a batch out — but ONLY this time. Measuring human
+# waits at the source (rather than residency in the authorization gate, which
+# is arbitrary code) is what keeps a wedged pre_tool_call plugin or a dead
+# approval client from growing the exclusion 1:1 with wall clock and defeating
+# the deadline entirely (#79719).
+#
+# Keyed by session so one gateway session's pending approval cannot extend a
+# different session's batch deadline. State is process-global like the rest
+# of this module's approval state; entries are bounded by _HUMAN_WAIT_MAX_SESSIONS.
+
+
+class _HumanWaitState:
+    __slots__ = ("pending", "window_started", "completed_seconds")
+
+    def __init__(self) -> None:
+        self.pending = 0
+        self.window_started: float | None = None
+        self.completed_seconds = 0.0
+
+
+_human_wait_lock = threading.Lock()
+_human_wait_states: dict[str, _HumanWaitState] = {}
+_HUMAN_WAIT_MAX_SESSIONS = 256
+# Margin added on top of approvals.timeout when clamping a window's
+# contribution (read-side AND close-side) and when bounding the authorization
+# gate's serialization-lock acquire in agent/tool_executor.py. One constant so
+# the clamps can't drift apart.
+HUMAN_WAIT_MARGIN_S = 60.0
+
+
+def human_wait_ceiling() -> float:
+    """Max seconds a single window may contribute: approvals.timeout + margin.
+
+    Every legitimate human wait self-terminates at ``approvals.timeout`` (the
+    CLI prompt join and the gateway poll loop both enforce it), so a window
+    that overstays this ceiling is itself wedged and must not keep extending
+    a batch deadline. Also used by agent/tool_executor.py as the bound on the
+    authorization gate's serialization-lock acquire, so the two bounds cannot
+    drift. Never call while holding ``_human_wait_lock`` — it reads the
+    config cache.
+    """
+    return float(_get_approval_timeout()) + HUMAN_WAIT_MARGIN_S
+
+
+def _clamped_window_seconds(started: float, now: float, ceiling: float) -> float:
+    """Seconds an open window contributes: elapsed, floored at 0, capped.
+
+    Shared by the close-time accrual in :func:`human_wait_window` and the
+    open-window read in :func:`human_wait_seconds` so the two clamps stay
+    identical by construction.
+    """
+    return min(max(0.0, now - started), ceiling)
+
+
+def _human_wait_state(session_key: str) -> _HumanWaitState:
+    """Return (creating if needed) the wait state for *session_key*.
+
+    Caller must hold ``_human_wait_lock``. Evicts idle entries (no pending
+    waiter) insertion-order-first until the table is under the cap so an army
+    of short-lived session keys cannot grow it without bound. Entries with an
+    open window are never evicted (that would corrupt live accounting), so
+    the cap is best-effort under 256+ concurrently-pending sessions.
+    """
+    state = _human_wait_states.get(session_key)
+    if state is None:
+        if len(_human_wait_states) >= _HUMAN_WAIT_MAX_SESSIONS:
+            for key in list(_human_wait_states):
+                if len(_human_wait_states) < _HUMAN_WAIT_MAX_SESSIONS:
+                    break
+                if _human_wait_states[key].pending == 0:
+                    del _human_wait_states[key]
+        state = _HumanWaitState()
+        _human_wait_states[session_key] = state
+    return state
+
+
+@contextlib.contextmanager
+def human_wait_window(session_key: str | None = None):
+    """Mark the enclosed block as time spent blocked on a human prompt.
+
+    Wrap ONLY code that is genuinely parked waiting for a user's answer (the
+    CLI approval prompt, the gateway approval poll loop). The concurrent tool
+    batch deadline excludes this time; wrapping anything else re-creates the
+    #79719 hang where arbitrary wedged code pushes the deadline out forever.
+
+    Overlapping windows for the same session coalesce (pending counter), so
+    two serialized approval prompts don't double-count the same wall clock.
+    """
+    key = session_key if session_key is not None else get_current_session_key()
+    now = time.monotonic()
+    with _human_wait_lock:
+        state = _human_wait_state(key)
+        if state.pending == 0:
+            state.window_started = now
+        state.pending += 1
+    try:
+        yield
+    finally:
+        now = time.monotonic()
+        # Clamp the accrual too: a window that overstayed the ceiling was
+        # wedged — record at most the ceiling instead of retroactively
+        # injecting the whole overstay into the exclusion.
+        ceiling = human_wait_ceiling()
+        with _human_wait_lock:
+            state = _human_wait_states.get(key)
+            if state is not None:
+                state.pending -= 1
+                if state.pending == 0:
+                    if state.window_started is not None:
+                        state.completed_seconds += _clamped_window_seconds(
+                            state.window_started, now, ceiling
+                        )
+                    state.window_started = None
+
+
+def human_wait_seconds(session_key: str | None = None) -> float:
+    """Return total human-wait seconds recorded for the session.
+
+    Completed windows plus the currently open one (if any). Monotonically
+    non-decreasing for the life of the process — except when an idle session's
+    entry is evicted under cap pressure, which can only shrink a consumer's
+    baseline delta to zero (the safe direction: the deadline fires sooner).
+    Deadline consumers snapshot a baseline at batch start and use the delta.
+
+    Each window's contribution is clamped to :func:`human_wait_ceiling`:
+    every legitimate human wait self-terminates at ``approvals.timeout``
+    (both the CLI prompt join and the gateway poll loop enforce it), so a
+    window that overstays that bound is itself wedged and must not keep
+    extending a batch deadline (belt-and-braces for #79719).
+    """
+    key = session_key if session_key is not None else get_current_session_key()
+    now = time.monotonic()
+    # Resolve the clamp outside the lock: it reads the config cache, which
+    # must never nest under _human_wait_lock.
+    ceiling = human_wait_ceiling()
+    with _human_wait_lock:
+        state = _human_wait_states.get(key)
+        if state is None:
+            return 0.0
+        total = state.completed_seconds
+        if state.window_started is not None:
+            total += _clamped_window_seconds(state.window_started, now, ceiling)
+        return total
+
 # =========================================================================
 # Consecutive-denial circuit breaker for smart approvals
 # =========================================================================
@@ -2585,6 +2737,26 @@ def prompt_dangerous_approval(command: str, description: str,
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
 
+    # Everything below is a human prompt: either the registered CLI callback
+    # (prompt_toolkit panel, bounded by the approval deadline) or the input()
+    # fallback (bounded by thread.join(timeout_seconds)). Record it as
+    # human-wait time so the concurrent batch deadline excludes it (#79719).
+    with human_wait_window():
+        return _prompt_dangerous_approval_inner(
+            command,
+            description,
+            timeout_seconds,
+            allow_permanent,
+            approval_callback,
+            smart_denied=smart_denied,
+        )
+
+
+def _prompt_dangerous_approval_inner(command: str, description: str,
+                                     timeout_seconds: int,
+                                     allow_permanent: bool = True,
+                                     approval_callback=None,
+                                     *, smart_denied: bool = False) -> str:
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
@@ -3511,32 +3683,37 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _deadline = _now + max(timeout, 0)
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
-    while True:
-        # Respect interrupt signals (e.g. /stop, /new, or an inactivity
-        # timeout from the gateway) so a pending approval doesn't keep the
-        # session wedged on threading.Event.wait() until the 5-minute approval
-        # timeout. The wait runs on the agent's execution thread, which is the
-        # exact thread AIAgent.interrupt() flags — so is_interrupted() here
-        # sees the signal. Resolve as "deny" so the agent loop receives a
-        # normal denial and unwinds cleanly (#8697).
-        if is_interrupted():
-            logger.info(
-                "Approval wait interrupted by user signal — "
-                "returning deny for session %s",
-                session_key,
-            )
-            entry.result = "deny"
-            entry.event.set()
-            resolved = True
-            break
-        _remaining = _deadline - time.monotonic()
-        if _remaining <= 0:
-            break
-        if entry.event.wait(timeout=min(1.0, _remaining)):
-            resolved = True
-            break
-        if touch_activity_if_due is not None:
-            touch_activity_if_due(_activity_state, "waiting for user approval")
+    # The poll loop below is verifiably blocked on a human answer (the user
+    # tapping approve/deny on the gateway surface), bounded by the approval
+    # timeout. Record it as human-wait time so the concurrent batch deadline
+    # excludes it (#79719).
+    with human_wait_window(session_key):
+        while True:
+            # Respect interrupt signals (e.g. /stop, /new, or an inactivity
+            # timeout from the gateway) so a pending approval doesn't keep the
+            # session wedged on threading.Event.wait() until the 5-minute approval
+            # timeout. The wait runs on the agent's execution thread, which is the
+            # exact thread AIAgent.interrupt() flags — so is_interrupted() here
+            # sees the signal. Resolve as "deny" so the agent loop receives a
+            # normal denial and unwinds cleanly (#8697).
+            if is_interrupted():
+                logger.info(
+                    "Approval wait interrupted by user signal — "
+                    "returning deny for session %s",
+                    session_key,
+                )
+                entry.result = "deny"
+                entry.event.set()
+                resolved = True
+                break
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                break
+            if entry.event.wait(timeout=min(1.0, _remaining)):
+                resolved = True
+                break
+            if touch_activity_if_due is not None:
+                touch_activity_if_due(_activity_state, "waiting for user approval")
 
     _drop_entry()
 

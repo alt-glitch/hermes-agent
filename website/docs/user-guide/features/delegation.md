@@ -269,6 +269,24 @@ A delegation the stall monitor has flagged shows as
 children show their quiet time so you can tell "slow" from "stuck" at a
 glance.
 
+## Steering a Running Subagent
+
+Interrupting a child throws away its in-flight work; often you just want to redirect it. `steer_subagent(subagent_id, text)` in `tools/delegate_tool.py` is the redirection-side mirror of `interrupt_subagent()`: it queues text into a live child through the same mechanism as [`/steer`](/reference/slash-commands) — the text is appended to the child's last tool result at its next iteration boundary, the in-flight tool call is never cut, and the child sees it as an out-of-band user message. Programmatic hosts reach it through the session-scoped `subagent.steer` gateway RPC, which sits beside `subagent.interrupt`:
+
+```json
+{"method": "subagent.steer", "params": {"session_id": "owning-ui-session", "subagent_id": "sa-0-1a2b3c4d", "text": "focus on pricing instead"}}
+```
+
+Subagent ids come from `delegation.status` (or `list_active_subagents()`) — the same place `subagent.interrupt` gets them. The gateway accepts steering only from the exact live UI/gateway session that spawned the child. A missing, foreign, ambiguous, or stale/recycled session identity is rejected; knowing a global subagent id is not authority. Direct in-process callers retain the unscoped helper contract deliberately.
+
+**Queued is not delivered, but it is never synthetic success.** A `"queued"` response means the text was accepted before the child's completion boundary, not necessarily that the child has seen it. Acceptance and completion are synchronized: either the child can still consume the text, or its exact text is drained into the result as `pending_steer`. Calls after closure return `"rejected"`. If a child accepted the steer but had already produced its final answer, the completion entry the parent receives retains it as `missed_steer`, with a note appended to the summary:
+
+```
+[steer did not land — the subagent finished before it could be delivered: focus on pricing instead]
+```
+
+So the parent (or the operator driving it) can tell a steered child from one that finished on the old instructions, and re-issue the guidance as a follow-up instead of trusting that it landed.
+
 ## Live Transcripts
 
 Every `delegate_task` dispatch also creates one **append-only, human-readable log per task** so you (or the parent agent) can watch a subagent work in real time instead of waiting for the consolidated summary:

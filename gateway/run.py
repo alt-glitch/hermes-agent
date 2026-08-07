@@ -61,7 +61,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
-    compression_made_progress as _compression_made_progress,
+    compression_made_progress,
 )
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
@@ -139,20 +139,20 @@ def _hygiene_cooldown_for_failure(
 ) -> float:
     """Bump the hygiene failure streak and return the escalated cooldown.
 
-    The in-agent compressor escalates repeat summary timeouts 60 -> 300 -> 900s
-    (``ContextCompressor.record_timeout_failure``), but that ladder reads the
-    in-memory ``_consecutive_timeout_failures`` counter which
-    ``bind_session_state`` zeroes.  Session hygiene constructs a FRESH
-    ``AIAgent`` per run and re-binds state every time, so from the gateway the
-    streak is structurally always 0 and only the flat
-    ``hygiene_failure_cooldown_seconds`` could ever be recorded — a session
-    whose summary model always times out retried on that same fixed interval
-    forever (#79624).
+    This is a MULTIPLIER ladder (x1, x3, x9) over the operator's configured
+    ``hygiene_failure_cooldown_seconds``, clamped to
+    ``_HYGIENE_COOLDOWN_MAX_SECONDS``, so a tuned base is preserved as rung 1.
 
-    The streak lives on ``PersistentState`` instead, which outlives the per-run
-    agent, so consecutive failures climb the ladder.  Multiplies the configured
-    base so operators who tuned ``hygiene_failure_cooldown_seconds`` keep their
-    first rung, then clamps to ``_HYGIENE_COOLDOWN_MAX_SECONDS``.
+    It exists because the in-agent equivalent is unreachable from here:
+    ``ContextCompressor.record_timeout_failure`` escalates on an absolute
+    60 -> 300 -> 900s ladder driven by the in-memory
+    ``_consecutive_timeout_failures`` counter, which ``bind_session_state``
+    zeroes.  Session hygiene constructs a FRESH ``AIAgent`` per run and re-binds
+    state every time, so from the gateway that streak is structurally always 0
+    and only the flat ``hygiene_failure_cooldown_seconds`` could ever be
+    recorded — a session whose summary model always times out retried on that
+    same fixed interval forever (#79624).  Keeping the streak on
+    ``PersistentState`` outlives the per-run agent, so failures climb.
     """
     streak = 1
     try:
@@ -184,13 +184,68 @@ def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
         logger.debug("hygiene failure streak reset failed: %s", exc)
 
 
-def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) -> None:
+def hygiene_compaction_recovered(
+    *,
+    aborted: bool,
+    rotated: bool,
+    in_place: bool,
+    msg_count: int,
+    new_count: int,
+    approx_tokens: int,
+    new_tokens: int,
+) -> bool:
+    """True when a hygiene run actually recovered the session.
+
+    Extracted from ``_handle_message_with_agent`` so the decision is unit
+    testable: it previously lived inline in a ~2000-line async method, and the
+    only way to pin it was a source-reading test — which AGENTS.md bans
+    outright, naming this file.
+
+    "Recovered" requires all three:
+
+    * the compressor did not abort (no summary produced at all);
+    * the transcript was actually rewritten — either rotated into a new session
+      or compacted in place.  The degenerate "did not rotate or compact in
+      place" path (#21301) reuses the pre-compression counts, so relying on the
+      numbers alone would read a no-op as success;
+    * the request materially shrank, per the canonical
+      :func:`compression_made_progress` (#39548) — a row-count drop counts even
+      when the summary keeps the token estimate flat, and a sub-5% token wobble
+      does not count at all.
+
+    The token arguments are deliberately compared through that shared predicate
+    rather than with a bare ``<``: ``approx_tokens`` can be provider-reported
+    while ``new_tokens`` is always a rough estimate (documented to run 30-50%
+    high on code-heavy sessions), so a bare comparison both misses real wins and
+    counts noise as one.
+    """
+    if aborted:
+        return False
+    if not (rotated or in_place):
+        return False
+    return compression_made_progress(
+        msg_count, new_count, approx_tokens, new_tokens
+    )
+
+
+def _record_hygiene_cooldown(
+    gateway,
+    session_id: str,
+    cooldown_seconds: float,
+    error: Optional[str] = None,
+) -> None:
     """Persist a session-hygiene compression-failure cooldown to the state DB.
 
     Uses the same ``compression_failure_cooldown_until`` column and
     ``record_compression_failure_cooldown`` method that the in-conversation
     compression path (``agent/context_compressor.py``) already uses, so the
     cooldown survives gateway restarts (#74136).
+
+    ``error`` is forwarded because the recorder writes
+    ``compression_failure_error`` UNCONDITIONALLY — omitting it clobbers to NULL
+    any reason the in-conversation path recorded, and readers surface that
+    reason to the user (falling back to "unknown error"). That matters more now
+    that an escalated cooldown can last up to an hour.
     """
     import time as _time
     session_db = getattr(gateway, "_session_db", None)
@@ -201,7 +256,7 @@ def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) 
     if recorder is None:
         return
     try:
-        recorder(session_id, _time.time() + cooldown_seconds)
+        recorder(session_id, _time.time() + cooldown_seconds, error)
     except Exception as exc:
         logger.debug("session hygiene cooldown persist failed: %s", exc)
 
@@ -14089,6 +14144,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
                 "subgoal": self._handle_subgoal_command,
+                "heartbeat": self._handle_heartbeat_command,
                 "yolo": self._handle_yolo_command,
                 "verbose": self._handle_verbose_command,
                 "footer": self._handle_footer_command,
@@ -14257,11 +14313,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _goal_arg = (event.get_command_args() or "").strip().lower()
         _goal_verb = _goal_arg.split(None, 1)[0] if _goal_arg else ""
         # Exact-match control verbs (unchanged semantics), plus the
-        # wait/unwait barrier verbs which take a pid argument.
+        # wait/unwait barrier verbs which take a pid argument and the
+        # gate management verb (inspection/mutation of the gate list only —
+        # gates run at turn boundary, so editing them mid-run is safe).
         _is_control = (
             not _goal_arg
             or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
-            or _goal_verb == "wait"
+            or _goal_verb in {"wait", "gate"}
         )
         if _is_control:
             return await self._handle_goal_command(event)
@@ -15293,6 +15351,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
+
+        if canonical == "heartbeat":
+            return await self._handle_heartbeat_command(event)
+        if canonical == "refine":
+            return await self._handle_refine_command(event)
 
         if canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
@@ -16980,6 +17043,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                         self, session_key,
                                                         _hyg_failure_cooldown_seconds,
                                                     ),
+                                                    "session hygiene compression "
+                                                    "timed out with no output from "
+                                                    "the summary model",
                                                 )
                                             from agent.session_activity import (
                                                 ActivityProvenance,
@@ -17174,24 +17240,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _comp, "_last_compress_aborted", False
                                     )
                                     if not _hyg_aborted:
-                                        # Only a run that materially reduced the
-                                        # request counts as recovery.  The
+                                        # Recovery decision lives in the
+                                        # extracted, unit-tested predicate — the
                                         # degenerate "did not rotate or compact
-                                        # in place" branch above leaves both
-                                        # counts equal and is NOT aborted, so
-                                        # gating on "not aborted" alone would
-                                        # clear the streak on every wedged run
-                                        # and the cooldown could never escalate
-                                        # (#79624).  Reuse the canonical
-                                        # progress predicate rather than a
-                                        # hand-rolled token comparison: rows
-                                        # dropping is progress even when the
-                                        # summary keeps the token estimate flat,
-                                        # and a sub-5% token wobble is noise,
-                                        # not recovery (#39548).
-                                        if _compression_made_progress(
-                                            _msg_count, _new_count,
-                                            _approx_tokens, _new_tokens,
+                                        # in place" path (#21301) sets both flags
+                                        # False and reuses the pre-compression
+                                        # counts, so a numbers-only check would
+                                        # read a no-op as success and clear the
+                                        # streak on every wedged run (#79624).
+                                        if hygiene_compaction_recovered(
+                                            aborted=_hyg_aborted,
+                                            rotated=_hyg_rotated,
+                                            in_place=_hyg_in_place,
+                                            msg_count=_msg_count,
+                                            new_count=_new_count,
+                                            approx_tokens=_approx_tokens,
+                                            new_tokens=_new_tokens,
                                         ):
                                             _reset_hygiene_failure_streak(
                                                 self, session_key
@@ -17203,6 +17267,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _hygiene_cooldown_for_failure(
                                                     self, session_key,
                                                     _hyg_failure_cooldown_seconds,
+                                                ),
+                                                getattr(
+                                                    _comp, "_last_summary_error", None
                                                 ),
                                             )
                                         from agent.session_activity import (
@@ -18657,6 +18724,99 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None, None
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
+
+    async def _get_heartbeat_manager_for_event(self, event: "MessageEvent"):
+        """Return a HeartbeatManager bound to the session for this event.
+
+        Returns ``(manager, session_entry)`` or ``(None, None)``.
+        """
+        try:
+            from hermes_cli.heartbeat import HeartbeatManager
+        except Exception as exc:
+            logger.debug("heartbeat manager unavailable: %s", exc)
+            return None, None
+        try:
+            session_entry = await self.async_session_store.get_or_create_session(event.source)
+        except Exception as exc:
+            logger.debug("heartbeat manager: session lookup failed: %s", exc)
+            return None, None
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid:
+            return None, None
+        return HeartbeatManager(session_id=sid), session_entry
+
+    def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
+        """Track a session with an active heartbeat and start the poller.
+
+        The registry maps ``quick_key`` → ``(source, session_id)`` so the
+        poller can rebuild a MessageEvent and enqueue via the adapter FIFO.
+        In-memory by design: heartbeat STATE survives restarts in SessionDB,
+        but firing resumes when the user touches /heartbeat again in the new
+        gateway process (documented; durable schedules belong to cron).
+        """
+        watch = getattr(self, "_heartbeat_watch", None)
+        if watch is None:
+            watch = {}
+            self._heartbeat_watch = watch
+        watch[quick_key] = (source, session_id)
+        self._start_heartbeat_poller()
+
+    def _unregister_heartbeat_watch(self, quick_key: str) -> None:
+        watch = getattr(self, "_heartbeat_watch", None)
+        if watch:
+            watch.pop(quick_key, None)
+
+    def _start_heartbeat_poller(self) -> None:
+        """Start the single gateway-wide heartbeat poll task (idempotent)."""
+        existing = getattr(self, "_heartbeat_poll_task", None)
+        if existing is not None and not existing.done():
+            return
+
+        from hermes_cli.heartbeat import POLL_SECONDS
+
+        async def _poll_loop():
+            while True:
+                await asyncio.sleep(POLL_SECONDS)
+                watch = getattr(self, "_heartbeat_watch", None)
+                if not watch:
+                    continue
+                for quick_key, (source, session_id) in list(watch.items()):
+                    try:
+                        # Busy sessions coalesce their tick to the next idle poll.
+                        if quick_key in self._running_agents:
+                            continue
+                        from hermes_cli.heartbeat import HeartbeatManager
+
+                        mgr = HeartbeatManager(session_id=session_id)
+                        if not mgr.has_heartbeat():
+                            watch.pop(quick_key, None)
+                            continue
+                        prompt = mgr.due_prompt()
+                        if not prompt:
+                            continue
+                        adapter = self._adapter_for_source(source)
+                        if adapter is None:
+                            continue
+                        hb_event = MessageEvent(
+                            text=prompt,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            message_id=None,
+                            channel_prompt=None,
+                        )
+                        self._enqueue_fifo(quick_key, hb_event, adapter)
+                    except Exception as exc:
+                        logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
+
+        try:
+            task = asyncio.create_task(_poll_loop())
+            self._heartbeat_poll_task = task
+            _bg = getattr(self, "_background_tasks", None)
+            if _bg is not None:
+                _bg.add(task)
+                task.add_done_callback(_bg.discard)
+        except Exception:
+            logger.debug("Failed to start heartbeat poller", exc_info=True)
 
 
 

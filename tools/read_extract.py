@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import posixpath
+import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any, Optional
@@ -32,6 +35,10 @@ ANYDOC_EXTENSIONS = frozenset({
     ".rtf", ".epub", ".pdf",
 })
 MAX_XLSX_BYTES = 50 * 1024 * 1024
+# Refuse to convert huge documents. anydoc loads the whole file through its
+# Rust core with no streaming, and the read_file char budget only applies
+# after conversion, so an unbounded input can pin a tool turn and spike RAM.
+MAX_ANYDOC_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
 
@@ -56,12 +63,32 @@ def _extension(path: str) -> str:
 
 _ANYDOC_UNSET = object()
 _anydoc_module: Any = _ANYDOC_UNSET
+_anydoc_lock = threading.Lock()
+# After a failed first load, wait this long before trying again. The attempt
+# can shell out to pip, so retrying on every call would hammer the network
+# in environments where the install can never succeed.
+ANYDOC_RETRY_SECONDS = 300.0
+_anydoc_failed_at: Optional[float] = None
 
 
 def _anydoc() -> Optional[Any]:
-    """Lazily import the optional anydoc converter; None when unavailable."""
-    global _anydoc_module
-    if _anydoc_module is _ANYDOC_UNSET:
+    """Lazily import the optional anydoc converter; None when unavailable.
+
+    A failed load is retried after :data:`ANYDOC_RETRY_SECONDS` rather than
+    disabling extraction for the rest of the process, so one transient
+    failure (network blip, pip race) does not stick in long-lived workers.
+    """
+    global _anydoc_module, _anydoc_failed_at
+    if _anydoc_module is not _ANYDOC_UNSET:
+        return _anydoc_module
+    with _anydoc_lock:
+        if _anydoc_module is not _ANYDOC_UNSET:
+            return _anydoc_module
+        if (
+            _anydoc_failed_at is not None
+            and time.monotonic() - _anydoc_failed_at < ANYDOC_RETRY_SECONDS
+        ):
+            return None
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
 
@@ -72,7 +99,8 @@ def _anydoc() -> Optional[Any]:
         try:
             _anydoc_module = importlib.import_module("anydoc")
         except Exception:  # ImportError or a broken native binding
-            _anydoc_module = None
+            _anydoc_failed_at = time.monotonic()
+            return None
     return _anydoc_module  # type: ignore[return-value]
 
 
@@ -97,6 +125,14 @@ def _extract_anydoc(path: str) -> str:
     mod = _anydoc()
     if mod is None:
         raise ExtractionError(f"Unsupported document type: {path!r}")
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise ExtractionError(str(exc)) from exc
+    if size > MAX_ANYDOC_BYTES:
+        raise ExtractionError(
+            f"Document too large to convert ({size:,} bytes, limit is {MAX_ANYDOC_BYTES:,})"
+        )
     try:
         text = mod.to_markdown(path)
     except OSError as exc:
