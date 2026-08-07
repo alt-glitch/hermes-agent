@@ -4283,6 +4283,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return self._session_row_dict(row) if row else None
 
+    # Children that carry a ``parent_session_id`` but are NOT compression
+    # continuations: branches, delegate/subagent runs, and tool sessions.
+    # A marker only disqualifies a child when it points at the parent being
+    # queried — compression continuations inherit the rotated agent's
+    # ``model_config`` verbatim (``publish_compression_child`` callers pass
+    # ``agent._session_init_model_config``), so a delegate subagent's
+    # continuation carries ``_delegate_from=<the delegate's own parent>``.
+    # Matching markers by mere presence misclassified those real
+    # continuations as delegate children (fail-open for orphan reopen,
+    # fail-closed for adoption). Bind the parent id for both markers.
+    _NON_CONTINUATION_CHILD_FILTER_SQL = (
+        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
+        " '$._branched_from'), '') != ?\n"
+        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
+        " '$._delegate_from'), '') != ?\n"
+        "  AND COALESCE({alias}source, '') != 'tool'\n"
+    )
+
     def find_live_compression_child(
         self, parent_session_id: str
     ) -> Optional[Dict[str, Any]]:
@@ -4316,15 +4334,95 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.parent_session_id = ?
                   AND s.ended_at IS NULL
-                  AND json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(s.source, '') != 'tool'
+                """
+                + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="s.")
+                + """
                 ORDER BY s.started_at ASC
                 LIMIT 2
                 """,
-                (parent_session_id,),
+                (parent_session_id, parent_session_id, parent_session_id),
             ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
+
+    def reopen_orphaned_compression_session(self, session_id: str) -> bool:
+        """Reopen a compression parent only when no continuation was published.
+
+        Compression publication is atomic in current builds, but older builds
+        could leave a closed parent behind after an interrupted handoff.  This
+        recovery is deliberately conservative: an active compression lease or
+        any canonical child means the lineage is still owned by another path,
+        so the caller must fail closed instead of reopening the parent.
+        """
+        if not session_id:
+            return False
+
+        def _do(conn):
+            parent = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                parent is None
+                or parent["ended_at"] is None
+                or parent["end_reason"] != "compression"
+            ):
+                return False
+
+            # Treat any direct non-branch/non-delegate/non-tool child as a
+            # continuation, regardless of its current ended state. Reopening
+            # in that case could create a second live head for one lineage.
+            child = conn.execute(
+                """
+                SELECT 1
+                FROM sessions
+                WHERE parent_session_id = ?
+                """
+                + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="")
+                + """
+                LIMIT 1
+                """,
+                (session_id, session_id, session_id),
+            ).fetchone()
+            if child is not None:
+                return False
+
+            # refresh_compression_lock() deliberately lets an owner revive its
+            # own expired row. Reclaim that row inside this write transaction
+            # before reopening: refresh-first makes the lease active and aborts
+            # recovery; recovery-first deletes the holder identity so a later
+            # refresh cannot resurrect it.
+            now = time.time()
+            lock_row = conn.execute(
+                "SELECT holder, expires_at FROM compression_locks "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if lock_row is not None:
+                expires_at = lock_row["expires_at"]
+                if expires_at is None or float(expires_at) >= now:
+                    return False
+                deleted = conn.execute(
+                    "DELETE FROM compression_locks "
+                    "WHERE session_id = ? AND holder = ? AND expires_at = ?",
+                    (session_id, lock_row["holder"], expires_at),
+                )
+                if deleted.rowcount != 1:
+                    return False
+
+            updated = conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                "WHERE id = ? AND ended_at IS NOT NULL "
+                "AND end_reason = 'compression'",
+                (session_id,),
+            )
+            # rowcount==1 is guaranteed by the parent SELECT at the top of
+            # this same BEGIN IMMEDIATE transaction. If this is ever edited
+            # to return False past this point, note that the lease DELETE
+            # above will still COMMIT (_execute_write commits unless _do
+            # raises) — raise instead of returning False to roll back.
+            return updated.rowcount == 1
+
+        return bool(self._execute_write(_do))
 
     def publish_compression_child(
         self,
@@ -7902,9 +8000,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
 
-        Used by callers (e.g. the ACP adapter's ``_persist``) that must decide
-        whether a full-history :meth:`replace_messages` would destroy durable
-        compaction-archived turns. Cheap existence probe — does not load rows.
+        Cheap existence probe — does not load rows. NOTE: production rewrite
+        paths no longer branch on this (they pass ``active_only=True``
+        unconditionally — a probe can fail open or race a concurrent
+        ``archive_and_compact``, #80216); kept for tests and diagnostics.
         """
         with self._lock:
             cursor = self._conn.execute(

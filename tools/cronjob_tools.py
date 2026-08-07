@@ -40,7 +40,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from cron.jobs import (
     AmbiguousJobReference,
     claim_job_for_fire,
-    create_job,
     get_job,
     list_jobs,
     mark_job_run,
@@ -591,7 +590,9 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
+def _execute_job_now(
+    job: Dict[str, Any], extra_prompt: Optional[str] = None
+) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
     Persists an execution attempt before atomically claiming the job via
@@ -611,7 +612,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     execution_id = None
     try:
         from cron.executions import create_execution
-        from cron.scheduler import _finish_execution_best_effort, run_one_job
+        from cron.scheduler import _finish_execution_best_effort
 
         # Persist the attempt before the CAS can claim or advance the schedule.
         execution_id = create_execution(job_id, source="manual")["id"]
@@ -634,6 +635,86 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
+    except Exception as e:
+        logger.error("Failed to claim cron job %s for immediate run: %s", job_id, e)
+        if execution_id is not None:
+            try:
+                from cron.scheduler import _finish_execution_best_effort
+
+                _finish_execution_best_effort(
+                    execution_id, success=False, error=str(e)
+                )
+            except Exception:
+                pass
+        try:
+            mark_job_run(job_id, False, str(e))
+        except Exception:
+            pass
+        return {"claimed": True, "success": False, "error": str(e)}
+
+    return _run_claimed_job(
+        job, extra_prompt=extra_prompt, execution_id=execution_id
+    )
+
+
+def _run_claimed_job(
+    job: Dict[str, Any], extra_prompt: Optional[str] = None,
+    execution_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fire an already-claimed job through the shared ``run_one_job`` body.
+
+    Split out of ``_execute_job_now`` so the background dispatch path
+    (``_try_dispatch_background_run``) can take the claim synchronously — so
+    the tool response can report "paused"/"already firing" immediately — and
+    hand the actual run to a daemon worker.
+
+    Returns {"claimed": True, "success": bool, "error": str|None}.
+    """
+    job_id = job["id"]
+    _registered = False
+    try:
+        from cron.scheduler import (
+            release_running_job,
+            run_one_job,
+            try_register_running_job,
+        )
+
+        # In-flight dedupe (idea from #53395 by @izumi0uu): the fire claim's
+        # TTL (300s) is routinely outlived by real jobs, so it alone cannot
+        # stop a manual run from double-firing a job the ticker (or another
+        # manual run) is still executing. Register in the scheduler's shared
+        # running set — the same guard _submit_with_guard uses — which also
+        # makes this run visible to the gateway shutdown drain
+        # (get_running_job_ids, #60432) and mark_running_jobs_interrupted.
+        run_claim = job.get("run_claim")
+        if not isinstance(run_claim, dict) or not run_claim.get("token"):
+            refreshed_claim = get_job(job_id) or {}
+            run_claim = refreshed_claim.get("run_claim")
+        run_claim_token = (
+            str(run_claim["token"])
+            if isinstance(run_claim, dict) and run_claim.get("token")
+            else None
+        )
+        if not try_register_running_job(
+            job_id, run_claim_token=run_claim_token
+        ):
+            if execution_id is not None:
+                from cron.scheduler import _finish_execution_best_effort
+
+                _finish_execution_best_effort(
+                    execution_id,
+                    success=False,
+                    error="In-flight registration rejected; execution was not started.",
+                )
+            return {
+                "claimed": True,
+                "success": False,
+                "error": (
+                    "Job is already running (a scheduler tick or another "
+                    "manual run is executing it); not started again."
+                ),
+            }
+        _registered = True
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -695,12 +776,38 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             )
             _heartbeat_thread.start()
 
+        # Manual runs invoked from a gateway agent execute outside the scheduler
+        # ticker, but they still share the process with the live platform
+        # adapters. Pass the gateway-owned adapter map and event loop through
+        # to run_one_job so delivery is scheduled on the loop that owns clients
+        # such as Matrix/aiohttp. Calling those clients from run_one_job's
+        # standalone asyncio.run() loop raises errors like "Timeout context
+        # manager should be used inside a task" and can break encrypted Matrix
+        # delivery (#61495 — salvaged from #63586 by @Fly-onlyone).
+        gateway_module = sys.modules.get("gateway.run")
+        runner_ref = getattr(gateway_module, "_gateway_runner_ref", None)
+        runner = runner_ref() if callable(runner_ref) else None
+        adapters = getattr(runner, "adapters", None) if runner is not None else None
+        gateway_loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
+
         try:
-            processed = run_one_job(dict(job, execution_id=execution_id))
+            try:
+                dispatched_job = (
+                    dict(job, execution_id=execution_id)
+                    if execution_id is not None
+                    else job
+                )
+                processed = run_one_job(
+                    dispatched_job, adapters=adapters, loop=gateway_loop,
+                    extra_prompt=extra_prompt,
+                )
+            finally:
+                _heartbeat_stop.set()
+                if _heartbeat_thread is not None:
+                    _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)
         finally:
-            _heartbeat_stop.set()
-            if _heartbeat_thread is not None:
-                _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)
+            _registered = False
+            release_running_job(job_id)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -719,11 +826,281 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 )
             except Exception:
                 pass
+        if _registered:
+            # Registration succeeded but we raised before the run's own
+            # release ran (e.g. heartbeat setup) — don't leave the job
+            # permanently marked in-flight. Only release registrations WE
+            # took: a bare discard here could erase a ticker-owned entry.
+            try:
+                from cron.scheduler import release_running_job as _release
+
+                _release(job_id)
+            except Exception:
+                pass
         try:
             mark_job_run(job_id, False, str(e))
         except Exception:
             pass
         return {"claimed": True, "success": False, "error": str(e)}
+
+
+def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[str]:
+    """Best-effort excerpt of the job's most recent saved output file.
+
+    Included in the background-run completion block so the parent agent sees
+    what the job actually produced without having to dig through
+    ``~/.hermes/cron/output/``. Never raises.
+    """
+    try:
+        from cron.jobs import get_cron_output_dir
+
+        out_dir = get_cron_output_dir() / job_id
+        files = sorted(out_dir.glob("*.md"))
+        if not files:
+            return None
+        text = files[-1].read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            return None
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n… (truncated; full output: {files[-1]})"
+        return text
+    except Exception:
+        return None
+
+
+def _try_dispatch_background_run(
+    job: Dict[str, Any], session_id: Optional[str] = None,
+    extra_prompt: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Claim ``job`` now, then fire it on the async-delegation daemon executor.
+
+    A manual ``cronjob(action='run')`` used to execute the job synchronously
+    on the calling agent's tool thread. A cron job is a full agent run that
+    routinely takes minutes-to-hours, so the parent turn sat inside ONE tool
+    call the whole time: uninterruptible (the interrupt flag is only checked
+    between loop iterations) and serial (a batch of runs executed one by one).
+
+    This dispatches the run like ``delegate_task``'s background mode: the tool
+    returns immediately with a handle, the run executes on the shared async
+    daemon executor, and a ``type="async_delegation"`` completion event
+    re-enters the conversation as a fresh turn when the job finishes — riding
+    the existing completion-queue rail (CLI drain + gateway watcher), which
+    keeps message-role alternation legal and the prompt cache intact.
+
+    The at-most-once claim is taken SYNCHRONOUSLY before dispatch so
+    unrunnable jobs (paused / missing / already firing) report in the tool
+    response immediately instead of as a delayed completion event.
+
+    Returns
+    -------
+    None
+        Background delivery unavailable on this session runtime (one-shot
+        ``hermes -z``, stateless HTTP, Kanban worker, nested cron run).
+        Caller falls back to the synchronous path unchanged.
+    dict
+        ``{"claimed": False, "success": False, "error": ...}`` — claim lost;
+        same shape as ``_execute_job_now`` so the caller's existing response
+        formatting applies.
+        ``{"claimed": True, "dispatched": True, "delegation_id": ...}`` —
+        run is executing in the background.
+        ``{"claimed": True, "dispatched": False, "success": ..., "error": ...}``
+        — dispatch pool was at capacity; the run executed inline (the claim
+        was already taken and must not be stranded).
+    """
+    # Finite sessions cannot route a detached result back after the turn
+    # ends — mirror delegate_task's gate and fall back to sync execution.
+    try:
+        from gateway.session_context import async_delivery_supported
+
+        if not async_delivery_supported():
+            return None
+    except Exception:
+        pass
+
+    job_id = job["id"]
+    job_name = str(job.get("name") or job_id)
+
+    # ---- routing capture (on THIS thread; contextvars don't cross the pool) ----
+    # Resolved BEFORE the claim: with no routable session there is no durable
+    # consumer for a detached completion, so we must not claim-and-dispatch.
+    try:
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="")
+    except Exception:
+        session_key = ""
+    if not session_key and session_id:
+        # CLI path: the approval contextvar is only bound during gateway/TUI
+        # turns. The CLI drain filters completions by the durable agent
+        # session id (#64240), so stamp it as the key — an empty key would
+        # fail closed and the completion could never be claimed.
+        session_key = str(session_id)
+    if not session_key:
+        # Direct Python callers (`hermes cron run`, tests) have no agent
+        # session to deliver a completion to — the process exits right after
+        # the tool returns. Run synchronously.
+        return None
+
+    # ---- synchronous claim (same semantics as _execute_job_now) ----
+    execution_id = None
+    try:
+        # Best-effort early dedupe so a mid-run job reports in THIS tool
+        # response instead of as a delayed error completion event. The
+        # authoritative (atomic) check is try_register_running_job inside
+        # _run_claimed_job on the worker.
+        try:
+            from cron.scheduler import get_running_job_ids
+
+            if job_id in get_running_job_ids():
+                return {
+                    "claimed": False,
+                    "success": False,
+                    "error": (
+                        "Job is already running (a scheduler tick or another "
+                        "manual run is executing it); not started again."
+                    ),
+                }
+        except Exception:
+            pass
+
+        from cron.executions import create_execution
+        from cron.scheduler import _finish_execution_best_effort
+
+        # Persist the attempt before the CAS can advance a recurring schedule.
+        execution_id = create_execution(job_id, source="manual")["id"]
+        if not claim_job_for_fire(job_id):
+            _finish_execution_best_effort(
+                execution_id,
+                success=False,
+                error="Dispatch claim rejected; execution was not started.",
+            )
+            refreshed = get_job(job_id)
+            if refreshed is None:
+                reason = "Job no longer exists; nothing to run."
+            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
+                reason = "Job is paused/disabled; resume it before running."
+            else:
+                reason = "Job is already being fired by the scheduler; not run again."
+            return {"claimed": False, "success": False, "error": reason}
+    except Exception as e:
+        logger.error("Failed to claim cron job %s for background run: %s", job_id, e)
+        if execution_id is not None:
+            try:
+                from cron.scheduler import _finish_execution_best_effort
+
+                _finish_execution_best_effort(
+                    execution_id, success=False, error=str(e)
+                )
+            except Exception:
+                pass
+        try:
+            mark_job_run(job_id, False, str(e))
+        except Exception:
+            pass
+        return {"claimed": True, "dispatched": False, "success": False, "error": str(e)}
+
+    origin_ui_session_id = ""
+    try:
+        from gateway.session_context import get_session_env
+
+        origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or ""
+    except Exception:
+        pass
+
+    try:
+        from tools.async_delegation import (
+            _current_origin_session_id,
+            dispatch_async_delegation,
+        )
+
+        origin_session_id = _current_origin_session_id()
+    except Exception as e:
+        logger.warning(
+            "cronjob run: async delegation registry unavailable (%s); "
+            "running job '%s' inline.", e, job_name,
+        )
+        result = _run_claimed_job(
+            job, extra_prompt=extra_prompt, execution_id=execution_id
+        )
+        result["dispatched"] = False
+        return result
+
+    try:
+        from tools.delegate_tool import _get_max_async_children
+
+        max_async = _get_max_async_children()
+    except Exception:
+        max_async = 3
+
+    started_at = time.time()
+    deliver = job.get("deliver", "local")
+
+    def _runner() -> Dict[str, Any]:
+        res = _run_claimed_job(
+            job, extra_prompt=extra_prompt, execution_id=execution_id
+        )
+        duration = round(time.time() - started_at, 2)
+        refreshed = get_job(job_id) or {}
+        lines = [
+            f"Cron job '{job_name}' ({job_id}) finished its manual run.",
+            f"Result: {'ok' if res.get('success') else 'FAILED'}"
+            + (f" — {res.get('error')}" if res.get("error") else ""),
+            f"Delivery target: {deliver}"
+            + (
+                " (output was delivered there by the job itself)"
+                if deliver != "local"
+                else " (output saved locally only)"
+            ),
+        ]
+        if refreshed.get("next_run_at"):
+            lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
+        excerpt = _latest_job_output_excerpt(job_id)
+        if excerpt:
+            lines.append("--- JOB OUTPUT ---")
+            lines.append(excerpt)
+        return {
+            "status": "completed" if res.get("success") else "error",
+            "summary": "\n".join(lines),
+            "error": res.get("error"),
+            "api_calls": 0,
+            "duration_seconds": duration,
+        }
+
+    dispatch = dispatch_async_delegation(
+        goal=f"Manual run of cron job '{job_name}' ({job_id})",
+        context=(
+            "Triggered via cronjob(action='run'). The job executed in its own "
+            "fresh cron session; this block reports its outcome."
+        ),
+        toolsets=None,
+        role="cron_run",
+        model=job.get("model"),
+        session_key=session_key,
+        parent_session_id=str(session_id) if session_id else None,
+        runner=_runner,
+        origin_ui_session_id=origin_ui_session_id,
+        origin_session_id=origin_session_id,
+        max_async_children=max_async,
+    )
+
+    if dispatch.get("status") == "dispatched":
+        return {
+            "claimed": True,
+            "dispatched": True,
+            "delegation_id": dispatch.get("delegation_id"),
+        }
+
+    # Pool at capacity (or submit failure): the claim is already taken and
+    # must not be stranded — run inline exactly as the legacy path did.
+    logger.info(
+        "cronjob run: background pool unavailable (%s); running job '%s' inline.",
+        dispatch.get("error", "rejected"), job_name,
+    )
+    result = _run_claimed_job(
+        job, extra_prompt=extra_prompt, execution_id=execution_id
+    )
+    result["dispatched"] = False
+    return result
 
 
 def cronjob(
@@ -749,6 +1126,7 @@ def cronjob(
     attach_to_session: Optional[bool] = None,
     inactivity_timeout_seconds: Optional[Union[int, str]] = None,
     task_id: str = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -804,26 +1182,34 @@ def cronjob(
                             success=False,
                         )
 
-            job = create_job(
-                prompt=prompt or "",
-                schedule=schedule,
-                name=name,
-                repeat=repeat,
-                deliver=_normalize_deliver_param(deliver),
-                origin=_origin_from_env(),
-                skills=canonical_skills,
-                model=_normalize_optional_job_value(model),
-                provider=_normalize_optional_job_value(provider),
-                base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
-                script=_normalize_optional_job_value(script),
-                context_from=context_from,
-                enabled_toolsets=enabled_toolsets or None,
-                workdir=_normalize_optional_job_value(workdir),
-                no_agent=_no_agent,
-                attach_to_session=attach_to_session,
-                inactivity_timeout_seconds=inactivity_timeout_seconds,
+            from cron.scheduler import (
+                CronSchedulerRegistrationError,
+                create_job_with_scheduler_registration,
             )
-            _notify_provider_jobs_changed_safe()
+
+            try:
+                job = create_job_with_scheduler_registration(
+                    prompt=prompt or "",
+                    schedule=schedule,
+                    name=name,
+                    repeat=repeat,
+                    deliver=_normalize_deliver_param(deliver),
+                    origin=_origin_from_env(),
+                    skills=canonical_skills,
+                    model=_normalize_optional_job_value(model),
+                    provider=_normalize_optional_job_value(provider),
+                    base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
+                    script=_normalize_optional_job_value(script),
+                    context_from=context_from,
+                    enabled_toolsets=enabled_toolsets or None,
+                    workdir=_normalize_optional_job_value(workdir),
+                    no_agent=_no_agent,
+                    attach_to_session=attach_to_session,
+                    inactivity_timeout_seconds=inactivity_timeout_seconds,
+                )
+            except CronSchedulerRegistrationError as exc:
+                _partial = exc.to_dict()
+                return tool_error(_partial.pop("error"), success=False, **_partial)
             _create_message = f"Cron job '{job['name']}' created."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
@@ -908,12 +1294,59 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
+            # Per-run context (#57331, salvaged from #57342/@liuhao1024 and
+            # #57360/@ghedeselmabot): `prompt` on the run action is transient
+            # context appended to the stored prompt for THIS fire only, never
+            # persisted. It goes through the same strict injection scan as
+            # stored prompts before firing.
+            extra_prompt = prompt or None
+            if extra_prompt:
+                scan_error = _scan_cron_prompt(extra_prompt)
+                if scan_error:
+                    return tool_error(scan_error, success=False)
             # Execute the job immediately rather than only scheduling it for the
             # next scheduler tick — a manual `run` should actually run, even when
-            # no gateway/ticker is active (the #41037 case). The claim inside
-            # _execute_job_now advances next_run_at and blocks a concurrent tick
-            # from double-firing.
-            exec_result = _execute_job_now(job)
+            # no gateway/ticker is active (the #41037 case). The claim (taken
+            # inside both paths below) advances next_run_at and blocks a
+            # concurrent tick from double-firing.
+            #
+            # Preferred path: dispatch the run to the background like
+            # delegate_task — the tool returns a handle immediately and the
+            # job's outcome re-enters the conversation as a completion event.
+            # A cron job is a full agent run (minutes to hours); executing it
+            # inline made the parent turn uninterruptible and serialized
+            # batches of manual runs (#80xxx — the "stuck Telegram session"
+            # incident). Falls back to inline execution when the session
+            # runtime can't receive detached completions.
+            bg = _try_dispatch_background_run(
+                job, session_id=session_id, extra_prompt=extra_prompt
+            )
+            if bg is not None and bg.get("dispatched"):
+                _notify_provider_jobs_changed_safe()
+                result = _format_job(get_job(job_id) or {"id": job_id})
+                result["executed"] = True
+                result["execution_mode"] = "background"
+                result["delegation_id"] = bg.get("delegation_id")
+                return json.dumps(
+                    {
+                        "success": True,
+                        "job": result,
+                        "note": (
+                            "The job is running in the background. You and the "
+                            "user can keep working; its outcome re-enters the "
+                            "conversation as a new message when it finishes. "
+                            "Do not wait or poll — just continue."
+                        ),
+                    },
+                    indent=2,
+                )
+            # bg carries a terminal result (claim lost, or inline fallback
+            # after pool rejection); None means background delivery is
+            # unsupported here — run synchronously as before.
+            exec_result = (
+                bg if bg is not None
+                else _execute_job_now(job, extra_prompt=extra_prompt)
+            )
             # A claimed direct run advances next_run_at and may race the
             # external one-shot for the same occurrence. If Chronos loses that
             # claim, its consumed fire cannot re-arm itself; reconcile from the
@@ -1055,6 +1488,8 @@ Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
 
+action='run' fires the job immediately in the BACKGROUND (like delegate_task): the call returns at once with a handle and the job's outcome re-enters the conversation as a new message when it finishes. Do not wait or poll after triggering a run — just continue. Optionally pass 'prompt' with action='run' to inject transient per-run context (appended to the job's stored prompt for that single fire only, never persisted).
+
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
@@ -1079,7 +1514,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "prompt": {
                 "type": "string",
-                "description": "For create: the full self-contained prompt. If skills are also provided, this becomes the task instruction paired with those skills."
+                "description": "For create: the full self-contained prompt. If skills are also provided, this becomes the task instruction paired with those skills. For run: optional transient context appended to the stored prompt for that single fire only (never persisted)."
             },
             "schedule": {
                 "type": "string",
@@ -1223,6 +1658,7 @@ registry.register(
         no_agent=args.get("no_agent"),
         inactivity_timeout_seconds=args.get("inactivity_timeout_seconds"),
         task_id=kw.get("task_id"),
+        session_id=kw.get("session_id"),
     ),
     check_fn=check_cronjob_requirements,
     emoji="⏰",

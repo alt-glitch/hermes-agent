@@ -1494,6 +1494,34 @@ def _db_for_profile(profile: str | None = None):
         return None, False
 
 
+def _transfer_db_to_agent(agent, db) -> bool:
+    """Hand a DEDICATED profile handle to *agent*, which closes it on teardown.
+
+    The build sites open a per-profile ``state.db`` handle, pass it to
+    ``_make_agent``, and own it until the built agent is the one that will be
+    torn down. This marks that transfer: from here ``AIAgent.close()`` (reached
+    via :func:`_teardown_session`) releases the handle, so the caller must stop
+    closing it.
+
+    Returns True only when the transfer actually happened. It is refused when
+    *agent* is not holding *this* handle — the build failed before
+    ``_make_agent``, or the agent was given a different db — because a False
+    return is what tells the caller the handle is still its own to close.
+    Never called for the shared launch handle: that one is opened by
+    ``_get_db()``, outlives every agent, and stays at ``_owns_session_db``
+    False.
+    """
+    if agent is None or db is None:
+        return False
+    try:
+        if getattr(agent, "_session_db", None) is not db:
+            return False
+        agent._owns_session_db = True
+        return True
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def _profile_db(params: dict | None = None):
     """Yield the SessionDB for ``params['profile']`` (app-global remote mode).
@@ -2390,6 +2418,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         secret_token = None
+        session_db = None
+        owns_db = False
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -2408,7 +2438,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 try:
                     from hermes_state import SessionDB
 
+                    # DEDICATED handle — ours until _transfer_db_to_agent hands
+                    # it to the built agent in the finally below. Every path
+                    # that leaves this build without that transfer (the except
+                    # below, and a session reaped mid-build) must close it.
                     session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                    owns_db = True
                 except Exception:
                     session_db = None
 
@@ -2545,6 +2580,18 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
+            # Dedicated profile handle: hand it to the agent that will actually
+            # be torn down, or close it here when no such agent exists. Both
+            # non-transfer cases are real: the except above (build raised, so
+            # nothing holds the handle) and `replaced` (the session was reaped
+            # mid-build, so this agent is discarded and _teardown_session will
+            # never reach it). Transferring to a discarded agent would leak the
+            # handle exactly as before.
+            if owns_db and session_db is not None:
+                built = None if replaced else current.get("agent")
+                if not _transfer_db_to_agent(built, session_db):
+                    with contextlib.suppress(Exception):
+                        session_db.close()
             ready.set()
 
     build_thread = threading.Thread(target=_build, daemon=True)
@@ -8570,6 +8617,22 @@ def _emit_terminal_turn_error(
     _emit("message.complete", sid, payload)
 
 
+def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
+    """Keep a failed turn's working transcript in the gateway session.
+
+    ``AIAgent`` persists its working messages independently of the gateway's
+    history snapshot. If the turn raises after that persistence, the next
+    prompt must see the working transcript instead of the pre-turn snapshot.
+    """
+    agent_messages = getattr(agent, "_session_messages", None)
+    if not isinstance(agent_messages, list):
+        return False
+    with session["history_lock"]:
+        session["history"] = list(agent_messages)
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+    return True
+
+
 def _queued_prompt_snapshot(session: dict) -> dict | None:
     """Return the accepted next-turn prompt without its transport handle.
 
@@ -12088,6 +12151,26 @@ def _(rid, params: dict) -> dict:
             except (TypeError, ValueError):
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
+            # An ordinal alone is not consent. A stale client field on an
+            # ordinary submit is otherwise indistinguishable from a real
+            # rewind and can durably delete a non-empty history tail.
+            if not is_truthy_value(params.get("confirm_truncate")):
+                logger.warning(
+                    "prompt.submit: REFUSED unconfirmed truncation of session %s "
+                    "(%d messages held; ordinal=%d). The client attached "
+                    "truncate_before_user_ordinal without confirm_truncate — "
+                    "likely a stale ordinal on an ordinary submit.",
+                    sid,
+                    len(history),
+                    ordinal,
+                )
+                return _err(
+                    rid,
+                    4029,
+                    "truncate_before_user_ordinal requires confirm_truncate=true; "
+                    "an ordinary prompt.submit must not drop session history "
+                    "(update your Hermes client if a rewind was intended)",
+                )
             user_indices = [
                 i
                 for i, m in enumerate(history)
@@ -14045,6 +14128,22 @@ def _run_prompt_submit(
                             "the next-turn queue is at its 4 MiB safety limit"
                         )
                     },
+                )
+
+            # The agent persists its working transcript on normal finalization,
+            # but an exception in that finalizer can otherwise leave the
+            # gateway's separate in-memory history at the turn-start snapshot.
+            # Keep the partial turn available to the next prompt; the durable
+            # inflight record still carries the recoverable error state.
+            # Run this only after steer recovery releases history_lock: the
+            # helper takes that lock itself, and accepted steer admission must
+            # be sealed before doing any additional crash cleanup.
+            try:
+                _restore_agent_history_after_turn_error(session, agent)
+            except Exception:
+                logger.debug(
+                    "failed to restore agent history after turn error",
+                    exc_info=True,
                 )
             try:
                 # Close the turn with the same terminal error frame shape as

@@ -1693,7 +1693,9 @@ class TestOneShotDispatchFencing:
 
         replacement = {}
 
-        def _run_then_resume(job, *, defer_agent_teardown=None):
+        def _run_then_resume(
+            job, *, defer_agent_teardown=None, extra_prompt=None
+        ):
             current_time[0] = t0 + timedelta(
                 seconds=jobs._oneshot_run_claim_ttl_seconds() + 1
             )
@@ -2051,7 +2053,7 @@ class TestParallelTick:
         barrier = threading.Barrier(2, timeout=5)
         call_order = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_job(job, *, defer_agent_teardown=None, **kw):
             """Each job hits a barrier — both must be active simultaneously."""
             call_order.append(("start", job["id"]))
             barrier.wait()  # blocks until both threads reach here
@@ -2085,7 +2087,7 @@ class TestParallelTick:
         from gateway.session_context import get_session_env
         seen = {}
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_job(job, *, defer_agent_teardown=None, **kw):
             origin = job.get("origin", {})
             # run_job sets ContextVars — verify each job sees its own
             from gateway.session_context import set_session_vars, clear_session_vars
@@ -2718,6 +2720,30 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         assert "a@example.com" in result
         assert "b@example.com" in result
         assert mock_pool.submit.call_count == 2
+
+class TestBuildJobPromptExtraPrompt:
+    """Regression: _build_job_prompt merges extra_prompt into the assembled prompt."""
+
+    def test_extra_prompt_appended_with_header(self):
+        """extra_prompt appears under a '## Run Context' header."""
+        job = {"prompt": "stored prompt"}
+        result = _build_job_prompt(job, extra_prompt="CONTEXT: client=Foo")
+        assert "stored prompt" in result
+        assert "## Run Context" in result
+        assert "CONTEXT: client=Foo" in result
+
+    def test_extra_prompt_does_not_mutate_job(self):
+        """The job dict's 'prompt' field must remain unchanged."""
+        job = {"prompt": "original"}
+        _build_job_prompt(job, extra_prompt="transient context")
+        assert job["prompt"] == "original"
+
+    def test_no_extra_prompt_omits_header(self):
+        """Without extra_prompt, no '## Run Context' header is injected."""
+        job = {"prompt": "just the stored prompt"}
+        result = _build_job_prompt(job)
+        assert "## Run Context" not in result
+        assert "just the stored prompt" in result
 
 
 class TestSetCronSessionTitle:

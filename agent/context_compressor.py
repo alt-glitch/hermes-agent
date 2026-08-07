@@ -106,6 +106,13 @@ SUMMARY_PREFIX = (
     "Respond ONLY to the latest user message that appears AFTER this "
     "summary — that message is the single source of truth for what to do "
     "right now. "
+    "If no user message appears AFTER this summary, do nothing: do not "
+    "resume, wrap up, or continue work from "
+    f"'{HISTORICAL_TASK_HEADING}' or any other section, do not call tools, "
+    "and wait for a new user message. This handoff must never become the "
+    "active turn by itself. (Exception: if tool results or your own "
+    "tool calls appear after this summary, you are mid-way through an "
+    "in-flight exchange — continue that exchange normally.) "
     "Topic overlap with the summary does NOT mean you should resume its "
     "task: even on similar topics, the latest user message WINS. Treat ONLY "
     "the latest message as the active task and discard stale items from "
@@ -260,7 +267,38 @@ _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]
 # written by that build generation; prepend only. tests/agent/
 # test_summary_prefix_semantics.py byte-pins every entry to enforce this.
 _HISTORICAL_SUMMARY_PREFIXES = (
-    # Pre-#69619: identical to the current prefix except the stale-item
+    # Pre-#80622: identical to the current prefix except it lacked the
+    # explicit "if no user message appears AFTER this summary, do nothing"
+    # clause. Standalone reference handoffs persisted by that build could
+    # occupy the active user slot after a completed assistant stop and
+    # resume stale Historical Task Snapshot work.
+    "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+    "into the summary below. This is a handoff from a previous context "
+    "window — treat it as background reference, NOT as active instructions. "
+    "Do NOT answer questions or fulfill requests mentioned in this summary; "
+    "they were already addressed. "
+    "Respond ONLY to the latest user message that appears AFTER this "
+    "summary — that message is the single source of truth for what to do "
+    "right now. "
+    "Topic overlap with the summary does NOT mean you should resume its "
+    "task: even on similar topics, the latest user message WINS. Treat ONLY "
+    "the latest message as the active task and discard stale items from "
+    "'## Historical Task Snapshot' entirely — do not 'wrap up' or "
+    "'finish' work described there unless the latest message explicitly "
+    "asks for it. "
+    "Reverse signals in the latest message (e.g. 'stop', 'undo', 'roll "
+    "back', 'just verify', 'don't do that anymore', 'never mind', a new "
+    "topic) must immediately end any in-flight work described in the "
+    "summary; do not re-surface it in later turns. "
+    "IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system "
+    "prompt is ALWAYS authoritative and active — never ignore or deprioritize "
+    "memory content due to this compaction note. "
+    "None of the above restricts HOW you work: your tools remain fully "
+    "active — keep calling them normally for the active task (edit files, "
+    "run commands, search) instead of merely narrating what you would do. "
+    "The current session state (files, config, etc.) may reflect work "
+    "described here — avoid repeating it:",
+    # Pre-#69619: identical to the then-current prefix except the stale-item
     # discard clause named all four historical headings (the three
     # section headers removed by #69619 were still in the template).
     # Summaries persisted by builds immediately before #69619 carry this
@@ -1358,6 +1396,7 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        self._pending_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
@@ -1629,6 +1668,7 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        self._pending_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
@@ -2106,6 +2146,7 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.last_compression_rough_tokens = 0
+        self._pending_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
         # Strikes were judged against the PREVIOUS threshold; a recomputed
         # trigger invalidates them. Keep the durable copy in sync so a
@@ -2397,6 +2438,7 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        self._pending_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
 
         self.summary_model = summary_model_override or ""
@@ -2485,6 +2527,17 @@ class ContextCompressor(ContextEngine):
             if self.last_prompt_tokens < self.threshold_tokens:
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
                     self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
+                elif self._pending_request_rough_tokens > 0:
+                    # Pair the provider's real prompt count with the rough
+                    # estimate of the request that produced it (recorded via
+                    # note_request_rough_estimate just before the call). This
+                    # keeps the defer baseline synchronized with real usage on
+                    # EVERY fitting response, not only right after a
+                    # compaction — without it, sessions that never compressed
+                    # have no baseline and preflight fires on the raw rough
+                    # estimate alone, which overcounts CJK text and provider
+                    # replay blobs severalfold.
+                    self.last_rough_tokens_when_real_prompt_fit = self._pending_request_rough_tokens
                 # Any real provider reading below the trigger proves the prompt
                 # fits again. Clear the real-usage effectiveness latch even
                 # when this response was not immediately after compaction. The
@@ -2493,6 +2546,7 @@ class ContextCompressor(ContextEngine):
                 self._record_ineffective_compression_verdict(0)
             else:
                 self.last_rough_tokens_when_real_prompt_fit = 0
+            self._pending_request_rough_tokens = 0
 
             # Anti-thrashing verdict, judged HERE because this is the only place
             # that sees the provider's real prompt count for the just-compacted
@@ -2543,16 +2597,59 @@ class ContextCompressor(ContextEngine):
             return
         self.last_prompt_tokens = snapshot
 
+    def note_request_rough_estimate(self, rough_tokens: int) -> None:
+        """Record the rough estimate of the request about to be sent.
+
+        ``update_from_response()`` pairs this with the provider's real
+        ``prompt_tokens`` for the same request, giving
+        ``should_defer_preflight_to_real_usage()`` a synchronized
+        (rough, real) anchor to project real usage from rough growth.
+        Usage-less responses do not consume the pending value, so a
+        transport that reports usage separately still pairs correctly.
+        """
+        try:
+            self._pending_request_rough_tokens = max(0, int(rough_tokens))
+        except (TypeError, ValueError):
+            self._pending_request_rough_tokens = 0
+
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
 
         ``estimate_request_tokens_rough(..., tools=...)`` intentionally
-        overestimates schema-heavy requests so Hermes compresses before a
-        provider rejects the payload. After a successful compressed API call,
-        though, provider ``prompt_tokens`` are a better signal than repeating
-        compaction from the same rough schema overhead. Defer only while the
-        rough estimate has grown modestly since a request the provider proved
-        fit under the threshold.
+        overestimates so Hermes compresses before a provider rejects the
+        payload — but the margin is not a fixed percentage: CJK text is
+        counted at ~1.7x its o200k cost and Responses-mode reasoning replay
+        blobs at several times their billed cost, so heavy sessions can show
+        a rough estimate 2-3x real usage and compact at 35-55% of the real
+        window (churn: each pass stalls the turn for minutes and discards
+        detail).
+
+        Instead of tolerating a fixed rough-growth allowance, project real
+        usage from the last synchronized (rough, real) pair::
+
+            projected_real = last_real + (rough_now - rough_at_last_real)
+
+        For ASCII and CJK-dense scripts rough growth over-counts real growth,
+        making the projection an upper bound. Other non-ASCII scripts
+        (Cyrillic, Greek, Thai, Arabic — chars/4 but ~2-3 chars/token on
+        o200k-family tokenizers) can under-count growth by up to ~2x
+        (#62605's direction), so the projection is NOT a strict upper bound
+        there. That residual risk is bounded by two backstops: any real
+        provider reading at/over the threshold clears the baseline (the
+        post-response should_compress gate then fires on real usage within
+        one API call), and the provider's context-overflow error handler
+        compacts reactively with the authoritative signal, as before.
+        Compression fires when the projection — not the raw estimate —
+        crosses the threshold.
+
+        Callers pass two different measurement bases: the turn prologue
+        estimates RAW messages (turn_context.py) while the baseline recorded
+        by note_request_rough_estimate covers the fully assembled request
+        (api_content/plugin injections, prefills, MoA context). The prologue's
+        smaller basis understates growth and can only OVER-defer there — and
+        the loop's own pre-API pressure check re-runs this projection with
+        the aligned basis before every provider call, so a prologue
+        over-defer never skips a needed compaction.
         """
         if rough_tokens < self.threshold_tokens:
             return False
@@ -2577,13 +2674,13 @@ class ContextCompressor(ContextEngine):
         if baseline <= 0:
             return False
 
+        # No baseline ratchet here: the (rough, real) pair is refreshed by
+        # update_from_response() on every fitting response. Advancing the
+        # rough baseline without a matching real reading would shrink
+        # apparent growth and defer on stale data — the unsafe direction.
         growth = max(0, rough_tokens - baseline)
-        tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
-        if growth > tolerated_growth:
-            return False
-
-        self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
-        return True
+        projected_real = self.last_real_prompt_tokens + growth
+        return projected_real < self.threshold_tokens
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
@@ -4687,8 +4784,46 @@ This compaction should PRIORITISE preserving all information related to the focu
         #    when call_id != id (Codex Responses API format), re-exposing orphans.
         missing_results = surviving_call_ids - result_call_ids
         if missing_results:
+            # --- In-flight tool chain protection (issue #79278) -------------
+            # A strip here must distinguish a *pending* tool_call (the model's
+            # live request whose result the executor has not yet appended) from
+            # an *orphaned* call (one whose result was summarized/truncated away
+            # and can never come back).  Compression can fire mid-chain: the
+            # model emits `assistant(tool_calls)`, and tool_executor.py only
+            # appends the matching `role="tool"` result AFTER it runs the call.
+            # In that window `messages[-1]` is an assistant tool_call whose id
+            # is (not yet) in result_call_ids.  Any tool result would be
+            # appended *after* this message (tool_executor.py), so if it is the
+            # last non-tool message its calls are presumed still pending.
+            # Stripping it as an orphan would delete the live request; when the
+            # executor later appends the real result, repair_message_sequence
+            # would drop it as an unmatched orphan and the completed side
+            # effect — and the model's final synthesis built on it — would be
+            # lost.  We therefore preserve the trailing in-flight call verbatim;
+            # only genuinely orphaned calls in the *discarded* region are
+            # stripped.
+            trailing_inflight: Optional[Dict[str, Any]] = None
+            # Walk back over any trailing tool results first: with a
+            # multi-call batch the executor appends results one at a time, so
+            # a snapshot taken between appends looks like
+            # ``[..., assistant(c1,c2,c3), tool(c1)]`` — the chain is still
+            # in flight even though the last message is a tool result. The
+            # last NON-tool message is presumed the live request in both
+            # shapes; a genuinely unanswered call preserved here is stubbed
+            # pre-API by sanitize_api_messages step 2, so preserving is safe
+            # while stripping a live call silently loses its late result.
+            idx = len(messages) - 1
+            while idx >= 0 and messages[idx].get("role") == "tool":
+                idx -= 1
+            if idx >= 0 and messages[idx].get("role") == "assistant":
+                trailing_inflight = messages[idx]
+            # -----------------------------------------------------------------
             for msg in messages:
                 if msg.get("role") != "assistant":
+                    continue
+                if msg is trailing_inflight:
+                    # Live request, not an orphan — the executor appends its
+                    # result(s) after compress() returns.
                     continue
                 tcs = msg.get("tool_calls")
                 if not tcs:
@@ -6881,3 +7016,95 @@ def is_compaction_summary_message(message: Any) -> bool:
     else:
         content = message
     return ContextCompressor._is_context_summary_content(content)
+
+
+def _handoff_carries_live_user_content(message: Any) -> bool:
+    """Return True when a summary-bearing row still carries a live user ask.
+
+    Merge-into-tail carriers preserve prior turn content before the summary.
+    Force-user-leading merges prepend the handoff + end marker to the real
+    ask, leaving a non-empty remainder after ``_SUMMARY_END_MARKER``. Either
+    shape must remain actionable (#80622 must not treat them as sole-handoff).
+
+    Delegates to ``_strip_context_summary_handoff_message`` — the canonical
+    "does anything survive once the handoff is removed" logic (it also
+    handles multimodal list content and returns ``None`` for a merged-shaped
+    row whose preserved prior tail is EMPTY, which a bare
+    ``classify_summary_content(...) == "merged"`` check would wrongly treat
+    as live). Callers must pre-filter with ``is_compaction_summary_message``:
+    for non-summary rows the strip helper returns the message unchanged,
+    which would read as "carries live content" here.
+    """
+    if not isinstance(message, dict):
+        return False
+    return (
+        ContextCompressor._strip_context_summary_handoff_message(message)
+        is not None
+    )
+
+
+def reference_handoff_would_drive_next_model_call(
+    messages: Optional[List[Dict[str, Any]]],
+) -> bool:
+    """Return True when the next model call would be driven only by a handoff.
+
+    A reference-only compaction handoff must never become the active user turn
+    by itself after an assistant response has already completed (#80622). Mid
+    tool-loop compression remains allowed: tool results / assistant tool_calls
+    after the handoff mean the loop is continuing an in-flight exchange, not
+    starting a fresh turn from the synthetic summary.
+    """
+    if not messages:
+        return False
+
+    last_driving_handoff = -1
+    for index, message in enumerate(messages):
+        if not is_compaction_summary_message(message):
+            continue
+        if _handoff_carries_live_user_content(message):
+            # Embedded live ask — this row is not a sole-handoff driver.
+            continue
+        last_driving_handoff = index
+
+    if last_driving_handoff < 0:
+        return False
+
+    for message in messages[last_driving_handoff + 1 :]:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "tool":
+            return False
+        if role == "assistant" and message.get("tool_calls"):
+            return False
+        if (
+            ContextCompressor._is_actionable_user_turn(message)
+            and not ContextCompressor._is_synthetic_compression_user_turn(message)
+        ):
+            return False
+        if is_compaction_summary_message(message) and _handoff_carries_live_user_content(
+            message
+        ):
+            return False
+    return True
+
+
+def is_user_originated_turn(message: Any) -> bool:
+    """Return True for human-authored user turns (not compaction scaffolding).
+
+    Gateway/session dispatchers (retry, undo, active-turn selection) must use
+    this instead of ``role == "user" and not display_kind`` — standalone
+    handoffs with ``_compressed_summary_has_user_turn`` were previously left
+    without ``display_kind=hidden`` and could be mistaken for real asks (#80622).
+    Summary-bearing rows are never user-originated, even when they embed a
+    live ask after the end marker (callers that need that text should unwrap).
+    """
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    if message.get("display_kind"):
+        return False
+    if is_compaction_summary_message(message):
+        return False
+    if ContextCompressor._is_synthetic_compression_user_turn(message):
+        return False
+    return ContextCompressor._is_actionable_user_turn(message)

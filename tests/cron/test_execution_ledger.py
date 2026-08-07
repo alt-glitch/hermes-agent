@@ -335,7 +335,7 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "run_job",
-        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+        lambda job, *, defer_agent_teardown=None, **_kw: (True, "output", "response", None),
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
@@ -357,7 +357,9 @@ def test_run_one_job_ledger_finish_failure_does_not_rewrite_success(monkeypatch)
     monkeypatch.setattr(
         scheduler,
         "run_job",
-        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+        lambda job, *, defer_agent_teardown=None, **_kwargs: (
+            True, "output", "response", None
+        ),
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
@@ -387,7 +389,9 @@ def test_job_store_double_failure_still_finalizes_execution(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "run_job",
-        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+        lambda job, *, defer_agent_teardown=None, **_kwargs: (
+            True, "output", "response", None
+        ),
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
@@ -437,7 +441,9 @@ def test_late_shutdown_interruption_finalizes_execution_failed(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "run_job",
-        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+        lambda job, *, defer_agent_teardown=None, **_kwargs: (
+            True, "output", "response", None
+        ),
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
 
