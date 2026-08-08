@@ -182,13 +182,10 @@ class TestSequentialPool:
         assert sched._sequential_pool is None
 
 
-class TestTickBatchAdvance:
-    """The tick's pre-dispatch advance must go through advance_next_runs
-    exactly once with the whole due set — a revert to the per-job loop
-    (or back to advance_next_run) must fail this test, not slip past the
-    helper-level I/O pin."""
+class TestTickDurableDispatch:
+    """Each submitted job is ledgered and advanced before its start gate opens."""
 
-    def test_tick_calls_advance_next_runs_once_with_all_due_ids(self, tmp_path, monkeypatch):
+    def test_tick_ledgers_then_advances_each_job_before_run(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
         sched._parallel_pool = None
@@ -202,20 +199,47 @@ class TestTickBatchAdvance:
             for i in range(4)
         ]
 
-        advance_calls = []
+        events = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(
-            sched, "advance_next_runs",
-            lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
+            sched,
+            "create_execution",
+            lambda job_id, source: (
+                events.append(("ledger", job_id)),
+                {"id": f"exec-{job_id}"},
+            )[1],
+        )
+        monkeypatch.setattr(
+            sched,
+            "advance_next_run",
+            lambda job_id: events.append(("advance", job_id)),
+        )
+        monkeypatch.setattr(
+            sched,
+            "advance_next_runs",
+            lambda _ids: (_ for _ in ()).throw(
+                AssertionError("durable dispatch must advance after each submit")
+            ),
+        )
+        monkeypatch.setattr(
+            sched,
+            "run_job",
+            lambda j, **_kw: (
+                events.append(("run", j["id"])),
+                (True, "out", "resp", None),
+            )[1],
+        )
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "finish_execution", lambda *_a, **_kw: None)
 
         n = sched.tick(verbose=False)
 
         assert n == 4
-        assert advance_calls == [["job-0", "job-1", "job-2", "job-3"]], (
-            f"tick must batch-advance the due set in ONE call; got {advance_calls}")
+        for job in jobs:
+            job_events = [kind for kind, job_id in events if job_id == job["id"]]
+            assert job_events == ["ledger", "advance", "run"]
 
         sched._shutdown_parallel_pool()
