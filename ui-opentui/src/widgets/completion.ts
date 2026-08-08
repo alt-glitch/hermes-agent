@@ -1,4 +1,5 @@
 import type { CompletionItem } from '../logic/store.ts'
+import { rankSlashItems } from '../logic/slashFuzzy.ts'
 import { listWidgetApps } from './registry.ts'
 
 /** Client-side widget apps live in the TUI's registry, not the gateway — so
@@ -16,12 +17,12 @@ export function mergeWidgetCompletionItems(input: string, items: CompletionItem[
   if (input.includes(' ') || !input.startsWith('/')) return items
 
   const needle = input.toLowerCase()
-  const local: CompletionItem[] = listWidgetApps()
-    .filter(app => `/${app.id}`.startsWith(needle))
+  const apps = listWidgetApps()
+  const local: CompletionItem[] = rankSlashItems(apps, input, app => ({ description: app.help, id: app.id }))
     .filter(app => !items.some(item => item.text === `/${app.id}`))
     .map(app => ({ display: `/${app.id}`, meta: app.help, text: `/${app.id}` }))
   if (
-    listWidgetApps().length > 0 &&
+    apps.length > 0 &&
     RELOAD_ITEM.text.startsWith(needle) &&
     needle.length > 1 &&
     !items.some(item => item.text === RELOAD_ITEM.text)

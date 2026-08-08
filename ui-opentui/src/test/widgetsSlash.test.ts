@@ -37,9 +37,9 @@ function makeCtx(request?: (method: string) => Promise<unknown>): Probe {
   return { ctx, requests, system }
 }
 
-function registerAmbient(id: string): void {
+function registerAmbient(id: string, help = `${id} help`): void {
   defineWidgetApp<{ label: string }>({
-    help: `${id} help`,
+    help,
     id,
     init: arg => ({ label: arg || 'x' }),
     mode: 'ambient',
@@ -151,6 +151,27 @@ describe('widget completion merge', () => {
     ])
   })
 
+  test('description-only matches discover client-local widgets', () => {
+    registerAmbient('clock', 'Start a countdown timer')
+    expect(mergeWidgetCompletionItems('/timer', [])).toEqual([
+      { display: '/clock', meta: 'Start a countdown timer', text: '/clock' }
+    ])
+  })
+
+  test('id substring matches are ranked above description matches', () => {
+    registerAmbient('stopwatch', 'Measure elapsed time')
+    registerAmbient('clock', 'Open the stopwatch timer')
+    expect(mergeWidgetCompletionItems('/watch', []).map(item => item.text)).toEqual(['/stopwatch'])
+  })
+
+  test('only the strongest tier survives and equal scores keep registry order', () => {
+    registerAmbient('timer-first', 'first')
+    registerAmbient('timer-second', 'second')
+    registerAmbient('kitchen', 'timer')
+    registerAmbient('oldtimer', 'archive')
+    expect(mergeWidgetCompletionItems('/timer', []).map(item => item.text)).toEqual(['/timer-first', '/timer-second'])
+  })
+
   test('gateway items keep precedence and duplicates are dropped', () => {
     registerAmbient('wdup')
     const gateway = [{ display: '/wdup', meta: 'from gateway', text: '/wdup' }]
@@ -159,8 +180,27 @@ describe('widget completion merge', () => {
   })
 
   test('arg position (a space) never merges widget names', () => {
-    registerAmbient('wargs')
+    registerAmbient('wargs', 'countdown timer')
     expect(mergeWidgetCompletionItems('/wargs UTC', [])).toEqual([])
+    expect(mergeWidgetCompletionItems('/timer UTC', [])).toEqual([])
+  })
+
+  test('/widgets-reload keeps its prefix-only discovery and gateway dedup behavior', () => {
+    registerAmbient('clock', 'Start a countdown timer')
+    const reload = {
+      display: '/widgets-reload',
+      meta: 'from gateway',
+      text: '/widgets-reload'
+    }
+    expect(mergeWidgetCompletionItems('/widgets-r', [])).toEqual([
+      {
+        display: '/widgets-reload',
+        meta: expect.stringContaining('rescan') as unknown as string,
+        text: '/widgets-reload'
+      }
+    ])
+    expect(mergeWidgetCompletionItems('/widgets-r', [reload])).toEqual([reload])
+    expect(mergeWidgetCompletionItems('/reload', [])).toEqual([])
   })
 
   test('a slash-ending widget completion keeps its argument separator', () => {

@@ -10,10 +10,9 @@
  * description-only match can surface in a completion MENU but never
  * auto-executes a submitted command.
  *
- * OpenTUI's completion menu itself is gateway-ranked (`complete.slash` runs the
- * Python port of this same scorer), so only the dispatch side lives here; Ink's
- * `rankSlashItems` list sorter is intentionally not ported until a local
- * consumer exists.
+ * OpenTUI's gateway rows are gateway-ranked (`complete.slash` runs the Python
+ * port of this same scorer). Client-local widget rows use `rankSlashItems`
+ * because the gateway cannot see that registry.
  */
 
 export interface SlashScoreItem {
@@ -64,4 +63,17 @@ export function scoreSlashMenuItem(item: SlashScoreItem, query: string): number 
   const descriptionFields = tokenizeSearchText(item.description ?? '')
 
   return Math.min(scoreFields(commandFields, query, 0), scoreFields(descriptionFields, query, 3))
+}
+
+/** Keep only the strongest matching tier, preserving input order within it.
+ * An empty query returns the original list so browsing keeps registry order. */
+export function rankSlashItems<T>(items: T[], query: string, toScoreItem: (item: T) => SlashScoreItem): T[] {
+  const normalized = normalizeSlashSearchQuery(query)
+
+  if (!normalized) return items
+
+  const scored = items.map(item => ({ item, score: scoreSlashMenuItem(toScoreItem(item), normalized) }))
+  const bestScore = Math.min(...scored.map(entry => entry.score))
+
+  return Number.isFinite(bestScore) ? scored.filter(entry => entry.score === bestScore).map(entry => entry.item) : []
 }
