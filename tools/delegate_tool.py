@@ -3070,8 +3070,19 @@ def _recover_tasks_from_json_string(
 
 # Placeholder shapes for batch goal validation: bare 'TODO', bare 'task N'
 # labels, or goals still carrying unexpanded template markers.
+#
+# The marker regex is deliberately NARROW: it only fires on snake_case /
+# space-separated placeholder identifiers (`<feature_name>`, `{file path}`,
+# `<FEATURE-NAME>`) — the shape LLM templates actually leave behind. Bare
+# single-word brackets are left alone because legitimate coding goals are
+# full of them: generics (`Vec<T>`, `Result<String>`), HTML tags (`<div>`),
+# JSON/dict snippets (`{"key": 1}`), glob braces (`{a,b}`), and f-string
+# style (`{i}`) must never be rejected (post-merge audit of #81141).
 _PLACEHOLDER_GOAL_RE = re.compile(r"^(todo|task\s*\d+)$", re.IGNORECASE)
-_TEMPLATE_MARKER_RE = re.compile(r"<[^<>]+>|\{[^{}]+\}")
+_TEMPLATE_MARKER_RE = re.compile(
+    r"<[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)+>"
+    r"|\{[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)+\}"
+)
 _MIN_BATCH_GOAL_LEN = 10
 
 
@@ -3081,6 +3092,10 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     Returns an actionable error string, or None when the batch is valid.
     Batch-only by design: the single-`goal` form legitimately uses short
     goals, so these checks must never run on it.
+
+    Duplicate goals are deliberately NOT rejected: identical-goal fan-outs
+    are a legitimate pattern (best-of-N / ensemble sampling), and blocking
+    them broke real workflows (post-merge audit of #81141).
     """
     if len(task_list) < 2:
         return (
@@ -3089,20 +3104,9 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
             'delegate_task(goal="...", context="...").'
         )
 
-    seen: Dict[str, int] = {}
     for i, task in enumerate(task_list):
         goal = str(task.get("goal", "")).strip()
         normalized = " ".join(goal.lower().split())
-
-        prev = seen.get(normalized)
-        if prev is not None:
-            return (
-                f"Task {i} duplicates task {prev}: both have the goal "
-                f"{goal!r}. Each task in a batch must do distinct work — "
-                "rewrite the goals so they don't overlap, or drop the "
-                "duplicate."
-            )
-        seen[normalized] = i
 
         if _PLACEHOLDER_GOAL_RE.match(normalized):
             return (
@@ -3253,9 +3257,10 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
-    # Batch-only quality gate: catch malformed fan-outs (duplicate goals,
-    # placeholder goals, 1-task batches) before any child is spawned.  The
-    # single-`goal` form is deliberately exempt — short goals are valid there.
+    # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
+    # unexpanded multi-word template markers, 1-task batches) before any
+    # child is spawned.  The single-`goal` form is deliberately exempt —
+    # short goals are valid there.  Duplicate goals are allowed (best-of-N).
     # Inspired by: MoonshotAI/kimi-code agent-swarm.md validation rules (MIT).
     if tasks is not None and isinstance(tasks, list):
         batch_error = _validate_batch_tasks(task_list)

@@ -3982,6 +3982,114 @@ class TestGetMessagesPagination:
         assert [m["content"] for m in page2] == ["msg-4", "msg-5", "msg-6", "msg-7"]
         assert [m["content"] for m in page3] == ["msg-8", "msg-9"]
 
+    def test_latest_pages_count_back_from_newest_but_remain_chronological(self, db):
+        self._seed(db)
+        page1 = db.get_messages("s1", limit=4, offset=0, latest=True)
+        page2 = db.get_messages("s1", limit=4, offset=4, latest=True)
+        page3 = db.get_messages("s1", limit=4, offset=8, latest=True)
+        assert [m["content"] for m in page1] == ["msg-6", "msg-7", "msg-8", "msg-9"]
+        assert [m["content"] for m in page2] == ["msg-2", "msg-3", "msg-4", "msg-5"]
+        assert [m["content"] for m in page3] == ["msg-0", "msg-1"]
+
+    def test_after_id_keyset_pages_forward_in_insertion_order(self, db):
+        self._seed(db)
+        page1 = db.get_messages("s1", limit=4, after_id=0)
+        assert [m["content"] for m in page1] == ["msg-0", "msg-1", "msg-2", "msg-3"]
+        page2 = db.get_messages("s1", limit=4, after_id=page1[-1]["id"])
+        assert [m["content"] for m in page2] == ["msg-4", "msg-5", "msg-6", "msg-7"]
+        page3 = db.get_messages("s1", limit=4, after_id=page2[-1]["id"])
+        assert [m["content"] for m in page3] == ["msg-8", "msg-9"]
+        with pytest.raises(ValueError):
+            db.get_messages("s1", limit=4, after_id=0, latest=True)
+        with pytest.raises(ValueError):
+            db.get_messages("s1", limit=4, after_id=0, offset=2)
+
+    def test_resume_safety_counts_active_rows_across_lineage(self, db):
+        db.create_session(session_id="root", source="cli")
+        db.append_messages_batch(
+            "root",
+            [{"role": "user", "content": f"root-{i}"} for i in range(3)],
+        )
+        db.create_session(
+            session_id="tip",
+            source="compression",
+            parent_session_id="root",
+        )
+        db.append_messages_batch(
+            "tip",
+            [{"role": "assistant", "content": f"tip-{i}"} for i in range(2)],
+        )
+
+        assert db.get_resume_message_count("tip") == 5
+        with pytest.raises(hermes_state.SessionResumeTooLargeError) as exc_info:
+            db.assert_resume_safe("tip", max_messages=4)
+        assert exc_info.value.message_count == 5
+        assert exc_info.value.limit == 4
+
+    def test_export_safety_is_bounded_to_the_requested_active_segment(self, db):
+        db.create_session(session_id="root", source="cli")
+        db.append_messages_batch(
+            "root",
+            [{"role": "user", "content": f"root-{i}"} for i in range(3)],
+        )
+        db.create_session(
+            session_id="tip",
+            source="compression",
+            parent_session_id="root",
+        )
+        db.append_messages_batch(
+            "tip",
+            [{"role": "assistant", "content": f"tip-{i}"} for i in range(2)],
+        )
+
+        assert db.assert_export_safe("tip", max_messages=2) == 2
+        with pytest.raises(hermes_state.SessionExportTooLargeError) as exc_info:
+            db.assert_export_safe("root", max_messages=2)
+        assert exc_info.value.session_id == "root"
+        assert exc_info.value.message_count == 3
+        assert exc_info.value.limit == 2
+
+    def test_zero_limit_disables_resume_and_export_guards(self, db, monkeypatch):
+        """sessions.max_*_messages: 0 disables the guard entirely."""
+        db.create_session(session_id="big", source="cli")
+        db.append_messages_batch(
+            "big",
+            [{"role": "user", "content": f"msg-{i}"} for i in range(5)],
+        )
+
+        # A small explicit limit rejects...
+        with pytest.raises(hermes_state.SessionResumeTooLargeError):
+            db.assert_resume_safe("big", max_messages=2)
+        with pytest.raises(hermes_state.SessionExportTooLargeError):
+            db.assert_export_safe("big", max_messages=2)
+
+        # ...but a config-resolved limit of 0 disables both guards: no raise,
+        # and no counting work at all (returns 0 — callers use the raise side
+        # effect only).
+        monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 0)
+        monkeypatch.setattr(hermes_state, "resolved_max_export_messages", lambda: 0)
+        assert db.assert_resume_safe("big") == 0
+        assert db.assert_export_safe("big") == 0
+        # An explicit 0 disables too, independent of config.
+        assert db.assert_resume_safe("big", max_messages=0) == 0
+        assert db.assert_export_safe("big", max_messages=0) == 0
+
+    def test_guard_limits_resolve_from_config_at_call_time(self, db, monkeypatch):
+        db.create_session(session_id="cfg", source="cli")
+        db.append_messages_batch(
+            "cfg",
+            [{"role": "user", "content": f"msg-{i}"} for i in range(4)],
+        )
+
+        monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 3)
+        monkeypatch.setattr(hermes_state, "resolved_max_export_messages", lambda: 3)
+        with pytest.raises(hermes_state.SessionResumeTooLargeError) as resume_exc:
+            db.assert_resume_safe("cfg")
+        assert resume_exc.value.limit == 3
+        with pytest.raises(hermes_state.SessionExportTooLargeError) as export_exc:
+            db.assert_export_safe("cfg")
+        assert export_exc.value.limit == 3
+
 
 
 

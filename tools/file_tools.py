@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """File Tools Module - LLM agent file manipulation tools."""
 
+import base64
 import errno
 import json
 import logging
@@ -1533,15 +1534,55 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
         # Malformed documents fall through to the normal path/binary guard.
-        from tools.read_extract import ExtractionError, extract_document_text, is_extractable_document
+        from tools.read_extract import (
+            ANYDOC_EXTENSIONS,
+            EXTRACTABLE_EXTENSIONS,
+            MAX_DOCUMENT_BYTES,
+            ExtractionError,
+            extract_document_bytes,
+            is_extractable_document,
+        )
 
         if is_extractable_document(str(_resolved)):
+            file_ops = _get_file_ops(task_id)
             try:
-                extracted_text = extract_document_text(str(_resolved))
-            except ExtractionError:
+                binary = file_ops.read_file_bytes(
+                    str(_resolved), max_bytes=MAX_DOCUMENT_BYTES
+                )
+                if binary.error or binary.base64_content is None:
+                    raise ExtractionError(binary.error or "Document bytes unavailable")
+                document_bytes = base64.b64decode(
+                    binary.base64_content, validate=True
+                )
+                extracted_text = extract_document_bytes(
+                    document_bytes, str(_resolved)
+                )
+            except (ExtractionError, ValueError, base64.binascii.Error) as exc:
                 logger.debug("document extraction failed for %s", path, exc_info=True)
+                # For binary document formats, surface the specific failure
+                # (size cap, encrypted, malformed…) instead of falling through
+                # — the fallthrough path can only produce a generic
+                # binary-file error or garbage raw bytes, hiding the
+                # actionable reason (e.g. "Document too large to convert").
+                # .ipynb stays on the fallthrough path: it is plain JSON text
+                # and a raw read is genuinely useful.  Byte-transport issues
+                # (ValueError / binascii) keep the fallthrough too — only a
+                # specific ExtractionError carries an actionable reason.
+                _doc_ext = _resolved.suffix.lower()
+                _binary_doc = _doc_ext in ANYDOC_EXTENSIONS or (
+                    _doc_ext in EXTRACTABLE_EXTENSIONS and _doc_ext != ".ipynb"
+                )
+                if (
+                    _binary_doc
+                    and isinstance(exc, ExtractionError)
+                    and not str(exc).startswith("Unsupported document type")
+                ):
+                    return tool_error(
+                        f"Cannot read '{path}' ({_doc_ext}): document "
+                        f"extraction failed — {exc}. Use terminal utilities "
+                        "to inspect or convert the file."
+                    )
             else:
-                file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
@@ -1549,7 +1590,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 result_dict = {
                     "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
                     "total_lines": total_lines,
-                    "file_size": os.path.getsize(_resolved),
+                    "file_size": binary.file_size,
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
                 }
@@ -2418,7 +2459,7 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {

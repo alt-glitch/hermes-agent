@@ -378,6 +378,37 @@ def _(rid, params: dict) -> dict:
                 target = tip
                 found = db.get_session(target) or found
 
+        # Every interactive resume path materializes the model history, even when
+        # omit_messages suppresses the response copy. Count the complete lineage
+        # before any reopen/history read so a runaway transcript cannot exhaust
+        # the dashboard. The metadata fallback keeps lightweight test/adaptor DBs
+        # that predate the shared SessionDB guard compatible. The limit resolves
+        # from config (sessions.max_resume_messages, 0 disables).
+        from hermes_state import (
+            SessionResumeTooLargeError,
+            resolved_max_resume_messages,
+        )
+
+        safety_check = getattr(db, "assert_resume_safe", None)
+        try:
+            if callable(safety_check):
+                safety_check(target)
+            else:
+                resume_limit = resolved_max_resume_messages()
+                stored_message_count = int(found.get("message_count") or 0)
+                if resume_limit and stored_message_count > resume_limit:
+                    raise SessionResumeTooLargeError(stored_message_count, resume_limit)
+        except SessionResumeTooLargeError as exc:
+            return _err(rid, 4130, str(exc))
+        except Exception as exc:
+            # Fail OPEN: a transient guard failure (locked DB, schema skew on
+            # an adaptor store) must not turn the safety check into a new way
+            # to lose access to a session. Only a genuine over-limit blocks.
+            logger.warning(
+                "resume safety check failed for %s (proceeding without guard): %s",
+                target, exc,
+            )
+
         profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
             profile_home
         )

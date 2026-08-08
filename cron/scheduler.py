@@ -4386,11 +4386,33 @@ def run_job(
         # and soft-failure marking below apply — restoring pre-#34452 silence
         # for scheduled jobs without disabling the explainer everywhere.
         if final_response.strip() and turn_exit_reason:
+            # The formatter's wording varies by persistence cause (locked /
+            # disk / unknown), so render every variant — matching only the
+            # one-argument render would let cause-refined explainer text slip
+            # through and be delivered as a cron warning.
+            _explainer_variants = []
             try:
-                _explainer_text = AIAgent._format_turn_completion_explanation(turn_exit_reason)
+                from hermes_state import PERSISTENCE_ERROR_CAUSES as _causes
             except Exception:
-                _explainer_text = ""
-            if _explainer_text and final_response.strip() == _explainer_text.strip():
+                _causes = ("locked", "disk", "unknown")
+            for _cause in (None, *_causes):
+                try:
+                    _variant = AIAgent._format_turn_completion_explanation(
+                        turn_exit_reason, _cause
+                    )
+                except TypeError:
+                    # Older single-argument formatter (or a test double).
+                    try:
+                        _variant = AIAgent._format_turn_completion_explanation(
+                            turn_exit_reason
+                        )
+                    except Exception:
+                        _variant = ""
+                except Exception:
+                    _variant = ""
+                if _variant:
+                    _explainer_variants.append(_variant.strip())
+            if final_response.strip() in _explainer_variants:
                 logger.info(
                     "Job '%s': abnormal empty turn (%s) — suppressing explainer for cron delivery",
                     job_id,

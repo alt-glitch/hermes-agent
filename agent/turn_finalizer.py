@@ -568,7 +568,8 @@ def finalize_turn(
                     or _is_partial_stream_recovery
                 ):
                     _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason
+                        _turn_exit_reason,
+                        getattr(agent, "_last_persistence_error_cause", None),
                     )
                     if _explanation:
                         if _is_empty_terminal:
@@ -586,6 +587,7 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
+    _pre_transform_response = None
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
@@ -603,6 +605,7 @@ def finalize_turn(
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
+                    _pre_transform_response = final_response
                     final_response = _hook_result
                     _response_transformed = True
                     break  # First non-empty string wins
@@ -685,6 +688,7 @@ def finalize_turn(
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
+        "pre_transform_response": _pre_transform_response,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,
@@ -712,11 +716,20 @@ def finalize_turn(
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
     # final_response; also stamp `error` so gateway surfaces status="error"
-    # (and desktop can toast disk-full) instead of a quiet complete frame.
+    # (and desktop can toast the cause) instead of a quiet complete frame.
     if failed and str(_turn_exit_reason) == "session_persistence_failed":
         result["error"] = final_response or (
-            "session storage could not be written — free disk space and try again"
+            "session storage could not be written — check the state database "
+            "health (`hermes doctor`), then send your message again"
         )
+        # Machine-readable cause for the gateway/desktop: exactly
+        # 'session_persistence_failed:<locked|disk|unknown>'. Never clobber a
+        # failure_reason another path already stamped on this result.
+        if "failure_reason" not in result:
+            _cause = getattr(agent, "_last_persistence_error_cause", None)
+            result["failure_reason"] = (
+                "session_persistence_failed:" + (_cause or "unknown")
+            )
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).
