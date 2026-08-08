@@ -65,15 +65,16 @@ export function scoreSlashMenuItem(item: SlashScoreItem, query: string): number 
   return Math.min(scoreFields(commandFields, query, 0), scoreFields(descriptionFields, query, 3))
 }
 
-/** Keep only the strongest matching tier, preserving input order within it.
- * An empty query returns the original list so browsing keeps registry order. */
+/** Filter and stable-sort `items` by score (then original order). An empty
+ * query returns the list untouched so browsing keeps the caller's order. */
 export function rankSlashItems<T>(items: T[], query: string, toScoreItem: (item: T) => SlashScoreItem): T[] {
   const normalized = normalizeSlashSearchQuery(query)
 
   if (!normalized) return items
 
-  const scored = items.map(item => ({ item, score: scoreSlashMenuItem(toScoreItem(item), normalized) }))
-  const bestScore = Math.min(...scored.map(entry => entry.score))
-
-  return Number.isFinite(bestScore) ? scored.filter(entry => entry.score === bestScore).map(entry => entry.item) : []
+  return items
+    .map((item, index) => ({ index, item, score: scoreSlashMenuItem(toScoreItem(item), normalized) }))
+    .filter(entry => entry.score !== Number.POSITIVE_INFINITY)
+    .sort((a, b) => a.score - b.score || a.index - b.index)
+    .map(entry => entry.item)
 }

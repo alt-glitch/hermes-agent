@@ -161,15 +161,20 @@ describe('widget completion merge', () => {
   test('id substring matches are ranked above description matches', () => {
     registerAmbient('stopwatch', 'Measure elapsed time')
     registerAmbient('clock', 'Open the stopwatch timer')
-    expect(mergeWidgetCompletionItems('/watch', []).map(item => item.text)).toEqual(['/stopwatch'])
+    expect(mergeWidgetCompletionItems('/watch', []).map(item => item.text)).toEqual(['/stopwatch', '/clock'])
   })
 
-  test('only the strongest tier survives and equal scores keep registry order', () => {
+  test('all finite score tiers remain ordered and true ties keep registry order', () => {
     registerAmbient('timer-first', 'first')
     registerAmbient('timer-second', 'second')
     registerAmbient('kitchen', 'timer')
     registerAmbient('oldtimer', 'archive')
-    expect(mergeWidgetCompletionItems('/timer', []).map(item => item.text)).toEqual(['/timer-first', '/timer-second'])
+    expect(mergeWidgetCompletionItems('/timer', []).map(item => item.text)).toEqual([
+      '/timer-first',
+      '/timer-second',
+      '/oldtimer',
+      '/kitchen'
+    ])
   })
 
   test('gateway items keep precedence and duplicates are dropped', () => {
