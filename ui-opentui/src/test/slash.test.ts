@@ -36,6 +36,7 @@ import {
   startModelPrefetch,
   type SlashContext
 } from '../logic/slash.ts'
+import { normalizeSlashSearchQuery, scoreSlashMenuItem } from '../logic/slashFuzzy.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
 import { isWakeUserDisabled, setWakeUserDisabled } from '../logic/wake.ts'
 import type { ConfirmRequest, Message, PickerItem } from '../logic/store.ts'
@@ -2989,5 +2990,135 @@ describe('diagnostic command gating (HERMES_TUI_DIAGNOSTICS)', () => {
     await dispatchSlash('/mem', p.ctx)
     const out = [...p.system, ...p.paged.map(x => x.text)].join('\n')
     expect(out).toMatch(/rss|heap/i)
+  })
+})
+
+describe('dispatchSlash — tiered catalog resolution (upstream 1405d330e7e5)', () => {
+  /** A canon fixture with a CLIENT-local command (/density), server commands,
+   *  an alias, and names that collide by prefix (/status↔/statistics) and by
+   *  substring only (den ⊂ goldenrod). */
+  const seedCatalog = (p: Probe) => {
+    p.cachedCatalog.value = {
+      canon: {
+        '/context': '/context',
+        '/density': '/density',
+        '/goldenrod': '/goldenrod',
+        '/hb': '/heartbeat',
+        '/heartbeat': '/heartbeat',
+        '/statistics': '/statistics',
+        '/status': '/status'
+      },
+      pairs: []
+    }
+  }
+
+  test('a unique SUBSTRING resolves a server command and forwards its args (/beat → /heartbeat)', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'thump' } : {}))
+    seedCatalog(p)
+    await dispatchSlash('/beat 5', p.ctx)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'heartbeat 5', session_id: 'sid-1' } }])
+    expect(p.system).toEqual(['thump'])
+  })
+
+  test('a unique PREFIX of a CLIENT command dispatches locally with its args (/dens on → densityCmd)', async () => {
+    const p = makeCtx(async method => {
+      if (method !== 'config.set') throw new Error('must resolve locally, not via ' + method)
+      return {}
+    })
+    seedCatalog(p)
+    await dispatchSlash('/dens on', p.ctx)
+    expect(p.compactFlag.value).toBe(true)
+    expect(p.system).toEqual(['density on'])
+    expect(p.calls.map(c => c.method)).toEqual(['config.set']) // densityCmd's own persist, no slash.exec
+  })
+
+  test('prefix outranks substring — only the best tier survives, so /den is NOT ambiguous', async () => {
+    const p = makeCtx(async () => ({}))
+    seedCatalog(p)
+    await dispatchSlash('/den off', p.ctx)
+    expect(p.system).toEqual(['density off']) // goldenrod's substring hit never widens the prefix hit
+    expect(p.compactFlag.value).toBe(false)
+  })
+
+  test('same-tier collisions report ambiguity and execute NOTHING (/stat)', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('an ambiguous command must not reach the gateway')
+    })
+    seedCatalog(p)
+    await dispatchSlash('/stat', p.ctx)
+    expect(p.calls).toHaveLength(0)
+    expect(p.system).toEqual(['ambiguous command: /statistics, /status'])
+  })
+
+  test('an exact canonical name keeps the plain slash.exec ladder (no recursion)', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'ctx dump' } : {}))
+    seedCatalog(p)
+    await dispatchSlash('/context', p.ctx)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'context', session_id: 'sid-1' } }])
+    expect(p.system).toEqual(['ctx dump'])
+  })
+
+  test('an exact ALIAS re-dispatches as its canonical name with args (/hb now → heartbeat now)', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'thump' } : {}))
+    seedCatalog(p)
+    await dispatchSlash('/hb now', p.ctx)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'heartbeat now', session_id: 'sid-1' } }])
+  })
+
+  test('an unmatched name keeps the full slash.exec → command.dispatch ladder', async () => {
+    const p = makeCtx(async method => {
+      if (method === 'slash.exec') throw new Error('unknown command')
+      return { output: 'dispatched', type: 'exec' }
+    })
+    seedCatalog(p)
+    await dispatchSlash('/zzz', p.ctx)
+    expect(p.calls.map(c => c.method)).toEqual(['slash.exec', 'command.dispatch'])
+    expect(p.system).toEqual(['dispatched'])
+  })
+
+  test('without a cached catalog the ladder is untouched (abbreviation goes to the gateway verbatim)', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'raw' } : {}))
+    await dispatchSlash('/hea', p.ctx)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'hea', session_id: 'sid-1' } }])
+  })
+
+  test('fuzzy resolution cannot bypass diagnostic gating (/me → /mem still shows the enable hint)', async () => {
+    const KEY = 'HERMES_TUI_DIAGNOSTICS'
+    const prev = process.env[KEY]
+    delete process.env[KEY]
+    try {
+      const p = makeCtx(async () => ({}))
+      p.cachedCatalog.value = { canon: { '/mem': '/mem' }, pairs: [] }
+      await dispatchSlash('/me', p.ctx)
+      expect(p.calls).toHaveLength(0)
+      expect(p.system).toHaveLength(1)
+      expect(p.system[0]).toContain('HERMES_TUI_DIAGNOSTICS=1')
+    } finally {
+      if (prev === undefined) delete process.env[KEY]
+      else process.env[KEY] = prev
+    }
+  })
+})
+
+describe('scoreSlashMenuItem (grok-cli tier contract)', () => {
+  test('tiers: exact 0 < prefix 1 < substring 2; no match is Infinity', () => {
+    expect(scoreSlashMenuItem({ id: 'heartbeat' }, 'heartbeat')).toBe(0)
+    expect(scoreSlashMenuItem({ id: 'heartbeat' }, 'hea')).toBe(1)
+    expect(scoreSlashMenuItem({ id: 'heartbeat' }, 'beat')).toBe(2)
+    expect(scoreSlashMenuItem({ id: 'heartbeat' }, 'pulse')).toBe(Number.POSITIVE_INFINITY)
+  })
+
+  test('description matches score at the +3 offset — dispatch (< 3) can never auto-execute them', () => {
+    const item = { description: 'Summarize older turns to reclaim context', id: 'compress' }
+    expect(scoreSlashMenuItem(item, 'summarize')).toBe(3)
+    expect(scoreSlashMenuItem(item, 'summar')).toBe(4)
+    expect(scoreSlashMenuItem(item, 'ummar')).toBe(5)
+    expect(scoreSlashMenuItem(item, 'compress')).toBe(0) // name always outranks description
+  })
+
+  test('aliases and labels count as command fields; queries normalize slashes/case', () => {
+    expect(scoreSlashMenuItem({ aliases: ['hb'], id: 'heartbeat' }, 'hb')).toBe(0)
+    expect(scoreSlashMenuItem({ id: 'model', label: 'Model picker' }, 'picker')).toBe(0) // label word token
+    expect(normalizeSlashSearchQuery(' /Model ')).toBe('model')
   })
 })

@@ -84,6 +84,7 @@ import { loadUserWidgets } from '../widgets/userWidgets.ts'
 import type { Message } from './store.ts'
 import { normalizeBusyInputMode, type BusyInputMode } from './busyQueue.ts'
 import { batteryInfoFromResponse, batteryLabel } from './battery.ts'
+import { scoreSlashMenuItem } from './slashFuzzy.ts'
 
 export interface ParsedSlash {
   name: string
@@ -3090,6 +3091,46 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
     const err = launchWidget(parsed.name, parsed.arg)
     if (err) ctx.pushSystem(err)
     return
+  }
+
+  // Abbreviation resolution against the cached commands.catalog `canon` map
+  // (Ink createSlashHandler parity, upstream 1405d330e7e5). An exact alias
+  // re-dispatches as its canonical name; otherwise tiered name scoring —
+  // prefix matches rank above substring matches, so `/hea` still resolves to
+  // /heartbeat while `/beat` now finds it too instead of dead-ending. Only the
+  // best tier survives — a substring hit never widens an unambiguous prefix
+  // hit into an "ambiguous command" complaint. Description tiers (score >= 3)
+  // are a completion-menu concern and never auto-execute a command here.
+  // Re-dispatch recurses so a canonical CLIENT command runs locally; an exact
+  // canonical name (or no match at all) keeps the slash.exec/command.dispatch
+  // ladder below. Backwards-compatible embedders may inject a SlashContext
+  // without the catalog accessor (see the AgentsSlashControl note above) — no
+  // catalog means no resolution, never a crash.
+  const canon = (ctx as Partial<SlashContext>).commandCatalog?.()?.canon
+  if (canon) {
+    const needle = `/${parsed.name}`
+    const argTail = parsed.arg ? ` ${parsed.arg}` : ''
+    const exact = Object.entries(canon).find(([alias]) => alias.toLowerCase() === needle)?.[1]
+    if (exact) {
+      if (exact.toLowerCase() !== needle) return dispatchSlash(`${exact}${argTail}`, ctx)
+    } else {
+      const scored = Object.entries(canon)
+        .map(([alias, canonical]) => ({
+          canonical,
+          score: scoreSlashMenuItem({ id: alias.replace(/^\//, '') }, parsed.name)
+        }))
+        .filter(entry => entry.score < 3)
+      const best = Math.min(...scored.map(entry => entry.score))
+      const matches = [...new Set(scored.filter(entry => entry.score === best).map(entry => entry.canonical))]
+      const [only] = matches
+      if (matches.length === 1 && only !== undefined && only.toLowerCase() !== needle) {
+        return dispatchSlash(`${only}${argTail}`, ctx)
+      }
+      if (matches.length > 1) {
+        ctx.pushSystem(`ambiguous command: ${matches.slice(0, 6).join(', ')}${matches.length > 6 ? ', …' : ''}`)
+        return
+      }
+    }
   }
 
   try {
