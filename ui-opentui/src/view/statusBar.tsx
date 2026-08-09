@@ -431,12 +431,13 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     }
     return len
   })
+  const sessionTitle = () => info().title?.trim() ?? ''
   const resumeHintText = createMemo(() => {
     const active = activeSubagents()
     // Only the registry-backed count can promise an automatic future resume;
     // local rows are a compatibility signal, not proof of parked background work.
     const count = active.source === 'usage' ? active.count : 0
-    const cwdReserve = info().cwd ? SEP.length + CWD_MIN : 0
+    const cwdReserve = sessionTitle() || info().cwd ? SEP.length + CWD_MIN : 0
     const availableCells = dims().width - ROW_PADDING - baseLeftLen() - SEP.length - cwdReserve
     return idleSubagentResumeStatus({
       availableCells,
@@ -452,7 +453,19 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   // and stranded empty space at the right edge. Pinned right with a flex spacer,
   // the dirname + branch hug the edge and only the head clips (truncLeft). Its
   // budget is the row width minus the left run; it drops whole below CWD_MIN.
+  // The session title OWNS the right-tail slot when set (upstream 5a16635f409c
+  // — Ink swaps cwdLabel for an accent-backed ` title ` chip): a compact,
+  // padded chip on the same leftover budget as the cwd, tail-truncated
+  // (truncRight) so the row can never wrap, dropped whole below CWD_MIN.
+  const titleChip = createMemo(() => {
+    const title = sessionTitle()
+    if (!title) return ''
+    const budget = dims().width - ROW_PADDING - leftLen() - SEP.length
+    if (budget < CWD_MIN) return ''
+    return ` ${truncRight(title, budget - 2)} `
+  })
   const cwdText = createMemo(() => {
+    if (sessionTitle()) return '' // the title chip replaces the cwd/project/branch tail
     const cwd = info().cwd
     const c = cwd ? shortCwd(cwd) : ''
     if (!c) return ''
@@ -539,12 +552,16 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
               after the width-gated tail segments just like Ink's SpawnHud. */}
           <Seg text={spawnHud().text} fg={spawnHudColor()} />
         </text>
-        {/* the cwd is RIGHT-PINNED (F10): a flex spacer eats the slack so the
-            dirname + branch hug the right edge instead of stranding empty navy. */}
-        <Show when={cwdText()}>
+        {/* the right tail is RIGHT-PINNED (F10): a flex spacer eats the slack so
+            the tail hugs the right edge instead of stranding empty navy. When a
+            session title exists, its accent-backed bold chip takes the slot;
+            otherwise the muted dirname + branch render as before. */}
+        <Show when={titleChip() || cwdText()}>
           <box style={{ flexGrow: 1 }} />
           <text selectable={false}>
-            <span style={{ fg: theme().color.muted }}>{cwdText()}</span>
+            <Show when={titleChip()} fallback={<span style={{ fg: theme().color.muted }}>{cwdText()}</span>}>
+              <b style={{ fg: theme().color.statusFg, bg: theme().color.accent }}>{titleChip()}</b>
+            </Show>
           </text>
         </Show>
       </Show>

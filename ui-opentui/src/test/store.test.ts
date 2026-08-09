@@ -1117,6 +1117,33 @@ describe('session store — session chrome / status bar (item 14)', () => {
     expect(store.state.info.projectName).toBeNull()
   })
 
+  test('session.title live push (upstream f726090d489d) sets the chrome title, trimmed', () => {
+    const store = createSessionStore()
+    store.applyInfo({ model: 'opus', cwd: '/p' })
+    store.apply({
+      type: 'session.title',
+      session_id: 'live-1',
+      payload: { session_id: 'db-key-9', title: '  fix the flaky tests  ' }
+    })
+    expect(store.state.info.title).toBe('fix the flaky tests')
+    // partial-patch rule holds — unrelated chrome survives the title merge.
+    expect(store.state.info).toMatchObject({ model: 'opus', cwd: '/p' })
+  })
+
+  test('session.title with a blank title never clears an existing one', () => {
+    const store = createSessionStore()
+    store.applyInfo({ title: 'first exchange title' })
+    store.apply({ type: 'session.title', session_id: 'live-1', payload: { title: '   ' } })
+    expect(store.state.info.title).toBe('first exchange title')
+  })
+
+  test('session.title with an absent payload is inert (no crash, no chrome change)', () => {
+    const store = createSessionStore()
+    store.applyInfo({ title: 'kept' })
+    store.apply({ type: 'session.title', session_id: 'live-1' })
+    expect(store.state.info.title).toBe('kept')
+  })
+
   test('message.start sets running, message.complete clears it + refreshes usage', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start' })

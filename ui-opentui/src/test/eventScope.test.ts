@@ -34,6 +34,24 @@ describe('eventBelongsToSession', () => {
     expect(eventBelongsToSession(approval, 'live-1')).toBe(false)
   })
 
+  test('a stale session.title cannot retitle successor chrome (entry-gate scoping)', () => {
+    // The gateway scopes the live title push by its TOP-LEVEL session_id (the
+    // payload's session_id is the DB key) — the same gate every scoped event
+    // rides, so a title emitted for a torn-down session never lands.
+    const stale = {
+      type: 'session.title',
+      session_id: 'old-1',
+      payload: { session_id: 'db-key-9', title: 'stale title' }
+    } satisfies GatewayEvent
+    const live = {
+      type: 'session.title',
+      session_id: 'live-1',
+      payload: { title: 'fresh title' }
+    } satisfies GatewayEvent
+    expect(eventBelongsToSession(stale, 'live-1')).toBe(false)
+    expect(eventBelongsToSession(live, 'live-1')).toBe(true)
+  })
+
   test('resume buffering admits target events before transport identity changes', () => {
     const target = { type: 'message.start', session_id: 'target-live' } satisfies GatewayEvent
     expect(eventMayEnterStore(target, 'old-live', false)).toBe(false)

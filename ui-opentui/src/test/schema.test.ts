@@ -183,6 +183,31 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     expect(Option.isSome(decode({ type: 'review.summary' }))).toBe(true)
   })
 
+  test('decodes the session.title live push (upstream f726090d489d) — sid scope + DB-key payload', () => {
+    const ev = decode({
+      type: 'session.title',
+      session_id: 'live-1',
+      payload: { session_id: 'db-key-9', title: 'rename the moon' }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'session.title') {
+      // top-level session_id carries the entry-gate scope; the payload's
+      // session_id is the DB session_key and may legitimately differ.
+      expect(ev.value.session_id).toBe('live-1')
+      expect(ev.value.payload?.session_id).toBe('db-key-9')
+      expect(ev.value.payload?.title).toBe('rename the moon')
+    }
+  })
+
+  test('session.title with a bare or absent payload still decodes (lenient optional)', () => {
+    expect(Option.isSome(decode({ type: 'session.title', session_id: 'live-1' }))).toBe(true)
+    expect(Option.isSome(decode({ type: 'session.title', session_id: 'live-1', payload: {} }))).toBe(true)
+  })
+
+  test('SKIPS a session.title with a malformed (non-string) title — Option.none, no throw', () => {
+    expect(Option.isNone(decode({ type: 'session.title', session_id: 'live-1', payload: { title: 123 } }))).toBe(true)
+  })
+
   test('decodes completion reasoning, MoA, tool progress, and browser progress events', () => {
     for (const wire of [
       { type: 'message.complete', payload: { reasoning: 'fallback thought', text: 'answer' } },

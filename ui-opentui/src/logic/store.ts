@@ -2240,6 +2240,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
       case 'session.info':
         applyInfo(event.payload)
         break
+      case 'session.title': {
+        // Live auto-title push (upstream f726090d489d) — fires the moment the
+        // turn prologue titles the session. The entry gate already scoped the
+        // event by its top-level session_id (the payload's session_id is the
+        // DB key, not re-checked here). Only a nonblank title lands; a blank
+        // or absent one never clears existing chrome.
+        const title = event.payload?.title?.trim()
+        if (title) applyInfo({ title })
+        break
+      }
       case 'message.start':
         settlePendingSteers(event.payload?.client_submission_ids)
         interimTextPartId = undefined

@@ -639,3 +639,102 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     }
   })
 })
+
+// ── 5. session title right tail (upstream 5a16635f409c) ─────────────────
+
+describe('StatusBar frames — session title replaces the cwd tail', () => {
+  test('a titled session shows the accent-backed bold chip instead of cwd/project/branch', async () => {
+    const store = seededStore()
+    store.applyInfo({
+      project: { id: 'p1', name: 'Hermes Agent', primary_path: '/tmp/proj', slug: 'hermes-agent' }
+    })
+    store.apply({ type: 'session.title', session_id: 'live-1', payload: { title: 'maint-title' } })
+    const probe = await renderProbe(bar(store), { width: 220, height: 3 })
+    try {
+      const frame = probe.frame()
+      const row = frame.split('\n').find(r => r.includes('claude-opus-4-8')) ?? ''
+      expect(row).toContain(' maint-title ')
+      // the chip REPLACES the whole cwd/project/branch tail (Ink rightLabel swap)
+      expect(row).not.toContain('/tmp/proj')
+      expect(row).not.toContain('(main)')
+      expect(row).not.toContain('Hermes Agent')
+      // …and stays right-pinned: the padded chip hugs the right edge.
+      expect(row.trimEnd().endsWith('maint-title')).toBe(true)
+      // accent-backed + statusFg ink (the one warm surface the bar allows)
+      const chip = probe
+        .spans()
+        .lines.flatMap(line => line.spans)
+        .find(span => span.text.includes('maint-title'))
+      expect(chip).toBeDefined()
+      expect(chip?.bg?.toInts().slice(0, 3)).toEqual(RGBA.fromHex(store.state.theme.color.accent).toInts().slice(0, 3))
+      expect(chip?.fg.toInts().slice(0, 3)).toEqual(RGBA.fromHex(store.state.theme.color.statusFg).toInts().slice(0, 3))
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('a live session.title push swaps the mounted tail without restart; clearing restores the cwd', async () => {
+    const store = seededStore()
+    const probe = await renderProbe(bar(store), { width: 220, height: 3 })
+    try {
+      expect(probe.frame()).toContain('/tmp/proj (main)')
+      store.apply({ type: 'session.title', session_id: 'live-1', payload: { title: 'name it live' } })
+      await probe.settle()
+      expect(probe.frame()).toContain(' name it live ')
+      expect(probe.frame()).not.toContain('/tmp/proj')
+      // active-list chrome clearing the title (e.g. session switch) restores the cwd tail.
+      store.setLiveSessionChrome(1, '')
+      await probe.settle()
+      expect(probe.frame()).not.toContain('name it live')
+      expect(probe.frame()).toContain('/tmp/proj (main)')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('the /title client path (applyInfo title) drives the same chip', async () => {
+    const store = seededStore()
+    store.applyInfo({ title: 'maint-title' })
+    const frame = await captureFrame(bar(store), { width: 220, height: 3 })
+    const row = frame.split('\n').find(r => r.includes('claude-opus-4-8')) ?? ''
+    expect(row).toContain(' maint-title ')
+    expect(row).not.toContain('/tmp/proj')
+  })
+
+  test('width sweep: the titled bar keeps ONE row at every width — truncate or drop, never wrap', async () => {
+    const store = seededStore()
+    store.applyInfo({ title: 'a long descriptive session title that cannot possibly fit narrow terminals' })
+    for (const width of [40, 60, 70, 78, 100, 120, 220]) {
+      const frame = await captureFrame(bar(store), { width, height: 3 })
+      const rows = frame.split('\n').filter(row => row.trim())
+      expect(rows, `width ${String(width)}`).toHaveLength(1)
+      expect(rows.filter(row => row.includes('│')).length, `width ${String(width)}`).toBe(1)
+    }
+  })
+
+  test('deterministic truncation: the chip tail-clips with … inside the leftover budget', async () => {
+    const store = seededStore()
+    const longTitle = 'a long descriptive session title that cannot possibly fit this terminal width'
+    store.applyInfo({ title: longTitle })
+    const frame = await captureFrame(bar(store), { width: 120, height: 3 })
+    const row = frame.split('\n').find(r => r.includes('claude-opus-4-8')) ?? ''
+    // truncRight keeps the HEAD of the title and clips the tail with an ellipsis
+    expect(row).toContain('a long descr')
+    expect(row).toContain('…')
+    expect(row).not.toContain(longTitle)
+  })
+
+  test('below the minimum tail budget the chip drops WHOLE (narrow-width behavior stays stable)', async () => {
+    const store = seededStore()
+    store.applyInfo({ title: 'maint-title' })
+    // At 44 cols the seeded left run (`● claude-opus-4-8 ·high │ ctx: 42%`)
+    // leaves under CWD_MIN cells of tail budget — the pre-title bar drops the
+    // cwd here, and the titled bar must drop the chip the same way (never a
+    // squeezed fragment, never a second row).
+    const frame = await captureFrame(bar(store), { width: 44, height: 3 })
+    expect(frame).toContain('claude-opus-4-8')
+    expect(frame).not.toContain('maint')
+    const rows = frame.split('\n').filter(row => row.trim())
+    expect(rows).toHaveLength(1)
+  })
+})

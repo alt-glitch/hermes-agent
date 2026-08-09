@@ -59,6 +59,16 @@ const SessionInfoEvent = Schema.Struct({
   // the chrome phase narrows the fields it actually reads.
   payload: Schema.Record(Str, Schema.Unknown)
 })
+// Live session-title push (upstream f726090d489d): auto-titling now runs in
+// the shared turn prologue and the gateway emits the landed title immediately
+// instead of waiting for the next list refresh. The payload's session_id is
+// the DB session_key (it can differ from the live sid); scoping rides the
+// top-level session_id, which the entry event gate already checks.
+const SessionTitle = Schema.Struct({
+  type: Schema.Literal('session.title'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ session_id: opt(Str), title: opt(Str) }))
+})
 
 const ClientSubmissionIds = opt(Schema.Array(Str))
 
@@ -361,10 +371,16 @@ const GatewayRecovering = Schema.Struct({
 })
 
 // ── The union ─────────────────────────────────────────────────────────
-export const GatewayEventSchema = Schema.Union([
+// Two nested member groups, ONE tagged union: `toTaggedUnion`'s type-level
+// `Flatten` recursion is depth-linear in tuple length, and one flat 46-member
+// tuple exceeds tsc's instantiation-depth limit (TS2589). Nested unions are
+// explicitly flattened (type AND runtime), so the decoded Type, the tag
+// dispatch, and Option.none skipping are identical to the flat spelling.
+const SessionTurnEvents = Schema.Union([
   GatewayReady,
   SkinChanged,
   SessionInfoEvent,
+  SessionTitle,
   MessageStart,
   MessageDelta,
   MessageInterim,
@@ -385,7 +401,9 @@ export const GatewayEventSchema = Schema.Union([
   SudoRequest,
   SecretRequest,
   SudoExpire,
-  SecretExpire,
+  SecretExpire
+])
+const ChromeTransportEvents = Schema.Union([
   StatusUpdate,
   NotificationShow,
   NotificationClear,
@@ -409,7 +427,10 @@ export const GatewayEventSchema = Schema.Union([
   GatewayProtocolError,
   GatewayExited,
   GatewayRecovering
-]).pipe(Schema.toTaggedUnion('type'))
+])
+export const GatewayEventSchema = Schema.Union([SessionTurnEvents, ChromeTransportEvents]).pipe(
+  Schema.toTaggedUnion('type')
+)
 
 /** The decoded, typed event. Inferred from the schema — never hand-declared. */
 export type GatewayEvent = typeof GatewayEventSchema.Type
