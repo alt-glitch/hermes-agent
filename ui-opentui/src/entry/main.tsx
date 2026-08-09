@@ -44,7 +44,11 @@ import { decodeSubagentInterruptResponse } from '../boundary/schema/Delegation.t
 import { decodeImageAttachResponse, decodeSetupStatusResponse } from '../boundary/schema/ExternalInputResponses.ts'
 import { decodeVoiceRecordResponse } from '../boundary/schema/VoiceResponses.ts'
 import { decodePetGalleryResponse, decodePetSelectResponse } from '../boundary/schema/PetResponses.ts'
-import { decodePluginsListResponse, decodePluginsToggleResponse } from '../boundary/schema/PluginResponses.ts'
+import {
+  decodePluginsListResponse,
+  decodePluginsToggleResponse,
+  type PluginRow
+} from '../boundary/schema/PluginResponses.ts'
 import {
   classifySessionSteerResponse,
   decodeCommandsCatalogResponse,
@@ -90,6 +94,7 @@ import { isVoiceRecordKey, voiceRecordKeyFromConfig } from '../logic/voiceKey.ts
 import { parseProcessList } from '../logic/backgroundActivity.ts'
 import { eventMayEnterStore } from '../logic/eventScope.ts'
 import { createPasteStore } from '../logic/pastes.ts'
+import { pluginToggleParams } from '../logic/pluginsHub.ts'
 import {
   heldTransitionBlocks,
   planTransitionDrain,
@@ -2120,9 +2125,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           if (!decoded) throw new Error('invalid plugins.manage list response')
           return decoded
         },
-        toggle: async (name: string, enable: boolean) => {
+        toggle: async (row: PluginRow, enable: boolean) => {
           const decoded = decodePluginsToggleResponse(
-            await Effect.runPromise(gateway.request('plugins.manage', { action: 'toggle', enable, name }))
+            await Effect.runPromise(gateway.request('plugins.manage', pluginToggleParams(row, enable)))
           )
           if (!decoded) throw new Error('invalid plugins.manage toggle response')
           return decoded
