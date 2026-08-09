@@ -344,7 +344,9 @@ export function useSessionActions({
       if (!hasWorkspaceTarget) {
         // In a project → the repo's default-branch checkout; not in a project →
         // detached. So cmd-n does not inherit an unrelated linked worktree.
-        setCurrentCwd(resolveNewSessionCwd())
+        // Transient: a resolved default is not the user naming a workspace, and
+        // remembering it here would make the NEXT new chat inherit it.
+        setCurrentCwdTransient(resolveNewSessionCwd())
       } else if (workspaceTarget === null) {
         setCurrentCwdTransient('')
       } else if (typeof workspaceTarget === 'string') {
@@ -498,7 +500,7 @@ export function useSessionActions({
       try {
         // Fresh tile → the caller's workspace when one was named (the sidebar
         // "+" on a project/worktree lane), else the resolved new-session cwd
-        // (focused session's project → project scope → default).
+        // (project scope → configured default).
         const params = await desktopSessionCreateParams((options?.cwd || resolveNewSessionCwd()).trim())
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id
@@ -533,7 +535,7 @@ export function useSessionActions({
         patchSessionTile(stored, { runtimeId: created.session_id })
 
         if (dir === 'center' && runtimeInfo?.cwd) {
-          setCurrentCwd(runtimeInfo.cwd)
+          setCurrentCwdTransient(runtimeInfo.cwd)
           setWorkspaceCwdOwner(stored)
         }
 
@@ -716,7 +718,7 @@ export function useSessionActions({
           setActiveSessionId(cachedRuntimeId)
           activeSessionIdRef.current = cachedRuntimeId
           syncSessionStateToView(cachedRuntimeId, cachedViewState)
-          setCurrentCwd(cachedViewState.cwd)
+          setCurrentCwdTransient(cachedViewState.cwd)
           // The warm cache IS this conversation's own workspace truth, so the
           // switch is already re-homed here. This claim cannot wait for
           // `session.activate`: its missing-RPC compat branch returns before
@@ -767,8 +769,17 @@ export function useSessionActions({
             } else {
               const runtimeInfo = applyRuntimeInfo(activated.info)
 
-              let activatedMessages =
-                activated.messages.length || activated.inflight || activated.queued
+              // `omit_messages` means the response carries NO transcript, not
+              // an empty one — the cache is the base and the live projection is
+              // a tail to graft onto it. Reconciling against the empty list
+              // instead rebuilds the thread out of the projection alone, so
+              // activating a session that is mid-turn somewhere else (leaving
+              // HUD mode is exactly that) collapsed the whole conversation down
+              // to the in-flight prompt until the turn finished and the
+              // post-turn hydrate restored it.
+              let activatedMessages = activated.messages_omitted
+                ? appendLiveSessionProjection(cachedViewState.messages, activated)
+                : activated.messages.length || activated.inflight || activated.queued
                   ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated)
                   : cachedViewState.messages
 
@@ -805,7 +816,11 @@ export function useSessionActions({
                   ...(runtimeInfo ?? {}),
                   messages: activatedMessages,
                   busy: running,
-                  awaitingResponse: running
+                  awaitingResponse: running,
+                  // Adopting someone else's turn: we'll stream its reply
+                  // without ever having received its prompt, so the settle
+                  // path must not take the "I saw it all" shortcut.
+                  adoptedRunningTurn: state.adoptedRunningTurn || running
                 }),
                 storedSessionId
               )
@@ -965,7 +980,15 @@ export function useSessionActions({
                   ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
                   : currentMessages
 
-                const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
+                // Omitted, not empty — same trap as the activate path above.
+                // The REST prefetch IS the transcript here; the resume payload
+                // only contributes the live tail, so graft rather than rebuild.
+                // (Without a usable prefetch there is nothing better to stand
+                // on, so the projection alone remains the degraded fallback.)
+                const resumedMessages =
+                  resumed.messages_omitted && prefetchApplied && prefetchMatchesResumedSession
+                    ? appendLiveSessionProjection(localSnapshot, resumed)
+                    : reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
 
                 return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
               })()
@@ -1022,6 +1045,7 @@ export function useSessionActions({
             messages: messagesForView,
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
+            adoptedRunningTurn: state.adoptedRunningTurn || resumedRunning,
             ...(inFlightRecovery.applied
               ? {
                   sawAssistantPayload: true,

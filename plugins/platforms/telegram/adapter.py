@@ -738,6 +738,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
+        # When rich_messages is on but rich_drafts is off, supports_draft_streaming
+        # declines drafts so transport=auto uses edit-in-place + rich finalize
+        # instead of MDV2 drafts that jump to sendRichMessage at the end.
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
@@ -5346,8 +5349,22 @@ class TelegramAdapter(BasePlatformAdapter):
         We additionally require ``self._bot`` to expose ``send_message_draft``
         (added to python-telegram-bot in 22.6); older PTB installs gracefully
         fall back to the edit path even on DMs.
+
+        When ``rich_messages`` is enabled but ``rich_drafts`` is not, decline
+        drafts even on DMs.  Final delivery then uses ``sendRichMessage`` /
+        rich ``editMessageText``, while the default draft path still renders
+        MarkdownV2 (tables → bullet lists).  That mismatch makes the streaming
+        preview look unformatted/"crooked" and the finalized reply a second
+        beautiful wiki-style bubble.  Prefer edit-in-place streaming so the
+        same message upgrades via rich finalize.  Operators who want animated
+        rich drafts opt in with ``rich_drafts: true``.
         """
         if not self._bot or not hasattr(self._bot, "send_message_draft"):
+            return False
+        if (
+            getattr(self, "_rich_messages_enabled", False)
+            and not getattr(self, "_rich_drafts_enabled", False)
+        ):
             return False
         return (chat_type or "").lower() in {"dm", "private"}
 
@@ -8228,7 +8245,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if offset < 0 or length <= 0:
                     continue
 
-                entity_text = source_text[offset:offset + length].strip()
+                entity_text = TelegramAdapter._telegram_entity_text(source_text, offset, length).strip()
                 if entity_type == "mention":
                     handle = entity_text.lstrip("@").lower()
                     if _is_bot_handle(handle):
@@ -8259,6 +8276,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return mentioned_bot_usernames
 
+    @staticmethod
+    def _telegram_entity_text(source_text: str, offset: int, length: int) -> str:
+        """Return a Telegram entity span using UTF-16 code-unit offsets."""
+        if offset < 0 or length <= 0:
+            return ""
+        try:
+            raw = source_text.encode("utf-16-le")
+            start = offset * 2
+            end = (offset + length) * 2
+            return raw[start:end].decode("utf-16-le")
+        except UnicodeDecodeError:
+            return ""
+
     def _message_mentions_bot(self, message: Message) -> bool:
         if not self._bot:
             return False
@@ -8285,7 +8315,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     length = int(getattr(entity, "length", 0))
                     if offset < 0 or length <= 0:
                         continue
-                    if source_text[offset:offset + length].strip().lower() == expected:
+                    if self._telegram_entity_text(source_text, offset, length).strip().lower() == expected:
                         return True
                 elif entity_type == "text_mention":
                     user = getattr(entity, "user", None)
@@ -8305,7 +8335,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     length = int(getattr(entity, "length", 0))
                     if offset < 0 or length <= 0:
                         continue
-                    command_text = source_text[offset:offset + length]
+                    command_text = self._telegram_entity_text(source_text, offset, length)
                     at_index = command_text.find("@")
                     if at_index < 0:
                         continue

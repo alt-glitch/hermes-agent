@@ -1391,6 +1391,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
 
+        # Native server-side compaction (gpt-5.6 on direct OpenAI API /
+        # ChatGPT Codex routes only) — None on every other route/model, in
+        # which case the request is unchanged from pre-feature behavior.
+        from agent.native_compaction import native_compaction_context_management
+        _context_management = native_compaction_context_management(
+            agent,
+            is_codex_backend=is_codex_backend,
+            is_xai_responses=is_xai_responses,
+            is_github_responses=is_github_responses,
+        )
+
         # xAI's /responses endpoint rejects ``pattern`` and ``format`` keywords
         # in tool schemas (HTTP 400 "Invalid arguments passed to the model").
         # Most commonly hit when MCP-derived tools carry JSON Schema validation
@@ -1441,6 +1452,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
+            context_management=_context_management,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
@@ -1743,7 +1755,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             elif hasattr(d, "__dict__"):
                 preserved.append(d.__dict__)
             elif hasattr(d, "model_dump"):
-                preserved.append(d.model_dump())
+                try:
+                    # warnings=False: avoid pydantic serializer UserWarnings
+                    # on generic-union SDK models leaking to the terminal.
+                    preserved.append(d.model_dump(warnings=False))
+                except TypeError:
+                    preserved.append(d.model_dump())
         if preserved:
             msg["reasoning_details"] = preserved
 
@@ -1833,7 +1850,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             extra = getattr(tool_call, "extra_content", None)
             if extra is not None:
                 if hasattr(extra, "model_dump"):
-                    extra = extra.model_dump()
+                    try:
+                        extra = extra.model_dump(warnings=False)
+                    except TypeError:
+                        extra = extra.model_dump()
                 tc_dict["extra_content"] = extra
             tool_calls.append(tc_dict)
         msg["tool_calls"] = tool_calls
@@ -3526,7 +3546,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")
                     if extra is not None:
                         if hasattr(extra, "model_dump"):
-                            extra = extra.model_dump()
+                            try:
+                                extra = extra.model_dump(warnings=False)
+                            except TypeError:
+                                extra = extra.model_dump()
                         entry["extra_content"] = extra
                     # Fire once per tool when the full name is available
                     name = entry["function"]["name"]

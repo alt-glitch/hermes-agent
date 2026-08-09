@@ -244,7 +244,8 @@ export interface Translations {
     unmuteHaptics: string
     openSettings: string
     openStarmap: string
-    openKeybinds: string
+    enterHud: string
+    exitHud: string
     layoutEditor: string
     layoutEditorTitle: string
   }
@@ -316,6 +317,17 @@ export interface Translations {
       failed: string
       empty: string
       kinds: { bundled: string; disk: string; runtime: string }
+      agent: {
+        title: string
+        blurb: string
+        empty: string
+        loadFailed: string
+        portable: string
+        search: string
+        noMatches: string
+        toggleFailed: (name: string) => string
+        sources: Record<string, string>
+      }
     }
     notifications: {
       title: string
@@ -1552,6 +1564,7 @@ export interface Translations {
     noWorkspace: string
     projectEmpty: string
     noSessions: string
+    noFilterMatches: string
     projects: {
       sectionLabel: string
       home: string
@@ -1646,6 +1659,7 @@ export interface Translations {
       waitingForAnswer: string
       finishedUnread: string
       backgroundRunning: string
+      draftSession: string
       handoffOrigin: (platform: string) => string
       ownedByProfile: (profile: string) => string
       renamed: string
@@ -1665,6 +1679,10 @@ export interface Translations {
       thisWeek: string
       lastWeek: string
       thisMonth: string
+    }
+    statusDivider: {
+      working: string
+      done: string
     }
   }
 

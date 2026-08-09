@@ -1263,6 +1263,9 @@ class CLICommandsMixin:
                         "tool_calls": msg.get("tool_calls"),
                         "tool_call_id": msg.get("tool_call_id"),
                         "reasoning": msg.get("reasoning"),
+                        "reasoning_details": msg.get("reasoning_details"),
+                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                        "codex_message_items": msg.get("codex_message_items"),
                         # Keep the api_content sidecar so the branch's first turn
                         # replays the parent's exact wire bytes (warm provider
                         # prompt cache) instead of a full cold prefill.
@@ -1340,21 +1343,34 @@ class CLICommandsMixin:
             personality_name = parts[1].strip().lower()
             
             if personality_name in {"none", "default", "neutral"}:
-                self.system_prompt = ""
+                # Persist the selection only. Never clear agent.system_prompt —
+                # that field is the user-owned manual overlay.
+                saved = save_config_value("display.personality", "")
+                try:
+                    from hermes_cli.config import cfg_get, read_raw_config, _prompt_text
+
+                    self.system_prompt = _prompt_text(
+                        cfg_get(read_raw_config(), "agent", "system_prompt", default="")
+                    )
+                except Exception:
+                    self.system_prompt = ""
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", ""):
+                if saved:
                     print("(^_^)b Personality cleared (saved to config)")
                 else:
                     print("(^_^) Personality cleared (session only)")
                 print("  No personality overlay — using base agent behavior.")
             elif personality_name in self.personalities:
-                self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
+                personality_prompt = self._resolve_personality_prompt(
+                    self.personalities[personality_name]
+                )
+                self.system_prompt = personality_prompt
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", self.system_prompt):
+                if save_config_value("display.personality", personality_name):
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
-                print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
+                print(f"  \"{personality_prompt[:60]}{'...' if len(personality_prompt) > 60 else ''}\"")
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
                 print(f"  Available: none, {', '.join(self.personalities.keys())}")

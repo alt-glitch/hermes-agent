@@ -1398,6 +1398,7 @@ def _save_jobs_unlocked(
                         {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
                         f,
                         indent=2,
+                        ensure_ascii=False,
                     )
                     f.flush()
                     os.fsync(f.fileno())
@@ -1466,6 +1467,7 @@ def _save_jobs_unlocked(
                 {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
                 f,
                 indent=2,
+                ensure_ascii=False,
             )
             f.flush()
             os.fsync(f.fileno())

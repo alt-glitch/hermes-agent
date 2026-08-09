@@ -1460,6 +1460,210 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
+    """Parse configured Docker volume mounts into ``(host_path, container_path)``.
+
+    Source of truth is ``TERMINAL_DOCKER_VOLUMES`` (JSON list of
+    ``host:container[:mode]`` specs), matching terminal/docker runtime config.
+    Named volumes and non-absolute hosts are skipped because they cannot be
+    resolved on the gateway host for media delivery.
+    """
+    raw = os.getenv("TERMINAL_DOCKER_VOLUMES", "").strip()
+    if not raw:
+        return []
+    try:
+        import json as _json
+
+        parsed = _json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    mounts: List[Tuple[Path, Path]] = []
+    for entry in parsed:
+        if not isinstance(entry, str):
+            continue
+        spec = entry.strip()
+        if not spec:
+            continue
+        # Prefer the first ':/' so absolute container paths are unambiguous.
+        sep = spec.find(":/")
+        if sep <= 0:
+            continue
+        host_raw = spec[:sep]
+        container_and_mode = spec[sep + 1 :]  # starts with /
+        container_raw = container_and_mode.split(":", 1)[0]
+        if not container_raw.startswith("/"):
+            continue
+        # Skip named volumes (no absolute/drive host path).
+        host_expanded = os.path.expanduser(host_raw)
+        if not (
+            host_expanded.startswith("/")
+            or (len(host_expanded) > 1 and host_expanded[1] == ":")
+        ):
+            continue
+        try:
+            host_path = Path(host_expanded).resolve(strict=False)
+            container_path = Path(container_raw)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not container_path.is_absolute():
+            continue
+        mounts.append((host_path, container_path))
+    return mounts
+
+
+def _default_docker_workspace_host_root() -> Optional[Path]:
+    """Host path for Docker's default persistent ``/workspace`` mount."""
+    if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
+        return None
+    if os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None
+    # Explicit cwd mount takes over /workspace when enabled.
+    if os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        cwd = os.getenv("TERMINAL_CWD") or os.getcwd()
+        try:
+            host = Path(os.path.expanduser(cwd)).resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return host if host.is_dir() else None
+    try:
+        from tools.environments.base import get_sandbox_dir
+
+        root = (get_sandbox_dir() / "docker" / "default" / "workspace").resolve(strict=False)
+    except Exception:
+        return None
+    return root if root.is_dir() else None
+
+
+def _docker_persistent_home_host_root() -> Optional[Path]:
+    """Host path for Docker's default persistent ``/root`` home mount.
+
+    Persistent containers bind ``<sandbox>/docker/<task>/home`` to ``/root``
+    (tools/environments/docker.py), so an agent that writes ``/root/out.png``
+    produced a real host file the gateway couldn't find. Same collapse rule as
+    the workspace mount: the gateway's container sharing resolves to the
+    ``default`` task sandbox.
+    """
+    if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
+        return None
+    if os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None
+    try:
+        from tools.environments.base import get_sandbox_dir
+
+        root = (get_sandbox_dir() / "docker" / "default" / "home").resolve(strict=False)
+    except Exception:
+        return None
+    return root if root.is_dir() else None
+
+
+def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
+    """(host, container) pairs for the auto-mounted Hermes cache dirs.
+
+    The agent legitimately sees generated artifacts at ``/root/.hermes/...``
+    (``agent_visible_image`` from image_generate, cache-dir reads) and will
+    naturally emit those container paths in MEDIA tags. These mounts are
+    longer prefixes than the ``/root`` home mount, so longest-prefix matching
+    picks the cache translation over the home translation for them.
+    """
+    if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
+        return []
+    try:
+        from tools.credential_files import get_cache_directory_mounts
+
+        return [
+            (Path(m["host_path"]), Path(m["container_path"]))
+            for m in get_cache_directory_mounts()
+        ]
+    except Exception:
+        return []
+
+
+def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
+    """Translate a container-absolute path to its host path when possible.
+
+    Uses longest-prefix match across configured ``docker_volumes``, the
+    auto-mounted Hermes cache dirs (``/root/.hermes/...``), the default
+    persistent Docker ``/workspace`` host root, and the persistent ``/root``
+    home mount.
+    """
+    if not candidate.is_absolute():
+        return None
+
+    # In-process gateways (Desktop backend, `hermes serve`) may not have
+    # bridged terminal.* config into TERMINAL_* env vars — run the idempotent
+    # bridge so the mount parsing below sees the active backend and volumes
+    # (same guard _binary_reference_block applies for inbound attachments).
+    try:
+        from tools.terminal_tool import _ensure_terminal_env_bridged
+
+        _ensure_terminal_env_bridged()
+    except Exception:
+        pass
+
+    mounts = list(_parse_docker_volume_mounts())
+    mounts.extend(_cache_dir_container_mounts())
+    # Synthetic /workspace mount for default persistent sandbox / cwd bind.
+    default_ws = _default_docker_workspace_host_root()
+    if default_ws is not None and not any(c.as_posix() == "/workspace" for _, c in mounts):
+        mounts.append((default_ws, Path("/workspace")))
+    # Synthetic /root mount for the persistent home bind. Cache mounts above
+    # are longer prefixes, so /root/.hermes/... still translates to the host
+    # cache — this only catches stray home writes like /root/out.png.
+    default_home = _docker_persistent_home_host_root()
+    if default_home is not None and not any(c.as_posix() == "/root" for _, c in mounts):
+        # /root/.hermes/* that did NOT match a cache mount is the container's
+        # credential/secret surface (.env, auth.json, ... are individually
+        # bind-mounted from the real host stores). Translating those through
+        # the home mount would resolve to sandbox-home copies OUTSIDE the
+        # host-side credential denylist prefixes — refuse instead so the
+        # normal "container path doesn't exist on host" rejection applies.
+        if not candidate.as_posix().startswith("/root/.hermes"):
+            mounts.append((default_home, Path("/root")))
+
+    if not mounts:
+        return None
+
+    # Longest container-prefix match.
+    best: Optional[Tuple[Path, Path, int]] = None
+    candidate_posix = candidate.as_posix()
+    for host_root, container_root in mounts:
+        container_posix = container_root.as_posix().rstrip("/") or "/"
+        if candidate_posix == container_posix or candidate_posix.startswith(container_posix + "/"):
+            score = len(container_posix)
+            if best is None or score > best[2]:
+                best = (host_root, container_root, score)
+    if best is None:
+        return None
+
+    host_root, container_root, _ = best
+    try:
+        relative = candidate.relative_to(container_root)
+        translated = (host_root / relative).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if translated != host_root and not _path_is_within(translated, host_root):
+        return None
+    return translated
+
+
 def validate_media_delivery_path(path: str) -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
@@ -1498,10 +1702,17 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     if not expanded.is_absolute():
         return None
 
-    try:
-        resolved = expanded.resolve(strict=True)
-    except (OSError, RuntimeError, ValueError):
-        return None
+    # Docker agents emit MEDIA:/workspace/... (or other configured container
+    # mount paths). Resolve those to host paths before the normal host-side
+    # existence / denylist checks.
+    translated = _translate_docker_container_media_path(expanded)
+    if translated is not None:
+        resolved = translated
+    else:
+        try:
+            resolved = expanded.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return None
 
     if not resolved.is_file():
         return None
@@ -4202,19 +4413,22 @@ class BasePlatformAdapter(ABC):
     def prepare_tts_text(self, text: str) -> str:
         """Prepare a spoken script for TTS.
 
-        Auto-TTS should not feed raw chat Markdown, ``<think>`` reasoning
+        Auto-TTS should not feed raw chat Markdown, ``⋗`` reasoning
         blocks, or compact symbols to the speech provider.  It should receive
         a transcript-like script: reasoning blocks removed, headings and
         bullets flattened into sentence pauses, and units like ``°C``
         expanded to words such as ``degrees Celsius``.
+
+        Provider-safe chunking and platform delivery limits are enforced
+        by the TTS tool.
         """
         try:
             from tools.tts_text_normalize import prepare_spoken_text
-            return prepare_spoken_text(text, max_chars=4000)
+            return prepare_spoken_text(text, max_chars=None)
         except Exception:
             # Keep auto-TTS best-effort if the normalizer ever fails.
             text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
-            return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
+            return re.sub(r'[*_`#\[\]()]', '', text).strip()
 
     async def play_tts(
         self,
@@ -6071,6 +6285,7 @@ class BasePlatformAdapter(ABC):
                 # Skip when streaming TTS already delivered audio for this turn
                 # (#60671) — the gateway streaming-TTS consumer sets the flag.
                 _tts_path = None
+                _tts_paths: List[str] = []
                 _tts_requested_path = None
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
@@ -6104,14 +6319,21 @@ class BasePlatformAdapter(ABC):
                             )
                             tts_data = _json.loads(tts_result_str)
                             if tts_data.get("success", True):
-                                _tts_path = tts_data.get("file_path") or _tts_requested_path
+                                raw_tts_paths = tts_data.get("file_paths") or [
+                                    tts_data.get("file_path")
+                                ]
+                                _tts_paths = [
+                                    str(path) for path in raw_tts_paths
+                                    if path and Path(path).exists()
+                                ]
+                                _tts_path = _tts_paths[0] if _tts_paths else None
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
-                _tts_cleanup_paths = {_tts_requested_path, _tts_path} - {None}
-                if _tts_path and Path(_tts_path).exists():
+                _tts_cleanup_paths = {_tts_requested_path, *_tts_paths} - {None}
+                for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:
                         # Caption eligibility and payload stay on the ORIGINAL
                         # reply text. The spoken script is for synthesis only:
@@ -6119,9 +6341,11 @@ class BasePlatformAdapter(ABC):
                         # 1024-char caption limit, and captioning that spoken
                         # form would suppress the full formatted reply the
                         # user is meant to receive as a separate message.
+                        # Caption only on the first file.
                         telegram_tts_caption = None
                         if (
-                            self.platform == Platform.TELEGRAM
+                            _tts_index == 0
+                            and self.platform == Platform.TELEGRAM
                             and text_content
                             and text_content[:1024] == text_content
                         ):
@@ -6132,16 +6356,20 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
-                            telegram_tts_caption and getattr(tts_result, "success", False)
+                            _tts_caption_delivered
+                            or (
+                                telegram_tts_caption
+                                and getattr(tts_result, "success", False)
+                            )
                         )
                     finally:
-                        for _cleanup_path in _tts_cleanup_paths:
-                            try:
-                                os.remove(_cleanup_path)
-                            except OSError:
-                                pass
-                elif _tts_cleanup_paths:
+                        try:
+                            os.remove(_tts_path)
+                        except OSError:
+                            pass
+                if not _tts_paths and _tts_cleanup_paths:
                     for _cleanup_path in _tts_cleanup_paths:
                         try:
                             os.remove(_cleanup_path)

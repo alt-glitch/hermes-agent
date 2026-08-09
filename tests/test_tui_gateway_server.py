@@ -8577,6 +8577,7 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
         history_version=4,
     )
     emits = []
+    writes = []
 
     server._sessions["sid"] = session
     monkeypatch.setattr(
@@ -8588,7 +8589,11 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
         server, "_session_info", lambda agent, *a: {"model": getattr(agent, "model", "?")}
     )
     monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
-    monkeypatch.setattr(server, "_write_config_key", lambda path, value: None)
+    monkeypatch.setattr(
+        server,
+        "_write_config_key",
+        lambda path, value: writes.append((path, value)),
+    )
 
     resp = server.handle_request(
         {
@@ -8611,6 +8616,8 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
     assert agent.ephemeral_system_prompt == "You are helpful."
     assert agent._cached_system_prompt == "old"
     assert ("session.info", "sid", {"model": "?"}) in emits
+    assert ("display.personality", "helpful") in writes
+    assert not any(path == "agent.system_prompt" for path, _ in writes)
 
 
 def test_compress_session_history_passes_force():
@@ -13661,8 +13668,13 @@ class _ImmediateThread:
         self._target()
 
 
-def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
-    """maybe_auto_title is called after a successful (complete) prompt."""
+def test_prompt_submit_wires_live_title_rename_callback(monkeypatch):
+    """The gateway hands the agent a hook so a new title repaints the sidebar.
+
+    Titling itself moved into the shared turn prologue (agent/turn_context.py),
+    so the gateway's only remaining job is delivering the rename event. Asserted
+    by calling the hook the gateway installed and checking what it emits.
+    """
 
     class _Agent:
         model = "gpt-5.6-sol"
@@ -13682,115 +13694,38 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
 
     agent = _Agent()
     server._sessions["sid"] = _session(agent=agent)
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     emitted = []
-    refreshed = []
-    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
-    monkeypatch.setattr(server, "_emit_title_refresh", refreshed.append)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        server, "_emit", lambda kind, sid, payload=None, **kw: emitted.append((kind, payload))
+    )
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
-    with patch("agent.title_generator.maybe_auto_title") as mock_title:
-        server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {
-                    "session_id": "sid",
-                    "text": "Tell me about Rome",
-                },
-            }
-        )
+    server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "Tell me about Rome"},
+        }
+    )
 
-    mock_title.assert_called_once()
-    args = mock_title.call_args.args
-    assert args[1] == "session-key"
-    assert args[2] == "Tell me about Rome"
-    assert args[3] == "Rome was founded in 753 BC."
-    assert mock_title.call_args.kwargs["main_runtime"] == {
-        "model": "gpt-5.6-sol",
-        "provider": "openai-codex",
-        "base_url": "https://chatgpt.example.test/backend-api/codex",
-        "api_key": _Agent.api_key,
-        "api_mode": "codex_responses",
-    }
-    runtime_validator = mock_title.call_args.kwargs["runtime_validator"]
-    assert runtime_validator() is True
-    agent.model = "gpt-5.7-switched"
-    assert runtime_validator() is False
-    agent.model = "gpt-5.6-sol"
-    agent.provider = "openrouter"
-    assert runtime_validator() is False
-
-    callback = mock_title.call_args.kwargs["title_callback"]
-    callback("Rome in Brief")
-    assert refreshed == ["sid"]
-    assert ("message.start", "sid") in emitted
+    hook = getattr(agent, "_on_session_title", None)
+    assert callable(hook), "gateway did not install a live title-rename hook"
+    # Titling is two-stage, and a local surface wants both: the sidebar renames
+    # off the derived slice instantly and sharpens when the model's lands. Only
+    # the lanes that spend a rate-limited remote rename filter by stage.
+    hook("tell me about rome", "derived")
+    hook("Founding of Rome", "llm")
+    assert [payload["title"] for kind, payload in emitted if kind == "session.title"] == [
+        "tell me about rome",
+        "Founding of Rome",
+    ]
     assert (
         "session.title",
-        "sid",
-        {"session_id": "session-key", "title": "Rome in Brief"},
+        {"session_id": "session-key", "title": "Founding of Rome"},
     ) in emitted
-
-
-def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
-    """maybe_auto_title must NOT be called when the agent was interrupted."""
-
-    class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
-            return {
-                "final_response": "partial answer",
-                "interrupted": True,
-                "messages": [],
-            }
-
-    server._sessions["sid"] = _session(agent=_Agent())
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
-    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
-    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
-
-    with patch("agent.title_generator.maybe_auto_title") as mock_title:
-        server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "Tell me about Rome"},
-            }
-        )
-
-    mock_title.assert_not_called()
-
-
-def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
-    """maybe_auto_title must NOT be called when the agent returns an empty reply."""
-
-    class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
-            return {
-                "final_response": "",
-                "messages": [],
-            }
-
-    server._sessions["sid"] = _session(agent=_Agent())
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
-    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
-    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
-
-    with patch("agent.title_generator.maybe_auto_title") as mock_title:
-        server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "Tell me about Rome"},
-            }
-        )
-
-    mock_title.assert_not_called()
 
 
 def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
@@ -19373,3 +19308,119 @@ def test_fallback_session_info_always_emits_branch(monkeypatch):
 
     assert "branch" in info
     assert info["branch"] == ""
+
+
+BRANCH_REASONING = "the parent's chain of thought"
+BRANCH_REASONING_CONTENT = "the parent's reasoning content"
+BRANCH_REASONING_DETAILS = [
+    {"type": "reasoning.text", "text": "keep the parent's plan", "format": "unknown"}
+]
+BRANCH_CODEX_REASONING_ITEMS = [
+    {"id": "rs_1", "type": "reasoning", "encrypted_content": "opaque-blob"}
+]
+BRANCH_CODEX_MESSAGE_ITEMS = [
+    {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "done"}],
+    }
+]
+
+
+def _branch_history():
+    return [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": "done",
+            "reasoning": BRANCH_REASONING,
+            "reasoning_content": BRANCH_REASONING_CONTENT,
+            "reasoning_details": BRANCH_REASONING_DETAILS,
+            "codex_reasoning_items": BRANCH_CODEX_REASONING_ITEMS,
+            "codex_message_items": BRANCH_CODEX_MESSAGE_ITEMS,
+        },
+    ]
+
+
+def _branched_assistant(db, session_key):
+    return next(
+        m
+        for m in db.get_messages_as_conversation(session_key)
+        if m["role"] == "assistant"
+    )
+
+
+def test_persist_branch_seed_keeps_reasoning_fields(monkeypatch, tmp_path):
+    """The seed write must carry the parent's reasoning fields.
+
+    A branch is a draft until its first submit, so this is the only write that
+    ever persists the copied transcript. Persisting role/content alone left the
+    branch resuming without the parent's reasoning, preserved thinking blocks or
+    Codex encrypted-reasoning/message-item continuation state.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session = _session(
+        session_key="branch-key",
+        parent_session_id="parent-key",
+        history=_branch_history(),
+    )
+    try:
+        db.create_session("branch-key", source="tui")
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+
+        server._persist_branch_seed(session)
+
+        assistant = _branched_assistant(db, "branch-key")
+        assert assistant["reasoning"] == BRANCH_REASONING
+        assert assistant["reasoning_content"] == BRANCH_REASONING_CONTENT
+        assert assistant["reasoning_details"] == BRANCH_REASONING_DETAILS
+        assert assistant["codex_reasoning_items"] == BRANCH_CODEX_REASONING_ITEMS
+        assert assistant["codex_message_items"] == BRANCH_CODEX_MESSAGE_ITEMS
+        assert session["_branch_seed_persisted"] is True
+    finally:
+        db.close()
+
+
+def test_session_branch_keeps_reasoning_fields(monkeypatch, tmp_path):
+    """session.branch copies the live transcript with its reasoning fields.
+
+    Same drop as the seed path: the copy loop wrote only role/content, so the
+    new session row replayed without the reasoning context the parent had.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    server._sessions["sid"] = _session(history=_branch_history())
+    try:
+        db.create_session("session-key", source="tui")
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_new_session_key", lambda: "branch-key")
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
+        monkeypatch.setattr(
+            server, "_claim_active_session_slot", lambda *args, **kwargs: (None, None)
+        )
+        monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+        monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
+        monkeypatch.setattr(
+            server, "_make_agent", lambda *args, **kwargs: types.SimpleNamespace()
+        )
+        monkeypatch.setattr(server, "_init_session", lambda *args, **kwargs: None)
+
+        resp = server.handle_request(
+            {"id": "1", "method": "session.branch", "params": {"session_id": "sid"}}
+        )
+
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assistant = _branched_assistant(db, "branch-key")
+        assert assistant["reasoning"] == BRANCH_REASONING
+        assert assistant["reasoning_content"] == BRANCH_REASONING_CONTENT
+        assert assistant["reasoning_details"] == BRANCH_REASONING_DETAILS
+        assert assistant["codex_reasoning_items"] == BRANCH_CODEX_REASONING_ITEMS
+        assert assistant["codex_message_items"] == BRANCH_CODEX_MESSAGE_ITEMS
+    finally:
+        server._sessions.pop("sid", None)
+        db.close()

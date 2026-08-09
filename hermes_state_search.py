@@ -32,6 +32,18 @@ from hermes_state_common import (
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
 
+# Characters FTS5's query grammar rejects outside a quoted phrase. Anything
+# missing from this set reaches MATCH raw and raises, which the execute site
+# swallows into zero results — the failure this strip step exists to prevent.
+# Assembled through re.escape so the backslash cannot be eaten as a regex
+# escape inside the class (it was, while the set was written as a literal).
+#
+# ``%`` is deliberately excluded: a CJK query falls back to a LIKE search that
+# needs it preserved as a literal (that path escapes wildcards itself), so
+# stripping it here widened those queries onto unrelated rows.
+_FTS5_SPECIAL_CHARS = '+{}():"^@/#&|~[]<>,;!?$=\\\''
+_FTS5_SPECIAL_RE = re.compile(f"[{re.escape(_FTS5_SPECIAL_CHARS)}]")
+
 
 class SessionSearchMixin:
     """See module docstring — mixin for SessionDB (Search cluster)."""
@@ -1210,7 +1222,21 @@ class SessionSearchMixin:
         # single ``content`` column, an unquoted colon query like ``TODO: fix``
         # parses as ``column:term`` and raises "no such column" — swallowed at
         # the execute site into zero results.  Strip it like the others.
-        sanitized = re.sub(r'[+{}():\"^]', " ", sanitized)
+        # The class below is every character FTS5's query grammar rejects
+        # outside a quoted phrase. Anything omitted here reaches MATCH raw and
+        # raises, which the execute site swallows into zero results — the
+        # failure mode this step exists to prevent. Measured against a real
+        # FTS5 table: ``it's``, ``gateway/run.py``, ``user@host``, ``a,b`` and
+        # ``50%`` all raised before the class was completed.
+        sanitized = _FTS5_SPECIAL_RE.sub(" ", sanitized)
+
+        # Step 2b: ``%`` is excluded from the class above only to protect the
+        # CJK LIKE-fallback path (LIKE treats % as a wildcard the fallback
+        # builds itself). A non-CJK query never reaches that fallback
+        # (``is_cjk`` gates it), so ``50%`` would sail into MATCH raw and
+        # raise like the rest. Strip it whenever the query has no CJK.
+        if "%" in sanitized and not SessionSearchMixin._contains_cjk(sanitized):
+            sanitized = sanitized.replace("%", " ")
 
         # Step 3: Collapse repeated * (e.g. "***") into a single one,
         # and remove leading * (prefix-only needs at least one char before *)

@@ -197,9 +197,12 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
   await syncConfiguredDefaultProjectDir()
   const configured = getConfiguredDefaultProjectDir()
 
+  // Transient: each source below is already remembered or comes from config, so
+  // persisting would only promote a configured default into the per-backend
+  // memory of what the user picked.
   const seedLiveCwd = (cwd: string) => {
     if (cwd && !$activeSessionId.get()) {
-      setCurrentCwd(cwd)
+      setCurrentCwdTransient(cwd)
     }
   }
 
@@ -250,6 +253,35 @@ export const sessionMatchesStoredId = (
   session: Pick<SessionInfo, '_lineage_root_id' | 'id'>,
   storedSessionId: string
 ): boolean => session.id === storedSessionId || session._lineage_root_id === storedSessionId
+
+/** Every id one conversation answers to: the id we were handed, plus the live
+ *  id and lineage root of each session it resolves to.
+ *
+ *  Status sets are published under a session's CURRENT stored id, but a sidebar
+ *  row, a persisted tile, and the route can each hold a different tip of the
+ *  same lineage after a compression. Publishing every alias lets those surfaces
+ *  keep using a plain membership test instead of each re-deriving lineage —
+ *  and getting it wrong, which reads as a running session going idle mid-turn. */
+export function lineageAliases(
+  storedId: string,
+  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id'>[]
+): string[] {
+  const aliases = new Set([storedId])
+
+  for (const session of sessions) {
+    if (!sessionMatchesStoredId(session, storedId)) {
+      continue
+    }
+
+    aliases.add(session.id)
+
+    if (session._lineage_root_id) {
+      aliases.add(session._lineage_root_id)
+    }
+  }
+
+  return [...aliases]
+}
 
 /** True when two ids name the same conversation across compression tip rotation. */
 export function idsShareLineage(
@@ -571,6 +603,12 @@ export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStor
 // Written by session-states.ts (handleTransition), cleared here on session open.
 export const $unreadFinishedSessionIds = atom<string[]>([])
 
+export const markAllSessionsRead = () => {
+  if ($unreadFinishedSessionIds.get().length) {
+    $unreadFinishedSessionIds.set([])
+  }
+}
+
 export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
   updateAtom($selectedStoredSessionId, next)
   // Opening a session clears its unread state — the user is now looking at it.
@@ -649,6 +687,14 @@ export const setCurrentFastMode = (next: Updater<boolean>) => {
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
 
+/** Move the live workspace AND remember it as this backend's workspace.
+ *
+ *  Only for a path the user chose — a folder pick, a project/worktree entry, an
+ *  explicit workspace target. The remembered value is where a new chat starts on
+ *  a remote backend, so writing it from a path the user merely *looked at* makes
+ *  every new chat land in the last session's folder (#77496, #80213). To follow
+ *  a conversation's cwd, use `setCurrentCwdTransient`.
+ */
 export const setCurrentCwd = (next: Updater<string>) => {
   updateAtom($currentCwd, next)
   persistString(workspaceCwdKey(), $currentCwd.get().trim() || null)
@@ -656,6 +702,11 @@ export const setCurrentCwd = (next: Updater<string>) => {
 
 export const setTerminalBackend = (next: Updater<string>) => updateAtom($terminalBackend, next)
 
+/** Move the live workspace without claiming it as the user's chosen one.
+ *
+ *  For paths that come from a conversation rather than from the user: resume
+ *  settling, a warm switch, the agent relocating mid-turn, detaching a draft.
+ */
 export const setCurrentCwdTransient = (next: Updater<string>) => updateAtom($currentCwd, next)
 
 // Released-ownership marker: the live path belongs to no conversation. `null`
@@ -688,12 +739,12 @@ export const releaseWorkspaceCwdOwner = () => updateAtom($workspaceCwdOwner, WOR
  *
  *  The single primitive for "this path IS the selected conversation's" — a folder
  *  pick, a project entry, the agent relocating itself. Prefer it over a bare
- *  `setCurrentCwd`, which moves the path while leaving ownership naming whatever
- *  held it before; workspace-derived slices then stay hidden even though the
- *  path is correct (#71254).
+ *  `setCurrentCwdTransient`, which moves the path while leaving ownership naming
+ *  whatever held it before; workspace-derived slices then stay hidden even though
+ *  the path is correct (#71254).
  */
 export const commitWorkspaceCwdForSelectedSession = (cwd: string) => {
-  setCurrentCwd(cwd)
+  setCurrentCwdTransient(cwd)
   setWorkspaceCwdOwner($selectedStoredSessionId.get())
 }
 
