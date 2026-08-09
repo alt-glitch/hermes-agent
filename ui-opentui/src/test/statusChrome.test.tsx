@@ -712,6 +712,17 @@ describe('StatusBar frames — session title replaces the cwd tail', () => {
     }
   })
 
+  test('wide CJK and emoji titles are budgeted in terminal cells and never wrap', async () => {
+    const store = seededStore()
+    store.applyInfo({ title: '规划发布窗口与回滚步骤 🚀🚀🚀' })
+    for (const width of [78, 100, 120, 160]) {
+      const frame = await captureFrame(bar(store), { width, height: 3 })
+      const rows = frame.split('\n').filter(row => row.trim())
+      expect(rows, `width ${String(width)}`).toHaveLength(1)
+      expect(rows.filter(row => row.includes('│')).length, `width ${String(width)}`).toBe(1)
+    }
+  })
+
   test('deterministic truncation: the chip tail-clips with … inside the leftover budget', async () => {
     const store = seededStore()
     const longTitle = 'a long descriptive session title that cannot possibly fit this terminal width'

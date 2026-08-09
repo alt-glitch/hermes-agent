@@ -55,7 +55,7 @@ import { delegationPressure, idleSubagentResumeStatus, type DelegationState } fr
 import { batteryLabel, type BatteryCategory } from '../logic/battery.ts'
 import type { SessionStore, SubagentInfo } from '../logic/store.ts'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../logic/subagentTree.ts'
-import { truncLeft, truncRight } from '../logic/truncate.ts'
+import { truncLeft, truncRight, truncRightCells } from '../logic/truncate.ts'
 import { useDimensions } from './dimensions.tsx'
 import { elapsedSeconds, useElapsedTick } from './elapsed.ts'
 import { useTheme } from './theme.tsx'
@@ -462,7 +462,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     if (!title) return ''
     const budget = dims().width - ROW_PADDING - leftLen() - SEP.length
     if (budget < CWD_MIN) return ''
-    return ` ${truncRight(title, budget - 2)} `
+    return ` ${truncRightCells(title, budget - 2)} `
   })
   const cwdText = createMemo(() => {
     if (sessionTitle()) return '' // the title chip replaces the cwd/project/branch tail
