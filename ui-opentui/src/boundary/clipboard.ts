@@ -40,7 +40,9 @@ function run(cmd: string, args: string[] = [], input?: string): Promise<Buffer> 
   return new Promise((resolve, reject) => {
     let child
     try {
-      child = spawn(cmd, args, { stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'ignore'] })
+      child = spawn(cmd, args, {
+        stdio: [input === undefined ? 'ignore' : 'pipe', input === undefined ? 'pipe' : 'ignore', 'ignore']
+      })
     } catch (cause) {
       reject(cause instanceof Error ? cause : new Error(String(cause)))
       return
@@ -52,7 +54,8 @@ function run(cmd: string, args: string[] = [], input?: string): Promise<Buffer> 
     child.on('close', code => (code === 0 ? resolve(Buffer.concat(out)) : reject(new Error(`${cmd} exit ${code}`))))
     if (input !== undefined) {
       // Copy is best-effort during shutdown: do not let its child keep Node alive.
-      // Reads stay referenced because their result depends on collecting stdout.
+      // Its stdout is ignored above because a referenced stdout pipe defeats
+      // child.unref(); reads stay referenced and piped because they need output.
       child.unref()
       if (child.stdin) {
         // Writing to a tool that died/closed early raises EPIPE (→ SIGPIPE). Swallow it.

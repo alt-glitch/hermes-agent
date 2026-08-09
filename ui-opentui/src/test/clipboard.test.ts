@@ -45,6 +45,9 @@ describe('clipboard child lifetime', () => {
     expect(writeChild.unref).toHaveBeenCalledOnce()
     expect(textChild?.unref).not.toHaveBeenCalled()
     expect(imageChild?.unref).not.toHaveBeenCalled()
+    expect(spawn.mock.calls[0]?.[2]).toEqual({ stdio: ['pipe', 'ignore', 'ignore'] })
+    expect(spawn.mock.calls[1]?.[2]).toEqual({ stdio: ['ignore', 'pipe', 'ignore'] })
+    expect(spawn.mock.calls[2]?.[2]).toEqual({ stdio: ['ignore', 'pipe', 'ignore'] })
   })
 })
 
