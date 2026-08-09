@@ -1,6 +1,52 @@
+import { EventEmitter } from 'node:events'
+
 import { describe, expect, test, vi } from 'vitest'
 
-import { readClipboardText } from '../boundary/clipboard.ts'
+const spawn = vi.hoisted(() => vi.fn())
+
+vi.mock('node:child_process', () => ({ spawn }))
+vi.mock('node:fs', () => ({ existsSync: () => true }))
+vi.mock('node:os', () => ({ platform: () => 'linux' }))
+
+import { readClipboardImage, readClipboardText, writeClipboard } from '../boundary/clipboard.ts'
+
+function clipboardChild(stdout: Buffer = Buffer.alloc(0)) {
+  const childStdout = new EventEmitter()
+  const childStdin = Object.assign(new EventEmitter(), { end: vi.fn() })
+  const child = Object.assign(new EventEmitter(), {
+    stdin: childStdin,
+    stdout: childStdout,
+    unref: vi.fn()
+  })
+  queueMicrotask(() => {
+    if (stdout.length > 0) childStdout.emit('data', stdout)
+    child.emit('close', 0)
+  })
+  return child
+}
+
+describe('clipboard child lifetime', () => {
+  test('unrefs writes but keeps text and image reads referenced', async () => {
+    const writeChild = clipboardChild()
+    let textChild: ReturnType<typeof clipboardChild> | undefined
+    let imageChild: ReturnType<typeof clipboardChild> | undefined
+    spawn
+      .mockReturnValueOnce(writeChild)
+      .mockImplementationOnce(() => (textChild = clipboardChild(Buffer.from('clipboard text'))))
+      .mockImplementationOnce(() => (imageChild = clipboardChild(Buffer.from('png bytes'))))
+
+    await writeClipboard('copied text')
+    await expect(readClipboardText('linux', undefined, {}, () => true)).resolves.toBe('clipboard text')
+    await expect(readClipboardImage()).resolves.toEqual({
+      data: Buffer.from('png bytes').toString('base64'),
+      mime: 'image/png'
+    })
+
+    expect(writeChild.unref).toHaveBeenCalledOnce()
+    expect(textChild?.unref).not.toHaveBeenCalled()
+    expect(imageChild?.unref).not.toHaveBeenCalled()
+  })
+})
 
 describe('PowerShell clipboard text reads', () => {
   test.each([

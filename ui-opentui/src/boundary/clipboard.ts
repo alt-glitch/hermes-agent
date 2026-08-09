@@ -50,13 +50,18 @@ function run(cmd: string, args: string[] = [], input?: string): Promise<Buffer> 
     child.stdout?.on('error', () => {}) // a closed stdout pipe must not throw
     child.stdout?.on('data', (c: Buffer) => out.push(c))
     child.on('close', code => (code === 0 ? resolve(Buffer.concat(out)) : reject(new Error(`${cmd} exit ${code}`))))
-    if (input !== undefined && child.stdin) {
-      // Writing to a tool that died/closed early raises EPIPE (→ SIGPIPE). Swallow it.
-      child.stdin.on('error', () => {})
-      try {
-        child.stdin.end(input)
-      } catch {
-        // pipe already gone — nothing to flush
+    if (input !== undefined) {
+      // Copy is best-effort during shutdown: do not let its child keep Node alive.
+      // Reads stay referenced because their result depends on collecting stdout.
+      child.unref()
+      if (child.stdin) {
+        // Writing to a tool that died/closed early raises EPIPE (→ SIGPIPE). Swallow it.
+        child.stdin.on('error', () => {})
+        try {
+          child.stdin.end(input)
+        } catch {
+          // pipe already gone — nothing to flush
+        }
       }
     }
   })
