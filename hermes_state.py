@@ -60,6 +60,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_SQL,
+    FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
@@ -3177,6 +3178,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # incremental FTS merge cadence (see _merge_fts_incrementally).
         self._fts_usermerge_floor_applied = False
         self._fts_enabled = False
+        self._fts_stale = False
         self._trigram_available = False
         # CJK-bigram index (cjk_unicode61 loadable tokenizer). _fts_cjk_loaded:
         # extension present on the writer connection; _fts_cjk_available: the
@@ -3813,16 +3815,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
-                # while the canonical messages table is intact. The gateway
-                # session store has its own retry queue for transcript
-                # appends (#65637 salvage), but cron and CLI writers call
-                # SessionDB directly — without this, their writes hard-fail
-                # until the next process restart triggers the offline repair.
-                # Rebuild the FTS index in place (once per instance) via
-                # rebuild_fts() and retry the failed write immediately.
-                if not self._try_runtime_fts_rebuild(exc):
-                    raise
-                continue
+                # while the canonical messages table is intact. Recover here,
+                # at the shared persistence boundary, so every caller gets the
+                # same guarantee. First try the cheap in-place repair. If that
+                # one-shot path is unavailable or corruption recurs, detach the
+                # derived indexes and retry against the canonical tables.
+                if self._try_runtime_fts_rebuild(exc):
+                    continue
+                if self._enter_fts_fail_open(exc):
+                    continue
+                raise
             except sqlite3.Error as exc:
                 # Catch-all for builds that surface 'no more rows available'
                 # as InterfaceError (a sibling of DatabaseError, not a
@@ -3923,6 +3925,63 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         logger.warning(
             "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
             rebuilt,
+        )
+        return True
+
+    def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
+        """Detach corrupt FTS indexes so canonical writes can continue.
+
+        The stale breadcrumb and trigger removal commit atomically. Its
+        ordering is load-bearing: after triggers are absent, new canonical
+        rows create an index gap of unknown extent, so another process must
+        never reinstall the triggers without first rebuilding every row.
+        """
+        if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
+            return False
+
+        try:
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._conn.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (FTS_STALE_KEY,),
+                    )
+                    cjk_triggers_present = self._conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
+                        "LIMIT 1",
+                        _FTS_CJK_TRIGGERS,
+                    ).fetchone()
+                    if cjk_triggers_present:
+                        self._conn.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (FTS_CJK_STALE_KEY,),
+                        )
+                    self._drop_all_fts_triggers(self._conn.cursor())
+                    self._conn.commit()
+                except BaseException:
+                    self._conn.rollback()
+                    raise
+        except sqlite3.Error as detach_exc:
+            logger.error(
+                "Could not detach corrupt FTS indexes; canonical write still "
+                "cannot proceed: %s",
+                detach_exc,
+            )
+            return False
+
+        self._fts_stale = True
+        self._fts_enabled = False
+        self._trigram_available = False
+        self._fts_cjk_available = False
+        logger.error(
+            "state.db FTS indexes remain corrupt (%s); disabled FTS sync and "
+            "retrying the canonical write. Search temporarily uses LIKE until "
+            "a later SessionDB open rebuilds the indexes.",
+            exc,
         )
         return True
 
@@ -4088,6 +4147,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cwd: str = None,
         profile_name: str = None,
         git_repo_root: str = None,
+        origin_json: str = None,
+        display_name: str = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -4130,9 +4191,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, system_prompt_hash,
-                   parent_session_id, cwd, profile_name, git_repo_root, started_at
+                   parent_session_id, cwd, profile_name, git_repo_root,
+                   origin_json, display_name, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -4153,7 +4215,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
                        cwd = COALESCE(sessions.cwd, excluded.cwd),
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
-                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root)""",
+                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root),
+                       origin_json = COALESCE(sessions.origin_json, excluded.origin_json),
+                       display_name = COALESCE(sessions.display_name, excluded.display_name)""",
                 (
                     session_id,
                     source,
@@ -4169,6 +4233,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     cwd,
                     profile_name,
                     git_repo_root,
+                    origin_json,
+                    display_name,
                     time.time(),
                 ),
             )
@@ -4270,6 +4336,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         on one routing peer when an explicit gateway resume moves its tip to a
         different lane. Normal per-turn metadata refreshes update only the
         supplied row.
+
+        Self-healing (#82616): when the target row does not exist yet — the
+        gateway's ``create_session`` write failed and was deferred, or a
+        crash landed between routing publication and row creation — this
+        recorder INSERTs the row with the full identity instead of silently
+        no-opping. Every per-turn peer refresh is therefore a repair
+        opportunity: a gateway session row can no longer be first-created by
+        an identity-less lazy writer (``update_token_counts`` /
+        ``record_auxiliary_usage``) and stay unroutable forever.
         """
         if not session_id or not session_key:
             return
@@ -4325,6 +4400,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    {target_clause}""",
                 query_params,
             )
+            # Self-heal (#82616): the UPDATE is a silent no-op when the row
+            # is missing (create_session failed earlier, or a crash landed
+            # between routing publication and row creation). Insert it with
+            # the full identity so the session is durably routable — never
+            # leave first-creation to an identity-less lazy writer.
+            if not include_compression_ancestors:
+                cur = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+                )
+                if cur.fetchone() is None:
+                    conn.execute(
+                        """INSERT INTO sessions (
+                               id, source, user_id, session_key, chat_id,
+                               chat_type, thread_id, display_name, origin_json,
+                               started_at
+                           )
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(id) DO UPDATE SET
+                               session_key = COALESCE(sessions.session_key, excluded.session_key),
+                               chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
+                               chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
+                               thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                               display_name = COALESCE(sessions.display_name, excluded.display_name),
+                               origin_json = COALESCE(sessions.origin_json, excluded.origin_json)""",
+                        (
+                            session_id,
+                            source,
+                            user_id,
+                            session_key,
+                            chat_id,
+                            chat_type,
+                            thread_id,
+                            display_name,
+                            origin_json,
+                            time.time(),
+                        ),
+                    )
 
         self._execute_write(_do)
 
@@ -4533,6 +4645,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (dashboard viewer disconnect before #60609) are treated as recoverable;
         explicit conversation boundaries such as /new, /resume switches, and
         compression splits are not.
+
+        Ordering and emptiness (#82616): candidates are ranked by actual
+        conversation recency (``last_activity_at``, falling back to
+        ``started_at``) — ``started_at`` alone resurrected days-old zombie
+        rows over the live conversation. Rows with messages are preferred,
+        but an empty keyed row is still returned rather than ``None``:
+        returning ``None`` mints a brand-new session id, which is a worse
+        outcome than resuming an empty-but-correctly-keyed row (and "empty"
+        may just mean the transcript lives under a compression child).
+
+        Reset boundaries fence recovery (#68539): an intentional boundary
+        such as ``session_reset`` (or any explicit non-recoverable
+        end_reason) must block fallback to an *older* row for the same
+        peer. Without the fence, the has-messages ranking above could reach
+        behind a /new reset and silently restore the exact context the user
+        reset. Each candidate is therefore rejected when a boundary row for
+        the peer ended *after* the candidate's last activity — if the
+        conversation's most recent event is an intentional reset, recovery
+        returns nothing rather than reaching behind it.
         """
         if not session_key:
             return None
@@ -4541,16 +4672,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
-                           AS _system_prompt_resolved
+                           AS _system_prompt_resolved,
+                       (COALESCE(s.message_count, 0) > 0 OR EXISTS (
+                           SELECT 1 FROM messages WHERE messages.session_id = s.id LIMIT 1
+                       )) AS _has_messages
                 FROM sessions s
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.session_key = ?
                   AND s.source = ?
                   AND (s.ended_at IS NULL OR s.end_reason IN ('agent_close', 'ws_orphan_reap'))
-                  AND (COALESCE(s.message_count, 0) > 0 OR EXISTS (
-                      SELECT 1 FROM messages WHERE messages.session_id = s.id LIMIT 1
-                  ))
-                ORDER BY s.started_at DESC
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sessions b
+                      WHERE b.session_key = s.session_key
+                        AND b.source = s.source
+                        AND b.ended_at IS NOT NULL
+                        AND b.end_reason IN ('session_reset', 'session_switch',
+                                             'idle', 'daily', 'suspended',
+                                             'resume_pending_expired')
+                        AND b.ended_at
+                            > COALESCE(s.last_activity_at, s.started_at)
+                  )
+                ORDER BY _has_messages DESC,
+                         COALESCE(s.last_activity_at, s.started_at) DESC
                 LIMIT 1
                 """,
                 (session_key, source),
@@ -4567,7 +4710,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
-                           AS _system_prompt_resolved
+                           AS _system_prompt_resolved,
+                       (COALESCE(s.message_count, 0) > 0 OR EXISTS (
+                           SELECT 1 FROM messages WHERE messages.session_id = s.id LIMIT 1
+                       )) AS _has_messages
                 FROM sessions s
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.source = ?
@@ -4579,12 +4725,255 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   AND (COALESCE(s.message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = s.id LIMIT 1
                   ))
-                ORDER BY s.started_at DESC
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sessions b
+                      WHERE b.source = s.source
+                        AND COALESCE(b.user_id, '') = COALESCE(s.user_id, '')
+                        AND COALESCE(b.chat_id, '') = COALESCE(s.chat_id, '')
+                        AND COALESCE(b.chat_type, '') = COALESCE(s.chat_type, '')
+                        AND COALESCE(b.thread_id, '') = COALESCE(s.thread_id, '')
+                        AND b.ended_at IS NOT NULL
+                        AND b.end_reason IN ('session_reset', 'session_switch',
+                                             'idle', 'daily', 'suspended',
+                                             'resume_pending_expired')
+                        AND b.ended_at
+                            > COALESCE(s.last_activity_at, s.started_at)
+                  )
+                ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC
                 LIMIT 1
                 """,
                 (source, user_id, chat_id, chat_type, thread_id),
             ).fetchone()
         return self._session_row_dict(row) if row else None
+
+    # ── Orphaned gateway-session repair (#82616) ──────────────────────────
+    # A write-path failure (corrupt FTS, crash between routing publication
+    # and row creation) can leave the live conversation in a session row
+    # that never received its identity columns. Both queries above require
+    # those columns, so the row holding the real transcript is invisible to
+    # recovery: the chat resolves to the last keyed row instead — days older
+    # — and the conversation time-travels. Hardening the write side cannot
+    # reach a row that is *already* damaged; these two methods are the
+    # offline repair path behind ``hermes sessions repair-routing``.
+
+    # Widest plausible gap between a keyed predecessor going quiet and its
+    # unkeyed successor being minted. The reported incident gap was ~60s;
+    # 15 minutes stays generous without spanning unrelated conversations.
+    _ORPHAN_ADOPTION_MAX_GAP_S = 900.0
+
+    def find_orphaned_gateway_sessions(
+        self, *, max_gap_s: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        """Report message-bearing session rows that lost their routing identity.
+
+        A row is a candidate orphan when it has messages but no
+        ``session_key``. It is only *adoptable* when exactly one keyed
+        predecessor can be named as the conversation it continues:
+
+        * ``lineage`` — ``parent_session_id`` points at a keyed row of the
+          same source. That is a recorded fact, so no time window applies.
+        * ``contiguity`` — exactly one keyed row of the same source (and
+          compatible ``user_id``) fell quiet within *max_gap_s* of the
+          orphan's start, and is older than the orphan's own last activity.
+
+        Anything ambiguous is reported with ``adoptable=False`` and a reason
+        rather than guessed at: mis-adopting would splice one person's
+        conversation into another person's chat. Branch/delegate/tool rows
+        are excluded outright — they are unkeyed by design, not by damage.
+        """
+        gap = (
+            self._ORPHAN_ADOPTION_MAX_GAP_S
+            if max_gap_s is None
+            else float(max_gap_s)
+        )
+        orphan_active = _sql_session_last_active("o")
+        donor_active = _sql_session_last_active("d")
+        donor_columns = (
+            "d.id, d.session_key, d.chat_id, d.chat_type, d.thread_id, "
+            "d.user_id, d.origin_json, d.display_name, d.end_reason"
+        )
+        records: List[Dict[str, Any]] = []
+
+        with self._lock:
+            orphans = self._conn.execute(
+                f"""
+                SELECT o.id, o.source, o.user_id, o.started_at,
+                       o.parent_session_id,
+                       {orphan_active} AS last_active,
+                       (SELECT COUNT(*) FROM messages m
+                         WHERE m.session_id = o.id) AS message_count
+                FROM sessions o
+                WHERE o.session_key IS NULL
+                  AND EXISTS (SELECT 1 FROM messages m
+                               WHERE m.session_id = o.id)
+                  AND COALESCE(o.source, '') != 'tool'
+                  AND json_extract(COALESCE(o.model_config, '{{}}'),
+                                   '$._branched_from') IS NULL
+                  AND json_extract(COALESCE(o.model_config, '{{}}'),
+                                   '$._delegate_from') IS NULL
+                ORDER BY o.started_at ASC
+                """
+            ).fetchall()
+
+            for orphan in orphans:
+                donor = None
+                evidence = ""
+                reason = ""
+
+                if orphan["parent_session_id"]:
+                    evidence = "lineage"
+                    donor = self._conn.execute(
+                        f"""
+                        SELECT {donor_columns}
+                        FROM sessions d
+                        WHERE d.id = ?
+                          AND d.session_key IS NOT NULL
+                          AND COALESCE(d.source, '') = COALESCE(?, '')
+                        """,
+                        (orphan["parent_session_id"], orphan["source"]),
+                    ).fetchone()
+                    if donor is None:
+                        reason = (
+                            "parent session carries no gateway identity of "
+                            "this source"
+                        )
+                else:
+                    evidence = "contiguity"
+                    candidates = self._conn.execute(
+                        f"""
+                        SELECT {donor_columns}, {donor_active} AS last_active
+                        FROM sessions d
+                        WHERE d.session_key IS NOT NULL
+                          AND d.id != ?
+                          AND COALESCE(d.source, '') = COALESCE(?, '')
+                          AND (COALESCE(d.user_id, '') = ''
+                               OR COALESCE(?, '') = ''
+                               OR d.user_id = ?)
+                          AND {donor_active} BETWEEN ? AND ?
+                          AND {donor_active} < ?
+                        ORDER BY last_active DESC
+                        LIMIT 2
+                        """,
+                        (
+                            orphan["id"],
+                            orphan["source"],
+                            orphan["user_id"],
+                            orphan["user_id"],
+                            (orphan["started_at"] or 0) - gap,
+                            (orphan["started_at"] or 0) + gap,
+                            orphan["last_active"],
+                        ),
+                    ).fetchall()
+                    if not candidates:
+                        reason = (
+                            f"no keyed predecessor fell quiet within {gap:.0f}s "
+                            "of this session's start"
+                        )
+                    elif len(candidates) > 1:
+                        reason = (
+                            "ambiguous: more than one keyed predecessor "
+                            "matches this window"
+                        )
+                    else:
+                        donor = candidates[0]
+
+                records.append(
+                    {
+                        "orphan_id": orphan["id"],
+                        "source": orphan["source"],
+                        "message_count": orphan["message_count"],
+                        "started_at": orphan["started_at"],
+                        "last_active": orphan["last_active"],
+                        "donor_id": donor["id"] if donor else None,
+                        "session_key": donor["session_key"] if donor else None,
+                        "evidence": evidence if donor else "",
+                        "adoptable": donor is not None,
+                        "reason": reason,
+                    }
+                )
+
+        # Two unkeyed successors claiming the same predecessor means at most
+        # one of them continues that chat, and nothing here says which.
+        contested = {
+            r["donor_id"]
+            for r in records
+            if r["adoptable"]
+            and sum(1 for x in records if x["donor_id"] == r["donor_id"]) > 1
+        }
+        for record in records:
+            if record["donor_id"] in contested:
+                record["adoptable"] = False
+                record["reason"] = (
+                    "ambiguous: more than one unkeyed session claims this "
+                    "predecessor"
+                )
+        return records
+
+    def adopt_orphaned_gateway_session(
+        self, orphan_id: str, donor_id: str
+    ) -> bool:
+        """Stamp *orphan_id* with *donor_id*'s routing identity, retire *donor_id*.
+
+        Re-verifies the pair inside the write transaction, so a concurrent
+        gateway that healed either row in the meantime turns this into a
+        no-op instead of a conflicting write. Existing non-NULL columns on
+        the orphan are preserved. Returns True when the adoption applied.
+        """
+        if not orphan_id or not donor_id or orphan_id == donor_id:
+            return False
+
+        def _do(conn):
+            donor = conn.execute(
+                "SELECT session_key, chat_id, chat_type, thread_id, user_id, "
+                "origin_json, display_name, source FROM sessions WHERE id = ?",
+                (donor_id,),
+            ).fetchone()
+            orphan = conn.execute(
+                "SELECT session_key, source FROM sessions WHERE id = ?",
+                (orphan_id,),
+            ).fetchone()
+            if donor is None or orphan is None:
+                return False
+            if not donor["session_key"] or orphan["session_key"]:
+                return False
+            if (donor["source"] or "") != (orphan["source"] or ""):
+                return False
+
+            conn.execute(
+                """UPDATE sessions
+                      SET session_key = ?,
+                          chat_id = COALESCE(chat_id, ?),
+                          chat_type = COALESCE(chat_type, ?),
+                          thread_id = COALESCE(thread_id, ?),
+                          user_id = COALESCE(user_id, ?),
+                          origin_json = COALESCE(origin_json, ?),
+                          display_name = COALESCE(display_name, ?),
+                          parent_session_id = COALESCE(parent_session_id, ?)
+                    WHERE id = ? AND session_key IS NULL""",
+                (
+                    donor["session_key"],
+                    donor["chat_id"],
+                    donor["chat_type"],
+                    donor["thread_id"],
+                    donor["user_id"],
+                    donor["origin_json"],
+                    donor["display_name"],
+                    donor_id,
+                    orphan_id,
+                ),
+            )
+            # Retire the predecessor under a reason recovery does NOT treat
+            # as resumable — 'agent_close'/'ws_orphan_reap' would keep it in
+            # the running, and the newly keyed orphan could lose the chat
+            # again on the next restart.
+            conn.execute(
+                "UPDATE sessions SET ended_at = COALESCE(ended_at, ?), "
+                "end_reason = 'superseded_by_repair' WHERE id = ?",
+                (time.time(), donor_id),
+            )
+            return True
+
+        return self._execute_write(_do)
 
     # Children that carry a ``parent_session_id`` but are NOT compression
     # continuations: branches, delegate/subagent runs, and tool sessions.
