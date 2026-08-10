@@ -138,6 +138,16 @@ export function mapResumeHistory(history: unknown): Message[] {
       pendingTools = []
       continue
     }
+    // A persisted personality pivot (upstream 327f7efab8b): the stored user row
+    // is the provider-facing pivot prompt. Surface the timeline fact as a concise
+    // system row, matching Ink's toTranscriptMessages.
+    if (displayKind === 'personality_switch') {
+      const message: Message = { role: 'system', text: 'personality changed' }
+      if (ts !== undefined) message.timestamp = ts
+      out.push(message)
+      pendingTools = []
+      continue
+    }
     if (displayKind === 'async_delegation_complete') {
       const metadata =
         raw && typeof raw === 'object' ? (raw as { display_metadata?: unknown }).display_metadata : undefined

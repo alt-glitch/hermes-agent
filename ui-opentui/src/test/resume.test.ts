@@ -215,6 +215,39 @@ describe('mapResumeHistory (Phase 4b)', () => {
     expect(msgs.filter(message => message.role === 'user')).toHaveLength(1)
   })
 
+  test('maps persisted personality pivots to a concise system row (upstream 327f7efab8b)', () => {
+    const msgs = mapResumeHistory([
+      { role: 'user', text: 'before' },
+      {
+        role: 'user',
+        text: '[System: adopt the following personality — verbose provider-facing pivot prompt]',
+        display_kind: 'personality_switch',
+        timestamp: 1_753_500_000
+      },
+      { role: 'assistant', text: 'after' }
+    ])
+
+    expect(msgs).toEqual([
+      { role: 'user', text: 'before' },
+      { role: 'system', text: 'personality changed', timestamp: 1_753_500_000 },
+      expect.objectContaining({ role: 'assistant', text: 'after' })
+    ])
+    // the raw provider-facing pivot never renders as a user bubble
+    expect(msgs.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  test('omits the timestamp on a personality pivot lacking one and drops a pending tool trail at the boundary', () => {
+    const msgs = mapResumeHistory([
+      { role: 'tool', name: 'orphan', context: 'x' },
+      { role: 'user', text: 'pivot marker', display_kind: 'personality_switch' },
+      { role: 'assistant', text: 'fresh answer' }
+    ])
+
+    expect(msgs[0]).toEqual({ role: 'system', text: 'personality changed' })
+    // the orphaned tool row is cleared at the display-only boundary, not folded forward
+    expect(msgs[1]?.parts?.map(part => part.type)).toEqual(['text'])
+  })
+
   test('keeps model-switch bookkeeping hidden instead of resurrecting a user bubble', () => {
     const msgs = mapResumeHistory([
       { role: 'user', text: 'before' },
