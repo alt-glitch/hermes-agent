@@ -15465,6 +15465,22 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"key": key, "value": nv})
 
+    if key == "browser_backend":
+        # /browser use changes the model tool schema, so persist the backend and
+        # invalidate this process's availability cache before the client starts
+        # its replacement session. The slash-worker process cannot own either
+        # side effect for a gateway-created agent.
+        raw = str(value or "").strip().lower()
+        if raw not in {"on", "off"}:
+            return _err(rid, 4002, f"unknown browser backend value: {value} (use on|off)")
+        from tools.browser_use_cli import BACKEND_DISABLED
+        from tools.registry import invalidate_check_fn_cache
+
+        backend = "browser-use" if raw == "on" else BACKEND_DISABLED
+        _write_config_key("browser.backend", backend)
+        invalidate_check_fn_cache()
+        return _ok(rid, {"key": key, "value": raw, "backend": backend})
+
     if key == "density":
         raw = str(value or "").strip().lower()
         cfg0 = _load_cfg()

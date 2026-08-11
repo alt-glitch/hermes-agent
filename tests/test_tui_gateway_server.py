@@ -1934,6 +1934,64 @@ def test_config_set_battery_explicit_off(monkeypatch):
     assert writes == {"display.battery": False}
 
 
+def test_config_set_browser_backend_persists_and_invalidates_availability(monkeypatch):
+    writes: list[tuple[str, object]] = []
+    invalidations: list[bool] = []
+    monkeypatch.setattr(
+        server, "_write_config_key", lambda key, value: writes.append((key, value))
+    )
+    monkeypatch.setattr(
+        "tools.registry.invalidate_check_fn_cache",
+        lambda: invalidations.append(True),
+    )
+
+    enabled = server.dispatch(
+        {
+            "id": "browser-on",
+            "method": "config.set",
+            "params": {"key": "browser_backend", "value": "on"},
+        }
+    )
+    disabled = server.dispatch(
+        {
+            "id": "browser-off",
+            "method": "config.set",
+            "params": {"key": "browser_backend", "value": "off"},
+        }
+    )
+
+    assert enabled["result"] == {
+        "key": "browser_backend",
+        "value": "on",
+        "backend": "browser-use",
+    }
+    assert disabled["result"] == {
+        "key": "browser_backend",
+        "value": "off",
+        "backend": "off",
+    }
+    assert writes == [("browser.backend", "browser-use"), ("browser.backend", "off")]
+    assert invalidations == [True, True]
+
+
+def test_config_set_browser_backend_rejects_unknown_value(monkeypatch):
+    writes: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        server, "_write_config_key", lambda key, value: writes.append((key, value))
+    )
+
+    resp = server.dispatch(
+        {
+            "id": "browser-bad",
+            "method": "config.set",
+            "params": {"key": "browser_backend", "value": "toggle"},
+        }
+    )
+
+    assert resp["error"]["code"] == 4002
+    assert writes == []
+
+
 def test_voice_toggle_returns_configured_record_key(monkeypatch):
     monkeypatch.setattr(
         server,
