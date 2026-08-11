@@ -947,6 +947,43 @@ describe('Ctrl+O model picker (upstream f27d45e288)', () => {
 })
 
 describe('browser command parity', () => {
+  test.each(['/browser use', '/browser use on'])(
+    '%s enables Browser Use and replaces the session after persistence',
+    async command => {
+      const p = makeCtx(async () => ({ key: 'browser_backend', value: 'on' }))
+      await dispatchSlash(command, p.ctx)
+      expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'on' } }])
+      expect(p.newSessions).toEqual([
+        ['Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0', undefined]
+      ])
+    }
+  )
+
+  test('/browser use off disables Browser Use and replaces the session after persistence', async () => {
+    const p = makeCtx(async () => ({ key: 'browser_backend', value: 'off' }))
+    await dispatchSlash('/browser use off', p.ctx)
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'off' } }])
+    expect(p.newSessions).toEqual([['Browser Use mode disabled — built-in browser tools restored', undefined]])
+  })
+
+  test('/browser use rejects invalid arguments without persistence or a session replacement', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/browser use maybe', p.ctx)
+    expect(p.calls).toEqual([])
+    expect(p.newSessions).toEqual([])
+    expect(p.system).toEqual(['usage: /browser use [off]'])
+  })
+
+  test('/browser use surfaces RPC failure without replacing the session', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('config unavailable')
+    })
+    await dispatchSlash('/browser use', p.ctx)
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'on' } }])
+    expect(p.newSessions).toEqual([])
+    expect(p.system).toEqual(['/browser: config unavailable'])
+  })
+
   test('connect uses the direct browser.manage boundary and commits live CDP chrome state', async () => {
     const p = makeCtx(async () => ({ connected: true, url: 'http://127.0.0.1:9333' }))
     await dispatchSlash('/browser connect http://127.0.0.1:9333', p.ctx)

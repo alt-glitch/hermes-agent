@@ -2847,8 +2847,27 @@ async function wakeCmd(arg: string, ctx: SlashContext): Promise<void> {
 async function browserCmd(arg: string, ctx: SlashContext, flight: number): Promise<void> {
   const [rawAction = 'status', ...rest] = arg.trim().split(/\s+/).filter(Boolean)
   const action = rawAction.toLowerCase()
+  if (action === 'use') {
+    const mode = (rest[0] ?? 'on').toLowerCase()
+    if (rest.length > 1 || (mode !== 'on' && mode !== 'off')) {
+      ctx.pushSystem('usage: /browser use [off]')
+      return
+    }
+
+    const sid = ctx.sessionId()
+    await ctx.request('config.set', { key: 'browser_backend', value: mode })
+    if (!currentSessionIs(ctx, sid, flight)) return
+    ctx.newSession(
+      mode === 'on'
+        ? 'Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0'
+        : 'Browser Use mode disabled — built-in browser tools restored'
+    )
+    return
+  }
   if (action !== 'connect' && action !== 'disconnect' && action !== 'status') {
-    ctx.pushSystem('usage: /browser [connect|disconnect|status] [url] · persistent: set browser.cdp_url in config.yaml')
+    ctx.pushSystem(
+      'usage: /browser [connect|disconnect|status|use] [url] · persistent: set browser.cdp_url in config.yaml'
+    )
     return
   }
 
