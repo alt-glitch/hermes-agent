@@ -20,6 +20,11 @@ DEFAULT_CONFIG = {
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
     },
+    # Soft file-descriptor limit for long-running Hermes server processes.
+    # Clamped to the OS hard limit; 0/false/null disables the adjustment.
+    "runtime": {
+        "nofile_soft_limit": 4096,
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
@@ -403,6 +408,17 @@ DEFAULT_CONFIG = {
     },
 
     "browser": {
+        # Browser tool implementation.
+        # ""            — DEFAULT: Browser Use mode when the browser-use CLI
+        #                 (or uvx) is available; otherwise the built-in
+        #                 browser tools. Camofox setups always keep the
+        #                 built-in tools (no CDP surface).
+        # "browser-use" — force Browser Use mode: one browser_exec tool
+        #                 driving the Browser Use CLI 3.0 over any CDP
+        #                 backend (local Chrome, cloud browsers)
+        # "off"         — force the built-in browser tools
+        #                 (browser_navigate, browser_click, …)
+        "backend": "",
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
@@ -2330,6 +2346,10 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Automatically claim tasks in the first-class review column and spawn
+        # the assigned profile with the bundled sdlc-review skill. Disable for
+        # boards where every review is performed manually from the dashboard.
+        "review_dispatch": True,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
