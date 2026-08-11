@@ -11650,6 +11650,11 @@ def _(rid, params: dict) -> dict:
                         "reasoning_details": msg.get("reasoning_details"),
                         "codex_reasoning_items": msg.get("codex_reasoning_items"),
                         "codex_message_items": msg.get("codex_message_items"),
+                        # Provider-facing timeline markers ride as role=user;
+                        # preserve their tags so a resumed branch does not count
+                        # them as real user turns in the rewind ordinal space.
+                        "display_kind": msg.get("display_kind"),
+                        "display_metadata": msg.get("display_metadata"),
                         # Preserve the parent's original timestamps: branch
                         # copies are history, not new activity.
                         "timestamp": msg.get("timestamp"),
@@ -12302,7 +12307,19 @@ def _(rid, params: dict) -> dict:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
+        # A bare confirmation flag is leaked rewind state, not consent for an
+        # ordinary submit. Keep this fork-local handler aligned with the
+        # extracted methods_prompt implementation merged from upstream.
+        if is_truthy_value(params.get("confirm_truncate")) and truncate_user_ordinal is None:
+            return _err(
+                rid,
+                4004,
+                "confirm_truncate requires truncate_before_user_ordinal",
+            )
         if truncate_user_ordinal is not None:
+            # bool is an int subclass: JSON true must not become ordinal 1.
+            if isinstance(truncate_user_ordinal, bool):
+                return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             try:
                 ordinal = int(truncate_user_ordinal)
             except (TypeError, ValueError):
@@ -12376,12 +12393,16 @@ def _(rid, params: dict) -> dict:
                 len(truncated),
                 ordinal,
             )
-            # Persist first. If storage fails, leave the in-memory transcript
-            # untouched so a retry/resume cannot resurrect the supposedly
-            # removed tail under newly appended messages.
+            # Persist first. Soft-archive the dropped active rows so a mis-aimed
+            # rewind remains recoverable without deleting compacted siblings.
             if (db := _get_db()) is not None:
                 try:
-                    db.replace_messages(session["session_key"], truncated)
+                    db.replace_messages(
+                        session["session_key"],
+                        truncated,
+                        active_only=True,
+                        archive_dropped=True,
+                    )
                 except Exception as exc:
                     logger.error(
                         "prompt.submit: replace_messages failed for session %s "
