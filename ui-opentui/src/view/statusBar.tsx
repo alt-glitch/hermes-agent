@@ -454,7 +454,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   // the dirname + branch hug the edge and only the head clips (truncLeft). Its
   // budget is the row width minus the left run; it drops whole below CWD_MIN.
   // The session title OWNS the right-tail slot when set (upstream 5a16635f409c
-  // — Ink swaps cwdLabel for an accent-backed ` title ` chip): a compact,
+  // — Ink swaps cwdLabel for a bold accent ` title ` label): a compact,
   // padded chip on the same leftover budget as the cwd, tail-truncated
   // (truncRight) so the row can never wrap, dropped whole below CWD_MIN.
   const titleChip = createMemo(() => {
@@ -554,13 +554,13 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
         </text>
         {/* the right tail is RIGHT-PINNED (F10): a flex spacer eats the slack so
             the tail hugs the right edge instead of stranding empty navy. When a
-            session title exists, its accent-backed bold chip takes the slot;
+            session title exists, its bold accent label takes the slot;
             otherwise the muted dirname + branch render as before. */}
         <Show when={titleChip() || cwdText()}>
           <box style={{ flexGrow: 1 }} />
           <text selectable={false}>
             <Show when={titleChip()} fallback={<span style={{ fg: theme().color.muted }}>{cwdText()}</span>}>
-              <b style={{ fg: theme().color.statusFg, bg: theme().color.accent }}>{titleChip()}</b>
+              <b style={{ fg: theme().color.accent }}>{titleChip()}</b>
             </Show>
           </text>
         </Show>

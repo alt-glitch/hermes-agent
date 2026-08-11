@@ -660,14 +660,16 @@ describe('StatusBar frames — session title replaces the cwd tail', () => {
       expect(row).not.toContain('Hermes Agent')
       // …and stays right-pinned: the padded chip hugs the right edge.
       expect(row.trimEnd().endsWith('maint-title')).toBe(true)
-      // accent-backed + statusFg ink (the one warm surface the bar allows)
+      // Ink parity: bold accent ink on the normal status surface. Painting a
+      // second theme token over accent can become unreadable in custom skins.
       const chip = probe
         .spans()
         .lines.flatMap(line => line.spans)
         .find(span => span.text.includes('maint-title'))
       expect(chip).toBeDefined()
-      expect(chip?.bg?.toInts().slice(0, 3)).toEqual(RGBA.fromHex(store.state.theme.color.accent).toInts().slice(0, 3))
-      expect(chip?.fg.toInts().slice(0, 3)).toEqual(RGBA.fromHex(store.state.theme.color.statusFg).toInts().slice(0, 3))
+      if (!chip) throw new Error('title chip span missing')
+      expect(chip.bg.toInts().slice(0, 3)).toEqual(RGBA.fromHex(store.state.theme.color.statusBg).toInts().slice(0, 3))
+      expect(chip.fg.toInts().slice(0, 3)).toEqual(RGBA.fromHex(store.state.theme.color.accent).toInts().slice(0, 3))
     } finally {
       probe.destroy()
     }
