@@ -91,6 +91,7 @@ import {
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
 import { actionExitBlocked, DASHBOARD_NEW_SESSION_MESSAGE, isExitHotkey, isRedrawHotkey } from '../logic/hotkeys.ts'
 import { isVoiceRecordKey, voiceRecordKeyFromConfig } from '../logic/voiceKey.ts'
+import { deliverVoiceTranscript, voiceSubmitModeFromConfig } from '../logic/voiceSubmit.ts'
 import { parseProcessList } from '../logic/backgroundActivity.ts'
 import { eventMayEnterStore } from '../logic/eventScope.ts'
 import { createPasteStore } from '../logic/pastes.ts'
@@ -423,7 +424,10 @@ const postSessionSetup = (
       store.hydrateDetails(details.mode, details.sections, detailsRevision)
       store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedBusyConfig.config), batteryRevision)
       store.configureAgentsNudge(tuiAgentsNudgeConfigValue(decodedBusyConfig.config))
-      store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedBusyConfig.config) })
+      store.setVoiceMode({
+        recordKey: voiceRecordKeyFromConfig(decodedBusyConfig.config),
+        submitMode: voiceSubmitModeFromConfig(decodedBusyConfig.config)
+      })
     }
 
     // A session switch may have completed while either best-effort catalog RPC
@@ -741,19 +745,11 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       store.registerCommittedEventHandler(event => {
         if (event.type === 'billing.step_up.verification') {
           presentBillingVerification(event.payload, { pushSystem: text => store.pushSystem(text) })
-        } else if (
-          event.type === 'voice.transcript' &&
-          !event.payload?.no_speech_limit &&
-          // A bare stop phrase (spoken or typed) is user intent to END the
-          // voice chat (upstream ba13132298) — the store reducer prints the
-          // "voice chat ended" notice; it MUST NOT submit as an agent turn.
-          !event.payload?.stop_phrase
-        ) {
-          const text = event.payload?.text?.trim()
-          if (text) {
-            store.clearComposerDraft()
-            queueMicrotask(() => submitVoiceTranscript(text))
-          }
+        } else if (event.type === 'voice.transcript') {
+          // Stop-phrase/no-speech guards and the voice.submit_mode decision
+          // (direct: clear + defer one submit; draft: edit the composer only)
+          // live in logic/voiceSubmit.ts.
+          deliverVoiceTranscript(store, event.payload, text => submitVoiceTranscript(text))
         } else if (event.type === 'wake.detected') {
           onWakeDetected(event.payload ?? {})
         }
@@ -1123,7 +1119,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               const details = detailsFromConfig(decodedConfig.config)
               store.hydrateDetails(details.mode, details.sections, detailsRevision)
               store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedConfig.config), batteryRevision)
-              store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedConfig.config) })
+              store.setVoiceMode({
+                recordKey: voiceRecordKeyFromConfig(decodedConfig.config),
+                submitMode: voiceSubmitModeFromConfig(decodedConfig.config)
+              })
               configSync.completeHydration(plan, true)
             })
           )

@@ -32,6 +32,7 @@ import {
 } from '../boundary/schema/SessionInfo.ts'
 import type { DetailsMode, DetailsSection, DetailsSections } from './details.ts'
 import type { BatteryInfo } from './battery.ts'
+import type { VoiceSubmitMode } from './voiceSubmit.ts'
 import {
   applyDelegationState,
   clearAgentsNudgeTurn,
@@ -722,6 +723,9 @@ export interface VoiceState {
   recording: boolean
   processing: boolean
   recordKey: string
+  /** What a committed ordinary transcript does: submit as a turn (`direct`,
+   * the default) or land in the composer editable (`voice.submit_mode: draft`). */
+  submitMode: VoiceSubmitMode
 }
 
 export interface BrowserState {
@@ -973,7 +977,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
     subscription: undefined,
     backgroundProcesses: [],
     bgTasks: [],
-    voice: { enabled: false, tts: false, recording: false, processing: false, recordKey: 'ctrl+b' },
+    voice: {
+      enabled: false,
+      tts: false,
+      recording: false,
+      processing: false,
+      recordKey: 'ctrl+b',
+      submitMode: 'direct'
+    },
     browser: { connected: false },
     lastNotification: undefined,
     notice: null,
@@ -1975,7 +1986,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   /** Merge an authoritative voice.toggle/config response without allowing an
    * older gateway that omits record_key to clobber the cached custom binding. */
-  function setVoiceMode(patch: { enabled?: boolean; tts?: boolean; recordKey?: string }): void {
+  function setVoiceMode(patch: {
+    enabled?: boolean
+    tts?: boolean
+    recordKey?: string
+    submitMode?: VoiceSubmitMode
+  }): void {
     setState(
       'voice',
       produce(voice => {
@@ -1983,6 +1999,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         if (patch.tts !== undefined) voice.tts = patch.tts
         const key = patch.recordKey?.trim()
         if (key) voice.recordKey = key
+        if (patch.submitMode !== undefined) voice.submitMode = patch.submitMode
         if (patch.enabled === false) {
           voice.recording = false
           voice.processing = false
@@ -2955,7 +2972,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
           tts: false,
           recording: false,
           processing: false,
-          recordKey: state.voice.recordKey
+          // Config-owned values (binding + submit mode) survive the child
+          // process exit; the next config hydration re-asserts them anyway.
+          recordKey: state.voice.recordKey,
+          submitMode: state.voice.submitMode
         })
         setBrowserState({ connected: false, url: '', lastProgress: '' })
         setState(produce(settleFailedAssistant))
@@ -3049,6 +3069,15 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('queueEditIndex', undefined)
     setState('composerDraft', text)
     setState('composerReplaceVersion', version => version + 1)
+  }
+
+  /** Insert a voice transcript (or other server-provided text) into the
+   * composer as an editable draft. An in-progress draft is preserved: trim its
+   * end and append after a single space (upstream 0ca78e5f32). Routes through
+   * the replace signal so the mounted uncontrolled textarea adopts the merge. */
+  function insertComposerDraft(text: string): void {
+    const current = state.composerDraft
+    replaceComposerDraft(current.trim() ? `${current.trimEnd()} ${text}` : text)
   }
 
   /** Clear both persisted state and the mounted native textarea via its
@@ -3416,6 +3445,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     clearPrompt,
     setComposerDraft,
     replaceComposerDraft,
+    insertComposerDraft,
     lastUserMessage,
     trimLastExchange,
     clearComposerDraft
