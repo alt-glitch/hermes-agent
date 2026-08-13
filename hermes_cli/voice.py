@@ -355,6 +355,24 @@ _continuous_no_speech_count = 0
 _CONTINUOUS_NO_SPEECH_LIMIT = 3
 
 
+def _shutdown_recorder(rec: Any, *, context: str) -> None:
+    """Best-effort release of a recorder's underlying microphone stream.
+
+    ``AudioRecorder.stop()`` and ``cancel()`` intentionally keep their
+    PortAudio stream open so an *active* continuous loop can reuse it without
+    repeatedly reopening CoreAudio. Once a loop is idle or disabled, however,
+    its owner must call ``shutdown()`` or macOS continues to report the
+    terminal as using the microphone. Keep that ownership rule in this wrapper
+    instead of weakening the recorder's reuse contract.
+    """
+    if rec is None:
+        return
+    try:
+        rec.shutdown()
+    except Exception as e:
+        logger.warning("failed to release recorder during %s: %s", context, e)
+
+
 # ── Push-to-talk API ─────────────────────────────────────────────────
 
 
@@ -368,8 +386,16 @@ def start_recording() -> None:
     with _recorder_lock:
         if _recorder is not None and getattr(_recorder, "is_recording", False):
             return
+        # A previous completed/cancelled push-to-talk recorder may still own
+        # its persistent CoreAudio stream. Release it before replacing it.
+        _shutdown_recorder(_recorder, context="push-to-talk restart")
+        _recorder = None
         rec = create_audio_recorder()
-        rec.start()
+        try:
+            rec.start()
+        except Exception:
+            _shutdown_recorder(rec, context="push-to-talk start failure")
+            raise
         _recorder = rec
 
 
@@ -388,7 +414,12 @@ def stop_and_transcribe() -> Optional[str]:
     if rec is None:
         return None
 
-    wav_path = rec.stop()
+    try:
+        wav_path = rec.stop()
+    finally:
+        # Transcription only needs the WAV file; it must not retain the live
+        # microphone for the duration of a network STT request.
+        _shutdown_recorder(rec, context="push-to-talk stop")
     if not wav_path:
         return None
 
@@ -508,6 +539,9 @@ def start_continuous(
         _debug(f"start_continuous: rec.start raised {type(e).__name__}: {e}")
         with _continuous_lock:
             _continuous_active = False
+            if _continuous_recorder is rec:
+                _continuous_recorder = None
+        _shutdown_recorder(rec, context="continuous start failure")
         raise
 
     if on_status:
@@ -522,10 +556,11 @@ def start_continuous(
 def stop_continuous(force_transcribe: bool = False) -> None:
     """Stop the active continuous loop and release the microphone.
 
-    Idempotent — calling while not active is a no-op. If ``force_transcribe`` is
-    True, the recorder stops synchronously, then transcription/cleanup runs on a
-    background thread before reporting ``"idle"``. Otherwise the buffer is
-    discarded.
+    Idempotent — calling while not active still releases any retained recorder
+    stream left by an already-finished one-shot capture. If
+    ``force_transcribe`` is True, the recorder stops synchronously, releases the
+    microphone, then transcription/cleanup runs on a background thread before
+    reporting ``"idle"``. Otherwise the buffer is discarded.
     """
     global _continuous_active, _continuous_on_transcript, _continuous_stopping
     global _continuous_on_status, _continuous_on_silent_limit
@@ -533,17 +568,23 @@ def stop_continuous(force_transcribe: bool = False) -> None:
     global _continuous_recorder, _continuous_no_speech_count
 
     with _continuous_lock:
-        if not _continuous_active:
+        was_active = _continuous_active
+        if not was_active and _continuous_recorder is None:
             return
         _continuous_active = False
         rec = _continuous_recorder
+        # Detach ownership before doing potentially slow CoreAudio cleanup so
+        # a concurrent stop path cannot close the same stream twice.
+        _continuous_recorder = None
         on_status = _continuous_on_status
         on_transcript = _continuous_on_transcript
         on_silent_limit = _continuous_on_silent_limit
         on_stop_phrase = _continuous_on_stop_phrase
         auto_restart = _continuous_auto_restart
-        track_no_speech = force_transcribe and not auto_restart
-        _continuous_stopping = rec is not None
+        track_no_speech = was_active and force_transcribe and not auto_restart
+        _continuous_stopping = (
+            was_active and force_transcribe and rec is not None
+        )
         _continuous_on_transcript = None
         _continuous_on_status = None
         _continuous_on_silent_limit = None
@@ -552,7 +593,7 @@ def stop_continuous(force_transcribe: bool = False) -> None:
             _continuous_no_speech_count = 0
 
     if rec is not None:
-        if force_transcribe and on_transcript:
+        if was_active and force_transcribe and on_transcript:
             if on_status:
                 try:
                     on_status("transcribing")
@@ -567,6 +608,8 @@ def stop_continuous(force_transcribe: bool = False) -> None:
                 except Exception as cancel_error:
                     logger.warning("failed to cancel recorder: %s", cancel_error)
                 wav_path = None
+            finally:
+                _shutdown_recorder(rec, context="continuous forced stop")
 
             def _transcribe_and_cleanup():
                 global _continuous_no_speech_count, _continuous_stopping
@@ -658,6 +701,8 @@ def stop_continuous(force_transcribe: bool = False) -> None:
                 rec.cancel()
             except Exception as e:
                 logger.warning("failed to cancel recorder: %s", e)
+            finally:
+                _shutdown_recorder(rec, context="continuous stop")
 
     with _continuous_lock:
         _continuous_stopping = False
@@ -687,6 +732,7 @@ def _continuous_on_silence() -> None:
     next capture. Three consecutive silent cycles end the loop.
     """
     global _continuous_active, _continuous_no_speech_count
+    global _continuous_recorder
 
     _debug("_continuous_on_silence: fired")
 
@@ -699,6 +745,7 @@ def _continuous_on_silence() -> None:
         on_status = _continuous_on_status
         on_silent_limit = _continuous_on_silent_limit
         on_stop_phrase = _continuous_on_stop_phrase
+        auto_restart = _continuous_auto_restart
 
     if rec is None:
         _debug("_continuous_on_silence: no recorder — abort")
@@ -711,6 +758,14 @@ def _continuous_on_silence() -> None:
             pass
 
     wav_path = rec.stop()
+    if not auto_restart:
+        # The TUI uses one-shot VAD captures and explicitly starts the next
+        # one after it receives the transcript. No active loop can reuse this
+        # stream, so release it before the potentially slow STT request.
+        with _continuous_lock:
+            if _continuous_recorder is rec:
+                _continuous_recorder = None
+        _shutdown_recorder(rec, context="one-shot silence stop")
     # Peak RMS is the critical diagnostic when stop() returns None despite
     # the VAD firing — tells us at a glance whether the mic was too quiet
     # for SILENCE_RMS_THRESHOLD (200) or the VAD + peak checks disagree.
@@ -819,6 +874,13 @@ def _continuous_on_silence() -> None:
             rec.cancel()
         except Exception:
             pass
+        release_recorder = False
+        with _continuous_lock:
+            if _continuous_recorder is rec:
+                _continuous_recorder = None
+                release_recorder = True
+        if release_recorder:
+            _shutdown_recorder(rec, context="continuous loop halt")
         if on_status:
             try:
                 on_status("idle")
@@ -852,8 +914,14 @@ def _continuous_on_silence() -> None:
         except Exception as e:
             logger.error("failed to restart continuous recording: %s", e)
             _debug(f"_continuous_on_silence: restart raised {type(e).__name__}: {e}")
+            release_recorder = False
             with _continuous_lock:
                 _continuous_active = False
+                if _continuous_recorder is rec:
+                    _continuous_recorder = None
+                    release_recorder = True
+            if release_recorder:
+                _shutdown_recorder(rec, context="continuous restart failure")
             if on_status:
                 try:
                     on_status("idle")
@@ -869,8 +937,14 @@ def _continuous_on_silence() -> None:
     else:
         # Do not auto-restart. Clean up state and notify idle.
         _debug("_continuous_on_silence: auto_restart=False, stopping loop")
+        release_recorder = False
         with _continuous_lock:
             _continuous_active = False
+            if _continuous_recorder is rec:
+                _continuous_recorder = None
+                release_recorder = True
+        if release_recorder:
+            _shutdown_recorder(rec, context="one-shot completion")
         if on_status:
             try:
                 on_status("idle")

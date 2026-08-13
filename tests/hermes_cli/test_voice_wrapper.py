@@ -154,6 +154,33 @@ class TestStopWithoutStart:
 
         assert voice.stop_and_transcribe() is None
 
+    def test_stop_releases_microphone_before_transcription(self, monkeypatch):
+        """A network STT request must not keep the finished capture's
+        CoreAudio stream open."""
+        import hermes_cli.voice as voice
+
+        events = []
+
+        class FakeRecorder:
+            def stop(self):
+                events.append("stop")
+                return "/tmp/fake.wav"
+
+            def shutdown(self):
+                events.append("shutdown")
+
+        monkeypatch.setattr(voice, "_recorder", FakeRecorder())
+        monkeypatch.setattr(
+            voice,
+            "transcribe_recording",
+            lambda _path: events.append("transcribe")
+            or {"success": True, "transcript": "hello"},
+        )
+        monkeypatch.setattr(voice.os.path, "isfile", lambda _path: False)
+
+        assert voice.stop_and_transcribe() == "hello"
+        assert events == ["stop", "shutdown", "transcribe"]
+
 
 @pytest.mark.real_audio_playback
 class TestSpeakTextGuards:
@@ -235,6 +262,33 @@ class TestContinuousAPI:
         assert voice.stop_continuous() is None
         assert voice.is_continuous_active() is False
 
+    def test_stop_continuous_releases_stale_inactive_stream(self, monkeypatch):
+        """A one-shot capture can become logically idle before /voice off.
+        The unconditional off path must still close its retained stream."""
+        import hermes_cli.voice as voice
+
+        class FakeRecorder:
+            def __init__(self):
+                self.cancelled = 0
+                self.shutdown_calls = 0
+
+            def cancel(self):
+                self.cancelled += 1
+
+            def shutdown(self):
+                self.shutdown_calls += 1
+
+        rec = FakeRecorder()
+        monkeypatch.setattr(voice, "_continuous_active", False)
+        monkeypatch.setattr(voice, "_continuous_recorder", rec)
+        monkeypatch.setattr(voice, "_play_beep", lambda *_, **__: None)
+
+        voice.stop_continuous()
+
+        assert rec.cancelled == 1
+        assert rec.shutdown_calls == 1
+        assert voice._continuous_recorder is None
+
     def test_double_start_is_idempotent(self, monkeypatch):
         """A second start_continuous while already active is a no-op — prevents
         two overlapping capture threads fighting over the microphone when the
@@ -249,6 +303,9 @@ class TestContinuousAPI:
                 called["n"] += 1
 
             def cancel(self):
+                pass
+
+            def shutdown(self):
                 pass
 
         monkeypatch.setattr(voice, "_continuous_recorder", FakeRecorder())
@@ -294,6 +351,7 @@ class TestContinuousLoopSimulation:
                 self.last_callback = None
                 self.stopped = 0
                 self.cancelled = 0
+                self.shutdown_calls = 0
                 # Preset WAV path returned by stop()
                 self.next_stop_wav = "/tmp/fake.wav"
                 self.fail_stop = False
@@ -316,6 +374,10 @@ class TestContinuousLoopSimulation:
 
             def cancel(self):
                 self.cancelled += 1
+                self.is_recording = False
+
+            def shutdown(self):
+                self.shutdown_calls += 1
                 self.is_recording = False
 
         rec = FakeRecorder()
@@ -354,6 +416,88 @@ class TestContinuousLoopSimulation:
         assert voice.is_continuous_active() is True
 
         voice.stop_continuous()
+        assert fake_recorder.shutdown_calls == 1
+        assert voice._continuous_recorder is None
+
+    def test_one_shot_silence_releases_stream_before_stt(
+        self, fake_recorder, monkeypatch
+    ):
+        import hermes_cli.voice as voice
+
+        events = []
+
+        original_shutdown = fake_recorder.shutdown
+
+        def shutdown():
+            events.append("shutdown")
+            original_shutdown()
+
+        fake_recorder.shutdown = shutdown
+        monkeypatch.setattr(
+            voice,
+            "transcribe_recording",
+            lambda _path: events.append("transcribe")
+            or {"success": True, "transcript": "hello"},
+        )
+        monkeypatch.setattr(voice, "is_whisper_hallucination", lambda _t: False)
+
+        voice.start_continuous(
+            on_transcript=lambda _t: None,
+            auto_restart=False,
+        )
+        fake_recorder.last_callback()
+
+        assert events == ["shutdown", "transcribe"]
+        assert fake_recorder.shutdown_calls == 1
+        assert voice._continuous_recorder is None
+        assert voice.is_continuous_active() is False
+
+    def test_forced_stop_releases_stream_before_stt(
+        self, fake_recorder, monkeypatch
+    ):
+        import hermes_cli.voice as voice
+
+        events = []
+
+        class ImmediateThread:
+            def __init__(self, target, daemon=False):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        original_stop = fake_recorder.stop
+        original_shutdown = fake_recorder.shutdown
+
+        def stop():
+            events.append("stop")
+            return original_stop()
+
+        def shutdown():
+            events.append("shutdown")
+            original_shutdown()
+
+        fake_recorder.stop = stop
+        fake_recorder.shutdown = shutdown
+        monkeypatch.setattr(voice.threading, "Thread", ImmediateThread)
+        monkeypatch.setattr(
+            voice,
+            "transcribe_recording",
+            lambda _path: events.append("transcribe")
+            or {"success": True, "transcript": "hello"},
+        )
+        monkeypatch.setattr(voice, "is_whisper_hallucination", lambda _t: False)
+
+        voice.start_continuous(
+            on_transcript=lambda _t: None,
+            auto_restart=False,
+        )
+        voice.stop_continuous(force_transcribe=True)
+
+        assert events == ["stop", "shutdown", "transcribe"]
+        assert fake_recorder.shutdown_calls == 1
+        assert voice._continuous_recorder is None
+        assert voice.is_continuous_active() is False
 
 
 
@@ -389,6 +533,8 @@ class TestContinuousLoopSimulation:
         assert silent_limit_fired == [True]
         assert voice.is_continuous_active() is False
         assert fake_recorder.cancelled >= 1
+        assert fake_recorder.shutdown_calls == 1
+        assert voice._continuous_recorder is None
 
 
     def test_silent_cycles_do_not_count_while_tts_playing(self, fake_recorder, monkeypatch):
@@ -487,5 +633,3 @@ class TestSpeakTextStreamingDispatch:
         assert voice.speak_text("Hello streaming world") is None
         assert streamed == ["Hello streaming world"]
         assert synced == [], "sync whole-file path must be skipped when streaming"
-
-

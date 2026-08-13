@@ -84,6 +84,9 @@ class TestContinuousLoopStopPhrase:
             def cancel(self):
                 pass
 
+            def shutdown(self):
+                pass
+
             def start(self, on_silence_stop=None):
                 pass
 
@@ -126,6 +129,9 @@ class TestContinuousLoopStopPhraseSignal:
             return "/tmp/fake.wav"
 
         def cancel(self):
+            pass
+
+        def shutdown(self):
             pass
 
         def start(self, on_silence_stop=None):
