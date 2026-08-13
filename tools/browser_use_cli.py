@@ -32,8 +32,14 @@ _STDERR_CAP_CHARS = 4000
 # Filesystem-safe task ids for per-task workspace dirs.
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
-# Screenshot paths printed by capture_screenshot() in the exec output
-_IMAGE_PATH_RE = re.compile(r"(/[^\s\"']+?\.(?:png|jpe?g|webp))", re.IGNORECASE)
+# Screenshot paths printed by capture_screenshot() in the exec output.
+# Two alternatives: POSIX absolute (/tmp/shot.png) and Windows drive-letter
+# absolute (C:\Users\...\shot.png or C:/Users/.../shot.png). Browser Use on
+# Windows prints native paths — the POSIX-only pattern silently dropped them
+# and screenshot_path / the multimodal attach never fired (#83884).
+_IMAGE_PATH_RE = re.compile(
+    r"((?:[A-Za-z]:[\\/]|/)[^\s\"']+?\.(?:png|jpe?g|webp))", re.IGNORECASE
+)
 
 # http(s) URL literals in exec code checked against browser_navigate's policy
 _URL_RE = re.compile(r"https?://[^\s'\"\\)]+", re.IGNORECASE)
@@ -53,7 +59,9 @@ def _blocked_url_in_code(code: str) -> Optional[str]:
 def _base_subprocess_env() -> dict:
     from tools.browser_tool import _build_browser_env
 
-    return _build_browser_env()
+    env = _build_browser_env()
+    env.setdefault("ANONYMIZED_TELEMETRY", "false")
+    return env
 
 
 def _read_browser_cfg() -> dict:

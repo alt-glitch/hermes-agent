@@ -6644,7 +6644,25 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     # would pull in desktop on every web build. See #38772.
     # When web/ has its own package-lock.json, _workspace_root() returns
     # web_dir itself and --workspace would fail.  See #42973.
-    npm_workspace_args: tuple[str, ...] = () if npm_cwd == web_dir else ("--workspace", "web")
+    #
+    # When running from the workspace root, this must name the SAME closure
+    # as `hermes update`'s _update_node_dependencies() (ui-tui + web +
+    # --include-workspace-root): the helper prefers `npm ci`, which deletes
+    # node_modules before reifying the requested tree, so a narrower closure
+    # here silently prunes everything the update step just installed (root
+    # devDependencies and the ui-tui workspace) while still exiting 0 —
+    # and since the manifests digest was already recorded, later no-op
+    # updates skip the repair. See #43564/#64354.
+    npm_workspace_args: tuple[str, ...]
+    if npm_cwd == web_dir:
+        npm_workspace_args = ()
+    else:
+        npm_workspace_args = ("--workspace", "web", "--include-workspace-root")
+        # Prebuilt/partial checkouts can lack the ui-tui workspace; naming a
+        # missing workspace makes npm fail hard, so only include it when
+        # present (same guard as _update_node_dependencies()).
+        if (npm_cwd / "ui-tui" / "package.json").exists():
+            npm_workspace_args = ("--workspace", "ui-tui", *npm_workspace_args)
     if _is_termux_startup_environment():
         npm_cwd, npm_workspace_args = _termux_workspace_install_context(web_dir)
 
@@ -7879,23 +7897,69 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
     return True
 
 
-def _desktop_launch_options() -> tuple[list[str], str]:
+_LINUX_PASSWORD_STORES = frozenset({"gnome-libsecret", "kwallet", "kwallet5", "kwallet6", "basic"})
+
+
+def _detect_linux_password_store() -> str | None:
+    """Detect the Chromium password-store backend for the current Linux session.
+
+    Electron's safeStorage only reports encryption as available when Chromium
+    selects the right keychain backend, and Chromium's own detection routinely
+    fails under `hermes desktop` because the launcher environment doesn't look
+    like a full desktop session. Probe order: KDE session env vars, GNOME
+    Keyring's control socket, then a D-Bus ping of org.freedesktop.secrets
+    (covers any Secret Service implementation, e.g. KeePassXC). Returns None
+    when no keychain daemon is reachable.
+    """
+    kde_version = os.environ.get("KDE_SESSION_VERSION", "").strip()
+    if kde_version == "6":
+        return "kwallet6"
+    if kde_version == "5":
+        return "kwallet5"
+    if kde_version:
+        return "kwallet"
+    if os.environ.get("KDE_FULL_SESSION"):
+        return "kwallet"
+    if os.environ.get("GNOME_KEYRING_CONTROL"):
+        return "gnome-libsecret"
+    try:
+        result = subprocess.run(
+            [
+                "dbus-send", "--session", "--print-reply", "--reply-timeout=2000",
+                "--dest=org.freedesktop.secrets",
+                "/org/freedesktop/secrets",
+                "org.freedesktop.DBus.Peer.Ping",
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return "gnome-libsecret"
+    except Exception:
+        pass
+    return None
+
+
+def _desktop_launch_options() -> tuple[list[str], str, str]:
     """Read `desktop.*` launch options from config.yaml.
 
-    Returns ``(electron_flags, disable_gpu)`` where ``electron_flags`` is a list
-    of extra Electron CLI flags and ``disable_gpu`` is one of "auto"/"1"/"0"
-    (normalized for the HERMES_DESKTOP_DISABLE_GPU env var the Electron app
-    reads). Best-effort: any config error yields the safe defaults
-    ``([], "auto")`` so a malformed config never blocks the launch.
+    Returns ``(electron_flags, disable_gpu, password_store)`` where
+    ``electron_flags`` is a list of extra Electron CLI flags, ``disable_gpu``
+    is one of "auto"/"1"/"0" (normalized for the HERMES_DESKTOP_DISABLE_GPU
+    env var the Electron app reads), and ``password_store`` is "auto" or one
+    of the Chromium password-store backends (unknown values normalize to
+    "auto"). Best-effort: any config error yields the safe defaults
+    ``([], "auto", "auto")`` so a malformed config never blocks the launch.
     """
     flags: list[str] = []
     disable_gpu = "auto"
+    password_store = "auto"
     try:
         from hermes_cli.config import load_config
 
         desktop_cfg = (load_config() or {}).get("desktop") or {}
     except Exception:
-        return flags, disable_gpu
+        return flags, disable_gpu, password_store
 
     raw_flags = desktop_cfg.get("electron_flags")
     if isinstance(raw_flags, str):
@@ -7914,7 +7978,13 @@ def _desktop_launch_options() -> tuple[list[str], str]:
             disable_gpu = "0"
         else:
             disable_gpu = "auto"
-    return flags, disable_gpu
+
+    raw_store = desktop_cfg.get("password_store", "auto")
+    if isinstance(raw_store, str):
+        low_store = raw_store.strip().lower()
+        if low_store in _LINUX_PASSWORD_STORES:
+            password_store = low_store
+    return flags, disable_gpu, password_store
 
 
 def _register_linux_desktop_entry() -> None:
@@ -7968,9 +8038,24 @@ def cmd_gui(args: argparse.Namespace):
     # `desktop.disable_gpu`). The GPU policy is bridged to the env var the
     # Electron app already reads; an explicit env var still wins over config so
     # `HERMES_DESKTOP_DISABLE_GPU=... hermes desktop` keeps working.
-    config_electron_flags, config_disable_gpu = _desktop_launch_options()
+    config_electron_flags, config_disable_gpu, config_password_store = _desktop_launch_options()
     if config_disable_gpu != "auto" and "HERMES_DESKTOP_DISABLE_GPU" not in os.environ:
         env["HERMES_DESKTOP_DISABLE_GPU"] = config_disable_gpu
+
+    # Linux keychain backend for safeStorage (`desktop.password_store`).
+    # Chromium needs the --password-store switch to pick the right keychain;
+    # without it safeStorage.isEncryptionAvailable() is often false and the
+    # desktop app refuses to persist remote gateway tokens. Config wins over
+    # detection; an explicit env var wins over both so
+    # `HERMES_DESKTOP_PASSWORD_STORE=... hermes desktop` keeps working.
+    if sys.platform == "linux" and "HERMES_DESKTOP_PASSWORD_STORE" not in os.environ:
+        password_store = (
+            config_password_store
+            if config_password_store != "auto"
+            else _detect_linux_password_store()
+        )
+        if password_store:
+            env["HERMES_DESKTOP_PASSWORD_STORE"] = password_store
 
     source_mode = getattr(args, "source", False)
     skip_build = getattr(args, "skip_build", False)
