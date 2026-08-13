@@ -291,6 +291,21 @@ def _(rid, params: dict) -> dict:
             _voice_emit("voice.transcript", {"stop_phrase": True, "typed": True})
             logger.info("prompt.submit: typed stop phrase — voice chat ended")
             return _ok(rid, {"voice_stopped": True})
+    client_submission_id = params.get("client_submission_id")
+    if client_submission_id is None:
+        client_submission_ids = []
+    elif (
+        not isinstance(client_submission_id, str)
+        or not client_submission_id
+        or len(client_submission_id) > _MAX_CLIENT_SUBMISSION_ID_CHARS
+    ):
+        return _err(rid, 4004, "invalid client_submission_id")
+    else:
+        client_submission_ids = [client_submission_id]
+    # Desktop/OpenTUI queue drains mark their resubmission explicitly. Keep
+    # this a strict JSON boolean: a string such as ``"false"`` must not
+    # silently acquire queue-only semantics.
+    queued_submission = params.get("queued") is True
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     if params.get("interrupted"):
         # Client-side barge-in (desktop VAD / typing over playback) — latch it
@@ -301,8 +316,26 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    # tools.configure keeps the mutation lock for its full config/agent rebuild
+    # transaction. Check its history-locked claim before config-backed active
+    # slot resolution or the mutation lock: either can wait until the flag is
+    # cleared and then start a turn that should have been rejected as racing
+    # the reconfiguration.
+    with session["history_lock"]:
+        if session.get("_tools_configuring"):
+            return _err(
+                rid,
+                4009,
+                "session tools are being reconfigured — wait for it to finish",
+            )
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    # The lease helper already fences its slow claim window. Revalidate at the
+    # handler boundary as well so a close/replacement between lookup and turn
+    # admission gets the same stable non-success result.
+    with _session_mutation_lock(session):
+        if not _session_registry_matches(sid, session) or session.get("_finalized"):
+            return _err(rid, 4090, _SESSION_CLOSED_DURING_ADMISSION)
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -328,32 +361,51 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
-    while True:
-        busy_transport = None
-        with session["history_lock"]:
-            if session.get("running"):
-                # Don't reject a mid-turn prompt — queue it (and, by default,
-                # interrupt the live turn) so it runs as the next turn. The
-                # provider interrupt itself must happen after this lock is
-                # released: a non-interruptible tool may keep it waiting.
-                busy_transport = t or session.get("transport")
-            else:
-                break
-        busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport,
-            queued=bool(params.get("queued")),
-        )
-        if busy_response is not None:
-            return busy_response
-        # The old turn finished between the two lock acquisitions. Retry the
-        # claim so this prompt starts normally instead of being stranded in a
-        # queue whose drain already ran.
-
     # Filled when this submit performed a truncation against a durable session:
     # the fresh post-rewrite row ids of the surviving user turns, for client
     # rowId rebinding (see comment at the assignment site).
     survivor_user_row_ids = None
-    with session["history_lock"]:
+    with _try_mcp_turn_admission(session, sid=sid) as admitted:
+        if not admitted:
+            if (
+                not _session_registry_matches(sid, session)
+                or session.get("_finalized")
+            ):
+                return _err(rid, 4090, _SESSION_CLOSED_DURING_ADMISSION)
+            return _err(
+                rid,
+                4009,
+                "MCP reload in progress — retry the prompt when it finishes",
+                {
+                    "kind": "mcp_reload_in_progress",
+                    "retry_after_ms": 250,
+                },
+            )
+        if session.get("_tools_configuring"):
+            return _err(
+                rid,
+                4009,
+                "session tools are being reconfigured — wait for it to finish",
+            )
+        if (
+            session.get("running")
+            or session.get("_busy_interrupt_pending")
+            or session.get("queued_prompt")
+        ):
+            # Don't reject a mid-turn prompt — queue it (and, by default,
+            # interrupt the live turn) so it runs as the next turn. See
+            # _handle_busy_submit for why the old "session busy" rejection
+            # dropped messages when teardown outlived the client's retry window.
+            return _handle_busy_submit(
+                rid,
+                sid,
+                session,
+                text,
+                t or session.get("transport"),
+                client_submission_ids,
+                history_lock_owned=True,
+                queued=queued_submission,
+            )
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -609,7 +661,15 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        with _session_mutation_lock(session):
+            if not _session_registry_matches(sid, session) or session.get("_finalized"):
+                with session["history_lock"]:
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+                return _err(rid, 4090, _SESSION_CLOSED_DURING_ADMISSION)
+            isolated_response = _submit_prompt_to_compute_host(
+                rid, sid, session, text
+            )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None:
                 # The truncation already happened inline above (memory + DB),
@@ -662,18 +722,39 @@ def _(rid, params: dict) -> dict:
         # only errors when the build itself fails or the bounded cap expires.
         err = _wait_agent_for_prompt(session, rid, sid)
         if err:
-            # Terminal frame + retained snapshot (not a bare "error" event +
-            # cleared inflight): if the client is disconnected right now, the
-            # retained snapshot is the only way resume can show this failure.
-            _emit_terminal_turn_error(
-                sid,
-                session,
-                (err.get("error") or {}).get("message", "agent initialization failed"),
-            )
+            # Settle server state BEFORE publishing the error. The full-screen
+            # clients may immediately drain one locally queued prompt when they
+            # receive this terminal event; emitting first races that submit
+            # against running=True and leaves the queue stranded. Do not emit a
+            # trailing session.info(false): the client may already have started
+            # its next queued turn from the terminal error, and a stale idle
+            # snapshot would clear that new optimistic busy flag before
+            # message.start.
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
-            _emit("session.info", sid, _session_info(session.get("agent"), session))
+                # No agent turn exists to drain anything accepted into this
+                # slot during startup. Clear every orphaned queue entry; IDs,
+                # when present, are still settled by the terminal frame below.
+                failed_submission_ids = _settle_pending_input_ids_locked(
+                    session,
+                    client_submission_ids,
+                )
+                # Terminal frame + retained snapshot (not a bare "error" event
+                # + cleared inflight): if the client is disconnected right
+                # now, the retained snapshot is the only way resume can show
+                # this failure. Keep the lifecycle lock through the emit so a
+                # racing new submit cannot replace inflight_turn between the
+                # idle transition and failure retention.
+                _emit_terminal_turn_error(
+                    sid,
+                    session,
+                    (err.get("error") or {}).get(
+                        "message", "agent initialization failed"
+                    ),
+                    client_submission_ids=failed_submission_ids,
+                    history_lock_owned=True,
+                )
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
@@ -695,13 +776,28 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        if client_submission_ids:
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                client_submission_ids=client_submission_ids,
+            )
+        else:
+            _run_prompt_submit(rid, sid, session, text)
 
-    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
-    # Keep a handle so session.interrupt can tell a live turn from a stuck
-    # `running` flag (a turn that died without clearing it) and recover the latter.
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    with _session_mutation_lock(session):
+        if not _session_registry_matches(sid, session) or session.get("_finalized"):
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            return _err(rid, 4090, _SESSION_CLOSED_DURING_ADMISSION)
+        run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+        # Keep a handle so session.interrupt can tell a live turn from a stuck
+        # `running` flag (a turn that died without clearing it) and recover the latter.
+        session["_run_thread"] = run_thread
+        run_thread.start()
     return _ok(
         rid,
         {
