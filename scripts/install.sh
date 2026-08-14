@@ -868,7 +868,9 @@ node_satisfies_opentui() {
 opentui_host_supported() {
     [ "${OS:-}" != "windows" ] \
         && [ "${OS:-}" != "android" ] \
-        && [ "${DISTRO:-}" != "termux" ]
+        && [ "${DISTRO:-}" != "termux" ] \
+        && { [ ! -d "${INSTALL_DIR:-}" ] \
+            || [ -f "$INSTALL_DIR/ui-opentui/package.json" ]; }
 }
 
 # npm 11.10.0–11.16.x honor `min-release-age` but ignore
@@ -934,13 +936,17 @@ check_node() {
     if [ -n "$path_node" ] \
         && node_satisfies_build "$("$path_node" --version 2>/dev/null)" \
         && ! node_runtime_npm_usable "$path_node"; then
-        local path_npm="$(dirname "$path_node")/npm"
-        local path_npm_version="missing"
-        if [ -x "$path_npm" ]; then
-            path_npm_version="$("$path_npm" --version 2>/dev/null || echo unknown)"
+        if ! command -v npm &> /dev/null; then
+            log_warn "node found but npm is not on PATH (stray node symlink?) — installing Hermes-managed Node $NODE_VERSION LTS..."
+        else
+            local path_npm="$(dirname "$path_node")/npm"
+            local path_npm_version="missing"
+            if [ -x "$path_npm" ]; then
+                path_npm_version="$("$path_npm" --version 2>/dev/null || echo unknown)"
+            fi
+            log_warn "npm $path_npm_version paired with $path_node cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
+            log_warn "min-release-age-exclude) — installing Hermes-managed Node $NODE_VERSION instead..."
         fi
-        log_warn "npm $path_npm_version paired with $path_node cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
-        log_warn "min-release-age-exclude) — installing Hermes-managed Node $NODE_VERSION instead..."
     fi
 
     if opentui_host_supported; then
@@ -950,12 +956,16 @@ check_node() {
             HAS_NODE=true
             return 0
         fi
-        if [ -n "$path_node" ] && node_satisfies_opentui "$("$path_node" --version 2>/dev/null)" && node_runtime_npm_usable "$path_node"; then
+        if command -v node &> /dev/null && command -v npm &> /dev/null \
+            && node_satisfies_opentui "$("$path_node" --version 2>/dev/null)" \
+            && node_runtime_npm_usable "$path_node"; then
             log_success "Node.js $("$path_node" --version) found (OpenTUI ready)"
             HAS_NODE=true
             return 0
         fi
-        if [ -x "$managed_node" ] && node_satisfies_opentui "$("$managed_node" --version 2>/dev/null)" && node_runtime_npm_usable "$managed_node"; then
+        if [ -x "$HERMES_HOME/node/bin/node" ] && [ -x "$HERMES_HOME/node/bin/npm" ] \
+            && node_satisfies_opentui "$("$managed_node" --version 2>/dev/null)" \
+            && node_runtime_npm_usable "$managed_node"; then
             export PATH="$HERMES_HOME/node/bin:$PATH"
             log_success "Node.js $("$managed_node" --version) found (Hermes-managed, OpenTUI ready)"
             HAS_NODE=true
@@ -968,12 +978,16 @@ check_node() {
             HAS_NODE=true
             return 0
         fi
-        if [ -n "$path_node" ] && node_satisfies_build "$("$path_node" --version 2>/dev/null)" && node_runtime_npm_usable "$path_node"; then
+        if command -v node &> /dev/null && command -v npm &> /dev/null \
+            && node_satisfies_build "$("$path_node" --version 2>/dev/null)" \
+            && node_runtime_npm_usable "$path_node"; then
             log_success "Node.js $("$path_node" --version) found"
             HAS_NODE=true
             return 0
         fi
-        if [ -x "$managed_node" ] && node_satisfies_build "$("$managed_node" --version 2>/dev/null)" && node_runtime_npm_usable "$managed_node"; then
+        if [ -x "$HERMES_HOME/node/bin/node" ] && [ -x "$HERMES_HOME/node/bin/npm" ] \
+            && node_satisfies_build "$("$managed_node" --version 2>/dev/null)" \
+            && node_runtime_npm_usable "$managed_node"; then
             export PATH="$HERMES_HOME/node/bin:$PATH"
             log_success "Node.js $("$managed_node" --version) found (Hermes-managed)"
             HAS_NODE=true
@@ -982,7 +996,9 @@ check_node() {
     fi
 
     local existing_node="${env_node:-$path_node}"
-    if [ -n "$existing_node" ] && opentui_host_supported; then
+    if [ -n "$existing_node" ] && ! node_runtime_npm_usable "$existing_node"; then
+        : # The paired-npm warning above already explains why it cannot be used.
+    elif [ -n "$existing_node" ] && opentui_host_supported; then
         log_warn "Node.js $("$existing_node" --version 2>/dev/null || echo unknown) is below the OpenTUI floor (need >=26.3) — installing Hermes-managed Node $NODE_VERSION..."
     elif [ -n "$existing_node" ]; then
         log_warn "Node.js $("$existing_node" --version 2>/dev/null || echo unknown) is below the supported build floor (need >=22.22) — installing Hermes-managed Node $NODE_VERSION..."
@@ -2439,9 +2455,14 @@ install_node_deps() {
         cd "$INSTALL_DIR"
         # Time-boxed: a stalled registry fetch would otherwise hang here with no
         # progress (same #39219 stall class as the desktop build below).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
-            log_warn "npm install failed or timed out (browser tools may not work)"
-        }
+        # A failed npm install used to still print "✓ Node.js dependencies
+        # installed", hiding the degradation from the user (#77003). Now it
+        # fails the install outright instead of burying the warning (#85297).
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
+            log_error "npm install failed or timed out; Node.js dependencies were not installed"
+            restore_dirty_lockfiles "$INSTALL_DIR"
+            return 1
+        fi
         log_success "Node.js dependencies installed"
 
         # Install Playwright browser + system dependencies.
@@ -2541,9 +2562,13 @@ install_node_deps() {
         log_info "Installing TUI dependencies..."
         cd "$INSTALL_DIR/ui-tui"
         # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
-            log_warn "TUI npm install failed or timed out (hermes --tui may not work)"
-        }
+        # Report success only on actual success, same as node-deps above
+        # (#77003) — and fail the install outright (#85297).
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
+            log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
+            restore_dirty_lockfiles "$INSTALL_DIR"
+            return 1
+        fi
         log_success "TUI dependencies installed"
     fi
 
@@ -3552,7 +3577,7 @@ run_stage_body() {
             resolve_install_layout
             require_install_dir
             check_node
-            install_node_deps
+            install_node_deps || return
             install_uv
             install_browser_use_cli
             install_computer_use_driver
@@ -3676,7 +3701,7 @@ main() {
     clone_repo
     setup_venv
     install_deps
-    install_node_deps
+    install_node_deps || return
     install_opentui
     install_browser_use_cli
     install_computer_use_driver

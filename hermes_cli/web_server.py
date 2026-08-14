@@ -1119,6 +1119,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "skills": "agent",
     "cron": "agent",
     "network": "agent",
+    # `models_dev.url` (mirror override) is the only schema-surfaced
+    # models_dev field — fold it in with the other network/agent plumbing
+    # rather than spawning a one-field orphan tab.
+    "models_dev": "agent",
     "checkpoints": "agent",
     "approvals": "security",
     "human_delay": "display",
@@ -3408,6 +3412,46 @@ async def get_status(profile: Optional[str] = None):
             if all(item.get("status") == "ok" for item in components.values())
             else "degraded"
         )
+
+        # Memory-pressure rollup (NS-656). Distilled from the gateway's
+        # 30s loop heartbeat + lifecycle sentinel — two small file reads,
+        # no gateway IPC. Coarse MB numbers/enums/booleans only: this
+        # endpoint is public (PUBLIC_API_PATHS), same disclosure class as
+        # nous_session_valid above. Deliberately NOT folded into
+        # components/overall — memory pressure is advisory (toast/notice
+        # material), not a liveness verdict, and flipping `overall` to
+        # "degraded" on it would page NAS's availability sweep for a
+        # condition the valve is already handling.
+        try:
+            from gateway.memory_status import collect_memory_status
+
+            status["memory"] = await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(
+                    collect_memory_status,
+                    profile_dir if profile_dir else get_hermes_home(),
+                ),
+            )
+        except Exception:
+            status["memory"] = {"pressure": "unknown"}
+
+        # Disk-usage rollup (NS-656, same lineage as OOF-2/OOF-107 fleet
+        # disk-exhaustion incidents). One statvfs call on HERMES_HOME's
+        # filesystem — coarse MB numbers + enum, same public disclosure
+        # class as the memory block, and equally advisory: not folded
+        # into components/overall.
+        try:
+            from gateway.disk_status import collect_disk_status
+
+            status["disk"] = await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(
+                    collect_disk_status,
+                    profile_dir if profile_dir else get_hermes_home(),
+                ),
+            )
+        except Exception:
+            status["disk"] = {"pressure": "unknown"}
 
         # Deferred FTS rebuild progress (schema v23): lets the desktop /
         # dashboard render a "search index rebuilding: N%" indicator instead
