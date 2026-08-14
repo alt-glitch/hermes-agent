@@ -7781,28 +7781,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 ) or None
             except Exception:
                 provider = None
+        # Both shapes use the same or-None discipline so stale keys from a
+        # previous switch are deleted (not merely omitted) in BOTH the
+        # nested gateway_runtime dict (CLI reader) and the top-level keys
+        # (TUI gateway reader). _merge_model_config_json only deletes on
+        # explicit None, so falsy values must be converted, not filtered.
+        # Deriving the top-level from **route guarantees the two shapes
+        # can never diverge — the asymmetry that caused the original
+        # stale-key bug (#85261 simplify-code review).
         route = {
-            k: v
-            for k, v in {
-                "provider": provider,
-                "base_url": result.base_url,
-                "api_mode": result.api_mode,
-            }.items()
-            if v
+            "provider": provider or None,
+            "base_url": result.base_url or None,
+            "api_mode": result.api_mode or None,
         }
         try:
             db.update_session_model(sid, result.new_model)
-            # Both shapes: nested for the CLI reader, top-level for the
-            # TUI gateway's resume path. Top-level keys are written as
-            # explicit None when absent — _merge_model_config_json only
-            # deletes on None, so omitting them would let a PREVIOUS
-            # switch's provider/api_mode survive this one (stale wire
-            # protocol / frankenroute on resume).
             db.patch_session_model_config(sid, {
                 "gateway_runtime": route,
-                "provider": provider or None,
-                "base_url": result.base_url or None,
-                "api_mode": result.api_mode or None,
+                **route,
             })
         except Exception:
             logger.debug(
@@ -9550,9 +9546,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not getattr(result, "success", False):
             return True
         try:
-            from hermes_cli.model_cost_guard import expensive_model_warning
+            from hermes_cli.model_selection_guards import combined_selection_warning
 
-            warning = expensive_model_warning(
+            warning = combined_selection_warning(
                 result.new_model,
                 provider=result.target_provider,
                 base_url=result.base_url or self.base_url or "",
@@ -9569,7 +9565,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ("cancel", "Cancel", "Keep the current model."),
         ]
         raw = self._prompt_text_input_modal(
-            title="!!! Expensive Model Warning !!!",
+            title=f"!!! {warning.title} !!!",
             detail=warning.message,
             choices=choices,
             timeout=120,
@@ -10079,6 +10075,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception as exc:
                 logger.debug("preflight-compression switch warning failed: %s", exc)
 
+        # Run the confirm + apply sequence off the main thread. The
+        # expensive-model confirmation modal blocks the calling thread on a
+        # response queue (see _prompt_text_input_modal); running it on the
+        # prompt_toolkit main thread freezes TUI rendering, so the modal never
+        # appears and the switch silently cancels after the 120s timeout.
+        # Mirror the picker path (_handle_model_picker_selection), which
+        # already dispatches confirm+apply on a worker thread.
+        if getattr(self, "_app", None):
+            threading.Thread(
+                target=self._confirm_and_apply_cli_model_switch,
+                args=(result, persist_global, one_turn, custom_provs),
+                daemon=True,
+            ).start()
+            return
+        self._confirm_and_apply_cli_model_switch(
+            result, persist_global, one_turn, custom_provs
+        )
+        return
+
+    def _confirm_and_apply_cli_model_switch(
+        self, result, persist_global: bool, one_turn: bool, custom_provs=None
+    ) -> None:
+        """Confirm an expensive model switch and apply it to CLI state.
+
+        Runs on a worker thread when the TUI is active (see
+        _handle_model_switch) so the confirmation modal can render.
+        """
         if not self._confirm_expensive_model_switch(result):
             _cprint("  Model switch cancelled.")
             return

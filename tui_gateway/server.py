@@ -4044,7 +4044,7 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
 # ``billing_provider="openrouter"``; dropping it forces resume to the current
 # global model (e.g. a custom endpoint), which is the wrong provider for the
 # stored model. See #57588.
-_BARE_BILLING_PROVIDERS = {"auto", "custom"}
+from hermes_state import _BARE_BILLING_PROVIDERS
 
 
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
@@ -4926,9 +4926,9 @@ def _apply_model_switch(
 
     if not confirm_expensive_model:
         try:
-            from hermes_cli.model_cost_guard import expensive_model_warning
+            from hermes_cli.model_selection_guards import combined_selection_warning
 
-            warning = expensive_model_warning(
+            warning = combined_selection_warning(
                 result.new_model,
                 provider=result.target_provider,
                 base_url=result.base_url or current_base_url,
