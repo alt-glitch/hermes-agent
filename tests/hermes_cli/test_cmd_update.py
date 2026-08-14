@@ -260,12 +260,20 @@ class TestCmdUpdateBranchFallback:
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
         ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
-            cmd_update(mock_args)
+            # This test's subprocess mock models Git commands only.  Keep the
+            # now-required current-checkout Node repair on its healthy path
+            # without feeding those Git-shaped results to npm/OpenTUI probes.
+            with patch(
+                "hermes_cli.update_cmd._update_node_dependencies", return_value=[]
+            ) as repair_node, patch.object(hm, "_build_web_ui") as build_web:
+                cmd_update(mock_args)
 
         expected_git_cmd = (
             ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
         )
         sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
+        repair_node.assert_called_once_with()
+        build_web.assert_called_once_with(PROJECT_ROOT / "web")
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
