@@ -447,6 +447,73 @@ def test_job_store_double_failure_still_finalizes_execution(monkeypatch):
     ]
 
 
+def test_run_claim_validation_failure_suppresses_delivery_and_finalizes_execution(
+    monkeypatch,
+):
+    import cron.scheduler as scheduler
+
+    finish_attempts = []
+    delivery_attempts = []
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_execution_running",
+        lambda _execution_id: None,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("jobs store unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "run_claim_is_owned",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("jobs store unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "mark_job_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("jobs store unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda *_args, **_kwargs: delivery_attempts.append(True),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: finish_attempts.append(
+            (execution_id, kwargs)
+        ),
+    )
+
+    job = {
+        "id": "token-store-fail",
+        "execution_id": "exec-token-store-fail",
+        "schedule": {"kind": "once", "at": "2026-08-15T00:00:00Z"},
+        "run_claim": {"token": "claim-token"},
+    }
+    assert scheduler.run_one_job(job) is False
+    assert delivery_attempts == []
+    assert finish_attempts == [
+        (
+            "exec-token-store-fail",
+            {
+                "success": False,
+                "error": "jobs store unavailable",
+                "delivery_outcome": "suppressed",
+            },
+        )
+    ]
+
+
 def test_late_shutdown_interruption_finalizes_execution_failed(monkeypatch):
     import cron.scheduler as scheduler
 

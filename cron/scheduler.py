@@ -5989,6 +5989,29 @@ def _run_one_job_body(
         if isinstance(claim, dict):
             expected_run_claim_token = str(claim.get("token") or "")
 
+    def _run_claim_ownership_lost() -> bool:
+        """Fail closed when a token-fenced run claim cannot be validated.
+
+        Jobs-store I/O can fail on the same paths this guard protects.  Never
+        let a validation error mask the original failure or strand the durable
+        execution ledger; suppress external side effects and let the
+        best-effort bookkeeping below finalize what it can.
+        """
+        if not expected_run_claim_token:
+            return False
+        try:
+            return not run_claim_is_owned(
+                job["id"], expected_token=expected_run_claim_token
+            )
+        except Exception:
+            logger.warning(
+                "Job '%s': run_claim ownership validation failed; "
+                "suppressing side effects",
+                job["id"],
+                exc_info=True,
+            )
+            return True
+
     def _mark_this_dispatch(
         success: bool,
         error: Optional[str] = None,
@@ -6246,9 +6269,7 @@ def _run_one_job_body(
                 )
 
             if should_deliver:
-                if expected_run_claim_token and not run_claim_is_owned(
-                    job["id"], expected_token=expected_run_claim_token
-                ):
+                if _run_claim_ownership_lost():
                     ownership_lost = True
                     should_deliver = False
                     logger.warning(
@@ -6329,9 +6350,7 @@ def _run_one_job_body(
             )
             return True
 
-        if expected_run_claim_token and not run_claim_is_owned(
-            job["id"], expected_token=expected_run_claim_token
-        ):
+        if _run_claim_ownership_lost():
             logger.warning(
                 "Job '%s': suppressing stale completion because run_claim "
                 "ownership changed",
@@ -6429,12 +6448,7 @@ def _run_one_job_body(
             and not delivery_attempted
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()
-            and not (
-                expected_run_claim_token
-                and not run_claim_is_owned(
-                    job["id"], expected_token=expected_run_claim_token
-                )
-            )
+            and not _run_claim_ownership_lost()
         ):
             normalized_deliver = _normalize_deliver_value(
                 job.get("deliver", "local")
