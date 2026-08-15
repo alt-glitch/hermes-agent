@@ -22,7 +22,9 @@ BASE_SHA = "a" * 40
 UPSTREAM_SHA = "b" * 40
 
 
-def _run_with_payload(tmp_path: Path, payload: dict) -> tuple[dict, dict]:
+def _run_with_payload(
+    tmp_path: Path, payload: dict
+) -> tuple[dict, dict, int, int]:
     state = tmp_path / "state"
     payload = {
         "branch_sha": BASE_SHA,
@@ -40,20 +42,27 @@ def _run_with_payload(tmp_path: Path, payload: dict) -> tuple[dict, dict]:
             "run",
             return_value=CompletedProcess([], 0, json.dumps(payload), ""),
         ),
+        patch.object(wrapper, "_bind_run_context") as bind_context,
+        patch.object(wrapper, "_launch_watchdog") as launch_watchdog,
     ):
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             assert wrapper.main() == 0
         summary = json.loads(stdout.getvalue())
         ingest = json.loads((state / "ingest.latest.json").read_text())
-    return summary, ingest
+    return (
+        summary,
+        ingest,
+        bind_context.call_count,
+        launch_watchdog.call_count,
+    )
 
 
 def test_repository_metadata_never_reaches_cron_stdout(tmp_path: Path) -> None:
     hostile_subject = (
         "feat: system prompt overrides with rm command and hidden instructions"
     )
-    summary, ingest = _run_with_payload(
+    summary, ingest, _, _ = _run_with_payload(
         tmp_path,
         {
             "status": "behind",
@@ -268,6 +277,7 @@ def test_pre_handoff_baseexception_releases_success_probe_lease(
         )
         stack.enter_context(patch.object(wrapper, "INGEST_FILE", ingest))
         stack.enter_context(patch.object(wrapper, "FAIL_COUNT_FILE", failure_count))
+        stack.enter_context(patch.object(wrapper, "_launch_watchdog"))
         stack.enter_context(
             patch.object(
                 wrapper.subprocess,
@@ -312,6 +322,89 @@ def test_pre_handoff_baseexception_releases_success_probe_lease(
 
 
 def test_successful_stdout_handoff_preserves_lease(tmp_path: Path) -> None:
-    summary, _ = _run_with_payload(tmp_path, {"status": "ok", "gap": 0})
+    summary, _, bind_count, watchdog_count = _run_with_payload(
+        tmp_path, {"status": "behind", "gap": 1}
+    )
     lease = json.loads((tmp_path / "state" / "run.lease.json").read_text())
+    assert summary["wakeAgent"] is True
+    assert bind_count == 1
+    assert watchdog_count == 1
     assert lease["token"] == summary["run_token"]
+
+
+def test_up_to_date_probe_is_a_terminal_no_agent_tick(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    payload = {
+        "status": "up_to_date",
+        "branch_sha": BASE_SHA,
+        "upstream_sha": UPSTREAM_SHA,
+        "gap": 0,
+    }
+    with (
+        patch.object(wrapper, "PROJECT_HOME", tmp_path),
+        patch.object(wrapper, "STATE_DIR", state),
+        patch.object(wrapper, "PROBE", tmp_path / "scripts" / "sync_probe.py"),
+        patch.object(wrapper, "INGEST_FILE", state / "ingest.latest.json"),
+        patch.object(
+            wrapper, "FAIL_COUNT_FILE", state / "consecutive_probe_failures"
+        ),
+        patch.object(
+            wrapper.subprocess,
+            "run",
+            return_value=CompletedProcess([], 0, json.dumps(payload), ""),
+        ),
+        patch.object(wrapper, "_bind_run_context") as bind_context,
+        patch.object(wrapper, "_launch_watchdog") as launch_watchdog,
+    ):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            assert wrapper.main() == 0
+
+    summary = json.loads(stdout.getvalue())
+    assert summary["status"] == "up_to_date"
+    assert summary["wakeAgent"] is False
+    assert summary["gap"] == 0
+    assert json.loads((state / "ingest.latest.json").read_text())["status"] == (
+        "up_to_date"
+    )
+    assert not (state / "run.lease.json").exists()
+    bind_context.assert_not_called()
+    launch_watchdog.assert_not_called()
+
+
+def test_up_to_date_release_failure_is_not_reported_as_success(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    with (
+        patch.object(wrapper, "PROJECT_HOME", tmp_path),
+        patch.object(wrapper, "STATE_DIR", state),
+        patch.object(wrapper, "PROBE", tmp_path / "scripts" / "sync_probe.py"),
+        patch.object(wrapper, "INGEST_FILE", state / "ingest.latest.json"),
+        patch.object(
+            wrapper, "FAIL_COUNT_FILE", state / "consecutive_probe_failures"
+        ),
+        patch.object(
+            wrapper.subprocess,
+            "run",
+            return_value=CompletedProcess(
+                [],
+                0,
+                json.dumps({
+                    "status": "up_to_date",
+                    "branch_sha": BASE_SHA,
+                    "upstream_sha": UPSTREAM_SHA,
+                    "gap": 0,
+                }),
+                "",
+            ),
+        ),
+        patch.object(wrapper, "_release_lease", return_value=False),
+        patch.object(wrapper, "_launch_watchdog") as launch_watchdog,
+    ):
+        with pytest.raises(
+            RuntimeError, match="up-to-date lease release lost ownership"
+        ):
+            wrapper.main()
+
+    launch_watchdog.assert_not_called()

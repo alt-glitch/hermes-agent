@@ -530,7 +530,9 @@ def _launch_watchdog(run: dict[str, Any], execution_id: str) -> None:
         )
 
 
-def _safe_summary(payload: dict[str, Any]) -> dict[str, Any]:
+def _safe_summary(
+    payload: dict[str, Any], *, wake_agent: bool = True
+) -> dict[str, Any]:
     """Return the only data allowed onto cron stdout.
 
     Do not add commit subjects, authors, paths, errors, diffs, or tool output.
@@ -554,7 +556,7 @@ def _safe_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "run_id": payload.get("run_id"),
         "evidence_dir": payload.get("evidence_dir"),
         "execution_id": payload.get("execution_id"),
-        "wakeAgent": True,
+        "wakeAgent": wake_agent,
     }
 
 
@@ -636,6 +638,20 @@ def main() -> int:
         payload["run_id"] = run["run_id"]
         payload["evidence_dir"] = run["evidence_dir"]
         payload["execution_id"] = execution_id
+
+        # A zero-gap probe is a complete cron tick, not an agent task. Handing
+        # it to Hermes would spend a model call, leave a watchdog polling the
+        # execution ledger, and hold the whole-run lease until the agent exits.
+        # Persist the probe result first, then release the exact lease owner
+        # before returning the scheduler's explicit no-wake gate.
+        if payload.get("status") == "up_to_date":
+            _write_text_atomic(INGEST_FILE, json.dumps(payload, indent=2) + "\n")
+            if not _release_lease(run_token):
+                raise RuntimeError("up-to-date lease release lost ownership")
+            handed_off = True
+            print(json.dumps(_safe_summary(payload, wake_agent=False)))
+            return 0
+
         context = {
             "evidence_dir": run["evidence_dir"],
             "schema_version": 1,
