@@ -142,6 +142,7 @@ def test_tui_tick_fires_when_idle_and_due(server, session):
 
     def fake_submit(rid, sid_, session_, text, **kwargs):
         fired["text"] = text
+        fired["claim_id"] = kwargs.get("loop_claim_id")
 
     with patch.object(server, "_run_prompt_submit", fake_submit), \
          patch.object(server, "_emit"):
@@ -149,6 +150,7 @@ def test_tui_tick_fires_when_idle_and_due(server, session):
 
     assert "poll the build" in fired.get("text", "")
     assert "[/loop wakeup #1" in fired["text"]
+    assert fired["claim_id"] == LoopManager(session_key).state.claim_id
     # Session claimed for the wakeup turn.
     assert s["running"] is True
 
@@ -203,3 +205,51 @@ def test_tui_tick_noop_when_not_due(server, session):
 
     submit.assert_not_called()
     assert s["running"] is False
+
+
+def test_tui_tick_recovers_expired_claim_and_retries_same_ordinal(server, session):
+    sid, session_key, s = session
+    from hermes_cli.loops import LoopManager, save_loop
+
+    mgr = LoopManager(session_key)
+    mgr.set("poll", interval_seconds=60)
+    mgr.state.next_due_at = time.time() - 1
+    mgr.fire_tick()
+    mgr.state.next_due_at = time.time() - 1
+    save_loop(session_key, mgr.state)
+
+    fired = {}
+    with patch.object(server, "read_turn_marker", return_value=None), \
+         patch.object(server, "_run_prompt_submit", lambda _r, _sid, _s, text, **_kw: fired.setdefault("text", text)), \
+         patch.object(server, "_emit"):
+        server._maybe_fire_tui_loop_tick(sid, s)
+
+    assert "wakeup #1" in fired["text"]
+    assert LoopManager(session_key).state.ticks_fired == 1
+
+
+def test_tui_tick_does_not_reclaim_restart_owned_claim(server, session):
+    sid, session_key, s = session
+    from hermes_cli.loops import LoopManager, save_loop
+
+    mgr = LoopManager(session_key)
+    mgr.set("poll", interval_seconds=60)
+    mgr.state.next_due_at = time.time() - 1
+    mgr.fire_tick()
+    mgr.state.next_due_at = time.time() - 1
+    save_loop(session_key, mgr.state)
+
+    with patch.object(server, "read_turn_marker", return_value={"started_at": time.time()}), \
+         patch.object(server, "_run_prompt_submit") as submit, \
+         patch.object(server, "_emit"):
+        server._maybe_fire_tui_loop_tick(sid, s)
+
+    submit.assert_not_called()
+    assert LoopManager(session_key).state.awaiting_response is True
+
+    s["_auto_continue_scheduled"] = True
+    with patch.object(server, "read_turn_marker", return_value=None), \
+         patch.object(server, "_run_prompt_submit") as submit, \
+         patch.object(server, "_emit"):
+        server._maybe_fire_tui_loop_tick(sid, s)
+    submit.assert_not_called()

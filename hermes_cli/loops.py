@@ -50,6 +50,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -304,6 +305,10 @@ class LoopState:
     # Keeps a tick from double-firing while its turn is still running and
     # tells the post-turn hook that the turn that just ended was ours.
     awaiting_response: bool = False
+    # Unique owner for the persisted in-flight tick. Surfaces propagate this
+    # token with the synthetic turn so unrelated turns cannot complete or
+    # abandon the claim.
+    claim_id: str = ""
     # Self-paced change detection: digest of the previous wakeup's reply.
     last_response_digest: str = ""
     paused_reason: Optional[str] = None
@@ -312,7 +317,7 @@ class LoopState:
     # chat_type / thread_id) so the idle wakeup watcher can inject the
     # tick back into the right chat. Empty for CLI / TUI sessions, which
     # drive ticks from their own session-local schedulers.
-    route: Dict[str, str] = field(default_factory=dict)
+    route: Dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -335,6 +340,7 @@ class LoopState:
             last_fired_at=float(data.get("last_fired_at", 0.0) or 0.0),
             next_due_at=float(data.get("next_due_at", 0.0) or 0.0),
             awaiting_response=bool(data.get("awaiting_response", False)),
+            claim_id=str(data.get("claim_id", "") or ""),
             last_response_digest=str(data.get("last_response_digest", "") or ""),
             paused_reason=data.get("paused_reason"),
             last_stop_reason=data.get("last_stop_reason"),
@@ -427,6 +433,49 @@ def save_loop(session_id: str, state: LoopState) -> None:
         db.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
         logger.debug("LoopManager: set_meta failed: %s", exc)
+
+
+def compare_and_set_loop(
+    session_id: str,
+    expected_raw: Optional[str],
+    state: LoopState,
+) -> bool:
+    """Persist ``state`` iff the loop row still matches ``expected_raw``."""
+    if not session_id:
+        return False
+    db = _get_session_db()
+    if db is None:
+        return False
+    try:
+        return bool(
+            db.compare_and_set_meta(
+                _meta_key(session_id), expected_raw, state.to_json()
+            )
+        )
+    except Exception as exc:
+        logger.debug("LoopManager: compare-and-set failed: %s", exc)
+        return False
+
+
+def _load_loop_record(session_id: str) -> tuple[Optional[LoopState], Optional[str]]:
+    """Return parsed state plus the exact raw value used for CAS."""
+    if not session_id:
+        return None, None
+    db = _get_session_db()
+    if db is None:
+        return None, None
+    try:
+        raw = db.get_meta(_meta_key(session_id))
+    except Exception as exc:
+        logger.debug("LoopManager: get_meta failed: %s", exc)
+        return None, None
+    if not raw:
+        return None, None
+    try:
+        return LoopState.from_json(raw), raw
+    except Exception as exc:
+        logger.warning("LoopManager: could not parse stored loop for %s: %s", session_id, exc)
+        return None, raw
 
 
 def clear_loop(session_id: str) -> None:
@@ -545,7 +594,7 @@ class LoopManager:
 
     def __init__(self, session_id: str):
         self.session_id = session_id
-        self._state: Optional[LoopState] = load_loop(session_id)
+        self._state, self._raw = _load_loop_record(session_id)
 
     # --- introspection ------------------------------------------------
 
@@ -555,7 +604,23 @@ class LoopManager:
 
     def refresh(self) -> None:
         """Re-read state from the DB (cross-process safety for the gateway)."""
-        self._state = load_loop(self.session_id)
+        self._state, self._raw = _load_loop_record(self.session_id)
+
+    def _cas(self, state: LoopState, expected_raw: Optional[str]) -> bool:
+        if not compare_and_set_loop(self.session_id, expected_raw, state):
+            self.refresh()
+            return False
+        self._state = state
+        self._raw = state.to_json()
+        return True
+
+    def _ownership_changed(self) -> Dict[str, Any]:
+        return {
+            "status": self._state.status if self._state else None,
+            "stopped": False,
+            "reason": "tick ownership changed",
+            "message": "",
+        }
 
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
@@ -601,7 +666,7 @@ class LoopManager:
         interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
-        route: Optional[Dict[str, str]] = None,
+        route: Optional[Dict[str, Any]] = None,
     ) -> LoopState:
         """Start a new loop (replaces any existing one for the session)."""
         prompt = (prompt or "").strip()
@@ -634,44 +699,69 @@ class LoopManager:
         state.route = dict(route or {})
         self._state = state
         save_loop(self.session_id, state)
+        self._raw = state.to_json()
         return state
 
     def pause(self, reason: str = "user-paused") -> Optional[LoopState]:
-        if not self._state or self._state.status not in {"active", "paused"}:
-            return None
-        self._state.status = "paused"
-        self._state.paused_reason = reason
-        self._state.awaiting_response = False
-        save_loop(self.session_id, self._state)
-        return self._state
+        for _ in range(3):
+            self.refresh()
+            if not self._state or self._state.status not in {"active", "paused"}:
+                return None
+            expected = self._raw
+            self._state.status = "paused"
+            self._state.paused_reason = reason
+            self._state.awaiting_response = False
+            self._state.claim_id = ""
+            if self._cas(self._state, expected):
+                return self._state
+        return None
 
     def resume(self) -> Optional[LoopState]:
-        if not self._state or self._state.status == "cleared":
-            return None
-        self._state.status = "active"
-        self._state.paused_reason = None
-        self._state.awaiting_response = False
-        # Re-arm relative to now so a long pause doesn't fire instantly N times.
-        delay = self._state.current_delay or self._state.interval_seconds or self_paced_floor_seconds()
-        self._state.next_due_at = time.time() + min(delay, 5.0)
-        save_loop(self.session_id, self._state)
-        return self._state
+        for _ in range(3):
+            self.refresh()
+            if not self._state or self._state.status == "cleared":
+                return None
+            expected = self._raw
+            self._state.status = "active"
+            self._state.paused_reason = None
+            self._state.awaiting_response = False
+            self._state.claim_id = ""
+            # Re-arm relative to now so a long pause doesn't fire instantly.
+            delay = (
+                self._state.current_delay
+                or self._state.interval_seconds
+                or self_paced_floor_seconds()
+            )
+            self._state.next_due_at = time.time() + min(delay, 5.0)
+            if self._cas(self._state, expected):
+                return self._state
+        return None
 
     def clear(self) -> bool:
-        if self._state is None or self._state.status == "cleared":
-            return False
-        self._state.status = "cleared"
-        save_loop(self.session_id, self._state)
-        self._state = None
-        return True
+        for _ in range(3):
+            self.refresh()
+            if self._state is None or self._state.status == "cleared":
+                return False
+            expected = self._raw
+            self._state.status = "cleared"
+            self._state.awaiting_response = False
+            self._state.claim_id = ""
+            if self._cas(self._state, expected):
+                self._state = None
+                self._raw = None
+                return True
+        return False
 
     def mark_done(self, reason: str) -> None:
+        self.refresh()
         if not self._state:
             return
+        expected = self._raw
         self._state.status = "done"
         self._state.last_stop_reason = reason
         self._state.awaiting_response = False
-        save_loop(self.session_id, self._state)
+        self._state.claim_id = ""
+        self._cas(self._state, expected)
 
     # --- tick lifecycle -------------------------------------------------
 
@@ -695,16 +785,19 @@ class LoopManager:
         s = self._state
         if s is None or not self.is_due():
             return None
+        expected = self._raw
         s.ticks_fired += 1
         s.last_fired_at = time.time()
         s.awaiting_response = True
+        s.claim_id = uuid.uuid4().hex
         # Provisionally schedule the next tick from NOW; complete_tick
         # reschedules from turn end (so a 10-minute turn doesn't cause an
         # instant re-fire), but if the process dies mid-turn the provisional
         # schedule keeps the persisted loop from being 'due' in a tight loop.
         delay = s.current_delay or s.interval_seconds or self_paced_floor_seconds()
         s.next_due_at = s.last_fired_at + delay
-        save_loop(self.session_id, s)
+        if not self._cas(s, expected):
+            return None
 
         if s.prompt.lstrip().startswith("/"):
             return s.prompt.strip()
@@ -712,16 +805,53 @@ class LoopManager:
         template = WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE if s.until else WAKEUP_PROMPT_TEMPLATE
         return template.format(tick=s.ticks_fired, cadence=cadence, prompt=s.prompt, until=s.until)
 
-    def abandon_tick(self) -> None:
+    def abandon_tick(self, claim_id: Optional[str] = None) -> bool:
         """Roll back a fired tick whose injection failed (nothing ran)."""
+        self.refresh()
         s = self._state
-        if s is None or not s.awaiting_response:
-            return
+        if (
+            s is None
+            or not s.awaiting_response
+            or (claim_id is not None and s.claim_id != claim_id)
+        ):
+            return False
+        expected = self._raw
         s.awaiting_response = False
+        s.claim_id = ""
         s.ticks_fired = max(0, s.ticks_fired - 1)
-        save_loop(self.session_id, s)
+        return self._cas(s, expected)
 
-    def complete_tick(self, last_response: str) -> Dict[str, Any]:
+    def recover_stale_tick(self, now: Optional[float] = None) -> bool:
+        """Re-arm a crash-left tick after its provisional cadence elapsed.
+
+        ``fire_tick`` persists ``awaiting_response`` before a surface injects
+        the wakeup. A process death in that small window can otherwise wedge
+        the loop forever. Drivers may call this only after proving that no
+        live or restart-recoverable turn still owns the claim.
+
+        Recovery is deliberately at-least-once: roll the unacknowledged tick
+        back and make that same ordinal due again.
+        """
+        self.refresh()
+        s = self._state
+        ts = now if now is not None else time.time()
+        if (
+            s is None
+            or s.status != "active"
+            or not s.awaiting_response
+            or ts < s.next_due_at
+        ):
+            return False
+        expected = self._raw
+        s.awaiting_response = False
+        s.claim_id = ""
+        s.ticks_fired = max(0, s.ticks_fired - 1)
+        s.next_due_at = ts
+        return self._cas(s, expected)
+
+    def complete_tick(
+        self, last_response: str, claim_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
 
         Returns a decision dict::
@@ -732,17 +862,25 @@ class LoopManager:
         ``message`` is a user-visible one-liner ("" when nothing worth
         saying — the common still-looping case stays quiet).
         """
+        self.refresh()
         s = self._state
-        if s is None or not s.awaiting_response:
+        if (
+            s is None
+            or not s.awaiting_response
+            or (claim_id is not None and s.claim_id != claim_id)
+        ):
             return {"status": s.status if s else None, "stopped": False, "reason": "no tick in flight", "message": ""}
+        expected = self._raw
         s.awaiting_response = False
+        s.claim_id = ""
         now = time.time()
 
         # 1. Agent self-stop marker.
         if response_signals_complete(last_response):
             s.status = "done"
             s.last_stop_reason = "agent signaled the task is complete"
-            save_loop(self.session_id, s)
+            if not self._cas(s, expected):
+                return self._ownership_changed()
             return {
                 "status": "done",
                 "stopped": True,
@@ -761,7 +899,8 @@ class LoopManager:
             if verdict == "done":
                 s.status = "done"
                 s.last_stop_reason = f"stop condition met: {reason}"
-                save_loop(self.session_id, s)
+                if not self._cas(s, expected):
+                    return self._ownership_changed()
                 return {
                     "status": "done",
                     "stopped": True,
@@ -773,7 +912,8 @@ class LoopManager:
         if s.times and s.ticks_fired >= s.times:
             s.status = "done"
             s.last_stop_reason = f"completed the requested {s.times} runs"
-            save_loop(self.session_id, s)
+            if not self._cas(s, expected):
+                return self._ownership_changed()
             return {
                 "status": "done",
                 "stopped": True,
@@ -785,7 +925,8 @@ class LoopManager:
         if s.max_ticks and s.ticks_fired >= s.max_ticks:
             s.status = "paused"
             s.paused_reason = f"tick budget exhausted ({s.ticks_fired}/{s.max_ticks})"
-            save_loop(self.session_id, s)
+            if not self._cas(s, expected):
+                return self._ownership_changed()
             return {
                 "status": "paused",
                 "stopped": True,
@@ -810,7 +951,8 @@ class LoopManager:
         else:
             s.current_delay = s.interval_seconds
         s.next_due_at = now + s.current_delay
-        save_loop(self.session_id, s)
+        if not self._cas(s, expected):
+            return self._ownership_changed()
         return {
             "status": "active",
             "stopped": False,
@@ -856,7 +998,7 @@ def dispatch_loop_command(
     mgr: "LoopManager",
     args: str,
     *,
-    route: Optional[Dict[str, str]] = None,
+    route: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Surface-agnostic handler for ``/loop <args>``.
 

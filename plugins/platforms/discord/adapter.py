@@ -5968,6 +5968,46 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
 
+        @tree.command(name="loop", description="Run or control a recurring in-session workflow")
+        @discord.app_commands.describe(
+            action="Start a loop or control the current one",
+            prompt="Task to repeat (required for start)",
+            every="Cadence such as 30s, 5m, or 1h; blank uses self-paced mode",
+            times="Stop after this many runs (0 = use the configured safety budget)",
+            until="Stop condition judged after each run",
+        )
+        @discord.app_commands.choices(action=[
+            discord.app_commands.Choice(name="status — show the current loop", value="status"),
+            discord.app_commands.Choice(name="start — create or replace a loop", value="start"),
+            discord.app_commands.Choice(name="pause", value="pause"),
+            discord.app_commands.Choice(name="resume", value="resume"),
+            discord.app_commands.Choice(name="stop", value="stop"),
+        ])
+        async def slash_loop(
+            interaction: discord.Interaction,
+            action: str = "status",
+            prompt: str = "",
+            every: str = "",
+            times: int = 0,
+            until: str = "",
+        ):
+            action = (action or "status").strip().lower()
+            if action != "start":
+                await self._run_simple_slash(interaction, f"/loop {action}")
+                return
+            if not prompt.strip():
+                await self._run_simple_slash(interaction, "/loop help")
+                return
+            parts = ["/loop"]
+            if every.strip():
+                parts.append(every.strip())
+            parts.append(prompt.strip())
+            if times > 0:
+                parts.extend(("--times", str(times)))
+            if until.strip():
+                parts.extend(("--until", until.strip()))
+            await self._run_simple_slash(interaction, " ".join(parts))
+
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
         # hermes_cli/commands.py automatically appear as Discord slash

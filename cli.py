@@ -11907,12 +11907,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         boundary, so the loop defers to the next poll.
         """
         mgr = self._get_loop_manager()
-        if mgr is None or not mgr.is_due():
+        if mgr is None:
+            return
+        now = time.time()
+        state = mgr.state
+        if state is not None and state.awaiting_response:
+            # process_loop calls this only at the CLI's idle boundary, so an
+            # expired claim cannot still belong to a live turn here.
+            mgr.recover_stale_tick(now)
+        if not mgr.is_due(now):
             return
         # The idle poll runs at ~10 Hz; once a tick is due but deferred
         # (queued input / active goal), every poll would otherwise hit the
         # DB via goal_blocks_loop_tick. Throttle the deferred re-check.
-        now = time.time()
         if now - getattr(self, "_last_loop_tick_check", 0.0) < 2.0:
             return
         self._last_loop_tick_check = now
@@ -11934,6 +11941,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         wakeup = mgr.fire_tick()
         if not wakeup:
             return
+        claim_id = mgr.state.claim_id if mgr.state else ""
+        self._active_loop_claim_id = claim_id
         try:
             state = mgr.state
             tick_no = state.ticks_fired if state else "?"
@@ -11942,7 +11951,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception as exc:
             logging.debug("loop tick injection failed: %s", exc)
             try:
-                mgr.abandon_tick()
+                mgr.abandon_tick(claim_id)
+                self._active_loop_claim_id = ""
             except Exception:
                 pass
             return
@@ -11953,7 +11963,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # complete them immediately (caps and scheduling still apply).
         if wakeup.lstrip().startswith("/"):
             try:
-                decision = mgr.complete_tick("")
+                decision = mgr.complete_tick("", claim_id)
+                self._active_loop_claim_id = ""
                 msg = decision.get("message") or ""
                 if msg:
                     _cprint(f"  {msg}")
@@ -11972,7 +11983,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if mgr is None:
             return
         state = mgr.state
-        if state is None or not state.awaiting_response:
+        claim_id = str(getattr(self, "_active_loop_claim_id", "") or "")
+        if state is None or not state.awaiting_response or not claim_id:
+            return
+
+        if getattr(self, "_last_loop_turn_failed", False):
+            try:
+                mgr.abandon_tick(claim_id)
+            finally:
+                self._active_loop_claim_id = ""
+                self._last_loop_turn_failed = False
+            _cprint(
+                f"  {_DIM}↻ Loop wakeup failed — it will retry on the next cadence.{_RST}"
+            )
             return
 
         # A user-interrupted wakeup turn pauses the loop (recoverable via
@@ -11982,6 +12005,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 mgr.pause(reason="user-interrupted (Ctrl+C)")
             except Exception:
                 pass
+            self._active_loop_claim_id = ""
             _cprint(
                 f"  {_DIM}⏸ Loop paused — wakeup turn was interrupted. "
                 f"Use /loop resume to continue, or /loop stop to end it.{_RST}"
@@ -12007,7 +12031,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             last_response = ""
 
-        decision = mgr.complete_tick(last_response)
+        decision = mgr.complete_tick(last_response, claim_id)
+        self._active_loop_claim_id = ""
         msg = decision.get("message") or ""
         if msg:
             _cprint(f"  {msg}")
@@ -18939,12 +18964,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._agent_running = True
                     self._interactive_turn = True
                     self._pet_turn_error = False
+                    self._last_loop_turn_failed = False
                     self._pet_reasoning = False
                     self._turn_summary_begin()
                     app.invalidate()  # Refresh status line
 
                     try:
                         self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                    except BaseException:
+                        self._last_loop_turn_failed = True
+                        raise
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

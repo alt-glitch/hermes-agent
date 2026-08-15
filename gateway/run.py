@@ -11563,6 +11563,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
+    @staticmethod
+    def _loop_claim_metadata(session_id: str) -> dict:
+        """Restore loop-turn ownership onto a restart continuation event."""
+        try:
+            from hermes_cli.loops import LoopManager
+
+            state = LoopManager(session_id=session_id).state
+            if state is not None and state.awaiting_response and state.claim_id:
+                return {"hermes_loop_claim_id": state.claim_id}
+        except Exception:
+            pass
+        return {}
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -11685,6 +11698,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                metadata=self._loop_claim_metadata(entry.session_id),
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -17367,6 +17381,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            _loop_claim_id = str(
+                (getattr(event, "metadata", None) or {}).get("hermes_loop_claim_id")
+                or ""
+            )
             try:
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
@@ -17423,11 +17441,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            claim_id=_loop_claim_id,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            # A loop wakeup that exits without a usable final response (user
+            # interrupt, provider error, exception) never reaches the normal
+            # completion hook above. Release its persisted claim so the next
+            # cadence can retry instead of showing "wakeup running" forever.
+            if _loop_claim_id:
+                try:
+                    _loop_entry = self.session_store.lookup_by_session_key(_quick_key)
+                    _loop_sid = getattr(_loop_entry, "session_id", None) or ""
+                    if _loop_sid:
+                        from hermes_cli.loops import LoopManager
+
+                        _loop_mgr = LoopManager(session_id=_loop_sid)
+                        if (
+                            _loop_mgr.state is not None
+                            and _loop_mgr.state.awaiting_response
+                        ):
+                            _loop_mgr.abandon_tick(_loop_claim_id)
+                except Exception:
+                    logger.debug("loop unwind cleanup failed", exc_info=True)
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
             # (_moa_restore_override), which is discarded once the event goes
@@ -21005,6 +21043,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        claim_id: str = "",
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn.
 
@@ -21020,7 +21059,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         sid = getattr(session_entry, "session_id", None) or ""
-        if not sid:
+        if not sid or not claim_id:
             return
 
         mgr = LoopManager(session_id=sid)
@@ -21029,12 +21068,149 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         # The --until judge is a sync aux-LLM call — keep it off the event loop.
-        decision = await asyncio.get_running_loop().run_in_executor(
-            None, mgr.complete_tick, final_response or ""
+        # Keep multiplexed profile credentials/context across the executor
+        # hop. Bare run_in_executor drops those contextvars and can make
+        # --until judging resolve the wrong auxiliary provider/account.
+        decision = await self._run_in_executor_with_context(
+            lambda: mgr.complete_tick(final_response or "", claim_id)
         )
         msg = decision.get("message") or ""
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
+
+    async def _fire_due_loop_wakeups_once(
+        self,
+        *,
+        profile_name: Optional[str] = None,
+        now: Optional[float] = None,
+        warned_no_route: Optional[set] = None,
+    ) -> None:
+        """Run one deterministic /loop wakeup scan in the current profile scope."""
+        from hermes_cli.loops import (
+            LoopManager,
+            goal_blocks_loop_tick,
+            list_active_loops,
+        )
+
+        scan_now = time.time() if now is None else now
+        warned = warned_no_route if warned_no_route is not None else set()
+        for sid, state in list_active_loops():
+            if scan_now < state.next_due_at:
+                continue
+            route = state.route or {}
+            if not route.get("platform") or not route.get("chat_id"):
+                # CLI / TUI-owned loop — their own schedulers drive it.
+                continue
+
+            # Prefer the session store's canonical origin. It preserves every
+            # Discord routing discriminator and follows source migrations. Old
+            # loop rows fall back to their persisted SessionSource-shaped route.
+            try:
+                entry = self.session_store.lookup_by_session_id(sid)
+            except Exception:
+                entry = None
+            origin = getattr(entry, "origin", None) if entry is not None else None
+            source = dataclasses.replace(origin) if origin is not None else None
+            if source is None:
+                try:
+                    source = SessionSource.from_dict(route)
+                except Exception:
+                    source = None
+            if source is None:
+                continue
+            if profile_name and not getattr(source, "profile", None):
+                source.profile = profile_name
+
+            # Profile-aware native adapter first. Relay is an alias transport,
+            # so resolve it through the shared delivery resolver rather than a
+            # literal platform-name scan.
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                source_profile = (getattr(source, "profile", None) or "").strip()
+                active_profile = self._active_profile_name()
+                delivery_adapters = self.adapters
+                if source_profile and source_profile not in {"default", active_profile}:
+                    # A missing secondary-profile native adapter must fail
+                    # closed. The process-level registry belongs to the
+                    # active/default profile; only its shared Relay transport
+                    # may legitimately carry a secondary profile's wakeup.
+                    relay = self.adapters.get(Platform.RELAY)
+                    delivery_adapters = {Platform.RELAY: relay} if relay else {}
+                try:
+                    transport = resolve_delivery_transport(
+                        source.platform, self.config, delivery_adapters,
+                    )
+                except Exception:
+                    transport = None
+                if transport is not None:
+                    adapter = transport.adapter
+                    if getattr(transport, "is_relay", False):
+                        source.delivered_via_upstream_relay = True
+            if adapter is None:
+                warn_key = (profile_name or "", sid)
+                if warn_key not in warned:
+                    warned.add(warn_key)
+                    logger.debug(
+                        "loop wakeup: no adapter for platform %r profile=%r (session %s)",
+                        route.get("platform"), profile_name, sid,
+                    )
+                continue
+
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:
+                session_key = None
+            if session_key and session_key in self._running_agents:
+                continue
+            owns_session = getattr(adapter, "has_active_or_pending_session", None)
+            if session_key and callable(owns_session) and owns_session(session_key):
+                continue
+            if session_key:
+                try:
+                    route_entry = self.session_store.lookup_by_session_key(session_key)
+                except Exception:
+                    route_entry = None
+                if route_entry is not None and getattr(route_entry, "resume_pending", False):
+                    continue
+            if goal_blocks_loop_tick(sid):
+                continue
+
+            mgr = LoopManager(session_id=sid)
+            if state.awaiting_response and not mgr.recover_stale_tick(scan_now):
+                continue
+            if not mgr.is_due(scan_now):
+                continue
+            wakeup = mgr.fire_tick()
+            if not wakeup:
+                continue
+            claim_id = mgr.state.claim_id if mgr.state else ""
+            try:
+                synth_event = MessageEvent(
+                    text=wakeup,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    internal=True,
+                    metadata={"hermes_loop_claim_id": claim_id},
+                )
+                prime = getattr(adapter, "prime_routing_cache", None)
+                if callable(prime):
+                    prime(synth_event)
+                logger.info(
+                    "loop wakeup #%s — injecting for %s chat=%s thread=%s profile=%s",
+                    mgr.state.ticks_fired if mgr.state else "?",
+                    source.platform.value, source.chat_id, source.thread_id,
+                    getattr(source, "profile", None) or "default",
+                )
+                await adapter.handle_message(synth_event)
+                # Slash-command loops bypass the post-turn hook.
+                if wakeup.lstrip().startswith("/"):
+                    mgr.complete_tick("", claim_id)
+            except Exception as exc:
+                logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
+                try:
+                    mgr.abandon_tick(claim_id)
+                except Exception:
+                    pass
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions.
@@ -21055,88 +21231,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         warned_no_route: set = set()
         while self._running:
             try:
-                from hermes_cli.loops import (
-                    LoopManager,
-                    goal_blocks_loop_tick,
-                    list_active_loops,
-                )
-
                 now = time.time()
-                for sid, state in list_active_loops():
-                    if state.awaiting_response or now < state.next_due_at:
-                        continue
-                    route = state.route or {}
-                    platform_name = route.get("platform", "")
-                    chat_id = route.get("chat_id", "")
-                    if not platform_name or not chat_id:
-                        # CLI / TUI-owned loop — their own schedulers drive it.
-                        continue
-                    adapter = None
-                    for p, a in self.adapters.items():
-                        if p.value == platform_name:
-                            adapter = a
-                            break
-                    if adapter is None:
-                        if sid not in warned_no_route:
-                            warned_no_route.add(sid)
-                            logger.debug(
-                                "loop wakeup: no adapter for platform %r (session %s)",
-                                platform_name, sid,
+                if getattr(self.config, "multiplex_profiles", False):
+                    scopes = _multiplex_profile_homes(self.config)
+                    for profile_name, profile_home in scopes:
+                        with _profile_runtime_scope(profile_home):
+                            await self._fire_due_loop_wakeups_once(
+                                profile_name=profile_name,
+                                now=now,
+                                warned_no_route=warned_no_route,
                             )
-                        continue
-
-                    # Build the source + session key to check business.
-                    evt_stub = {
-                        "session_key": "",
-                        "platform": platform_name,
-                        "chat_id": chat_id,
-                        "chat_type": route.get("chat_type", ""),
-                        "thread_id": route.get("thread_id", ""),
-                        "user_id": route.get("user_id", ""),
-                        "user_name": route.get("user_name", ""),
-                    }
-                    source = self._build_process_event_source(evt_stub)
-                    if source is None:
-                        continue
-                    try:
-                        session_key = self._session_key_for_source(source)
-                    except Exception:
-                        session_key = None
-                    if session_key and session_key in self._running_agents:
-                        continue  # busy — stays due, next scan retries
-                    if goal_blocks_loop_tick(sid):
-                        continue
-
-                    mgr = LoopManager(session_id=sid)
-                    if not mgr.is_due(now):
-                        continue
-                    wakeup = mgr.fire_tick()
-                    if not wakeup:
-                        continue
-                    try:
-                        synth_event = MessageEvent(
-                            text=wakeup,
-                            message_type=MessageType.TEXT,
-                            source=source,
-                            internal=True,
-                        )
-                        logger.info(
-                            "loop wakeup #%s — injecting for %s chat=%s thread=%s",
-                            mgr.state.ticks_fired if mgr.state else "?",
-                            platform_name, source.chat_id, source.thread_id,
-                        )
-                        await adapter.handle_message(synth_event)
-                        # Slash-command loops dispatch through the command
-                        # path and never hit the post-turn completion hook —
-                        # complete the tick immediately (caps + scheduling).
-                        if wakeup.lstrip().startswith("/"):
-                            mgr.complete_tick("")
-                    except Exception as exc:
-                        logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
-                        try:
-                            mgr.abandon_tick()
-                        except Exception:
-                            pass
+                else:
+                    await self._fire_due_loop_wakeups_once(
+                        now=now,
+                        warned_no_route=warned_no_route,
+                    )
             except Exception as exc:
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)

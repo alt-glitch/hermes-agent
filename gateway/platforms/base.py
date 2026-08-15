@@ -5748,6 +5748,14 @@ class BasePlatformAdapter(ABC):
         done = getattr(task, "done", None)
         return bool(done and done())
 
+    def has_active_or_pending_session(self, session_key: str) -> bool:
+        """Whether this adapter still owns or queues work for ``session_key``."""
+        return (
+            session_key in self._active_sessions
+            or session_key in self._pending_messages
+            or session_key in self._text_debounce_store()
+        )
+
     def _heal_stale_session_lock(self, session_key: str) -> bool:
         """Clear a stale session lock if the owner task is already gone.
 

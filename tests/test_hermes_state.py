@@ -2786,6 +2786,13 @@ class TestStateMeta:
         db.set_meta("foo", "bar")
         assert db.get_meta("foo") == "bar"
 
+    def test_compare_and_set_meta_is_atomic(self, db):
+        assert db.compare_and_set_meta("claim", None, "v1") is True
+        assert db.compare_and_set_meta("claim", None, "lost") is False
+        assert db.compare_and_set_meta("claim", "stale", "lost") is False
+        assert db.compare_and_set_meta("claim", "v1", "v2") is True
+        assert db.get_meta("claim") == "v2"
+
 
 
 class TestVacuum:

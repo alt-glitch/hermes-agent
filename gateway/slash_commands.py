@@ -3025,16 +3025,11 @@ class GatewaySlashCommandsMixin:
         try:
             src = event.source
             if src is not None:
-                platform = getattr(src, "platform", "")
-                route = {
-                    "platform": platform.value if hasattr(platform, "value") else str(platform or ""),
-                    "chat_id": str(getattr(src, "chat_id", "") or ""),
-                    "chat_type": str(getattr(src, "chat_type", "") or ""),
-                    "thread_id": str(getattr(src, "thread_id", "") or ""),
-                    "user_id": str(getattr(src, "user_id", "") or ""),
-                    "user_name": str(getattr(src, "user_name", "") or ""),
-                }
-                route = {k: v for k, v in route.items() if v}
+                # Persist the canonical SessionSource shape, not a reduced
+                # platform/chat tuple. Discord profile routing needs guild,
+                # parent-channel, thread, and profile identity after restart.
+                route = src.to_dict()
+                route = {k: v for k, v in route.items() if v is not None}
         except Exception:
             route = {}
 

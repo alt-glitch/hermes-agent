@@ -3,16 +3,22 @@
 import time
 
 import pytest
+from unittest.mock import AsyncMock
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli import loops
+from hermes_constants import get_hermes_home
 
 
 class _FakeSessionEntry:
     session_id = "sid-gateway-loop"
+
+    def __init__(self):
+        self.origin = None
+        self.resume_pending = False
 
 
 class _FakeSessionStore:
@@ -20,10 +26,17 @@ class _FakeSessionStore:
         self.entry = _FakeSessionEntry()
 
     def get_or_create_session(self, source):
+        self.entry.origin = source
         return self.entry
 
     def _generate_session_key(self, source):
         return "agent:main:discord:channel:loop-test"
+
+    def lookup_by_session_id(self, session_id):
+        return self.entry if session_id == self.entry.session_id else None
+
+    def lookup_by_session_key(self, session_key):
+        return self.entry if session_key else None
 
 
 @pytest.fixture
@@ -44,6 +57,8 @@ def _make_runner():
     runner.session_store = _FakeSessionStore()
     runner.adapters = {}
     runner._queued_events = {}
+    runner._running_agents = {}
+    runner._profile_adapters = {}
     return runner
 
 
@@ -57,6 +72,9 @@ def _make_event(text: str) -> MessageEvent:
             chat_type="channel",
             thread_id="thread-9",
             user_id="user-loop",
+            scope_id="guild-7",
+            parent_chat_id="parent-3",
+            profile="work",
         ),
         message_id="msg-loop",
     )
@@ -75,6 +93,9 @@ async def test_gateway_loop_create_captures_route(loop_env):
     assert state.route["platform"] == "discord"
     assert state.route["chat_id"] == "chat-loop"
     assert state.route["thread_id"] == "thread-9"
+    assert state.route["scope_id"] == "guild-7"
+    assert state.route["parent_chat_id"] == "parent-3"
+    assert state.route["profile"] == "work"
 
 
 @pytest.mark.asyncio
@@ -110,6 +131,7 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    claim_id = mgr.state.claim_id
 
     entry = _FakeSessionEntry()
     await GatewayRunner._post_turn_loop_completion(
@@ -117,9 +139,201 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
         session_entry=entry,
         source=None,
         final_response="CI is done.\nLOOP_COMPLETE",
+        claim_id=claim_id,
     )
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_post_turn_loop_completion_preserves_executor_context(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(
+        runner, _make_event("/loop 5m poll CI --until build is green")
+    )
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    assert mgr.fire_tick() is not None
+    claim_id = mgr.state.claim_id
+
+    calls = []
+
+    async def run_with_context(fn, *args):
+        calls.append(True)
+        return fn(*args)
+
+    runner._run_in_executor_with_context = run_with_context
+    await GatewayRunner._post_turn_loop_completion(
+        runner,
+        session_entry=_FakeSessionEntry(),
+        source=None,
+        final_response="still building",
+        claim_id=claim_id,
+    )
+    assert calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_gateway_scan_injects_due_discord_loop_into_original_thread(loop_env):
+    runner = _make_runner()
+    event = _make_event("/loop 5m poll CI")
+    await GatewayRunner._handle_loop_command(runner, event)
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
+
+    adapter = type("Adapter", (), {})()
+    adapter.handle_message = AsyncMock()
+    adapter.prime_routing_cache = None
+    runner._profile_adapters = {"work": {Platform.DISCORD: adapter}}
+    await GatewayRunner._fire_due_loop_wakeups_once(runner, now=time.time())
+
+    adapter.handle_message.assert_awaited_once()
+    wake = adapter.handle_message.await_args.args[0]
+    assert wake.internal is True
+    assert wake.source.chat_id == "chat-loop"
+    assert wake.source.thread_id == "thread-9"
+    assert wake.source.scope_id == "guild-7"
+    assert wake.source.parent_chat_id == "parent-3"
+    assert wake.source.profile == "work"
+    claim_id = wake.metadata.get("hermes_loop_claim_id")
+    assert claim_id
+    assert loops.LoopManager("sid-gateway-loop").state.claim_id == claim_id
+
+
+@pytest.mark.asyncio
+async def test_unowned_gateway_turn_cannot_complete_loop_claim(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    assert mgr.fire_tick() is not None
+    claim_id = mgr.state.claim_id
+
+    await GatewayRunner._post_turn_loop_completion(
+        runner,
+        session_entry=_FakeSessionEntry(),
+        source=None,
+        final_response="an unrelated user response",
+    )
+
+    state = loops.LoopManager("sid-gateway-loop").state
+    assert state.awaiting_response is True
+    assert state.claim_id == claim_id
+
+
+@pytest.mark.asyncio
+async def test_gateway_scan_recovers_expired_claim_but_not_resume_pending(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    mgr.fire_tick()
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
+
+    adapter = type("Adapter", (), {})()
+    adapter.handle_message = AsyncMock()
+    adapter.prime_routing_cache = None
+    runner._profile_adapters = {"work": {Platform.DISCORD: adapter}}
+    runner.session_store.entry.resume_pending = True
+    await GatewayRunner._fire_due_loop_wakeups_once(runner, now=time.time())
+    adapter.handle_message.assert_not_awaited()
+
+    runner.session_store.entry.resume_pending = False
+    await GatewayRunner._fire_due_loop_wakeups_once(runner, now=time.time())
+    adapter.handle_message.assert_awaited_once()
+    assert "wakeup #1" in adapter.handle_message.await_args.args[0].text
+
+
+@pytest.mark.asyncio
+async def test_gateway_scan_does_not_reclaim_adapter_owned_session(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    mgr.fire_tick()
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
+
+    adapter = type("Adapter", (), {})()
+    adapter.handle_message = AsyncMock()
+    adapter.has_active_or_pending_session = lambda _key: True
+    runner._profile_adapters = {"work": {Platform.DISCORD: adapter}}
+
+    await GatewayRunner._fire_due_loop_wakeups_once(runner, now=time.time())
+
+    adapter.handle_message.assert_not_awaited()
+    state = loops.LoopManager("sid-gateway-loop").state
+    assert state.awaiting_response is True
+    assert state.ticks_fired == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_scan_never_falls_back_to_default_profile_discord(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
+
+    default_adapter = type("Adapter", (), {})()
+    default_adapter.handle_message = AsyncMock()
+    runner.adapters = {Platform.DISCORD: default_adapter}
+
+    await GatewayRunner._fire_due_loop_wakeups_once(runner, now=time.time())
+
+    default_adapter.handle_message.assert_not_awaited()
+    assert loops.LoopManager("sid-gateway-loop").state.awaiting_response is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_scan_uses_shared_relay_for_profile_discord(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop(mgr.session_id, mgr.state)
+
+    relay = type("Relay", (), {})()
+    relay.fronts_platform = lambda platform: platform == Platform.DISCORD
+    relay.handle_message = AsyncMock()
+    relay.prime_routing_cache = None
+    runner.adapters = {Platform.RELAY: relay}
+    runner.config.platforms = {
+        Platform.RELAY: PlatformConfig(enabled=True, token="token")
+    }
+
+    await GatewayRunner._fire_due_loop_wakeups_once(runner, now=time.time())
+
+    relay.handle_message.assert_awaited_once()
+    wake = relay.handle_message.await_args.args[0]
+    assert wake.source.delivered_via_upstream_relay is True
+    assert wake.source.platform == Platform.DISCORD
+    assert wake.source.profile == "work"
+
+
+@pytest.mark.asyncio
+async def test_loop_watcher_scans_each_multiplex_profile(tmp_path, monkeypatch):
+    runner = _make_runner()
+    runner.config.multiplex_profiles = True
+    runner._running = True
+    homes = [("alpha", tmp_path / "alpha"), ("beta", tmp_path / "beta")]
+    for _, home in homes:
+        home.mkdir()
+    monkeypatch.setattr("gateway.run._multiplex_profile_homes", lambda _cfg: homes)
+
+    seen = []
+
+    async def scan_once(*, profile_name=None, now=None, warned_no_route=None):
+        seen.append((profile_name, get_hermes_home()))
+        if len(seen) == len(homes):
+            runner._running = False
+
+    runner._fire_due_loop_wakeups_once = scan_once
+    await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+
+    assert seen == [(name, home) for name, home in homes]
 
 
 @pytest.mark.asyncio

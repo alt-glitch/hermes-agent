@@ -8303,6 +8303,15 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     session["_auto_continue_scheduled"] = True
     attempt = marker["attempts"] + 1
     text = _auto_continue_note(marker["prompt"])
+    loop_claim_id = ""
+    try:
+        from hermes_cli.loops import LoopManager
+
+        loop_state = LoopManager(session_id=session_key).state
+        if loop_state is not None and loop_state.awaiting_response:
+            loop_claim_id = loop_state.claim_id
+    except Exception:
+        pass
 
     def kickoff() -> None:
         rid = f"__auto_continue__{int(time.time() * 1000)}"
@@ -8339,7 +8348,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 {"kind": "process", "text": "Resuming interrupted turn…"},
             )
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue")
+            submit_kwargs = {"display_kind": "auto_continue"}
+            if loop_claim_id:
+                submit_kwargs["loop_claim_id"] = loop_claim_id
+            _run_prompt_submit(rid, sid, session, text, **submit_kwargs)
         except Exception as exc:
             print(
                 f"[tui_gateway] auto-continue dispatch failed: "
@@ -12910,14 +12922,22 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     if not sid_key:
         return
     mgr = LoopManager(session_id=sid_key)
-    if not mgr.is_due():
+    state = mgr.state
+    now = time.time()
+    if state is None or state.status != "active" or now < state.next_due_at:
         return
     if goal_blocks_loop_tick(sid_key):
         return
 
     with session["history_lock"]:
-        if session.get("running"):
+        if session.get("running") or session.get("_auto_continue_scheduled"):
             return  # busy — stays due, next poll retries
+        if read_turn_marker(_session_home(session), sid_key) is not None:
+            return  # restart recovery owns this turn; never double-inject
+        if state.awaiting_response and not mgr.recover_stale_tick(now):
+            return
+        if not mgr.is_due(now):
+            return
         session["running"] = True
 
     wakeup = mgr.fire_tick()
@@ -12925,6 +12945,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         with session["history_lock"]:
             session["running"] = False
         return
+    claim_id = mgr.state.claim_id if mgr.state else ""
 
     tick_no = mgr.state.ticks_fired if mgr.state else "?"
     rid = f"__loop__{int(time.time() * 1000)}"
@@ -12959,20 +12980,26 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                     # the tick.
                     with session["history_lock"]:
                         if session.get("running"):
-                            mgr.abandon_tick()
+                            mgr.abandon_tick(claim_id)
                             return
                         session["running"] = True
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, payload["message"])
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        payload["message"],
+                        loop_claim_id=claim_id,
+                    )
                     return
             except Exception:
                 pass
-            decision = mgr.complete_tick("")
+            decision = mgr.complete_tick("", claim_id)
             if decision.get("message"):
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, wakeup)
+        _run_prompt_submit(rid, sid, session, wakeup, loop_claim_id=claim_id)
     except Exception as exc:
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
@@ -12982,7 +13009,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         with session["history_lock"]:
             session["running"] = False
         try:
-            mgr.abandon_tick()
+            mgr.abandon_tick(claim_id)
         except Exception:
             pass
 
@@ -13748,6 +13775,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    loop_claim_id: str = "",
 ) -> None:
     client_submission_ids = list(client_submission_ids or [])
     if _session_is_detached(sid, session):
@@ -14548,17 +14576,18 @@ def _run_prompt_submit(
             # If the turn that just finished was a /loop wakeup (fired by
             # the notification poller), evaluate it: LOOP_COMPLETE marker,
             # --until judge, --times / max_ticks caps, next-tick schedule.
-            if status == "complete":
-                try:
-                    from hermes_cli.loops import LoopManager
+            try:
+                from hermes_cli.loops import LoopManager
 
-                    loop_sid_key = session.get("session_key") or ""
-                    if loop_sid_key:
-                        loop_mgr = LoopManager(session_id=loop_sid_key)
-                        loop_state = loop_mgr.state
-                        if loop_state is not None and loop_state.awaiting_response:
+                loop_sid_key = session.get("session_key") or ""
+                if loop_sid_key and loop_claim_id:
+                    loop_mgr = LoopManager(session_id=loop_sid_key)
+                    loop_state = loop_mgr.state
+                    if loop_state is not None and loop_state.awaiting_response:
+                        if status == "complete":
                             loop_decision = loop_mgr.complete_tick(
-                                raw if isinstance(raw, str) else ""
+                                raw if isinstance(raw, str) else "",
+                                loop_claim_id,
                             )
                             loop_msg = loop_decision.get("message") or ""
                             if loop_msg:
@@ -14567,12 +14596,14 @@ def _run_prompt_submit(
                                     sid,
                                     {"kind": "loop", "text": loop_msg},
                                 )
-                except Exception as _loop_exc:
-                    print(
-                        f"[tui_gateway] loop completion hook failed: "
-                        f"{type(_loop_exc).__name__}: {_loop_exc}",
-                        file=sys.stderr,
-                    )
+                        else:
+                            loop_mgr.abandon_tick(loop_claim_id)
+            except Exception as _loop_exc:
+                print(
+                    f"[tui_gateway] loop completion hook failed: "
+                    f"{type(_loop_exc).__name__}: {_loop_exc}",
+                    file=sys.stderr,
+                )
 
             # Apply pending_title now that the DB row exists — in the
             # session-owned profile store (not the launch profile).

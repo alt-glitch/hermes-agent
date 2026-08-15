@@ -339,6 +339,81 @@ class TestTickLifecycle:
         assert mgr.state.awaiting_response is False
         assert mgr.state.ticks_fired == 0
 
+    def test_recover_stale_tick_waits_then_retries_same_ordinal(self, hermes_home):
+        from hermes_cli.loops import LoopManager, save_loop
+
+        mgr = LoopManager(session_id="t5-recover")
+        state = mgr.set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        assert "wakeup #1" in mgr.fire_tick()
+        provisional_due = mgr.state.next_due_at
+
+        assert mgr.recover_stale_tick(provisional_due - 0.01) is False
+        assert mgr.state.awaiting_response is True
+        assert mgr.state.ticks_fired == 1
+
+        assert mgr.recover_stale_tick(provisional_due + 0.01) is True
+        assert mgr.state.awaiting_response is False
+        assert mgr.state.ticks_fired == 0
+        # fire_tick reads the real clock, so persist an actually-due value.
+        mgr.state.next_due_at = time.time() - 1
+        save_loop(mgr.session_id, mgr.state)
+        mgr.refresh()
+        assert "wakeup #1" in mgr.fire_tick()
+
+    def test_stale_manager_cannot_resurrect_cleared_loop(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        stale = LoopManager("cas-clear")
+        state = stale.set("old task", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        controller = LoopManager("cas-clear")
+        assert controller.clear() is True
+
+        assert stale.fire_tick() is None
+        assert LoopManager("cas-clear").has_loop() is False
+
+    def test_stale_manager_cannot_overwrite_replaced_loop(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        stale = LoopManager("cas-replace")
+        state = stale.set("old task", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        LoopManager("cas-replace").set("new task", interval_seconds=600)
+
+        assert stale.fire_tick() is None
+        current = LoopManager("cas-replace").state
+        assert current is not None
+        assert current.prompt == "new task"
+        assert current.awaiting_response is False
+
+    def test_claim_token_rejects_unrelated_completion_and_cleanup(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager("claim-owner")
+        state = mgr.set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        assert mgr.fire_tick() is not None
+        claim_id = mgr.state.claim_id
+
+        decision = mgr.complete_tick("wrong turn", "not-the-owner")
+        assert decision["reason"] == "no tick in flight"
+        assert LoopManager("claim-owner").state.claim_id == claim_id
+        assert mgr.abandon_tick("not-the-owner") is False
+        assert LoopManager("claim-owner").state.claim_id == claim_id
+        assert mgr.abandon_tick(claim_id) is True
+
+    def test_recover_stale_tick_rejects_non_awaiting_and_paused(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t5-recover-noop")
+        state = mgr.set("poll", interval_seconds=300)
+        assert mgr.recover_stale_tick(state.next_due_at + 1) is False
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        mgr.pause()
+        assert mgr.recover_stale_tick(time.time() + 1_000) is False
+
     def test_complete_tick_marker_stops(self, hermes_home):
         from hermes_cli.loops import LoopManager
 

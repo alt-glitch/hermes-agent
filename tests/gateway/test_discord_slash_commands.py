@@ -1,7 +1,7 @@
 """Tests for native Discord slash command fast-paths (thread creation & auto-thread)."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 import sys
 
 import pytest
@@ -201,6 +201,38 @@ async def test_auto_registers_plugin_commands_for_discord(adapter):
     adapter._run_simple_slash.assert_awaited_once_with(
         interaction, "/metricas dias:7 formato:json"
     )
+
+
+@pytest.mark.asyncio
+async def test_registers_native_loop_with_structured_controls(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["loop"]
+    assert callable(command) and not hasattr(command, "callback")
+    interaction = SimpleNamespace()
+
+    await command(interaction)
+    await command(interaction, action="pause")
+    await command(interaction, action="start")
+    await command(
+        interaction,
+        action="start",
+        prompt="poll CI",
+        every="5m",
+        times=3,
+        until="build is green",
+    )
+
+    assert adapter._run_simple_slash.await_args_list == [
+        call(interaction, "/loop status"),
+        call(interaction, "/loop pause"),
+        call(interaction, "/loop help"),
+        call(
+            interaction,
+            "/loop 5m poll CI --times 3 --until build is green",
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -600,5 +632,3 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-
-
