@@ -23,6 +23,10 @@ def test_update_node_dependencies_survives_repeated_reload(
 
     assert main_mod._update_node_dependencies() == []
     assert opentui_calls == ["opentui"]
-    assert main_mod._update_cmd._update_node_dependencies is (
-        main_mod._update_node_dependencies
-    )
+
+    # Upstream now lazy-loads command modules through main.__getattr__ instead
+    # of retaining the old eager main._update_cmd alias.  The behavior contract
+    # is that resolving the main export decorates the authoritative update_cmd
+    # function used by the real update path, without undoing that startup win.
+    update_cmd = importlib.import_module("hermes_cli.update_cmd")
+    assert update_cmd._update_node_dependencies is main_mod._update_node_dependencies
