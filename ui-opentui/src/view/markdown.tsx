@@ -18,13 +18,13 @@
  * and cached by theme-object identity, so all text parts share ONE instance and
  * it's rebuilt only when the skin changes (a new `Theme` object).
  */
-import { createMarkdownCodeBlockRenderer, RGBA, ScrollBoxRenderable, SyntaxStyle, TextRenderable } from '@opentui/core'
+import { createMarkdownCodeBlockRenderer, RGBA, SyntaxStyle } from '@opentui/core'
 import { useRenderer } from '@opentui/solid'
 import { createMemo } from 'solid-js'
 
-import { preprocessMath } from '../logic/mathPreprocess.ts'
-import { mermaidFenceIsClosed, renderMermaidTerminal } from '../logic/mermaid.ts'
+import { applyTransforms } from '../logic/markdownTransforms.ts'
 import type { Theme } from '../logic/theme.ts'
+import { CODE_BLOCKS, type CodeBlockPlugin } from './markdown/codeBlocks.tsx'
 import { useTheme } from './theme.tsx'
 
 const FALLBACK = RGBA.fromHex('#E6EDF3')
@@ -97,60 +97,34 @@ export function syntaxStyleFor(theme: Theme): SyntaxStyle {
 export function Markdown(props: { text: string; streaming?: boolean; fg?: string }) {
   const theme = useTheme()
   const renderer = useRenderer()
-  // Tier-A LaTeX: convert `$…$` / `$$…$$` / `\(...\)` / `\[...\]` spans to
-  // unicode BEFORE the native parser sees the text (fences and inline code pass
-  // through untouched; unclosed delimiters stay verbatim mid-stream — see
-  // logic/mathPreprocess.ts). Memoized so it recomputes only when the text
-  // delta arrives, and the no-math fast path returns the same string identity.
-  const content = createMemo(() => preprocessMath(props.text, { streaming: props.streaming }))
+  // Pre-parse text pipeline (logic/markdownTransforms.ts): today Tier-A LaTeX →
+  // unicode, BEFORE the native parser sees the text (fences and inline code pass
+  // through untouched; unclosed delimiters stay verbatim mid-stream). Memoized so
+  // it recomputes only when the text delta arrives, and the no-transform fast
+  // path returns the same string identity.
+  const content = createMemo(() => applyTransforms(props.text, { streaming: props.streaming ?? false }))
   const renderNode = createMemo(() => {
     // Initial terminal width only selects a spacing density. The native local
     // ScrollBox below owns subsequent parent/terminal resize layout, avoiding
     // one global renderer resize listener per Markdown block in long sessions.
     const availableWidth = Math.max(20, renderer.width - 8)
-    const foreground = props.fg ?? theme().color.text
-    return (
-      createMarkdownCodeBlockRenderer({
-        mermaid: (token, context) => {
-          if (!mermaidFenceIsClosed(token.raw)) return context.defaultRender()
-          const result = renderMermaidTerminal(token.text, availableWidth)
-          if (result.kind === 'fallback') return context.defaultRender()
-          const diagram = new TextRenderable(renderer, {
-            content: result.text,
-            fg: foreground,
-            selectable: true,
-            height: result.height,
-            width: result.width,
-            wrapMode: 'none'
-          })
-          // Always use a local horizontal viewport. The terminal width is not the
-          // Markdown parent's width (dialogs/padded rows can be much narrower),
-          // and ScrollBox auto-hides its bar when content fits the real layout.
-          const viewport = new ScrollBoxRenderable(renderer, {
-            contentOptions: { height: result.height, width: result.width },
-            focusable: false,
-            height: result.height + 1,
-            horizontalScrollbarOptions: {
-              showArrows: true,
-              trackOptions: {
-                backgroundColor: theme().color.border,
-                foregroundColor: theme().color.accent
-              }
-            },
-            scrollX: true,
-            scrollY: false,
-            width: '100%'
-          })
-          // ScrollBoxRenderable 0.4.1 hard-resets `_focusable = true` after its
-          // base constructor, so the option alone is ignored. Explicitly use the
-          // public setter: mouse wheel/drag remain hit-tested, while composer
-          // arrows and h/l can never be stolen by an inline diagram.
-          viewport.focusable = false
-          viewport.add(diagram)
-          return viewport
-        }
-      }) ?? (() => undefined)
+    // Adapt each CODE_BLOCKS plugin onto OpenTUI's MarkdownCodeBlockRenderer:
+    // a `null` return means "use the default fenced-code renderable". The
+    // `theme()` read stays INSIDE this memo so a skin change rebuilds the map.
+    const activeTheme = theme()
+    const adapted = Object.fromEntries(
+      Object.entries(CODE_BLOCKS).map(([lang, plugin]: [string, CodeBlockPlugin]) => [
+        lang,
+        (token: Parameters<CodeBlockPlugin>[0], context: { defaultRender: () => ReturnType<CodeBlockPlugin> }) =>
+          plugin(token, {
+            availableWidth,
+            defaultRender: context.defaultRender,
+            renderer,
+            theme: activeTheme
+          }) ?? context.defaultRender()
+      ])
     )
+    return createMarkdownCodeBlockRenderer(adapted) ?? (() => undefined)
   })
   // `internalBlockMode="top-level"` is the anti-flicker mode (stable head blocks
   // aren't re-rendered per delta); `tableOptions` gives native GFM tables with

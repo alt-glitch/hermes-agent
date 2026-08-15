@@ -43,10 +43,46 @@ describe('inline Mermaid Markdown renderable', () => {
     try {
       expect(mounted.probe.frame()).toMatch(/[┌┐└┘]/u)
       expect(mounted.nodes.some(node => node instanceof ScrollBoxRenderable)).toBe(true)
-      const diagram = mounted.nodes.find(node => node instanceof TextRenderable && node.plainText.includes('►')) as
+      const diagram = mounted.nodes.find(node => node instanceof TextRenderable && node.plainText.includes('▶')) as
         | TextRenderable
         | undefined
       expect(diagram?.selectable).toBe(true)
+    } finally {
+      mounted.probe.destroy()
+    }
+  })
+
+  it('themes diagram spans from the active theme (distinct fg per semantic class)', async () => {
+    const mounted = await mount('```mermaid\ngraph LR\nA --> B\n```', 100)
+    try {
+      const diagram = mounted.nodes.find(node => node instanceof TextRenderable && node.plainText.includes('▶')) as
+        | TextRenderable
+        | undefined
+      expect(diagram).toBeDefined()
+      // Renderable STATE read (headless-safe, unlike captured <markdown> frames):
+      // border(muted) vs edge(accent) must carry different fg colors.
+      const foregrounds = new Set(
+        (diagram?.content.chunks ?? []).filter(chunk => chunk.fg !== undefined).map(chunk => String(chunk.fg))
+      )
+      expect(foregrounds.size).toBeGreaterThan(1)
+    } finally {
+      mounted.probe.destroy()
+    }
+  })
+
+  it('appends an advisory warning line and grows the viewport to fit it', async () => {
+    const source = '```mermaid\ngraph LR\nA --> B\ntotal garbage line here\nC --> D\n```'
+    const mounted = await mount(source, 120)
+    try {
+      const diagram = mounted.nodes.find(
+        node => node instanceof TextRenderable && node.plainText.includes('mermaid:')
+      ) as TextRenderable | undefined
+      expect(diagram).toBeDefined()
+      expect(diagram?.plainText).toContain('! mermaid:')
+      const rows = diagram?.plainText.split('\n') ?? []
+      const scroll = mounted.nodes.find(node => node instanceof ScrollBoxRenderable) as ScrollBoxRenderable | undefined
+      // scrollY is off — every row (art + warning) must fit the declared height.
+      expect(scroll?.scrollHeight).toBeGreaterThanOrEqual(rows.length)
     } finally {
       mounted.probe.destroy()
     }
