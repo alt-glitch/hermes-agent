@@ -18,8 +18,10 @@ from typing import Any, Dict, Iterator, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
-_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
+# Optional test override. Production resolves the path at transaction time so
+# dashboard operations that temporarily enter another profile cannot leak that
+# profile's execution records into the import-time home.
+EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
@@ -33,12 +35,18 @@ def _current_executions_file() -> Path:
     deliberately re-point the module constant. Otherwise follow
     ``use_cron_store()`` and late profile changes exactly like jobs.json does.
     """
-    configured = Path(EXECUTIONS_FILE)
-    if configured != _IMPORT_EXECUTIONS_FILE:
-        return configured
-    from cron.jobs import _current_cron_store
+    if EXECUTIONS_FILE is not None:
+        return Path(EXECUTIONS_FILE)
+    # An explicit context-local cron store must win so profile-multiplexed
+    # gateway work keeps the jobs file and its ledger together. Outside such
+    # a scope, resolve our own profile home late: callers/tests may switch the
+    # active home after cron.jobs was imported, and patching this module's
+    # resolver must not be bypassed through cron.jobs' import binding.
+    from cron.jobs import _cron_store_override, _current_cron_store
 
-    return _current_cron_store().cron_dir / "executions.db"
+    if _cron_store_override.get() is not None:
+        return _current_cron_store().cron_dir / "executions.db"
+    return get_hermes_home().resolve() / "cron" / "executions.db"
 
 
 def _connect() -> sqlite3.Connection:

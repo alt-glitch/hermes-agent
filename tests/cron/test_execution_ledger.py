@@ -62,6 +62,24 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert persisted == [completed]
 
 
+def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path):
+    import cron.executions as executions
+
+    current_home = {"path": tmp_path / "default"}
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", None)
+    monkeypatch.setattr(executions, "get_hermes_home", lambda: current_home["path"])
+
+    default_row = executions.create_execution("default-job", source="builtin")
+    current_home["path"] = tmp_path / "worker"
+    worker_row = executions.create_execution("worker-job", source="builtin")
+
+    assert executions.list_executions() == [worker_row]
+    current_home["path"] = tmp_path / "default"
+    assert executions.list_executions() == [default_row]
+    assert (tmp_path / "default" / "cron" / "executions.db").is_file()
+    assert (tmp_path / "worker" / "cron" / "executions.db").is_file()
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")
@@ -264,8 +282,10 @@ def test_ledger_creation_failure_keeps_recurring_job_due_for_retry(monkeypatch, 
     monkeypatch.setattr(scheduler, "create_execution", fail_ledger_creation)
 
     for expected_attempts in (1, 2):
-        with __import__("pytest").raises(sqlite3.OperationalError, match="database is locked"):
-            scheduler.tick(verbose=False, sync=False)
+        # Ledger initialization is observability, not the execution control
+        # plane: a locked DB leaves the occurrence due and releases the guard
+        # without crashing the long-lived ticker.
+        assert scheduler.tick(verbose=False, sync=False) == 0
         assert scheduler.get_running_job_ids() == frozenset()
         assert scheduler._running_run_claim_tokens == {}
         assert jobs.get_job(job["id"])["next_run_at"] == due_at
@@ -295,19 +315,20 @@ def test_schedule_advance_failure_finishes_attempt_and_releases_guard(monkeypatc
     monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "advance-fail"}])
     monkeypatch.setattr(
         scheduler,
-        "advance_next_run",
-        lambda _job_id: (_ for _ in ()).throw(OSError("jobs store unavailable")),
+        "claim_job_for_fire",
+        lambda _job_id, **_kwargs: (_ for _ in ()).throw(
+            OSError("jobs store unavailable")
+        ),
     )
 
-    with __import__("pytest").raises(OSError, match="jobs store unavailable"):
-        scheduler.tick(verbose=False, sync=False)
+    assert scheduler.tick(verbose=False, sync=True) == 0
 
     assert finished == [
         (
             "exec-advance-fail",
             {
                 "success": False,
-                "error": "Schedule advance failed: jobs store unavailable",
+                "error": "Fire claim failed: jobs store unavailable",
                 "delivery_outcome": None,
             },
         )
@@ -410,14 +431,17 @@ def test_job_store_double_failure_still_finalizes_execution(monkeypatch):
     assert scheduler.run_one_job(
         {"id": "job-store-fail", "execution_id": "exec-store-fail"}
     ) is False
-    assert mark_attempts == [(True, None)]
+    assert mark_attempts == [
+        (True, None),
+        (False, "jobs store unavailable"),
+    ]
     assert finish_attempts == [
         (
             "exec-store-fail",
             {
                 "success": False,
                 "error": "jobs store unavailable",
-                "delivery_outcome": None,
+                "delivery_outcome": "suppressed",
             },
         )
     ]
@@ -477,14 +501,17 @@ def test_late_shutdown_interruption_finalizes_execution_failed(monkeypatch):
     assert not worker.is_alive()
 
     assert results == [True]
-    assert marks == [(job_id, False, "gateway shutdown")]
+    # There is no durable owner in this synthetic direct-run setup. Upstream's
+    # interruption fence deliberately avoids an unfenced jobs.json rewrite;
+    # the exact in-memory execution token still forces the ledger terminal.
+    assert marks == []
     assert finishes == [
         (
             "exec-interrupt",
             {
                 "success": False,
-                "error": scheduler._INTERRUPTED_EXECUTION_ERROR,
-                "delivery_outcome": "suppressed",
+                "error": "Interrupted by gateway shutdown before terminal completion.",
+                "delivery_outcome": None,
             },
         )
     ]

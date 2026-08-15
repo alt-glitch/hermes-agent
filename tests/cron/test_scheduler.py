@@ -274,6 +274,24 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_unresolved_target_still_delivered_as_written(self):
+        """A stored job's platform-native target keeps delivering when neither
+        parser nor directory recognizes it. Routing cron through
+        resolve_send_target turned these into a warning plus a silently
+        dropped delivery; pass_unresolved_references hands the raw id to the adapter
+        again."""
+        job = {"deliver": "telegram:ops-room"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value=None,
+        ):
+            result = _resolve_delivery_target(job)
+        assert result == {
+            "platform": "telegram",
+            "chat_id": "ops-room",
+            "thread_id": None,
+        }
+
 
     def test_list_form_deliver_is_normalized(self, monkeypatch):
         """deliver=['telegram'] (Python list) should resolve like 'telegram' string.
@@ -720,11 +738,11 @@ class TestRunJobSessionPersistence:
             "enabled": True,
         }
         with patch("cron.scheduler.get_due_jobs", return_value=[job]), patch(
-            "cron.scheduler.advance_next_runs"
-        ) as advance, patch("cron.scheduler.run_one_job") as run_one:
+            "cron.scheduler.claim_job_for_fire", return_value=True
+        ) as claim, patch("cron.scheduler.run_one_job") as run_one:
             assert tick(verbose=False, sync=True, can_dispatch=lambda: False) == 0
 
-        advance.assert_not_called()
+        claim.assert_not_called()
         run_one.assert_not_called()
 
     def test_tick_marks_empty_response_as_error(self, tmp_path):
@@ -749,7 +767,7 @@ class TestRunJobSessionPersistence:
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler.get_due_jobs", return_value=[job]), \
-             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.mark_job_run") as mock_mark, \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -791,7 +809,7 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._cron_preflight_enabled", return_value=False), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -851,7 +869,7 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._cron_preflight_enabled", return_value=False), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -912,6 +930,7 @@ class TestRunJobSessionPersistence:
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", timeout_value)
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -1087,7 +1106,7 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._cron_preflight_enabled", return_value=False), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -1202,6 +1221,70 @@ class TestRunJobConfigEnvVarExpansion:
             f"Expected model='gpt-4o-mini-cron-test', got {kwargs['model']!r}. "
             "config.yaml ${VAR} was not expanded in the cron execution path."
         )
+
+
+    def test_transient_dns_fallback_switches_provider_and_model_together(self, tmp_path):
+        """DNS blip during primary OAuth resolve must still walk fallback_providers.
+
+        Regression for Daily Focus Kickoff 2026-08-11: xai-oauth token refresh
+        raised httpx.ConnectError ([Errno 8] nodename nor servname provided)
+        and the scheduler only tried fallbacks on AuthError, so the job died
+        before XAI_API_KEY / Anthropic could rescue it.
+        """
+        import httpx
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: grok-4.5\n"
+            "  provider: xai-oauth\n"
+            "fallback_providers:\n"
+            "  - provider: xai\n"
+            "    model: grok-4.5\n"
+            "  - provider: anthropic\n"
+            "    model: claude-opus-5\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "dns-fallback",
+            "name": "dns fallback",
+            "prompt": "hi",
+            "provider": "xai-oauth",
+            "model": "grok-4.5",
+        }
+        fake_db = MagicMock()
+        requested = []
+
+        def resolve_runtime(**kwargs):
+            requested.append(kwargs.get("requested"))
+            if kwargs.get("requested") in (None, "xai-oauth"):
+                raise httpx.ConnectError(
+                    "[Errno 8] nodename nor servname provided, or not known"
+                )
+            # First fallback rung (xai API key) succeeds.
+            assert kwargs["requested"] == "xai"
+            assert kwargs["target_model"] == "grok-4.5"
+            return {**self._RUNTIME, "provider": "xai", "api_mode": "chat_completions"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=resolve_runtime), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True, error
+        assert error is None
+        assert requested == ["xai-oauth", "xai"]
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "xai"
+        assert kwargs["model"] == "grok-4.5"
 
 
     def test_auth_fallback_switches_provider_and_model_together(self, tmp_path):
@@ -1800,6 +1883,7 @@ class TestSilentDelivery:
 
     def test_silent_response_suppresses_delivery(self, caplog):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1810,12 +1894,61 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
+    def test_silent_with_note_suppresses_delivery(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
+
+    def test_silent_trailing_suppresses_delivery(self):
+        """Agent appended [SILENT] after explanation text — must still suppress."""
+        response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
+
+    def test_silent_is_case_insensitive(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
+
+    def test_bracketless_silent_variants_suppress(self):
+        """Bracketless near-markers the model emits when it drops brackets
+        must still suppress delivery (#51438, #46917)."""
+        from cron.scheduler import tick
+        for marker in ("SILENT", "NO_REPLY", "NO REPLY", "no_reply"):
+            with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+                 patch("cron.scheduler.run_job", return_value=(True, "# output", marker, None)), \
+                 patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+                 patch("cron.scheduler._deliver_result") as deliver_mock, \
+                 patch("cron.scheduler.mark_job_run"):
+                tick(verbose=False)
+            deliver_mock.assert_not_called()
 
     def test_report_quoting_marker_mid_sentence_still_delivers(self):
         """A genuine report that merely mentions the token mid-sentence must
         be delivered — the old substring check wrongly swallowed it."""
         response = "I considered staying [SILENT] but here is the summary: 3 items merged."
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1828,6 +1961,7 @@ class TestSilentDelivery:
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1836,10 +1970,23 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_called_once()
 
+    def test_output_saved_even_when_delivery_suppressed(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
+             patch("cron.scheduler.save_job_output") as save_mock, \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            save_mock.return_value = "/tmp/out.md"
+            from cron.scheduler import tick
+            tick(verbose=False)
+        save_mock.assert_called_once_with("monitor-job", "# full output")
+        deliver_mock.assert_not_called()
 
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
         """Whitespace-only final responses should behave like empty responses."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1873,6 +2020,7 @@ class TestOneShotDispatchClaim:
     def test_claim_runs_before_run_job(self):
         order = []
         with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.claim_dispatch", side_effect=lambda _id: order.append("claim") or True), \
              patch("cron.scheduler.run_job", side_effect=lambda _j, **_kw: order.append("run") or (True, "# out", "ok", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -1881,6 +2029,20 @@ class TestOneShotDispatchClaim:
             from cron.scheduler import tick
             tick(verbose=False)
         assert order == ["claim", "run"]  # claim strictly before side effect
+
+    def test_refused_claim_skips_run_job(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.claim_dispatch", return_value=False), \
+             patch("cron.scheduler.run_job") as run_mock, \
+             patch("cron.scheduler.save_job_output"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+        run_mock.assert_not_called()
+        deliver_mock.assert_not_called()
+        mark_mock.assert_not_called()
 
 
 class TestBuildJobPromptSilentHint:
@@ -2127,7 +2289,7 @@ class TestParallelTick:
         ]
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_runs"), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
@@ -2172,7 +2334,7 @@ class TestParallelTick:
         ]
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_runs"), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
@@ -2182,6 +2344,38 @@ class TestParallelTick:
 
         assert seen["tg-job"] == {"platform": "telegram", "chat_id": "111"}
         assert seen["dc-job"] == {"platform": "discord", "chat_id": "222"}
+
+    def test_max_parallel_env_var(self, monkeypatch):
+        """HERMES_CRON_MAX_PARALLEL=1 should restore serial behaviour."""
+        monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
+        call_times = []
+
+        def mock_run_job(job, *, defer_agent_teardown=None, **_kw):
+            import time
+            call_times.append(("start", job["id"], time.monotonic()))
+            time.sleep(0.05)
+            call_times.append(("end", job["id"], time.monotonic()))
+            return (True, "output", "response", None)
+
+        jobs = [
+            {"id": "s1", "name": "s1", "deliver": "local"},
+            {"id": "s2", "name": "s2", "deliver": "local"},
+        ]
+
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            result = tick(verbose=False)
+
+        assert result == 2
+        # With max_workers=1, second job starts after first ends
+        end_s1 = [t for action, jid, t in call_times if action == "end" and jid == "s1"][0]
+        start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
+        assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
 
 
 class TestDeliverResultTimeoutCancelsFuture:
