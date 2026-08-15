@@ -1729,6 +1729,64 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     expect(store.state.compact).toBe(false)
   })
 
+  test('late timestamps hydration cannot overwrite a newer /timestamps command', () => {
+    const store = createSessionStore()
+    const revision = store.getTimestampsRevision()
+    store.setTimestamps(true)
+    expect(store.hydrateTimestamps(false, revision)).toBe(false)
+    expect(store.state.timestamps).toBe(true)
+
+    const current = store.getTimestampsRevision()
+    expect(store.hydrateTimestamps(false, current)).toBe(true)
+    expect(store.state.timestamps).toBe(false)
+  })
+
+  test('session.usage live tick refreshes the context gauges mid-turn without settling the turn', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({
+      payload: { usage: { context_max: 128000, context_percent: 12.5, context_used: 16000 } },
+      type: 'session.usage'
+    })
+    expect(store.state.info.contextUsed).toBe(16000)
+    expect(store.state.info.contextMax).toBe(128000)
+    expect(store.state.info.contextPercent).toBe(12.5)
+    // the tick carries no `running`, so it must neither stop the spinner nor
+    // fire the busy-queue drain edge, and the streaming row stays live.
+    expect(store.state.info.running).toBe(true)
+    expect(store.isTurnInFlight()).toBe(true)
+    expect(store.state.messages.at(-1)?.streaming).toBe(true)
+
+    // a later tick advances the gauge in place
+    store.apply({ payload: { usage: { context_percent: 15.6, context_used: 20000 } }, type: 'session.usage' })
+    expect(store.state.info.contextUsed).toBe(20000)
+    expect(store.state.info.contextPercent).toBe(15.6)
+  })
+
+  test('message.complete usage still wins over the last mid-turn session.usage tick', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ payload: { usage: { context_percent: 15.6, context_used: 20000 } }, type: 'session.usage' })
+    store.apply({
+      payload: { text: 'done', usage: { context_percent: 18.8, context_used: 24000, cost_usd: 0.42 } },
+      type: 'message.complete'
+    })
+    expect(store.state.info.contextUsed).toBe(24000)
+    expect(store.state.info.contextPercent).toBe(18.8)
+    expect(store.state.info.costUsd).toBe(0.42)
+    expect(store.state.info.running).toBe(false)
+  })
+
+  test('a usage-less session.usage tick is inert', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ payload: { usage: { context_used: 16000 } }, type: 'session.usage' })
+    store.apply({ type: 'session.usage' })
+    store.apply({ payload: {}, type: 'session.usage' })
+    expect(store.state.info.contextUsed).toBe(16000)
+    expect(store.state.info.running).toBe(true)
+  })
+
   test('late details hydration cannot overwrite a newer /details command', () => {
     const store = createSessionStore()
     const revision = store.getDetailsRevision()

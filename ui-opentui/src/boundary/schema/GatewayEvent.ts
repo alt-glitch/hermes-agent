@@ -135,6 +135,19 @@ const MessageComplete = Schema.Struct({
   )
 })
 
+// Live mid-turn usage tick (upstream 2cabeba563cf): the gateway's
+// `_start_usage_ticker` emits this every ~1s while a turn runs so the
+// status-bar context gauge tracks growth live instead of only jumping at
+// `message.complete`. Same nested `usage` shape as session.info/_get_usage —
+// kept loose (Record); the SessionInfo patch reader narrows what it needs.
+// The gateway stops+joins the ticker BEFORE emitting message.complete, so the
+// final frame's usage always lands last and wins.
+const SessionUsage = Schema.Struct({
+  type: Schema.Literal('session.usage'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ usage: opt(Schema.Record(Str, Schema.Unknown)) }))
+})
+
 // reasoning / thinking — toTaggedUnion needs ONE literal per member, so the
 // reasoning.delta/reasoning.available pair is two structs sharing a shape.
 const ReasoningShape = {
@@ -385,6 +398,7 @@ const SessionTurnEvents = Schema.Union([
   MessageDelta,
   MessageInterim,
   MessageComplete,
+  SessionUsage,
   ReasoningDelta,
   ReasoningAvailable,
   MoaReference,

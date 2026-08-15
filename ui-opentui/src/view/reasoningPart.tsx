@@ -1,8 +1,10 @@
 /**
  * ReasoningPart — the model's thinking trace, collapsible (item 6; opencode's
- * ReasoningPart/ReasoningHeader). Auto-EXPANDED while the turn streams (so you
- * watch it think), then COLLAPSES to a one-line `▶ Thought: <title>` once the
- * turn settles. Click the header to override either way.
+ * ReasoningPart/ReasoningHeader). Auto-EXPANDED while this part's reasoning
+ * phase is LIVE (`streaming` is the PER-PART liveness computed by
+ * messageLine's isLiveReasoningPart — upstream 2b0b4a219195 adaptation), then
+ * COLLAPSES to a one-line `▶ Thought: <title>` the moment a later tool/text
+ * part begins or the turn settles. Click the header to override either way.
  *
  *   ▼ Thinking: <title>        ← live (streaming), body shown
  *   ◐ Thought: <title>         ← settled (collapsed), click to reopen

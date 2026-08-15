@@ -326,6 +326,30 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     expect(Option.isSome(decode({ type: 'moa.phase' }))).toBe(true)
   })
 
+  test('decodes a session.usage live tick with the loose nested usage record (upstream 2cabeba563cf)', () => {
+    const ev = decode({
+      type: 'session.usage',
+      session_id: 's1',
+      // the gateway's _get_usage shape: context numbers PLUS counter fields the
+      // engine doesn't read — the loose Record must carry them all through.
+      payload: { usage: { calls: 3, context_max: 128000, context_percent: 12.5, context_used: 16000, total: 999 } }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'session.usage') {
+      expect(ev.value.payload?.usage?.['context_used']).toBe(16000)
+      expect(ev.value.payload?.usage?.['calls']).toBe(3)
+    }
+
+    // payload and usage are both optional — a bare frame decodes (reducer inert)
+    expect(Option.isSome(decode({ type: 'session.usage' }))).toBe(true)
+    expect(Option.isSome(decode({ type: 'session.usage', payload: {} }))).toBe(true)
+  })
+
+  test('SKIPS a session.usage tick whose usage is not a record (never tears the stream)', () => {
+    expect(Option.isNone(decode({ type: 'session.usage', payload: { usage: 5 } }))).toBe(true)
+    expect(Option.isNone(decode({ type: 'session.usage', payload: { usage: 'lots' } }))).toBe(true)
+  })
+
   test('SKIPS an unrecognized event type (Option.none, no throw)', () => {
     expect(Option.isNone(decode({ type: 'totally.unknown.event', foo: 1 }))).toBe(true)
   })

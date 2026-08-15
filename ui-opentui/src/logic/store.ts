@@ -700,9 +700,18 @@ export interface StoreState {
   detailsSections: DetailsSections
   /** Show a muted `[HH:MM]` time next to each transcript message that carries a
    *  stored unix `timestamp` (/timestamps — port of upstream 5ff11a689). Defaults
-   *  OFF; like `compact`, the persisted pref doesn't reach the TUI via session.info,
-   *  so it starts false each launch. */
+   *  OFF; hydrated from the persisted `display.timestamps` on both `config.get
+   *  full` entry paths (boot + config-mtime repoll — upstream 77fcc2ea31e0),
+   *  revision-guarded so a local /timestamps command beats a stale in-flight
+   *  hydration. */
   timestamps: boolean
+  /** `approvals.destructive_slash_confirm` (upstream 77f35add0cc4): gate the
+   *  destructive-slash confirm dialog (/clear, /new, /queue --clear …). Fail
+   *  safe: defaults ON, and only the config's explicit boolean `false` turns it
+   *  off (decoder-enforced). `HERMES_TUI_NO_CONFIRM` remains an env
+   *  alias/override at the confirm seam. Config-scoped — survives session
+   *  resets; a transient config poll failure preserves the last policy. */
+  destructiveSlashConfirm: boolean
   /** /reasoning full — expand ALL thinking ("Thinking"/"Thought") sections to show
    *  their full body, independently of the global /details mode. Defaults OFF;
    *  bare `/reasoning` syncs it from the persisted `display.reasoning_full` (via
@@ -1007,6 +1016,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     detailsCommandOverride: false,
     detailsSections: {},
     timestamps: false,
+    destructiveSlashConfirm: true,
     reasoningFull: false,
     busyInputMode: DEFAULT_BUSY_INPUT_MODE,
     batteryEnabled: false,
@@ -2045,6 +2055,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
   let focusViewRevision = 0
   let detailsRevision = 0
   let batteryRevision = 0
+  let timestampsRevision = 0
   let onBatteryEnabled = (_enabled: boolean) => {}
 
   function registerBatteryEnabledHandler(handler: (enabled: boolean) => void): void {
@@ -2152,9 +2163,35 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return detailsRevision
   }
 
-  /** /timestamps — set the show-[HH:MM] display flag (port of upstream 5ff11a689). */
+  /** /timestamps — set the show-[HH:MM] display flag (port of upstream 5ff11a689).
+   *  Bumps the revision so an in-flight `config.get full` hydration snapshot
+   *  taken BEFORE this command can never overwrite it (same guard as /compact). */
   function setTimestamps(on: boolean): void {
+    timestampsRevision += 1
     setState('timestamps', on)
+  }
+
+  /** Hydrate `display.timestamps` from config (boot + config repoll — upstream
+   *  77fcc2ea31e0). Applies only when no local /timestamps command superseded
+   *  the captured revision. */
+  function hydrateTimestamps(on: boolean, expectedRevision: number): boolean {
+    if (timestampsRevision !== expectedRevision) return false
+    setState('timestamps', on)
+    return true
+  }
+
+  function getTimestampsRevision(): number {
+    return timestampsRevision
+  }
+
+  /** Hydrate the `approvals.destructive_slash_confirm` policy (upstream
+   *  77f35add0cc4). Config-scoped like `focusView`/`batteryEnabled` — it
+   *  deliberately survives session-owned resets, and the caller only invokes
+   *  this on a successfully decoded `config.get full`, so a transient config
+   *  failure preserves the last known policy instead of silently re-enabling
+   *  or disabling the safety gate. */
+  function setDestructiveSlashConfirm(on: boolean): void {
+    setState('destructiveSlashConfirm', on)
   }
 
   /** /reasoning full|clamp — set the expand-all-thinking display flag. */
@@ -2265,6 +2302,19 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // or absent one never clears existing chrome.
         const title = event.payload?.title?.trim()
         if (title) applyInfo({ title })
+        break
+      }
+      case 'session.usage': {
+        // Live mid-turn usage tick (upstream 2cabeba563cf) — the gateway's
+        // usage ticker pushes the growing token/context counters every ~1s
+        // while a turn runs. Route it through the SAME info/usage patch path
+        // as session.info / message.complete so the status-bar gauges update
+        // live. The gateway stops+joins the ticker before it emits
+        // message.complete, so the final authoritative usage always applies
+        // last and wins. A tick never carries `running`, so the busy-queue
+        // drain edge in applyInfo cannot fire from here.
+        const usage = event.payload?.usage
+        if (usage) applyInfo({ usage })
         break
       }
       case 'message.start':
@@ -3422,6 +3472,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     hydrateDetails,
     getDetailsRevision,
     setTimestamps,
+    hydrateTimestamps,
+    getTimestampsRevision,
+    setDestructiveSlashConfirm,
     setReasoningFull,
     setBusyInputMode,
     hydrateBusyInputMode,

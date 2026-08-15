@@ -1,3 +1,7 @@
+import { Option, Schema } from 'effect'
+
+import { noConfirmDestructive } from './env.ts'
+
 /** Approval choices shared by the decoded prompt, view, and response guard. */
 export type ApprovalChoice = 'once' | 'session' | 'always' | 'deny'
 
@@ -44,4 +48,40 @@ export function approvalChoices(policy: ApprovalChoicePolicy): readonly Approval
 export function secureApprovalChoice(choice: unknown, policy: ApprovalChoicePolicy): ApprovalChoice {
   if (choice !== 'once' && choice !== 'session' && choice !== 'always' && choice !== 'deny') return 'deny'
   return approvalChoices(policy).includes(choice) ? choice : 'deny'
+}
+
+// ── destructive-slash confirmation policy (upstream 77f35add0cc4) ──────
+
+/** The `approvals` subset of `config.get full`. `destructive_slash_confirm`
+ * stays Unknown at the boundary — the reader below applies the boolean-false-
+ * only rule, so any other shape fails safe to confirmation. */
+const ApprovalsRootConfigSchema = Schema.Struct({
+  approvals: Schema.optionalKey(Schema.Struct({ destructive_slash_confirm: Schema.optionalKey(Schema.Unknown) }))
+})
+const decodeApprovalsRootConfig = Schema.decodeUnknownOption(ApprovalsRootConfigSchema)
+
+/**
+ * Decode `approvals.destructive_slash_confirm` from `config.get full`. Fail
+ * SAFE: only the explicit YAML boolean `false` disables the /clear//new
+ * confirm dialog — absent, null, strings ("false", "off"), numbers, or a
+ * malformed `approvals` block all keep it ON (Ink applyDisplay's
+ * `!== false` parity).
+ */
+export function destructiveSlashConfirmFromConfig(config: unknown): boolean {
+  const decoded = decodeApprovalsRootConfig(config)
+  if (Option.isNone(decoded)) return true
+  return decoded.value.approvals?.destructive_slash_confirm !== false
+}
+
+/**
+ * The confirm-seam policy: skip the destructive confirm dialog when EITHER the
+ * `HERMES_TUI_NO_CONFIRM` env flag (the pre-existing alias/override, read per
+ * call) or the hydrated config policy disables it. Pure — the entry's `confirm`
+ * dispatcher is the sole consumer.
+ */
+export function skipDestructiveConfirm(
+  configConfirm: boolean,
+  env: { readonly [k: string]: string | undefined } = process.env
+): boolean {
+  return noConfirmDestructive(env) || configConfirm === false
 }

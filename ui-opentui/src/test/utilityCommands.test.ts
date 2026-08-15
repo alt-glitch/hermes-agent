@@ -814,6 +814,10 @@ describe('details logic (pure)', () => {
   })
 
   test('detailsFromConfig hydrates global mode and only validated section overrides', () => {
+    // An invalid section value ('loud') is dropped — but a config-level
+    // expanded mode then pins thinking expanded explicitly, because the
+    // built-in thinking default is collapsed (live-only expansion) and
+    // SECTION_DEFAULTS would otherwise beat the global mode at lookup time.
     expect(
       detailsFromConfig({
         display: {
@@ -821,8 +825,28 @@ describe('details logic (pure)', () => {
           sections: { activity: 'hidden', thinking: 'loud', tools: 'collapsed', future: 'hidden' }
         }
       })
-    ).toEqual({ mode: 'expanded', sections: { activity: 'hidden', tools: 'collapsed' } })
-    expect(detailsFromConfig({ display: { thinking_mode: 'full' } })).toEqual({ mode: 'expanded', sections: {} })
+    ).toEqual({ mode: 'expanded', sections: { activity: 'hidden', thinking: 'expanded', tools: 'collapsed' } })
+    expect(detailsFromConfig({ display: { thinking_mode: 'full' } })).toEqual({
+      mode: 'expanded',
+      sections: { thinking: 'expanded' }
+    })
+    // An explicit thinking section always wins over the expanded-mode pin.
+    expect(detailsFromConfig({ display: { details_mode: 'expanded', sections: { thinking: 'collapsed' } } })).toEqual({
+      mode: 'expanded',
+      sections: { thinking: 'collapsed' }
+    })
+    // Non-expanded modes never pin thinking — the built-in collapsed default
+    // (live-only expansion) governs.
+    expect(detailsFromConfig({ display: { details_mode: 'collapsed' } })).toEqual({ mode: 'collapsed', sections: {} })
+  })
+
+  test('thinking defaults to collapsed (live-only expansion) at sectionMode lookup', () => {
+    // upstream 2b0b4a219195 adaptation: the built-in default must be collapsed
+    // so only the per-part liveness rule (view) expands the streaming phase.
+    expect(sectionMode('thinking', 'collapsed', {})).toBe('collapsed')
+    // /details expanded (commandOverride) and an explicit section still expand.
+    expect(sectionMode('thinking', 'expanded', {}, true)).toBe('expanded')
+    expect(sectionMode('thinking', 'collapsed', { thinking: 'expanded' })).toBe('expanded')
   })
 
   test('parseDetailsMode + nextDetailsMode', () => {

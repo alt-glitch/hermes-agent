@@ -1037,8 +1037,9 @@ const densityCmd: ClientHandler = (arg, ctx) => {
  *    key `timestamps` (matching densityCmd's `key: 'density'` convention — the
  *    classic CLI's `display.timestamps` is its dotted config path, but this RPC
  *    uses the short flag name, so we mirror density). The flag flips locally
- *    regardless (the store drives the render); each launch starts OFF (the
- *    persisted pref doesn't reach this TUI via session.info — see store.ts). */
+ *    immediately (the store drives the render), and the persisted
+ *    `display.timestamps` value hydrates on launch/config repoll with a revision
+ *    guard so a stale reply cannot overwrite this command. */
 const timestampsCmd: ClientHandler = (arg, ctx) => {
   const mode = arg.trim().toLowerCase()
   if (mode === 'status' || mode === '?') {

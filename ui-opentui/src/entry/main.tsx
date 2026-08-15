@@ -68,7 +68,8 @@ import {
 } from '../boundary/sessionLifecycle.ts'
 import { configSyncBlocked, createConfigSyncTracker } from '../logic/configSync.ts'
 import { batteryEnabledFromConfig, createBatteryPoller } from '../logic/battery.ts'
-import { compactFromConfig, detailsFromConfig, focusViewFromConfig } from '../logic/details.ts'
+import { destructiveSlashConfirmFromConfig, skipDestructiveConfirm } from '../logic/approval.ts'
+import { compactFromConfig, detailsFromConfig, focusViewFromConfig, timestampsFromConfig } from '../logic/details.ts'
 import {
   createDelegationStatusRefresher,
   createSpawnTreeSaveDrainer,
@@ -82,7 +83,6 @@ import {
   envFlag,
   heapdumpOnStart,
   launchCwd,
-  noConfirmDestructive,
   resolveMouseEnabled,
   startupImage,
   startupPrompt,
@@ -361,6 +361,7 @@ const postSessionSetup = (
     const focusViewRevision = store.getFocusViewRevision()
     const detailsRevision = store.getDetailsRevision()
     const batteryRevision = store.getBatteryRevision()
+    const timestampsRevision = store.getTimestampsRevision()
 
     // Claim model hydration for this SID before the first async yield. Session
     // transitions clear the previous claim, so an immediate `/model` can only
@@ -423,6 +424,8 @@ const postSessionSetup = (
       const details = detailsFromConfig(decodedBusyConfig.config)
       store.hydrateDetails(details.mode, details.sections, detailsRevision)
       store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedBusyConfig.config), batteryRevision)
+      store.hydrateTimestamps(timestampsFromConfig(decodedBusyConfig.config), timestampsRevision)
+      store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedBusyConfig.config))
       store.configureAgentsNudge(tuiAgentsNudgeConfigValue(decodedBusyConfig.config))
       store.setVoiceMode({
         recordKey: voiceRecordKeyFromConfig(decodedBusyConfig.config),
@@ -1093,6 +1096,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               const focusViewRevision = store.getFocusViewRevision()
               const detailsRevision = store.getDetailsRevision()
               const batteryRevision = store.getBatteryRevision()
+              const timestampsRevision = store.getTimestampsRevision()
 
               if (plan.reload) {
                 const reload = yield* gateway
@@ -1119,6 +1123,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               const details = detailsFromConfig(decodedConfig.config)
               store.hydrateDetails(details.mode, details.sections, detailsRevision)
               store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedConfig.config), batteryRevision)
+              store.hydrateTimestamps(timestampsFromConfig(decodedConfig.config), timestampsRevision)
+              store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedConfig.config))
               store.setVoiceMode({
                 recordKey: voiceRecordKeyFromConfig(decodedConfig.config),
                 submitMode: voiceSubmitModeFromConfig(decodedConfig.config)
@@ -2859,10 +2865,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             return undefined
           }
         },
-        // HERMES_TUI_NO_CONFIRM (Ink parity): skip the destructive-action confirm
-        // step and run the action immediately. Read per call so a wrapper that
-        // mutates env before launch sees the live value.
-        confirm: (message, onConfirm) => (noConfirmDestructive() ? onConfirm() : store.setConfirm(message, onConfirm)),
+        // Skip the destructive-action confirm step and run the action
+        // immediately when EITHER HERMES_TUI_NO_CONFIRM (Ink-parity env
+        // alias/override, read per call so a wrapper that mutates env before
+        // launch sees the live value) OR the hydrated
+        // `approvals.destructive_slash_confirm: false` config policy disables
+        // it (upstream 77f35add0cc4; boolean-false-only, fail-safe decode).
+        confirm: (message, onConfirm) =>
+          skipDestructiveConfirm(store.state.destructiveSlashConfirm)
+            ? onConfirm()
+            : store.setConfirm(message, onConfirm),
         copyResponse: n => {
           const text = nthAssistantResponse(store.state.messages, n)
           if (!text) return false

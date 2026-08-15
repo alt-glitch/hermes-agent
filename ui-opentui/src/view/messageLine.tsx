@@ -122,6 +122,24 @@ export function formatTimestamp(unixSeconds: number): string {
 }
 
 /**
+ * Per-reasoning-phase liveness (upstream 2b0b4a219195 adaptation): a reasoning
+ * (or MoA) part is LIVE — and therefore auto-expanded under the default
+ * collapsed thinking mode — only while the turn is still streaming AND no later
+ * part has begun. The moment a tool/text/reasoning part is appended after it,
+ * that phase is over and the earlier part folds immediately; settling the turn
+ * (streaming=false) or resuming history folds everything. Pure — exported for
+ * tests.
+ */
+export function isLiveReasoningPart(
+  parts: readonly Part[] | undefined,
+  id: string,
+  streaming: boolean | undefined
+): boolean {
+  if (!streaming || !parts?.length) return false
+  return parts[parts.length - 1]?.id === id
+}
+
+/**
  * The quiet per-block copy chip — a muted `⧉ copy` run on its own line at the
  * block's BOTTOM-LEFT (never the right edge: that column belongs to the
  * scrollbar). `alignSelf: flex-start` shrinks the click target to the run
@@ -265,12 +283,25 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                     {part => (
                       <Switch>
                         <Match when={part.type === 'tool' && part}>{tool => <ToolPart part={tool()} />}</Match>
+                        {/* PER-PART liveness (not the message-level streaming
+                      flag): only the currently-live reasoning phase stays
+                      expanded; a part with any later sibling folded already —
+                      see isLiveReasoningPart. */}
                         <Match when={part.type === 'reasoning' && part}>
-                          {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
+                          {r => (
+                            <ReasoningPart
+                              text={r().text}
+                              streaming={isLiveReasoningPart(m().parts, r().id, m().streaming)}
+                            />
+                          )}
                         </Match>
                         <Match when={part.type === 'moa' && part}>
                           {r => (
-                            <ReasoningPart text={r().text} streaming={m().streaming ?? false} section="subagents" />
+                            <ReasoningPart
+                              text={r().text}
+                              streaming={isLiveReasoningPart(m().parts, r().id, m().streaming)}
+                              section="subagents"
+                            />
                           )}
                         </Match>
                         <Match when={part.type === 'hiddenRun' && part}>
