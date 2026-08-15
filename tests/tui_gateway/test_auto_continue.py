@@ -371,6 +371,25 @@ def test_failed_agent_build_leaves_marker_for_retry(
     assert read_turn_marker(marker_home, "session-key") is not None
 
 
+def test_dispatch_failure_releases_auto_continue_guard(
+    emits, schedule_env, marker_home, monkeypatch
+):
+    record_turn_start(marker_home, "session-key", "prompt")
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    session = _session()
+
+    result = server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert result is not None
+    assert session["running"] is False
+    assert session["_auto_continue_scheduled"] is False
+    assert read_turn_marker(marker_home, "session-key") is not None
+
+
 # ── End to end: continuation runs a real turn and clears the marker ────
 
 

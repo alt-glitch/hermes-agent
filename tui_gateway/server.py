@@ -8360,6 +8360,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             )
             with session["history_lock"]:
                 session["running"] = False
+                # Release the ownership guard so the live process can retry
+                # this persisted marker on a later poll. Keeping it set here
+                # would make loop wakeups defer forever until process restart.
+                session["_auto_continue_scheduled"] = False
 
     threading.Thread(target=kickoff, daemon=True).start()
     logger.info(

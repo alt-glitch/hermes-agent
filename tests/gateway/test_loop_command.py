@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _profile_runtime_scope
 from gateway.session import SessionSource
 from hermes_cli import loops
 from hermes_constants import get_hermes_home
@@ -96,6 +96,31 @@ async def test_gateway_loop_create_captures_route(loop_env):
     assert state.route["scope_id"] == "guild-7"
     assert state.route["parent_chat_id"] == "parent-3"
     assert state.route["profile"] == "work"
+
+
+def test_restart_claim_metadata_uses_source_profile(loop_env, tmp_path):
+    runner = _make_runner()
+    source = _make_event("/loop status").source
+    profile_home = tmp_path / "work-profile"
+    profile_home.mkdir()
+    runner._resolve_profile_home_for_source = lambda _source: profile_home
+
+    default_mgr = loops.LoopManager("sid-gateway-loop")
+    default_mgr.set("default poll", interval_seconds=60)
+    default_mgr.state.next_due_at = time.time() - 1
+    assert default_mgr.fire_tick() is not None
+    default_claim_id = default_mgr.state.claim_id
+
+    with _profile_runtime_scope(profile_home):
+        mgr = loops.LoopManager("sid-gateway-loop")
+        mgr.set("poll CI", interval_seconds=60)
+        mgr.state.next_due_at = time.time() - 1
+        assert mgr.fire_tick() is not None
+        claim_id = mgr.state.claim_id
+
+    metadata = runner._loop_claim_metadata("sid-gateway-loop", source)
+    assert claim_id != default_claim_id
+    assert metadata == {"hermes_loop_claim_id": claim_id}
 
 
 @pytest.mark.asyncio

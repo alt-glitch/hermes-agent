@@ -11563,13 +11563,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
-    @staticmethod
-    def _loop_claim_metadata(session_id: str) -> dict:
+    def _loop_claim_metadata(
+        self, session_id: str, source: SessionSource
+    ) -> dict:
         """Restore loop-turn ownership onto a restart continuation event."""
         try:
             from hermes_cli.loops import LoopManager
 
-            state = LoopManager(session_id=session_id).state
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                state = LoopManager(session_id=session_id).state
             if state is not None and state.awaiting_response and state.claim_id:
                 return {"hermes_loop_claim_id": state.claim_id}
         except Exception:
@@ -11698,7 +11701,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
-                metadata=self._loop_claim_metadata(entry.session_id),
+                metadata=self._loop_claim_metadata(entry.session_id, source),
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
