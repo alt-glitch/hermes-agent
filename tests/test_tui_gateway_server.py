@@ -3794,8 +3794,6 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
         (target, False, False),
         (target, True, False),
     ]
-    if omit_messages:
-        expected_calls[0] = (target, False, True)
     assert captured["history_calls"] == expected_calls
     live_sid = resp["result"]["session_id"]
     assert server._sessions[live_sid]["history"] == [
@@ -3897,6 +3895,8 @@ def test_cold_then_live_resume_keeps_verbatim_verification_history(
         "verification candidate",
         "verified final",
     ]
+    # A model-history prefix rewrite (undo/edit/truncate) invalidates the
+    # immutable display projection so removed durable rows cannot resurrect.
     assert truncated["messages"] == [{"role": "user", "text": "check this"}]
 
 

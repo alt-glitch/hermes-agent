@@ -9891,6 +9891,7 @@ def _(rid, params: dict) -> dict:
             cols=cols,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            include_tool_output=bool(params.get("with_tool_output")),
             include_ui_chrome=is_truthy_value(
                 params.get("with_ui_chrome", params.get("with_tool_output", False))
             ),
@@ -10563,6 +10564,7 @@ def _live_session_payload(
     cols: int | None = None,
     touch: bool = False,
     transport: Transport | None = None,
+    include_tool_output: bool = False,
     include_ui_chrome: bool = False,
     omit_messages: bool = False,
 ) -> dict:
@@ -10614,13 +10616,17 @@ def _live_session_payload(
         # skips this path so undo/retry/edit cannot resurrect removed rows.
         with _session_db(session) as db:
             history = _live_visible_history(session, db, history)
+    # Project the display lineage even when the caller omits the response body:
+    # raw model history can contain assistant tool-call placeholders that do not
+    # become visible rows, so ``len(history)`` is not a valid display count.
     display_messages = _history_to_messages(
         history,
+        include_tool_output=include_tool_output,
         include_ui_chrome=include_ui_chrome,
-    ) if not omit_messages else []
+    )
     payload = {
         "info": _fallback_session_info(session),
-        "message_count": len(history) if omit_messages else len(display_messages),
+        "message_count": len(display_messages),
         "messages": [] if omit_messages else display_messages,
         "messages_omitted": omit_messages,
         "running": running,

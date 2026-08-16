@@ -422,6 +422,10 @@ def _(rid, params: dict) -> dict:
                 cols=cols,
                 touch=True,
                 transport=current_transport() or _stdio_transport,
+                include_tool_output=bool(params.get("with_tool_output")),
+                include_ui_chrome=is_truthy_value(
+                    params.get("with_ui_chrome", params.get("with_tool_output", False))
+                ),
                 omit_messages=omit_messages,
             )
             payload["resumed"] = target
@@ -501,13 +505,20 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 logger.debug("child-watch display projection read failed", exc_info=True)
                 display_history = history
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            display_messages = _history_to_messages(
+                display_history,
+                include_tool_output=bool(params.get("with_tool_output")),
+                include_ui_chrome=is_truthy_value(
+                    params.get("with_ui_chrome", params.get("with_tool_output", False))
+                ),
+            )
+            messages = [] if omit_messages else display_messages
             return _ok(
                 rid,
                 {
                     "session_id": sid,
                     "resumed": target,
-                    "message_count": len(display_history) if omit_messages else len(messages),
+                    "message_count": len(display_messages),
                     "messages": messages,
                     "messages_omitted": omit_messages,
                     "info": _lazy_resume_info(cwd, profile=profile),
@@ -611,14 +622,10 @@ def _(rid, params: dict) -> dict:
                 # from the desktop audit): the model-fed copy is alternation-repaired
                 # (raw_history → sanitize_replay_history → the resumed session's
                 # working conversation) and the display copy stays verbatim —
-                # inspection/export must show what is actually stored.
-                if omit_messages:
-                    raw_history = db.get_messages_as_conversation(
-                        target, repair_alternation=True, include_row_ids=True
-                    )
-                    display_history = []
-                else:
-                    raw_history, display_history = db.get_resume_conversations(target)
+                # inspection/export must show what is actually stored. Keep the
+                # durable display projection even when the response omits messages;
+                # a later live reuse must not lose verification/interim rows.
+                raw_history, display_history = db.get_resume_conversations(target)
             except Exception as e:
                 if lease is not None:
                     lease.release()
@@ -626,7 +633,7 @@ def _(rid, params: dict) -> dict:
             # Display keeps the full transcript; the model-fed history drops a
             # dangling/interrupted tool-call tail so a session killed mid-loop does
             # not replay the unanswered call forever (#29086).
-            prefix = [] if omit_messages else db.get_ancestor_display_prefix(target)
+            prefix = db.get_ancestor_display_prefix(target)
             history = sanitize_replay_history(raw_history)
             # Restore the model/provider/reasoning/tier this chat last used so the
             # deferred build (and the info below) match the eager path — without them
@@ -643,6 +650,7 @@ def _(rid, params: dict) -> dict:
                 source=source,
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 display_history_prefix=prefix,
+                display_history=display_history,
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
@@ -654,11 +662,18 @@ def _(rid, params: dict) -> dict:
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
             auto_continue = _maybe_schedule_auto_continue(sid, record, target)
 
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            display_messages = _history_to_messages(
+                display_history,
+                include_tool_output=bool(params.get("with_tool_output")),
+                include_ui_chrome=is_truthy_value(
+                    params.get("with_ui_chrome", params.get("with_tool_output", False))
+                ),
+            )
+            messages = [] if omit_messages else display_messages
             payload = {
                 "session_id": sid,
                 "resumed": target,
-                "message_count": len(raw_history) if omit_messages else len(messages),
+                "message_count": len(display_messages),
                 "messages": messages,
                 "messages_omitted": omit_messages,
                 "info": _lazy_resume_info(
@@ -697,14 +712,10 @@ def _(rid, params: dict) -> dict:
             db.reopen_session(target)
             # One lineage SELECT feeds both projections (see the interactive resume
             # above): the model-fed copy is alternation-repaired for LIVE REPLAY, the
-            # display copy stays verbatim.
-            if omit_messages:
-                raw_history = db.get_messages_as_conversation(
-                    target, repair_alternation=True, include_row_ids=True
-                )
-                display_history = []
-            else:
-                raw_history, display_history = db.get_resume_conversations(target)
+            # display copy stays verbatim. Preserve that display projection even
+            # when the response body is omitted so eager and deferred live reuse
+            # expose the same durable transcript.
+            raw_history, display_history = db.get_resume_conversations(target)
             # The display transcript keeps every row so the user still sees their
             # full history.  The model-fed history is sanitized: a session whose
             # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
@@ -712,11 +723,16 @@ def _(rid, params: dict) -> dict:
             # re-issue the unanswered call forever — the permanent-"thinking" stuck
             # session in #29086.  The messaging gateway already strips this; this is
             # the WebUI/TUI resume path picking up the same cleanup.
-            display_history_prefix = (
-                [] if omit_messages else db.get_ancestor_display_prefix(target)
-            )
+            display_history_prefix = db.get_ancestor_display_prefix(target)
             history = sanitize_replay_history(raw_history)
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            display_messages = _history_to_messages(
+                display_history,
+                include_tool_output=bool(params.get("with_tool_output")),
+                include_ui_chrome=is_truthy_value(
+                    params.get("with_ui_chrome", params.get("with_tool_output", False))
+                ),
+            )
+            messages = [] if omit_messages else display_messages
             tokens = _set_session_context(target)
             try:
                 # Pass the profile's db so the agent persists turns to the right
@@ -825,6 +841,11 @@ def _(rid, params: dict) -> dict:
                             "model_override"
                         ]
                     _sessions[sid]["display_history_prefix"] = display_history_prefix
+                    _sessions[sid]["display_history"] = list(display_history)
+                    _sessions[sid]["display_history_model_length"] = len(history)
+                    _sessions[sid]["display_history_model_fingerprint"] = (
+                        _display_history_model_fingerprint(history)
+                    )
                     # Remember the profile home so each turn re-binds HERMES_HOME (the
                     # agent persists to its own db, but mid-turn home reads — memory,
                     # skills — must resolve to the resumed profile too).
@@ -868,7 +889,7 @@ def _(rid, params: dict) -> dict:
     payload = {
         "session_id": sid,
         "resumed": target,
-        "message_count": len(raw_history) if omit_messages else len(messages),
+        "message_count": len(display_messages),
         "messages": messages,
         "messages_omitted": omit_messages,
         "info": _session_info(agent, session),
