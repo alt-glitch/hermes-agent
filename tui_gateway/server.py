@@ -187,6 +187,7 @@ try:
 except (ValueError, TypeError):
     _ws_orphan_reap_grace = 20.0
 _WS_ORPHAN_REAP_GRACE_S = max(0.0, _ws_orphan_reap_grace)
+_TURN_SETTLE_BEFORE_CLOSE_SECONDS = 5.0
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity", "delegation")
 _GLOBAL_DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
@@ -828,6 +829,10 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
+    history_ready = session.get("resume_history_ready")
+    if history_ready is not None and not history_ready.is_set():
+        session["resume_history_error"] = "session resume cancelled"
+        history_ready.set()
     _release_active_session_slot(session)
     # A close is terminal for every already-accepted input owned by this
     # record. Drain the complete queue (head + image-bearing tail), fence any
@@ -1108,6 +1113,7 @@ def _pop_session_by_id(sid: str) -> dict | None:
         with _sessions_lock:
             if _sessions.get(sid) is not session:
                 return None
+            session["_closing"] = True
             _sessions.pop(sid, None)
         # The session is already out of _sessions here, so downstream teardown
         # (e.g. _finalize_session's per-session async-delegation interrupt) can't
@@ -1122,6 +1128,22 @@ def _teardown_popped_session(
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
+    run_thread = session.get("_run_thread")
+    if (
+        end_reason != "tui_shutdown"
+        and run_thread is not None
+        and run_thread is not threading.current_thread()
+    ):
+        try:
+            if run_thread.is_alive():
+                run_thread.join(timeout=_TURN_SETTLE_BEFORE_CLOSE_SECONDS)
+            if run_thread.is_alive():
+                logger.warning(
+                    "session turn thread still alive after %.1fs teardown grace",
+                    _TURN_SETTLE_BEFORE_CLOSE_SECONDS,
+                )
+        except Exception:
+            logger.debug("failed waiting for session turn thread", exc_info=True)
     _teardown_session(session, end_reason=end_reason)
     return True
 
@@ -2528,6 +2550,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
         owns_db = False
         profile_home = current.get("profile_home")
         try:
+            history_ready = current.get("resume_history_ready")
+            if history_ready is not None:
+                if not history_ready.wait(timeout=300.0):
+                    raise TimeoutError("session history hydration timed out")
+                if history_error := current.get("resume_history_error"):
+                    raise RuntimeError(str(history_error))
+                with _sessions_lock:
+                    if _sessions.get(sid) is not current:
+                        return
             tokens = _set_session_context(key)
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
@@ -5750,6 +5781,16 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    # Epoch seconds the current turn started, or None when idle. Lets the
+    # desktop preserve the turn-elapsed timer across session switches (cold
+    # resume path) instead of resetting it to 0:00.
+    inflight = (session or {}).get("inflight_turn")
+    turn_started_at = (
+        float(inflight["started_at"])
+        if isinstance(inflight, dict) and inflight.get("started_at")
+        else None
+    )
+
     info: dict = {
         "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
         "provider": pending_provider
@@ -5766,6 +5807,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "project": _project_info_for_cwd(cwd),
         "terminal_backend": _effective_terminal_backend(),
         "personality": str(personality or ""),
+        "turn_started_at": turn_started_at,
         "title": _session_live_title(session or {}, session_key) if session_key else "",
         "running": bool((session or {}).get("running")),
         "stored_session_id": session_key or "",
@@ -8848,6 +8890,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             if (
                 (live_session is not None and live_session is not session)
                 or session.get("_finalized")
+                or session.get("_closing")
             ):
                 return False
             with session["history_lock"]:
@@ -10234,6 +10277,80 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, info)
 
 
+def _schedule_resume_hydration(
+    sid: str, stored_id: str, db, *, close_db: bool = False
+) -> None:
+    """Load a cold resume's transcript off the JSON-RPC response path."""
+
+    def _run() -> None:
+        session = _sessions.get(sid)
+        try:
+            if session is None:
+                return
+            _emit(
+                "session.resume_progress",
+                sid,
+                {"phase": "history", "status": "loading"},
+            )
+            db.reopen_session(stored_id)
+            raw_history, display_history = db.get_resume_conversations(stored_id)
+            prefix = db.get_ancestor_display_prefix(stored_id)
+            history = sanitize_replay_history(raw_history)
+
+            if _sessions.get(sid) is not session:
+                return
+            with session["history_lock"]:
+                session["history"] = history
+                session["display_history_prefix"] = prefix
+                session["display_history"] = list(display_history)
+                session["display_history_model_length"] = len(history)
+                session["display_history_model_fingerprint"] = (
+                    _display_history_model_fingerprint(history)
+                )
+                session["resume_hydrating"] = False
+                session["resume_message_count"] = len(display_history)
+            session["resume_history_ready"].set()
+            _emit(
+                "session.resume_progress",
+                sid,
+                {
+                    "message_count": len(display_history),
+                    "phase": "history",
+                    "status": "complete",
+                },
+            )
+            _maybe_schedule_auto_continue(sid, session, stored_id)
+            _start_agent_build(sid, session)
+        except Exception as exc:
+            if _sessions.get(sid) is not session:
+                return
+            message = f"resume failed: {exc}"
+            session["resume_hydrating"] = False
+            session["resume_history_error"] = message
+            session["agent_error"] = message
+            session["resume_history_ready"].set()
+            session["agent_ready"].set()
+            _emit(
+                "session.resume_progress",
+                sid,
+                {"message": message, "phase": "history", "status": "failed"},
+            )
+            _emit("error", sid, {"message": message})
+            with _sessions_lock:
+                discarded = _sessions.pop(sid, None) if _sessions.get(sid) is session else None
+            lease = (discarded or {}).get("active_session_lease")
+            if lease is not None:
+                lease.release()
+        finally:
+            if close_db and hasattr(db, "close"):
+                try:
+                    db.close()
+                except Exception:
+                    logger.debug("failed to close resume db for %s", sid, exc_info=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _session_pending_kind(sid: str) -> str:
     for rid, (owner_sid, _ev) in list(_pending.items()):
         if owner_sid != sid:
@@ -10483,6 +10600,12 @@ def _live_session_payload(
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)
         running = bool(session.get("running"))
+        inflight_turn = session.get("inflight_turn")
+        turn_started_at = (
+            float(inflight_turn["started_at"])
+            if isinstance(inflight_turn, dict) and inflight_turn.get("started_at")
+            else None
+        )
     if reconcile_from_db and not omit_messages:
         # Sessions created before the durable projection existed still need the
         # upstream candidate-inclusive DB reconciliation. Use the session-scoped
@@ -10501,6 +10624,7 @@ def _live_session_payload(
         "messages": [] if omit_messages else display_messages,
         "messages_omitted": omit_messages,
         "running": running,
+        "turn_started_at": turn_started_at,
         "session_id": sid,
         "session_key": _session_lookup_key(session, fallback=sid),
         "started_at": float(session.get("created_at") or time.time()),
@@ -13780,14 +13904,14 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     loop_claim_id: str = "",
-) -> None:
+) -> bool:
     client_submission_ids = list(client_submission_ids or [])
-    if _session_is_detached(sid, session):
+    if session.get("_closing") or _session_is_detached(sid, session):
         with session["history_lock"]:
             session["running"] = False
             session["_active_client_submission_ids"] = []
             _clear_inflight_turn(session)
-        return
+        return False
     agent = session.get("agent")
     if agent is None:
         with session["history_lock"]:
@@ -13799,25 +13923,29 @@ def _run_prompt_submit(
                 client_submission_ids=client_submission_ids,
                 history_lock_owned=True,
             )
-        return
+        return False
     with session["history_lock"]:
         # Claim start atomically against session.interrupt. The start event is
         # written while holding the same lock, so the interrupt response can
         # never overtake it on the wire; clients flush start events before
         # resolving a later interrupt response.
-        if session.get("_turn_cancel_requested") or not session.get("running"):
+        if (
+            session.get("_closing")
+            or session.get("_turn_cancel_requested")
+            or not session.get("running")
+        ):
             session["_turn_cancel_requested"] = False
             session["running"] = False
             session["_active_client_submission_ids"] = []
             _clear_inflight_turn(session)
-            return
+            return False
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0))
             != queued_prompt_generation
         ):
             session["running"] = False
-            return
+            return False
         session["_steer_admission_closed"] = False
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -14956,15 +15084,16 @@ def _run_prompt_submit(
     # excluded by the per-session mutation lock; a popped/finalized record
     # never starts a ghost worker.
     with _session_mutation_lock(session):
-        if _session_is_detached(sid, session):
+        if session.get("_closing") or _session_is_detached(sid, session):
             with session["history_lock"]:
                 session["running"] = False
                 session["_active_client_submission_ids"] = []
                 _clear_inflight_turn(session)
-            return
+            return False
         run_thread = threading.Thread(target=run, daemon=True)
         session["_run_thread"] = run_thread
         run_thread.start()
+    return True
 
 
 # Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25
@@ -20768,7 +20897,6 @@ _fork_method_names = frozenset({
     "session.compress",
     "session.interrupt",
     "session.list",
-    "session.resume",
     "session.steer",
     "tools.configure",
 })

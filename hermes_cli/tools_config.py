@@ -715,6 +715,7 @@ TOOL_CATEGORIES = {
                     # specific binary (e.g. a local build); there is no
                     # version-pin env var.
                 ],
+                "computer_use_backend": "cua",
                 "post_setup": "cua_driver",
             },
         ],
@@ -2550,11 +2551,17 @@ def _get_platform_tools(
     # Honor agent.disabled_toolsets from config.yaml — allows users to
     # globally suppress specific toolsets (e.g. "memory") across all
     # platforms without per-platform toolset configuration.  This runs
-    # last so it overrides everything above.
+    # last so it overrides everything above.  The value may arrive as a
+    # JSON-array string (e.g. "['memory']") from `hermes config set` or a
+    # JSON-mode editor save; parse it so the list is not silently dead (#86661).
     agent_cfg = config.get("agent") or {}
     disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
     if disabled_toolsets:
-        disabled_set = {str(ts) for ts in disabled_toolsets}
+        from agent.skill_utils import parse_config_string_list
+
+        disabled_set = {
+            name.strip() for name in parse_config_string_list(disabled_toolsets) if name.strip()
+        }
         enabled_toolsets -= disabled_set
 
     # #38798: if this platform was explicitly configured but every toolset name
@@ -2668,14 +2675,16 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     agent_cfg = config.get("agent")
     if isinstance(agent_cfg, dict):
         disabled_toolsets = agent_cfg.get("disabled_toolsets")
-        if isinstance(disabled_toolsets, list) and disabled_toolsets:
+        if disabled_toolsets:
+            from agent.skill_utils import parse_config_string_list
+
+            parsed_disabled = parse_config_string_list(disabled_toolsets)
             newly_enabled = enabled_toolset_keys - preserved_entries
             if newly_enabled:
                 remaining = [
-                    ts for ts in disabled_toolsets
-                    if str(ts) not in newly_enabled
+                    ts for ts in parsed_disabled if ts not in newly_enabled
                 ]
-                if remaining != disabled_toolsets:
+                if remaining != parsed_disabled:
                     agent_cfg["disabled_toolsets"] = remaining
 
     save_config(config)
@@ -3779,6 +3788,9 @@ def _is_provider_active(
     if provider.get("web_backend"):
         current = cfg_get(config, "web", "backend")
         return current == provider["web_backend"]
+    if provider.get("computer_use_backend"):
+        current = cfg_get(config, "computer_use", "backend")
+        return current == provider["computer_use_backend"]
     if provider.get("imagegen_backend"):
         image_cfg = config.get("image_gen", {})
         if not isinstance(image_cfg, dict):
@@ -4242,6 +4254,11 @@ def _write_provider_config(provider: dict, config: dict, *, managed_feature) -> 
         web_cfg = config.setdefault("web", {})
         web_cfg["backend"] = provider["web_backend"]
         web_cfg["use_gateway"] = bool(managed_feature)
+
+    # Set computer_use backend in config if applicable
+    if provider.get("computer_use_backend"):
+        cu_cfg = config.setdefault("computer_use", {})
+        cu_cfg["backend"] = provider["computer_use_backend"]
 
     # For tools without a specific config key (e.g. image_gen), still
     # track use_gateway so the runtime knows the user's intent.
@@ -4911,6 +4928,12 @@ def _reconfigure_provider(
         web_cfg["use_gateway"] = bool(managed_feature)
         _print_success(f"  Web backend set to: {provider['web_backend']}")
 
+    # Set computer_use backend in config if applicable
+    if provider.get("computer_use_backend"):
+        cu_cfg = config.setdefault("computer_use", {})
+        cu_cfg["backend"] = provider["computer_use_backend"]
+        _print_success(f"  Computer Use backend set to: {provider['computer_use_backend']}")
+
     if managed_feature and managed_feature not in {"web", "tts", "stt", "browser"}:
         section = config.setdefault(managed_feature, {})
         if not isinstance(section, dict):
@@ -4948,7 +4971,13 @@ def _reconfigure_provider(
                 img_cfg = config.setdefault("image_gen", {})
                 if isinstance(img_cfg, dict):
                     img_cfg["provider"] = "fal"
-                    img_cfg["use_gateway"] = False
+                    # A managed (Nous Subscription) row also carries
+                    # imagegen_backend="fal" — the model picker runs AFTER
+                    # _write_provider_config set use_gateway=True, so an
+                    # unconditional False here silently flipped managed
+                    # picks onto the user's personal FAL_KEY (same class
+                    # as fe63353cb, which fixed the plugin-provider path).
+                    img_cfg["use_gateway"] = bool(managed_feature)
         # STT providers prompt for model selection on reconfig too.
         if provider.get("stt_provider") and not managed_feature:
             _configure_stt_model(provider["stt_provider"], config)
@@ -4991,7 +5020,9 @@ def _reconfigure_provider(
             img_cfg = config.setdefault("image_gen", {})
             if isinstance(img_cfg, dict):
                 img_cfg["provider"] = "fal"
-                img_cfg["use_gateway"] = False
+                # Same managed-row guard as the no-env-vars branch above:
+                # never clobber a Nous-managed pick back onto direct keys.
+                img_cfg["use_gateway"] = bool(managed_feature)
 
     # STT providers prompt for model selection on reconfig too.
     if provider.get("stt_provider") and not managed_feature:
