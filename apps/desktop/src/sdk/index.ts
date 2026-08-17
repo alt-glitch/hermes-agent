@@ -26,25 +26,27 @@ import type { ClientSessionState } from '@/app/types'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { deleteProfile, getLogs, getStatus, type HermesGateway } from '@/hermes'
-import { $gateway, openGatewayForAgent, openGatewayForProfile } from '@/store/gateway'
+import {
+  $gateway,
+  openGatewayForAgent,
+  openGatewayForProfile,
+  requestGatewayForAgent,
+  requestGatewayForProfile
+} from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
+  $profiles,
   ensureGatewayAgent,
   ensureGatewayProfile,
   newSessionInProfile,
   normalizeProfileKey,
+  refreshProfiles,
   selectProfile,
   setActiveProfile,
   setShowAllProfiles
 } from '@/store/profile'
-import {
-  $activeSessionId,
-  $currentCwd,
-  $currentModel,
-  $gatewayState,
-  $selectedStoredSessionId
-} from '@/store/session'
+import { $activeSessionId, $currentCwd, $currentModel, $gatewayState, $selectedStoredSessionId } from '@/store/session'
 import {
   $focusedRuntimeId,
   $focusedSessionState,
@@ -82,6 +84,15 @@ const $focusedAwaitingResponse = focusedTurnFlag(
   PRIMARY_SESSION_VIEW.$awaitingResponse
 )
 
+export interface PluginProfileRoute {
+  connectionId: string
+  mode: 'local' | 'remote'
+  /** Desktop profile used to select the connection route. */
+  profile: string
+  /** Backend Hermes profile served by that route. */
+  targetProfile: string
+}
+
 /** Window geometry + the app's responsive posture, one readonly rect. */
 export interface ViewportRect {
   width: number
@@ -108,6 +119,38 @@ const $busyBySession = computed($sessionStates, states => {
 })
 
 const $viewport = atom<ViewportRect>(readViewport())
+
+async function requestPluginProfile<T>(
+  route: PluginProfileRoute | string,
+  method: string,
+  params: Record<string, unknown>
+): Promise<T> {
+  if (typeof route !== 'string') {
+    return requestGatewayForAgent<T>(route.connectionId, route.profile, method, params)
+  }
+
+  const getAgentRoster = window.hermesDesktop?.getAgentRoster
+
+  if (!getAgentRoster) {
+    return requestGatewayForProfile<T>(route, method, params)
+  }
+
+  const roster = await getAgentRoster()
+  const profile = route.trim() || 'default'
+  const soleLocalSource = roster.sources.length === 1 && roster.sources[0]?.kind === 'local'
+
+  // The string overload is compatibility-only. A sole local registry is the
+  // one topology where a profile name is intrinsically unambiguous, even when
+  // its live enumeration transiently failed. Any additional source requires a
+  // descriptor because an undialed/unreachable source may expose the same name.
+  if (soleLocalSource) {
+    return requestGatewayForProfile<T>(profile, method, params)
+  }
+
+  throw new Error(
+    `Profile "${profile}" requires a route descriptor from host.profileRoutes(); profile-only routing is limited to legacy/local profiles.`
+  )
+}
 
 if (typeof window !== 'undefined') {
   const refresh = () => $viewport.set(readViewport())
@@ -325,6 +368,38 @@ export const host = {
   /** One-shot system status snapshot (platforms, versions, …). */
   status: async () => getStatus(),
 
+  /** Credential-free routes across every current registry source. Identity is
+   *  the (connectionId, profile) pair; endpoint/auth details stay in Electron. */
+  profileRoutes: async () => {
+    const desktop = window.hermesDesktop
+    const getProfileRoutes = desktop?.getProfileRoutes
+
+    if (!getProfileRoutes) {
+      throw new Error('Hermes Desktop connection routing unavailable')
+    }
+
+    let profiles = $profiles.get()
+
+    try {
+      profiles = await refreshProfiles()
+    } catch {
+      // Route inventory is a read: a transient backend failure falls back to
+      // the last cache. Electron always adds the primary Desktop profile.
+    }
+
+    return getProfileRoutes(profiles.map(profile => profile.name))
+  },
+
+  /** Gateway JSON-RPC through a credential-free route descriptor without
+   *  foregrounding it. Passing a bare profile is the v1/local compatibility
+   *  overload; registry callers must pass the descriptor so duplicate names
+   *  remain unambiguous. */
+  requestProfile: async <T>(
+    route: PluginProfileRoute | string,
+    method: string,
+    params: Record<string, unknown> = {}
+  ): Promise<T> => requestPluginProfile<T>(route, method, params),
+
   /** Gateway JSON-RPC — sessions, config, skills, cron, kanban, everything
    *  the app itself uses. Lazy: resolves the LIVE socket per call. */
   request: async <T>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
@@ -350,7 +425,13 @@ export const host = {
 // Every contribution surface, plugin-reachable: register keybinds, palette
 // commands, routes, themes, panes, composer extensions, and bar items with
 // the same area ids + payload types core uses.
-export { COMPOSER_AREAS, type ComposerAttachmentProvider, type ComposerMiddleware } from '@/app/chat/composer/contrib'
+export {
+  COMPOSER_AREAS,
+  type ComposerAtCompletionItem,
+  type ComposerAtCompletionSource,
+  type ComposerAttachmentProvider,
+  type ComposerMiddleware
+} from '@/app/chat/composer/contrib'
 
 // -- ui: the design language --------------------------------------------------
 

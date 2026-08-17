@@ -3434,6 +3434,7 @@ def _launch_tui(
             from cli import (
                 _cleanup_worktree,
                 _git_repo_root,
+                _maintain_pack_health,
                 _prune_stale_worktrees,
                 _setup_worktree,
             )
@@ -3441,6 +3442,19 @@ def _launch_tui(
             repo = _git_repo_root()
             if repo:
                 _prune_stale_worktrees(repo)
+                # Same maintenance pass as the CLI path: repack on pack
+                # sprawl so `worktree add` never crawls on a multi-agent box
+                # (cli._maintain_pack_health is a cheap no-op below the
+                # threshold). Runs on a thread — the TUI path calls the
+                # pruner synchronously, and a repack must not block launch.
+                import threading as _threading
+
+                _threading.Thread(
+                    target=_maintain_pack_health,
+                    args=(repo,),
+                    name="pack-maintenance",
+                    daemon=True,
+                ).start()
             wt_info = _setup_worktree()
         except Exception as exc:
             print(f"✗ Failed to create TUI worktree: {exc}", file=sys.stderr)
@@ -4760,6 +4774,17 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("curator", "Curator", "skill-usage review pass"),
 ]
 
+# Special non-auxiliary task surfaced in the same picker: subagent delegation.
+# Routing lives under top-level `delegation.*` in config.yaml (NOT
+# `auxiliary.delegation`) because delegate_task spawns full child agents via
+# tools/delegate_tool.py::_resolve_delegation_credentials(), which reads the
+# delegation section directly. "auto" here means "inherit the parent agent's
+# provider/model/credentials" and is stored as empty strings — never persist
+# the literal "auto", or it would be resolved as a provider name.
+_DELEGATION_TASK_KEY = "delegation"
+_DELEGATION_TASK_NAME = "Delegation"
+_DELEGATION_TASK_DESC = "subagent model (delegate_task)"
+
 
 def _all_aux_tasks() -> list[tuple[str, str, str]]:
     """Return built-in + plugin-registered auxiliary tasks for picker/menu use.
@@ -4799,6 +4824,32 @@ def _format_aux_current(task_cfg: dict) -> str:
     return provider
 
 
+def _delegation_cfg_as_task(cfg: dict) -> dict:
+    """Project the top-level ``delegation`` section into aux-task shape.
+
+    Returns a dict with provider/model/base_url/api_key keys so the shared
+    rendering (``_format_aux_current``) and picker code can treat delegation
+    like any other task. Empty provider means "inherit parent" which renders
+    as "auto".
+    """
+    d = cfg.get("delegation")
+    if not isinstance(d, dict):
+        d = {}
+    return {
+        "provider": str(d.get("provider") or "").strip(),
+        "model": str(d.get("model") or "").strip(),
+        "base_url": str(d.get("base_url") or "").strip(),
+        "api_key": str(d.get("api_key") or "").strip(),
+    }
+
+
+def _aux_task_display_name(task: str) -> str:
+    """Display name for a task key, covering the special delegation entry."""
+    if task == _DELEGATION_TASK_KEY:
+        return _DELEGATION_TASK_NAME
+    return next((name for key, name, _ in _all_aux_tasks() if key == task), task)
+
+
 def _save_aux_choice(
     task: str,
     *,
@@ -4812,10 +4863,28 @@ def _save_aux_choice(
     Only writes the four routing fields — timeout, download_timeout, and any
     other task-specific settings are preserved untouched. The main model
     config (``model.default``/``model.provider``) is never modified.
+
+    The special ``delegation`` task writes to the top-level ``delegation``
+    section (consumed by ``tools/delegate_tool.py``), not ``auxiliary.*``.
+    There, "auto" (inherit the parent agent) is stored as an empty provider —
+    the literal string "auto" would be resolved as a provider name.
     """
     from hermes_cli.config import load_config, save_config
 
     cfg = load_config()
+
+    if task == _DELEGATION_TASK_KEY:
+        entry = cfg.setdefault("delegation", {})
+        if not isinstance(entry, dict):
+            entry = {}
+            cfg["delegation"] = entry
+        entry["provider"] = "" if provider == "auto" else provider
+        entry["model"] = model or ""
+        entry["base_url"] = base_url or ""
+        entry["api_key"] = api_key or ""
+        save_config(cfg)
+        return
+
     aux = cfg.setdefault("auxiliary", {})
     if not isinstance(aux, dict):
         aux = {}
@@ -4861,6 +4930,18 @@ def _reset_aux_to_auto() -> int:
         # Preserve timeout/download_timeout — those are user-tuned, not routing
         if changed:
             count += 1
+    # Delegation (top-level section) — clear only the routing fields; other
+    # delegation settings (max_concurrent_children, max_spawn_depth, etc.)
+    # are not routing and must be preserved.
+    dele = cfg.get("delegation")
+    if isinstance(dele, dict):
+        changed = False
+        for field in ("provider", "model", "base_url", "api_key"):
+            if dele.get(field):
+                dele[field] = ""
+                changed = True
+        if changed:
+            count += 1
     save_config(cfg)
     return count
 
@@ -4889,13 +4970,19 @@ def _aux_config_menu() -> None:
 
         # Build the task menu with current settings inline
         all_tasks = _all_aux_tasks()
-        name_col = max(len(name) for _, name, _ in all_tasks) + 2
-        desc_col = max(len(desc) for _, _, desc in all_tasks) + 4
+        menu_tasks = all_tasks + [
+            (_DELEGATION_TASK_KEY, _DELEGATION_TASK_NAME, _DELEGATION_TASK_DESC)
+        ]
+        name_col = max(len(name) for _, name, _ in menu_tasks) + 2
+        desc_col = max(len(desc) for _, _, desc in menu_tasks) + 4
         entries: list[tuple[str, str]] = []
-        for task_key, name, desc in all_tasks:
-            task_cfg = (
-                aux.get(task_key, {}) if isinstance(aux.get(task_key), dict) else {}
-            )
+        for task_key, name, desc in menu_tasks:
+            if task_key == _DELEGATION_TASK_KEY:
+                task_cfg = _delegation_cfg_as_task(cfg)
+            else:
+                task_cfg = (
+                    aux.get(task_key, {}) if isinstance(aux.get(task_key), dict) else {}
+                )
             current = _format_aux_current(task_cfg)
             label = (
                 f"{name.ljust(name_col)}{('(' + desc + ')').ljust(desc_col)}{current}"
@@ -4940,13 +5027,16 @@ def _aux_select_for_task(task: str) -> None:
     from hermes_cli.inventory import build_aux_picker_rows, format_aux_picker_entries
 
     cfg = load_config()
-    aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
-    task_cfg = aux.get(task, {}) if isinstance(aux.get(task), dict) else {}
+    if task == _DELEGATION_TASK_KEY:
+        task_cfg = _delegation_cfg_as_task(cfg)
+    else:
+        aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+        task_cfg = aux.get(task, {}) if isinstance(aux.get(task), dict) else {}
     current_provider = str(task_cfg.get("provider") or "auto").strip() or "auto"
     current_model = str(task_cfg.get("model") or "").strip()
     current_base_url = str(task_cfg.get("base_url") or "").strip()
 
-    display_name = next((name for key, name, _ in _all_aux_tasks() if key == task), task)
+    display_name = _aux_task_display_name(task)
 
     # Gather authenticated providers (has credentials + curated model list)
     try:
@@ -4964,7 +5054,12 @@ def _aux_select_for_task(task: str) -> None:
     auto_marker = (
         "  ← current" if current_provider == "auto" and not current_base_url else ""
     )
-    entries.append(("__auto__", f"auto (recommended){auto_marker}", []))
+    auto_label = (
+        "auto (inherit main agent)"
+        if task == _DELEGATION_TASK_KEY
+        else "auto (recommended)"
+    )
+    entries.append(("__auto__", f"{auto_label}{auto_marker}", []))
 
     entries.extend(
         format_aux_picker_entries(
@@ -5014,7 +5109,7 @@ def _aux_flow_provider_model(
     from hermes_cli.auth import _prompt_model_selection
     from hermes_cli.models import get_pricing_for_provider
 
-    display_name = next((name for key, name, _ in _all_aux_tasks() if key == task), task)
+    display_name = _aux_task_display_name(task)
 
     # Fetch live pricing for this provider (non-blocking)
     pricing: dict = {}
@@ -5061,7 +5156,7 @@ def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
     """Prompt for a direct OpenAI-compatible base_url + optional api_key/model."""
     from hermes_cli.secret_prompt import masked_secret_prompt
 
-    display_name = next((name for key, name, _ in _all_aux_tasks() if key == task), task)
+    display_name = _aux_task_display_name(task)
     current_base_url = str(task_cfg.get("base_url") or "").strip()
     current_model = str(task_cfg.get("model") or "").strip()
 
@@ -5504,6 +5599,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_resume_windows_gateways_after_update",
         "_run_logged_subprocess",
         "_run_pre_update_backup",
+        "_service_unit_supports_graceful_sigusr1_restart",
         "_should_skip_upstream_prompt",
         "_stash_apply_failed_only_on_existing_untracked",
         "_stash_local_changes_if_needed",
@@ -13544,7 +13640,7 @@ def main():
     build_tools_parser(subparsers, cmd_tools=cmd_tools)
 
     # =========================================================================
-    # computer-use command — manage Computer Use (cua-driver) on macOS
+    # computer-use command — manage Computer Use (cua-driver)
     # =========================================================================
     computer_use_parser = subparsers.add_parser(
         "computer-use",
@@ -13647,47 +13743,20 @@ def main():
         "grant",
         help="Request the grants (opens the dialog attributed to CuaDriver)",
     )
-    computer_use_browser_approve = computer_use_sub.add_parser(
-        "browser-approve",
-        help="Mint a single-use token authorizing browser attachment for one exact window",
-        description=(
-            "Runs `cua-driver browser-approve` to mint a five-minute,\n"
-            "single-use token that authorizes ONE browser preparation for the\n"
-            "exact process (and window) you name. Give the printed token to\n"
-            "the agent; it passes it as approval_token on the\n"
-            "cua_browser_prepare action.\n\n"
-            "This is the explicit human boundary for attaching to a browser —\n"
-            "especially an existing signed-in profile, where the DevTools\n"
-            "protocol can see that profile's live pages, cookies, and storage.\n"
-            "Ordinary tool approval never substitutes for this grant, so a\n"
-            "model can never mint or guess the token itself.\n\n"
-            "Find the pid/window_id via the agent (list_windows) or ask it to\n"
-            "read them from a native capture."
-        ),
-    )
-    computer_use_browser_approve.add_argument(
-        "--pid", type=int, required=True,
-        help="Exact browser process id to authorize",
-    )
-    computer_use_browser_approve.add_argument(
-        "--window-id", type=int, default=None,
-        help="Exact native window id (required for existing-profile attachment)",
-    )
-    computer_use_browser_approve.add_argument(
-        "--profile-mode",
-        choices=["isolated_new", "isolated_named", "existing_profile"],
-        default="isolated_new",
-        help="Preparation the token authorizes (default: isolated_new)",
-    )
-
     def cmd_computer_use(args):
         action = getattr(args, "computer_use_action", None)
         if action == "install":
-            from hermes_cli.tools_config import install_cua_driver
-            install_cua_driver(upgrade=bool(getattr(args, "upgrade", False)))
-            return
+            from hermes_cli.tools_config import (
+                _cua_driver_contract_status,
+                install_cua_driver,
+            )
+            if not install_cua_driver(upgrade=bool(getattr(args, "upgrade", False))):
+                return 1
+            return 0 if _cua_driver_contract_status().get("ready") else 1
         if action == "status":
+            import os as _os
             import subprocess
+            from hermes_cli.tools_config import _cua_driver_contract_status
             from tools.computer_use.cua_backend import (
                 cua_driver_update_check,
                 resolve_cua_driver_cmd,
@@ -13695,6 +13764,7 @@ def main():
             # Must match the runtime resolver: Desktop/TUI processes can omit
             # ~/.local/bin even though the official installer put the driver there.
             path = resolve_cua_driver_cmd()
+            override = _os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip()
             if path:
                 version = ""
                 try:
@@ -13706,10 +13776,31 @@ def main():
                     ).stdout.strip()
                 except Exception:
                     pass
+                from hermes_cli.tools_config import _cua_version_summary
+                version = _cua_version_summary(version)
+                # Name the override here too. Without it the operator is told
+                # to repair an install that `hermes computer-use install` will
+                # (correctly) refuse to touch, with nothing pointing at the
+                # env var that actually selected the binary.
+                origin = " [custom binary from HERMES_CUA_DRIVER_CMD]" if override else ""
                 if version:
-                    print(f"cua-driver: installed at {path} ({version})")
+                    print(f"cua-driver: installed at {path}{origin} ({version})")
                 else:
-                    print(f"cua-driver: installed at {path}")
+                    print(f"cua-driver: installed at {path}{origin}")
+                contract = _cua_driver_contract_status(path)
+                if not contract.get("ready"):
+                    print(
+                        "  ⚠ Repair required: "
+                        + (contract.get("reason") or "runtime contract is incomplete")
+                    )
+                    if override:
+                        print(
+                            "    Update the binary selected by HERMES_CUA_DRIVER_CMD, or unset "
+                            "the override and run: hermes computer-use install --upgrade"
+                        )
+                    else:
+                        print("    Run: hermes computer-use install")
+                    return 1
                 try:
                     st = cua_driver_update_check()
                     if st and st.get("update_available"):
@@ -13723,10 +13814,10 @@ def main():
                         print("  Refresh to latest: hermes computer-use install --upgrade")
                 except Exception:
                     print("  Refresh to latest: hermes computer-use install --upgrade")
-                return
+                return 0
             print("cua-driver: not installed")
             print("  Run: hermes computer-use install")
-            return
+            return 1
         if action == "doctor":
             from tools.computer_use.doctor import run_doctor
             code = run_doctor(
@@ -13735,36 +13826,6 @@ def main():
                 json_output=bool(getattr(args, "json", False)),
             )
             sys.exit(code)
-        if action == "browser-approve":
-            import subprocess
-            from tools.computer_use.cua_backend import (
-                cua_driver_child_env,
-                cua_driver_install_hint,
-                resolve_cua_driver_cmd,
-            )
-            binary = resolve_cua_driver_cmd()
-            if not binary:
-                print(cua_driver_install_hint())
-                sys.exit(2)
-            cmd = [binary, "browser-approve", "--pid", str(args.pid)]
-            window_id = getattr(args, "window_id", None)
-            if window_id is not None:
-                cmd += ["--window-id", str(window_id)]
-            cmd += ["--profile-mode", getattr(args, "profile_mode", "isolated_new")]
-            try:
-                # Interactive passthrough: cua-driver requires a TTY to mint
-                # the grant, prints the token itself, and owns the expiry.
-                proc = subprocess.run(cmd, env=cua_driver_child_env())
-            except OSError as exc:
-                print(f"cua-driver browser-approve failed to launch: {exc}", file=sys.stderr)
-                sys.exit(2)
-            if proc.returncode == 0:
-                print(
-                    "\nGive the token above to the agent — it passes it as "
-                    "approval_token on cua_browser_prepare. Single use, "
-                    "expires in ~5 minutes."
-                )
-            sys.exit(proc.returncode)
         if action == "permissions":
             perms_action = getattr(args, "computer_use_perms_action", None)
             if perms_action == "grant":
@@ -14222,6 +14283,36 @@ def main():
     )
     sessions_rename.add_argument("session_id", help="Session ID to rename")
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
+
+    sessions_pin = sessions_subparsers.add_parser(
+        "pin",
+        help="Pin session(s) — durable keep flag, exempt from auto-archive",
+        description=(
+            "Set the durable 'keep' flag on one or more sessions. Pinned "
+            "sessions are exempt from the sessions.auto_archive stale sweep "
+            "and always appear in listings. The same flag drives the Desktop "
+            "sidebar's Pinned section — pin from either surface, both see it."
+        ),
+    )
+    sessions_pin.add_argument(
+        "session_ids", nargs="+", help="Session ID(s) or unique prefix(es) to pin"
+    )
+
+    sessions_unpin = sessions_subparsers.add_parser(
+        "unpin", help="Remove the pin (durable keep flag) from session(s)"
+    )
+    sessions_unpin.add_argument(
+        "session_ids", nargs="+", help="Session ID(s) or unique prefix(es) to unpin"
+    )
+
+    sessions_pinned = sessions_subparsers.add_parser(
+        "pinned", help="List pinned sessions"
+    )
+    sessions_pinned.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON (for backup/restore scripting)",
+    )
 
     sessions_retitle = sessions_subparsers.add_parser(
         "retitle-skills",

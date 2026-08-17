@@ -642,8 +642,9 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
         "`computer_use.grant_existing_profile: true` (if unset, report the "
         "refusal and name that key — you can never grant it yourself); "
         "bounded mode authorizes via the user's reviewed capability manifest; "
-        "explicit Hermes YOLO uses a private unrestricted daemon after the "
-        "user's launch/session risk acceptance.\n\n"
+        "explicit Hermes YOLO uses an unrestricted runtime after the user's "
+        "launch/session risk acceptance. Permission mode and grants are fixed "
+        "when Hermes launches that runtime.\n\n"
         "## Background mode rules\n"
         "- Do NOT use `raise_window=true` on `focus_app` unless the user "
         "explicitly asked you to bring a window to front. Input routing to "
@@ -653,9 +654,11 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
         "won't leak other windows the user has open.\n"
         + offscreen_line +
         "## The agent cursor you'll see on screen\n"
-        "Each computer-use run declares a session with cua-driver; that "
-        "session owns a tinted overlay cursor that glides to where you "
-        "act. It's a visual cue for the user — the REAL OS cursor never "
+        "Each computer-use run gives cua-driver a public session name. The "
+        "name labels its tinted overlay cursor and related state, while the "
+        "MCP transport owns a private lifecycle session inside the runtime. "
+        "The cursor glides "
+        "to where you act. It's a visual cue for the user; the REAL OS cursor never "
         "moves. Don't try to read it or click on it; it's UI feedback, "
         "not input.\n\n"
         "## Safety\n"
@@ -2271,18 +2274,21 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     """AGENTS.md — merged directory chain from git root down to cwd.
 
     Each directory on the chain (see ``_agents_md_directory_chain``)
-    contributes its ``AGENTS.md`` / ``agents.md`` (first name wins per
-    directory) as its own provenance-labelled section.  Identical content
-    encountered again further down the chain (copied or symlinked files) is
-    deduplicated.  With a single match — the common case, and always the
-    case outside a git repo — output is identical to the historical
-    single-file behavior.
+    contributes its ``AGENTS.override.md`` / ``AGENTS.md`` / ``agents.md``
+    (first name wins per directory) as its own provenance-labelled section.
+    ``AGENTS.override.md`` wins over ``AGENTS.md`` so a developer can keep a
+    personal, typically-gitignored override next to the committed project
+    instructions without editing the tracked file (same convention as
+    earendil-works/pi#7681).  Identical content encountered again further
+    down the chain (copied or symlinked files) is deduplicated.  With a
+    single match — the common case, and always the case outside a git repo —
+    output is identical to the historical single-file behavior.
     """
     cwd_resolved = cwd_path.resolve()
     sections: List[str] = []
     seen_content: set = set()
     for directory in _agents_md_directory_chain(cwd_resolved):
-        for name in ["AGENTS.md", "agents.md"]:
+        for name in ["AGENTS.override.md", "AGENTS.md", "agents.md"]:
             candidate = directory / name
             if not candidate.exists():
                 continue
