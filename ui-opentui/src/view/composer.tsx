@@ -3,11 +3,13 @@
  * Enter submits, the input clears imperatively, and a live slash-completion
  * dropdown renders ABOVE it as you type `/…` (spec §1 completions).
  *
- * Newlines: Shift+Enter inserts one on kitty-protocol terminals (ghostty/
- * kitty/wezterm — legacy input can't distinguish it from Enter, both arrive as
- * the CR byte, so plain Enter stays submit everywhere); Alt+Enter is the
- * universal fallback (ESC-prefixed CR in legacy terminals), Ctrl+J too (the
- * legacy linefeed byte keeps the stock `newline` binding). Height: the box
+ * Newlines: Shift/Ctrl/Cmd+Enter insert one on kitty-protocol terminals
+ * (ghostty/kitty/wezterm — legacy input can't distinguish them from Enter, all
+ * arrive as the CR byte, so plain Enter stays submit everywhere). IDE terminal
+ * setup (boundary/terminalSetup.ts) makes the same chords work in VS Code-family
+ * terminals by sending the atomic CSI u encodings (ESC[13;2u / 13;5u / 13;9u).
+ * Alt+Enter is the universal fallback (ESC-prefixed CR in legacy terminals),
+ * Ctrl+J too (the legacy linefeed byte keeps the stock `newline` binding). Height: the box
  * auto-grows to COMPOSER_MAX_ROWS (Ink parity 8; HERMES_TUI_COMPOSER_ROWS
  * overrides) then scrolls INTERNALLY — the native edit buffer keeps the cursor
  * in view, Up/Down navigate lines in a multi-line buffer (history recall is a
@@ -1025,6 +1027,15 @@ export function Composer(props: {
             // — the legacy linefeed byte — also stays newline via the defaults.)
             { action: 'newline', meta: true, name: 'return' },
             { action: 'newline', meta: true, name: 'kpenter' },
+            // Ctrl/Cmd+Enter: newline too. IDE terminal setup (Ink parity) binds
+            // ctrl+enter / cmd+enter to the atomic CSI u sequences ESC[13;5u and
+            // ESC[13;9u, which parse as return+ctrl / return+super; kitty
+            // terminals report the same events natively. Without these bindings
+            // a modified return matches nothing and the keypress is dropped.
+            { action: 'newline', ctrl: true, name: 'return' },
+            { action: 'newline', ctrl: true, name: 'kpenter' },
+            { action: 'newline', name: 'return', super: true },
+            { action: 'newline', name: 'kpenter', super: true },
             // Home/End move PER LINE in a multi-line buffer (stock binds them to
             // the buffer ends); Ctrl+Home/End keep the whole-buffer jumps.
             { action: 'line-home', name: 'home' },

@@ -301,6 +301,73 @@ describe('shift+enter — kitty protocol inserts a newline', () => {
   })
 })
 
+describe('ctrl/cmd+enter — atomic CSI u modified Enter inserts a newline (Ink terminal-setup parity)', () => {
+  // The exact bytes boundary/terminalSetup.ts binds to ctrl+enter / cmd+enter in
+  // VS Code-family terminals. The IDE sends them verbatim via sendSequence, so
+  // these tests feed the raw wire bytes through the stdin parser rather than a
+  // synthetic key event: modifier 5 = ctrl, 9 = super (Cmd), on codepoint 13.
+  const CSI_U_CTRL_ENTER = '\x1b[13;5u'
+  const CSI_U_SUPER_ENTER = '\x1b[13;9u'
+
+  // VS Code's terminal does not negotiate the kitty protocol; the CSI u bytes
+  // arrive on a legacy-mode session. The parser accepts them either way (the
+  // production renderer config keeps CSI u parsing on), pinned here in BOTH modes.
+  for (const kitty of [false, true]) {
+    const label = kitty ? 'kitty' : 'legacy'
+
+    test(`${label}: CSI-u Ctrl+Enter → newline; plain Enter then submits the multi-line text`, async () => {
+      const h = await mountComposer({ kitty })
+      try {
+        await h.probe.keys.typeText('one')
+        h.probe.renderer.stdin.emit('data', Buffer.from(CSI_U_CTRL_ENTER))
+        await h.probe.settle()
+        await h.probe.keys.typeText('two')
+        await h.probe.settle()
+        expect(h.submitted).toEqual([]) // Ctrl+Enter = newline, never a submit
+        h.probe.keys.pressEnter()
+        await h.probe.settle()
+        expect(h.submitted).toEqual(['one\ntwo'])
+      } finally {
+        h.probe.destroy()
+      }
+    })
+
+    test(`${label}: CSI-u Cmd+Enter → newline; plain Enter then submits the multi-line text`, async () => {
+      const h = await mountComposer({ kitty })
+      try {
+        await h.probe.keys.typeText('one')
+        h.probe.renderer.stdin.emit('data', Buffer.from(CSI_U_SUPER_ENTER))
+        await h.probe.settle()
+        await h.probe.keys.typeText('two')
+        await h.probe.settle()
+        expect(h.submitted).toEqual([]) // Cmd+Enter = newline, never a submit
+        h.probe.keys.pressEnter()
+        await h.probe.settle()
+        expect(h.submitted).toEqual(['one\ntwo'])
+      } finally {
+        h.probe.destroy()
+      }
+    })
+  }
+
+  test('kitty: natively-reported Ctrl+Enter inserts a newline too', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ ctrl: true })
+      await h.probe.settle()
+      await h.probe.keys.typeText('two')
+      await h.probe.settle()
+      expect(h.submitted).toEqual([])
+      h.probe.keys.pressEnter()
+      await h.probe.settle()
+      expect(h.submitted).toEqual(['one\ntwo'])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+})
+
 describe('external draft clear', () => {
   test('clears the mounted uncontrolled textarea as well as persisted state', async () => {
     const h = await mountComposer({ history: ['older prompt', 'newest prompt'], kitty: true })
