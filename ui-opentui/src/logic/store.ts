@@ -75,6 +75,12 @@ import {
   type SubagentStatus
 } from './subagentTree.ts'
 import { approvalPolicy, type ApprovalChoicePolicy } from './approval.ts'
+import {
+  formatAbandonedClarifyBatch,
+  normalizeClarifyQuestions,
+  remainingClarifyQids,
+  type ClarifyBatchQuestion
+} from './clarifyBatch.ts'
 import { billingWallAction, billingWallCopy, runBillingWallAction, type BillingWallHost } from './billingWall.ts'
 
 /** Monotonic identity for one concrete overlay instance. Async work must carry
@@ -199,7 +205,17 @@ export type ConfirmRequest = string | ConfirmSpec
  * Each is answered via the matching `*.respond` RPC; Esc/Ctrl+C sends deny/empty.
  */
 export type ActivePrompt =
-  | { kind: 'clarify'; question: string; choices: string[] | null; requestId: string }
+  | {
+      kind: 'clarify'
+      question: string
+      choices: string[] | null
+      requestId: string
+      /** Batch (multi-question) clarify — present instead of question/choices. */
+      questions?: ClarifyBatchQuestion[]
+      /** Answers locked server-side (qid → answer): seeded from the reconnect
+       *  replay, extended by recordClarifyAnswer as each lock is acknowledged. */
+      answers?: Record<string, string>
+    }
   | { kind: 'approval'; allowPermanent: ApprovalChoicePolicy; command: string; description: string }
   | { kind: 'sudo'; requestId: string }
   | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
@@ -2384,6 +2400,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
       }
       case 'message.complete': {
         settlePendingSteers(event.payload?.client_submission_ids)
+        // Backstop for the clarify tool.complete flush above: a turn can settle
+        // with the timed-out batch prompt still open (no clarify.expire event
+        // exists on this wire) — persist the partials before the turn closes.
+        flushAbandonedClarify('timed out')
         // Terminal error frame (upstream 57b351d3689/b8675a18990): the
         // structured status/error/partial fields drive the failure state —
         // free-form text is never re-classified. `partial` marks `text` as
@@ -2872,18 +2892,43 @@ export function createSessionStore(options?: SessionStoreOptions) {
           const snap = todoSnapshotFrom(event.payload['result'], event.payload['args'])
           if (snap) setState('latestTodos', snap)
         }
+        // Abandoned batch clarify: the clarify tool settling while its batch
+        // prompt is STILL open proves the server-side deadline fired (an
+        // answered batch clears the prompt before this event arrives). Flush
+        // the questions + locked partials as a persistent transcript record so
+        // they don't silently vanish while the agent's follow-up refers to them.
+        if (name === 'clarify') flushAbandonedClarify('timed out')
         break
       }
       // ── blocking prompts (spec §8 #6 — unhandled = the agent deadlocks) ──
-      case 'clarify.request':
-        setState('prompt', {
-          kind: 'clarify',
-          question: event.payload.question ?? '',
-          // decoded choices are readonly — copy to the store's mutable string[]
-          choices: event.payload.choices ? [...event.payload.choices] : null,
-          requestId: event.payload.request_id
-        })
+      case 'clarify.request': {
+        // Batch (multi-question) clarify: malformed entries (blank qid/question)
+        // are filtered; when none survive, the single-question payload fields
+        // stay authoritative (backward compatibility with the plain shape).
+        const batch = normalizeClarifyQuestions(event.payload.questions)
+        setState(
+          'prompt',
+          batch.length
+            ? {
+                kind: 'clarify',
+                question: '',
+                choices: null,
+                requestId: event.payload.request_id,
+                questions: batch,
+                // Locked answers replayed on reconnect (qid → answer) — seed the
+                // per-question ✓ state instead of presenting all as unanswered.
+                answers: { ...(event.payload.answers ?? {}) }
+              }
+            : {
+                kind: 'clarify',
+                question: event.payload.question ?? '',
+                // decoded choices are readonly — copy to the store's mutable string[]
+                choices: event.payload.choices ? [...event.payload.choices] : null,
+                requestId: event.payload.request_id
+              }
+        )
         break
+      }
       case 'approval.request':
         setState('prompt', {
           kind: 'approval',
@@ -3104,6 +3149,43 @@ export function createSessionStore(options?: SessionStoreOptions) {
   /** Clear the active blocking prompt (after it's answered/cancelled). */
   function clearPrompt(): void {
     setState('prompt', undefined)
+  }
+
+  /** Lock one batch-clarify answer locally (call AFTER its per-question
+   *  `clarify.respond {question_id}` was acknowledged, so the local answers map
+   *  mirrors the gateway's accumulator exactly). Returns how many questions
+   *  remain unlocked — 0 means the batch is complete and the prompt can close. */
+  function recordClarifyAnswer(qid: string, answer: string): number {
+    const prompt = state.prompt
+    if (prompt?.kind !== 'clarify' || !prompt.questions?.length) return 0
+    setState(
+      produce(draft => {
+        const p = draft.prompt
+        if (p?.kind === 'clarify') (p.answers ??= {})[qid] = answer
+      })
+    )
+    const updated = state.prompt
+    if (updated?.kind !== 'clarify' || !updated.questions?.length) return 0
+    return remainingClarifyQids(updated.questions, updated.answers ?? {}).length
+  }
+
+  // Request IDs of batch clarify prompts already flushed to the transcript as
+  // an abandoned-prompt record, so the tool.complete and message.complete
+  // backstops (and an explicit cancel) can't persist the same prompt twice.
+  const persistedAbandonedClarify = new Set<string>()
+
+  /** Persist a still-open batch clarify prompt as a transcript record (locked
+   *  partials included — they survive the server-side deadline) and drop the
+   *  overlay. No-op for single-question prompts and already-flushed batches.
+   *  Fired by the clarify tool.complete / message.complete backstops with
+   *  'timed out', and by the Esc cancel-all path with 'cancelled'. */
+  function flushAbandonedClarify(reason: string): void {
+    const prompt = state.prompt
+    if (prompt?.kind !== 'clarify' || !prompt.questions?.length) return
+    if (persistedAbandonedClarify.has(prompt.requestId)) return
+    persistedAbandonedClarify.add(prompt.requestId)
+    pushSystem(formatAbandonedClarifyBatch(prompt.questions, prompt.answers ?? {}, reason))
+    clearPrompt()
   }
 
   /** Persist the composer's in-progress draft (survives composer unmount when a
@@ -3496,6 +3578,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     commitSnapshot,
     duplicate,
     clearPrompt,
+    recordClarifyAnswer,
+    flushAbandonedClarify,
     setComposerDraft,
     replaceComposerDraft,
     insertComposerDraft,

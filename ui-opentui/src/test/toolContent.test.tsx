@@ -116,6 +116,83 @@ describe('clarify renderer — Q/A, never JSON (item 4)', () => {
     expect(clarifyQA(part)).toEqual([])
     expect(clarifyRenderer.expandable(part)).toBe(false) // no body → no JSON ever
   })
+
+  // Batch (multi-question) result shape — tools/clarify_tool.py _batch_result:
+  // {"responses": [{question, choices_offered, user_response}], "timed_out"?}.
+  // Empty user_response = a deliberate skip; timed_out marks blanks as the
+  // user walking away instead.
+  const BATCH_COMPLETE = {
+    name: 'clarify',
+    result: {
+      responses: [
+        { choices_offered: ['red', 'blue'], question: 'Primary?', user_response: 'blue' },
+        { choices_offered: null, question: 'Axis label?', user_response: '' },
+        { choices_offered: ['x', 'y'], question: 'Which axes?', user_response: ['x', 'y'] }
+      ]
+    },
+    tool_id: 'cb1'
+  }
+
+  test('clarifyQA extracts every batch row (skips kept, multi-select joined)', () => {
+    const store = createSessionStore()
+    seedTool(store, { name: 'clarify', tool_id: 'cb1' }, BATCH_COMPLETE)
+    const part = partFrom(store, 'cb1')
+    expect(clarifyQA(part)).toEqual([
+      { answer: 'blue', question: 'Primary?' },
+      { answer: '', question: 'Axis label?' },
+      { answer: 'x, y', question: 'Which axes?' }
+    ])
+    expect(clarifyRenderer.subtitle(part)).toBe('2/3 answered')
+    expect(clarifyRenderer.expandable(part)).toBe(true)
+    expect(clarifyRenderer.lines?.(part)).toEqual([
+      'User answered:',
+      '· Primary?: blue',
+      '· Axis label?: (skipped)',
+      '· Which axes?: x, y'
+    ])
+  })
+
+  test('a timed-out batch marks the subtitle and lines', () => {
+    const store = createSessionStore()
+    seedTool(
+      store,
+      { name: 'clarify', tool_id: 'cb2' },
+      {
+        name: 'clarify',
+        result: {
+          responses: [{ choices_offered: null, question: 'One?', user_response: 'kept' }],
+          timed_out: true
+        },
+        tool_id: 'cb2'
+      }
+    )
+    const part = partFrom(store, 'cb2')
+    expect(clarifyRenderer.subtitle(part)).toBe('1/1 answered · timed out')
+    expect(clarifyRenderer.lines?.(part)).toEqual(['User answered:', '· One?: kept', '(timed out)'])
+  })
+
+  test('frame: expanded batch shows every row (skips included), NO JSON anywhere', async () => {
+    const store = createSessionStore()
+    store.setDetails('collapsed', true)
+    seedTool(store, { context: '3 questions', name: 'clarify', tool_id: 'cb1' }, BATCH_COMPLETE)
+    const probe = await mountApp(store)
+    try {
+      const collapsed = await probe.waitForFrame(f => f.includes('clarify'))
+      expect(collapsed).toContain('2/3 answered')
+      expect(collapsed).not.toContain('{"')
+
+      await clickHeader(probe, 'clarify')
+      const expanded = await probe.waitForFrame(f => f.includes('User answered:'))
+      expect(expanded).toContain('· Primary?: blue')
+      expect(expanded).toContain('· Axis label?: (skipped)')
+      expect(expanded).toContain('· Which axes?: x, y')
+      expect(expanded).not.toContain('{"')
+      expect(expanded).not.toContain('user_response')
+      expect(expanded).not.toContain('responses')
+    } finally {
+      probe.destroy()
+    }
+  })
 })
 
 describe('skill_view renderer — WHICH skill, not its contents (item 5)', () => {

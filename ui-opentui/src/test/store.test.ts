@@ -742,6 +742,135 @@ describe('session store — blocking prompts (Phase 3)', () => {
   })
 })
 
+describe('session store — batch (multi-question) clarify', () => {
+  const BATCH = {
+    questions: [
+      { choices: ['a', 'b'], qid: 'q0', question: 'One?' },
+      { choices: null, qid: 'q1', question: 'Two?' }
+    ],
+    request_id: 'req-batch'
+  }
+
+  /** The active clarify prompt, asserted into its narrowed shape. */
+  function clarifyPrompt(store: ReturnType<typeof createSessionStore>) {
+    const prompt = store.state.prompt
+    if (prompt?.kind !== 'clarify') throw new Error(`expected a clarify prompt, got ${prompt?.kind ?? 'none'}`)
+    return prompt
+  }
+
+  test('a batch clarify.request sets a questions prompt with an empty answers map', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: BATCH })
+    const p = clarifyPrompt(store)
+    expect(p.requestId).toBe('req-batch')
+    expect(p.questions).toHaveLength(2)
+    expect(p.questions?.[0]).toEqual({ choices: ['a', 'b'], multiSelect: false, qid: 'q0', question: 'One?' })
+    expect(p.questions?.[1]?.choices).toBeNull()
+    expect(p.answers).toEqual({})
+  })
+
+  test('a reconnect-replay batch clarify.request seeds the locked answers', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { ...BATCH, answers: { q0: 'a' }, request_id: 'req-replay' } })
+    expect(clarifyPrompt(store).answers).toEqual({ q0: 'a' })
+  })
+
+  test('malformed batch entries are dropped; single-question shape wins when none survive', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'clarify.request',
+      payload: {
+        choices: ['x', 'y'],
+        question: 'Fallback?',
+        questions: [
+          { qid: '', question: 'no qid' },
+          { qid: 'q1', question: '   ' }
+        ],
+        request_id: 'req-bad'
+      }
+    })
+    const p = clarifyPrompt(store)
+    expect(p.questions).toBeUndefined()
+    expect(p.question).toBe('Fallback?')
+    expect(p.choices).toEqual(['x', 'y'])
+  })
+
+  test('recordClarifyAnswer locks answers one at a time and reports the remaining count', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: BATCH })
+    // out-of-order lock (Tab affordance) — q1 first
+    expect(store.recordClarifyAnswer('q1', 'beta')).toBe(1)
+    expect(clarifyPrompt(store).answers).toEqual({ q1: 'beta' })
+    expect(store.state.prompt?.kind).toBe('clarify') // prompt stays open
+    // an empty lock is a deliberate skip — it still counts toward completion
+    expect(store.recordClarifyAnswer('q0', '')).toBe(0)
+    expect(clarifyPrompt(store).answers).toEqual({ q0: '', q1: 'beta' })
+  })
+
+  test('re-locking a question overwrites its earlier answer (revisit edit)', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: BATCH })
+    store.recordClarifyAnswer('q0', 'first')
+    expect(store.recordClarifyAnswer('q0', 'changed')).toBe(1)
+    expect(clarifyPrompt(store).answers).toEqual({ q0: 'changed' })
+  })
+
+  test('an abandoned batch persists its locked partials on the clarify tool.complete', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-timeout' } })
+    store.recordClarifyAnswer('q0', 'alpha')
+    // server-side deadline: the clarify tool settles while the prompt is open
+    store.apply({ type: 'tool.complete', payload: { name: 'clarify', tool_id: 'clar-b' } })
+    const record = store.state.messages.find(
+      message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+    )
+    expect(record).toBeDefined()
+    expect(record?.text).toContain('✓ One? → alpha')
+    expect(record?.text).toContain('· Two? (no answer)')
+    expect(record?.text).toContain('(timed out)')
+    expect(store.state.prompt).toBeUndefined()
+    // the message.complete backstop must not persist the same prompt twice
+    store.apply({ type: 'message.complete' })
+    const records = store.state.messages.filter(
+      message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+    )
+    expect(records).toHaveLength(1)
+  })
+
+  test('message.complete is the backstop flush when no clarify tool.complete arrived', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-backstop' } })
+    store.apply({ type: 'message.complete' })
+    expect(store.state.prompt).toBeUndefined()
+    const record = store.state.messages.find(
+      message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+    )
+    expect(record?.text).toContain('(timed out)')
+  })
+
+  test('flushAbandonedClarify("cancelled") records the Esc cancel-all with its partials', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-cancel' } })
+    store.recordClarifyAnswer('q0', 'kept')
+    store.flushAbandonedClarify('cancelled')
+    const record = store.state.messages.find(
+      message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+    )
+    expect(record?.text).toContain('✓ One? → kept')
+    expect(record?.text).toContain('(cancelled)')
+    expect(store.state.prompt).toBeUndefined()
+  })
+
+  test('a single-question clarify prompt is never batch-flushed (behavior preserved)', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { choices: ['a'], question: 'One?', request_id: 'r-single' } })
+    store.apply({ type: 'tool.complete', payload: { name: 'clarify', tool_id: 'clar-s' } })
+    store.apply({ type: 'message.complete' })
+    expect(store.state.prompt).toMatchObject({ kind: 'clarify', question: 'One?' })
+    expect(store.state.messages.some(message => message.text.startsWith('ask ('))).toBe(false)
+  })
+})
+
 describe('session store — billing wall confirm (upstream 960d339f86f + 9c274db89ff)', () => {
   const nousBlock: BillingBlockDecoded = {
     billing_url: null,

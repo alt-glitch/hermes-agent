@@ -223,15 +223,30 @@ const ToolGenerating = Schema.Struct({
 })
 
 // blocking prompts (deadlock-critical — Phase 3 renders these)
+// Batch clarify (multi-question): every entry field is optional at the
+// boundary — malformed entries (blank qid/question) are FILTERED by the store
+// (logic/clarifyBatch.ts), never allowed to fail the whole event decode (a
+// dropped clarify.request deadlocks the agent).
+const ClarifyBatchQuestionWire = Schema.Struct({
+  choices: opt(Schema.NullOr(Schema.Array(Str))),
+  multi_select: opt(Schema.Boolean),
+  qid: opt(Str),
+  question: opt(Str)
+})
 const ClarifyRequest = Schema.Struct({
   type: Schema.Literal('clarify.request'),
   session_id: opt(Str),
   payload: Schema.Struct({
+    // Answers already locked server-side (qid → answer) — present only on the
+    // reconnect-replay snapshot of a partially answered batch.
+    answers: opt(Schema.Record(Str, Str)),
     choices: opt(Schema.NullOr(Schema.Array(Str))),
     question: opt(Str),
+    questions: opt(Schema.Array(ClarifyBatchQuestionWire)),
     request_id: Str
   })
 })
+export type ClarifyBatchQuestionWireDecoded = typeof ClarifyBatchQuestionWire.Type
 const ApprovalRequest = Schema.Struct({
   type: Schema.Literal('approval.request'),
   session_id: opt(Str),

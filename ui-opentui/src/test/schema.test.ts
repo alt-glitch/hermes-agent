@@ -82,6 +82,38 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
+  test('decodes a batch clarify.request (questions + replayed answers)', () => {
+    const ev = decode({
+      type: 'clarify.request',
+      payload: {
+        answers: { q0: 'a' },
+        questions: [
+          { choices: ['a', 'b'], multi_select: false, qid: 'q0', question: 'One?' },
+          { choices: null, qid: 'q1', question: 'Two?' }
+        ],
+        request_id: 'req-batch'
+      }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'clarify.request') {
+      expect(ev.value.payload.questions).toHaveLength(2)
+      expect(ev.value.payload.questions?.[0]?.qid).toBe('q0')
+      expect(ev.value.payload.questions?.[0]?.choices).toEqual(['a', 'b'])
+      expect(ev.value.payload.questions?.[1]?.choices).toBeNull()
+      expect(ev.value.payload.answers).toEqual({ q0: 'a' })
+    }
+  })
+
+  test('a malformed batch entry still DECODES (filtering is the store reducer, not the boundary)', () => {
+    // A dropped clarify.request deadlocks the agent — blank/missing qids must
+    // survive the decode and be filtered by the store instead.
+    const ev = decode({
+      type: 'clarify.request',
+      payload: { questions: [{ question: 'no qid' }, { qid: '', question: '   ' }], request_id: 'req-bad' }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+  })
+
   test('preserves an explicit approval allow_permanent=false', () => {
     const ev = decode({
       type: 'approval.request',
