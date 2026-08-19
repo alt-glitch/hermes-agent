@@ -331,6 +331,19 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         }
         if not visible:
             placeholder["display_kind"] = "hidden"
+            # Keep the transcript hidden and empty, but give the historical
+            # API projection a non-empty neutral assistant turn so the
+            # pre-call sanitizer (repair_empty_non_final_messages) does not
+            # re-heal this row on every later call (#88955). display_kind is
+            # stripped before sanitization, while api_content is projected
+            # back into content for historical assistant rows. Use the
+            # canonical neutral interruption placeholder, never
+            # _INTERRUPT_SCAFFOLD_MARKER: replaying the scaffold as assistant
+            # text made the model echo it and self-replicate ghost rows
+            # (#81841).
+            from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+
+            placeholder["api_content"] = _INTERRUPTED_PLACEHOLDER
         append_message(messages, placeholder)
         append_message(
             messages,
@@ -2123,8 +2136,28 @@ def run_conversation(
             # from every outgoing copy so strict OpenAI-compatible backends
             # don't reject the request after a model switch or resumed typed
             # event row enters the live history.
-            api_msg.pop("display_kind", None)
+            _display_kind = api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+
+            # Legacy hidden redirect placeholders (#88955): rows persisted
+            # BEFORE the writer-side api_content stamp in
+            # _apply_active_turn_redirect are content="" with no sidecar.
+            # Once display_kind is stripped the pre-call sanitizer
+            # (repair_empty_non_final_messages) would re-heal such a row on
+            # every call forever, since the durable transcript is never
+            # mutated. Give the wire copy the same neutral payload here so
+            # old sessions converge too. Never the interrupt scaffold —
+            # replaying scaffold bytes as assistant text is #81841.
+            if (
+                _display_kind == "hidden"
+                and api_msg.get("role") == "assistant"
+                and not _api_content
+                and not (api_msg.get("content") or "").strip()
+                and not api_msg.get("tool_calls")
+            ):
+                from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+
+                api_msg["content"] = _INTERRUPTED_PLACEHOLDER
 
             # Durable row identity stamped by _rows_to_conversation so the
             # desktop can address a specific persisted message (reactions).

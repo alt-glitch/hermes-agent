@@ -11,6 +11,7 @@ handler are thin wrappers that parse args and delegate.
 """
 
 import json
+import logging
 import re
 import shutil
 from pathlib import Path
@@ -94,6 +95,41 @@ def _resolve_short_name(name: str, sources, console: Console) -> str:
     return ""
 
 
+def _print_tier1_advisory(skill_dir, console) -> None:
+    """Print the advisory SkillEvaluator Tier 1 report, if available.
+
+    Never raises and never blocks the install: scanner missing, disabled
+    via ``skills.tier1_advisory: false``, or erroring all degrade to
+    silence. Secrets-class findings render red, the rest yellow.
+    """
+    try:
+        from tools.skillevaluator_scan import (
+            format_tier1_report, run_tier1_scan, tier1_advisory_enabled,
+        )
+        if not tier1_advisory_enabled():
+            return
+        report = run_tier1_scan(Path(skill_dir))
+        if not report.available:
+            return
+        text = format_tier1_report(report)
+        if not report.findings:
+            console.print(f"[dim]{text}[/]")
+            return
+        style = "red" if report.secrets_findings else "yellow"
+        console.print(Panel(
+            text,
+            title="SkillEvaluator Tier 1 (advisory)",
+            border_style=style,
+        ))
+        if report.secrets_findings:
+            console.print(
+                "[bold red]Possible credentials detected above.[/] "
+                "Review the flagged lines before using this skill.\n"
+            )
+    except Exception as exc:  # advisory only — never break an install
+        logging.getLogger(__name__).debug("Tier 1 advisory scan skipped: %s", exc)
+
+
 def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
     lines: list[str] = []
     if not extra:
@@ -123,33 +159,39 @@ def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
 
 
 def _resolve_source_meta_and_bundle(identifier: str, sources):
-    """Resolve metadata and bundle for a specific identifier."""
-    meta = None
-    bundle = None
-    matched_source = None
+    """Resolve metadata and bundle from a single source adapter.
+
+    Meta and bundle must come from the same adapter. Keeping catalog
+    metadata from skills.sh while taking a ClawHub zip of a same-named
+    skill is how ``hermes skills inspect owner/repo/skills/foo`` showed
+    the requested identifier and the wrong SKILL.md.
+    """
+    first_meta = None
+    first_meta_source = None
 
     for src in sources:
-        if meta is None:
-            try:
-                meta = src.inspect(identifier)
-                if meta:
-                    matched_source = src
-            except Exception:
-                meta = None
+        meta = None
+        bundle = None
+        try:
+            meta = src.inspect(identifier)
+        except Exception:
+            meta = None
         try:
             bundle = src.fetch(identifier)
         except Exception:
             bundle = None
         if bundle:
-            matched_source = src
             if meta is None:
                 try:
                     meta = src.inspect(identifier)
                 except Exception:
                     meta = None
-            break
+            return meta, bundle, src
+        if first_meta is None and meta:
+            first_meta = meta
+            first_meta_source = src
 
-    return meta, bundle, matched_source
+    return first_meta, None, first_meta_source
 
 
 def _derive_category_from_install_path(install_path: str) -> str:
@@ -687,6 +729,12 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                          bundle.trust_level, result.verdict,
                          f"{len(result.findings)}_findings")
         return
+
+    # Advisory SkillEvaluator Tier 1 scan (optional second opinion).
+    # Warn-and-continue by design: PII-class findings are informational
+    # (known false-positive classes upstream), and the existing install
+    # confirmation below is where the user decides. Never blocks.
+    _print_tier1_advisory(q_path, c)
 
     if extra_metadata:
         metadata_lines = _format_extra_metadata_lines(extra_metadata)

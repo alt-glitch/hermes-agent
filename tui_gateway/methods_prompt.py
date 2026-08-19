@@ -272,6 +272,10 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    # Off-screen sends (widget intents): type the persisted user row so no
+    # client renders it as a bubble. Whitelisted to "hidden" — display_kind
+    # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
+    display_kind = "hidden" if params.get("display_kind") == "hidden" else None
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -766,7 +770,7 @@ def _(rid, params: dict) -> dict:
                     _clear_inflight_turn(session)
                 return _err(rid, 4090, _SESSION_CLOSED_DURING_ADMISSION)
             isolated_response = _submit_prompt_to_compute_host(
-                rid, sid, session, text
+                rid, sid, session, text, display_kind=display_kind
             )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None:
@@ -881,9 +885,10 @@ def _(rid, params: dict) -> dict:
                 session,
                 text,
                 client_submission_ids=client_submission_ids,
+                display_kind=display_kind,
             )
         else:
-            _run_prompt_submit(rid, sid, session, text)
+            _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
 
     with _session_mutation_lock(session):
         if not _session_registry_matches(sid, session) or session.get("_finalized"):

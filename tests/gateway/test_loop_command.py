@@ -10,7 +10,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner, _profile_runtime_scope
 from gateway.session import SessionSource
-from hermes_cli import loops
+from hermes_cli import goals, loops
 from hermes_constants import get_hermes_home
 
 
@@ -45,9 +45,9 @@ def loop_env(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    loops._DB_CACHE.clear()
+    goals._DB_CACHE.clear()
     yield home
-    loops._DB_CACHE.clear()
+    goals._DB_CACHE.clear()
 
 
 def _make_runner():
@@ -185,7 +185,7 @@ async def test_post_turn_loop_completion_preserves_executor_context(loop_env):
     calls = []
 
     async def run_with_context(fn, *args):
-        calls.append(True)
+        calls.append(getattr(fn, "__name__", ""))
         return fn(*args)
 
     runner._run_in_executor_with_context = run_with_context
@@ -196,7 +196,7 @@ async def test_post_turn_loop_completion_preserves_executor_context(loop_env):
         final_response="still building",
         claim_id=claim_id,
     )
-    assert calls == [True]
+    assert calls == ["_get_session_db", "<lambda>"]
 
 
 @pytest.mark.asyncio
@@ -404,6 +404,7 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    claim_id = mgr.state.claim_id
     assert mgr.state.awaiting_response is True
     assert mgr.is_due() is False
 
@@ -418,6 +419,7 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
         session_entry=_FakeSessionEntry(),
         source=None,
         final_response=final_text,
+        claim_id=claim_id,
     )
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.awaiting_response is False
@@ -432,6 +434,7 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    claim_id = mgr.state.claim_id
     assert mgr.state.awaiting_response is True
 
     runner._post_turn_goal_continuation = AsyncMock()
@@ -440,6 +443,7 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
         agent_result={"final_response": ""},
         source=_make_event("wakeup").source,
         is_internal=True,
+        loop_claim_id=claim_id,
     )
 
     runner._post_turn_goal_continuation.assert_not_awaited()
@@ -457,6 +461,7 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    claim_id = mgr.state.claim_id
 
     runner._post_turn_goal_continuation = AsyncMock(side_effect=RuntimeError("judge failed"))
     with caplog.at_level(logging.DEBUG, logger="gateway.run"):
@@ -465,6 +470,7 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
             agent_result={"final_response": "still working"},
             source=_make_event("wakeup").source,
             is_internal=True,
+            loop_claim_id=claim_id,
         )
 
     reloaded = loops.load_loop("sid-gateway-loop")

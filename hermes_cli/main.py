@@ -4411,9 +4411,11 @@ def select_provider_and_model(args=None):
                 "name": name,
                 "base_url": base_url,
                 "api_key": entry.get("api_key", ""),
-                "key_env": entry.get("key_env", ""),
+                "key_env": entry.get("key_env") or entry.get("api_key_env", ""),
                 "model": entry.get("model", ""),
                 "models": entry.get("models", {}),
+                "models_discovered": entry.get("models_discovered", False),
+                "extra_headers": entry.get("extra_headers", {}),
                 "discover_models": entry.get("discover_models", True),
                 "api_mode": entry.get("api_mode", ""),
                 "provider_key": provider_key,
@@ -5546,6 +5548,9 @@ _LAZY_COMMAND_EXPORTS = {
         "_capture_active_lazy_features",
         "_capture_active_tool_dependencies",
         "_capture_head_sha",
+        "_assess_parked_branch_switch",
+        "_branch_head_label",
+        "_branch_head_suffix",
         "_cmd_update_check",
         "_cmd_update_impl",
         "_cold_start_windows_gateway_after_update",
@@ -5583,6 +5588,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_print_curator_first_run_notice",
         "_print_curator_recent_run_notice",
         "_print_fts_optimize_available_notice",
+        "_print_parked_branch_skip_warning",
         "_print_stash_cleanup_guidance",
         "_print_update_completion",
         "_record_npm_lockfile_hash",
@@ -10883,6 +10889,7 @@ def cmd_update(args):
         detect_install_method,
         format_docker_update_message,
         is_managed,
+        is_nix_install_method,
         managed_error,
         recommended_update_command_for_method,
     )
@@ -10894,7 +10901,8 @@ def cmd_update(args):
     if install_method == "docker":
         print(format_docker_update_message())
         sys.exit(1)
-    if install_method in {"nix", "nixos"}:
+
+    if is_nix_install_method(install_method) or install_method == "apt":
         print(recommended_update_command_for_method(install_method))
         sys.exit(1)
     if getattr(args, "check", False):
@@ -10970,6 +10978,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "security",
         "acp",
         "webhook",
+        "peer",
         "memory",
         "dump",
         "debug",
@@ -11025,31 +11034,47 @@ def cmd_profile(args):
 
     if action is None:
         # Bare `hermes profile` — show current profile status
+        from hermes_cli.profiles import format_profile_label
+
         profile_name = get_active_profile_name()
         dhh = display_hermes_home()
-        print(f"\nActive profile: {profile_name}")
-        print(f"Path:           {dhh}")
 
         profiles = list_profiles()
-        for p in profiles:
-            if p.name == profile_name or (profile_name == "default" and p.is_default):
-                if p.model:
-                    print(
-                        f"Model:          {p.model}"
-                        + (f" ({p.provider})" if p.provider else "")
-                    )
+        current = next(
+            (
+                p
+                for p in profiles
+                if p.name == profile_name
+                or (profile_name == "default" and p.is_default)
+            ),
+            None,
+        )
+        label = format_profile_label(
+            profile_name, current.display_name if current else ""
+        )
+        print(f"\nActive profile: {label}")
+        print(f"Path:           {dhh}")
+
+        if current is not None:
+            p = current
+            if p.model:
                 print(
-                    f"Gateway:        {'running' if p.gateway_running else 'stopped'}"
+                    f"Model:          {p.model}"
+                    + (f" ({p.provider})" if p.provider else "")
                 )
-                print(f"Skills:         {p.skill_count} installed")
-                if p.alias_path:
-                    alias_display = p.alias_name or p.name
-                    print(f"Alias:          {alias_display} → hermes -p {p.name}")
-                break
+            print(
+                f"Gateway:        {'running' if p.gateway_running else 'stopped'}"
+            )
+            print(f"Skills:         {p.skill_count} installed")
+            if p.alias_path:
+                alias_display = p.alias_name or p.name
+                print(f"Alias:          {alias_display} → hermes -p {p.name}")
         print()
         return
 
     if action == "list":
+        from hermes_cli.profiles import format_profile_label
+
         profiles = list_profiles()
         active = get_active_profile_name()
 
@@ -11073,7 +11098,7 @@ def cmd_profile(args):
                 if (p.name == active or (active == "default" and p.is_default))
                 else "  "
             )
-            name = p.name
+            name = format_profile_label(p.name, p.display_name)
             model = (p.model or "—")[:26]
             gw = "running" if p.gateway_running else "stopped"
             alias = (p.alias_name or p.name) if p.alias_path else "—"
@@ -11332,6 +11357,8 @@ def cmd_profile(args):
             _read_distribution_meta,
             _get_wrapper_dir,
             find_alias_for_profile,
+            format_profile_label,
+            read_profile_meta,
         )
 
         if not profile_exists(name):
@@ -11343,8 +11370,9 @@ def cmd_profile(args):
         skills = _count_skills(profile_dir)
         dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
         alias_name = find_alias_for_profile(name)
+        display = read_profile_meta(profile_dir).get("display_name", "")
 
-        print(f"\nProfile: {name}")
+        print(f"\nProfile: {format_profile_label(name, display)}")
         print(f"Path:    {profile_dir}")
         if model:
             print(f"Model:   {model}" + (f" ({provider})" if provider else ""))
@@ -11405,12 +11433,13 @@ def cmd_profile(args):
                     print(f"⚠ {_get_wrapper_dir()} is not in your PATH.")
 
     elif action == "rename":
-        from hermes_cli.profiles import rename_profile
+        from hermes_cli.profiles import normalize_profile_name, rename_profile
 
         try:
             new_dir = rename_profile(args.old_name, args.new_name)
-            print(f"\nProfile renamed: {args.old_name} → {args.new_name}")
-            print(f"Path: {new_dir}\n")
+            if normalize_profile_name(args.old_name) != "default":
+                print(f"\nProfile renamed: {args.old_name} → {args.new_name}")
+                print(f"Path: {new_dir}\n")
         except (ValueError, FileExistsError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -12372,7 +12401,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "monitoring", "pairing", "pause", "pets", "plugins", "portal", "profile",
+        "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy",
         "prompt-size",
         "resume",
@@ -13007,10 +13036,87 @@ def cmd_skills(args):
         from hermes_cli.skills_config import skills_command as skills_config_command
 
         skills_config_command(args)
+    elif getattr(args, "skills_action", None) in ("trust", "untrust"):
+        _cmd_skills_trust(args)
     else:
         from hermes_cli.skills_hub import skills_command
 
         skills_command(args)
+
+
+def _cmd_skills_trust(args):
+    """``hermes skills trust [path]`` / ``hermes skills untrust [path]``.
+
+    Manages ``skills.trusted_project_dirs`` in config.yaml. With no path,
+    operates on the project root enclosing the current directory (nearest
+    ancestor with ``.git``).
+    """
+    from pathlib import Path
+
+    from agent.skill_utils import (
+        PROJECT_SKILLS_SUBDIRS,
+        _candidate_project_skills_dirs,
+        find_project_root,
+        iter_skill_index_files,
+    )
+    from hermes_cli.config import load_config, save_config
+
+    action = args.skills_action
+    raw_path = getattr(args, "path", None)
+    if raw_path:
+        root = Path(raw_path).expanduser().resolve()
+        if not root.is_dir():
+            print(f"Not a directory: {root}")
+            return
+    else:
+        root = find_project_root()
+        if root is None:
+            print(
+                "Not inside a git checkout. Run from a project directory or "
+                "pass the project root path explicitly."
+            )
+            return
+
+    config = load_config()
+    skills_cfg = config.setdefault("skills", {})
+    trusted = skills_cfg.get("trusted_project_dirs") or []
+    if not isinstance(trusted, list):
+        trusted = [trusted]
+    trusted = [str(t) for t in trusted]
+    root_str = str(root)
+
+    if action == "untrust":
+        kept = [t for t in trusted if str(Path(t).expanduser().resolve()) != root_str]
+        if len(kept) == len(trusted):
+            print(f"{root} was not trusted.")
+            return
+        skills_cfg["trusted_project_dirs"] = kept
+        save_config(config)
+        print(f"Untrusted: {root}")
+        print("Project skills from this repo will no longer load.")
+        return
+
+    # trust
+    if any(str(Path(t).expanduser().resolve()) == root_str for t in trusted):
+        print(f"Already trusted: {root}")
+    else:
+        trusted.append(root_str)
+        skills_cfg["trusted_project_dirs"] = trusted
+        save_config(config)
+        print(f"Trusted: {root}")
+
+    # Show what this unlocks
+    count = 0
+    for d in _candidate_project_skills_dirs(root):
+        count += sum(1 for _ in iter_skill_index_files(d, "SKILL.md"))
+    if count:
+        print(
+            f"{count} project skill(s) will load in sessions started inside "
+            "this repo (they take precedence over same-named profile skills)."
+        )
+    else:
+        subdirs = " or ".join(PROJECT_SKILLS_SUBDIRS)
+        print(f"No project skills found yet — add them under {subdirs}.")
 
 
 def cmd_pairing(args):
@@ -13376,6 +13482,13 @@ def main():
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
     # =========================================================================
     build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
+
+    # =========================================================================
+    # peer command — bot-to-bot DMs across machines (peer Hermes gateways)
+    # =========================================================================
+    from hermes_cli.subcommands.peer import build_peer_parser
+
+    build_peer_parser(subparsers)
 
     # =========================================================================
     # portal command — Nous Portal status + Tool Gateway routing
