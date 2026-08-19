@@ -30,19 +30,18 @@
  * Tab-only accept so arrows/Enter retain history/cursor/submit meanings.
  * `onSubmit`/`onType` are plain callbacks wired by the entry — no Effect here.
  *
- * Skill highlighting + one-edit autocorrect (Epic 6): standalone `/name` tokens
- * whose name exactly matches a valid command/skill name get a native textarea
- * highlight (editBuffer.addHighlightByCharRange + a SyntaxStyle — the same
- * range-styling seam the extmarks demo uses, WITHOUT ExtmarksController's
- * cursor monkey-patching, so the token stays normally editable). The catalog of
- * valid names is LEARNED from the slash-completion batches the gateway already
- * sends (module-level, survives composer remounts) — the completion flow is the
- * source of truth, nothing is hardcoded. When the message is EXACTLY a bare
+ * Reference highlighting + one-edit autocorrect: slash invocations/references,
+ * `@` refs, and attachment/paste tokens get a native textarea highlight
+ * (editBuffer.addHighlightByCharRange + a SyntaxStyle — the same range-styling
+ * seam the extmarks demo uses, WITHOUT ExtmarksController's cursor
+ * monkey-patching, so the token stays normally editable). Half-typed refs paint
+ * immediately. The learned gateway command catalog remains the source of truth
+ * for autocorrect. When the message is EXACTLY a bare
  * lead token one edit away from one valid name (`/comit`) and the gateway menu
  * is empty, a synthetic "did you mean" row rides the SAME dropdown (same
  * routeMenuKey routing/accept path; Esc dismisses it until the text changes).
- * Anti-jank: a `/` mid-prose never completes or autocorrects — exact tokens get
- * highlight-only, everything else gets nothing (see logic/skillMatch.ts).
+ * Anti-jank: a `/` mid-prose never completes or autocorrects; highlighting is
+ * cosmetic and follows the same vocabulary as the sent transcript.
  *
  * Always-active input (item 2): the textarea focuses on mount, on click
  * (onMouseDown), and reclaims focus on the next PRINTABLE keystroke if focus ever
@@ -57,6 +56,7 @@ import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Sh
 
 import { MENU_MAX, acceptChangesToken, completionEdit, routeMenuKey } from '../logic/completionMenu.ts'
 import { BUSY_QUEUE_MAX_CHARS, BUSY_QUEUE_MAX_EDIT_CHARS } from '../logic/busyQueue.ts'
+import { composerHighlightSpans } from '../logic/composerHighlights.ts'
 import { envComposerRows } from '../logic/env.ts'
 import { createDoublePress } from '../logic/promptHistory.ts'
 import { analyzeSlash, learnableNames, nativeCharOffset } from '../logic/skillMatch.ts'
@@ -269,18 +269,16 @@ export function Composer(props: {
    *  the mode is visually unmistakable. */
   const shellMode = createMemo(() => bufText().startsWith('!'))
 
-  // Native highlight plumbing: one SyntaxStyle per mount holding the token
-  // style; ranges are recomputed from `analysis()` on every change (clear+add —
+  // Native highlight plumbing: one SyntaxStyle per mount holding the reference
+  // style; ranges are recomputed from live text on every change (clear+add —
   // the same recompute model ExtmarksController uses). Best-effort: a native
   // styling failure must never take the composer down.
   let syntax: SyntaxStyle | undefined
   let tokenStyleId = 0
-  let imageStyleId = 0
   onMount(() => {
     try {
       const style = SyntaxStyle.create()
       tokenStyleId = style.registerStyle('slash-token', { bold: true, fg: theme().color.accent })
-      imageStyleId = style.registerStyle('image-token', { bold: true, fg: theme().color.primary })
       if (ta) ta.syntaxStyle = style
       syntax = style
     } catch {
@@ -293,11 +291,9 @@ export function Composer(props: {
   // the highlight createEffect below re-tracks `theme()` so ranges re-apply.
   createEffect(() => {
     const accent = theme().color.accent
-    const primary = theme().color.primary
     if (!syntax) return
     try {
       tokenStyleId = syntax.registerStyle('slash-token', { bold: true, fg: accent })
-      imageStyleId = syntax.registerStyle('image-token', { bold: true, fg: primary })
     } catch {
       /* cosmetic — never crash on a native restyle */
     }
@@ -329,31 +325,18 @@ export function Composer(props: {
     syntax = undefined
   })
   createEffect(() => {
-    const a = analysis()
-    const images = props.pendingImages?.() ?? []
+    const text = bufText()
+    const spans = composerHighlightSpans(text)
     void theme().color.accent // re-track: re-apply highlights after a live re-theme
     if (!ta || !syntax || ta.isDestroyed) return
     try {
-      const text = bufText()
       ta.editBuffer.clearAllHighlights()
-      for (const t of a.highlights) {
+      for (const span of spans) {
         ta.editBuffer.addHighlightByCharRange({
-          end: nativeCharOffset(text, t.end),
-          start: nativeCharOffset(text, t.start),
+          end: nativeCharOffset(text, span.end),
+          start: nativeCharOffset(text, span.start),
           styleId: tokenStyleId
         })
-      }
-      for (const image of images) {
-        let start = text.indexOf(image.token)
-        while (start >= 0) {
-          const end = start + image.token.length
-          ta.editBuffer.addHighlightByCharRange({
-            end: nativeCharOffset(text, end),
-            start: nativeCharOffset(text, start),
-            styleId: imageStyleId
-          })
-          start = text.indexOf(image.token, end)
-        }
       }
       ta.requestRender()
     } catch {

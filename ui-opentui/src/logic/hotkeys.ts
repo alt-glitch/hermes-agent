@@ -59,11 +59,21 @@ export function isExitHotkey(key: ActionKey, platform: NodeJS.Platform = process
   return isActionHotkey(key, 'd', platform)
 }
 
+export type CtrlCAction = 'clear-draft' | 'interrupt' | 'exit'
+
+/** Ink's input-first Ctrl+C precedence. A typed draft belongs to the composer,
+ * even while a turn is streaming, so the first press clears it before a later
+ * press can interrupt the turn or enter the surface-specific exit flow. */
+export function ctrlCAction(busy: boolean, hasDraft: boolean): CtrlCAction {
+  if (hasDraft) return 'clear-draft'
+  return busy ? 'interrupt' : 'exit'
+}
+
 /** OpenTUI-native shortcuts actually implemented by this engine. */
 export function openTuiHotkeys(platform: NodeJS.Platform = process.platform): readonly HotkeyRow[] {
   const action = actionModifier(platform)
   return [
-    ['Ctrl+C', 'copy selection / interrupt / clear draft / arm quit'],
+    ['Ctrl+C', 'copy selection / clear draft / interrupt / arm quit'],
     [`${action}+D`, 'exit'],
     [`${action}+L`, 'redraw / repaint'],
     ['Tab', 'apply completion'],

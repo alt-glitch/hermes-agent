@@ -89,7 +89,13 @@ import {
   STARTUP_IMAGE_DEFAULT_PROMPT
 } from '../logic/env.ts'
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
-import { actionExitBlocked, DASHBOARD_NEW_SESSION_MESSAGE, isExitHotkey, isRedrawHotkey } from '../logic/hotkeys.ts'
+import {
+  actionExitBlocked,
+  ctrlCAction,
+  DASHBOARD_NEW_SESSION_MESSAGE,
+  isExitHotkey,
+  isRedrawHotkey
+} from '../logic/hotkeys.ts'
 import { isVoiceRecordKey, voiceRecordKeyFromConfig } from '../logic/voiceKey.ts'
 import { deliverVoiceTranscript, voiceSubmitModeFromConfig } from '../logic/voiceSubmit.ts'
 import { parseProcessList } from '../logic/backgroundActivity.ts'
@@ -1279,21 +1285,20 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
       const onCtrlC = () => {
-        // Busy Ctrl+C ONLY interrupts (Ink parity). It must not leave a sticky
-        // hosted hint that masks subsequent status lines.
-        if (isTurnBusy()) {
-          interruptTurn()
-          if (!hostedDashboard) armQuit('⏹ stopped — Ctrl+C again to quit')
-          return
-        }
-        // An idle non-empty composer clears before any exit gesture, matching
-        // Ink's input-first Ctrl+C precedence.
-        if (store.state.composerDraft) {
+        const action = ctrlCAction(isTurnBusy(), Boolean(store.state.composerDraft))
+        if (action === 'clear-draft') {
           // This is an explicit abandon, not a session clear→restore. Release
           // every large-paste body before clearing the visible token/draft.
           pasteStore.clear()
           store.clearComposerDraft()
           disarmQuit()
+          return
+        }
+        // With no draft, busy Ctrl+C interrupts. It must not leave a sticky
+        // hosted hint that masks subsequent status lines.
+        if (action === 'interrupt') {
+          interruptTurn()
+          if (!hostedDashboard) armQuit('⏹ stopped — Ctrl+C again to quit')
           return
         }
         // Dashboard PTYs cannot be destroyed and restarted in-page. Publish the

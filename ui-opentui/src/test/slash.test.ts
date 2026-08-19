@@ -2868,6 +2868,27 @@ describe('dispatchSlash — server ladder', () => {
     expect(p.system).not.toContain('/goal: no output')
   })
 
+  test('a send display projection renders the display while submitting the model-facing message', async () => {
+    const continuation = '[Continuing toward your standing goal]\nTake the next step without asking.'
+    const p = makeCtx(async method =>
+      method === 'slash.exec'
+        ? { type: 'send', notice: '▶ Goal resumed', message: continuation, display: '/goal resume' }
+        : {}
+    )
+    await dispatchSlash('/goal resume', p.ctx)
+    expect(p.submitted).toHaveLength(0)
+    expect(p.skillSubmitted).toEqual([{ command: '/goal resume', body: continuation }])
+    expect(p.system).toContain('▶ Goal resumed')
+  })
+
+  test('a rejected send display projection restores the display, never the hidden message', async () => {
+    const p = makeCtx(async () => ({ type: 'send', message: 'hidden continuation scaffold', display: '/goal resume' }))
+    const ctx = { ...p.ctx, submitSkill: () => false }
+    await dispatchSlash('/goal resume', ctx)
+    expect(p.prefills).toEqual(['/goal resume'])
+    expect(p.prefills).not.toContain('hidden continuation scaffold')
+  })
+
   test('a rejected {type:send} result restores the generated body instead of dropping it', async () => {
     const p = makeCtx(async () => ({ type: 'send', message: 'release-critical generated prompt' }))
     const ctx = { ...p.ctx, submit: () => false }

@@ -183,7 +183,7 @@ describe('anti-jank: mid-prose never completes, never autocorrects', () => {
   })
 })
 
-describe('exact-match token highlight (native editBuffer ranges)', () => {
+describe('composer reference highlight (native editBuffer ranges)', () => {
   /** Find a styled span whose text contains `needle`. */
   const findSpan = (h: Harness, needle: string) => {
     for (const line of h.probe.spans().lines) {
@@ -235,7 +235,7 @@ describe('exact-match token highlight (native editBuffer ranges)', () => {
     }
   })
 
-  test('a non-matching token stays unhighlighted (default text color)', async () => {
+  test('a half-typed or unknown slash reference still tracks the caret in accent', async () => {
     const h = await mountComposer()
     try {
       await h.probe.keys.typeText('/xyzzy')
@@ -244,31 +244,37 @@ describe('exact-match token highlight (native editBuffer ranges)', () => {
       const span = findSpan(h, '/xyzzy')
       expect(span).toBeDefined()
       const accent = RGBA.fromHex(h.store.state.theme.color.accent).toInts()
-      expect(span!.fg.toInts().slice(0, 3)).not.toEqual(accent.slice(0, 3))
+      expect(span!.fg.toInts().slice(0, 3)).toEqual(accent.slice(0, 3))
     } finally {
       h.probe.destroy()
     }
   })
 
-  // glitch 2026-06-14: highlighting used to be hit-or-miss — a `/command` only
-  // painted accent if its completion batch had been browsed EARLIER in the
-  // session (the catalog started empty and grew lazily). The boot now seeds the
-  // catalog from `commands.catalog` via seedLearnedNames, so a cold command —
-  // typed as the very first keystrokes, with NO prior `/prefix` teaching —
-  // highlights immediately. This pins that fix.
-  test('a SEEDED command highlights cold (no prior /prefix teaching)', async () => {
+  test('@refs and OpenTUI paste tokens paint through the native textarea', async () => {
+    const h = await mountComposer()
+    try {
+      await h.probe.keys.typeText('inspect @file:src/a.ts [Pasted text #2 +3 lines]')
+      await h.probe.settle()
+      await h.probe.waitForFrame(f => f.includes('[Pasted text #2 +3 lines]'))
+      const accent = RGBA.fromHex(h.store.state.theme.color.accent).toInts()
+      for (const needle of ['@file:src/a.ts', '[Pasted text #2 +3 lines]']) {
+        const span = findSpan(h, needle)
+        expect(span).toBeDefined()
+        expect(span!.fg.toInts().slice(0, 3)).toEqual(accent.slice(0, 3))
+      }
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('a seeded command supports cold autocorrect without prior prefix teaching', async () => {
     seedLearnedNames([{ text: '/handoff' }, { text: 'review' }])
     const h = await mountComposer()
     try {
-      // type the whole command in one burst — there is no earlier slash batch to
-      // teach the catalog, so this only highlights because of the boot seed.
-      await h.probe.keys.typeText('/handoff')
+      await h.probe.keys.typeText('/handof')
       await h.probe.settle()
-      await h.probe.waitForFrame(f => f.includes('/handoff'))
-      const span = findSpan(h, '/handoff')
-      expect(span).toBeDefined()
-      const accent = RGBA.fromHex(h.store.state.theme.color.accent).toInts()
-      expect(span!.fg.toInts().slice(0, 3)).toEqual(accent.slice(0, 3))
+      const frame = await h.probe.waitForFrame(f => f.includes('did you mean'))
+      expect(frame).toContain('/handoff')
     } finally {
       h.probe.destroy()
     }
@@ -279,13 +285,10 @@ describe('exact-match token highlight (native editBuffer ranges)', () => {
     refreshLearnedNames([{ text: '/current-skill' }, { text: '/queue' }], ['removed-skill'])
     const h = await mountComposer()
     try {
-      await h.probe.keys.typeText('/removed-skill')
+      await h.probe.keys.typeText('/removed-skil')
       await h.probe.settle()
-      await h.probe.waitForFrame(f => f.includes('/removed-skill'))
-      const span = findSpan(h, '/removed-skill')
-      expect(span).toBeDefined()
-      const accent = RGBA.fromHex(h.store.state.theme.color.accent).toInts()
-      expect(span!.fg.toInts().slice(0, 3)).not.toEqual(accent.slice(0, 3))
+      await h.probe.waitForFrame(f => f.includes('/removed-skil'))
+      expect(h.probe.frame()).not.toContain('did you mean')
     } finally {
       h.probe.destroy()
     }
@@ -296,13 +299,10 @@ describe('exact-match token highlight (native editBuffer ranges)', () => {
     refreshLearnedNames([{ text: '/queue' }], ['removed-skill'])
     const alias = await mountComposer()
     try {
-      await alias.probe.keys.typeText('/learning')
+      await alias.probe.keys.typeText('/learnin')
       await alias.probe.settle()
-      await alias.probe.waitForFrame(f => f.includes('/learning'))
-      const accent = RGBA.fromHex(alias.store.state.theme.color.accent).toInts()
-      const span = findSpan(alias, '/learning')
-      expect(span).toBeDefined()
-      expect(span!.fg.toInts().slice(0, 3)).toEqual(accent.slice(0, 3))
+      const frame = await alias.probe.waitForFrame(f => f.includes('did you mean'))
+      expect(frame).toContain('/learning')
     } finally {
       alias.probe.destroy()
     }
@@ -313,13 +313,10 @@ describe('exact-match token highlight (native editBuffer ranges)', () => {
     refreshLearnedNames([{ text: '/queue' }], ['removed-skill'])
     const plugin = await mountComposer()
     try {
-      await plugin.probe.keys.typeText('/plugin-command')
+      await plugin.probe.keys.typeText('/plugin-comman')
       await plugin.probe.settle()
-      await plugin.probe.waitForFrame(f => f.includes('/plugin-command'))
-      const accent = RGBA.fromHex(plugin.store.state.theme.color.accent).toInts()
-      const span = findSpan(plugin, '/plugin-command')
-      expect(span).toBeDefined()
-      expect(span!.fg.toInts().slice(0, 3)).toEqual(accent.slice(0, 3))
+      const frame = await plugin.probe.waitForFrame(f => f.includes('did you mean'))
+      expect(frame).toContain('/plugin-command')
     } finally {
       plugin.probe.destroy()
     }

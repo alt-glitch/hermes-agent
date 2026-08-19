@@ -3055,8 +3055,10 @@ function handleDispatchResult(parsed: ParsedSlash, raw: unknown, ctx: SlashConte
       if (notice) ctx.pushSystem(notice)
       const message = readStr(raw, 'message')
       if (message?.trim()) {
-        if (ctx.submit(message) === false) {
-          ctx.prefillComposer(message)
+        const display = readStr(raw, 'display')
+        const accepted = display?.trim() ? ctx.submitSkill(display, message) : ctx.submit(message)
+        if (accepted === false) {
+          ctx.prefillComposer(display?.trim() ? display : message)
           ctx.pushSystem('generated prompt could not be queued — message restored to composer')
         }
       } else ctx.pushSystem(`/${parsed.name}: empty message`)

@@ -1,9 +1,8 @@
 /**
- * Inline `/skill` references in SENT user messages (Ink messageLine parity —
- * the transcript half of the inline completion trigger). Frame tests through
- * the real App tree (store → Transcript → MessageLine): a non-leading,
- * whitespace-preceded `/skill` token renders as an ACCENT span while the
- * surrounding prose keeps the user body color — flat sibling spans in one
+ * Composer references in SENT user messages (Ink messageLine parity). Frame
+ * tests through the real App tree (store → Transcript → MessageLine): slash,
+ * `@`, and attachment tokens render as ACCENT spans while surrounding prose
+ * keeps the user body color — flat sibling spans in one
  * native <text>, so the message source (and CopyChip's source) is untouched
  * and the frame still shows the text byte-for-byte.
  */
@@ -40,7 +39,7 @@ function findSpan(probe: RenderProbe, needle: string) {
 
 const rgb = (hex: string): number[] => RGBA.fromHex(hex).toInts().slice(0, 3)
 
-describe('user-message inline skill references (frame spans)', () => {
+describe('user-message composer references (frame spans)', () => {
   test('a mid-prose /skill accents; the prose around it keeps the user body color', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
@@ -65,7 +64,7 @@ describe('user-message inline skill references (frame spans)', () => {
     }
   })
 
-  test('a LEADING slash token is an invocation, not a reference — no accent', async () => {
+  test('a leading slash invocation keeps the composer accent', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
     store.pushUser('/notaskill run something')
@@ -74,7 +73,24 @@ describe('user-message inline skill references (frame spans)', () => {
       await probe.waitForFrame(f => f.includes('/notaskill'))
       const span = findSpan(probe, '/notaskill')
       expect(span).toBeDefined()
-      expect(span?.fg.toInts().slice(0, 3)).toEqual(rgb(store.state.theme.color.muted))
+      expect(span?.fg.toInts().slice(0, 3)).toEqual(rgb(store.state.theme.color.accent))
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('an @ref and attachment token keep the composer accent', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.pushUser('inspect @file:src/a.ts with [Image #1]')
+    const probe = await mountApp(store)
+    try {
+      await probe.waitForFrame(f => f.includes('[Image #1]'))
+      for (const needle of ['@file:src/a.ts', '[Image #1]']) {
+        const span = findSpan(probe, needle)
+        expect(span).toBeDefined()
+        expect(span?.fg.toInts().slice(0, 3)).toEqual(rgb(store.state.theme.color.accent))
+      }
     } finally {
       probe.destroy()
     }
