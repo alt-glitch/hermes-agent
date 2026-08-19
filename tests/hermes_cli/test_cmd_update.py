@@ -227,9 +227,20 @@ class TestCmdUpdateBranchFallback:
     def test_update_falls_back_to_main_when_current_branch_is_local_only(
         self, mock_run, _mock_which, mock_args
     ):
-        mock_run.side_effect = _make_run_side_effect(
+        base_side_effect = _make_run_side_effect(
             branch="local/experiment", verify_ok=False, commit_count="3"
         )
+        branch_reads = iter(("local/experiment", "local/experiment", "main"))
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{next(branch_reads)}\n", stderr=""
+                )
+            return base_side_effect(cmd, **kwargs)
+
+        mock_run.side_effect = side_effect
 
         cmd_update(mock_args)
 
