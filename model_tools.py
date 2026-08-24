@@ -297,9 +297,11 @@ _LEGACY_TOOLSET_MAP = {
 # because quiet_mode=False has stdout side effects (tool-selection prints).
 #
 # Invalidation happens transparently via the registry's _generation counter,
-# which bumps on register() / deregister() / register_toolset_alias(). The
-# inner check_fn TTL cache in registry.py handles environment drift (Docker
-# daemon start/stop, env var changes, etc.) on a 30 s horizon.
+# which bumps on register() / deregister() / register_toolset_alias(), plus a
+# Short-TTL aggregate snapshot of every cached check_fn verdict in the cache
+# key. The snapshot lets external availability drift propagate through THIS
+# cache on the combined probe/snapshot TTL horizon — the generation counter
+# alone never re-probes on a hit.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 _tool_defs_cache_lock = threading.Lock()
 
@@ -353,6 +355,8 @@ def get_tool_definitions(
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
     cache_key = None
+    verdict_snapshot: tuple = ()
+    key_generation: int = -1
     if quiet_mode:
         try:
             from hermes_cli.config import get_config_path
@@ -363,17 +367,37 @@ def get_tool_definitions(
             cfg_fp = None
         profile_scope = check_fn_cache_scope()
         if profile_scope != CHECK_FN_CACHE_BYPASS:
+            # check_fn verdicts: the registry generation only captures
+            # registry MUTATIONS. An availability probe can flip without
+            # one (Docker daemon starts, credential lands, OAuth login),
+            # and before this key member a memo hit skipped probing
+            # entirely — the tool list stayed stale for the process
+            # lifetime. The aggregate is TTL-cached, so hits cost one lookup; a flip
+            # changes the tuple and forces a recompute within ~35 s worst case.
+            # Held in a named local (not just a key slot) because the
+            # TOCTOU guard below re-checks it after compute.
+            verdict_snapshot = registry.check_fn_verdict_snapshot()
+            key_generation = registry._generation
+            if verdict_snapshot != registry.check_fn_verdict_snapshot():
+                # Probes executed by the first snapshot can lazily import
+                # and register tools, bumping the generation — the first
+                # snapshot then describes a registry state older than the
+                # key's. Re-take once so key_generation and the snapshot
+                # agree; the second pass runs no new registrations.
+                key_generation = registry._generation
+                verdict_snapshot = registry.check_fn_verdict_snapshot()
             cache_key = (
                 registry.current_scope_key(),
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
-                registry._generation,
+                key_generation,
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                verdict_snapshot,
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -389,6 +413,22 @@ def get_tool_definitions(
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
     if quiet_mode and cache_key is not None:
+        # TOCTOU guard: the verdict snapshot in cache_key was taken BEFORE
+        # compute. If a verdict flipped (and the snapshot cache was
+        # invalidated) while compute ran — with NO registry mutation — the
+        # result reflects the NEW verdicts but cache_key carries the OLD
+        # ones; caching would poison the old key (flip back later and the
+        # memo serves this mismatched list). Skip caching in that case.
+        # When the GENERATION moved during compute (first call in a process
+        # triggers lazy tool registration), the old key can never be looked
+        # up again, so caching under it is harmless — and skipping would
+        # leave the first call permanently uncached. (cache_key is not None
+        # implies verdict_snapshot was bound above.)
+        if (
+            registry._generation == key_generation
+            and verdict_snapshot != registry.check_fn_verdict_snapshot()
+        ):
+            return list(result)
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a

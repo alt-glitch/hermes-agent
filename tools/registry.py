@@ -272,8 +272,11 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
 _CHECK_FN_CACHE_MAX = 512
+_VERDICT_SNAPSHOT_TTL_SECONDS = 5.0
 _check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
 _check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
+_verdict_snapshot_cache: Dict[tuple, tuple[float, tuple]] = {}
+_verdict_snapshot_epoch = 0
 _check_fn_cache_lock = threading.Lock()
 CHECK_FN_CACHE_BYPASS = ""
 _NO_CACHE_CHECK_FNS: Set[Callable] = set()
@@ -298,6 +301,8 @@ def _prune_check_fn_caches(now: float) -> None:
             _check_fn_last_good.pop(key, None)
     while len(_check_fn_cache) >= _CHECK_FN_CACHE_MAX:
         _check_fn_cache.pop(next(iter(_check_fn_cache)))
+    # Same hard cap as _check_fn_cache: TTL pruning alone leaves last-good
+    # unbounded under high (fn, scope) churn inside one grace window.
     while len(_check_fn_last_good) >= _CHECK_FN_CACHE_MAX:
         _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
 
@@ -418,11 +423,16 @@ def _check_fn_cached(fn: Callable) -> bool:
 
 
 def invalidate_check_fn_cache() -> None:
-    """Drop all cached ``check_fn`` results. Call after config changes that
-    affect tool availability (e.g. ``hermes tools enable``)."""
+    """Drop cached probes and aggregate verdict snapshots.
+
+    Call after config changes that affect tool availability.
+    """
+    global _verdict_snapshot_epoch
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+        _verdict_snapshot_cache.clear()
+        _verdict_snapshot_epoch += 1
 
 
 def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
@@ -508,6 +518,67 @@ class ToolRegistry:
     def _snapshot_entries(self) -> List[ToolEntry]:
         """Return a stable snapshot of registered tool entries."""
         return self._snapshot_state()[0]
+
+    def check_fn_verdict_snapshot(self, scope: Optional[str] = None) -> tuple:
+        """Return a hashable snapshot of every availability probe's verdict.
+
+        Built for outer memo keys (``get_tool_definitions``' cache): the
+        registry generation captures registry *mutations*, but a ``check_fn``
+        verdict can flip without any mutation — a daemon starts, a credential
+        file appears, an OAuth login lands. Before this existed, an outer
+        memo keyed only on the generation served stale tool lists
+        indefinitely after such a flip, because nothing on the cache-hit
+        path ever re-probed.
+
+        Aggregate snapshots are cached briefly per registry and profile, so a
+        hot-path hit is one dictionary lookup. On a snapshot miss, each
+        distinct probe runs through :func:`_check_fn_cached`. A verdict flip
+        changes the tuple after the probe TTL plus the snapshot TTL (~35 s),
+        or immediately after :func:`invalidate_check_fn_cache`, which clears
+        both layers. Request-bound cache-bypass scopes are never aggregated.
+
+        Probes marked :func:`no_cache_check_fn` are skipped: they are local,
+        config-backed checks that execute UNCACHED on every call (some with
+        deliberate side effects, e.g. the memory tool's flag snapshot), and
+        their verdicts only change when config changes — which the outer
+        memo key already captures through the config-file fingerprint.
+        """
+        registry_scope = scope or self.current_scope_key()
+        probe_scope = check_fn_cache_scope()
+        cache_key = (self, registry_scope, probe_scope, self._generation)
+        now = time.monotonic()
+        snapshot_epoch = -1
+        if probe_scope != CHECK_FN_CACHE_BYPASS:
+            with _check_fn_cache_lock:
+                snapshot_epoch = _verdict_snapshot_epoch
+                cached = _verdict_snapshot_cache.get(cache_key)
+                if cached is not None and now - cached[0] < _VERDICT_SNAPSHOT_TTL_SECONDS:
+                    return cached[1]
+
+        entries, toolset_checks = self._snapshot_state(registry_scope)
+        fns: Dict[Callable, str] = {}
+        for entry in entries:
+            if entry.check_fn is not None and entry.check_fn not in fns:
+                fns[entry.check_fn] = getattr(
+                    entry.check_fn, "__qualname__", repr(entry.check_fn)
+                )
+        for fn in toolset_checks.values():
+            if fn is not None and fn not in fns:
+                fns[fn] = getattr(fn, "__qualname__", repr(fn))
+        verdicts = [
+            (label, id(fn), _check_fn_cached(fn))
+            for fn, label in fns.items()
+            if fn not in _NO_CACHE_CHECK_FNS
+        ]
+        verdicts.sort(key=lambda item: (item[0], item[1]))
+        snapshot = tuple((label, value) for label, _, value in verdicts)
+        if probe_scope != CHECK_FN_CACHE_BYPASS:
+            with _check_fn_cache_lock:
+                if snapshot_epoch == _verdict_snapshot_epoch:
+                    while len(_verdict_snapshot_cache) >= _CHECK_FN_CACHE_MAX:
+                        _verdict_snapshot_cache.pop(next(iter(_verdict_snapshot_cache)))
+                    _verdict_snapshot_cache[cache_key] = (time.monotonic(), snapshot)
+        return snapshot
 
     def _toolset_has_exposable_tools(
         self,
