@@ -431,8 +431,12 @@ class TestBatchedDescribe:
             config=ToolSearchConfig.from_raw({}),
         ))
         assert "mq_linear_create_issue" in result["tools"]
-        assert "terminal" in result["not_found"]
-        assert "errors" not in result
+        # Whether "terminal" is not_found or a not-deferrable error depends on
+        # whether this process's registry has core tools registered; both are
+        # correct refusals — assert it is refused, never described.
+        refused = result.get("not_found", []) + list(result.get("errors", {}))
+        assert "terminal" in refused
+        assert "terminal" not in result["tools"]
 
     def test_registered_direct_surface_name_keeps_exact_error(self):
         from tools.tool_search import ToolSearchConfig, dispatch_tool_describe

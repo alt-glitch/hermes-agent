@@ -300,9 +300,12 @@ class TestSourceNameIndexing:
                 _td("mcp__catalogsource__native_action", "Perform a native action."),
                 _td("plugin_action", "Perform a plugin action."),
             ])
+            from tools.tool_search import _stem
+
+            # The index stems every token (ns-730), so the label appears as its stem.
             tokens_by_name = {entry.name: entry._tokens for entry in catalog}
-            assert tokens_by_name[names[0]].count(source_label) == 1
-            assert tokens_by_name[names[1]].count(source_label) == 1
+            assert tokens_by_name[names[0]].count(_stem(source_label)) == 1
+            assert tokens_by_name[names[1]].count(_stem(source_label)) == 1
         finally:
             for name in names:
                 registry.deregister(name)
