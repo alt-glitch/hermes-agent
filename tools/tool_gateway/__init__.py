@@ -20,10 +20,11 @@ Layering rules (enforced by review, not imports — keep them true):
 - ``merge.py`` is PURE: partition / splice / render with no I/O and no
   exceptions. Position in the original ``calls[]`` array is the only
   correlation key — the wire ``index`` field is never trusted.
-- ``client.py`` / ``bridge.py`` (next PR): the HTTP client and the only
-  module core code imports. Every bridge entry point is TOTAL — it catches
-  its own exceptions, because the bridge branch bypasses the registry's
-  catch-wrap.
+- ``client.py`` / ``bridge.py``: the HTTP client and the only module core
+  imports. Every bridge entry point is TOTAL — it catches its own
+  exceptions, because the bridge branch bypasses the registry's catch-wrap.
+  Approval is settled by the core BEFORE the bridge is called; denied
+  entries never reach it.
 
 Nothing outside this package imports it yet; the bridge wiring lands as its
 own PR so this package stays independently revertible.
