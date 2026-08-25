@@ -138,6 +138,84 @@ def test_managed_gateway_origin_honors_the_harness_override():
         )
 
 
+def test_vendor_env_override_does_not_inherit_the_bearer():
+    # An attacker who can set one env var must not receive the user's token:
+    # managed mode resolves to None (tool reports unconfigured) with a warning,
+    # instead of shipping the bearer to whatever the environment names.
+    with patch.dict(
+        os.environ, {"FIRECRAWL_GATEWAY_URL": "https://attacker.example"}, clear=False
+    ), patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+        os.environ.pop("HERMES_TRUSTED_GATEWAY_ORIGINS", None)
+        config = managed_tool_gateway.resolve_managed_tool_gateway(
+            "firecrawl", token_reader=lambda: "secret-token"
+        )
+    assert config is None
+
+
+def test_loopback_and_trust_listed_overrides_keep_managed_mode():
+    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+        # Loopback (the local harness) needs no configuration.
+        with patch.dict(
+            os.environ, {"FIRECRAWL_GATEWAY_URL": "http://127.0.0.1:3009"}, clear=False
+        ):
+            os.environ.pop("HERMES_TRUSTED_GATEWAY_ORIGINS", None)
+            config = managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "secret-token"
+            )
+        assert config is not None and config.nous_user_token == "secret-token"
+
+        # A staging origin is granted by exact membership in the trust list.
+        with patch.dict(
+            os.environ,
+            {
+                "FIRECRAWL_GATEWAY_URL": "https://stage.example",
+                "HERMES_TRUSTED_GATEWAY_ORIGINS": "https://other.example, https://stage.example",
+            },
+            clear=False,
+        ):
+            config = managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "secret-token"
+            )
+        assert config is not None
+
+        # The hardcoded deployed vendor host stays trusted with no env at all.
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ("FIRECRAWL_GATEWAY_URL", "TOOL_GATEWAY_DOMAIN", "TOOL_GATEWAY_SCHEME",
+                        "TOOL_GATEWAY_URL", "HERMES_TRUSTED_GATEWAY_ORIGINS"):
+                os.environ.pop(key, None)
+            config = managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "secret-token"
+            )
+        assert config is not None
+        assert config.gateway_origin == "https://firecrawl-gateway.nousresearch.com"
+
+
+def test_shared_origin_override_gates_the_bearer_not_the_address():
+    # TOOL_GATEWAY_URL still steers where requests GO (address resolution is
+    # untouched), but an untrusted override origin never earns the bearer.
+    with patch.dict(
+        os.environ, {"TOOL_GATEWAY_URL": "https://attacker.example"}, clear=False
+    ):
+        os.environ.pop("HERMES_TRUSTED_GATEWAY_ORIGINS", None)
+        endpoints = managed_tool_gateway.managed_vendor_endpoints("connectors")
+        assert endpoints is not None and endpoints["origin"] == "https://attacker.example"
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://attacker.example/v1/connectors/search"
+        )
+
+    with patch.dict(
+        os.environ,
+        {
+            "TOOL_GATEWAY_URL": "https://stage.example",
+            "HERMES_TRUSTED_GATEWAY_ORIGINS": "https://stage.example",
+        },
+        clear=False,
+    ):
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://stage.example/v1/connectors/search"
+        )
+
+
 def test_default_bearer_gate_accepts_only_the_deployed_host():
     # Exact (scheme, netloc) equality against the deployed origin: the old
     # host, subdomain cousins, and scheme downgrades all stay untrusted.

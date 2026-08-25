@@ -171,6 +171,44 @@ def build_vendor_gateway_url(vendor: str) -> str:
     return f"{shared_scheme}://{vendor}-gateway.{_DEFAULT_TOOL_GATEWAY_DOMAIN}"
 
 
+_TRUSTED_GATEWAY_ORIGINS_ENV = "HERMES_TRUSTED_GATEWAY_ORIGINS"
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _explicitly_trusted_origins() -> set:
+    raw = os.getenv(_TRUSTED_GATEWAY_ORIGINS_ENV, "")
+    return {entry.strip().rstrip("/") for entry in raw.split(",") if entry.strip()}
+
+
+def _is_bearer_trusted_origin(origin: str, deployed_origin: str) -> bool:
+    """True when the Nous bearer may be attached to ``origin``.
+
+    Env vars may point a vendor at any URL (that is what local dev uses), but
+    a URL taken from the environment must not inherit the user's token: an
+    attacker who can set one env var must not be able to harvest the bearer.
+    Trusted: loopback hosts, the hardcoded deployed origin, and exact origins
+    listed in ``HERMES_TRUSTED_GATEWAY_ORIGINS`` (comma-separated). Exact
+    (scheme, netloc) membership only — never a suffix rule.
+    """
+    normalized = origin.rstrip("/")
+    try:
+        parts = urlsplit(normalized)
+    except ValueError:
+        return False
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        return False
+    try:
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    if host in _LOOPBACK_HOSTS or host.endswith(".localhost"):
+        # RFC 6761 reserves the .localhost TLD for loopback.
+        return True
+    if normalized == deployed_origin:
+        return True
+    return normalized in _explicitly_trusted_origins()
+
+
 def resolve_managed_tool_gateway(
     vendor: str,
     gateway_builder: Optional[Callable[[str], str]] = None,
@@ -184,6 +222,20 @@ def resolve_managed_tool_gateway(
     resolved_token_reader = token_reader or read_nous_access_token
 
     gateway_origin = resolved_gateway_builder(vendor)
+    if gateway_origin and gateway_builder is None and not _is_bearer_trusted_origin(
+        gateway_origin,
+        f"{_DEFAULT_TOOL_GATEWAY_SCHEME}://{vendor}-gateway.{_DEFAULT_TOOL_GATEWAY_DOMAIN}",
+    ):
+        # An injected gateway_builder is a DI seam whose caller owns the
+        # decision; an env-derived origin gets no token unless trusted.
+        logger.warning(
+            "Refusing to attach the Nous token to untrusted gateway origin %s "
+            "for vendor %s; add the exact origin to %s to allow it.",
+            gateway_origin,
+            vendor,
+            _TRUSTED_GATEWAY_ORIGINS_ENV,
+        )
+        return None
     nous_user_token = resolved_token_reader()
     if not gateway_origin or not nous_user_token:
         return None
@@ -321,6 +373,16 @@ def is_managed_nous_gateway_url(
         expected = urlsplit(expected_origin)
         actual = urlsplit(url.strip())
     except ValueError:
+        return False
+
+    if gateway_builder is None and not _is_bearer_trusted_origin(
+        expected_origin,
+        f"{_DEFAULT_TOOL_GATEWAY_SCHEME}://tools.{_DEFAULT_TOOL_GATEWAY_DOMAIN}",
+    ):
+        # TOOL_GATEWAY_URL may re-point the shared origin (local dev), but an
+        # env-derived origin never inherits the bearer: requests still go out,
+        # just unauthenticated, so a bad override fails loudly instead of
+        # handing the token to whatever the environment names.
         return False
 
     return bool(actual.scheme) and (actual.scheme, actual.netloc) == (expected.scheme, expected.netloc)
