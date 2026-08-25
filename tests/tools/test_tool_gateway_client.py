@@ -363,3 +363,55 @@ def test_search_hits_pass_through_on_success():
         client_factory=lambda: FakeClient(),
     )
     assert hits["results"][0]["use_case"] == "send mail"
+
+
+# ---------------------------------------------------------------------------
+# default endpoint resolver: the SHARED origin, not a fabricated vendor
+# ---------------------------------------------------------------------------
+
+
+_GATEWAY_ENV_KEYS = (
+    "TOOL_GATEWAY_URL",
+    "CONNECTOR_GATEWAY_URL",
+    "TOOL_GATEWAY_DOMAIN",
+    "TOOL_GATEWAY_SCHEME",
+)
+
+
+def _resolve_with_env(**overrides):
+    """Run the default resolver with ONLY the given gateway env keys set."""
+    import os
+    from unittest.mock import patch
+
+    from tools.tool_gateway.client import _default_endpoint_resolver
+
+    env = {k: v for k, v in os.environ.items() if k not in _GATEWAY_ENV_KEYS}
+    env.update(overrides)
+    with patch.dict("os.environ", env, clear=True):
+        return _default_endpoint_resolver()
+
+
+def test_default_resolver_uses_the_connector_gateway_origin():
+    # Connector routes live on the connectors deployment's own host, so the
+    # resolver wants that origin — never a fabricated "connectors" vendor
+    # passthrough host, and never the media/on-origin-vendor host.
+    assert _resolve_with_env(CONNECTOR_GATEWAY_URL="http://127.0.0.1:3009") == (
+        "http://127.0.0.1:3009"
+    )
+    assert _resolve_with_env(TOOL_GATEWAY_DOMAIN="gw.example.com") == (
+        "https://connector-gateway.gw.example.com"
+    )
+
+
+def test_default_resolver_ignores_the_media_host_override():
+    # TOOL_GATEWAY_URL moves the media/on-origin-vendor host only. Letting it
+    # drag the connectors client along would silently point connector calls at
+    # a host that does not serve them.
+    assert _resolve_with_env(
+        TOOL_GATEWAY_URL="http://127.0.0.1:3009",
+        TOOL_GATEWAY_DOMAIN="gw.example.com",
+    ) == "https://connector-gateway.gw.example.com"
+
+
+def test_default_resolver_is_none_on_a_misconfigured_scheme():
+    assert _resolve_with_env(TOOL_GATEWAY_SCHEME="ftp") is None

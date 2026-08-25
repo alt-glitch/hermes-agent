@@ -106,9 +106,9 @@ def test_read_nous_access_token_refreshes_expiring_cached_token(tmp_path, monkey
 def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
     """The exact URL an agent may connect to is a code fact, not a lookup.
 
-    Exercises the real ``build_vendor_gateway_url`` (which once resolved a
-    typo'd pseudo-vendor to a non-existent host while every other test stubbed
-    it): default builder, real deployed host, pinned vendor path.
+    Exercises the real default resolution (which once resolved a typo'd
+    pseudo-vendor to a non-existent host while every other test stubbed it):
+    default resolver, real deployed host, pinned vendor path.
     """
     with patch.dict(
         os.environ,
@@ -123,6 +123,82 @@ def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
         "base_url": "https://tool-gateway.nousresearch.com/api/bfl",
         "upload_path": "/api/uploads/bfl",
     }
+
+
+def test_connector_gateway_origin_pins_the_deployed_connectors_host():
+    # The connectors API is its own deployment on its own canonical host, so
+    # the default resolution must not land on the media/vendor origin.
+    with patch.dict(
+        os.environ,
+        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com", "TOOL_GATEWAY_SCHEME": "https"},
+        clear=False,
+    ):
+        os.environ.pop("CONNECTOR_GATEWAY_URL", None)
+        assert managed_tool_gateway.connector_gateway_origin() == (
+            "https://connector-gateway.nousresearch.com"
+        )
+
+
+def test_managed_gateway_origin_honors_the_harness_override():
+    # TOOL_GATEWAY_URL pins the full media origin (the e2e harness sets it to a
+    # loopback gateway), and the bearer gate must accept exactly that origin.
+    with patch.dict(os.environ, {"TOOL_GATEWAY_URL": "http://127.0.0.1:3009/"}, clear=False):
+        os.environ.pop("CONNECTOR_GATEWAY_URL", None)
+        assert managed_tool_gateway.managed_gateway_origin() == "http://127.0.0.1:3009"
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "http://127.0.0.1:3009/api/bfl/generations"
+        )
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://tools.nousresearch.com/api/bfl/generations"
+        )
+
+
+def test_connector_gateway_origin_honors_its_own_override():
+    # CONNECTOR_GATEWAY_URL is the connectors host's own key: it moves the
+    # connectors origin without touching the media origin, and the bearer gate
+    # accepts the overridden origin.
+    with patch.dict(
+        os.environ,
+        {
+            "CONNECTOR_GATEWAY_URL": "http://127.0.0.1:3009/",
+            "TOOL_GATEWAY_DOMAIN": "nousresearch.com",
+        },
+        clear=False,
+    ):
+        os.environ.pop("TOOL_GATEWAY_URL", None)
+        assert managed_tool_gateway.connector_gateway_origin() == "http://127.0.0.1:3009"
+        assert managed_tool_gateway.managed_gateway_origin() == (
+            "https://tool-gateway.nousresearch.com"
+        )
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "http://127.0.0.1:3009/v1/connectors/search"
+        )
+
+
+def test_default_bearer_gate_accepts_both_deployed_hosts_only():
+    # Exact (scheme, netloc) equality against each deployed origin. Both
+    # first-party hosts are in; the retired `tools.` host, subdomain cousins,
+    # and scheme downgrades are all out.
+    with patch.dict(
+        os.environ,
+        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com", "TOOL_GATEWAY_SCHEME": "https"},
+        clear=False,
+    ):
+        os.environ.pop("TOOL_GATEWAY_URL", None)
+        os.environ.pop("CONNECTOR_GATEWAY_URL", None)
+        for trusted in (
+            "https://connector-gateway.nousresearch.com/v1/connectors/execute",
+            "https://tool-gateway.nousresearch.com/api/bfl/generations",
+        ):
+            assert managed_tool_gateway.is_managed_nous_gateway_url(trusted)
+        for untrusted in (
+            "https://tools.nousresearch.com/v1/connectors/execute",
+            "https://evil-connector-gateway.nousresearch.com.attacker.dev/v1/connectors",
+            "https://connector-gateway.nousresearch.com.attacker.dev/v1/connectors",
+            "http://connector-gateway.nousresearch.com/v1/connectors",
+            "http://tool-gateway.nousresearch.com/api/bfl/generations",
+        ):
+            assert not managed_tool_gateway.is_managed_nous_gateway_url(untrusted)
 
 
 def test_managed_vendor_endpoints_do_not_consult_entitlement():
