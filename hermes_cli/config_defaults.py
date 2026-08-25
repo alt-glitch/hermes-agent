@@ -4258,8 +4258,16 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
+    "TOOL_GATEWAY_URL": {
+        "description": "Exact shared tool-gateway origin override for Nous Subscribers only, e.g. http://127.0.0.1:3009 for a local gateway (optional)",
+        "prompt": "Shared tool-gateway URL (leave empty to derive from domain)",
+        "url": None,
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
     "TOOL_GATEWAY_DOMAIN": {
-        "description": "Shared tool-gateway domain suffix for Nous Subscribers only, used to derive vendor hosts, e.g. nousresearch.com -> firecrawl-gateway.nousresearch.com",
+        "description": "Shared tool-gateway domain suffix for Nous Subscribers only, used to derive both host shapes: per-vendor passthroughs (nousresearch.com -> firecrawl-gateway.nousresearch.com) and the shared gateway origin (nousresearch.com -> tools.nousresearch.com)",
         "prompt": "Tool-gateway domain suffix",
         "url": None,
         "password": False,

@@ -186,9 +186,15 @@ Running your own Nous-compatible gateway? Override endpoints in `~/.hermes/.env`
 ```bash
 TOOL_GATEWAY_DOMAIN=your-domain.example.com
 TOOL_GATEWAY_SCHEME=https
+TOOL_GATEWAY_URL=http://127.0.0.1:3009    # pin the SHARED origin exactly
 TOOL_GATEWAY_USER_TOKEN=your-token        # normally auto-populated from Portal login
-FIRECRAWL_GATEWAY_URL=https://...         # override one endpoint specifically
+FIRECRAWL_GATEWAY_URL=https://...         # override one vendor endpoint specifically
 ```
+
+The gateway is reached on two host shapes, and `TOOL_GATEWAY_DOMAIN` / `TOOL_GATEWAY_SCHEME` reshape **both**:
+
+- `{vendor}-gateway.<domain>` — per-vendor passthroughs (Firecrawl, BFL, ...), overridable one at a time with `{VENDOR}_GATEWAY_URL`.
+- `tools.<domain>` — the shared origin that serves connectors and the vendors hosted on the gateway itself. `TOOL_GATEWAY_URL` pins this one exactly and skips the domain/scheme derivation.
 
 These knobs exist for custom infrastructure setups (enterprise deployments, dev environments). Regular subscribers never set them.
 
