@@ -42,8 +42,21 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["connector_describe", "connector_search_hits", "dispatch_calls"]
 
-# Signature of the injected local dispatcher: (name, arguments) -> result str.
-LocalDispatch = Callable[[str, dict[str, Any]], str]
+# Signature of the injected local dispatcher: (name, arguments) -> (ok, payload).
+#
+# The CALLER states success. The bridge cannot tell a refusal from a result by
+# looking at the payload: ``tool_error`` puts its message under ``error`` but a
+# legitimate tool result may also carry an ``error`` field (a provider echo, a
+# per-item error list), and sniffing for it both misclassified those results and
+# forced an allow-list that dropped every other ``tool_error`` extra. So the
+# dispatcher returns ``ok=False`` for the refusals IT raised, and the bridge
+# files the payload verbatim in that entry's error slot.
+#
+# Consequence, deliberate: a real tool that fails inside its own handler still
+# comes back ``ok=True``, so it lands in the response slot and counts as a
+# success. The failure text reaches the model either way; only the envelope's
+# success/error tallies treat it as a completed call.
+LocalDispatch = Callable[[str, dict[str, Any]], "tuple[bool, Any]"]
 
 
 def _default_client_factory():
@@ -138,7 +151,9 @@ def dispatch_calls(
 
     Total: any internal failure becomes per-entry errors or an envelope-level
     ``{"error": ...}`` string — never an exception. ``local_dispatch`` is
-    injected so this module never imports core dispatch code.
+    injected so this module never imports core dispatch code; it returns
+    ``(ok, payload)`` so the CALLER classifies its own refusals (see
+    :data:`LocalDispatch`).
 
     ``pre_dispatch`` is the caller's per-REMOTE-entry gate (hooks/approval):
     called with (name, arguments) before the gateway request is built; a
@@ -240,21 +255,7 @@ def _run_local(
     name = str(call.get("name") or "") if isinstance(call, dict) else ""
     arguments = call.get("arguments") if isinstance(call, dict) else None
     try:
-        raw = local_dispatch(name, arguments if isinstance(arguments, dict) else {})
-        parsed = _maybe_parse_json(raw)
-        if isinstance(parsed, dict) and parsed.get("error") is not None:
-            # A tool_error-shaped result (scope refusal, probe validation,
-            # tool failure) is an ERROR slot — filing it under "response"
-            # would count a denied call as a success.
-            error_payload: dict[str, Any] = {
-                "code": "TOOL_ERROR",
-                "message": str(parsed.get("error")),
-            }
-            for extra in ("parameters", "hint"):
-                if extra in parsed:
-                    error_payload[extra] = parsed[extra]
-            return {"index": position, "name": name, "error": error_payload}
-        return {"index": position, "name": name, "response": parsed}
+        ok, payload = local_dispatch(name, arguments if isinstance(arguments, dict) else {})
     except Exception as exc:
         # Core dispatch wraps its own errors; reaching here means the injected
         # dispatcher itself blew up. Keep it to this entry.
@@ -263,6 +264,30 @@ def _run_local(
             "name": name,
             "error": {"code": "TOOL_ERROR", "message": str(exc)},
         }
+    # JSON-embed either way: structural results beat a quoted blob. This reads
+    # the payload's SHAPE, never its meaning — ``ok`` already decided the slot.
+    value = _maybe_parse_json(payload)
+    if ok:
+        return {"index": position, "name": name, "response": value}
+    return {"index": position, "name": name, "error": _error_slot(value)}
+
+
+def _error_slot(payload: Any) -> dict[str, Any]:
+    """Wrap a refusal payload as an error slot without losing any of it.
+
+    Every key the dispatcher sent survives — ``tool_error`` takes arbitrary
+    extras (``parameters``, ``hint``, ``code=404``, …) and an allow-list would
+    silently drop the ones it did not anticipate. ``code``/``message`` are only
+    ADDED when absent, so the slot always has the shape the envelope promises.
+    """
+    if not isinstance(payload, dict):
+        return {"code": "TOOL_ERROR", "message": str(payload)}
+    slot = dict(payload)
+    if "message" not in slot:
+        # tool_error keys its text as "error"; error slots key it "message".
+        slot["message"] = str(slot.get("error") or "The tool call failed.")
+    slot.setdefault("code", "TOOL_ERROR")
+    return slot
 
 
 def _run_remote(

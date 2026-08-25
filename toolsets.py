@@ -89,6 +89,15 @@ _HERMES_CORE_TOOLS = [
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Remote connector accounts. Core because it is the ONLY way the model can
+    # answer "am I connected?" or hand the user an authorization link, and the
+    # connector tools it services reach every platform — not just the GUI ones.
+    # Its registered toolset ("connections") is registry-only, so leaving it
+    # out of here made it unreachable: every real session passes
+    # enabled_toolsets, and a name absent from those bundles is never resolved.
+    # check_fn (_connectors_available) keeps it out of non-entitled sessions,
+    # which is what the entitlement gate is for.
+    "manage_connections",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,

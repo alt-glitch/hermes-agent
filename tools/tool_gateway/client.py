@@ -80,11 +80,21 @@ def _default_transport() -> Transport:
 
 
 def _default_endpoint_resolver() -> Optional[str]:
-    """The gateway origin, or ``None`` when none resolves (scheme misconfig)."""
-    from tools.managed_tool_gateway import managed_vendor_endpoints
+    """The gateway origin, or ``None`` when none resolves (scheme misconfig).
 
-    endpoints = managed_vendor_endpoints("connectors")
-    return endpoints["origin"] if endpoints else None
+    Asks the shared-origin resolver directly. This used to go through
+    ``managed_vendor_endpoints("connectors")``, which invented a vendor that
+    does not exist just to reach the same origin — and then discarded the
+    ``base_url``/``upload_path`` it built for it. Connector routes are the
+    gateway's own paths (``v1/connectors/*``), not a vendor passthrough.
+    """
+    from tools.managed_tool_gateway import managed_gateway_origin
+
+    try:
+        return managed_gateway_origin() or None
+    except ValueError:
+        # Misconfigured TOOL_GATEWAY_SCHEME: there is no origin to call.
+        return None
 
 
 def _default_header_provider(url: str) -> dict:

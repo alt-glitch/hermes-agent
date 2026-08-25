@@ -228,7 +228,7 @@ def test_connection_required_stays_inside_the_200_envelope():
 
 
 def local_echo(name, arguments):
-    return json.dumps({"ran": name, "args": arguments})
+    return True, json.dumps({"ran": name, "args": arguments})
 
 
 def test_dispatch_mixed_batch_splices_local_and_remote_in_order():
@@ -363,3 +363,39 @@ def test_search_hits_pass_through_on_success():
         client_factory=lambda: FakeClient(),
     )
     assert hits["results"][0]["use_case"] == "send mail"
+
+
+# ---------------------------------------------------------------------------
+# default endpoint resolver: the SHARED origin, not a fabricated vendor
+# ---------------------------------------------------------------------------
+
+
+_GATEWAY_ENV_KEYS = ("TOOL_GATEWAY_URL", "TOOL_GATEWAY_DOMAIN", "TOOL_GATEWAY_SCHEME")
+
+
+def _resolve_with_env(**overrides):
+    """Run the default resolver with ONLY the given gateway env keys set."""
+    import os
+    from unittest.mock import patch
+
+    from tools.tool_gateway.client import _default_endpoint_resolver
+
+    env = {k: v for k, v in os.environ.items() if k not in _GATEWAY_ENV_KEYS}
+    env.update(overrides)
+    with patch.dict("os.environ", env, clear=True):
+        return _default_endpoint_resolver()
+
+
+def test_default_resolver_uses_the_shared_gateway_origin():
+    # Connector routes are the gateway's own paths, so the resolver wants the
+    # shared origin — never a fabricated "connectors" vendor passthrough host.
+    assert _resolve_with_env(TOOL_GATEWAY_URL="http://127.0.0.1:3009") == (
+        "http://127.0.0.1:3009"
+    )
+    assert _resolve_with_env(TOOL_GATEWAY_DOMAIN="gw.example.com") == (
+        "https://tools.gw.example.com"
+    )
+
+
+def test_default_resolver_is_none_on_a_misconfigured_scheme():
+    assert _resolve_with_env(TOOL_GATEWAY_SCHEME="ftp") is None
