@@ -1,4 +1,4 @@
-"""Behavior tests for tool_manage_connections.
+"""Behavior tests for manage_connections.
 
 DI-callable idiom: a fake client injected through manage_connections'
 seams; no module mocks, no network.
