@@ -34,10 +34,11 @@ from tools.tool_gateway.merge import (
     partition_calls,
     splice_remote_results,
 )
+from tools.tool_gateway.names import parse_connector_name
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["connector_search_hits", "dispatch_calls"]
+__all__ = ["connector_describe", "connector_search_hits", "dispatch_calls"]
 
 # Signature of the injected local dispatcher: (name, arguments) -> result str.
 LocalDispatch = Callable[[str, dict[str, Any]], str]
@@ -72,6 +73,53 @@ def connector_search_hits(
         return {}
     except Exception as exc:
         logger.debug("Connector search failed silently (D32): %s", exc)
+        return {}
+
+
+def connector_describe(
+    names: Sequence[str],
+    *,
+    availability: Optional[Callable[[], bool]] = None,
+    client_factory: Optional[Callable[[], Any]] = None,
+) -> dict[str, Any]:
+    """Schemas for ``connectors__*`` names, or ``{}`` on EVERY failure path (D32).
+
+    Returns ``{"tools": {<composed name>: {"description", "parameters"}}}``
+    keyed by the ORIGINAL composed names. Names the gateway does not resolve
+    are simply absent — the caller's not_found handling covers them. The
+    gateway's schemas route takes bare tool slugs; composition back to the
+    ``connectors__`` name uses the caller's own parse, never the response.
+    """
+    try:
+        available = (availability or connectors_available)()
+        if not available:
+            return {}
+        by_slug: dict[str, str] = {}
+        for name in names:
+            parsed = parse_connector_name(name)
+            if parsed is not None:
+                # First composed name wins for a duplicated slug.
+                by_slug.setdefault(parsed.tool, parsed.raw)
+        if not by_slug:
+            return {}
+        client = (client_factory or _default_client_factory)()
+        response = client.schemas(list(by_slug)) or {}
+        schemas = response.get("schemas") if isinstance(response.get("schemas"), dict) else {}
+        tools: dict[str, Any] = {}
+        for slug, schema in schemas.items():
+            composed = by_slug.get(slug)
+            if composed is None or not isinstance(schema, dict):
+                continue
+            tools[composed] = {
+                "description": str(schema.get("description") or ""),
+                "parameters": schema.get("input_schema") or {},
+            }
+        return {"tools": tools}
+    except GatewayUnavailable:
+        logger.debug("Connector describe skipped: gateway dark")
+        return {}
+    except Exception as exc:
+        logger.debug("Connector describe failed silently (D32): %s", exc)
         return {}
 
 
