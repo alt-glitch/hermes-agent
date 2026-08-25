@@ -106,9 +106,9 @@ def test_read_nous_access_token_refreshes_expiring_cached_token(tmp_path, monkey
 def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
     """The exact URL an agent may connect to is a code fact, not a lookup.
 
-    Exercises the real ``build_vendor_gateway_url`` (which once resolved a
-    typo'd pseudo-vendor to a non-existent host while every other test stubbed
-    it): default builder, real deployed host, pinned vendor path.
+    Exercises the real default resolution (which once resolved a typo'd
+    pseudo-vendor to a non-existent host while every other test stubbed it):
+    default resolver, real deployed host, pinned vendor path.
     """
     with patch.dict(
         os.environ,
@@ -119,10 +119,43 @@ def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
         endpoints = managed_tool_gateway.managed_vendor_endpoints("bfl")
 
     assert endpoints == {
-        "origin": "https://tool-gateway.nousresearch.com",
-        "base_url": "https://tool-gateway.nousresearch.com/api/bfl",
+        "origin": "https://tools.nousresearch.com",
+        "base_url": "https://tools.nousresearch.com/api/bfl",
         "upload_path": "/api/uploads/bfl",
     }
+
+
+def test_managed_gateway_origin_honors_the_harness_override():
+    # TOOL_GATEWAY_URL pins the full origin (the e2e harness sets it to a
+    # loopback gateway), and the bearer gate must accept exactly that origin.
+    with patch.dict(os.environ, {"TOOL_GATEWAY_URL": "http://127.0.0.1:3009/"}, clear=False):
+        assert managed_tool_gateway.managed_gateway_origin() == "http://127.0.0.1:3009"
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "http://127.0.0.1:3009/v1/connectors/search"
+        )
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://tools.nousresearch.com/v1/connectors/search"
+        )
+
+
+def test_default_bearer_gate_accepts_only_the_deployed_host():
+    # Exact (scheme, netloc) equality against the deployed origin: the old
+    # host, subdomain cousins, and scheme downgrades all stay untrusted.
+    with patch.dict(
+        os.environ,
+        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com", "TOOL_GATEWAY_SCHEME": "https"},
+        clear=False,
+    ):
+        os.environ.pop("TOOL_GATEWAY_URL", None)
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://tools.nousresearch.com/v1/connectors/execute"
+        )
+        for untrusted in (
+            "https://tool-gateway.nousresearch.com/v1/connectors/execute",
+            "https://evil-tools.nousresearch.com.attacker.dev/v1/connectors",
+            "http://tools.nousresearch.com/v1/connectors",
+        ):
+            assert not managed_tool_gateway.is_managed_nous_gateway_url(untrusted)
 
 
 def test_managed_vendor_endpoints_do_not_consult_entitlement():
@@ -142,7 +175,7 @@ def test_managed_vendor_endpoints_do_not_consult_entitlement():
         endpoints = managed_tool_gateway.managed_vendor_endpoints("bfl")
 
     assert endpoints is not None
-    assert endpoints["base_url"] == "https://tool-gateway.nousresearch.com/api/bfl"
+    assert endpoints["base_url"] == "https://tools.nousresearch.com/api/bfl"
 
 
 def test_managed_vendor_endpoints_are_none_when_no_origin_resolves():

@@ -231,9 +231,29 @@ def is_managed_tool_gateway_ready(
 # vendor but not the vendor's own API, so nothing here needs to know the
 # upstream's endpoint or field names.
 
-# Pseudo-vendor used only to resolve the shared tool-gateway origin via
-# build_vendor_gateway_url (honors TOOL_GATEWAY_URL / TOOL_GATEWAY_DOMAIN).
+# Vendor label handed to injected ``gateway_builder`` seams when resolving the
+# shared managed origin. Default resolution does NOT go through
+# build_vendor_gateway_url: the shared origin has its own host (see
+# managed_gateway_origin), not a ``{vendor}-gateway`` passthrough name.
 _MANAGED_GATEWAY_VENDOR = "tool"
+
+
+def managed_gateway_origin() -> str:
+    """Origin for the shared managed gateway (connectors + on-origin vendors).
+
+    Honors the same overrides as vendor hosts: ``TOOL_GATEWAY_URL`` pins the
+    full origin (the local harness sets ``http://127.0.0.1:3009``), and
+    ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN`` reshape the default.
+    The deployed host is ``tools.<domain>`` — the gateway's own name, not a
+    ``{vendor}-gateway`` passthrough host.
+    """
+    explicit = os.getenv("TOOL_GATEWAY_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+
+    scheme = get_tool_gateway_scheme()
+    domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/") or _DEFAULT_TOOL_GATEWAY_DOMAIN
+    return f"{scheme}://tools.{domain}"
 
 def managed_vendor_base_path(vendor: str) -> str:
     """Base path for a managed vendor's REST routes on the gateway host."""
@@ -260,9 +280,13 @@ def managed_vendor_endpoints(
     ``None`` means no origin could be resolved — a misconfigured
     ``TOOL_GATEWAY_SCHEME`` — so there is nothing to call.
     """
-    builder = gateway_builder or build_vendor_gateway_url
     try:
-        origin = builder(_MANAGED_GATEWAY_VENDOR).rstrip("/")
+        raw_origin = (
+            gateway_builder(_MANAGED_GATEWAY_VENDOR)
+            if gateway_builder
+            else managed_gateway_origin()
+        )
+        origin = raw_origin.rstrip("/")
     except ValueError:
         return None
     if not origin:
@@ -288,9 +312,13 @@ def is_managed_nous_gateway_url(
     if not isinstance(url, str) or not url.strip():
         return False
 
-    builder = gateway_builder or build_vendor_gateway_url
     try:
-        expected = urlsplit(builder(_MANAGED_GATEWAY_VENDOR))
+        expected_origin = (
+            gateway_builder(_MANAGED_GATEWAY_VENDOR)
+            if gateway_builder
+            else managed_gateway_origin()
+        )
+        expected = urlsplit(expected_origin)
         actual = urlsplit(url.strip())
     except ValueError:
         return False
