@@ -18,15 +18,44 @@ MODULE_SPEC.loader.exec_module(managed_tool_gateway)
 is_managed_tool_gateway_ready = managed_tool_gateway.is_managed_tool_gateway_ready
 resolve_managed_tool_gateway = managed_tool_gateway.resolve_managed_tool_gateway
 
+# Every gateway knob, so a test can state the whole environment it wants.
+_GATEWAY_ENV_KEYS = (
+    "TOOL_GATEWAY_URL",
+    "CONNECTOR_GATEWAY_URL",
+    "TOOL_GATEWAY_DOMAIN",
+    "TOOL_GATEWAY_SCHEME",
+    "HERMES_TRUSTED_GATEWAY_ORIGINS",
+    "FIRECRAWL_GATEWAY_URL",
+    "BROWSER_USE_GATEWAY_URL",
+    "BFL_GATEWAY_URL",
+    "MODAL_GATEWAY_URL",
+)
 
-def test_resolve_managed_tool_gateway_derives_vendor_origin_from_shared_domain():
-    with patch.dict(
-        os.environ,
-        {
-            "TOOL_GATEWAY_DOMAIN": "nousresearch.com",
-        },
-        clear=False,
-    ), patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+
+def gateway_env(**overrides):
+    """patch.dict context with ONLY the given gateway env keys set.
+
+    The trust gate keys on whether the environment shaped the origin, so a
+    leaked TOOL_GATEWAY_DOMAIN from the ambient shell would change the verdict.
+    Every trust test states its whole environment through this helper.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _GATEWAY_ENV_KEYS}
+    env.update(overrides)
+    return patch.dict(os.environ, env, clear=True)
+
+
+@pytest.fixture(autouse=True)
+def _forget_untrusted_origin_warnings():
+    """The warn-once set is module state; tests must not inherit each other's."""
+    managed_tool_gateway._warned_untrusted_origins.clear()
+    yield
+    managed_tool_gateway._warned_untrusted_origins.clear()
+
+
+def test_resolve_managed_tool_gateway_derives_vendor_origin_from_the_default_domain():
+    with gateway_env(), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+    ):
         result = resolve_managed_tool_gateway(
             "firecrawl",
             token_reader=lambda: "nous-token",
@@ -38,13 +67,30 @@ def test_resolve_managed_tool_gateway_derives_vendor_origin_from_shared_domain()
     assert result.managed_mode is True
 
 
+def test_a_domain_reshape_is_env_derived_and_needs_the_trust_list():
+    # Deliberate: TOOL_GATEWAY_DOMAIN is an env knob like TOOL_GATEWAY_URL, so
+    # a host it shapes does not inherit the bearer just because it happens to
+    # spell out today's default domain.
+    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+        with gateway_env(TOOL_GATEWAY_DOMAIN="nousresearch.com"):
+            assert resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "nous-token"
+            ) is None
+
+        with gateway_env(
+            TOOL_GATEWAY_DOMAIN="nousresearch.com",
+            HERMES_TRUSTED_GATEWAY_ORIGINS="https://firecrawl-gateway.nousresearch.com",
+        ):
+            granted = resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "nous-token"
+            )
+        assert granted is not None
+        assert granted.gateway_origin == "https://firecrawl-gateway.nousresearch.com"
+
+
 def test_resolve_managed_tool_gateway_uses_vendor_specific_override():
-    with patch.dict(
-        os.environ,
-        {
-            "BROWSER_USE_GATEWAY_URL": "http://browser-use-gateway.localhost:3009/",
-        },
-        clear=False,
+    with gateway_env(
+        BROWSER_USE_GATEWAY_URL="http://browser-use-gateway.localhost:3009/"
     ), patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
         result = resolve_managed_tool_gateway(
             "browser-use",
@@ -56,13 +102,9 @@ def test_resolve_managed_tool_gateway_uses_vendor_specific_override():
 
 
 def test_resolve_managed_tool_gateway_is_inactive_without_nous_token():
-    with patch.dict(
-        os.environ,
-        {
-            "TOOL_GATEWAY_DOMAIN": "nousresearch.com",
-        },
-        clear=False,
-    ), patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+    with gateway_env(), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+    ):
         result = resolve_managed_tool_gateway(
             "firecrawl",
             token_reader=lambda: None,
@@ -72,8 +114,9 @@ def test_resolve_managed_tool_gateway_is_inactive_without_nous_token():
 
 
 def test_resolve_managed_tool_gateway_is_disabled_without_subscription():
-    with patch.dict(os.environ, {"TOOL_GATEWAY_DOMAIN": "nousresearch.com"}, clear=False), \
-         patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=False):
+    with gateway_env(), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=False
+    ):
         result = resolve_managed_tool_gateway(
             "firecrawl",
             token_reader=lambda: "nous-token",
@@ -106,16 +149,11 @@ def test_read_nous_access_token_refreshes_expiring_cached_token(tmp_path, monkey
 def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
     """The exact URL an agent may connect to is a code fact, not a lookup.
 
-    Exercises the real ``build_vendor_gateway_url`` (which once resolved a
-    typo'd pseudo-vendor to a non-existent host while every other test stubbed
-    it): default builder, real deployed host, pinned vendor path.
+    Exercises the real default resolution (which once resolved a typo'd
+    pseudo-vendor to a non-existent host while every other test stubbed it):
+    default resolver, real deployed host, pinned vendor path.
     """
-    with patch.dict(
-        os.environ,
-        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com", "TOOL_GATEWAY_SCHEME": "https"},
-        clear=False,
-    ):
-        os.environ.pop("TOOL_GATEWAY_URL", None)
+    with gateway_env(TOOL_GATEWAY_DOMAIN="nousresearch.com", TOOL_GATEWAY_SCHEME="https"):
         endpoints = managed_tool_gateway.managed_vendor_endpoints("bfl")
 
     assert endpoints == {
@@ -125,6 +163,251 @@ def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
     }
 
 
+def test_connector_gateway_origin_pins_the_deployed_connectors_host():
+    # The connectors API is its own deployment on its own canonical host, so
+    # its default resolution must not land on the media/vendor origin.
+    with gateway_env():
+        assert managed_tool_gateway.connector_gateway_origin() == (
+            "https://connector-gateway.nousresearch.com"
+        )
+        assert managed_tool_gateway.managed_gateway_origin() == (
+            "https://tool-gateway.nousresearch.com"
+        )
+
+
+def test_managed_gateway_origin_honors_the_harness_override():
+    # TOOL_GATEWAY_URL pins the full media origin (the e2e harness sets it to a
+    # loopback gateway), and the bearer gate must accept exactly that origin.
+    with gateway_env(TOOL_GATEWAY_URL="http://127.0.0.1:3009/"):
+        assert managed_tool_gateway.managed_gateway_origin() == "http://127.0.0.1:3009"
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "http://127.0.0.1:3009/api/bfl/generations"
+        )
+        # The retired shared host is now nobody's origin, and the override
+        # means even the real media host is not this install's address.
+        for untrusted in (
+            "https://tools.nousresearch.com/api/bfl/generations",
+            "https://tool-gateway.nousresearch.com/api/bfl/generations",
+        ):
+            assert not managed_tool_gateway.is_managed_nous_gateway_url(untrusted)
+
+
+def test_the_two_first_party_hosts_have_separate_override_keys():
+    # Each surface is pinned by its own key. Moving the media host must not
+    # drag the connectors client along, or connector calls would silently go to
+    # a host that does not serve them (and the reverse).
+    with gateway_env(TOOL_GATEWAY_URL="http://127.0.0.1:3009/"):
+        assert managed_tool_gateway.connector_gateway_origin() == (
+            "https://connector-gateway.nousresearch.com"
+        )
+
+    with gateway_env(CONNECTOR_GATEWAY_URL="http://127.0.0.1:3009/"):
+        assert managed_tool_gateway.connector_gateway_origin() == "http://127.0.0.1:3009"
+        assert managed_tool_gateway.managed_gateway_origin() == (
+            "https://tool-gateway.nousresearch.com"
+        )
+        # Loopback earns the bearer with no trust list, same as the media host.
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "http://127.0.0.1:3009/v1/connectors/search"
+        )
+
+
+def test_vendor_env_override_does_not_inherit_the_bearer():
+    # An attacker who can set one env var must not receive the user's token:
+    # managed mode resolves to None (tool reports unconfigured) with a warning,
+    # instead of shipping the bearer to whatever the environment names.
+    with gateway_env(FIRECRAWL_GATEWAY_URL="https://attacker.example"), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+    ):
+        config = managed_tool_gateway.resolve_managed_tool_gateway(
+            "firecrawl", token_reader=lambda: "secret-token"
+        )
+    assert config is None
+
+
+def test_loopback_and_trust_listed_overrides_keep_managed_mode():
+    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+        # Loopback (the local harness) needs no configuration.
+        with gateway_env(FIRECRAWL_GATEWAY_URL="http://127.0.0.1:3009"):
+            config = managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "secret-token"
+            )
+        assert config is not None and config.nous_user_token == "secret-token"
+
+        # A staging origin is granted by exact membership in the trust list.
+        with gateway_env(
+            FIRECRAWL_GATEWAY_URL="https://stage.example",
+            HERMES_TRUSTED_GATEWAY_ORIGINS="https://other.example, https://stage.example",
+        ):
+            config = managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "secret-token"
+            )
+        assert config is not None
+
+        # The hardcoded deployed vendor host stays trusted with no env at all.
+        with gateway_env():
+            config = managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "secret-token"
+            )
+        assert config is not None
+        assert config.gateway_origin == "https://firecrawl-gateway.nousresearch.com"
+
+
+def test_trust_list_entries_are_normalized_like_origins():
+    # (scheme, host, port) on both sides: a trailing slash and a shouted host
+    # still match, but a port is significant and an entry must spell it out.
+    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+        with gateway_env(
+            FIRECRAWL_GATEWAY_URL="https://Stage.Example/",
+            HERMES_TRUSTED_GATEWAY_ORIGINS="https://stage.example",
+        ):
+            assert managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "t"
+            ) is not None
+
+        with gateway_env(
+            FIRECRAWL_GATEWAY_URL="https://stage.example:8443",
+            HERMES_TRUSTED_GATEWAY_ORIGINS="https://stage.example",
+        ):
+            assert managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "t"
+            ) is None
+
+        with gateway_env(
+            FIRECRAWL_GATEWAY_URL="https://stage.example:8443",
+            HERMES_TRUSTED_GATEWAY_ORIGINS="junk, https://stage.example:8443/",
+        ):
+            assert managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "t"
+            ) is not None
+
+
+def test_untrusted_origin_warns_once_per_vendor_and_origin(caplog):
+    # is_managed_tool_gateway_ready runs on every availability paint; the same
+    # warning on every repaint would drown the log.
+    import logging
+
+    def _warnings():
+        return [r for r in caplog.records if "attacker.example" in r.getMessage()]
+
+    with gateway_env(
+        FIRECRAWL_GATEWAY_URL="https://attacker.example",
+        BFL_GATEWAY_URL="https://attacker.example",
+    ), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+    ), caplog.at_level(logging.WARNING, logger=managed_tool_gateway.logger.name):
+        for _ in range(5):
+            assert managed_tool_gateway.is_managed_tool_gateway_ready(
+                "firecrawl", token_reader=lambda: "t"
+            ) is False
+        assert len(_warnings()) == 1
+
+        # A DIFFERENT vendor on the same origin is a distinct fact worth saying.
+        assert managed_tool_gateway.is_managed_tool_gateway_ready(
+            "bfl", token_reader=lambda: "t"
+        ) is False
+        assert len(_warnings()) == 2
+        assert {r.getMessage().split("for ")[1] for r in _warnings()} == {
+            "vendor firecrawl; add the exact origin to HERMES_TRUSTED_GATEWAY_ORIGINS to allow it.",
+            "vendor bfl; add the exact origin to HERMES_TRUSTED_GATEWAY_ORIGINS to allow it.",
+        }
+
+
+def test_shared_origin_override_gates_the_bearer_not_the_address():
+    # TOOL_GATEWAY_URL still steers where requests GO (address resolution is
+    # untouched), but an untrusted override origin never earns the bearer.
+    with gateway_env(TOOL_GATEWAY_URL="https://attacker.example"):
+        endpoints = managed_tool_gateway.managed_vendor_endpoints("bfl")
+        assert endpoints is not None and endpoints["origin"] == "https://attacker.example"
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://attacker.example/api/bfl/generations"
+        )
+
+    with gateway_env(
+        TOOL_GATEWAY_URL="https://stage.example",
+        HERMES_TRUSTED_GATEWAY_ORIGINS="https://stage.example",
+    ):
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://stage.example/api/bfl/generations"
+        )
+
+
+def test_connector_origin_override_gates_the_bearer_not_the_address():
+    # The connectors host gets no weaker a gate for being the newer surface:
+    # CONNECTOR_GATEWAY_URL still resolves the address, and an attacker-named
+    # origin still earns nothing until it is loopback or trust-listed.
+    with gateway_env(CONNECTOR_GATEWAY_URL="https://attacker.example"):
+        assert managed_tool_gateway.connector_gateway_origin() == "https://attacker.example"
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://attacker.example/v1/connectors/search"
+        )
+
+    with gateway_env(
+        CONNECTOR_GATEWAY_URL="https://stage.example",
+        HERMES_TRUSTED_GATEWAY_ORIGINS="https://stage.example",
+    ):
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://stage.example/v1/connectors/search"
+        )
+
+
+def test_default_bearer_gate_accepts_both_deployed_hosts_only():
+    # Exact (scheme, host, port) equality against each deployed origin. Both
+    # first-party hosts are in; the retired shared host, subdomain cousins,
+    # scheme downgrades, and a bare hostname are all out.
+    with gateway_env():
+        for trusted in (
+            "https://connector-gateway.nousresearch.com/v1/connectors/execute",
+            "https://tool-gateway.nousresearch.com/api/bfl/generations",
+        ):
+            assert managed_tool_gateway.is_managed_nous_gateway_url(trusted)
+        for untrusted in (
+            "https://tools.nousresearch.com/v1/connectors/execute",
+            "https://connector-gateway.nousresearch.com.attacker.dev/v1/connectors",
+            "https://evil-connector-gateway.nousresearch.com/v1/connectors",
+            "http://connector-gateway.nousresearch.com/v1/connectors",
+            "http://tool-gateway.nousresearch.com/api/bfl/generations",
+            "connector-gateway.nousresearch.com/v1/connectors",  # no scheme
+        ):
+            assert not managed_tool_gateway.is_managed_nous_gateway_url(untrusted)
+
+
+def test_a_domain_reshape_needs_the_trust_list_on_both_first_party_hosts():
+    # Same deliberate consequence as the vendor path, and it applies per host:
+    # TOOL_GATEWAY_DOMAIN is an env knob, so every host built from it is
+    # env-derived — even when it spells out today's default domain.
+    with gateway_env(TOOL_GATEWAY_DOMAIN="nousresearch.com", TOOL_GATEWAY_SCHEME="https"):
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://connector-gateway.nousresearch.com/v1/connectors/execute"
+        )
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://tool-gateway.nousresearch.com/api/bfl/generations"
+        )
+
+    # Listing one host grants that host only — trust does not spread sideways.
+    with gateway_env(
+        TOOL_GATEWAY_DOMAIN="gw.example.com",
+        HERMES_TRUSTED_GATEWAY_ORIGINS="https://connector-gateway.gw.example.com",
+    ):
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://connector-gateway.gw.example.com/v1/connectors/execute"
+        )
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://tool-gateway.gw.example.com/api/bfl/generations"
+        )
+
+    with gateway_env(
+        TOOL_GATEWAY_DOMAIN="gw.example.com",
+        HERMES_TRUSTED_GATEWAY_ORIGINS=(
+            "https://connector-gateway.gw.example.com,"
+            "https://tool-gateway.gw.example.com"
+        ),
+    ):
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://tool-gateway.gw.example.com/api/bfl/generations"
+        )
+
+
 def test_managed_vendor_endpoints_do_not_consult_entitlement():
     """Address resolution, not a policy decision.
 
@@ -132,13 +415,11 @@ def test_managed_vendor_endpoints_do_not_consult_entitlement():
     Guessing at it here would hide the address from a caller the server would
     have served, so entitlement must not be read on this path at all.
     """
-    with patch.dict(os.environ, {"TOOL_GATEWAY_DOMAIN": "nousresearch.com"}, clear=False), \
-         patch.object(
-             managed_tool_gateway,
-             "managed_nous_tools_enabled",
-             side_effect=AssertionError("entitlement must not gate address resolution"),
-         ):
-        os.environ.pop("TOOL_GATEWAY_URL", None)
+    with gateway_env(TOOL_GATEWAY_DOMAIN="nousresearch.com"), patch.object(
+        managed_tool_gateway,
+        "managed_nous_tools_enabled",
+        side_effect=AssertionError("entitlement must not gate address resolution"),
+    ):
         endpoints = managed_tool_gateway.managed_vendor_endpoints("bfl")
 
     assert endpoints is not None
@@ -148,16 +429,21 @@ def test_managed_vendor_endpoints_do_not_consult_entitlement():
 def test_managed_vendor_endpoints_are_none_when_no_origin_resolves():
     # A misconfigured scheme leaves nothing to call, and the caller reports
     # that rather than building a URL out of a broken setting.
-    with patch.dict(os.environ, {"TOOL_GATEWAY_SCHEME": "ftp"}, clear=False):
-        os.environ.pop("TOOL_GATEWAY_URL", None)
+    with gateway_env(TOOL_GATEWAY_SCHEME="ftp"):
+        assert managed_tool_gateway.managed_gateway_origin() is None
+        assert managed_tool_gateway.connector_gateway_origin() is None
         assert managed_tool_gateway.managed_vendor_endpoints("bfl") is None
+        with pytest.raises(ValueError):
+            # The vendor builder's contract has always been to raise.
+            managed_tool_gateway.build_vendor_gateway_url("firecrawl")
 
 
 def test_managed_gateway_auth_headers_carry_the_bearer():
-    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+    with gateway_env(), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+    ):
         headers = managed_tool_gateway.managed_gateway_auth_headers(
-            "https://tool-gateway.example.com/api/bfl/generations",
-            gateway_builder=lambda vendor: f"https://{vendor}-gateway.example.com",
+            "https://tool-gateway.nousresearch.com/api/bfl/generations",
             token_reader=lambda: "nous-token",
         )
 
@@ -168,12 +454,13 @@ def test_managed_gateway_auth_headers_reflect_a_rotated_token():
     # Read fresh on every call: a Nous access token expires within the hour,
     # and a long session must not keep presenting a dead bearer.
     tokens = iter(["first-token", "second-token"])
-    builder = lambda vendor: f"https://{vendor}-gateway.example.com"
-    url = "https://tool-gateway.example.com/api/bfl/generations"
+    url = "https://tool-gateway.nousresearch.com/api/bfl/generations"
 
-    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
-        first = managed_tool_gateway.managed_gateway_auth_headers(url, builder, lambda: next(tokens))
-        second = managed_tool_gateway.managed_gateway_auth_headers(url, builder, lambda: next(tokens))
+    with gateway_env(), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+    ):
+        first = managed_tool_gateway.managed_gateway_auth_headers(url, lambda: next(tokens))
+        second = managed_tool_gateway.managed_gateway_auth_headers(url, lambda: next(tokens))
 
     assert first["Authorization"] == "Bearer first-token"
     assert second["Authorization"] == "Bearer second-token"
@@ -182,10 +469,11 @@ def test_managed_gateway_auth_headers_reflect_a_rotated_token():
 def test_managed_gateway_auth_headers_refuse_a_url_off_the_gateway_origin():
     # Gated on the URL, never a name: our bearer must never be handed to a
     # host that merely looks managed.
-    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+    with gateway_env(), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+    ):
         assert managed_tool_gateway.managed_gateway_auth_headers(
             "https://attacker.example/api/bfl/generations",
-            gateway_builder=lambda vendor: f"https://{vendor}-gateway.example.com",
             token_reader=lambda: "nous-token",
         ) == {}
 
@@ -193,10 +481,11 @@ def test_managed_gateway_auth_headers_refuse_a_url_off_the_gateway_origin():
 def test_managed_gateway_auth_headers_empty_without_a_token():
     # Empty rather than raising, so a caller can say "sign in" instead of
     # sending an unauthenticated request.
-    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+    with gateway_env(), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+    ):
         assert managed_tool_gateway.managed_gateway_auth_headers(
-            "https://tool-gateway.example.com/api/bfl/generations",
-            gateway_builder=lambda vendor: f"https://{vendor}-gateway.example.com",
+            "https://tool-gateway.nousresearch.com/api/bfl/generations",
             token_reader=lambda: None,
         ) == {}
 
@@ -210,15 +499,23 @@ class TestManagedMediaUploader:
     rejected by storage rather than by us.
     """
 
-    GATEWAY = "https://tool-gateway.example.com"
+    # The real deployed shared origin, reached through the real trust gate —
+    # the gateway_builder seam this used to inject was also the switch that
+    # turned that gate off, so the protocol was never tested with it on.
+    GATEWAY = "https://tool-gateway.nousresearch.com"
     BASE_URL = f"{GATEWAY}/api/bfl"
     UPLOAD_PATH = "/api/uploads/bfl"
+
+    @pytest.fixture(autouse=True)
+    def _default_gateway_env(self):
+        """No gateway env at all: the hardcoded default origin, which is trusted."""
+        with gateway_env():
+            yield
 
     def _uploader(self, **kwargs):
         return managed_tool_gateway.build_managed_media_uploader(
             kwargs.pop("server_url", self.BASE_URL),
             kwargs.pop("upload_path", self.UPLOAD_PATH),
-            gateway_builder=lambda vendor: self.GATEWAY,
             token_reader=kwargs.pop("token_reader", lambda: "nous-token"),
         )
 
@@ -316,6 +613,31 @@ class TestManagedMediaUploader:
         with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
             assert self._uploader(server_url="https://attacker.example/api/bfl") is None
 
+    def test_no_uploader_when_the_shared_origin_is_an_untrusted_override(self):
+        # The trust gate reaches the uploader too: an env-shaped origin with no
+        # trust-list entry disables local uploads entirely rather than sending
+        # the user's files (and bearer) to whatever the environment names.
+        with gateway_env(TOOL_GATEWAY_URL="https://attacker.example"), patch.object(
+            managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+        ):
+            assert managed_tool_gateway.build_managed_media_uploader(
+                "https://attacker.example/api/bfl",
+                self.UPLOAD_PATH,
+                token_reader=lambda: "nous-token",
+            ) is None
+
+    def test_uploader_is_built_for_a_trusted_loopback_override(self):
+        # The local harness pins TOOL_GATEWAY_URL to loopback and needs no
+        # trust-list entry, so uploads keep working there.
+        with gateway_env(TOOL_GATEWAY_URL="http://127.0.0.1:3009"), patch.object(
+            managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+        ):
+            assert managed_tool_gateway.build_managed_media_uploader(
+                "http://127.0.0.1:3009/api/bfl",
+                self.UPLOAD_PATH,
+                token_reader=lambda: "nous-token",
+            ) is not None
+
     @pytest.mark.parametrize("upload_path", [None, "", "api/uploads/bfl", 42])
     def test_no_uploader_without_a_rooted_upload_path(self, upload_path):
         with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
@@ -402,11 +724,33 @@ def test_is_managed_tool_gateway_ready_skips_refresh_for_expired_cached_token(tm
         _record_refresh,
     )
 
-    with patch.dict(
-        os.environ,
-        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com"},
-        clear=False,
-    ), patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+    with gateway_env(), patch.object(
+        managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
+    ):
         assert is_managed_tool_gateway_ready("modal") is True
 
     assert refresh_calls == []
+
+
+def test_untrusted_origin_warning_never_logs_embedded_credentials(caplog):
+    # An env-shaped URL can carry userinfo; the refusal warning must log the
+    # origin identity only — never the secret, the path, or the query.
+    import logging
+
+    managed_tool_gateway._warned_untrusted_origins.clear()
+    with patch.dict(
+        os.environ,
+        {"FIRECRAWL_GATEWAY_URL": "https://user:sk-live-secret@attacker.example/base?token=q"},
+        clear=False,
+    ), patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+        os.environ.pop("HERMES_TRUSTED_GATEWAY_ORIGINS", None)
+        with caplog.at_level(logging.WARNING):
+            config = managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "tok"
+            )
+    assert config is None
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert "sk-live-secret" not in joined
+    assert "user:" not in joined
+    assert "/base" not in joined and "token=q" not in joined
+    assert "attacker.example" in joined
