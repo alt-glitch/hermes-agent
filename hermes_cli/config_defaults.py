@@ -2842,6 +2842,17 @@ DEFAULT_CONFIG = {
             # estimate), regardless of context size. Range 200..60000.
             "listing_max_tokens": 4000,
         },
+
+        # Connectors (remote tools served by the managed tool gateway).
+        # Availability additionally requires the Nous portal sign-in that
+        # gates every managed tool — signed-out users are unaffected by
+        # this flag, and a gateway that doesn't serve connector routes for
+        # this account degrades silently to local-only tools.
+        "connectors": {
+            # false — never touch connector routes; tool_search behaves
+            # exactly as if the feature didn't exist.
+            "enabled": True,
+        },
     },
 
     # Logging — controls file logging to ~/.hermes/logs/.
