@@ -74,6 +74,17 @@ def test_connect_returns_link_and_instruction_once_per_session():
     assert "instruction" not in second["results"][0]  # shown once per session
     assert ("connections", ("gmail",), False) in client.calls
 
+    # A DIFFERENT session sharing the process still gets the guidance.
+    other_session = json.loads(
+        manage_connections(
+            {"action": "connect", "connectors": ["gmail"]},
+            client_factory=lambda: client,
+            seen_instructions=seen,
+            session_id="other-session",
+        )
+    )
+    assert "instruction" in other_session["results"][0]
+
 
 def test_reconnect_sets_reinitiate():
     client = FakeClient()

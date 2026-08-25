@@ -33,9 +33,12 @@ logger = logging.getLogger(__name__)
 _CONNECTOR_ACTIONS = ("status", "connect", "reconnect")
 _MCP_ACTIONS = ("install", "enable", "authorize")
 
-# Connectors whose `instruction` text has already been shown this session.
-# Module-level on purpose (browser_use `_pending_create_keys` precedent):
-# one process is one session on every surface this tool serves.
+# (session_id, connector) pairs whose `instruction` text has already been
+# shown. Keyed per session, not per process: the gateway multiplexes many
+# sessions through one process, and guidance suppressed for session A must
+# still reach session B. Module-level dict + lock is the house idiom
+# (browser_use `_pending_create_keys` precedent); an unknown session keys
+# on "" and degrades to per-process, never crashes.
 _seen_instructions: set = set()
 _seen_instructions_lock = threading.Lock()
 
@@ -61,6 +64,7 @@ def manage_connections(
     callback: Optional[Callable] = None,
     client_factory: Optional[Callable[[], Any]] = None,
     seen_instructions: Optional[set] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Dispatch one ``tool_manage_connections`` action. Returns a JSON string."""
     action = str(args.get("action") or "status").strip().lower()
@@ -133,9 +137,10 @@ def manage_connections(
                 )
             instruction = entry.get("instruction")
             if instruction:
+                seen_key = (str(session_id or ""), connector)
                 with _seen_instructions_lock:
-                    if connector not in seen:
-                        seen.add(connector)
+                    if seen_key not in seen:
+                        seen.add(seen_key)
                         rendered["instruction"] = instruction
             results.append(rendered)
         return json.dumps(
@@ -200,7 +205,9 @@ registry.register(
     name="tool_manage_connections",
     toolset="connections",
     schema=TOOL_MANAGE_CONNECTIONS_SCHEMA,
-    handler=lambda args, **kw: manage_connections(args, callback=kw.get("callback")),
+    handler=lambda args, **kw: manage_connections(
+        args, callback=kw.get("callback"), session_id=kw.get("session_id")
+    ),
     check_fn=_connectors_available,
     emoji="🔗",
 )
