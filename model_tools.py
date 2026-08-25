@@ -1360,22 +1360,26 @@ def handle_function_call(
                 # block and middleware rewrite keyed on a real tool name.
                 _scoped_batch = _ts_mod.scoped_deferrable_names(current_defs)
 
-                def _local_dispatch(_name: str, _args: Dict[str, Any]) -> str:
+                # Returns (ok, payload): THIS closure owns the success/failure
+                # call because only it knows which returns are its own refusals.
+                # The bridge must not guess from the payload — a legitimate tool
+                # result can carry an "error" field of its own.
+                def _local_dispatch(_name: str, _args: Dict[str, Any]):
                     if not _ts_mod.is_deferrable_tool_name(_name):
-                        return tool_error(
+                        return False, tool_error(
                             f"'{_name}' is not a deferrable tool. If it appears in the "
                             "model-facing tools list already, call it directly instead "
                             "of via tool_call."
                         )
                     if _name not in _scoped_batch:
-                        return tool_error(
+                        return False, tool_error(
                             f"'{_name}' is not available in this session. "
                             "Use tool_search to find tools you can call."
                         )
                     _perr = _ts_mod.validate_deferred_call_args(_name, _args)
                     if _perr is not None:
-                        return _perr
-                    return handle_function_call(
+                        return False, _perr
+                    return True, handle_function_call(
                         function_name=_name,
                         function_args=_args,
                         task_id=task_id,

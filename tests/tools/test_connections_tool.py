@@ -5,8 +5,10 @@ seams; no module mocks, no network.
 """
 
 import json
+from unittest.mock import patch
 
-from tools.connections_tool import manage_connections
+import tools.connections_tool  # registers the tool
+from tools.connections_tool import MANAGE_CONNECTIONS_SCHEMA, manage_connections
 
 
 class FakeClient:
@@ -120,9 +122,61 @@ def test_gateway_failure_is_a_model_actionable_error():
     assert "connector gateway request failed" in out["error"]
 
 
-def test_mcp_actions_delegate_to_setup_flow_without_callback():
+def test_mcp_actions_are_not_this_tools_business():
+    # Local MCP setup belongs to setup_mcp, which owns the desktop consent
+    # callback. Folding those actions in here promised a flow this tool has no
+    # way to reach, so they are rejected as unknown actions.
     out = json.loads(
         manage_connections({"action": "install", "server": "linear"})
     )
-    # No desktop callback in this context -> the existing terminal guidance.
-    assert "hermes mcp install" in out["error"]
+    assert "action must be one of" in out["error"]
+    assert "install" not in MANAGE_CONNECTIONS_SCHEMA["parameters"]["properties"]["action"]["enum"]
+
+
+# ---------------------------------------------------------------------------
+# reachability: a registered tool nobody enables is a tool nobody can call
+# ---------------------------------------------------------------------------
+
+
+def test_tool_is_enabled_for_platform_sessions_not_just_registered():
+    # The registered toolset ("connections") is registry-only: absent from
+    # TOOLSETS, from _gui_surface_toolsets, and — before this fix — from
+    # _HERMES_CORE_TOOLS. Every real session passes enabled_toolsets, so the
+    # tool resolved into no bundle and no session could ever call it.
+    from toolsets import TOOLSETS, resolve_toolset
+
+    assert "connections" not in TOOLSETS  # still registry-only; nothing to enable
+    for bundle in ("hermes-cli", "hermes-cron", "hermes-gateway", "hermes-telegram"):
+        assert "manage_connections" in resolve_toolset(bundle), bundle
+
+
+def test_entitled_session_sees_the_tool_in_its_definitions():
+    from model_tools import get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    def _defs():
+        invalidate_check_fn_cache()
+        return {
+            d["function"]["name"]
+            for d in get_tool_definitions(enabled_toolsets=["hermes-cli"], quiet_mode=True)
+        }
+
+    with patch("tools.tool_gateway.config.connectors_available", return_value=True):
+        entitled = _defs()
+    with patch("tools.tool_gateway.config.connectors_available", return_value=False):
+        signed_out = _defs()
+    invalidate_check_fn_cache()
+
+    # Present and NOT collapsed into the tool_search catalog: connection
+    # trouble is what the model reaches for when a connector call fails.
+    assert "manage_connections" in entitled
+    # check_fn keeps it off non-entitled sessions — today's behavior, unchanged.
+    assert "manage_connections" not in signed_out
+
+
+def test_tool_is_never_deferrable():
+    from tools.tool_search import is_deferrable_tool_name
+
+    # Core names short-circuit before the toolset check, so listing
+    # "connections" in _DIRECT_SURFACE_TOOLSETS would be redundant.
+    assert is_deferrable_tool_name("manage_connections") is False
