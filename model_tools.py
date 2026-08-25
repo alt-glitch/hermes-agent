@@ -1401,9 +1401,20 @@ def handle_function_call(
                     # Connector entries never reach handle_function_call
                     # individually, so their pre_tool_call pass fires here —
                     # same single-fire contract, keyed on the composed
-                    # connectors__ name. A block becomes that entry's
-                    # USER_DENIED slot; siblings still run. (Arg-modify
-                    # directives are not applied to remote entries.)
+                    # connectors__ name. Returns the bridge's
+                    # (block_message, replacement_arguments) pair: a block
+                    # becomes that entry's USER_DENIED slot and siblings still
+                    # run, while modified args from a `modify` directive go out
+                    # on the wire for that entry.
+                    #
+                    # Rewrite semantics are the single-entry path's, verbatim
+                    # (see the skip_pre_tool_call_hook branch below): the hook
+                    # dispatcher returns modified args as None when NO hook
+                    # asked for a change and as the merged dict when one did,
+                    # so None here means "send the original arguments" and a
+                    # dict — empty included — replaces them. Anything else is
+                    # not a rewrite the wire can carry, so it is dropped
+                    # rather than guessed at.
                     try:
                         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
                         block_message, _modified = _dispatch_pre_tool_call_hooks(
@@ -1416,10 +1427,13 @@ def handle_function_call(
                             api_request_id=api_request_id or "",
                             middleware_trace=list(_tool_middleware_trace),
                         )
-                        return block_message
+                        return (
+                            block_message,
+                            _modified if isinstance(_modified, dict) else None,
+                        )
                     except Exception as _hook_err:
                         logger.debug("connector pre_tool_call hook error: %s", _hook_err)
-                        return None
+                        return None, None
 
                 try:
                     from tools.tool_gateway.bridge import dispatch_calls as _connector_dispatch
