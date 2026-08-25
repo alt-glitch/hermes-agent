@@ -10,7 +10,8 @@ entries recurse into core dispatch, where scope/probe/hook/middleware gates
 fire against each real tool name) and ``pre_dispatch`` (remote entries get
 the caller's hook/approval pass against their composed ``connectors__``
 names; a block pre-fills that entry's ``USER_DENIED`` slot and its siblings
-still run). The bridge itself only partitions, gates, dispatches, splices.
+still run, and an argument REWRITE from that same pass travels to the wire).
+The bridge itself only partitions, gates, dispatches, splices.
 
 Dispatch shape (V1, decided 2026-08-25): local entries run via the injected
 ``local_dispatch``; ALL connector entries travel as ONE gateway execute
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace as dataclass_replace
 from typing import Any, Callable, Optional, Sequence
 
 from tools.tool_gateway.config import MAX_CALLS_PER_DISPATCH, connectors_available
@@ -57,6 +59,28 @@ __all__ = ["connector_describe", "connector_search_hits", "dispatch_calls"]
 # success. The failure text reaches the model either way; only the envelope's
 # success/error tallies treat it as a completed call.
 LocalDispatch = Callable[[str, dict[str, Any]], "tuple[bool, Any]"]
+
+# Signature of the injected per-remote-entry gate:
+#   (name, arguments) -> (block_message, replacement_arguments)
+#
+# Both halves are independent and either may be None:
+#
+# - ``block_message`` not None  -> that entry becomes a USER_DENIED slot and
+#   never reaches the wire. Its siblings still run.
+# - ``replacement_arguments`` a dict -> the surviving remote call is rebuilt
+#   with those arguments, so the gateway request body carries the REWRITTEN
+#   values. ``None`` means "the gate requested no change" and the original
+#   arguments go out verbatim — a hook that only observes must not be able to
+#   silently blank a call's arguments, so "no change" and "changed to {}" are
+#   kept distinct (an empty dict IS a rewrite to no arguments).
+#
+# Policy rewrites (sanitization, redaction) are the reason this half exists:
+# the single-entry deferred path applies the pre_tool_call hook's modified
+# args before dispatch, and remote entries must not be the one path where a
+# redaction is dropped on the floor.
+PreDispatch = Callable[
+    [str, dict[str, Any]], "tuple[Optional[str], Optional[dict[str, Any]]]"
+]
 
 
 def _default_client_factory():
@@ -143,7 +167,7 @@ def dispatch_calls(
     dispatch_id: Optional[str] = None,
     *,
     local_dispatch: LocalDispatch,
-    pre_dispatch: Optional[Callable[[str, dict], Optional[str]]] = None,
+    pre_dispatch: Optional[PreDispatch] = None,
     availability: Optional[Callable[[], bool]] = None,
     client_factory: Optional[Callable[[], Any]] = None,
 ) -> str:
@@ -156,10 +180,13 @@ def dispatch_calls(
     :data:`LocalDispatch`).
 
     ``pre_dispatch`` is the caller's per-REMOTE-entry gate (hooks/approval):
-    called with (name, arguments) before the gateway request is built; a
-    non-None return is that entry's block message — the entry is pre-filled
-    as a ``USER_DENIED`` error slot and excluded from the remote batch while
-    its siblings still run. Local entries gate inside ``local_dispatch``.
+    called with (name, arguments) before the gateway request is built, and
+    returning ``(block_message, replacement_arguments)`` (see
+    :data:`PreDispatch`). A non-None block message pre-fills that entry's
+    ``USER_DENIED`` error slot and excludes it from the remote batch while
+    its siblings still run; a replacement dict on a surviving entry is the
+    arguments that actually go out on the wire. Local entries gate inside
+    ``local_dispatch``.
     """
     try:
         return _dispatch_calls_inner(
@@ -182,7 +209,7 @@ def _dispatch_calls_inner(
     dispatch_id: Optional[str],
     *,
     local_dispatch: LocalDispatch,
-    pre_dispatch: Optional[Callable[[str, dict], Optional[str]]],
+    pre_dispatch: Optional[PreDispatch],
     availability: Optional[Callable[[], bool]],
     client_factory: Optional[Callable[[], Any]],
 ) -> str:
@@ -209,20 +236,19 @@ def _dispatch_calls_inner(
     ]
 
     # The caller's per-entry gate (hooks/approval) runs before anything is
-    # sent: a blocked entry becomes a USER_DENIED slot, siblings still run.
+    # sent: a blocked entry becomes a USER_DENIED slot, siblings still run,
+    # and a rewrite rebuilds that entry alone before the request is built.
     denied_entries: list[dict[str, Any]] = []
     surviving = list(partition.remote)
     if pre_dispatch is not None and surviving:
         kept = []
         for plan in surviving:
             try:
-                block = pre_dispatch(plan.name, dict(plan.arguments))
+                block, replacement = _run_pre_dispatch(pre_dispatch, plan)
             except Exception as exc:
                 logger.debug("pre_dispatch gate failed open for %s: %s", plan.name, exc)
-                block = None
-            if block is None:
-                kept.append(plan)
-            else:
+                block, replacement = None, None
+            if block is not None:
                 denied_entries.append(
                     {
                         "index": plan.position,
@@ -230,6 +256,14 @@ def _dispatch_calls_inner(
                         "error": {"code": "USER_DENIED", "message": str(block)},
                     }
                 )
+                continue
+            if replacement is not None:
+                # PlannedCall is frozen: rebuild this entry only. position and
+                # name ride along untouched, so every downstream correlation
+                # (request slot order, result splice, error slots) is unmoved
+                # while the wire body carries the rewritten arguments.
+                plan = dataclass_replace(plan, arguments=dict(replacement))
+            kept.append(plan)
         surviving = kept
 
     remote_entries: list[dict[str, Any]] = []
@@ -246,6 +280,29 @@ def _dispatch_calls_inner(
             len(calls), local_entries, remote_entries, denied_entries, partition.errors
         ),
         ensure_ascii=False,
+    )
+
+
+def _run_pre_dispatch(
+    pre_dispatch: PreDispatch, plan
+) -> "tuple[Optional[str], Optional[dict[str, Any]]]":
+    """Call the gate and normalize its return to (block, replacement).
+
+    The contract is the 2-tuple (:data:`PreDispatch`). A gate that returns a
+    bare value instead is read as a block message and nothing else: guessing
+    "no block" from a malformed return would fail OPEN on the one seam whose
+    job is to stop calls. A replacement that is not a dict is discarded — the
+    wire body needs an object, and rewriting is opt-in.
+    """
+    outcome = pre_dispatch(plan.name, dict(plan.arguments))
+    if isinstance(outcome, tuple):
+        block = outcome[0] if len(outcome) > 0 else None
+        replacement = outcome[1] if len(outcome) > 1 else None
+    else:
+        block, replacement = outcome, None
+    return (
+        block if block is None else str(block),
+        replacement if isinstance(replacement, dict) else None,
     )
 
 
