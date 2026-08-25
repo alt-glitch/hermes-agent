@@ -1081,7 +1081,15 @@ def _connector_matches_by_group(
                 schema = schemas.get(slug)
                 if not isinstance(schema, dict) or not schema.get("connector"):
                     continue  # cannot compose a callable name without its connector
-                name = format_connector_name(str(schema["connector"]), str(slug))
+                # Lowercase the connector half at composition: the search
+                # route leaks vendor-cased connector slugs for custom
+                # toolkits (live-verified 2026-08-25: connections say
+                # custom_nous_lab_deepwiki while schemas say
+                # CUSTOM_NOUS_LAB_DEEPWIKI in the SAME response), and the
+                # gateway's policy gates compare case-sensitively against
+                # the lowercase catalog form. Tool slugs stay verbatim.
+                # No-op once the gateway normalizes its own surface.
+                name = format_connector_name(str(schema["connector"]).lower(), str(slug))
                 per_query[position].append(name)
                 if name not in records:
                     input_schema = schema.get("input_schema")

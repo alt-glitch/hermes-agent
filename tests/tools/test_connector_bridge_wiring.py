@@ -119,6 +119,33 @@ def _fake_connector_search(queries):
     }
 
 
+def test_search_composes_lowercase_connector_from_vendor_cased_schema():
+    # The gateway search surface leaks vendor-cased connector slugs for
+    # custom toolkits; the composed name must carry the lowercase catalog
+    # form or the gateway's own policy gates refuse the call.
+    def cased_search(queries):
+        return {
+            "results": [{"index": 1, "tools": ["CUSTOM_X_READ"]}],
+            "schemas": {
+                "CUSTOM_X_READ": {
+                    "connector": "CUSTOM_X",
+                    "tool": "CUSTOM_X_READ",
+                    "description": "d",
+                    "input_schema": {},
+                }
+            },
+        }
+
+    out = json.loads(
+        dispatch_tool_search(
+            {"queries": ["anything"]},
+            current_tool_defs=_local_defs(),
+            connector_search=cased_search,
+        )
+    )
+    assert "connectors__custom_x__CUSTOM_X_READ" in out["results"][0]["matches"]
+
+
 def test_search_merges_remote_hits_tagged_as_connectors():
     out = json.loads(
         dispatch_tool_search(
