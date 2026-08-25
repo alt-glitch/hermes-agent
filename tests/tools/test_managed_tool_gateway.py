@@ -21,6 +21,7 @@ resolve_managed_tool_gateway = managed_tool_gateway.resolve_managed_tool_gateway
 # Every gateway knob, so a test can state the whole environment it wants.
 _GATEWAY_ENV_KEYS = (
     "TOOL_GATEWAY_URL",
+    "CONNECTOR_GATEWAY_URL",
     "TOOL_GATEWAY_DOMAIN",
     "TOOL_GATEWAY_SCHEME",
     "HERMES_TRUSTED_GATEWAY_ORIGINS",
@@ -156,22 +157,58 @@ def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
         endpoints = managed_tool_gateway.managed_vendor_endpoints("bfl")
 
     assert endpoints == {
-        "origin": "https://tools.nousresearch.com",
-        "base_url": "https://tools.nousresearch.com/api/bfl",
+        "origin": "https://tool-gateway.nousresearch.com",
+        "base_url": "https://tool-gateway.nousresearch.com/api/bfl",
         "upload_path": "/api/uploads/bfl",
     }
 
 
+def test_connector_gateway_origin_pins_the_deployed_connectors_host():
+    # The connectors API is its own deployment on its own canonical host, so
+    # its default resolution must not land on the media/vendor origin.
+    with gateway_env():
+        assert managed_tool_gateway.connector_gateway_origin() == (
+            "https://connector-gateway.nousresearch.com"
+        )
+        assert managed_tool_gateway.managed_gateway_origin() == (
+            "https://tool-gateway.nousresearch.com"
+        )
+
+
 def test_managed_gateway_origin_honors_the_harness_override():
-    # TOOL_GATEWAY_URL pins the full origin (the e2e harness sets it to a
+    # TOOL_GATEWAY_URL pins the full media origin (the e2e harness sets it to a
     # loopback gateway), and the bearer gate must accept exactly that origin.
     with gateway_env(TOOL_GATEWAY_URL="http://127.0.0.1:3009/"):
         assert managed_tool_gateway.managed_gateway_origin() == "http://127.0.0.1:3009"
         assert managed_tool_gateway.is_managed_nous_gateway_url(
-            "http://127.0.0.1:3009/v1/connectors/search"
+            "http://127.0.0.1:3009/api/bfl/generations"
         )
-        assert not managed_tool_gateway.is_managed_nous_gateway_url(
-            "https://tools.nousresearch.com/v1/connectors/search"
+        # The retired shared host is now nobody's origin, and the override
+        # means even the real media host is not this install's address.
+        for untrusted in (
+            "https://tools.nousresearch.com/api/bfl/generations",
+            "https://tool-gateway.nousresearch.com/api/bfl/generations",
+        ):
+            assert not managed_tool_gateway.is_managed_nous_gateway_url(untrusted)
+
+
+def test_the_two_first_party_hosts_have_separate_override_keys():
+    # Each surface is pinned by its own key. Moving the media host must not
+    # drag the connectors client along, or connector calls would silently go to
+    # a host that does not serve them (and the reverse).
+    with gateway_env(TOOL_GATEWAY_URL="http://127.0.0.1:3009/"):
+        assert managed_tool_gateway.connector_gateway_origin() == (
+            "https://connector-gateway.nousresearch.com"
+        )
+
+    with gateway_env(CONNECTOR_GATEWAY_URL="http://127.0.0.1:3009/"):
+        assert managed_tool_gateway.connector_gateway_origin() == "http://127.0.0.1:3009"
+        assert managed_tool_gateway.managed_gateway_origin() == (
+            "https://tool-gateway.nousresearch.com"
+        )
+        # Loopback earns the bearer with no trust list, same as the media host.
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "http://127.0.0.1:3009/v1/connectors/search"
         )
 
 
@@ -283,7 +320,7 @@ def test_shared_origin_override_gates_the_bearer_not_the_address():
         endpoints = managed_tool_gateway.managed_vendor_endpoints("bfl")
         assert endpoints is not None and endpoints["origin"] == "https://attacker.example"
         assert not managed_tool_gateway.is_managed_nous_gateway_url(
-            "https://attacker.example/v1/connectors/search"
+            "https://attacker.example/api/bfl/generations"
         )
 
     with gateway_env(
@@ -291,40 +328,83 @@ def test_shared_origin_override_gates_the_bearer_not_the_address():
         HERMES_TRUSTED_GATEWAY_ORIGINS="https://stage.example",
     ):
         assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://stage.example/api/bfl/generations"
+        )
+
+
+def test_connector_origin_override_gates_the_bearer_not_the_address():
+    # The connectors host gets no weaker a gate for being the newer surface:
+    # CONNECTOR_GATEWAY_URL still resolves the address, and an attacker-named
+    # origin still earns nothing until it is loopback or trust-listed.
+    with gateway_env(CONNECTOR_GATEWAY_URL="https://attacker.example"):
+        assert managed_tool_gateway.connector_gateway_origin() == "https://attacker.example"
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://attacker.example/v1/connectors/search"
+        )
+
+    with gateway_env(
+        CONNECTOR_GATEWAY_URL="https://stage.example",
+        HERMES_TRUSTED_GATEWAY_ORIGINS="https://stage.example",
+    ):
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
             "https://stage.example/v1/connectors/search"
         )
 
 
-def test_default_bearer_gate_accepts_only_the_deployed_host():
-    # Exact (scheme, host, port) equality against the deployed origin: the old
-    # host, subdomain cousins, and scheme downgrades all stay untrusted.
+def test_default_bearer_gate_accepts_both_deployed_hosts_only():
+    # Exact (scheme, host, port) equality against each deployed origin. Both
+    # first-party hosts are in; the retired shared host, subdomain cousins,
+    # scheme downgrades, and a bare hostname are all out.
     with gateway_env():
-        assert managed_tool_gateway.is_managed_nous_gateway_url(
-            "https://tools.nousresearch.com/v1/connectors/execute"
-        )
+        for trusted in (
+            "https://connector-gateway.nousresearch.com/v1/connectors/execute",
+            "https://tool-gateway.nousresearch.com/api/bfl/generations",
+        ):
+            assert managed_tool_gateway.is_managed_nous_gateway_url(trusted)
         for untrusted in (
-            "https://tool-gateway.nousresearch.com/v1/connectors/execute",
-            "https://evil-tools.nousresearch.com.attacker.dev/v1/connectors",
-            "http://tools.nousresearch.com/v1/connectors",
-            "tools.nousresearch.com/v1/connectors",  # no scheme: not an origin
+            "https://tools.nousresearch.com/v1/connectors/execute",
+            "https://connector-gateway.nousresearch.com.attacker.dev/v1/connectors",
+            "https://evil-connector-gateway.nousresearch.com/v1/connectors",
+            "http://connector-gateway.nousresearch.com/v1/connectors",
+            "http://tool-gateway.nousresearch.com/api/bfl/generations",
+            "connector-gateway.nousresearch.com/v1/connectors",  # no scheme
         ):
             assert not managed_tool_gateway.is_managed_nous_gateway_url(untrusted)
 
 
-def test_a_shared_domain_reshape_also_needs_the_trust_list():
-    # Same deliberate consequence as the vendor path: TOOL_GATEWAY_DOMAIN is an
-    # env knob, so tools.<domain> built from it is env-derived.
+def test_a_domain_reshape_needs_the_trust_list_on_both_first_party_hosts():
+    # Same deliberate consequence as the vendor path, and it applies per host:
+    # TOOL_GATEWAY_DOMAIN is an env knob, so every host built from it is
+    # env-derived — even when it spells out today's default domain.
     with gateway_env(TOOL_GATEWAY_DOMAIN="nousresearch.com", TOOL_GATEWAY_SCHEME="https"):
         assert not managed_tool_gateway.is_managed_nous_gateway_url(
-            "https://tools.nousresearch.com/v1/connectors/execute"
+            "https://connector-gateway.nousresearch.com/v1/connectors/execute"
+        )
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://tool-gateway.nousresearch.com/api/bfl/generations"
+        )
+
+    # Listing one host grants that host only — trust does not spread sideways.
+    with gateway_env(
+        TOOL_GATEWAY_DOMAIN="gw.example.com",
+        HERMES_TRUSTED_GATEWAY_ORIGINS="https://connector-gateway.gw.example.com",
+    ):
+        assert managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://connector-gateway.gw.example.com/v1/connectors/execute"
+        )
+        assert not managed_tool_gateway.is_managed_nous_gateway_url(
+            "https://tool-gateway.gw.example.com/api/bfl/generations"
         )
 
     with gateway_env(
         TOOL_GATEWAY_DOMAIN="gw.example.com",
-        HERMES_TRUSTED_GATEWAY_ORIGINS="https://tools.gw.example.com",
+        HERMES_TRUSTED_GATEWAY_ORIGINS=(
+            "https://connector-gateway.gw.example.com,"
+            "https://tool-gateway.gw.example.com"
+        ),
     ):
         assert managed_tool_gateway.is_managed_nous_gateway_url(
-            "https://tools.gw.example.com/v1/connectors/execute"
+            "https://tool-gateway.gw.example.com/api/bfl/generations"
         )
 
 
@@ -343,7 +423,7 @@ def test_managed_vendor_endpoints_do_not_consult_entitlement():
         endpoints = managed_tool_gateway.managed_vendor_endpoints("bfl")
 
     assert endpoints is not None
-    assert endpoints["base_url"] == "https://tools.nousresearch.com/api/bfl"
+    assert endpoints["base_url"] == "https://tool-gateway.nousresearch.com/api/bfl"
 
 
 def test_managed_vendor_endpoints_are_none_when_no_origin_resolves():
@@ -351,6 +431,7 @@ def test_managed_vendor_endpoints_are_none_when_no_origin_resolves():
     # that rather than building a URL out of a broken setting.
     with gateway_env(TOOL_GATEWAY_SCHEME="ftp"):
         assert managed_tool_gateway.managed_gateway_origin() is None
+        assert managed_tool_gateway.connector_gateway_origin() is None
         assert managed_tool_gateway.managed_vendor_endpoints("bfl") is None
         with pytest.raises(ValueError):
             # The vendor builder's contract has always been to raise.
@@ -362,7 +443,7 @@ def test_managed_gateway_auth_headers_carry_the_bearer():
         managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
     ):
         headers = managed_tool_gateway.managed_gateway_auth_headers(
-            "https://tools.nousresearch.com/api/bfl/generations",
+            "https://tool-gateway.nousresearch.com/api/bfl/generations",
             token_reader=lambda: "nous-token",
         )
 
@@ -373,7 +454,7 @@ def test_managed_gateway_auth_headers_reflect_a_rotated_token():
     # Read fresh on every call: a Nous access token expires within the hour,
     # and a long session must not keep presenting a dead bearer.
     tokens = iter(["first-token", "second-token"])
-    url = "https://tools.nousresearch.com/api/bfl/generations"
+    url = "https://tool-gateway.nousresearch.com/api/bfl/generations"
 
     with gateway_env(), patch.object(
         managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
@@ -404,7 +485,7 @@ def test_managed_gateway_auth_headers_empty_without_a_token():
         managed_tool_gateway, "managed_nous_tools_enabled", return_value=True
     ):
         assert managed_tool_gateway.managed_gateway_auth_headers(
-            "https://tools.nousresearch.com/api/bfl/generations",
+            "https://tool-gateway.nousresearch.com/api/bfl/generations",
             token_reader=lambda: None,
         ) == {}
 
@@ -421,7 +502,7 @@ class TestManagedMediaUploader:
     # The real deployed shared origin, reached through the real trust gate —
     # the gateway_builder seam this used to inject was also the switch that
     # turned that gate off, so the protocol was never tested with it on.
-    GATEWAY = "https://tools.nousresearch.com"
+    GATEWAY = "https://tool-gateway.nousresearch.com"
     BASE_URL = f"{GATEWAY}/api/bfl"
     UPLOAD_PATH = "/api/uploads/bfl"
 

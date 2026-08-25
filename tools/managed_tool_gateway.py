@@ -1,16 +1,33 @@
-"""Generic managed-tool gateway helpers for Nous-hosted vendor passthroughs.
+"""Managed-tool gateway helpers: host resolution, bearer trust, media uploads.
+
+Three shapes of first-party gateway host live behind these helpers, all named
+``{label}.{domain}`` and all built by the one formula in
+:func:`_gateway_origin`:
+
+* ``connector-gateway`` — the connectors API (``/v1/connectors/*``). Its own
+  deployment, its own canonical host, its own ``CONNECTOR_GATEWAY_URL``
+  override. Resolved by :func:`connector_gateway_origin`.
+* ``tool-gateway`` — the vendors the gateway serves on its own origin under
+  ``/api/{vendor}``, plus the media upload endpoints. Overridden with
+  ``TOOL_GATEWAY_URL``. Resolved by :func:`managed_gateway_origin`.
+* ``{vendor}-gateway`` — per-vendor passthroughs (Firecrawl, BFL, ...), each
+  overridable on its own with ``{VENDOR}_GATEWAY_URL``. Resolved by
+  :func:`build_vendor_gateway_url`.
 
 Two separable questions live here, and keeping them apart is the whole design:
 
 * WHERE do requests go — :func:`build_vendor_gateway_url`,
-  :func:`managed_gateway_origin`, :func:`managed_vendor_endpoints`. Every env
-  override steers this freely; that is what local and staging setups use.
+  :func:`managed_gateway_origin`, :func:`connector_gateway_origin`,
+  :func:`managed_vendor_endpoints`. Every env override steers this freely; that
+  is what local and staging setups use.
 * Which origin earns the user's Nous bearer — :func:`_bearer_is_allowed`. Trust
   is provenance: the hardcoded default is trusted, loopback is trusted, and
   ANY origin the environment shaped (including a ``TOOL_GATEWAY_SCHEME`` /
   ``TOOL_GATEWAY_DOMAIN`` reshape, not just an exact-origin override) needs an
   entry in ``HERMES_TRUSTED_GATEWAY_ORIGINS``. Deliberate: one settable env var
-  must not be enough to harvest the token.
+  must not be enough to harvest the token. Because the answer is a property of
+  each origin's own provenance, adding a second first-party host needed no new
+  trust rule.
 """
 
 from __future__ import annotations
@@ -181,10 +198,6 @@ def get_tool_gateway_scheme() -> str:
 # written a third and fourth time, and they could drift from the real one
 # silently.
 
-# Host label for the shared managed gateway. Its own name, not a
-# ``{vendor}-gateway`` passthrough host.
-_MANAGED_GATEWAY_HOST_LABEL = "tools"
-
 _TRUSTED_GATEWAY_ORIGINS_ENV = "HERMES_TRUSTED_GATEWAY_ORIGINS"
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -236,6 +249,43 @@ def _gateway_origin(env_key: str, host_label: str) -> Optional[ResolvedOrigin]:
         origin=f"{scheme}://{host_label}.{domain}",
         from_env=bool(raw_scheme or raw_domain),
     )
+
+
+@dataclass(frozen=True)
+class _GatewaySurface:
+    """One first-party gateway host: how to resolve it, what to call it.
+
+    The two surfaces are declared once, below, and everything that needs one —
+    the public origin resolvers, the bearer gate's URL matching, the untrusted
+    warning's wording — reads it from here. Same ``{label}.{domain}`` formula
+    as a ``{vendor}-gateway`` passthrough, because the naming scheme is the
+    same; what differs is which env key pins each one.
+    """
+
+    env_key: str
+    host_label: str
+    log_label: str
+
+    def resolve(self) -> Optional[ResolvedOrigin]:
+        """This surface's origin WITH its provenance, for the bearer gate."""
+        return _gateway_origin(self.env_key, self.host_label)
+
+
+_MANAGED_VENDOR_SURFACE = _GatewaySurface(
+    env_key="TOOL_GATEWAY_URL",
+    host_label="tool-gateway",
+    log_label="the managed vendor gateway",
+)
+_CONNECTOR_SURFACE = _GatewaySurface(
+    env_key="CONNECTOR_GATEWAY_URL",
+    host_label="connector-gateway",
+    log_label="the connectors gateway",
+)
+
+# Each surface is a separate resolution with its own provenance, so the bearer
+# gate rules on each independently — a trusted media host says nothing about
+# the connectors host.
+_FIRST_PARTY_GATEWAY_SURFACES = (_MANAGED_VENDOR_SURFACE, _CONNECTOR_SURFACE)
 
 
 def _vendor_origin_env_key(vendor: str) -> str:
@@ -412,8 +462,8 @@ def is_managed_tool_gateway_ready(
 # Managed vendor endpoints
 # ---------------------------------------------------------------------------
 #
-# Vendors the gateway serves on its own origin (rather than on a
-# `{vendor}-gateway` host) are pinned HERE, in code, the same way every other
+# Vendors the gateway serves on its own origin — `tool-gateway`, rather than a
+# `{vendor}-gateway` host — are pinned HERE, in code, the same way every other
 # managed vendor's gateway URL is pinned: adding one is a Hermes release, and
 # the exact URL a user's agent may connect to is reviewable in this file. A
 # runtime discovery catalog was tried and deliberately removed — a remote
@@ -424,26 +474,40 @@ def is_managed_tool_gateway_ready(
 # vendor but not the vendor's own API, so nothing here needs to know the
 # upstream's endpoint or field names.
 
-def _resolved_managed_gateway_origin() -> Optional[ResolvedOrigin]:
-    """The shared managed origin WITH its provenance, for the bearer gate."""
-    return _gateway_origin("TOOL_GATEWAY_URL", _MANAGED_GATEWAY_HOST_LABEL)
-
-
 def managed_gateway_origin() -> Optional[str]:
-    """Origin for the shared managed gateway (connectors + on-origin vendors).
+    """Origin for the shared managed gateway host, ``tool-gateway``.
+
+    This serves the vendors the gateway hosts on its own origin under
+    ``/api/{vendor}`` plus the media upload endpoints. It is NOT where the
+    connectors API lives — see :func:`connector_gateway_origin`.
 
     Honors the same overrides as vendor hosts: ``TOOL_GATEWAY_URL`` pins the
     full origin (the local harness sets ``http://127.0.0.1:3009``), and
-    ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN`` reshape the default.
-    The deployed host is ``tools.<domain>`` — the gateway's own name, not a
-    ``{vendor}-gateway`` passthrough host.
+    ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN`` reshape the default
+    ``tool-gateway.<domain>``.
 
     ADDRESS ONLY. Every override here still steers where requests go; whether
     the origin also earns the bearer is :func:`_bearer_is_allowed`'s call.
     ``None`` when ``TOOL_GATEWAY_SCHEME`` is misconfigured, so callers need no
     try/except of their own.
     """
-    resolved = _resolved_managed_gateway_origin()
+    resolved = _MANAGED_VENDOR_SURFACE.resolve()
+    return resolved.origin if resolved is not None else None
+
+
+def connector_gateway_origin() -> Optional[str]:
+    """Origin for the connectors API host, ``connector-gateway``.
+
+    The connectors API is its own deployment with its own canonical host, so it
+    gets its own override key — ``CONNECTOR_GATEWAY_URL`` — rather than riding
+    on the media host's. ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN``
+    reshape the default ``connector-gateway.<domain>`` the same way they
+    reshape every other gateway host.
+
+    ADDRESS ONLY, and ``None`` on a misconfigured scheme, exactly as
+    :func:`managed_gateway_origin`.
+    """
+    resolved = _CONNECTOR_SURFACE.resolve()
     return resolved.origin if resolved is not None else None
 
 
@@ -485,7 +549,12 @@ def managed_vendor_endpoints(vendor: str) -> Optional[dict]:
 
 
 def is_managed_nous_gateway_url(url: object) -> bool:
-    """True when ``url`` is on the shared gateway origin AND that origin is trusted.
+    """True when ``url`` is on a first-party gateway origin that is trusted.
+
+    Two origins qualify — the media/on-origin-vendor host and the connectors
+    host — and the URL is matched to ONE of them before trust is decided, so
+    each surface is judged on its own provenance. A trusted media host never
+    lends its trust to a connectors URL, or the reverse.
 
     Anything granting a URL extra trust — our bearer, reading files off disk to
     upload — must gate on this rather than on a name, so an arbitrary URL can
@@ -511,13 +580,16 @@ def is_managed_nous_gateway_url(url: object) -> bool:
         # warn about the gateway's own configuration.
         return False
 
-    resolved = _resolved_managed_gateway_origin()
-    if resolved is None:
-        return False
-    if not _bearer_is_allowed(resolved, "the shared gateway"):
-        return False
+    for surface in _FIRST_PARTY_GATEWAY_SURFACES:
+        resolved = surface.resolve()
+        if resolved is None or actual != _origin_key(resolved.origin):
+            continue
+        # Trust is asked only of the surface this URL actually belongs to, so
+        # the warn-once line names the origin being refused rather than an
+        # unrelated one that happens to be misconfigured.
+        return _bearer_is_allowed(resolved, surface.log_label)
 
-    return actual == _origin_key(resolved.origin)
+    return False
 
 
 def managed_gateway_auth_headers(

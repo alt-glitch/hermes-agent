@@ -186,15 +186,20 @@ Running your own Nous-compatible gateway? Override endpoints in `~/.hermes/.env`
 ```bash
 TOOL_GATEWAY_DOMAIN=your-domain.example.com
 TOOL_GATEWAY_SCHEME=https
-TOOL_GATEWAY_URL=http://127.0.0.1:3009    # pin the SHARED origin exactly
-TOOL_GATEWAY_USER_TOKEN=your-token        # normally auto-populated from Portal login
-FIRECRAWL_GATEWAY_URL=https://...         # override one vendor endpoint specifically
+TOOL_GATEWAY_URL=http://127.0.0.1:3009      # pin the SHARED managed origin exactly
+CONNECTOR_GATEWAY_URL=http://127.0.0.1:3009 # pin the CONNECTORS origin exactly
+TOOL_GATEWAY_USER_TOKEN=your-token          # normally auto-populated from Portal login
+FIRECRAWL_GATEWAY_URL=https://...           # override one vendor endpoint specifically
+HERMES_TRUSTED_GATEWAY_ORIGINS=https://...  # origins allowed to receive your Nous token
 ```
 
-The gateway is reached on two host shapes, and `TOOL_GATEWAY_DOMAIN` / `TOOL_GATEWAY_SCHEME` reshape **both**:
+`HERMES_TRUSTED_GATEWAY_ORIGINS` is a comma-separated list of exact origins (scheme, host, and port must all match). Any origin the environment shaped — an exact-origin override *or* a `TOOL_GATEWAY_DOMAIN` / `TOOL_GATEWAY_SCHEME` reshape — has to appear in it before Hermes will attach your Nous token to requests going there. Loopback (`127.0.0.1`, `localhost`, `*.localhost`) is trusted without listing, so a local gateway needs nothing extra.
+
+Every host is named `{label}-gateway.<domain>`, and `TOOL_GATEWAY_DOMAIN` / `TOOL_GATEWAY_SCHEME` reshape **all** of them:
 
 - `{vendor}-gateway.<domain>` — per-vendor passthroughs (Firecrawl, BFL, ...), overridable one at a time with `{VENDOR}_GATEWAY_URL`.
-- `tools.<domain>` — the shared origin that serves connectors and the vendors hosted on the gateway itself. `TOOL_GATEWAY_URL` pins this one exactly and skips the domain/scheme derivation.
+- `tool-gateway.<domain>` — the shared managed origin: the vendors hosted on the gateway itself (`/api/{vendor}`) plus media uploads. `TOOL_GATEWAY_URL` pins this one exactly and skips the domain/scheme derivation.
+- `connector-gateway.<domain>` — the connectors API (`/v1/connectors/*`), its own deployment. `CONNECTOR_GATEWAY_URL` pins it exactly.
 
 These knobs exist for custom infrastructure setups (enterprise deployments, dev environments). Regular subscribers never set them.
 
