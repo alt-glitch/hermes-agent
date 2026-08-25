@@ -1211,7 +1211,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if function_name == _ts.TOOL_CALL_NAME:
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    if _underlying == _ts.CONNECTOR_BATCH_SENTINEL:
+                        # A calls[] batch (connector entries and/or multiple
+                        # locals): leave the tool_call wrapper intact — the
+                        # model_tools bridge branch owns batch dispatch, and
+                        # the scope + probe gates run per entry there.
+                        pass
+                    elif _underlying in _tool_search_scoped_names(agent):
                         # Probe-validate before unwrapping (ironclaw#5149):
                         # missing required args return the parameter schema
                         # instead of dispatching into an opaque failure.
@@ -2067,7 +2073,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if function_name == _ts.TOOL_CALL_NAME:
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    if _underlying == _ts.CONNECTOR_BATCH_SENTINEL:
+                        # A calls[] batch: leave the tool_call wrapper intact —
+                        # the model_tools bridge branch owns batch dispatch
+                        # (scope + probe gates run per entry there).
+                        pass
+                    elif _underlying in _tool_search_scoped_names(agent):
                         # Probe-validate before unwrapping (ironclaw#5149):
                         # missing required args return the parameter schema
                         # instead of dispatching into an opaque failure.

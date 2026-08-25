@@ -67,6 +67,14 @@ TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 
+# Connector (remote-tool) name codec. names.py is a stdlib-only leaf, so this
+# import is safe at module scope; everything heavier in tools.tool_gateway
+# (pydantic, requests) is imported lazily at the dispatch sites that need it.
+from tools.tool_gateway.names import (  # noqa: E402
+    CONNECTOR_BATCH_SENTINEL,
+    is_connector_name,
+)
+
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars
 # per token for English+JSON. Underestimating leads to false negatives
@@ -810,9 +818,12 @@ def bridge_tool_schemas(
         "Batch every schema you need into one call."
     )
     desc_call = (
-        "Invoke a deferred tool by name with the given arguments. Argument shape "
-        f"matches the tool's schema (see `{TOOL_DESCRIBE_NAME}`). Policy, hooks, "
-        "and approvals run exactly as for any directly-listed tool."
+        "Invoke deferred tools. Takes `calls`, an array of {name, arguments} "
+        "— one entry per invocation; a single call is an array of one. "
+        "Entries run as one batch and results return as one array in the "
+        f"same order. Argument shapes match each tool's schema (see "
+        f"`{TOOL_DESCRIBE_NAME}`). Policy, hooks, and approvals run exactly "
+        "as for any directly-listed tool."
     )
 
     return [
@@ -864,16 +875,26 @@ def bridge_tool_schemas(
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Exact tool name to invoke.",
-                        },
-                        "arguments": {
-                            "type": "object",
-                            "description": "Arguments for the tool, matching its schema.",
+                        "calls": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Exact tool name to invoke.",
+                                    },
+                                    "arguments": {
+                                        "type": "object",
+                                        "description": "Arguments for the tool, matching its schema.",
+                                    },
+                                },
+                                "required": ["name", "arguments"],
+                            },
+                            "description": "Tool invocations to run as one batch. A single call is an array of one entry.",
                         },
                     },
-                    "required": ["name", "arguments"],
+                    "required": ["calls"],
                 },
             },
         },
@@ -1031,10 +1052,62 @@ def _available_source_summary(catalog: List[CatalogEntry]) -> List[Dict[str, Any
     ]
 
 
+def _connector_matches_by_group(
+    queries: List[str],
+    connector_search: Optional[Any] = None,
+) -> Tuple[List[List[str]], Dict[str, Dict[str, Any]]]:
+    """Remote connector hits for ``dispatch_tool_search``, grouped per query.
+
+    Returns ``(per_query_match_names, tools_map_records)``. Correlation with
+    the remote response is by ARRAY POSITION only — the wire ``index`` field
+    is 1-based vendor passthrough on the search route and is never read.
+    Every failure path (signed out, config off, gateway dark, bad shapes)
+    returns empty results so local search behaves exactly as today (D32).
+    """
+    per_query: List[List[str]] = [[] for _ in queries]
+    records: Dict[str, Dict[str, Any]] = {}
+    try:
+        if connector_search is None:
+            from tools.tool_gateway.bridge import connector_search_hits as connector_search
+        hits = connector_search([{"use_case": q} for q in queries]) or {}
+        schemas = hits.get("schemas") if isinstance(hits.get("schemas"), dict) else {}
+        groups = hits.get("results") if isinstance(hits.get("results"), list) else []
+        from tools.tool_gateway.names import format_connector_name
+        for position, group in enumerate(groups[: len(queries)]):
+            if not isinstance(group, dict):
+                continue
+            slugs = group.get("tools") if isinstance(group.get("tools"), list) else []
+            for slug in slugs:
+                schema = schemas.get(slug)
+                if not isinstance(schema, dict) or not schema.get("connector"):
+                    continue  # cannot compose a callable name without its connector
+                name = format_connector_name(str(schema["connector"]), str(slug))
+                per_query[position].append(name)
+                if name not in records:
+                    input_schema = schema.get("input_schema")
+                    required = (
+                        input_schema.get("required")
+                        if isinstance(input_schema, dict) else None
+                    )
+                    if not isinstance(required, list):
+                        required = []
+                    records[name] = {
+                        "source": "connectors",
+                        "source_name": str(schema["connector"]),
+                        "description": str(schema.get("description") or "")[:400],
+                        "required": [r[:64] for r in required if isinstance(r, str)][:32],
+                    }
+    except Exception:
+        logger.debug("connector search merge failed silently (D32)", exc_info=True)
+        return [[] for _ in queries], {}
+    return per_query, records
+
+
 def dispatch_tool_search(args: Dict[str, Any],
                          *,
                          current_tool_defs: List[Dict[str, Any]],
-                         config: Optional[ToolSearchConfig] = None) -> str:
+                         config: Optional[ToolSearchConfig] = None,
+                         connector_search: Optional[Any] = None) -> str:
     """Execute the ``tool_search`` bridge tool. Returns a JSON string.
 
     Accepts ``queries: [str, ...]`` — each query is searched independently
@@ -1081,17 +1154,30 @@ def dispatch_tool_search(args: Dict[str, Any],
     _, deferrable = classify_tools(current_tool_defs)
     catalog = build_catalog(deferrable)
 
+    # Remote (connector) leg: merged per query alongside local BM25 hits,
+    # tagged source "connectors" in the shared tools map. Silent on every
+    # failure path — signed out / config off / gateway dark leaves this
+    # function's output byte-identical to local-only behavior (D32).
+    remote_matches, remote_records = _connector_matches_by_group(
+        queries, connector_search=connector_search
+    )
+
     results: List[Dict[str, Any]] = []
     tools_map: Dict[str, Dict[str, Any]] = {}
     corpus_stats = _corpus_stats(catalog)
     available_sources = _available_source_summary(catalog) if catalog else []
-    for query in queries:
+    for position, query in enumerate(queries):
         hits = search_catalog(catalog, query, limit=limit, corpus_stats=corpus_stats)
         for h in hits:
             if h.name not in tools_map:
                 tools_map[h.name] = _shared_tool_record(h)
-        group: Dict[str, Any] = {"query": query, "matches": [h.name for h in hits]}
-        if not hits and catalog:
+        matches = [h.name for h in hits]
+        for name in remote_matches[position]:
+            if name not in matches:
+                matches.append(name)
+                tools_map.setdefault(name, remote_records[name])
+        group: Dict[str, Any] = {"query": query, "matches": matches}
+        if not matches and catalog:
             group["available_sources"] = available_sources
             group["hint"] = (
                 "This query returned no lexical matches, but the sources above "
@@ -1113,7 +1199,8 @@ def dispatch_tool_search(args: Dict[str, Any],
 def dispatch_tool_describe(args: Dict[str, Any],
                            *,
                            current_tool_defs: List[Dict[str, Any]],
-                           config: Optional[ToolSearchConfig] = None) -> str:
+                           config: Optional[ToolSearchConfig] = None,
+                           connector_describe: Optional[Any] = None) -> str:
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string.
 
     Accepts ``names: [str, ...]`` and returns a map keyed by tool name::
@@ -1158,16 +1245,41 @@ def dispatch_tool_describe(args: Dict[str, Any],
         if fn.get("name"):
             by_name[fn["name"]] = fn
 
+    # Remote (connector) leg: schemas for connectors__* names come from the
+    # gateway. Silent degradation (D32): on any failure the remote map is
+    # empty and those names fall through to not_found, exactly as today.
+    remote_schemas: Dict[str, Dict[str, Any]] = {}
+    connector_names = [n for n in names if is_connector_name(n)]
+    if connector_names:
+        try:
+            if connector_describe is None:
+                from tools.tool_gateway.bridge import connector_describe
+            remote = connector_describe(connector_names)
+            if isinstance(remote, dict) and isinstance(remote.get("tools"), dict):
+                remote_schemas = remote["tools"]
+        except Exception:
+            logger.debug("connector describe merge failed silently (D32)", exc_info=True)
+
     tools: Dict[str, Dict[str, Any]] = {}
     not_found: List[str] = []
     errors: Dict[str, str] = {}
     for name in names:
         fn = by_name.get(name)
+        remote_fn = remote_schemas.get(name)
         if fn is not None:
             tools[name] = {
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {}),
             }
+        elif isinstance(remote_fn, dict):
+            tools[name] = {
+                "description": str(remote_fn.get("description", "")),
+                "parameters": remote_fn.get("parameters", {}),
+            }
+        elif is_connector_name(name):
+            # Connector name the gateway didn't resolve (or connectors are
+            # dark): a stale/unknown name, never a "not deferrable" error.
+            not_found.append(name)
         elif _describe_classification(name) == "not_deferrable":
             errors[name] = (
                 f"'{name}' is not a deferrable tool. If you see it in the tools list "
@@ -1258,6 +1370,49 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         return None
 
 
+def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Normalize ``tool_call`` arguments into a ``calls[]`` list of entries.
+
+    Accepts the advertised batch shape ``{"calls": [{"name", "arguments"}, ...]}``
+    and, tolerantly, the legacy single shape ``{"name": ..., "arguments": ...}``
+    (a single call is a batch of one). Each entry's ``arguments`` is coerced to
+    a dict (JSON strings parsed, ``None`` → ``{}``). Returns ``(entries, None)``
+    or ``([], error_message)``.
+    """
+    raw_calls = args.get("calls")
+    if raw_calls is None:
+        # Legacy single shape.
+        if not str(args.get("name") or "").strip():
+            return [], "tool_call requires 'calls' (an array of {name, arguments})"
+        raw_calls = [{"name": args.get("name"), "arguments": args.get("arguments")}]
+    if isinstance(raw_calls, dict):
+        raw_calls = [raw_calls]
+    if not isinstance(raw_calls, list) or not raw_calls:
+        return [], "tool_call 'calls' must be a non-empty array of {name, arguments}"
+
+    entries: List[Dict[str, Any]] = []
+    for position, raw in enumerate(raw_calls):
+        if not isinstance(raw, dict):
+            return [], f"tool_call calls[{position}] must be an object with 'name' and 'arguments'"
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            return [], f"tool_call calls[{position}] requires a 'name'"
+        if name in BRIDGE_TOOL_NAMES:
+            return [], f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
+        raw_args = raw.get("arguments")
+        if raw_args is None:
+            raw_args = {}
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except json.JSONDecodeError as e:
+                return [], f"tool_call calls[{position}].arguments is not valid JSON: {e}"
+        if not isinstance(raw_args, dict):
+            return [], f"tool_call calls[{position}].arguments must be an object"
+        entries.append({"name": name, "arguments": raw_args})
+    return entries, None
+
+
 def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
 
@@ -1266,23 +1421,23 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     * the display layer (so the activity feed shows the underlying tool),
     * the trajectory recorder.
 
+    A batch — more than one entry, or any ``connectors__*`` entry — resolves
+    to ``(CONNECTOR_BATCH_SENTINEL, {"calls": [...]}, None)``: the batch is
+    one dispatch unit owned by the ``model_tools`` bridge branch, and the
+    sentinel is what planners/display layers see. A single local entry keeps
+    the historical single-tool contract unchanged.
+
     On parse error, returns ``(None, {}, error_message)``.
     """
-    name = str(args.get("name") or "").strip()
-    if not name:
-        return None, {}, "tool_call requires a 'name' argument"
-    if name in BRIDGE_TOOL_NAMES:
-        return None, {}, f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
-    raw_args = args.get("arguments")
-    if raw_args is None:
-        raw_args = {}
-    if isinstance(raw_args, str):
-        try:
-            raw_args = json.loads(raw_args)
-        except json.JSONDecodeError as e:
-            return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
-    if not isinstance(raw_args, dict):
-        return None, {}, "tool_call 'arguments' must be an object"
+    entries, err = normalize_tool_call_entries(args)
+    if err:
+        return None, {}, err
+
+    if len(entries) > 1 or any(is_connector_name(e["name"]) for e in entries):
+        return CONNECTOR_BATCH_SENTINEL, {"calls": entries}, None
+
+    name = entries[0]["name"]
+    raw_args = entries[0]["arguments"]
     if not is_deferrable_tool_name(name):
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
@@ -1314,7 +1469,10 @@ __all__ = [
     "is_bridge_tool",
     "dispatch_tool_search",
     "dispatch_tool_describe",
+    "normalize_tool_call_entries",
     "resolve_underlying_call",
+    "CONNECTOR_BATCH_SENTINEL",
+    "is_connector_name",
     "scoped_deferrable_names",
     "validate_deferred_call_args",
 ]

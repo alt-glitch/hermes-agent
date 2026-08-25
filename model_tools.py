@@ -1346,6 +1346,61 @@ def handle_function_call(
                 return _return_bridge_result(
                     tool_error(err or "tool_call could not be resolved")
                 )
+            if underlying_name == _ts_mod.CONNECTOR_BATCH_SENTINEL:
+                # A calls[] batch (any connector entry, or >1 entry). The
+                # connector bridge partitions it: connector entries travel as
+                # ONE gateway request; local entries run through the SAME
+                # gates as the single-call path below via this closure —
+                # session scope, probe validation, then the normal recursive
+                # dispatch so hooks fire against each real tool name.
+                _scoped_batch = _ts_mod.scoped_deferrable_names(current_defs)
+
+                def _local_dispatch(_name: str, _args: Dict[str, Any]) -> str:
+                    if _name not in _scoped_batch:
+                        return tool_error(
+                            f"'{_name}' is not available in this session. "
+                            "Use tool_search to find tools you can call."
+                        )
+                    if not _ts_mod.is_deferrable_tool_name(_name):
+                        return tool_error(
+                            f"'{_name}' is not a deferrable tool. If it appears in the "
+                            "model-facing tools list already, call it directly instead "
+                            "of via tool_call."
+                        )
+                    _perr = _ts_mod.validate_deferred_call_args(_name, _args)
+                    if _perr is not None:
+                        return _perr
+                    return handle_function_call(
+                        function_name=_name,
+                        function_args=_args,
+                        task_id=task_id,
+                        tool_call_id=tool_call_id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        user_task=user_task,
+                        enabled_tools=enabled_tools,
+                        skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+                        skip_tool_request_middleware=skip_tool_request_middleware,
+                        skip_tool_execution_middleware=skip_tool_execution_middleware,
+                        tool_request_middleware_trace=list(_tool_middleware_trace),
+                        enabled_toolsets=enabled_toolsets,
+                        disabled_toolsets=disabled_toolsets,
+                    )
+
+                try:
+                    from tools.tool_gateway.bridge import dispatch_calls as _connector_dispatch
+                except Exception as _imp_exc:
+                    return _return_bridge_result(
+                        tool_error(f"tool_call batch dispatch is unavailable: {_imp_exc}")
+                    )
+                return _return_bridge_result(
+                    _connector_dispatch(
+                        underlying_args.get("calls") or [],
+                        tool_call_id,
+                        local_dispatch=_local_dispatch,
+                    )
+                )
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate
