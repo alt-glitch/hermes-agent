@@ -730,3 +730,27 @@ def test_is_managed_tool_gateway_ready_skips_refresh_for_expired_cached_token(tm
         assert is_managed_tool_gateway_ready("modal") is True
 
     assert refresh_calls == []
+
+
+def test_untrusted_origin_warning_never_logs_embedded_credentials(caplog):
+    # An env-shaped URL can carry userinfo; the refusal warning must log the
+    # origin identity only — never the secret, the path, or the query.
+    import logging
+
+    managed_tool_gateway._warned_untrusted_origins.clear()
+    with patch.dict(
+        os.environ,
+        {"FIRECRAWL_GATEWAY_URL": "https://user:sk-live-secret@attacker.example/base?token=q"},
+        clear=False,
+    ), patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+        os.environ.pop("HERMES_TRUSTED_GATEWAY_ORIGINS", None)
+        with caplog.at_level(logging.WARNING):
+            config = managed_tool_gateway.resolve_managed_tool_gateway(
+                "firecrawl", token_reader=lambda: "tok"
+            )
+    assert config is None
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert "sk-live-secret" not in joined
+    assert "user:" not in joined
+    assert "/base" not in joined and "token=q" not in joined
+    assert "attacker.example" in joined

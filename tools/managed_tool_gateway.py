@@ -403,11 +403,29 @@ def _bearer_is_allowed(resolved: ResolvedOrigin, label: str) -> bool:
         logger.warning(
             "Refusing to attach the Nous token to untrusted gateway origin %s "
             "for %s; add the exact origin to %s to allow it.",
-            resolved.origin,
+            _loggable_origin(resolved.origin),
             label,
             _TRUSTED_GATEWAY_ORIGINS_ENV,
         )
     return False
+
+
+def _loggable_origin(origin: str) -> str:
+    """The origin identity only — never userinfo, path, or query.
+
+    An env-shaped URL can embed credentials (``https://user:secret@host``);
+    a refusal warning must not copy them into logs. On an unparseable value,
+    say so rather than echoing it.
+    """
+    try:
+        parts = urlsplit(origin)
+        host = parts.hostname or ""
+        if not parts.scheme or not host:
+            return "<unparseable origin>"
+        port = f":{parts.port}" if parts.port is not None else ""
+        return f"{parts.scheme}://{host}{port}"
+    except ValueError:
+        return "<unparseable origin>"
 
 
 def resolve_managed_tool_gateway(
