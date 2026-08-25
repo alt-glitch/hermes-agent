@@ -1,10 +1,24 @@
-"""Generic managed-tool gateway helpers for Nous-hosted vendor passthroughs."""
+"""Generic managed-tool gateway helpers for Nous-hosted vendor passthroughs.
+
+Two separable questions live here, and keeping them apart is the whole design:
+
+* WHERE do requests go — :func:`build_vendor_gateway_url`,
+  :func:`managed_gateway_origin`, :func:`managed_vendor_endpoints`. Every env
+  override steers this freely; that is what local and staging setups use.
+* Which origin earns the user's Nous bearer — :func:`_bearer_is_allowed`. Trust
+  is provenance: the hardcoded default is trusted, loopback is trusted, and
+  ANY origin the environment shaped (including a ``TOOL_GATEWAY_SCHEME`` /
+  ``TOOL_GATEWAY_DOMAIN`` reshape, not just an exact-origin override) needs an
+  entry in ``HERMES_TRUSTED_GATEWAY_ORIGINS``. Deliberate: one settable env var
+  must not be enough to harvest the token.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -156,93 +170,222 @@ def get_tool_gateway_scheme() -> str:
     raise ValueError("TOOL_GATEWAY_SCHEME must be 'http' or 'https'")
 
 
-def build_vendor_gateway_url(vendor: str) -> str:
-    """Return the gateway origin for a specific vendor."""
-    vendor_key = f"{vendor.upper().replace('-', '_')}_GATEWAY_URL"
-    explicit_vendor_url = os.getenv(vendor_key, "").strip().rstrip("/")
-    if explicit_vendor_url:
-        return explicit_vendor_url
+# ---------------------------------------------------------------------------
+# Origin provenance
+# ---------------------------------------------------------------------------
+#
+# Every gateway origin this module hands out comes from ONE formula, and that
+# formula records WHERE the origin came from. Trust is then a property of
+# provenance, not a string comparison against a re-derived "expected" value:
+# the two inline deployed-origin f-strings this replaces were the same formula
+# written a third and fourth time, and they could drift from the real one
+# silently.
 
-    shared_scheme = get_tool_gateway_scheme()
-    shared_domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/")
-    if shared_domain:
-        return f"{shared_scheme}://{vendor}-gateway.{shared_domain}"
-
-    return f"{shared_scheme}://{vendor}-gateway.{_DEFAULT_TOOL_GATEWAY_DOMAIN}"
-
+# Host label for the shared managed gateway. Its own name, not a
+# ``{vendor}-gateway`` passthrough host.
+_MANAGED_GATEWAY_HOST_LABEL = "tools"
 
 _TRUSTED_GATEWAY_ORIGINS_ENV = "HERMES_TRUSTED_GATEWAY_ORIGINS"
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+# (label, origin) pairs already warned about. is_managed_tool_gateway_ready
+# runs on every availability scan — once per paint — so without this the log
+# fills with the same line forever (30-F5).
+_warned_untrusted_origins: set = set()
+_warned_untrusted_lock = threading.Lock()
 
-def _explicitly_trusted_origins() -> set:
-    raw = os.getenv(_TRUSTED_GATEWAY_ORIGINS_ENV, "")
-    return {entry.strip().rstrip("/") for entry in raw.split(",") if entry.strip()}
 
+@dataclass(frozen=True)
+class ResolvedOrigin:
+    """A gateway origin plus the answer to "did the environment shape it?".
 
-def _is_bearer_trusted_origin(origin: str, deployed_origin: str) -> bool:
-    """True when the Nous bearer may be attached to ``origin``.
-
-    Env vars may point a vendor at any URL (that is what local dev uses), but
-    a URL taken from the environment must not inherit the user's token: an
-    attacker who can set one env var must not be able to harvest the bearer.
-    Trusted: loopback hosts, the hardcoded deployed origin, and exact origins
-    listed in ``HERMES_TRUSTED_GATEWAY_ORIGINS`` (comma-separated). Exact
-    (scheme, netloc) membership only — never a suffix rule.
+    ``from_env`` is False ONLY on the fully-hardcoded default branch: no
+    ``*_GATEWAY_URL`` override, no ``TOOL_GATEWAY_SCHEME``, no
+    ``TOOL_GATEWAY_DOMAIN``. Anything the environment touched is env-derived,
+    which is what the bearer gate keys on.
     """
-    normalized = origin.rstrip("/")
+
+    origin: str
+    from_env: bool
+
+
+def _gateway_origin(env_key: str, host_label: str) -> Optional[ResolvedOrigin]:
+    """The one formula for a gateway origin. ``None`` when none can be built.
+
+    Precedence: ``env_key`` (an exact origin) beats the derived
+    ``{scheme}://{host_label}.{domain}``, where scheme and domain honor
+    ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN``.
+
+    ``None`` means a misconfigured ``TOOL_GATEWAY_SCHEME`` — the only way this
+    can fail. The ValueError is mapped HERE so no caller carries a try/except
+    for it; :func:`build_vendor_gateway_url` restates it as a raise because
+    that has always been its contract.
+    """
+    explicit = os.getenv(env_key, "").strip().rstrip("/")
+    if explicit:
+        return ResolvedOrigin(origin=explicit, from_env=True)
+
+    raw_scheme = os.getenv("TOOL_GATEWAY_SCHEME", "").strip()
+    raw_domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/")
     try:
-        parts = urlsplit(normalized)
+        scheme = get_tool_gateway_scheme()
     except ValueError:
-        return False
-    if parts.scheme not in {"http", "https"} or not parts.netloc:
-        return False
+        return None
+    domain = raw_domain or _DEFAULT_TOOL_GATEWAY_DOMAIN
+    return ResolvedOrigin(
+        origin=f"{scheme}://{host_label}.{domain}",
+        from_env=bool(raw_scheme or raw_domain),
+    )
+
+
+def _vendor_origin_env_key(vendor: str) -> str:
+    return f"{vendor.upper().replace('-', '_')}_GATEWAY_URL"
+
+
+def build_vendor_gateway_url(vendor: str) -> str:
+    """Return the gateway origin for a specific vendor.
+
+    Raises ``ValueError`` when ``TOOL_GATEWAY_SCHEME`` is not http/https —
+    unchanged contract, restated from the ``None`` :func:`_gateway_origin`
+    returns.
+    """
+    resolved = _gateway_origin(_vendor_origin_env_key(vendor), f"{vendor}-gateway")
+    if resolved is None:
+        raise ValueError("TOOL_GATEWAY_SCHEME must be 'http' or 'https'")
+    return resolved.origin
+
+
+def _origin_key(value: object) -> Optional[tuple]:
+    """Normalize an origin to a comparable ``(scheme, host, port)``.
+
+    The (scheme, netloc) comparison the bearer gate promises, done properly:
+    the host is lowercased (RFC 3986 makes it case-insensitive) and the port
+    is kept as-is, because a port is significant. Practical consequence for
+    ``HERMES_TRUSTED_GATEWAY_ORIGINS``: an entry must spell out the explicit
+    port when the origin it authorizes carries one — ``https://stage.example``
+    does not authorize ``https://stage.example:8443``, and no default-port
+    folding happens either.
+
+    ``None`` for anything that is not an http(s) origin.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
     try:
+        parts = urlsplit(value.strip().rstrip("/"))
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            return None
         host = (parts.hostname or "").lower()
+        port = parts.port
     except ValueError:
+        # urlsplit raises on a malformed port or IPv6 literal.
+        return None
+    if not host:
+        return None
+    return parts.scheme, host, port
+
+
+def _is_loopback(origin: object) -> bool:
+    """True for an origin on the local machine.
+
+    Includes the ``.localhost`` name suffix, which an existing dev flow needs
+    ({vendor}-gateway.localhost:3009). Be honest about what that is: RFC 6761
+    INTENDS ``.localhost`` to resolve to loopback, but this is a name check,
+    not a check of the resolved address — an OS resolver override could point
+    it elsewhere. Acceptable, because setting one requires control of the local
+    machine, which already owns the token this gate protects.
+    """
+    key = _origin_key(origin)
+    if key is None:
         return False
-    if host in _LOOPBACK_HOSTS or host.endswith(".localhost"):
-        # RFC 6761 reserves the .localhost TLD for loopback.
+    host = key[1]
+    return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+
+
+def _trusted_origin_keys() -> set:
+    """``HERMES_TRUSTED_GATEWAY_ORIGINS`` normalized the same way as an origin."""
+    raw = os.getenv(_TRUSTED_GATEWAY_ORIGINS_ENV, "")
+    keys = set()
+    for entry in raw.split(","):
+        key = _origin_key(entry)
+        if key is not None:
+            keys.add(key)
+    return keys
+
+
+def _is_bearer_trusted_origin(origin: object) -> bool:
+    """True when an ENV-DERIVED origin may still carry the Nous bearer.
+
+    Exact ``(scheme, host, port)`` membership only, never a suffix rule — plus
+    loopback, which needs no configuration.
+    """
+    key = _origin_key(origin)
+    if key is None:
+        return False
+    if _is_loopback(origin):
         return True
-    if normalized == deployed_origin:
+    return key in _trusted_origin_keys()
+
+
+def _bearer_is_allowed(resolved: ResolvedOrigin, label: str) -> bool:
+    """Trust as provenance: the hardcoded default, loopback, or trust-listed.
+
+    The security model, owner-approved and deliberate: an origin the
+    environment shaped does NOT inherit the user's token, because an attacker
+    who can set one env var must not be able to harvest the bearer. That
+    includes ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN`` reshapes, not
+    just the exact-origin overrides — a reshaped host needs listing in
+    ``HERMES_TRUSTED_GATEWAY_ORIGINS`` exactly like ``TOOL_GATEWAY_URL`` does.
+    Loopback needs nothing.
+
+    Warns at most once per (label, origin): this runs on the availability path,
+    which repaints constantly.
+    """
+    if not resolved.from_env:
         return True
-    return normalized in _explicitly_trusted_origins()
+    if _is_bearer_trusted_origin(resolved.origin):
+        return True
+    seen_key = (label, resolved.origin)
+    with _warned_untrusted_lock:
+        first_time = seen_key not in _warned_untrusted_origins
+        if first_time:
+            _warned_untrusted_origins.add(seen_key)
+    if first_time:
+        logger.warning(
+            "Refusing to attach the Nous token to untrusted gateway origin %s "
+            "for %s; add the exact origin to %s to allow it.",
+            resolved.origin,
+            label,
+            _TRUSTED_GATEWAY_ORIGINS_ENV,
+        )
+    return False
 
 
 def resolve_managed_tool_gateway(
     vendor: str,
-    gateway_builder: Optional[Callable[[str], str]] = None,
     token_reader: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[ManagedToolGatewayConfig]:
-    """Resolve shared managed-tool gateway config for a vendor."""
+    """Resolve shared managed-tool gateway config for a vendor.
+
+    ``None`` means "not in managed mode", which covers three things: no
+    entitlement, no resolvable origin, and — see :func:`_bearer_is_allowed` —
+    an env-derived origin that is not trust-listed.
+    """
     if not managed_nous_tools_enabled():
         return None
 
-    resolved_gateway_builder = gateway_builder or build_vendor_gateway_url
-    resolved_token_reader = token_reader or read_nous_access_token
-
-    gateway_origin = resolved_gateway_builder(vendor)
-    if gateway_origin and gateway_builder is None and not _is_bearer_trusted_origin(
-        gateway_origin,
-        f"{_DEFAULT_TOOL_GATEWAY_SCHEME}://{vendor}-gateway.{_DEFAULT_TOOL_GATEWAY_DOMAIN}",
-    ):
-        # An injected gateway_builder is a DI seam whose caller owns the
-        # decision; an env-derived origin gets no token unless trusted.
-        logger.warning(
-            "Refusing to attach the Nous token to untrusted gateway origin %s "
-            "for vendor %s; add the exact origin to %s to allow it.",
-            gateway_origin,
-            vendor,
-            _TRUSTED_GATEWAY_ORIGINS_ENV,
-        )
+    resolved = _gateway_origin(_vendor_origin_env_key(vendor), f"{vendor}-gateway")
+    if resolved is None or not resolved.origin:
         return None
-    nous_user_token = resolved_token_reader()
-    if not gateway_origin or not nous_user_token:
+    if not _bearer_is_allowed(resolved, f"vendor {vendor}"):
+        return None
+
+    nous_user_token = (token_reader or read_nous_access_token)()
+    if not nous_user_token:
         return None
 
     return ManagedToolGatewayConfig(
         vendor=vendor,
-        gateway_origin=gateway_origin,
+        gateway_origin=resolved.origin,
         nous_user_token=nous_user_token,
         managed_mode=True,
     )
@@ -250,7 +393,6 @@ def resolve_managed_tool_gateway(
 
 def is_managed_tool_gateway_ready(
     vendor: str,
-    gateway_builder: Optional[Callable[[str], str]] = None,
     token_reader: Optional[Callable[[], Optional[str]]] = None,
 ) -> bool:
     """Return True when gateway URL and a likely-usable Nous token are present.
@@ -262,7 +404,6 @@ def is_managed_tool_gateway_ready(
     """
     return resolve_managed_tool_gateway(
         vendor,
-        gateway_builder=gateway_builder,
         token_reader=token_reader or peek_nous_access_token,
     ) is not None
 
@@ -283,14 +424,12 @@ def is_managed_tool_gateway_ready(
 # vendor but not the vendor's own API, so nothing here needs to know the
 # upstream's endpoint or field names.
 
-# Vendor label handed to injected ``gateway_builder`` seams when resolving the
-# shared managed origin. Default resolution does NOT go through
-# build_vendor_gateway_url: the shared origin has its own host (see
-# managed_gateway_origin), not a ``{vendor}-gateway`` passthrough name.
-_MANAGED_GATEWAY_VENDOR = "tool"
+def _resolved_managed_gateway_origin() -> Optional[ResolvedOrigin]:
+    """The shared managed origin WITH its provenance, for the bearer gate."""
+    return _gateway_origin("TOOL_GATEWAY_URL", _MANAGED_GATEWAY_HOST_LABEL)
 
 
-def managed_gateway_origin() -> str:
+def managed_gateway_origin() -> Optional[str]:
     """Origin for the shared managed gateway (connectors + on-origin vendors).
 
     Honors the same overrides as vendor hosts: ``TOOL_GATEWAY_URL`` pins the
@@ -298,14 +437,15 @@ def managed_gateway_origin() -> str:
     ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN`` reshape the default.
     The deployed host is ``tools.<domain>`` — the gateway's own name, not a
     ``{vendor}-gateway`` passthrough host.
-    """
-    explicit = os.getenv("TOOL_GATEWAY_URL", "").strip().rstrip("/")
-    if explicit:
-        return explicit
 
-    scheme = get_tool_gateway_scheme()
-    domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/") or _DEFAULT_TOOL_GATEWAY_DOMAIN
-    return f"{scheme}://tools.{domain}"
+    ADDRESS ONLY. Every override here still steers where requests go; whether
+    the origin also earns the bearer is :func:`_bearer_is_allowed`'s call.
+    ``None`` when ``TOOL_GATEWAY_SCHEME`` is misconfigured, so callers need no
+    try/except of their own.
+    """
+    resolved = _resolved_managed_gateway_origin()
+    return resolved.origin if resolved is not None else None
+
 
 def managed_vendor_base_path(vendor: str) -> str:
     """Base path for a managed vendor's REST routes on the gateway host."""
@@ -317,10 +457,7 @@ def managed_vendor_upload_path(vendor: str) -> str:
     return f"/api/uploads/{vendor}"
 
 
-def managed_vendor_endpoints(
-    vendor: str,
-    gateway_builder: Optional[Callable[[str], str]] = None,
-) -> Optional[dict]:
+def managed_vendor_endpoints(vendor: str) -> Optional[dict]:
     """Absolute URLs for a managed vendor, or ``None`` when none resolves.
 
     Address resolution only: entitlement is deliberately not consulted here.
@@ -329,18 +466,14 @@ def managed_vendor_endpoints(
     ever disagree with the server. A caller that wants to hide its tools from
     users who could not call them at all does that in its ``check_fn``.
 
+    The bearer gate is likewise not consulted: an untrusted origin still has an
+    address, and the caller finds out it earns no token when
+    :func:`managed_gateway_auth_headers` comes back empty.
+
     ``None`` means no origin could be resolved — a misconfigured
     ``TOOL_GATEWAY_SCHEME`` — so there is nothing to call.
     """
-    try:
-        raw_origin = (
-            gateway_builder(_MANAGED_GATEWAY_VENDOR)
-            if gateway_builder
-            else managed_gateway_origin()
-        )
-        origin = raw_origin.rstrip("/")
-    except ValueError:
-        return None
+    origin = (managed_gateway_origin() or "").rstrip("/")
     if not origin:
         return None
 
@@ -351,46 +484,44 @@ def managed_vendor_endpoints(
     }
 
 
-def is_managed_nous_gateway_url(
-    url: object,
-    gateway_builder: Optional[Callable[[str], str]] = None,
-) -> bool:
-    """True when ``url`` is on the Nous tool-gateway origin this client builds.
+def is_managed_nous_gateway_url(url: object) -> bool:
+    """True when ``url`` is on the shared gateway origin AND that origin is trusted.
 
     Anything granting a URL extra trust — our bearer, reading files off disk to
     upload — must gate on this rather than on a name, so an arbitrary URL can
     never inherit that trust.
+
+    What a ``False`` actually does, in all three consumers (none of them sends
+    an unauthenticated request):
+
+    * the connectors client refuses before the wire, raising ``GatewayAuthError``
+      ("no portal access token available") so the dispatch reports a gateway
+      failure instead of a 401;
+    * the managed media tool renders its sign-in message to the model in place
+      of the call;
+    * the media uploader is never built at all, so the owning tool refuses
+      local file paths and asks for a URL.
+
+    So a bad override fails loudly and early rather than handing the token to
+    whatever the environment names.
     """
-    if not isinstance(url, str) or not url.strip():
+    actual = _origin_key(url)
+    if actual is None:
+        # Not an http(s) origin at all — nothing to compare, and no reason to
+        # warn about the gateway's own configuration.
         return False
 
-    try:
-        expected_origin = (
-            gateway_builder(_MANAGED_GATEWAY_VENDOR)
-            if gateway_builder
-            else managed_gateway_origin()
-        )
-        expected = urlsplit(expected_origin)
-        actual = urlsplit(url.strip())
-    except ValueError:
+    resolved = _resolved_managed_gateway_origin()
+    if resolved is None:
+        return False
+    if not _bearer_is_allowed(resolved, "the shared gateway"):
         return False
 
-    if gateway_builder is None and not _is_bearer_trusted_origin(
-        expected_origin,
-        f"{_DEFAULT_TOOL_GATEWAY_SCHEME}://tools.{_DEFAULT_TOOL_GATEWAY_DOMAIN}",
-    ):
-        # TOOL_GATEWAY_URL may re-point the shared origin (local dev), but an
-        # env-derived origin never inherits the bearer: requests still go out,
-        # just unauthenticated, so a bad override fails loudly instead of
-        # handing the token to whatever the environment names.
-        return False
-
-    return bool(actual.scheme) and (actual.scheme, actual.netloc) == (expected.scheme, expected.netloc)
+    return actual == _origin_key(resolved.origin)
 
 
 def managed_gateway_auth_headers(
     url: object,
-    gateway_builder: Optional[Callable[[str], str]] = None,
     token_reader: Optional[Callable[[], Optional[str]]] = None,
 ) -> dict:
     """Live auth headers for a managed gateway URL, or ``{}`` when not managed.
@@ -400,7 +531,7 @@ def managed_gateway_auth_headers(
     bearer. Returns ``{}`` rather than raising when no token is available, so a
     caller can report "sign in" instead of sending an unauthenticated request.
     """
-    if not is_managed_nous_gateway_url(url, gateway_builder):
+    if not is_managed_nous_gateway_url(url):
         return {}
 
     resolved_token_reader = token_reader or read_nous_access_token
@@ -456,7 +587,6 @@ def _describe_media_upload_refusal(response) -> str:
 def build_managed_media_uploader(
     server_url: object,
     upload_path: object,
-    gateway_builder: Optional[Callable[[str], str]] = None,
     token_reader: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[Callable]:
     """Async ``(data, mime) -> argument value`` uploader for one managed vendor.
@@ -477,7 +607,7 @@ def build_managed_media_uploader(
        bound to this Nous principal and is redeemable only through the
        gateway, so it is inert anywhere else it might end up.
     """
-    if not is_managed_nous_gateway_url(server_url, gateway_builder):
+    if not is_managed_nous_gateway_url(server_url):
         return None
     if not isinstance(upload_path, str) or not upload_path.startswith("/"):
         return None
@@ -491,7 +621,7 @@ def build_managed_media_uploader(
 
         from tools.url_safety import create_ssrf_safe_async_client
 
-        headers = managed_gateway_auth_headers(server_url, gateway_builder, token_reader)
+        headers = managed_gateway_auth_headers(server_url, token_reader)
         if not headers:
             raise RuntimeError("no Nous credential is available for the upload")
 
