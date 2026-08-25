@@ -1,4 +1,18 @@
-"""Generic managed-tool gateway helpers for Nous-hosted vendor passthroughs."""
+"""Managed-tool gateway helpers: host resolution, bearer trust, media uploads.
+
+Hermes talks to three shapes of first-party gateway host, all named
+``{label}-gateway.<domain>`` and all resolved by one formula
+(:func:`_gateway_origin_for_host_label`):
+
+* ``connector-gateway`` — the connectors API (``/v1/connectors/*``). Its own
+  deployment, its own canonical host, its own ``CONNECTOR_GATEWAY_URL``
+  override.
+* ``tool-gateway`` — the vendors the gateway serves on its own origin under
+  ``/api/{vendor}``, plus the media upload endpoints. Overridden with
+  ``TOOL_GATEWAY_URL``.
+* ``{vendor}-gateway`` — per-vendor passthroughs (Firecrawl, BFL, ...), each
+  overridable on its own with ``{VENDOR}_GATEWAY_URL``.
+"""
 
 from __future__ import annotations
 
@@ -156,19 +170,33 @@ def get_tool_gateway_scheme() -> str:
     raise ValueError("TOOL_GATEWAY_SCHEME must be 'http' or 'https'")
 
 
-def build_vendor_gateway_url(vendor: str) -> str:
-    """Return the gateway origin for a specific vendor."""
-    vendor_key = f"{vendor.upper().replace('-', '_')}_GATEWAY_URL"
-    explicit_vendor_url = os.getenv(vendor_key, "").strip().rstrip("/")
-    if explicit_vendor_url:
-        return explicit_vendor_url
+def _gateway_origin_for_host_label(label: str) -> str:
+    """Resolve the origin of the gateway host named ``{label}-gateway``.
+
+    One formula serves every gateway host Hermes talks to, because they are
+    all named the same way: ``{LABEL}_GATEWAY_URL`` pins the origin exactly
+    (``TOOL_GATEWAY_URL``, ``CONNECTOR_GATEWAY_URL``, ``BFL_GATEWAY_URL``, ...),
+    and otherwise ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN`` reshape the
+    default ``{label}-gateway.<domain>``. Keeping the derivation in one place is
+    what makes a new host a one-line addition instead of a fourth near-copy of
+    the same string building.
+    """
+    env_key = f"{label.upper().replace('-', '_')}_GATEWAY_URL"
+    explicit_url = os.getenv(env_key, "").strip().rstrip("/")
+    if explicit_url:
+        return explicit_url
 
     shared_scheme = get_tool_gateway_scheme()
-    shared_domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/")
-    if shared_domain:
-        return f"{shared_scheme}://{vendor}-gateway.{shared_domain}"
+    shared_domain = (
+        os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/")
+        or _DEFAULT_TOOL_GATEWAY_DOMAIN
+    )
+    return f"{shared_scheme}://{label}-gateway.{shared_domain}"
 
-    return f"{shared_scheme}://{vendor}-gateway.{_DEFAULT_TOOL_GATEWAY_DOMAIN}"
+
+def build_vendor_gateway_url(vendor: str) -> str:
+    """Return the gateway origin for a specific vendor passthrough host."""
+    return _gateway_origin_for_host_label(vendor)
 
 
 def resolve_managed_tool_gateway(
@@ -231,29 +259,38 @@ def is_managed_tool_gateway_ready(
 # vendor but not the vendor's own API, so nothing here needs to know the
 # upstream's endpoint or field names.
 
-# Vendor label handed to injected ``gateway_builder`` seams when resolving the
-# shared managed origin. Default resolution does NOT go through
-# build_vendor_gateway_url: the shared origin has its own host (see
-# managed_gateway_origin), not a ``{vendor}-gateway`` passthrough name.
+# Host labels for the two first-party gateway surfaces. Both go through the
+# same ``{label}-gateway.<domain>`` formula as a vendor passthrough, so an
+# injected ``gateway_builder`` seam can resolve them by label too.
 _MANAGED_GATEWAY_VENDOR = "tool"
+_CONNECTOR_GATEWAY_LABEL = "connector"
 
 
 def managed_gateway_origin() -> str:
-    """Origin for the shared managed gateway (connectors + on-origin vendors).
+    """Origin for the media/on-origin-vendor gateway host, ``tool-gateway``.
 
-    Honors the same overrides as vendor hosts: ``TOOL_GATEWAY_URL`` pins the
-    full origin (the local harness sets ``http://127.0.0.1:3009``), and
-    ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN`` reshape the default.
-    The deployed host is ``tools.<domain>`` — the gateway's own name, not a
-    ``{vendor}-gateway`` passthrough host.
+    This is the shared managed origin: the vendors the gateway serves on its
+    own origin under ``/api/{vendor}`` plus the media upload endpoints. It is
+    NOT where the connectors API lives — see :func:`connector_gateway_origin`.
+
+    ``TOOL_GATEWAY_URL`` pins the full origin (the local harness sets
+    ``http://127.0.0.1:3009``); otherwise ``TOOL_GATEWAY_SCHEME`` /
+    ``TOOL_GATEWAY_DOMAIN`` reshape the default ``tool-gateway.<domain>``.
     """
-    explicit = os.getenv("TOOL_GATEWAY_URL", "").strip().rstrip("/")
-    if explicit:
-        return explicit
+    return _gateway_origin_for_host_label(_MANAGED_GATEWAY_VENDOR)
 
-    scheme = get_tool_gateway_scheme()
-    domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/") or _DEFAULT_TOOL_GATEWAY_DOMAIN
-    return f"{scheme}://tools.{domain}"
+
+def connector_gateway_origin() -> str:
+    """Origin for the connectors API host, ``connector-gateway``.
+
+    The connectors API is its own deployment with its own canonical host, so it
+    gets its own override key — ``CONNECTOR_GATEWAY_URL`` — rather than riding
+    on the media host's. ``TOOL_GATEWAY_SCHEME`` / ``TOOL_GATEWAY_DOMAIN``
+    reshape the default ``connector-gateway.<domain>`` the same way they
+    reshape every other gateway host.
+    """
+    return _gateway_origin_for_host_label(_CONNECTOR_GATEWAY_LABEL)
+
 
 def managed_vendor_base_path(vendor: str) -> str:
     """Base path for a managed vendor's REST routes on the gateway host."""
@@ -303,27 +340,32 @@ def is_managed_nous_gateway_url(
     url: object,
     gateway_builder: Optional[Callable[[str], str]] = None,
 ) -> bool:
-    """True when ``url`` is on the Nous tool-gateway origin this client builds.
+    """True when ``url`` is on one of the first-party gateway origins we build.
+
+    Both first-party surfaces count: the media/on-origin-vendor host
+    (:func:`managed_gateway_origin`) and the connectors host
+    (:func:`connector_gateway_origin`). Each is compared as an exact
+    ``(scheme, netloc)`` pair — never as a name or a domain suffix — so
+    ``evil-connector-gateway.nousresearch.com.attacker.dev`` and an ``http``
+    downgrade of a real host both stay outside the set.
 
     Anything granting a URL extra trust — our bearer, reading files off disk to
-    upload — must gate on this rather than on a name, so an arbitrary URL can
-    never inherit that trust.
+    upload — must gate on this, so an arbitrary URL can never inherit it.
     """
     if not isinstance(url, str) or not url.strip():
         return False
 
+    build_origin = gateway_builder or _gateway_origin_for_host_label
     try:
-        expected_origin = (
-            gateway_builder(_MANAGED_GATEWAY_VENDOR)
-            if gateway_builder
-            else managed_gateway_origin()
-        )
-        expected = urlsplit(expected_origin)
+        expected = {
+            urlsplit(build_origin(label))[:2]
+            for label in (_MANAGED_GATEWAY_VENDOR, _CONNECTOR_GATEWAY_LABEL)
+        }
         actual = urlsplit(url.strip())
     except ValueError:
         return False
 
-    return bool(actual.scheme) and (actual.scheme, actual.netloc) == (expected.scheme, expected.netloc)
+    return bool(actual.scheme) and (actual.scheme, actual.netloc) in expected
 
 
 def managed_gateway_auth_headers(
