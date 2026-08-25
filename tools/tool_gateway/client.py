@@ -143,6 +143,29 @@ class ConnectorClient:
         payload = self._post(wire.CONNECTOR_CONNECTIONS_PATH, body, retries=0)
         return wire.ConnectorConnectionsResponse.model_validate(payload).model_dump()
 
+    def list_connectors(self) -> list[dict[str, Any]]:
+        """GET v1/connectors, following pagination. Read-only.
+
+        Returns the raw item dicts (``{"connector", "enabled", "connected"}``
+        today; tolerant of additions). The page size cap is the gateway's.
+        """
+        items: list[dict[str, Any]] = []
+        cursor: Optional[str] = None
+        for _ in range(20):  # generous page bound; the catalog is small
+            path = f"{wire.CONNECTORS_PATH}?limit=50"
+            if cursor:
+                path += f"&cursor={cursor}"
+            payload = self._request("GET", path, None)
+            if not isinstance(payload, dict):
+                break
+            page = payload.get("items")
+            if isinstance(page, list):
+                items.extend(entry for entry in page if isinstance(entry, dict))
+            cursor = payload.get("nextCursor")
+            if not cursor:
+                break
+        return items
+
     def execute(self, planned: Sequence[PlannedCall]) -> list[dict[str, Any]]:
         """POST v1/connectors/execute — ONE request for the whole slice.
 
@@ -182,6 +205,21 @@ class ConnectorClient:
         idempotency_key: Optional[str] = None,
         retries: int = _MAX_RETRIES,
     ) -> Any:
+        return self._request(
+            "POST", path, body,
+            timeout=timeout, idempotency_key=idempotency_key, retries=retries,
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict[str, Any]],
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        idempotency_key: Optional[str] = None,
+        retries: int = _MAX_RETRIES,
+    ) -> Any:
         origin = self._endpoint_resolver()
         if not origin:
             raise GatewayUnavailable(
@@ -204,7 +242,7 @@ class ConnectorClient:
 
             try:
                 response = self._transport.request(
-                    "POST", url, headers=headers, json=body, timeout=timeout
+                    method, url, headers=headers, json=body, timeout=timeout
                 )
             except Exception as exc:
                 last_error = ToolGatewayError(
