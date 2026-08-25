@@ -1013,7 +1013,10 @@ PLATFORM_HINTS = {
         "When the user asks to add, enable, or authorize an MCP server (or a "
         "task clearly needs one that is missing), use the setup_mcp tool if "
         "it is available — it shows an inline consent card right in the chat; "
-        "never hand-edit mcp_servers config for them."
+        "never hand-edit mcp_servers config for them. For remote connector "
+        "accounts (tools reached through tool_search with connectors__ "
+        "names), use manage_connections to check status and get "
+        "authorization links."
     ),
     "sms": (
         "You are communicating via SMS. Keep responses concise and use plain text "
