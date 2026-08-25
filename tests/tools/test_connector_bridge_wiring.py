@@ -315,7 +315,7 @@ def test_pre_dispatch_block_denies_one_remote_entry_and_siblings_run():
             ],
             local_dispatch=lambda n, a: (True, "{}"),
             pre_dispatch=lambda name, args: (
-                "blocked by policy" if "gmail" in name else None
+                ("blocked by policy", None) if "gmail" in name else (None, None)
             ),
             availability=lambda: True,
             client_factory=lambda: FakeClient(),
@@ -324,6 +324,179 @@ def test_pre_dispatch_block_denies_one_remote_entry_and_siblings_run():
     assert out["results"][0]["error"]["code"] == "USER_DENIED"
     assert out["results"][1]["response"] == "posted"
     assert out["success_count"] == 1 and out["error_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# pre_dispatch argument rewrites (policy sanitization/redaction) reach the WIRE
+#
+# A pre_tool_call `modify` directive is a policy rewrite; the single-entry
+# deferred path applies it before dispatch. These assert on the outgoing
+# gateway request body, not on bridge internals: a rewrite that stops at the
+# PlannedCall and never reaches the transport is exactly the bug.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self.status_code = 200
+        self._body = body
+        self.text = json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+class _RecordingTransport:
+    """Records every outgoing request; answers each with `data` echoes."""
+
+    def __init__(self):
+        self.requests = []
+
+    def request(self, method, url, *, headers=None, json=None, timeout=None):
+        self.requests.append({"method": method, "url": url, "json": json})
+        tools = (json or {}).get("tools") or []
+        results = [
+            {"index": i, "connector": t.get("connector"), "tool": t.get("tool"), "data": "ok"}
+            for i, t in enumerate(tools)
+        ]
+        return _FakeResponse(
+            {
+                "results": results,
+                "successCount": len(results),
+                "errorCount": 0,
+                "totalCount": len(results),
+            }
+        )
+
+
+def _recording_client_factory(transport):
+    from tools.tool_gateway.client import ConnectorClient
+
+    return lambda: ConnectorClient(
+        transport=transport,
+        endpoint_resolver=lambda: "https://tool-gateway.test",
+        header_provider=lambda url: {"Authorization": "Bearer nous-token"},
+    )
+
+
+def _sent_tools(transport):
+    assert len(transport.requests) == 1
+    return transport.requests[0]["json"]["tools"]
+
+
+def test_pre_dispatch_rewrite_reaches_the_gateway_request_body():
+    transport = _RecordingTransport()
+
+    def gate(name, args):
+        # A redaction pass: the secret never leaves the process.
+        return None, {**args, "body": "[REDACTED]"}
+
+    out = json.loads(
+        dispatch_calls(
+            [{"name": "connectors__gmail__GMAIL_SEND_EMAIL",
+              "arguments": {"to": "x@example.com", "body": "sk-live-secret"}}],
+            local_dispatch=lambda n, a: (True, "{}"),
+            pre_dispatch=gate,
+            availability=lambda: True,
+            client_factory=_recording_client_factory(transport),
+        )
+    )
+    assert _sent_tools(transport) == [
+        {
+            "connector": "gmail",
+            "tool": "GMAIL_SEND_EMAIL",
+            "arguments": {"to": "x@example.com", "body": "[REDACTED]"},
+        }
+    ]
+    assert "sk-live-secret" not in json.dumps(transport.requests[0]["json"])
+    assert out["results"][0]["response"] == "ok"  # correlation survives the rebuild
+
+
+def test_pre_dispatch_rewrite_does_not_leak_to_sibling_entries():
+    transport = _RecordingTransport()
+
+    def gate(name, args):
+        if "slack" in name:
+            return None, {**args, "channel": "#safe"}
+        return None, None  # explicit "no change" for the sibling
+
+    out = json.loads(
+        dispatch_calls(
+            [
+                {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "keep-me"}},
+                {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {"channel": "#raw"}},
+            ],
+            local_dispatch=lambda n, a: (True, "{}"),
+            pre_dispatch=gate,
+            availability=lambda: True,
+            client_factory=_recording_client_factory(transport),
+        )
+    )
+    assert _sent_tools(transport) == [
+        {"connector": "gmail", "tool": "GMAIL_SEND_EMAIL", "arguments": {"to": "keep-me"}},
+        {"connector": "slack", "tool": "SLACK_POST_MESSAGE", "arguments": {"channel": "#safe"}},
+    ]
+    assert [e["response"] for e in out["results"]] == ["ok", "ok"]
+
+
+def test_pre_dispatch_block_keeps_the_entry_off_the_wire_entirely():
+    transport = _RecordingTransport()
+
+    out = json.loads(
+        dispatch_calls(
+            [
+                {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "blocked"}},
+                {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {"channel": "#ok"}},
+            ],
+            local_dispatch=lambda n, a: (True, "{}"),
+            # A block wins even when the same pass also produced a rewrite.
+            pre_dispatch=lambda name, args: (
+                ("blocked by policy", {"to": "rewritten"}) if "gmail" in name else (None, None)
+            ),
+            availability=lambda: True,
+            client_factory=_recording_client_factory(transport),
+        )
+    )
+    assert _sent_tools(transport) == [
+        {"connector": "slack", "tool": "SLACK_POST_MESSAGE", "arguments": {"channel": "#ok"}}
+    ]
+    assert out["results"][0]["error"]["code"] == "USER_DENIED"
+    assert out["results"][0]["error"]["message"] == "blocked by policy"
+    assert out["results"][1]["response"] == "ok"
+
+
+def test_pre_dispatch_rewrite_to_empty_dict_is_a_rewrite_not_a_no_op():
+    # "No change" is None; an empty dict is a deliberate strip-all rewrite.
+    transport = _RecordingTransport()
+
+    dispatch_calls(
+        [{"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "x"}}],
+        local_dispatch=lambda n, a: (True, "{}"),
+        pre_dispatch=lambda name, args: (None, {}),
+        availability=lambda: True,
+        client_factory=_recording_client_factory(transport),
+    )
+    assert _sent_tools(transport) == [
+        {"connector": "gmail", "tool": "GMAIL_SEND_EMAIL", "arguments": {}}
+    ]
+
+
+def test_pre_dispatch_exception_sends_the_original_arguments():
+    transport = _RecordingTransport()
+
+    def exploding_gate(name, args):
+        raise RuntimeError("hook blew up")
+
+    dispatch_calls(
+        [{"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "x"}}],
+        local_dispatch=lambda n, a: (True, "{}"),
+        pre_dispatch=exploding_gate,
+        availability=lambda: True,
+        client_factory=_recording_client_factory(transport),
+    )
+    assert _sent_tools(transport) == [
+        {"connector": "gmail", "tool": "GMAIL_SEND_EMAIL", "arguments": {"to": "x"}}
+    ]
 
 
 def test_local_tool_error_results_are_counted_as_errors():
