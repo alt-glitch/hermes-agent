@@ -313,7 +313,7 @@ def test_pre_dispatch_block_denies_one_remote_entry_and_siblings_run():
                 {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
                 {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {}},
             ],
-            local_dispatch=lambda n, a: "{}",
+            local_dispatch=lambda n, a: (True, "{}"),
             pre_dispatch=lambda name, args: (
                 "blocked by policy" if "gmail" in name else None
             ),
@@ -328,7 +328,10 @@ def test_pre_dispatch_block_denies_one_remote_entry_and_siblings_run():
 
 def test_local_tool_error_results_are_counted_as_errors():
     def local_dispatch(name, arguments):
-        return json.dumps({"error": f"'{name}' is not available in this session."})
+        # ok=False: the dispatcher declares its own refusal.
+        return False, json.dumps(
+            {"error": f"'{name}' is not available in this session."}
+        )
 
     out = json.loads(
         dispatch_calls(
@@ -340,7 +343,54 @@ def test_local_tool_error_results_are_counted_as_errors():
         )
     )
     assert all(e["error"]["code"] == "TOOL_ERROR" for e in out["results"])
+    assert all("not available" in e["error"]["message"] for e in out["results"])
     assert out["error_count"] == 2 and out["success_count"] == 0
+
+
+def test_local_refusal_extras_survive_into_the_error_slot():
+    # tool_error takes arbitrary extras; an allow-list of ("parameters",
+    # "hint") silently dropped everything else, so the model never saw them.
+    def local_dispatch(name, arguments):
+        return False, json.dumps(
+            {
+                "error": "upstream said no",
+                "code": 404,
+                "parameters": {"title": "string"},
+                "hint": "pass a title",
+                "retry_after": 30,
+            }
+        )
+
+    out = json.loads(
+        dispatch_calls([{"name": "denied_tool", "arguments": {}}], local_dispatch=local_dispatch)
+    )
+    slot = out["results"][0]["error"]
+    assert slot["code"] == 404  # caller-supplied code is NOT overwritten
+    assert slot["message"] == "upstream said no"
+    assert slot["parameters"] == {"title": "string"}
+    assert slot["hint"] == "pass a title"
+    assert slot["retry_after"] == 30  # the key an allow-list would have eaten
+
+
+def test_successful_result_carrying_an_error_field_is_not_misclassified():
+    # A legitimate result may report per-item errors under "error". Sniffing
+    # for that key filed the whole call as a failure and threw the payload away.
+    def local_dispatch(name, arguments):
+        return True, json.dumps(
+            {"error": "2 of 5 rows rejected", "rows": [1, 2, 3], "written": 3}
+        )
+
+    out = json.loads(
+        dispatch_calls([{"name": "bulk_write", "arguments": {}}], local_dispatch=local_dispatch)
+    )
+    entry = out["results"][0]
+    assert "error" not in entry
+    assert entry["response"] == {
+        "error": "2 of 5 rows rejected",
+        "rows": [1, 2, 3],
+        "written": 3,
+    }
+    assert out["success_count"] == 1 and out["error_count"] == 0
 
 
 # ---------------------------------------------------------------------------
