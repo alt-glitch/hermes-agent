@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Manage remote connector accounts and local MCP servers.
 
-``tool_manage_connections`` is the never-deferred surface for connection
+``manage_connections`` is the never-deferred surface for connection
 lifecycle:
 
 - ``status`` — which connectors exist for this account and whether each is
@@ -66,7 +66,7 @@ def manage_connections(
     seen_instructions: Optional[set] = None,
     session_id: Optional[str] = None,
 ) -> str:
-    """Dispatch one ``tool_manage_connections`` action. Returns a JSON string."""
+    """Dispatch one ``manage_connections`` action. Returns a JSON string."""
     action = str(args.get("action") or "status").strip().lower()
 
     if action in _MCP_ACTIONS:
@@ -157,8 +157,8 @@ def manage_connections(
         )
 
 
-TOOL_MANAGE_CONNECTIONS_SCHEMA = {
-    "name": "tool_manage_connections",
+MANAGE_CONNECTIONS_SCHEMA = {
+    "name": "manage_connections",
     "description": (
         "Manage remote connector accounts (Gmail, Linear, Notion, ...) served "
         "through the tool gateway, and set up local MCP servers. Actions: "
@@ -202,9 +202,9 @@ TOOL_MANAGE_CONNECTIONS_SCHEMA = {
 
 
 registry.register(
-    name="tool_manage_connections",
+    name="manage_connections",
     toolset="connections",
-    schema=TOOL_MANAGE_CONNECTIONS_SCHEMA,
+    schema=MANAGE_CONNECTIONS_SCHEMA,
     handler=lambda args, **kw: manage_connections(
         args, callback=kw.get("callback"), session_id=kw.get("session_id")
     ),

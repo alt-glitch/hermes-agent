@@ -1015,7 +1015,7 @@ PLATFORM_HINTS = {
         "it is available — it shows an inline consent card right in the chat; "
         "never hand-edit mcp_servers config for them. For remote connector "
         "accounts (tools reached through tool_search with connectors__ "
-        "names), use tool_manage_connections to check status and get "
+        "names), use manage_connections to check status and get "
         "authorization links."
     ),
     "sms": (
