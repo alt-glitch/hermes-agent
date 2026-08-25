@@ -1351,21 +1351,26 @@ def handle_function_call(
                 # connector bridge partitions it: connector entries travel as
                 # ONE gateway request; local entries run through the SAME
                 # gates as the single-call path below via this closure —
-                # session scope, probe validation, then the normal recursive
-                # dispatch so hooks fire against each real tool name.
+                # repair hint, session scope, probe validation, then the
+                # normal recursive dispatch. The three skip flags are FORCED
+                # off: the executor's own hook/middleware pass fired against
+                # the tool_call wrapper, never against these entry names, so
+                # the recursion must own the per-entry policy pipeline —
+                # otherwise a 2-entry batch would evade every pre_tool_call
+                # block and middleware rewrite keyed on a real tool name.
                 _scoped_batch = _ts_mod.scoped_deferrable_names(current_defs)
 
                 def _local_dispatch(_name: str, _args: Dict[str, Any]) -> str:
-                    if _name not in _scoped_batch:
-                        return tool_error(
-                            f"'{_name}' is not available in this session. "
-                            "Use tool_search to find tools you can call."
-                        )
                     if not _ts_mod.is_deferrable_tool_name(_name):
                         return tool_error(
                             f"'{_name}' is not a deferrable tool. If it appears in the "
                             "model-facing tools list already, call it directly instead "
                             "of via tool_call."
+                        )
+                    if _name not in _scoped_batch:
+                        return tool_error(
+                            f"'{_name}' is not available in this session. "
+                            "Use tool_search to find tools you can call."
                         )
                     _perr = _ts_mod.validate_deferred_call_args(_name, _args)
                     if _perr is not None:
@@ -1380,13 +1385,37 @@ def handle_function_call(
                         api_request_id=api_request_id,
                         user_task=user_task,
                         enabled_tools=enabled_tools,
-                        skip_pre_tool_call_hook=skip_pre_tool_call_hook,
-                        skip_tool_request_middleware=skip_tool_request_middleware,
-                        skip_tool_execution_middleware=skip_tool_execution_middleware,
+                        skip_pre_tool_call_hook=False,
+                        skip_tool_request_middleware=False,
+                        skip_tool_execution_middleware=False,
                         tool_request_middleware_trace=list(_tool_middleware_trace),
                         enabled_toolsets=enabled_toolsets,
                         disabled_toolsets=disabled_toolsets,
                     )
+
+                def _connector_pre_dispatch(_name: str, _args: Dict[str, Any]):
+                    # Connector entries never reach handle_function_call
+                    # individually, so their pre_tool_call pass fires here —
+                    # same single-fire contract, keyed on the composed
+                    # connectors__ name. A block becomes that entry's
+                    # USER_DENIED slot; siblings still run. (Arg-modify
+                    # directives are not applied to remote entries.)
+                    try:
+                        from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+                        block_message, _modified = _dispatch_pre_tool_call_hooks(
+                            _name,
+                            _args,
+                            task_id=task_id or "",
+                            session_id=session_id or "",
+                            tool_call_id=tool_call_id or "",
+                            turn_id=turn_id or "",
+                            api_request_id=api_request_id or "",
+                            middleware_trace=list(_tool_middleware_trace),
+                        )
+                        return block_message
+                    except Exception as _hook_err:
+                        logger.debug("connector pre_tool_call hook error: %s", _hook_err)
+                        return None
 
                 try:
                     from tools.tool_gateway.bridge import dispatch_calls as _connector_dispatch
@@ -1399,6 +1428,7 @@ def handle_function_call(
                         underlying_args.get("calls") or [],
                         tool_call_id,
                         local_dispatch=_local_dispatch,
+                        pre_dispatch=_connector_pre_dispatch,
                     )
                 )
             # Defense in depth: the underlying tool MUST be in the session's

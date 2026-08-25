@@ -9,7 +9,8 @@ import json
 
 import pytest
 
-from tools.tool_gateway.bridge import connector_describe
+from agent.tool_dispatch_helpers import _peel_bridge_call
+from tools.tool_gateway.bridge import connector_describe, dispatch_calls
 from tools.tool_search import (
     CONNECTOR_BATCH_SENTINEL,
     dispatch_tool_describe,
@@ -164,6 +165,50 @@ def test_search_merges_remote_hits_tagged_as_connectors():
     assert record["required"] == ["to", "subject"]
 
 
+def test_search_remote_leg_respects_per_query_limit_and_counts_total():
+    def many_hits(queries):
+        slugs = [f"CUSTOM_X_TOOL_{i}" for i in range(9)]
+        return {
+            "results": [{"index": 1, "tools": slugs}],
+            "schemas": {
+                s: {"connector": "custom_x", "tool": s, "description": "d", "input_schema": {}}
+                for s in slugs
+            },
+        }
+
+    out = json.loads(
+        dispatch_tool_search(
+            {"queries": ["anything"], "limit": 3},
+            current_tool_defs=_local_defs(),
+            connector_search=many_hits,
+        )
+    )
+    remote = [m for m in out["results"][0]["matches"] if m.startswith("connectors__")]
+    assert len(remote) == 3  # limit applies to the remote leg too
+    # total_available counts merged remote tools on top of the local catalog
+    # (empty here: the fake def is not registry-backed in this test env).
+    assert out["total_available"] == 3
+
+
+def test_search_drops_remote_group_with_mismatched_use_case_echo():
+    def misaligned(queries):
+        return {
+            "results": [{"index": 1, "use_case": "SOMETHING ELSE", "tools": ["CUSTOM_X_READ"]}],
+            "schemas": {
+                "CUSTOM_X_READ": {"connector": "custom_x", "tool": "CUSTOM_X_READ", "description": "d", "input_schema": {}}
+            },
+        }
+
+    out = json.loads(
+        dispatch_tool_search(
+            {"queries": ["send an email"]},
+            current_tool_defs=_local_defs(),
+            connector_search=misaligned,
+        )
+    )
+    assert not any(m.startswith("connectors__") for m in out["results"][0]["matches"])
+
+
 def test_search_identical_to_local_only_when_remote_leg_fails():
     def exploding_search(queries):
         raise RuntimeError("gateway exploded")
@@ -216,6 +261,85 @@ def test_describe_connector_names_fall_to_not_found_when_dark():
         )
     )
     assert out["not_found"] == [composed]
+
+
+# ---------------------------------------------------------------------------
+# planner admission: only PURE connector batches are parallel-safe
+# ---------------------------------------------------------------------------
+
+
+def test_peel_admits_pure_connector_batch_as_sentinel():
+    name, args = _peel_bridge_call(
+        "tool_call",
+        {"calls": [
+            {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
+            {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {}},
+        ]},
+    )
+    assert name == CONNECTOR_BATCH_SENTINEL
+
+
+def test_peel_keeps_mixed_and_local_batches_as_sequential_barrier():
+    mixed = {"calls": [
+        {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
+        {"name": "write_file", "arguments": {"path": "x"}},
+    ]}
+    name, args = _peel_bridge_call("tool_call", mixed)
+    assert name == "tool_call"  # barrier: local entries never got admission
+
+    all_local = {"calls": [
+        {"name": "write_file", "arguments": {"path": "x"}},
+        {"name": "read_file", "arguments": {"path": "x"}},
+    ]}
+    name, _ = _peel_bridge_call("tool_call", all_local)
+    assert name == "tool_call"
+
+
+# ---------------------------------------------------------------------------
+# dispatch_calls: per-entry gates
+# ---------------------------------------------------------------------------
+
+
+def test_pre_dispatch_block_denies_one_remote_entry_and_siblings_run():
+    class FakeClient:
+        def execute(self, planned):
+            assert [p.name for p in planned] == ["connectors__slack__SLACK_POST_MESSAGE"]
+            return [{"data": "posted", "error": None}]
+
+    out = json.loads(
+        dispatch_calls(
+            [
+                {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
+                {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {}},
+            ],
+            local_dispatch=lambda n, a: "{}",
+            pre_dispatch=lambda name, args: (
+                "blocked by policy" if "gmail" in name else None
+            ),
+            availability=lambda: True,
+            client_factory=lambda: FakeClient(),
+        )
+    )
+    assert out["results"][0]["error"]["code"] == "USER_DENIED"
+    assert out["results"][1]["response"] == "posted"
+    assert out["success_count"] == 1 and out["error_count"] == 1
+
+
+def test_local_tool_error_results_are_counted_as_errors():
+    def local_dispatch(name, arguments):
+        return json.dumps({"error": f"'{name}' is not available in this session."})
+
+    out = json.loads(
+        dispatch_calls(
+            [
+                {"name": "denied_tool", "arguments": {}},
+                {"name": "another_denied", "arguments": {}},
+            ],
+            local_dispatch=local_dispatch,
+        )
+    )
+    assert all(e["error"]["code"] == "TOOL_ERROR" for e in out["results"])
+    assert out["error_count"] == 2 and out["success_count"] == 0
 
 
 # ---------------------------------------------------------------------------

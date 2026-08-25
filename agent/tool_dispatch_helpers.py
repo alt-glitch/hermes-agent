@@ -139,11 +139,30 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
     bridge call stays a sequential barrier and fails at dispatch as before.
     """
     try:
-        from tools.tool_search import TOOL_CALL_NAME, resolve_underlying_call
+        from tools.tool_search import (
+            CONNECTOR_BATCH_SENTINEL,
+            TOOL_CALL_NAME,
+            is_connector_name,
+            resolve_underlying_call,
+        )
         if tool_name != TOOL_CALL_NAME:
             return tool_name, function_args
         underlying, underlying_args, err = resolve_underlying_call(function_args)
         if err is not None or not underlying:
+            return tool_name, function_args
+        if underlying == CONNECTOR_BATCH_SENTINEL:
+            # Only a PURE connector batch is parallel-safe (network-bound,
+            # no local state, own idempotency key). A batch containing any
+            # local entry keeps the sequential barrier: its entries never
+            # went through per-tool admission here, so treating the batch
+            # as parallel-safe would bypass path-overlap serialization for
+            # local writers and the per-server MCP parallel opt-in.
+            entries = underlying_args.get("calls") or []
+            if entries and all(
+                isinstance(e, dict) and is_connector_name(e.get("name"))
+                for e in entries
+            ):
+                return underlying, underlying_args
             return tool_name, function_args
         return underlying, underlying_args
     except Exception:

@@ -5,10 +5,12 @@ structured value, because the bridge branch in core dispatch bypasses the
 registry's catch-wrap — an exception escaping this module is a bug, full
 stop.
 
-Approval is deliberately absent: the core's approval machinery settles every
-entry BEFORE calling :func:`dispatch_calls` (denied entries never reach the
-bridge; the core pre-fills their ``USER_DENIED`` slots). The bridge only
-partitions, dispatches, and splices.
+Per-entry policy runs through two injected seams: ``local_dispatch`` (local
+entries recurse into core dispatch, where scope/probe/hook/middleware gates
+fire against each real tool name) and ``pre_dispatch`` (remote entries get
+the caller's hook/approval pass against their composed ``connectors__``
+names; a block pre-fills that entry's ``USER_DENIED`` slot and its siblings
+still run). The bridge itself only partitions, gates, dispatches, splices.
 
 Dispatch shape (V1, decided 2026-08-25): local entries run via the injected
 ``local_dispatch``; ALL connector entries travel as ONE gateway execute
@@ -128,6 +130,7 @@ def dispatch_calls(
     dispatch_id: Optional[str] = None,
     *,
     local_dispatch: LocalDispatch,
+    pre_dispatch: Optional[Callable[[str, dict], Optional[str]]] = None,
     availability: Optional[Callable[[], bool]] = None,
     client_factory: Optional[Callable[[], Any]] = None,
 ) -> str:
@@ -136,12 +139,19 @@ def dispatch_calls(
     Total: any internal failure becomes per-entry errors or an envelope-level
     ``{"error": ...}`` string — never an exception. ``local_dispatch`` is
     injected so this module never imports core dispatch code.
+
+    ``pre_dispatch`` is the caller's per-REMOTE-entry gate (hooks/approval):
+    called with (name, arguments) before the gateway request is built; a
+    non-None return is that entry's block message — the entry is pre-filled
+    as a ``USER_DENIED`` error slot and excluded from the remote batch while
+    its siblings still run. Local entries gate inside ``local_dispatch``.
     """
     try:
         return _dispatch_calls_inner(
             calls,
             dispatch_id,
             local_dispatch=local_dispatch,
+            pre_dispatch=pre_dispatch,
             availability=availability,
             client_factory=client_factory,
         )
@@ -157,6 +167,7 @@ def _dispatch_calls_inner(
     dispatch_id: Optional[str],
     *,
     local_dispatch: LocalDispatch,
+    pre_dispatch: Optional[Callable[[str, dict], Optional[str]]],
     availability: Optional[Callable[[], bool]],
     client_factory: Optional[Callable[[], Any]],
 ) -> str:
@@ -182,17 +193,43 @@ def _dispatch_calls_inner(
         for position, call in partition.local
     ]
 
+    # The caller's per-entry gate (hooks/approval) runs before anything is
+    # sent: a blocked entry becomes a USER_DENIED slot, siblings still run.
+    denied_entries: list[dict[str, Any]] = []
+    surviving = list(partition.remote)
+    if pre_dispatch is not None and surviving:
+        kept = []
+        for plan in surviving:
+            try:
+                block = pre_dispatch(plan.name, dict(plan.arguments))
+            except Exception as exc:
+                logger.debug("pre_dispatch gate failed open for %s: %s", plan.name, exc)
+                block = None
+            if block is None:
+                kept.append(plan)
+            else:
+                denied_entries.append(
+                    {
+                        "index": plan.position,
+                        "name": plan.name,
+                        "error": {"code": "USER_DENIED", "message": str(block)},
+                    }
+                )
+        surviving = kept
+
     remote_entries: list[dict[str, Any]] = []
-    if partition.remote:
+    if surviving:
         remote_entries = _run_remote(
-            partition.remote,
+            surviving,
             dispatch_id,
             availability=availability,
             client_factory=client_factory,
         )
 
     return json.dumps(
-        assemble_results(len(calls), local_entries, remote_entries, partition.errors),
+        assemble_results(
+            len(calls), local_entries, remote_entries, denied_entries, partition.errors
+        ),
         ensure_ascii=False,
     )
 
@@ -204,7 +241,20 @@ def _run_local(
     arguments = call.get("arguments") if isinstance(call, dict) else None
     try:
         raw = local_dispatch(name, arguments if isinstance(arguments, dict) else {})
-        return {"index": position, "name": name, "response": _maybe_parse_json(raw)}
+        parsed = _maybe_parse_json(raw)
+        if isinstance(parsed, dict) and parsed.get("error") is not None:
+            # A tool_error-shaped result (scope refusal, probe validation,
+            # tool failure) is an ERROR slot — filing it under "response"
+            # would count a denied call as a success.
+            error_payload: dict[str, Any] = {
+                "code": "TOOL_ERROR",
+                "message": str(parsed.get("error")),
+            }
+            for extra in ("parameters", "hint"):
+                if extra in parsed:
+                    error_payload[extra] = parsed[extra]
+            return {"index": position, "name": name, "error": error_payload}
+        return {"index": position, "name": name, "response": parsed}
     except Exception as exc:
         # Core dispatch wraps its own errors; reaching here means the injected
         # dispatcher itself blew up. Keep it to this entry.

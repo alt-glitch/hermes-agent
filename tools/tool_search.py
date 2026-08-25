@@ -362,7 +362,17 @@ def should_activate(
     if config.enabled == "off":
         return False
     if deferrable_tokens <= 0:
-        return False
+        # No local deferrable tools — but a signed-in account with connectors
+        # still needs the bridge, or remote tools are unreachable (a session
+        # with zero MCP servers would otherwise never see tool_search).
+        # connectors_available() fails closed and its entitlement leg is
+        # TTL-cached, so this adds no meaningful latency to assembly.
+        try:
+            from tools.tool_gateway.config import connectors_available
+
+            return connectors_available()
+        except Exception:
+            return False
     return True
 
 
@@ -780,16 +790,31 @@ def bridge_tool_schemas(
     sees the exact name; the server-summary form ("groups") tells it which
     DOMAINS are reachable and that search is mandatory for tool discovery.
     """
-    desc_search = (
-        f"Search {deferred_count} additional tools that are loaded on demand. "
-        "Takes a list of queries searched in parallel against the same "
-        "catalog; send one query per distinct capability you need. Returns "
-        "matching tool names grouped per query plus a shared map with each "
-        "tool's description. Follow with "
-        f"`{TOOL_DESCRIBE_NAME}` to load full parameter schemas, "
-        f"then `{TOOL_CALL_NAME}` to invoke. Tools listed at the top of this "
-        "system prompt are already available and do not need to be searched."
-    )
+    if deferred_count > 0:
+        desc_search = (
+            f"Search {deferred_count} additional tools that are loaded on demand. "
+            "Takes a list of queries searched in parallel against the same "
+            "catalog; send one query per distinct capability you need. Returns "
+            "matching tool names grouped per query plus a shared map with each "
+            "tool's description. Follow with "
+            f"`{TOOL_DESCRIBE_NAME}` to load full parameter schemas, "
+            f"then `{TOOL_CALL_NAME}` to invoke. Tools listed at the top of this "
+            "system prompt are already available and do not need to be searched."
+        )
+    else:
+        # Bare connectors-only bridge: no local deferred catalog, but remote
+        # connector tools are reachable through the same three calls.
+        desc_search = (
+            "Search remote connector tools (email, calendars, issue trackers, "
+            "and more) that are loaded on demand. Takes a list of queries "
+            "searched in parallel; send one query per distinct capability you "
+            "need. Returns matching tool names grouped per query plus a "
+            "shared map with each tool's description. Follow with "
+            f"`{TOOL_DESCRIBE_NAME}` to load full parameter schemas, "
+            f"then `{TOOL_CALL_NAME}` to invoke. Tools listed at the top of "
+            "this system prompt are already available and do not need to be "
+            "searched."
+        )
     if listing and listing_form == "groups":
         desc_search += (
             "\n\nThe servers below are connected and their tools ARE available "
@@ -950,6 +975,17 @@ def assemble_tool_defs(
 
     visible, deferrable = classify_tools(incoming)
     if not deferrable:
+        # No local deferrable tools. The bridge still activates when remote
+        # connectors are reachable (should_activate's connectors leg) — a
+        # bare bridge, no listing, so remote tools stay discoverable.
+        if should_activate(config, 0, context_length):
+            return AssemblyResult(
+                tool_defs=incoming + bridge_tool_schemas(0),
+                activated=True,
+                deferred_count=0,
+                tier=2,
+                listing_form="none",
+            )
         return AssemblyResult(tool_defs=incoming, activated=False)
 
     deferrable_tokens = estimate_tokens_from_schemas(deferrable)
@@ -1076,6 +1112,13 @@ def _connector_matches_by_group(
         for position, group in enumerate(groups[: len(queries)]):
             if not isinstance(group, dict):
                 continue
+            # Correlate by position, then verify the echoed use_case when the
+            # gateway provides one — never the wire index (NS-734). A
+            # mismatched echo means the response groups don't line up with
+            # our queries; drop the group rather than mis-attribute hits.
+            echoed = group.get("use_case")
+            if isinstance(echoed, str) and echoed and echoed != queries[position]:
+                continue
             slugs = group.get("tools") if isinstance(group.get("tools"), list) else []
             for slug in slugs:
                 schema = schemas.get(slug)
@@ -1180,7 +1223,7 @@ def dispatch_tool_search(args: Dict[str, Any],
             if h.name not in tools_map:
                 tools_map[h.name] = _shared_tool_record(h)
         matches = [h.name for h in hits]
-        for name in remote_matches[position]:
+        for name in remote_matches[position][:limit]:  # limit applies per leg
             if name not in matches:
                 matches.append(name)
                 tools_map.setdefault(name, remote_records[name])
@@ -1195,9 +1238,10 @@ def dispatch_tool_search(args: Dict[str, Any],
             )
         results.append(group)
 
+    remote_count = sum(1 for n in tools_map if is_connector_name(n))
     result: Dict[str, Any] = {
         "queries": queries,
-        "total_available": len(catalog),
+        "total_available": len(catalog) + remote_count,
         "results": results,
         "tools": tools_map,
     }
