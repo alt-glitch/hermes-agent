@@ -1346,6 +1346,109 @@ def handle_function_call(
                 return _return_bridge_result(
                     tool_error(err or "tool_call could not be resolved")
                 )
+            if underlying_name == _ts_mod.CONNECTOR_BATCH_SENTINEL:
+                # A calls[] batch (any connector entry, or >1 entry). The
+                # connector bridge partitions it: connector entries travel as
+                # ONE gateway request; local entries run through the SAME
+                # gates as the single-call path below via this closure —
+                # repair hint, session scope, probe validation, then the
+                # normal recursive dispatch. The three skip flags are FORCED
+                # off: the executor's own hook/middleware pass fired against
+                # the tool_call wrapper, never against these entry names, so
+                # the recursion must own the per-entry policy pipeline —
+                # otherwise a 2-entry batch would evade every pre_tool_call
+                # block and middleware rewrite keyed on a real tool name.
+                _scoped_batch = _ts_mod.scoped_deferrable_names(current_defs)
+
+                # Returns (ok, payload): THIS closure owns the success/failure
+                # call because only it knows which returns are its own refusals.
+                # The bridge must not guess from the payload — a legitimate tool
+                # result can carry an "error" field of its own.
+                def _local_dispatch(_name: str, _args: Dict[str, Any]):
+                    if not _ts_mod.is_deferrable_tool_name(_name):
+                        return False, tool_error(
+                            f"'{_name}' is not a deferrable tool. If it appears in the "
+                            "model-facing tools list already, call it directly instead "
+                            "of via tool_call."
+                        )
+                    if _name not in _scoped_batch:
+                        return False, tool_error(
+                            f"'{_name}' is not available in this session. "
+                            "Use tool_search to find tools you can call."
+                        )
+                    _perr = _ts_mod.validate_deferred_call_args(_name, _args)
+                    if _perr is not None:
+                        return False, _perr
+                    return True, handle_function_call(
+                        function_name=_name,
+                        function_args=_args,
+                        task_id=task_id,
+                        tool_call_id=tool_call_id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        user_task=user_task,
+                        enabled_tools=enabled_tools,
+                        skip_pre_tool_call_hook=False,
+                        skip_tool_request_middleware=False,
+                        skip_tool_execution_middleware=False,
+                        tool_request_middleware_trace=list(_tool_middleware_trace),
+                        enabled_toolsets=enabled_toolsets,
+                        disabled_toolsets=disabled_toolsets,
+                    )
+
+                def _connector_pre_dispatch(_name: str, _args: Dict[str, Any]):
+                    # Connector entries never reach handle_function_call
+                    # individually, so their pre_tool_call pass fires here —
+                    # same single-fire contract, keyed on the composed
+                    # connectors__ name. Returns the bridge's
+                    # (block_message, replacement_arguments) pair: a block
+                    # becomes that entry's USER_DENIED slot and siblings still
+                    # run, while modified args from a `modify` directive go out
+                    # on the wire for that entry.
+                    #
+                    # Rewrite semantics are the single-entry path's, verbatim
+                    # (see the skip_pre_tool_call_hook branch below): the hook
+                    # dispatcher returns modified args as None when NO hook
+                    # asked for a change and as the merged dict when one did,
+                    # so None here means "send the original arguments" and a
+                    # dict — empty included — replaces them. Anything else is
+                    # not a rewrite the wire can carry, so it is dropped
+                    # rather than guessed at.
+                    try:
+                        from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+                        block_message, _modified = _dispatch_pre_tool_call_hooks(
+                            _name,
+                            _args,
+                            task_id=task_id or "",
+                            session_id=session_id or "",
+                            tool_call_id=tool_call_id or "",
+                            turn_id=turn_id or "",
+                            api_request_id=api_request_id or "",
+                            middleware_trace=list(_tool_middleware_trace),
+                        )
+                        return (
+                            block_message,
+                            _modified if isinstance(_modified, dict) else None,
+                        )
+                    except Exception as _hook_err:
+                        logger.debug("connector pre_tool_call hook error: %s", _hook_err)
+                        return None, None
+
+                try:
+                    from tools.tool_gateway.bridge import dispatch_calls as _connector_dispatch
+                except Exception as _imp_exc:
+                    return _return_bridge_result(
+                        tool_error(f"tool_call batch dispatch is unavailable: {_imp_exc}")
+                    )
+                return _return_bridge_result(
+                    _connector_dispatch(
+                        underlying_args.get("calls") or [],
+                        tool_call_id,
+                        local_dispatch=_local_dispatch,
+                        pre_dispatch=_connector_pre_dispatch,
+                    )
+                )
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate

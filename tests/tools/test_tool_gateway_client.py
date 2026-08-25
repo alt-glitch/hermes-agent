@@ -228,7 +228,7 @@ def test_connection_required_stays_inside_the_200_envelope():
 
 
 def local_echo(name, arguments):
-    return json.dumps({"ran": name, "args": arguments})
+    return True, json.dumps({"ran": name, "args": arguments})
 
 
 def test_dispatch_mixed_batch_splices_local_and_remote_in_order():

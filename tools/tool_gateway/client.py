@@ -51,6 +51,12 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 # One execute request carries up to MAX_CALLS_PER_DISPATCH remote tool runs;
 # measured batch latency is seconds, not minutes, but give slow tools room.
 EXECUTE_TIMEOUT_SECONDS = 60.0
+# Search rides the availability path of EVERY tool_search once connectors are
+# lit — a hung gateway must degrade silently AND fast, so it gets a short
+# budget and no retry. Schemas (tool_describe) is user-initiated; a short
+# budget with one retry keeps its worst case at 2x this value.
+SEARCH_TIMEOUT_SECONDS = 8.0
+SCHEMAS_TIMEOUT_SECONDS = 10.0
 
 _MAX_RETRIES = 1  # D29: at most one retry, same key.
 
@@ -108,7 +114,10 @@ class ConnectorClient:
         body = wire.ConnectorSearchRequest(
             queries=[wire.ConnectorSearchQuery(**q) for q in queries]
         ).model_dump(by_alias=True, exclude_none=True)
-        payload = self._post(wire.CONNECTOR_SEARCH_PATH, body)
+        payload = self._post(
+            wire.CONNECTOR_SEARCH_PATH, body,
+            timeout=SEARCH_TIMEOUT_SECONDS, retries=0,
+        )
         parsed = wire.ConnectorSearchResponse.model_validate(payload)
         return parsed.model_dump()
 
@@ -117,7 +126,9 @@ class ConnectorClient:
         body = wire.ConnectorSchemasRequest(tools=list(tools)).model_dump(
             by_alias=True
         )
-        payload = self._post(wire.CONNECTOR_SCHEMAS_PATH, body)
+        payload = self._post(
+            wire.CONNECTOR_SCHEMAS_PATH, body, timeout=SCHEMAS_TIMEOUT_SECONDS
+        )
         return wire.ConnectorSchemasResponse.model_validate(payload).model_dump()
 
     def connections(
