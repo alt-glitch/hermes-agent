@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage remote connector accounts and local MCP servers.
+"""Manage remote connector accounts served through the tool gateway.
 
 ``manage_connections`` is the never-deferred surface for connection
 lifecycle:
@@ -10,9 +10,15 @@ lifecycle:
   The gateway returns a connect link, passed through UN-redacted: the model
   shows it to the user, who opens it in a browser. Each connector's
   ``instruction`` text is surfaced once per session, not on every call.
-- ``install`` / ``enable`` / ``authorize`` — the existing local MCP setup
-  flows, folded in from ``setup_mcp`` (desktop consent card; on other
-  surfaces the same terminal guidance as before).
+
+Scope: gateway connectors ONLY. Local MCP servers stay with ``setup_mcp``,
+which still exists and still works. An earlier draft folded ``install`` /
+``enable`` / ``authorize`` in here, but the desktop consent card arrives
+through a per-tool interception branch keyed on the name ``setup_mcp``
+(agent/tool_executor.py, agent/agent_runtime_helpers.py) and
+``registry.dispatch`` never forwards a ``callback``. So the fold could only
+ever return the "use the terminal" fallback while its schema advertised the
+consent flow — a promise with no delivery path.
 
 De-authentication is deliberately NOT exposed to the model: disconnecting
 an account is a user decision, made in the portal dashboard.
@@ -31,7 +37,6 @@ from tools.registry import registry, tool_error
 logger = logging.getLogger(__name__)
 
 _CONNECTOR_ACTIONS = ("status", "connect", "reconnect")
-_MCP_ACTIONS = ("install", "enable", "authorize")
 
 # (session_id, connector) pairs whose `instruction` text has already been
 # shown. Keyed per session, not per process: the gateway multiplexes many
@@ -61,7 +66,6 @@ def _default_client():
 def manage_connections(
     args: Dict[str, Any],
     *,
-    callback: Optional[Callable] = None,
     client_factory: Optional[Callable[[], Any]] = None,
     seen_instructions: Optional[set] = None,
     session_id: Optional[str] = None,
@@ -69,19 +73,10 @@ def manage_connections(
     """Dispatch one ``manage_connections`` action. Returns a JSON string."""
     action = str(args.get("action") or "status").strip().lower()
 
-    if action in _MCP_ACTIONS:
-        from tools.setup_mcp_tool import setup_mcp_tool
-
-        return setup_mcp_tool(
-            server=str(args.get("server") or ""),
-            action=action,
-            reason=str(args.get("reason") or ""),
-            callback=callback,
-        )
-
     if action not in _CONNECTOR_ACTIONS:
         return tool_error(
-            f"action must be one of {', '.join(_CONNECTOR_ACTIONS + _MCP_ACTIONS)}. "
+            f"action must be one of {', '.join(_CONNECTOR_ACTIONS)}. "
+            "Local MCP servers are set up with setup_mcp, not here. "
             "Disconnecting an account is done by the user in the Nous Portal "
             "dashboard, not through this tool."
         )
@@ -161,14 +156,13 @@ MANAGE_CONNECTIONS_SCHEMA = {
     "name": "manage_connections",
     "description": (
         "Manage remote connector accounts (Gmail, Linear, Notion, ...) served "
-        "through the tool gateway, and set up local MCP servers. Actions: "
+        "through the tool gateway. Actions: "
         "'status' lists connectors and whether each is connected; 'connect' "
         "starts an authorization for the given connectors and returns a link "
         "for the USER to open in a browser (never open it yourself); "
         "'reconnect' restarts a broken authorization. When a connector tool "
         "call returns CONNECTION_REQUIRED, use 'connect' and show the link. "
-        "For local MCP servers, 'install'/'enable'/'authorize' run the same "
-        "flows as before (desktop consent card, or terminal guidance). "
+        "Local MCP servers are a different thing — use setup_mcp for those. "
         "Disconnecting accounts is done by the user in the Nous Portal."
     ),
     "parameters": {
@@ -176,7 +170,7 @@ MANAGE_CONNECTIONS_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": list(_CONNECTOR_ACTIONS + _MCP_ACTIONS),
+                "enum": list(_CONNECTOR_ACTIONS),
                 "description": "Defaults to status.",
             },
             "connectors": {
@@ -186,14 +180,6 @@ MANAGE_CONNECTIONS_SCHEMA = {
                     "Connector slugs for connect/reconnect (e.g. [\"gmail\"]); "
                     "optional filter for status."
                 ),
-            },
-            "server": {
-                "type": "string",
-                "description": "MCP server name, for install/enable/authorize.",
-            },
-            "reason": {
-                "type": "string",
-                "description": "One short sentence shown on the MCP consent card.",
             },
         },
         "required": [],
@@ -206,7 +192,7 @@ registry.register(
     toolset="connections",
     schema=MANAGE_CONNECTIONS_SCHEMA,
     handler=lambda args, **kw: manage_connections(
-        args, callback=kw.get("callback"), session_id=kw.get("session_id")
+        args, session_id=kw.get("session_id")
     ),
     check_fn=_connectors_available,
     emoji="🔗",
