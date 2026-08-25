@@ -183,8 +183,9 @@ def test_search_remote_leg_respects_per_query_limit_and_counts_total():
             connector_search=many_hits,
         )
     )
-    remote = [m for m in out["results"][0]["matches"] if m.startswith("connectors__")]
-    assert len(remote) == 3  # limit applies to the remote leg too
+    matches = out["results"][0]["matches"]
+    assert len(matches) == 3  # limit is the per-query cap across BOTH legs
+    assert all(m.startswith("connectors__") for m in matches)
     # total_available counts merged remote tools on top of the local catalog
     # (empty here: the fake def is not registry-backed in this test env).
     assert out["total_available"] == 3

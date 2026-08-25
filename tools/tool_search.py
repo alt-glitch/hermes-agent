@@ -1223,7 +1223,12 @@ def dispatch_tool_search(args: Dict[str, Any],
             if h.name not in tools_map:
                 tools_map[h.name] = _shared_tool_record(h)
         matches = [h.name for h in hits]
-        for name in remote_matches[position][:limit]:  # limit applies per leg
+        for name in remote_matches[position]:
+            # `limit` is the documented per-QUERY cap, counted across the
+            # local and connector legs combined — a query never returns
+            # more than `limit` names no matter where they come from.
+            if len(matches) >= limit:
+                break
             if name not in matches:
                 matches.append(name)
                 tools_map.setdefault(name, remote_records[name])
