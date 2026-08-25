@@ -2465,6 +2465,10 @@ _NOUS_STALE_PORTAL_HOSTS: FrozenSet[str] = frozenset({
 # "localhost" / "127.0.0.1" are valid for local development and testing.
 _NOUS_PORTAL_ALLOWED_HOSTS: FrozenSet[str] = frozenset({
     "portal.nousresearch.com",
+    # First-party staging portal: same trust owner as prod, needed to sign the
+    # agent into the staging stack. The allowlist exists to reject look-alike
+    # hosts, not our own environments.
+    "portal.staging-nousresearch.com",
     "localhost",
     "127.0.0.1",
 })
