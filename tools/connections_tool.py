@@ -160,10 +160,13 @@ MANAGE_CONNECTIONS_SCHEMA = {
         "'status' lists connectors and whether each is connected; 'connect' "
         "starts an authorization for the given connectors and returns a link "
         "for the USER to open in a browser (never open it yourself); "
-        "'reconnect' restarts a broken authorization. When a connector tool "
+        "'reconnect' restarts a broken authorization. Pass SEVERAL slugs in one "
+        "call to get all authorization links at once. When a connector tool "
         "call returns CONNECTION_REQUIRED, use 'connect' and show the link. "
         "Local MCP servers are a different thing — use setup_mcp for those. "
-        "Disconnecting accounts is done by the user in the Nous Portal."
+        "This tool can NOT disconnect, delete, or revoke an account — that is "
+        "deliberately user-only. When asked, say so and direct the user to "
+        "the Nous Portal (their org's Connectors page) or the desktop app."
     ),
     "parameters": {
         "type": "object",
@@ -177,7 +180,7 @@ MANAGE_CONNECTIONS_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Connector slugs for connect/reconnect (e.g. [\"gmail\"]); "
+                    "Connector slugs for connect/reconnect (e.g. [\"gmail\", \"linear\"]); "
                     "optional filter for status."
                 ),
             },
