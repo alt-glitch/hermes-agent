@@ -1,18 +1,21 @@
 """Codec for ``connectors__<connector>__<tool>`` bridge names.
 
 Remote connector tools are never registered in the model-facing tools array;
-the model addresses them through ``tool_call`` using composed names. This
-module is the ONLY place that composes or parses those names — responses are
-correlated by array position, never by re-parsing names.
+the model addresses them through ``tool_call`` using composed names. Composition
+strips the repeated toolkit prefix from vendor tool slugs; wire slugs are
+reconstructed through :func:`vendor_slug_candidates`. This module is the ONLY
+place that composes or parses those names — responses are correlated by array
+position, never by re-parsing names.
 
 Parsing rules:
 
 - ``split("__", 2)`` exactly: tool slugs legitimately contain underscores
   (``GMAIL_SEND_EMAIL``), so ``rsplit`` or an unbounded split would corrupt
   them.
-- Case is preserved in both directions: the gateway lowercases connector
-  slugs itself, and tool slugs pass through verbatim. No second
-  normalization boundary on this side.
+- Case is preserved: the gateway lowercases connector slugs itself, and the
+  tool segment is otherwise untouched. Prefix removal is exactly reversible,
+  including partial prefix matches such as ``granola`` +
+  ``GRANOLA_MCP_GET_MEETINGS``: decoding prepends exactly what encoding cut.
 - :func:`parse_connector_name` returns ``None`` and never raises — a
   malformed name is a per-entry error and sibling calls still run.
 
@@ -31,6 +34,7 @@ __all__ = [
     "format_connector_name",
     "is_connector_name",
     "parse_connector_name",
+    "vendor_slug_candidates",
 ]
 
 CONNECTOR_NAME_PREFIX = "connectors__"
@@ -77,5 +81,17 @@ def parse_connector_name(name: object) -> Optional[ConnectorName]:
 
 
 def format_connector_name(connector: str, tool: str) -> str:
-    """Compose the model-facing name for a remote tool, case preserved."""
+    """Compose a model-facing name, stripping a repeated toolkit prefix."""
+    prefix = f"{connector.upper()}_"
+    if tool.startswith(prefix):
+        tool = tool[len(prefix):]
     return f"{CONNECTOR_NAME_PREFIX}{connector}__{tool}"
+
+
+def vendor_slug_candidates(connector: str, tool: str) -> tuple[str, ...]:
+    """Return wire-slug candidates in deterministic recovery order.
+
+    Prefixed-first restores every slug the encoder stripped; the literal
+    covers slugs that never conformed and therefore composed verbatim.
+    """
+    return (f"{connector.upper()}_{tool}", tool)

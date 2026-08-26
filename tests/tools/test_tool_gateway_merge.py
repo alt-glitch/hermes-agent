@@ -37,7 +37,7 @@ def test_parse_round_trips_and_keeps_tool_slug_underscores():
     name = format_connector_name("gmail", "GMAIL_SEND_EMAIL")
     parsed = parse_connector_name(name)
     assert parsed is not None
-    assert (parsed.connector, parsed.tool) == ("gmail", "GMAIL_SEND_EMAIL")
+    assert (parsed.connector, parsed.tool) == ("gmail", "SEND_EMAIL")
     assert parsed.raw == name
 
 
@@ -74,9 +74,9 @@ def test_parse_preserves_case_both_directions():
 def test_partition_splits_mixed_batch_preserving_positions():
     calls = [
         {"name": "local_tool", "arguments": {"a": 1}},
-        {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "x"}},
+        {"name": "connectors__gmail__SEND_EMAIL", "arguments": {"to": "x"}},
         {"name": "another_local", "arguments": {}},
-        {"name": "connectors__slack__SLACK_POST_MESSAGE"},
+        {"name": "connectors__slack__POST_MESSAGE"},
     ]
     part = partition_calls(calls)
     assert [pos for pos, _ in part.local] == [0, 2]
@@ -90,7 +90,7 @@ def test_partition_splits_mixed_batch_preserving_positions():
 def test_partition_malformed_connector_name_is_per_entry_error_siblings_run():
     calls = [
         {"name": "connectors__broken"},  # claims prefix, doesn't parse
-        {"name": "connectors__gmail__GMAIL_SEND_EMAIL"},
+        {"name": "connectors__gmail__SEND_EMAIL"},
     ]
     part = partition_calls(calls)
     assert len(part.errors) == 1
@@ -118,8 +118,8 @@ def _plan(calls):
 def test_splice_maps_by_slot_and_renders_success_and_error():
     planned = _plan(
         [
-            {"name": "connectors__gmail__GMAIL_SEND_EMAIL"},
-            {"name": "connectors__slack__SLACK_POST_MESSAGE"},
+            {"name": "connectors__gmail__SEND_EMAIL"},
+            {"name": "connectors__slack__POST_MESSAGE"},
         ]
     )
     remote = [
@@ -132,7 +132,7 @@ def test_splice_maps_by_slot_and_renders_success_and_error():
     entries = splice_remote_results(planned, remote)
     assert entries[0] == {
         "index": 0,
-        "name": "connectors__gmail__GMAIL_SEND_EMAIL",
+        "name": "connectors__gmail__SEND_EMAIL",
         "response": {"id": "msg_1"},
     }
     assert entries[1]["index"] == 1
@@ -142,18 +142,18 @@ def test_splice_maps_by_slot_and_renders_success_and_error():
 def test_splice_short_remote_response_fills_provider_error():
     planned = _plan(
         [
-            {"name": "connectors__gmail__GMAIL_SEND_EMAIL"},
-            {"name": "connectors__slack__SLACK_POST_MESSAGE"},
+            {"name": "connectors__gmail__SEND_EMAIL"},
+            {"name": "connectors__slack__POST_MESSAGE"},
         ]
     )
     entries = splice_remote_results(planned, [{"data": "ok", "error": None}])
     assert entries[0]["response"] == "ok"
     assert entries[1]["error"]["code"] == "PROVIDER_ERROR"
-    assert entries[1]["name"] == "connectors__slack__SLACK_POST_MESSAGE"
+    assert entries[1]["name"] == "connectors__slack__POST_MESSAGE"
 
 
 def test_splice_over_long_remote_response_drops_surplus():
-    planned = _plan([{"name": "connectors__gmail__GMAIL_SEND_EMAIL"}])
+    planned = _plan([{"name": "connectors__gmail__SEND_EMAIL"}])
     entries = splice_remote_results(
         planned, [{"data": "ok", "error": None}, {"data": "surplus", "error": None}]
     )
@@ -162,13 +162,13 @@ def test_splice_over_long_remote_response_drops_surplus():
 
 
 def test_splice_none_response_fills_every_slot():
-    planned = _plan([{"name": "connectors__gmail__GMAIL_SEND_EMAIL"}])
+    planned = _plan([{"name": "connectors__gmail__SEND_EMAIL"}])
     entries = splice_remote_results(planned, None)
     assert entries[0]["error"]["code"] == "PROVIDER_ERROR"
 
 
 def test_connection_required_renders_shared_shape_with_connect_url():
-    planned = _plan([{"name": "connectors__gmail__GMAIL_SEND_EMAIL"}])
+    planned = _plan([{"name": "connectors__gmail__SEND_EMAIL"}])
     remote = [
         {
             "data": None,
@@ -191,8 +191,8 @@ def test_connection_required_renders_shared_shape_with_connect_url():
 def test_fill_remote_failure_marks_all_planned_slots():
     planned = _plan(
         [
-            {"name": "connectors__gmail__GMAIL_SEND_EMAIL"},
-            {"name": "connectors__slack__SLACK_POST_MESSAGE"},
+            {"name": "connectors__gmail__SEND_EMAIL"},
+            {"name": "connectors__slack__POST_MESSAGE"},
         ]
     )
     entries = fill_remote_failure(planned, "gateway unreachable")

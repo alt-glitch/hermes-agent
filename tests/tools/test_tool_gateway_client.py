@@ -6,6 +6,7 @@ transports. FakeTransport records requests and replays queued responses.
 """
 
 import json
+from dataclasses import replace as dataclass_replace
 
 import pytest
 
@@ -17,6 +18,7 @@ from tools.tool_gateway.errors import (
     IdempotencyConflict,
     ToolGatewayError,
 )
+from tools.tool_gateway.names import vendor_slug_candidates
 
 
 class FakeResponse:
@@ -65,15 +67,21 @@ def execute_envelope(results):
 
 
 PLAN_CALLS = [
-    {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "x"}},
-    {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {}},
+    {"name": "connectors__gmail__SEND_EMAIL", "arguments": {"to": "x"}},
+    {"name": "connectors__slack__POST_MESSAGE", "arguments": {}},
 ]
 
 
 def planned(calls=PLAN_CALLS):
     from tools.tool_gateway.merge import partition_calls
 
-    return partition_calls(calls).remote
+    return tuple(
+        dataclass_replace(
+            plan,
+            tool=vendor_slug_candidates(plan.connector, plan.tool)[0],
+        )
+        for plan in partition_calls(calls).remote
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +252,7 @@ def test_dispatch_mixed_batch_splices_local_and_remote_in_order():
         dispatch_calls(
             [
                 {"name": "local_tool", "arguments": {"a": 1}},
-                {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
+                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
             ],
             "dispatch-1",
             local_dispatch=local_echo,
@@ -270,7 +278,7 @@ def test_dispatch_gateway_failure_hits_only_connector_entries():
         dispatch_calls(
             [
                 {"name": "local_tool", "arguments": {}},
-                {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
+                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
             ],
             local_dispatch=local_echo,
             availability=lambda: True,
@@ -285,7 +293,7 @@ def test_dispatch_gateway_failure_hits_only_connector_entries():
 def test_dispatch_connector_names_with_connectors_unavailable_are_unknown_tools():
     out = json.loads(
         dispatch_calls(
-            [{"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}}],
+            [{"name": "connectors__gmail__SEND_EMAIL", "arguments": {}}],
             local_dispatch=local_echo,
             availability=lambda: False,
         )
@@ -304,7 +312,7 @@ def test_dispatch_is_total_when_everything_explodes():
         dispatch_calls(
             [
                 {"name": "local_tool", "arguments": {}},
-                {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
+                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
             ],
             local_dispatch=exploding_dispatch,
             availability=lambda: True,
