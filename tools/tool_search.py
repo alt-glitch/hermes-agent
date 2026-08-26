@@ -1041,6 +1041,15 @@ def is_bridge_tool(name: str) -> bool:
     return name in BRIDGE_TOOL_NAMES
 
 
+def _clip_description(text: str, cap: int = 400) -> str:
+    """Cap a record description, marking the cut so it reads as deliberate.
+
+    A bare slice ends mid-word ("apply exponential bac") and looks like
+    corruption; the ellipsis says "there is more — tool_describe has it".
+    """
+    return text if len(text) <= cap else text[:cap] + "…"
+
+
 def _shared_tool_record(entry: CatalogEntry) -> Dict[str, Any]:
     """One record for the response's shared ``tools`` map.
 
@@ -1063,7 +1072,7 @@ def _shared_tool_record(entry: CatalogEntry) -> Dict[str, Any]:
         "source": entry.source,
         "source_name": entry.source_name,
         # Cap description so a chatty MCP server doesn't blow up the result.
-        "description": (entry.description or "")[:400],
+        "description": _clip_description(entry.description or ""),
         "required": [r[:64] for r in required if isinstance(r, str)][:32],
     }
 
@@ -1145,7 +1154,7 @@ def _connector_matches_by_group(
                     records[name] = {
                         "source": "connectors",
                         "source_name": str(schema["connector"]),
-                        "description": str(schema.get("description") or "")[:400],
+                        "description": _clip_description(str(schema.get("description") or "")),
                         "required": [r[:64] for r in required if isinstance(r, str)][:32],
                     }
     except Exception:
