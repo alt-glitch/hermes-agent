@@ -38,7 +38,7 @@ from tools.tool_gateway.merge import (
     partition_calls,
     splice_remote_results,
 )
-from tools.tool_gateway.names import parse_connector_name
+from tools.tool_gateway.names import parse_connector_name, vendor_slug_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +126,9 @@ def connector_describe(
     Returns ``{"tools": {<composed name>: {"description", "parameters"}}}``
     keyed by the ORIGINAL composed names. Names the gateway does not resolve
     are simply absent — the caller's not_found handling covers them. The
-    gateway's schemas route takes bare tool slugs; composition back to the
-    ``connectors__`` name uses the caller's own parse, never the response.
+    gateway's schemas route takes bare vendor slugs, so every deterministic
+    recovery candidate is requested; mapping back to the ``connectors__``
+    name uses the caller's own parse, never the response.
     """
     try:
         available = (availability or connectors_available)()
@@ -137,8 +138,9 @@ def connector_describe(
         for name in names:
             parsed = parse_connector_name(name)
             if parsed is not None:
-                # First composed name wins for a duplicated slug.
-                by_slug.setdefault(parsed.tool, parsed.raw)
+                # First composed name wins even when candidate sets collide.
+                for slug in vendor_slug_candidates(parsed.connector, parsed.tool):
+                    by_slug.setdefault(slug, parsed.raw)
         if not by_slug:
             return {}
         client = (client_factory or _default_client_factory)()
@@ -367,10 +369,20 @@ def _run_remote(
             code="TOOL_NOT_FOUND",
         )
 
+    # Composition cuts only the conventional toolkit prefix. Restore that
+    # exact prefix before crossing the wire; literal recovery below covers
+    # the convention's exceptions without probing entries that succeeded.
+    wire_planned = [
+        dataclass_replace(
+            plan,
+            tool=vendor_slug_candidates(plan.connector, plan.tool)[0],
+        )
+        for plan in planned
+    ]
     try:
         client = (client_factory or _default_client_factory)()
-        remote_results = client.execute(planned)
-        return splice_remote_results(planned, remote_results)
+        remote_results = client.execute(wire_planned)
+        entries = splice_remote_results(planned, remote_results)
     except ToolGatewayError as exc:
         logger.debug(
             "Connector execute for dispatch %s failed (%s): %s",
@@ -390,6 +402,49 @@ def _run_remote(
         return fill_remote_failure(
             planned, "The connector gateway request failed unexpectedly."
         )
+
+    fallback_slots: list[int] = []
+    fallback_planned = []
+    for slot, (plan, entry) in enumerate(zip(planned, entries)):
+        primary, literal = vendor_slug_candidates(plan.connector, plan.tool)
+        error = entry.get("error") if isinstance(entry, dict) else None
+        if (
+            primary != literal
+            and isinstance(error, dict)
+            and error.get("code") == "TOOL_NOT_FOUND"
+        ):
+            fallback_slots.append(slot)
+            fallback_planned.append(dataclass_replace(plan, tool=literal))
+    if not fallback_planned:
+        return entries
+
+    # One literal pass only: retry confirmed misses together, then splice
+    # those slots alone so successful and non-not-found siblings stay fixed.
+    try:
+        fallback_results = client.execute(fallback_planned)
+        fallback_entries = splice_remote_results(fallback_planned, fallback_results)
+    except ToolGatewayError as exc:
+        logger.debug(
+            "Connector execute fallback for dispatch %s failed (%s): %s",
+            dispatch_id,
+            exc.code,
+            exc,
+        )
+        fallback_entries = fill_remote_failure(
+            fallback_planned, f"The connector gateway request failed: {exc}"
+        )
+    except Exception as exc:
+        logger.warning(
+            "Connector execute fallback for dispatch %s failed unexpectedly: %s",
+            dispatch_id,
+            exc,
+        )
+        fallback_entries = fill_remote_failure(
+            fallback_planned, "The connector gateway request failed unexpectedly."
+        )
+    for slot, fallback_entry in zip(fallback_slots, fallback_entries):
+        entries[slot] = fallback_entry
+    return entries
 
 
 def _maybe_parse_json(raw: Any) -> Any:

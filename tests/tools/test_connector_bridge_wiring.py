@@ -41,11 +41,11 @@ def _local_defs():
 
 def test_resolve_single_connector_entry_returns_sentinel():
     name, args, err = resolve_underlying_call(
-        {"calls": [{"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "x"}}]}
+        {"calls": [{"name": "connectors__gmail__SEND_EMAIL", "arguments": {"to": "x"}}]}
     )
     assert err is None
     assert name == CONNECTOR_BATCH_SENTINEL
-    assert args["calls"][0]["name"] == "connectors__gmail__GMAIL_SEND_EMAIL"
+    assert args["calls"][0]["name"] == "connectors__gmail__SEND_EMAIL"
     assert args["calls"][0]["arguments"] == {"to": "x"}
 
 
@@ -70,7 +70,7 @@ def test_resolve_legacy_single_shape_unchanged_for_local_names():
 
 def test_resolve_legacy_connector_single_shape_routes_to_sentinel():
     name, args, err = resolve_underlying_call(
-        {"name": "connectors__gmail__GMAIL_CREATE_EMAIL_DRAFT", "arguments": {}}
+        {"name": "connectors__gmail__CREATE_EMAIL_DRAFT", "arguments": {}}
     )
     assert err is None
     assert name == CONNECTOR_BATCH_SENTINEL
@@ -144,7 +144,7 @@ def test_search_composes_lowercase_connector_from_vendor_cased_schema():
             connector_search=cased_search,
         )
     )
-    assert "connectors__custom_x__CUSTOM_X_READ" in out["results"][0]["matches"]
+    assert "connectors__custom_x__READ" in out["results"][0]["matches"]
 
 
 def test_search_merges_remote_hits_tagged_as_connectors():
@@ -156,7 +156,7 @@ def test_search_merges_remote_hits_tagged_as_connectors():
         )
     )
     matches = out["results"][0]["matches"]
-    composed = "connectors__gmail__GMAIL_SEND_EMAIL"
+    composed = "connectors__gmail__SEND_EMAIL"
     assert composed in matches
     assert all("ORPHAN_TOOL" not in m for m in matches)
     record = out["tools"][composed]
@@ -233,8 +233,8 @@ def test_search_identical_to_local_only_when_remote_leg_fails():
 
 
 def test_describe_merges_remote_schema_and_leaves_misses_in_not_found():
-    composed = "connectors__gmail__GMAIL_SEND_EMAIL"
-    stale = "connectors__gmail__GMAIL_GONE_TOOL"
+    composed = "connectors__gmail__SEND_EMAIL"
+    stale = "connectors__gmail__GONE_TOOL"
 
     def fake_describe(names):
         assert set(names) == {composed, stale}
@@ -253,7 +253,7 @@ def test_describe_merges_remote_schema_and_leaves_misses_in_not_found():
 
 
 def test_describe_connector_names_fall_to_not_found_when_dark():
-    composed = "connectors__gmail__GMAIL_SEND_EMAIL"
+    composed = "connectors__gmail__SEND_EMAIL"
     out = json.loads(
         dispatch_tool_describe(
             {"names": [composed]},
@@ -273,8 +273,8 @@ def test_peel_admits_pure_connector_batch_as_sentinel():
     name, args = _peel_bridge_call(
         "tool_call",
         {"calls": [
-            {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
-            {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {}},
+            {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
+            {"name": "connectors__slack__POST_MESSAGE", "arguments": {}},
         ]},
     )
     assert name == CONNECTOR_BATCH_SENTINEL
@@ -282,7 +282,7 @@ def test_peel_admits_pure_connector_batch_as_sentinel():
 
 def test_peel_keeps_mixed_and_local_batches_as_sequential_barrier():
     mixed = {"calls": [
-        {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
+        {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
         {"name": "write_file", "arguments": {"path": "x"}},
     ]}
     name, args = _peel_bridge_call("tool_call", mixed)
@@ -304,14 +304,14 @@ def test_peel_keeps_mixed_and_local_batches_as_sequential_barrier():
 def test_pre_dispatch_block_denies_one_remote_entry_and_siblings_run():
     class FakeClient:
         def execute(self, planned):
-            assert [p.name for p in planned] == ["connectors__slack__SLACK_POST_MESSAGE"]
+            assert [p.name for p in planned] == ["connectors__slack__POST_MESSAGE"]
             return [{"data": "posted", "error": None}]
 
     out = json.loads(
         dispatch_calls(
             [
-                {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {}},
-                {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {}},
+                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
+                {"name": "connectors__slack__POST_MESSAGE", "arguments": {}},
             ],
             local_dispatch=lambda n, a: (True, "{}"),
             pre_dispatch=lambda name, args: (
@@ -324,6 +324,118 @@ def test_pre_dispatch_block_denies_one_remote_entry_and_siblings_run():
     assert out["results"][0]["error"]["code"] == "USER_DENIED"
     assert out["results"][1]["response"] == "posted"
     assert out["success_count"] == 1 and out["error_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# dispatch_calls: vendor-slug restoration and one-pass literal fallback
+# ---------------------------------------------------------------------------
+
+
+def test_execute_falls_back_once_for_literal_slug_without_touching_siblings():
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, planned):
+            self.calls.append(tuple(planned))
+            if len(self.calls) == 1:
+                return [
+                    {"data": "sent", "error": None},
+                    {
+                        "data": None,
+                        "error": {"code": "TOOL_NOT_FOUND", "message": "missing"},
+                    },
+                    {
+                        "data": None,
+                        "error": {"code": "TOOL_NOT_ALLOWED", "message": "blocked"},
+                    },
+                ]
+            return [{"data": "literal result", "error": None}]
+
+    client = FakeClient()
+    out = json.loads(
+        dispatch_calls(
+            [
+                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
+                {"name": "connectors__granola__FETCH_NOTES", "arguments": {}},
+                {"name": "connectors__slack__POST_MESSAGE", "arguments": {}},
+            ],
+            local_dispatch=lambda n, a: (True, "{}"),
+            availability=lambda: True,
+            client_factory=lambda: client,
+        )
+    )
+
+    assert [[plan.tool for plan in call] for call in client.calls] == [
+        ["GMAIL_SEND_EMAIL", "GRANOLA_FETCH_NOTES", "SLACK_POST_MESSAGE"],
+        ["FETCH_NOTES"],
+    ]
+    assert out["results"][0]["response"] == "sent"
+    assert out["results"][1] == {
+        "index": 1,
+        "name": "connectors__granola__FETCH_NOTES",
+        "response": "literal result",
+    }
+    assert out["results"][2]["error"]["code"] == "TOOL_NOT_ALLOWED"
+
+
+def test_execute_does_not_fallback_when_primary_candidate_succeeds():
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, planned):
+            self.calls.append(tuple(planned))
+            return [{"data": "sent", "error": None}]
+
+    client = FakeClient()
+    out = json.loads(
+        dispatch_calls(
+            [{"name": "connectors__gmail__SEND_EMAIL", "arguments": {}}],
+            local_dispatch=lambda n, a: (True, "{}"),
+            availability=lambda: True,
+            client_factory=lambda: client,
+        )
+    )
+
+    assert len(client.calls) == 1
+    assert client.calls[0][0].tool == "GMAIL_SEND_EMAIL"
+    assert out["results"][0]["response"] == "sent"
+
+
+def test_execute_fallback_failure_degrades_only_the_retried_entry():
+    class FakeClient:
+        def __init__(self):
+            self.call_count = 0
+
+        def execute(self, planned):
+            self.call_count += 1
+            if self.call_count == 1:
+                return [
+                    {"data": "sibling", "error": None},
+                    {
+                        "data": None,
+                        "error": {"code": "TOOL_NOT_FOUND", "message": "missing"},
+                    },
+                ]
+            raise RuntimeError("fallback transport failed")
+
+    client = FakeClient()
+    out = json.loads(
+        dispatch_calls(
+            [
+                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
+                {"name": "connectors__granola__FETCH_NOTES", "arguments": {}},
+            ],
+            local_dispatch=lambda n, a: (True, "{}"),
+            availability=lambda: True,
+            client_factory=lambda: client,
+        )
+    )
+
+    assert client.call_count == 2
+    assert out["results"][0]["response"] == "sibling"
+    assert out["results"][1]["error"]["code"] == "PROVIDER_ERROR"
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +505,7 @@ def test_pre_dispatch_rewrite_reaches_the_gateway_request_body():
 
     out = json.loads(
         dispatch_calls(
-            [{"name": "connectors__gmail__GMAIL_SEND_EMAIL",
+            [{"name": "connectors__gmail__SEND_EMAIL",
               "arguments": {"to": "x@example.com", "body": "sk-live-secret"}}],
             local_dispatch=lambda n, a: (True, "{}"),
             pre_dispatch=gate,
@@ -423,8 +535,8 @@ def test_pre_dispatch_rewrite_does_not_leak_to_sibling_entries():
     out = json.loads(
         dispatch_calls(
             [
-                {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "keep-me"}},
-                {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {"channel": "#raw"}},
+                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {"to": "keep-me"}},
+                {"name": "connectors__slack__POST_MESSAGE", "arguments": {"channel": "#raw"}},
             ],
             local_dispatch=lambda n, a: (True, "{}"),
             pre_dispatch=gate,
@@ -445,8 +557,8 @@ def test_pre_dispatch_block_keeps_the_entry_off_the_wire_entirely():
     out = json.loads(
         dispatch_calls(
             [
-                {"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "blocked"}},
-                {"name": "connectors__slack__SLACK_POST_MESSAGE", "arguments": {"channel": "#ok"}},
+                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {"to": "blocked"}},
+                {"name": "connectors__slack__POST_MESSAGE", "arguments": {"channel": "#ok"}},
             ],
             local_dispatch=lambda n, a: (True, "{}"),
             # A block wins even when the same pass also produced a rewrite.
@@ -470,7 +582,7 @@ def test_pre_dispatch_rewrite_to_empty_dict_is_a_rewrite_not_a_no_op():
     transport = _RecordingTransport()
 
     dispatch_calls(
-        [{"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "x"}}],
+        [{"name": "connectors__gmail__SEND_EMAIL", "arguments": {"to": "x"}}],
         local_dispatch=lambda n, a: (True, "{}"),
         pre_dispatch=lambda name, args: (None, {}),
         availability=lambda: True,
@@ -488,7 +600,7 @@ def test_pre_dispatch_exception_sends_the_original_arguments():
         raise RuntimeError("hook blew up")
 
     dispatch_calls(
-        [{"name": "connectors__gmail__GMAIL_SEND_EMAIL", "arguments": {"to": "x"}}],
+        [{"name": "connectors__gmail__SEND_EMAIL", "arguments": {"to": "x"}}],
         local_dispatch=lambda n, a: (True, "{}"),
         pre_dispatch=exploding_gate,
         availability=lambda: True,
@@ -574,7 +686,7 @@ def test_successful_result_carrying_an_error_field_is_not_misclassified():
 def test_connector_describe_maps_slugs_back_to_composed_names():
     class FakeClient:
         def schemas(self, slugs):
-            assert slugs == ["GMAIL_SEND_EMAIL"]
+            assert slugs == ["GMAIL_SEND_EMAIL", "SEND_EMAIL"]
             return {
                 "schemas": {
                     "GMAIL_SEND_EMAIL": {
@@ -588,11 +700,11 @@ def test_connector_describe_maps_slugs_back_to_composed_names():
             }
 
     out = connector_describe(
-        ["connectors__gmail__GMAIL_SEND_EMAIL", "connectors__broken"],
+        ["connectors__gmail__SEND_EMAIL", "connectors__broken"],
         availability=lambda: True,
         client_factory=lambda: FakeClient(),
     )
-    assert out["tools"]["connectors__gmail__GMAIL_SEND_EMAIL"]["parameters"] == {"type": "object"}
+    assert out["tools"]["connectors__gmail__SEND_EMAIL"]["parameters"] == {"type": "object"}
 
 
 def test_connector_describe_is_empty_on_unavailable_and_exploding_client():
