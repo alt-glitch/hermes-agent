@@ -163,7 +163,9 @@ MANAGE_CONNECTIONS_SCHEMA = {
         "'reconnect' restarts a broken authorization. When a connector tool "
         "call returns CONNECTION_REQUIRED, use 'connect' and show the link. "
         "Local MCP servers are a different thing — use setup_mcp for those. "
-        "Disconnecting accounts is done by the user in the Nous Portal."
+        "This tool can NOT disconnect, delete, or revoke an account — that is "
+        "deliberately user-only. When asked, say so and direct the user to "
+        "the Nous Portal (their org's Connectors page) or the desktop app."
     ),
     "parameters": {
         "type": "object",
