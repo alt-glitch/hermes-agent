@@ -497,6 +497,48 @@ def _compute_tool_definitions(
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
 
+    # `manage_connections` rides with the connector bridge, not with a bundle.
+    #
+    # It is registered into the toolset "connections", which exists only in the
+    # registry — never in TOOLSETS. Real sessions do not pass composite bundle
+    # names: CLI, TUI/desktop, cron and every messaging platform resolve their
+    # selection through hermes_cli/tools_config.py::_get_platform_tools, which
+    # returns per-CAPABILITY toolset names (`file`, `terminal`, `web`, …) and
+    # deliberately skips posture toolsets and anything absent from
+    # CONFIGURABLE_TOOLSETS / TOOLSETS. A registry-only toolset can therefore
+    # never appear in any real session's enabled list, so listing the tool in
+    # toolsets._HERMES_CORE_TOOLS only reached callers that hand-pass the
+    # literal name "hermes-cli" — which nothing in production does. Result: a
+    # signed-in engineer in a code workspace could call Gmail through the
+    # bridge but had no tool to ask which accounts were connected.
+    #
+    # So enable it on exactly the condition that activates the bridge trio
+    # (tool_search / tool_describe / tool_call): connectors reachable for this
+    # account. No second gate is written here — the name is added
+    # unconditionally and the tool's own check_fn (_connectors_available, the
+    # same predicate tools/tool_search.py::should_activate consults) drops it
+    # in registry.get_definitions below for a signed-out or non-entitled
+    # session. One predicate, so the two tiers cannot drift apart.
+    #
+    # Added BEFORE the disabled_toolsets subtraction, so naming `connections`
+    # in agent.disabled_toolsets still turns it off like any other toolset.
+    #
+    # Deliberately NOT conditioned on the platform or the bundle. This
+    # function is platform-blind and its result is memoized on a cache key
+    # with no platform member, so an env-derived platform gate would leak one
+    # session's surface into another's tool list inside a gateway process that
+    # multiplexes platforms (the hazard the browser_exec gate below avoids by
+    # keying off the resolved toolset instead). The narrow, injection-
+    # constrained bundles (hermes-webhook, hermes-api-server) are not special-
+    # cased for the same reason and one more: the bridge ALREADY activates
+    # there under this very condition, so withholding the one tool that
+    # reports connection state — while the connector action tools stay
+    # callable — would leave a CONNECTION_REQUIRED failure unexplainable
+    # rather than prevent anything. Whether untrusted-content surfaces should
+    # reach connectors at all is a question about connectors_available(), and
+    # it is tracked separately; it is not answered by hiding this tool.
+    tools_to_include.add("manage_connections")
+
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)
     # is enabled, any tools belonging to a disabled toolset are strictly
