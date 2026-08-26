@@ -134,22 +134,36 @@ def connector_describe(
         available = (availability or connectors_available)()
         if not available:
             return {}
-        by_slug: dict[str, str] = {}
+        # Candidate sets from different names can nominate the SAME vendor
+        # slug (one name's literal is another's prefixed primary), so the
+        # slug->name mapping cannot be global. Resolution is per name: each
+        # name takes the schema of its own best-ranked candidate that the
+        # gateway resolved. First occurrence wins only for a DUPLICATED
+        # composed name.
+        wanted: dict[str, tuple[str, ...]] = {}
+        request_slugs: list[str] = []
         for name in names:
             parsed = parse_connector_name(name)
-            if parsed is not None:
-                # First composed name wins even when candidate sets collide.
-                for slug in vendor_slug_candidates(parsed.connector, parsed.tool):
-                    by_slug.setdefault(slug, parsed.raw)
-        if not by_slug:
+            if parsed is None or parsed.raw in wanted:
+                continue
+            candidates = vendor_slug_candidates(parsed.connector, parsed.tool)
+            wanted[parsed.raw] = candidates
+            for slug in candidates:
+                if slug not in request_slugs:
+                    request_slugs.append(slug)
+        if not wanted:
             return {}
         client = (client_factory or _default_client_factory)()
-        response = client.schemas(list(by_slug)) or {}
+        response = client.schemas(request_slugs) or {}
         schemas = response.get("schemas") if isinstance(response.get("schemas"), dict) else {}
         tools: dict[str, Any] = {}
-        for slug, schema in schemas.items():
-            composed = by_slug.get(slug)
-            if composed is None or not isinstance(schema, dict):
+        for composed, candidates in wanted.items():
+            schema = next(
+                (schemas[slug] for slug in candidates
+                 if isinstance(schemas.get(slug), dict)),
+                None,
+            )
+            if schema is None:
                 continue
             tools[composed] = {
                 "description": str(schema.get("description") or ""),

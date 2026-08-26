@@ -707,6 +707,71 @@ def test_connector_describe_maps_slugs_back_to_composed_names():
     assert out["tools"]["connectors__gmail__SEND_EMAIL"]["parameters"] == {"type": "object"}
 
 
+def test_connector_describe_colliding_candidate_slugs_resolve_per_name():
+    # connectors__first__SECOND_X nominates (FIRST_SECOND_X, SECOND_X) and
+    # connectors__second__X nominates (SECOND_X, X): the shared SECOND_X must
+    # not be claimed globally by whichever name came first. Each name takes
+    # its own best-ranked resolved candidate — here the first name's prefixed
+    # primary is unknown to the gateway, so BOTH names land on SECOND_X.
+    class FakeClient:
+        def schemas(self, slugs):
+            assert slugs == ["FIRST_SECOND_X", "SECOND_X", "X"]
+            return {
+                "schemas": {
+                    "SECOND_X": {
+                        "connector": "second",
+                        "tool": "SECOND_X",
+                        "description": "Shared slug",
+                        "input_schema": {"type": "object"},
+                    }
+                },
+                "not_found": ["FIRST_SECOND_X", "X"],
+            }
+
+    out = connector_describe(
+        ["connectors__first__SECOND_X", "connectors__second__X"],
+        availability=lambda: True,
+        client_factory=lambda: FakeClient(),
+    )
+    assert set(out["tools"]) == {
+        "connectors__first__SECOND_X",
+        "connectors__second__X",
+    }
+
+
+def test_connector_describe_prefers_each_names_prefixed_candidate():
+    # When BOTH of a name's candidates resolve, the prefixed primary wins —
+    # the literal is only the recovery lane for slugs the encoder never
+    # stripped.
+    class FakeClient:
+        def schemas(self, slugs):
+            assert slugs == ["GMAIL_X", "X"]
+            return {
+                "schemas": {
+                    "GMAIL_X": {
+                        "connector": "gmail",
+                        "tool": "GMAIL_X",
+                        "description": "prefixed",
+                        "input_schema": {"type": "object", "title": "prefixed"},
+                    },
+                    "X": {
+                        "connector": "gmail",
+                        "tool": "X",
+                        "description": "literal",
+                        "input_schema": {"type": "object", "title": "literal"},
+                    },
+                },
+                "not_found": [],
+            }
+
+    out = connector_describe(
+        ["connectors__gmail__X"],
+        availability=lambda: True,
+        client_factory=lambda: FakeClient(),
+    )
+    assert out["tools"]["connectors__gmail__X"]["description"] == "prefixed"
+
+
 def test_connector_describe_is_empty_on_unavailable_and_exploding_client():
     assert connector_describe(["connectors__g__T"], availability=lambda: False) == {}
 
