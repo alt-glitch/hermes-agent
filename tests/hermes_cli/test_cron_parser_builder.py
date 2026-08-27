@@ -25,8 +25,8 @@ def _build():
 
 def test_cron_subactions_present():
     parser = _build()
-    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "tick"):
-        ns = parser.parse_args(["cron", action] if action in ("list", "status", "tick")
+    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "tick"):
+        ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "tick")
                                else ["cron", action, "jobid"] if action in ("pause", "resume", "run", "remove", "edit")
                                else ["cron", "create", "30m"])
         assert ns.command == "cron"
@@ -42,6 +42,10 @@ def test_cron_aliases():
     for alias in ("rm", "delete"):
         ns = parser.parse_args(["cron", alias, "jid"])
         assert ns.cron_command == alias
+    ns = parser.parse_args(["cron", "history", "jid", "--limit", "7"])
+    assert ns.cron_command == "history"
+    assert ns.job_id == "jid"
+    assert ns.limit == 7
 
 
 def test_cron_create_options():
@@ -51,6 +55,7 @@ def test_cron_create_options():
         "--name", "daily", "--deliver", "origin", "--repeat", "3",
         "--skill", "a", "--skill", "b", "--no-agent",
         "--workdir", "/tmp/x",
+        "--inactivity-timeout", "18000",
     ])
     assert ns.schedule == "0 9 * * *"
     assert ns.prompt == "daily task prompt"
@@ -60,6 +65,7 @@ def test_cron_create_options():
     assert ns.skills == ["a", "b"]
     assert ns.no_agent is True
     assert ns.workdir == "/tmp/x"
+    assert ns.inactivity_timeout_seconds == "18000"
 
 
 def test_cron_edit_no_agent_tristate():
@@ -68,6 +74,14 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j", "--no-agent"]).no_agent is True
     assert parser.parse_args(["cron", "edit", "j", "--agent"]).no_agent is False
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
+
+
+def test_cron_edit_can_restore_inherited_inactivity_timeout():
+    parser = _build()
+    ns = parser.parse_args(
+        ["cron", "edit", "j", "--inactivity-timeout", "inherit"]
+    )
+    assert ns.inactivity_timeout_seconds == "inherit"
 
 
 def test_cron_dispatch_func_is_injected_handler():

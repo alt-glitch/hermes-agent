@@ -14,6 +14,7 @@ import { describe, expect, test } from 'vitest'
 import { ClarifyPrompt } from '../view/prompts/clarifyPrompt.tsx'
 import { PromptOverlay } from '../view/prompts/promptOverlay.tsx'
 import type { PromptResponseMethod } from '../boundary/promptResponses.ts'
+import { clarifyRevisitState, type ClarifyBatchQuestion } from '../logic/clarifyBatch.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
@@ -77,7 +78,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
       await h.settle()
       expect(calls).toBe(1)
       resolveResponse?.(true)
-      await new Promise(resolve => setTimeout(resolve, 5))
+      await expect.poll(() => store.state.prompt).toBeUndefined()
       await h.settle()
       expect(store.state.prompt).toBeUndefined()
     } finally {
@@ -241,6 +242,284 @@ describe('ClarifyPrompt (F5/F6)', () => {
       h.keys.pressEscape()
       await h.settle()
       expect(cancelled).toBe(true)
+    } finally {
+      h.destroy()
+    }
+  })
+})
+
+// ── Batch (multi-question) clarify — compact status list, Tab cycling, ──────
+// per-question locks, revisit restore. Question BODIES render via the native
+// <markdown> renderable, which doesn't settle in the headless renderer (see the
+// note in the F5 tests above) — so frames assert the structural chrome (✓/▸/·
+// markers, numbered choice rows, the answered count, the plain-text locked
+// answer lines) and the callback params carry the behavioral assertions.
+
+const QUESTIONS: ClarifyBatchQuestion[] = [
+  { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Primary color?' },
+  { choices: ['x', 'y', 'z'], multiSelect: false, qid: 'q1', question: 'Axis?' }
+]
+
+async function mountBatch(
+  questions: ClarifyBatchQuestion[],
+  answers: Record<string, string>,
+  onQuestionAnswer: (qid: string, answer: string) => void = () => {},
+  onCancel: () => void = () => {}
+): Promise<RenderProbe> {
+  return renderProbe(
+    () => (
+      <ThemeProvider theme={() => theme}>
+        <ClarifyPrompt
+          question=""
+          choices={null}
+          questions={questions}
+          answers={answers}
+          onAnswer={() => {}}
+          onCancel={onCancel}
+          onQuestionAnswer={onQuestionAnswer}
+        />
+      </ThemeProvider>
+    ),
+    { height: 24, kittyKeyboard: true, width: 60 }
+  )
+}
+
+describe('ClarifyPrompt — batch mode', () => {
+  test('compact status list: count heading, ▸/· markers, ONLY the active question expanded', async () => {
+    const h = await mountBatch(QUESTIONS, {})
+    try {
+      const frame = h.frame()
+      expect(frame).toContain('? 2 questions')
+      expect(frame).toContain('▸') // active marker (q0)
+      expect(frame).toContain('·') // pending marker (q1)
+      expect(frame).not.toContain('✓') // nothing answered yet
+      // only q0's two choices are expanded — q1's third row must NOT render
+      expect(frame).toContain('1. ')
+      expect(frame).toContain('2. ')
+      expect(frame).not.toContain('3. ')
+      expect(frame).toContain('or type a custom answer')
+      expect(frame).toContain('0/2 answered')
+      // the hint wraps within the 60-col frame — assert its wrap-safe pieces
+      expect(frame).toContain('switch question')
+      expect(frame).toContain('cancel all')
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('Enter locks the ACTIVE question via onQuestionAnswer (qid + answer)', async () => {
+    const locks: [string, string][] = []
+    const h = await mountBatch(QUESTIONS, {}, (qid, answer) => locks.push([qid, answer]))
+    try {
+      h.keys.pressArrow('down') // red → blue
+      await h.settle()
+      h.keys.pressEnter()
+      await h.settle()
+      expect(locks).toEqual([['q0', 'blue']])
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('digit quick-pick locks the active question', async () => {
+    const locks: [string, string][] = []
+    const h = await mountBatch(QUESTIONS, {}, (qid, answer) => locks.push([qid, answer]))
+    try {
+      h.keys.pressKey('2')
+      await h.settle()
+      expect(locks).toEqual([['q0', 'blue']])
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('Tab moves to the next question (its choices expand); Tab again wraps back', async () => {
+    const locks: [string, string][] = []
+    const h = await mountBatch(QUESTIONS, {}, (qid, answer) => locks.push([qid, answer]))
+    try {
+      h.keys.pressTab()
+      await h.settle()
+      expect(h.frame()).toContain('3. ') // q1's three choices now expanded
+      h.keys.pressEnter()
+      await h.settle()
+      expect(locks).toEqual([['q1', 'x']])
+      h.keys.pressTab() // wrap: q1 → q0
+      await h.settle()
+      expect(h.frame()).not.toContain('3. ')
+      h.keys.pressEnter()
+      await h.settle()
+      expect(locks).toEqual([
+        ['q1', 'x'],
+        ['q0', 'red']
+      ])
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('Shift-Tab wraps backwards to the last question', async () => {
+    const locks: [string, string][] = []
+    const h = await mountBatch(QUESTIONS, {}, (qid, answer) => locks.push([qid, answer]))
+    try {
+      h.keys.pressTab({ shift: true }) // q0 → q1 (wrap)
+      await h.settle()
+      expect(h.frame()).toContain('3. ')
+      h.keys.pressEnter()
+      await h.settle()
+      expect(locks).toEqual([['q1', 'x']])
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('mounts on the first UNANSWERED question; locked answers render on their own line', async () => {
+    const h = await mountBatch(QUESTIONS, { q0: 'blue' })
+    try {
+      const frame = h.frame()
+      expect(frame).toContain('✓') // q0 answered
+      expect(frame).toContain('→ blue') // its locked answer line
+      expect(frame).toContain('3. ') // q1 (3 choices) is the active question
+      expect(frame).toContain('1/2 answered')
+      expect(frame).toContain('Enter confirm and continue') // one remaining
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('an empty locked answer renders as an explicit skip', async () => {
+    const h = await mountBatch(QUESTIONS, { q0: '' })
+    try {
+      expect(h.frame()).toContain('(skipped)')
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('revisiting a CHOICE answer restores the cursor onto its row', async () => {
+    const locks: [string, string][] = []
+    // q1 is active (first unanswered); Shift-Tab revisits answered q0.
+    const h = await mountBatch(QUESTIONS, { q0: 'blue' }, (qid, answer) => locks.push([qid, answer]))
+    try {
+      h.keys.pressTab({ shift: true })
+      await h.settle()
+      h.keys.pressEnter() // cursor restored onto 'blue' (row 2) — not 'red'
+      await h.settle()
+      expect(locks).toEqual([['q0', 'blue']])
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('revisiting a TYPED answer stages it on the input row for editing', async () => {
+    const locks: [string, string][] = []
+    const h = await mountBatch(QUESTIONS, { q0: 'chartreuse' }, (qid, answer) => locks.push([qid, answer]))
+    try {
+      h.keys.pressTab({ shift: true }) // q1 → q0 (answered via custom text)
+      await h.settle()
+      expect(h.frame()).toContain('chartreuse') // staged in the inline input
+      h.keys.pressEnter() // input is the selected row → submits the staged text
+      await h.settle()
+      expect(locks).toEqual([['q0', 'chartreuse']])
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('Esc cancels the whole batch', async () => {
+    let cancelled = false
+    const h = await mountBatch(QUESTIONS, {}, undefined, () => (cancelled = true))
+    try {
+      h.keys.pressEscape()
+      await h.settle()
+      expect(cancelled).toBe(true)
+    } finally {
+      h.destroy()
+    }
+  })
+})
+
+describe('clarifyRevisitState (pure restore helper)', () => {
+  test('restores the cursor onto a choice answer', () => {
+    expect(clarifyRevisitState(['red', 'blue'], 'blue')).toEqual({ custom: '', selected: 1 })
+  })
+
+  test('stages a typed answer on the input row for editing', () => {
+    expect(clarifyRevisitState(['red', 'blue'], 'chartreuse')).toEqual({ custom: 'chartreuse', selected: 2 })
+  })
+
+  test('stages a typed answer for an open-ended question (no choices)', () => {
+    expect(clarifyRevisitState([], 'free text')).toEqual({ custom: 'free text', selected: 0 })
+  })
+
+  test('resets cleanly for unanswered and empty answers', () => {
+    expect(clarifyRevisitState(['red'], undefined)).toEqual({ custom: '', selected: 0 })
+    expect(clarifyRevisitState(['red'], '')).toEqual({ custom: '', selected: 0 })
+  })
+})
+
+describe('PromptOverlay — batch clarify per-question locks', () => {
+  const BATCH_EVENT = {
+    payload: {
+      questions: [
+        { choices: ['a', 'b'], qid: 'q0', question: 'One?' },
+        { choices: null, qid: 'q1', question: 'Two?' }
+      ],
+      request_id: 'req-batch'
+    },
+    type: 'clarify.request'
+  } as const
+
+  test('locks answer per question; the prompt stays open until none remain', async () => {
+    const store = createSessionStore()
+    store.apply(BATCH_EVENT)
+    const sent: Record<string, unknown>[] = []
+    const h = await mountOverlay(store, (method, params) => {
+      expect(method).toBe('clarify.respond')
+      sent.push(params)
+      return Promise.resolve(true)
+    })
+    try {
+      // q0 (choices): Enter locks 'a' → clarify.respond {question_id: 'q0'}
+      h.keys.pressEnter()
+      await expect.poll(() => sent.length).toBe(1)
+      expect(sent[0]).toEqual({ answer: 'a', question_id: 'q0', request_id: 'req-batch' })
+      // prompt STAYS open, the lock is mirrored locally
+      expect(store.state.prompt).toMatchObject({ kind: 'clarify', answers: { q0: 'a' } })
+
+      // remounted on q1 (open-ended → the input is focused): type + Enter
+      await h.settle()
+      await h.keys.typeText('freeform')
+      await h.settle()
+      h.keys.pressEnter()
+      await expect.poll(() => sent.length).toBe(2)
+      expect(sent[1]).toEqual({ answer: 'freeform', question_id: 'q1', request_id: 'req-batch' })
+      // final lock resolves the batch — the prompt closes
+      await expect.poll(() => store.state.prompt).toBeUndefined()
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('Esc cancel-all responds WITHOUT question_id and persists the partial record', async () => {
+    const store = createSessionStore()
+    store.apply(BATCH_EVENT)
+    store.recordClarifyAnswer('q0', 'a')
+    const sent: Record<string, unknown>[] = []
+    const h = await mountOverlay(store, (_method, params) => {
+      sent.push(params)
+      return Promise.resolve(true)
+    })
+    try {
+      h.keys.pressEscape()
+      await expect.poll(() => sent.length).toBe(1)
+      expect(sent[0]).toEqual({ answer: '', request_id: 'req-batch' })
+      await expect.poll(() => store.state.prompt).toBeUndefined()
+      const record = store.state.messages.find(
+        message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+      )
+      expect(record?.text).toContain('✓ One? → a')
+      expect(record?.text).toContain('· Two? (no answer)')
+      expect(record?.text).toContain('(cancelled)')
     } finally {
       h.destroy()
     }

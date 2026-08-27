@@ -1,31 +1,46 @@
 import { useStore } from '@nanostores/react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import type { SetTitlebarToolGroup, TitlebarTool } from '@/app/shell/titlebar-controls'
+import { PanelEmpty } from '@/app/overlays/panel'
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
-import { Bug } from '@/lib/icons'
+import { guardGuestPointers } from '@/lib/guest-pointer-guard'
+import { openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
+import { isRemoteGateway } from '@/lib/media'
+import { reachablePreviewUrl } from '@/lib/preview-reach'
+import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { $previewServerRestart, failPreviewServerRestart, type PreviewTarget } from '@/store/preview'
 
+import { ArtifactPreview } from './preview-artifact'
+import { PreviewBrowserBar } from './preview-browser-bar'
 import {
   clampConsoleHeight,
   compactUrl,
   formatLogLine,
   isNearConsoleBottom,
-  PreviewConsolePanel,
-  PreviewConsoleTitlebarIcon
+  PreviewConsolePanel
 } from './preview-console'
-import { type ConsoleEntry, createPreviewConsoleState } from './preview-console-state'
+import { type ConsoleEntry } from './preview-console-state'
+import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
+import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
+import { registerPreviewPageReader } from './preview-reader'
 
 type PreviewWebview = HTMLElement & {
+  canGoBack?: () => boolean
+  canGoForward?: () => boolean
   closeDevTools?: () => void
+  executeJavaScript?: (code: string) => Promise<unknown>
+  getTitle?: () => string
   getURL?: () => string
+  goBack?: () => void
+  goForward?: () => void
   isDevToolsOpened?: () => boolean
+  loadURL?: (url: string) => Promise<void>
   openDevTools?: () => void
   reload?: () => void
   reloadIgnoringCache?: () => void
@@ -35,7 +50,9 @@ interface PreviewPaneProps {
   embedded?: boolean
   onRestartServer?: (url: string, context?: string) => Promise<string>
   reloadRequest?: number
-  setTitlebarToolGroup?: SetTitlebarToolGroup
+  /** The preview tab this pane renders. Keys the per-tab console store the
+   *  browser bar's console toggle and the console panel both read. */
+  tabId?: string
   target: PreviewTarget
 }
 
@@ -60,6 +77,30 @@ function loadErrorTitle(error: PreviewLoadErrorState, copy: Translations['previe
   }
 
   return copy.failedToLoad
+}
+
+/** Loopback hosts — the address family that means "this machine", and so the
+ *  one family whose meaning changes with WHICH machine is running the page. */
+const LOOPBACK_HOST_RE = /^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?)$/i
+
+/**
+ * True when this address can't mean what the agent meant.
+ *
+ * The `<webview>` always runs on the user's own machine, never on the gateway
+ * host. So against a remote gateway, an agent's `localhost:5173` resolves here
+ * — where that port is usually nothing, or worse, somebody else's service. The
+ * URL isn't wrong, it's just addressed to a different computer.
+ */
+function isRemoteLoopbackUrl(url: string): boolean {
+  if (!isRemoteGateway()) {
+    return false
+  }
+
+  try {
+    return LOOPBACK_HOST_RE.test(new URL(url).hostname)
+  } catch {
+    return false
+  }
 }
 
 function isModuleMimeError(message: string): boolean {
@@ -100,6 +141,9 @@ function PreviewLoadError({
             {error.code ? ` (${error.code})` : ''}
           </a>
           <div className="mt-1 text-[0.6875rem] text-muted-foreground/70">{error.description}</div>
+          {isRemoteLoopbackUrl(error.url) && (
+            <div className="mt-2 text-[0.6875rem] leading-relaxed text-muted-foreground/70">{copy.remoteLoopback}</div>
+          )}
         </>
       }
       consoleHeight={consoleHeight}
@@ -118,18 +162,12 @@ function PreviewLoadError({
   )
 }
 
-const TITLEBAR_GROUP_ID = 'preview'
-
-export function PreviewPane({
-  embedded = false,
-  onRestartServer,
-  reloadRequest = 0,
-  setTitlebarToolGroup,
-  target
-}: PreviewPaneProps) {
+export function PreviewPane({ embedded = false, onRestartServer, reloadRequest = 0, tabId, target }: PreviewPaneProps) {
   const { t } = useI18n()
   const copy = t.preview.web
-  const [consoleState] = useState(() => createPreviewConsoleState())
+  // The console store belongs to the TAB, not this render: the toggles live on
+  // the tab and must read the same logs this pane appends to.
+  const consoleState = previewConsoleState(tabId ?? target.url)
   const consoleBodyRef = useRef<HTMLDivElement | null>(null)
   const consoleShouldStickRef = useRef(true)
   const hostRef = useRef<HTMLDivElement | null>(null)
@@ -142,11 +180,33 @@ export function PreviewPane({
   const consoleOpen = useStore(consoleState.$open)
   const [currentUrl, setCurrentUrl] = useState(target.url)
   const [devtoolsOpen, setDevtoolsOpen] = useState(false)
+  const [history, setHistory] = useState({ back: false, forward: false })
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<PreviewLoadErrorState | null>(null)
   const [localReloadKey, setLocalReloadKey] = useState(0)
-  const isWebPreview = target.kind === 'url' || (target.previewKind === 'html' && target.renderMode !== 'source')
+
+  // Artifacts have no URL to load — they render from the registry, never in a
+  // webview.
+  const isWebPreview =
+    target.kind !== 'artifact' &&
+    (target.kind === 'url' || (target.previewKind === 'html' && target.renderMode !== 'source'))
+
+  const isRemoteHtmlTarget =
+    target.kind === 'file' && target.previewKind === 'html' && Boolean(target.dataUrl || target.transient)
+
+  const isRemoteHtml = isRemoteHtmlTarget && target.renderMode !== 'source' && Boolean(target.dataUrl)
+
+  const remoteHtmlDocument = useMemo(
+    () => (isRemoteHtml ? remoteHtmlPreviewDocument(target.dataUrl!) : null),
+    [isRemoteHtml, target.dataUrl]
+  )
+
   const currentLabel = compactUrl(currentUrl)
+
+  // Nothing loaded: no address yet, or the blank page itself. A webview on
+  // `about:blank` paints a white void that reads as broken next to the app's
+  // dark chrome, so the pane says what it is instead.
+  const isBlankPage = isWebPreview && !isRemoteHtml && (!currentUrl || /^about:blank\/?$/i.test(currentUrl))
 
   const previewLabel =
     target.label && target.label.replace(/\/$/, '') !== currentLabel.replace(/\/$/, '') ? target.label : currentLabel
@@ -171,13 +231,19 @@ export function PreviewPane({
 
       document.body.style.cursor = 'row-resize'
       document.body.style.userSelect = 'none'
+      // The webview above the console must not swallow the gesture.
+      const releaseGuests = guardGuestPointers()
+
+      // pointermove outpaces 60fps and each setHeight reflows the webview +
+      // console split, so coalesce to one apply per frame (commits on cleanup).
+      const resize = rafCoalesce((height: number) => consoleState.setHeight(height))
 
       const handleMove = (moveEvent: PointerEvent) => {
         if (!active) {
           return
         }
 
-        consoleState.setHeight(clampConsoleHeight(startHeight + startY - moveEvent.clientY))
+        resize.push(clampConsoleHeight(startHeight + startY - moveEvent.clientY))
       }
 
       const cleanup = () => {
@@ -186,6 +252,8 @@ export function PreviewPane({
         }
 
         active = false
+        resize.finish()
+        releaseGuests()
         document.body.style.cursor = previousCursor
         document.body.style.userSelect = previousUserSelect
         handle.releasePointerCapture?.(pointerId)
@@ -273,46 +341,93 @@ export function PreviewPane({
 
     if (webview.isDevToolsOpened?.()) {
       webview.closeDevTools?.()
-      setDevtoolsOpen(false)
 
       return
     }
 
     webview.openDevTools()
-    setDevtoolsOpen(true)
   }, [])
 
+  const navigateTo = useCallback(
+    (url: string) => {
+      setLoadError(null)
+      // Typed addresses get the same loopback reach as agent-opened ones — on a
+      // remote gateway `localhost:5173` is usually the dev server the user is
+      // there to look at, not something on their own laptop.
+      void reachablePreviewUrl(url)
+        .then(reached =>
+          // loadURL, not a `src` swap: `src` only reloads when the value CHANGES,
+          // so re-entering the address you're already on would do nothing. A
+          // rejected load is a real navigation failure the user has to see —
+          // `did-fail-load` doesn't fire for every rejection (a bad scheme
+          // rejects outright).
+          webviewRef.current?.loadURL?.(reached)
+        )
+        .catch((error: unknown) => {
+          setLoadError({
+            description: error instanceof Error ? error.message : copy.unreachableDescription,
+            url
+          })
+          setLoading(false)
+        })
+    },
+    [copy.unreachableDescription]
+  )
+
+  const goBack = useCallback(() => {
+    const webview = webviewRef.current
+
+    if (webview?.canGoBack?.()) {
+      webview.goBack?.()
+    }
+  }, [])
+
+  const goForward = useCallback(() => {
+    const webview = webviewRef.current
+
+    if (webview?.canGoForward?.()) {
+      webview.goForward?.()
+    }
+  }, [])
+
+  // Gestures that land on the app's chrome (⌘R from the address bar, a mouse
+  // button over the frame). A gesture made INSIDE the page is answered by main
+  // against the focused guest — this renderer can't see into a webview.
   useEffect(() => {
-    if (!setTitlebarToolGroup) {
+    if (!isWebPreview || isRemoteHtml || !tabId) {
       return
     }
 
-    const tools: TitlebarTool[] = [
-      ...(isWebPreview
-        ? [
-            {
-              active: consoleOpen,
-              icon: <PreviewConsoleTitlebarIcon consoleState={consoleState} />,
-              id: `${TITLEBAR_GROUP_ID}-console`,
-              label: consoleOpen ? copy.hideConsole : copy.showConsole,
-              onSelect: () => consoleState.setOpen(open => !open)
-            },
-            {
-              active: devtoolsOpen,
-              icon: <Bug />,
-              id: `${TITLEBAR_GROUP_ID}-devtools`,
-              label: devtoolsOpen ? copy.hideDevTools : copy.openDevTools,
-              onSelect: toggleDevTools
-            }
-          ]
-        : [])
-    ]
+    return registerPreviewNav(tabId, { back: goBack, forward: goForward, reload: reloadPreview })
+  }, [goBack, goForward, isRemoteHtml, isWebPreview, reloadPreview, tabId])
 
-    setTitlebarToolGroup(TITLEBAR_GROUP_ID, tools)
+  // Publish the PAGE reader for this tab (the read_preview tool): extract the
+  // rendered page's title + visible text from the webview. innerText (not
+  // textContent) so hidden nodes and script/style bodies stay out, matching
+  // what the user actually sees.
+  useEffect(() => {
+    if (!isWebPreview || !tabId) {
+      return
+    }
 
-    return () => setTitlebarToolGroup(TITLEBAR_GROUP_ID, [])
-  }, [consoleOpen, consoleState, copy, devtoolsOpen, isWebPreview, setTitlebarToolGroup, toggleDevTools])
+    return registerPreviewPageReader(tabId, async () => {
+      const webview = webviewRef.current
 
+      if (!webview?.executeJavaScript) {
+        throw new Error('preview webview is not ready')
+      }
+
+      const text = await webview.executeJavaScript('document.body ? document.body.innerText : ""')
+
+      return {
+        text: typeof text === 'string' ? text : '',
+        title: webview.getTitle?.() ?? '',
+        url: webview.getURL?.() ?? ''
+      }
+    })
+  }, [isWebPreview, tabId])
+
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (!consoleOpen) {
       return
@@ -328,6 +443,7 @@ export function PreviewPane({
     return () => window.cancelAnimationFrame(handle)
   }, [consoleOpen])
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (
       !previewServerRestart ||
@@ -386,6 +502,7 @@ export function PreviewPane({
     return () => window.clearTimeout(timer)
   }, [copy.stillWorking, previewServerRestart, restartingServer])
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (reloadRequest === lastReloadRequestRef.current) {
       return
@@ -492,6 +609,7 @@ export function PreviewPane({
     }
   }, [appendConsoleEntry, copy, reloadPreview, target.kind, target.url])
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     const host = hostRef.current
 
@@ -503,11 +621,12 @@ export function PreviewPane({
     webviewRef.current = null
     setCurrentUrl(target.url)
     setDevtoolsOpen(false)
+    setHistory({ back: false, forward: false })
     setLoadError(null)
     consoleState.reset()
     setLoading(true)
 
-    if (!isWebPreview) {
+    if (!isWebPreview || isRemoteHtml) {
       setLoading(false)
 
       return
@@ -545,6 +664,9 @@ export function PreviewPane({
       }
     }
 
+    const syncHistory = () =>
+      setHistory({ back: webview.canGoBack?.() ?? false, forward: webview.canGoForward?.() ?? false })
+
     const onNavigate = (event: Event) => {
       const detail = event as Event & { url?: string }
 
@@ -552,6 +674,12 @@ export function PreviewPane({
         setLoadError(null)
         setCurrentUrl(detail.url)
       }
+
+      // Ask the webview rather than counting navigations: the guest page can
+      // move itself (redirects, history.pushState, a link into a new document),
+      // so it is the only thing that knows what its history holds. Wired to
+      // `did-navigate-in-page` too, or SPA route changes never update it.
+      syncHistory()
     }
 
     const onFail = (event: Event) => {
@@ -580,9 +708,24 @@ export function PreviewPane({
     }
 
     const onStart = () => setLoading(true)
-    const onStop = () => setLoading(false)
+
+    const onStop = () => {
+      setLoading(false)
+      // A load that ends without a `did-navigate` (an in-place reload, a
+      // cancelled navigation) still settles the history — resync so the
+      // buttons can't be left stale.
+      syncHistory()
+    }
+
+    // The WEBVIEW is the source of truth for DevTools, not our click handler:
+    // closing the DevTools window itself fires devtools-closed with no click,
+    // and the glyph was left stuck "on" when we tracked it locally.
+    const onDevToolsOpened = () => setDevtoolsOpen(true)
+    const onDevToolsClosed = () => setDevtoolsOpen(false)
 
     webview.addEventListener('console-message', onConsole)
+    webview.addEventListener('devtools-closed', onDevToolsClosed)
+    webview.addEventListener('devtools-opened', onDevToolsOpened)
     webview.addEventListener('did-fail-load', onFail)
     webview.addEventListener('did-navigate', onNavigate)
     webview.addEventListener('did-navigate-in-page', onNavigate)
@@ -593,6 +736,8 @@ export function PreviewPane({
 
     return () => {
       webview.removeEventListener('console-message', onConsole)
+      webview.removeEventListener('devtools-closed', onDevToolsClosed)
+      webview.removeEventListener('devtools-opened', onDevToolsOpened)
       webview.removeEventListener('did-fail-load', onFail)
       webview.removeEventListener('did-navigate', onNavigate)
       webview.removeEventListener('did-navigate-in-page', onNavigate)
@@ -600,10 +745,30 @@ export function PreviewPane({
       webview.removeEventListener('did-stop-loading', onStop)
       webview.remove()
     }
-  }, [appendConsoleEntry, consoleState, copy, isWebPreview, target.url])
+  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, target.url])
 
   return (
-    <aside className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground">
+    <aside
+      className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground"
+      // Buttons 3/4 are a mouse's back/forward. Chromium delivers them to the
+      // renderer as a normal mouse event inside the app's own chrome (the
+      // guest page gets its own via `app-command` in main), and unhandled they
+      // walk the HOST document's history.
+      onMouseDown={event => {
+        if (event.button !== 3 && event.button !== 4) {
+          return
+        }
+
+        event.preventDefault()
+
+        if (event.button === 3) {
+          goBack()
+        } else {
+          goForward()
+        }
+      }}
+      {...(isWebPreview && !isRemoteHtml && tabId ? { [PREVIEW_BROWSER_ATTR]: tabId } : {})}
+    >
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {!embedded && (
           <div className="pointer-events-none flex min-h-(--titlebar-height) items-center gap-1.5 border-b border-border/60 bg-background px-2 py-1">
@@ -611,15 +776,38 @@ export function PreviewPane({
               <Tip label={copy.openTarget(currentUrl)}>
                 <a
                   className="pointer-events-auto inline max-w-full truncate text-left text-xs font-medium text-foreground underline-offset-4 decoration-current/20 transition-colors hover:text-primary hover:underline"
-                  href={currentUrl}
+                  href={isRemoteHtmlTarget ? undefined : currentUrl}
+                  onClick={event => {
+                    if (isRemoteHtmlTarget) {
+                      event.preventDefault()
+                      void openPreviewTargetInBrowser(target).catch(error => notifyError(error, t.preview.unavailable))
+                    }
+                  }}
                   rel="noreferrer"
-                  target="_blank"
+                  target={isRemoteHtmlTarget ? undefined : '_blank'}
                 >
                   {previewLabel || copy.fallbackTitle}
                 </a>
               </Tip>
             </div>
           </div>
+        )}
+
+        {isWebPreview && !isRemoteHtml && (
+          <PreviewBrowserBar
+            canGoBack={history.back}
+            canGoForward={history.forward}
+            consoleOpen={consoleOpen}
+            devToolsOpen={devtoolsOpen}
+            loading={loading}
+            onBack={goBack}
+            onForward={goForward}
+            onNavigate={navigateTo}
+            onReload={reloadPreview}
+            onToggleConsole={() => consoleState.setOpen(open => !open)}
+            onToggleDevTools={toggleDevTools}
+            url={currentUrl}
+          />
         )}
 
         <div
@@ -629,11 +817,30 @@ export function PreviewPane({
           <div
             className={cn(
               'absolute inset-0 flex bg-transparent',
-              (!isWebPreview || loadError) && 'pointer-events-none opacity-0'
+              (isRemoteHtml || !isWebPreview || loadError) && 'pointer-events-none opacity-0'
             )}
             ref={hostRef}
           />
-          {!isWebPreview && <LocalFilePreview reloadKey={localReloadKey} target={target} />}
+          {isRemoteHtml && (
+            <iframe
+              className="absolute inset-0 size-full border-0 bg-white"
+              referrerPolicy="no-referrer"
+              sandbox=""
+              srcDoc={remoteHtmlDocument || ''}
+              title={target.label || copy.fallbackTitle}
+            />
+          )}
+          {!isWebPreview &&
+            (target.kind === 'artifact' ? (
+              <ArtifactPreview target={target} />
+            ) : (
+              <LocalFilePreview reloadKey={localReloadKey} target={target} />
+            ))}
+          {isBlankPage && (
+            <div className="absolute inset-0 grid bg-background">
+              <PanelEmpty description={copy.blankPageBody} icon="globe" />
+            </div>
+          )}
           {loadError && (
             <PreviewLoadError
               consoleHeight={consoleOpen ? consoleHeight : 0}
@@ -644,7 +851,7 @@ export function PreviewPane({
             />
           )}
 
-          {isWebPreview && consoleOpen && (
+          {isWebPreview && !isRemoteHtml && consoleOpen && (
             <PreviewConsolePanel
               consoleBodyRef={consoleBodyRef}
               consoleShouldStickRef={consoleShouldStickRef}

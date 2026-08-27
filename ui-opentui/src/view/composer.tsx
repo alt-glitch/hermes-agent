@@ -3,11 +3,13 @@
  * Enter submits, the input clears imperatively, and a live slash-completion
  * dropdown renders ABOVE it as you type `/…` (spec §1 completions).
  *
- * Newlines: Shift+Enter inserts one on kitty-protocol terminals (ghostty/
- * kitty/wezterm — legacy input can't distinguish it from Enter, both arrive as
- * the CR byte, so plain Enter stays submit everywhere); Alt+Enter is the
- * universal fallback (ESC-prefixed CR in legacy terminals), Ctrl+J too (the
- * legacy linefeed byte keeps the stock `newline` binding). Height: the box
+ * Newlines: Shift/Ctrl/Cmd+Enter insert one on kitty-protocol terminals
+ * (ghostty/kitty/wezterm — legacy input can't distinguish them from Enter, all
+ * arrive as the CR byte, so plain Enter stays submit everywhere). IDE terminal
+ * setup (boundary/terminalSetup.ts) makes the same chords work in VS Code-family
+ * terminals by sending the atomic CSI u encodings (ESC[13;2u / 13;5u / 13;9u).
+ * Alt+Enter is the universal fallback (ESC-prefixed CR in legacy terminals),
+ * Ctrl+J too (the legacy linefeed byte keeps the stock `newline` binding). Height: the box
  * auto-grows to COMPOSER_MAX_ROWS (Ink parity 8; HERMES_TUI_COMPOSER_ROWS
  * overrides) then scrolls INTERNALLY — the native edit buffer keeps the cursor
  * in view, Up/Down navigate lines in a multi-line buffer (history recall is a
@@ -28,19 +30,18 @@
  * Tab-only accept so arrows/Enter retain history/cursor/submit meanings.
  * `onSubmit`/`onType` are plain callbacks wired by the entry — no Effect here.
  *
- * Skill highlighting + one-edit autocorrect (Epic 6): standalone `/name` tokens
- * whose name exactly matches a valid command/skill name get a native textarea
- * highlight (editBuffer.addHighlightByCharRange + a SyntaxStyle — the same
- * range-styling seam the extmarks demo uses, WITHOUT ExtmarksController's
- * cursor monkey-patching, so the token stays normally editable). The catalog of
- * valid names is LEARNED from the slash-completion batches the gateway already
- * sends (module-level, survives composer remounts) — the completion flow is the
- * source of truth, nothing is hardcoded. When the message is EXACTLY a bare
+ * Reference highlighting + one-edit autocorrect: slash invocations/references,
+ * `@` refs, and attachment/paste tokens get a native textarea highlight
+ * (editBuffer.addHighlightByCharRange + a SyntaxStyle — the same range-styling
+ * seam the extmarks demo uses, WITHOUT ExtmarksController's cursor
+ * monkey-patching, so the token stays normally editable). Half-typed refs paint
+ * immediately. The learned gateway command catalog remains the source of truth
+ * for autocorrect. When the message is EXACTLY a bare
  * lead token one edit away from one valid name (`/comit`) and the gateway menu
  * is empty, a synthetic "did you mean" row rides the SAME dropdown (same
  * routeMenuKey routing/accept path; Esc dismisses it until the text changes).
- * Anti-jank: a `/` mid-prose never completes or autocorrects — exact tokens get
- * highlight-only, everything else gets nothing (see logic/skillMatch.ts).
+ * Anti-jank: a `/` mid-prose never completes or autocorrects; highlighting is
+ * cosmetic and follows the same vocabulary as the sent transcript.
  *
  * Always-active input (item 2): the textarea focuses on mount, on click
  * (onMouseDown), and reclaims focus on the next PRINTABLE keystroke if focus ever
@@ -53,8 +54,9 @@ import { SyntaxStyle, type PasteEvent, type TextareaRenderable } from '@opentui/
 import { useKeyboard, useRenderer } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
-import { MENU_MAX, acceptChangesToken, applyCompletion, routeMenuKey } from '../logic/completionMenu.ts'
+import { MENU_MAX, acceptChangesToken, completionEdit, routeMenuKey } from '../logic/completionMenu.ts'
 import { BUSY_QUEUE_MAX_CHARS, BUSY_QUEUE_MAX_EDIT_CHARS } from '../logic/busyQueue.ts'
+import { composerHighlightSpans } from '../logic/composerHighlights.ts'
 import { envComposerRows } from '../logic/env.ts'
 import { createDoublePress } from '../logic/promptHistory.ts'
 import { analyzeSlash, learnableNames, nativeCharOffset } from '../logic/skillMatch.ts'
@@ -160,6 +162,7 @@ export function Composer(props: {
   onType?: ((text: string, cursor: number) => void) | undefined
   completions?: (() => CompletionItem[]) | undefined
   completionFrom?: (() => number) | undefined
+  completionEnd?: (() => number | undefined) | undefined
   onDismiss?: (() => void) | undefined
   history?: PromptHistory | undefined
   onImagePaste?: ((hotkey?: boolean) => void | string | Promise<void | string | undefined>) | undefined
@@ -266,18 +269,16 @@ export function Composer(props: {
    *  the mode is visually unmistakable. */
   const shellMode = createMemo(() => bufText().startsWith('!'))
 
-  // Native highlight plumbing: one SyntaxStyle per mount holding the token
-  // style; ranges are recomputed from `analysis()` on every change (clear+add —
+  // Native highlight plumbing: one SyntaxStyle per mount holding the reference
+  // style; ranges are recomputed from live text on every change (clear+add —
   // the same recompute model ExtmarksController uses). Best-effort: a native
   // styling failure must never take the composer down.
   let syntax: SyntaxStyle | undefined
   let tokenStyleId = 0
-  let imageStyleId = 0
   onMount(() => {
     try {
       const style = SyntaxStyle.create()
       tokenStyleId = style.registerStyle('slash-token', { bold: true, fg: theme().color.accent })
-      imageStyleId = style.registerStyle('image-token', { bold: true, fg: theme().color.primary })
       if (ta) ta.syntaxStyle = style
       syntax = style
     } catch {
@@ -290,11 +291,9 @@ export function Composer(props: {
   // the highlight createEffect below re-tracks `theme()` so ranges re-apply.
   createEffect(() => {
     const accent = theme().color.accent
-    const primary = theme().color.primary
     if (!syntax) return
     try {
       tokenStyleId = syntax.registerStyle('slash-token', { bold: true, fg: accent })
-      imageStyleId = syntax.registerStyle('image-token', { bold: true, fg: primary })
     } catch {
       /* cosmetic — never crash on a native restyle */
     }
@@ -326,31 +325,18 @@ export function Composer(props: {
     syntax = undefined
   })
   createEffect(() => {
-    const a = analysis()
-    const images = props.pendingImages?.() ?? []
+    const text = bufText()
+    const spans = composerHighlightSpans(text)
     void theme().color.accent // re-track: re-apply highlights after a live re-theme
     if (!ta || !syntax || ta.isDestroyed) return
     try {
-      const text = bufText()
       ta.editBuffer.clearAllHighlights()
-      for (const t of a.highlights) {
+      for (const span of spans) {
         ta.editBuffer.addHighlightByCharRange({
-          end: nativeCharOffset(text, t.end),
-          start: nativeCharOffset(text, t.start),
+          end: nativeCharOffset(text, span.end),
+          start: nativeCharOffset(text, span.start),
           styleId: tokenStyleId
         })
-      }
-      for (const image of images) {
-        let start = text.indexOf(image.token)
-        while (start >= 0) {
-          const end = start + image.token.length
-          ta.editBuffer.addHighlightByCharRange({
-            end: nativeCharOffset(text, end),
-            start: nativeCharOffset(text, start),
-            styleId: imageStyleId
-          })
-          start = text.indexOf(image.token, end)
-        }
       }
       ta.requestRender()
     } catch {
@@ -383,11 +369,12 @@ export function Composer(props: {
     })
   }
 
-  /** Replace the textarea content and park the cursor at the end (history recall). */
-  const setBuffer = (text: string): boolean => {
+  /** Replace the textarea content and park the cursor at the requested offset
+   * (history recall defaults to the end). */
+  const setBuffer = (text: string, cursor: number = text.length): boolean => {
     if (!ta || text.length > BUSY_QUEUE_MAX_EDIT_CHARS) return false
     ta.setText(text)
-    ta.cursorOffset = text.length
+    ta.cursorOffset = Math.min(Math.max(0, cursor), text.length)
     // Programmatic replacement/history recall abandons every retained paste
     // token not reachable from the new buffer. Restoring the same token across
     // a session clear→restore keeps it live.
@@ -555,7 +542,9 @@ export function Composer(props: {
     // the `/` (its own `from`); gateway rows keep the store's replace_from.
     const synthetic = storeItems().length === 0
     const from = synthetic ? (suggested()?.from ?? 1) : (props.completionFrom?.() ?? 0)
-    setBuffer(applyCompletion(ta.plainText, item.text, from))
+    const end = synthetic ? undefined : props.completionEnd?.()
+    const edit = completionEdit(ta.plainText, item.text, from, end)
+    setBuffer(edit.text, edit.cursor)
     props.onDismiss?.()
   }
 
@@ -570,14 +559,16 @@ export function Composer(props: {
     if (!item || !ta) return false
     const synthetic = storeItems().length === 0
     const from = synthetic ? (suggested()?.from ?? 1) : (props.completionFrom?.() ?? 0)
-    return acceptChangesToken(ta.plainText, item.text, from)
+    const end = synthetic ? undefined : props.completionEnd?.()
+    return acceptChangesToken(ta.plainText, item.text, from, end)
   }
 
-  // Esc+Esc → session prompt history (Epic 5; free-code's double-press model).
+  // Esc+Esc → discard a draft (recallable with Up), or open session prompt
+  // history when the buffer is empty. Match the upstream Ink/CLI 500ms window.
   // ONLY an Esc that nothing else consumed counts: the dropdown-dismiss branch
   // returns before press() is reached (so a dismissing Esc never arms), and any
   // other key resets the window (intervening keys disarm).
-  const doubleEsc = createDoublePress()
+  const doubleEsc = createDoublePress(500)
   const doubleEmptyEnter = createDoublePress(450)
 
   const submit = () => {
@@ -689,6 +680,10 @@ export function Composer(props: {
     // processes the key; the microtask runs after both). Equal-value signal
     // sets are no-ops, so this is cheap on every keystroke.
     queueMicrotask(syncCursorLine)
+    // Any real non-Esc press is an intervening key for the double-Esc
+    // gesture. Do this before handlers that return early (paste, line kill,
+    // queue editing, etc.) so Esc -> action -> Esc cannot discard a draft.
+    if (key.eventType !== 'release' && key.name !== 'escape') doubleEsc.reset()
     if (key.eventType !== 'release' && key.name === 'v' && (key.ctrl || key.meta || key.super) && !key.option) {
       key.preventDefault()
       void Promise.resolve(props.onImagePaste?.(true)).then(text => {
@@ -712,9 +707,24 @@ export function Composer(props: {
       props.onOpenEditor?.(ta?.plainText ?? '')
       return
     }
-    // 0) double-Esc bookkeeping: any non-Esc press is an intervening key and
-    // disarms the pending Esc (free-code resets on every other input).
-    if (key.eventType !== 'release' && key.name !== 'escape') doubleEsc.reset()
+    // OpenTUI 0.4.1 already exposes the native line-kill actions used below,
+    // but its delete-to-line-end action is a no-op at EOL. Readline Ctrl+K
+    // consumes that newline, as does upstream Ink's Cmd/Super+Delete path.
+    // Intercept only this boundary case; every non-boundary kill stays native.
+    const lineEndKill =
+      key.eventType !== 'release' &&
+      ((key.name === 'k' && key.ctrl && !key.meta && !key.option && !key.super) ||
+        (key.name === 'delete' && key.super === true))
+    if (lineEndKill && ta?.focused) {
+      const cursor = ta.logicalCursor
+      const eol = ta.editBuffer.getEOL()
+      if (cursor.row === eol.row && cursor.col === eol.col && cursor.row < ta.lineCount - 1) {
+        key.preventDefault()
+        ta.deleteRange(cursor.row, cursor.col, cursor.row + 1, 0)
+        props.history?.reset()
+        return
+      }
+    }
     // 1) Queue edit owns Esc/Ctrl+X before completion dismissal. Ink's queue
     // header promises one-press "Esc cancel", including slash-like rows whose
     // body opened a completion menu.
@@ -818,13 +828,30 @@ export function Composer(props: {
         return
       }
     }
-    // 1.5) Esc+Esc on an EMPTY, FOCUSED composer (no dropdown — the dismiss
-    // branch returned above) opens the session prompt-history viewer (Epic 5).
-    // With text in the buffer the Esc is just an intervening key (disarms);
-    // unfocused (e.g. the agents tray owns the keys) it never counts.
-    if (key.name === 'escape' && key.eventType !== 'release' && !key.ctrl && !key.meta && !key.option) {
-      if (ta?.focused === true && ta.plainText === '' && !key.defaultPrevented) {
-        if (doubleEsc.press()) props.onDoubleEsc?.()
+    // 1.5) Esc+Esc on a FOCUSED composer with no dropdown. A non-empty draft
+    // is recorded before it is discarded so Up recalls it; an empty buffer
+    // keeps the existing session prompt-history viewer behavior. The history
+    // guard reflects the production contract: without a recall sink, do not
+    // destructively clear a caller's draft.
+    if (
+      key.name === 'escape' &&
+      key.eventType !== 'release' &&
+      key.repeated !== true &&
+      !key.ctrl &&
+      !key.meta &&
+      !key.option &&
+      !key.super
+    ) {
+      if (ta?.focused === true && !key.defaultPrevented) {
+        if (doubleEsc.press()) {
+          const draft = ta.plainText
+          if (draft !== '' && props.history) {
+            props.history.push(draft)
+            clearBuffer(true)
+          } else if (draft === '') {
+            props.onDoubleEsc?.()
+          }
+        }
       } else {
         doubleEsc.reset()
       }
@@ -983,6 +1010,15 @@ export function Composer(props: {
             // — the legacy linefeed byte — also stays newline via the defaults.)
             { action: 'newline', meta: true, name: 'return' },
             { action: 'newline', meta: true, name: 'kpenter' },
+            // Ctrl/Cmd+Enter: newline too. IDE terminal setup (Ink parity) binds
+            // ctrl+enter / cmd+enter to the atomic CSI u sequences ESC[13;5u and
+            // ESC[13;9u, which parse as return+ctrl / return+super; kitty
+            // terminals report the same events natively. Without these bindings
+            // a modified return matches nothing and the keypress is dropped.
+            { action: 'newline', ctrl: true, name: 'return' },
+            { action: 'newline', ctrl: true, name: 'kpenter' },
+            { action: 'newline', name: 'return', super: true },
+            { action: 'newline', name: 'kpenter', super: true },
             // Home/End move PER LINE in a multi-line buffer (stock binds them to
             // the buffer ends); Ctrl+Home/End keep the whole-buffer jumps.
             { action: 'line-home', name: 'home' },
@@ -990,7 +1026,12 @@ export function Composer(props: {
             { action: 'select-line-home', name: 'home', shift: true },
             { action: 'select-line-end', name: 'end', shift: true },
             { action: 'buffer-home', ctrl: true, name: 'home' },
-            { action: 'buffer-end', ctrl: true, name: 'end' }
+            { action: 'buffer-end', ctrl: true, name: 'end' },
+            // Only the explicit Super bit means Cmd here. OpenTUI reports
+            // macOS Option as meta, and Ctrl+Backspace is also delete-word, so
+            // neither modifier may be broadened into a line kill.
+            { action: 'delete-to-line-start', name: 'backspace', super: true },
+            { action: 'delete-to-line-end', name: 'delete', super: true }
           ]}
           onMouseDown={() => ta?.focus()}
           onSubmit={submit}

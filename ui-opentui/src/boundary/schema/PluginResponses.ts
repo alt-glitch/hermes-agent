@@ -8,7 +8,9 @@ const UnknownFields = Schema.Record(Str, Schema.Unknown)
 export const PluginRowSchema = Schema.StructWithRest(
   Schema.Struct({
     description: opt(Str),
+    key: opt(Str),
     name: Str,
+    portable: opt(Schema.Boolean),
     source: opt(Str),
     status: opt(Str),
     version: opt(Str)

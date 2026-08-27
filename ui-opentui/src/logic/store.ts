@@ -15,7 +15,7 @@ import { Option } from 'effect'
 import { createStore, produce } from 'solid-js/store'
 
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
-import type { BillingOverlayState } from '../boundary/billing.ts'
+import type { BillingOverlayState, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { CommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
 import { decodeSessionActiveListResponse, type ActiveItem } from '../boundary/schema/SessionOrchestratorResponses.ts'
 import {
@@ -31,6 +31,8 @@ import {
   type SessionInfoPatchDecoded
 } from '../boundary/schema/SessionInfo.ts'
 import type { DetailsMode, DetailsSection, DetailsSections } from './details.ts'
+import type { BatteryInfo } from './battery.ts'
+import type { VoiceSubmitMode } from './voiceSubmit.ts'
 import {
   applyDelegationState,
   clearAgentsNudgeTurn,
@@ -73,6 +75,26 @@ import {
   type SubagentStatus
 } from './subagentTree.ts'
 import { approvalPolicy, type ApprovalChoicePolicy } from './approval.ts'
+import {
+  formatAbandonedClarifyBatch,
+  normalizeClarifyQuestions,
+  remainingClarifyQids,
+  type ClarifyBatchQuestion
+} from './clarifyBatch.ts'
+import { billingWallAction, billingWallCopy, runBillingWallAction, type BillingWallHost } from './billingWall.ts'
+
+/** Monotonic identity for one concrete overlay instance. Async work must carry
+ * this token back to patch/close so a completion from an old session cannot
+ * mutate a successor overlay. */
+export type OverlayOwner = number
+
+export interface OwnedBillingOverlayState extends BillingOverlayState {
+  readonly owner: OverlayOwner
+}
+
+export interface OwnedSubscriptionOverlayState extends SubscriptionOverlayState {
+  readonly owner: OverlayOwner
+}
 
 /** A tool call inside an assistant turn (matched start↔complete by `id`=tool_id). */
 export interface ToolPartState {
@@ -183,7 +205,17 @@ export type ConfirmRequest = string | ConfirmSpec
  * Each is answered via the matching `*.respond` RPC; Esc/Ctrl+C sends deny/empty.
  */
 export type ActivePrompt =
-  | { kind: 'clarify'; question: string; choices: string[] | null; requestId: string }
+  | {
+      kind: 'clarify'
+      question: string
+      choices: string[] | null
+      requestId: string
+      /** Batch (multi-question) clarify — present instead of question/choices. */
+      questions?: ClarifyBatchQuestion[]
+      /** Answers locked server-side (qid → answer): seeded from the reconnect
+       *  replay, extended by recordClarifyAnswer as each lock is acknowledged. */
+      answers?: Record<string, string>
+    }
   | { kind: 'approval'; allowPermanent: ApprovalChoicePolicy; command: string; description: string }
   | { kind: 'sudo'; requestId: string }
   | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
@@ -257,6 +289,10 @@ export interface CompletionItem {
   text: string
   display: string
   meta: string
+  /** Row class from the gateway (`skill` | `command`); absent on rows that
+   *  predate the field (and on TUI-local widget extras). Inline `/skill`
+   *  reference plans keep only `kind === 'skill'` rows. */
+  kind?: string
 }
 
 /** One typed entry in a subagent's activity trace — `kind` drives glyph + color
@@ -469,6 +505,9 @@ export interface SessionInfo {
   provider?: string
   cwd?: string
   branch?: string
+  /** First-class project resolved by the gateway for the active cwd. `null`
+   *  deliberately clears a prior project when the session changes workspace. */
+  projectName?: string | null
   /** Session title (auto-titled after the first exchange / renamed via the
    *  picker) — drives the terminal window-title chrome; unset until titled. */
   title?: string
@@ -490,7 +529,8 @@ export interface SessionInfo {
   updateCommand?: string
   /** Active profile name (`profile_name`); the bar badges it when non-default. */
   profileName?: string
-  /** Count of configured MCP servers (`mcp_servers.length`) for the bar's `N mcp`. */
+  /** Count of connected MCP servers from `session.info`; the status bar uses
+   *  this only as a fallback until the enabled startup catalog is available. */
   mcpServers?: number
   /** Epoch ms when this TUI session started (set once at store creation; never
    *  patched from the wire) — drives the status-bar session duration. */
@@ -571,6 +611,9 @@ export interface StoreState {
   /** Char offset in the input where an accepted completion should start replacing
    *  (gateway `replace_from` for slash args; the path-token start for @-mentions). */
   completionFrom: number
+  /** Exclusive inline-token replacement end. Undefined keeps the legacy
+   * replace-through-buffer-end behavior for callers that only provide `from`. */
+  completionEnd: number | undefined
   /** Delegated subagents (from `subagent.*`), shown in the agents dashboard. */
   subagents: SubagentInfo[]
   /** Process-global newest-first in-memory archives (Ink `/replay` parity). */
@@ -599,8 +642,10 @@ export interface StoreState {
   pluginsHub: boolean
   /** Whether the searchable Pet gallery is open. */
   petPicker: boolean
-  /** The open /billing overlay (full-screen modal; undefined when closed). */
-  billing: BillingOverlayState | undefined
+  /** The open /topup overlay (full-screen modal; undefined when closed). */
+  billing: OwnedBillingOverlayState | undefined
+  /** The open /subscription plan-management overlay. */
+  subscription: OwnedSubscriptionOverlayState | undefined
   /** OS background processes (from `agents.list`) — shown in the /processes panel. */
   backgroundProcesses: BackgroundProcess[]
   /** In-flight background-PROMPT task ids (`/bg` → `prompt.background`, cleared on
@@ -656,6 +701,14 @@ export interface StoreState {
    *  Defaults OFF — the persisted `display.tui_compact` config doesn't reach the
    *  TUI via session.info, so the flag starts false each launch. */
   compact: boolean
+  /** Focus view (/focus — port of upstream d6fa2709de6): display-only
+   *  reduced-output mode, driving the pinned `◉ focus` status-bar badge. The
+   *  gateway owns the actual tool_progress stash/restore behind `config.set
+   *  {key:'focus'}`. Hydrated from the persisted `display.focus_view` on both
+   *  `config.get full` entry paths (boot + config-mtime refresh); like
+   *  `compact`/`batteryEnabled` it deliberately survives session resets — the
+   *  persisted config, not the session, owns it. */
+  focusView: boolean
   /** Global tool/reasoning detail mode (/details): collapsed (default) /
    *  expanded (bodies default-open) / hidden (runs fold to one muted line). */
   details: DetailsMode
@@ -663,9 +716,18 @@ export interface StoreState {
   detailsSections: DetailsSections
   /** Show a muted `[HH:MM]` time next to each transcript message that carries a
    *  stored unix `timestamp` (/timestamps — port of upstream 5ff11a689). Defaults
-   *  OFF; like `compact`, the persisted pref doesn't reach the TUI via session.info,
-   *  so it starts false each launch. */
+   *  OFF; hydrated from the persisted `display.timestamps` on both `config.get
+   *  full` entry paths (boot + config-mtime repoll — upstream 77fcc2ea31e0),
+   *  revision-guarded so a local /timestamps command beats a stale in-flight
+   *  hydration. */
   timestamps: boolean
+  /** `approvals.destructive_slash_confirm` (upstream 77f35add0cc4): gate the
+   *  destructive-slash confirm dialog (/clear, /new, /queue --clear …). Fail
+   *  safe: defaults ON, and only the config's explicit boolean `false` turns it
+   *  off (decoder-enforced). `HERMES_TUI_NO_CONFIRM` remains an env
+   *  alias/override at the confirm seam. Config-scoped — survives session
+   *  resets; a transient config poll failure preserves the last policy. */
+  destructiveSlashConfirm: boolean
   /** /reasoning full — expand ALL thinking ("Thinking"/"Thought") sections to show
    *  their full body, independently of the global /details mode. Defaults OFF;
    *  bare `/reasoning` syncs it from the persisted `display.reasoning_full` (via
@@ -673,6 +735,11 @@ export interface StoreState {
   reasoningFull: boolean
   /** Persisted display.busy_input_mode mirrored into the live submit policy. */
   busyInputMode: BusyInputMode
+  /** Launch-level display.battery preference. It deliberately survives every
+   * session-owned reset; the poller is armed only while this is true. */
+  batteryEnabled: boolean
+  /** Latest host reading. Cleared immediately when the indicator is disabled. */
+  batteryStatus: BatteryInfo | null
 }
 
 export interface VoiceState {
@@ -681,6 +748,9 @@ export interface VoiceState {
   recording: boolean
   processing: boolean
   recordKey: string
+  /** What a committed ordinary transcript does: submit as a turn (`direct`,
+   * the default) or land in the composer editable (`voice.submit_mode: draft`). */
+  submitMode: VoiceSubmitMode
 }
 
 export interface BrowserState {
@@ -738,6 +808,7 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   if (d.provider) patch.provider = d.provider
   if (d.cwd) patch.cwd = d.cwd
   if (d.branch) patch.branch = d.branch
+  if (d.project !== undefined) patch.projectName = d.project?.name.trim() || null
   if (d.title) patch.title = d.title
   if (d.running !== undefined) patch.running = d.running
   // prefer the nested usage.context_* numbers, else the top-level fallback.
@@ -848,6 +919,7 @@ export interface SessionStoreOptions {
 }
 
 export function createSessionStore(options?: SessionStoreOptions) {
+  let overlayOwnerSequence = 0
   // Rolling cap on retained transcript rows. OpenTUI lays out via Yoga (WASM), whose
   // linear memory is grow-only — every live `<For>` row is a Yoga-node subtree, so an
   // uncapped `messages[]` ratchets the high-water mark up over a long session and never
@@ -911,6 +983,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     promptHistory: false,
     completions: undefined,
     completionFrom: 0,
+    completionEnd: undefined,
     subagents: [],
     spawnHistory: emptySpawnHistory(),
     spawnTreeSaveIntents: [],
@@ -926,9 +999,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
     dashboardDiffPair: undefined,
     backgroundPanel: false,
     billing: undefined,
+    subscription: undefined,
     backgroundProcesses: [],
     bgTasks: [],
-    voice: { enabled: false, tts: false, recording: false, processing: false, recordKey: 'ctrl+b' },
+    voice: {
+      enabled: false,
+      tts: false,
+      recording: false,
+      processing: false,
+      recordKey: 'ctrl+b',
+      submitMode: 'direct'
+    },
     browser: { connected: false },
     lastNotification: undefined,
     notice: null,
@@ -946,12 +1027,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
     sessionId: undefined,
     resumeId: undefined,
     compact: false,
+    focusView: false,
     details: 'collapsed',
     detailsCommandOverride: false,
     detailsSections: {},
     timestamps: false,
+    destructiveSlashConfirm: true,
     reasoningFull: false,
-    busyInputMode: DEFAULT_BUSY_INPUT_MODE
+    busyInputMode: DEFAULT_BUSY_INPUT_MODE,
+    batteryEnabled: false,
+    batteryStatus: null
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
@@ -990,6 +1075,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   function registerCommittedEventHandler(handler: (event: GatewayEvent) => void): void {
     onCommittedEvent = handler
+  }
+
+  // The billing-wall confirm's recovery routes through the composer's slash
+  // ladder (`/topup` opens the native billing overlay, `/model` the picker) —
+  // entry-owned, like the busy-queue drain. Registered once at boot; without a
+  // registration (bare logic tests) the action degrades to an honest
+  // transcript hint via runBillingWallAction's fallback.
+  let billingWallHost: Omit<BillingWallHost, 'pushSystem'> | undefined
+  function registerBillingWallHost(host: Omit<BillingWallHost, 'pushSystem'>): void {
+    billingWallHost = host
   }
 
   // Chrome-notice TTL timer (NOT store state — a transient handle, not reactive
@@ -1069,6 +1164,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
     const left = a?.replace(/\r\n?/gu, '\n').trim() ?? ''
     const right = b?.replace(/\r\n?/gu, '\n').trim() ?? ''
     return !!left && left === right
+  }
+
+  function visibleText(message: Message | undefined): string {
+    return (message?.parts ?? [])
+      .filter(part => part.type === 'text')
+      .map(part => part.text)
+      .join('')
   }
 
   function appendPart(m: Message, type: 'text' | 'reasoning', text: string): void {
@@ -1430,6 +1532,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // server reliably emits that session.info in run()'s finally (server.py ~7227)
   // after EVERY turn (success/error/interrupt), so the drain always fires once.
   let turnInFlight = false
+  // The latest interim assistant text part identifies the provisional answer
+  // that message.complete may settle in place when response_previewed is true.
+  let interimTextPartId: string | undefined
 
   // Separate from `turnInFlight`: message.complete optimistically settles the
   // UI before the authoritative session.info(false), so a child exit in that
@@ -1670,6 +1775,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.promptHistory = false
         draft.completions = undefined
         draft.completionFrom = 0
+        draft.completionEnd = undefined
         draft.subagents = []
         draft.agentsNudge = clearAgentsNudgeTurn(draft.agentsNudge)
         draft.agentsNudgePending = false
@@ -1682,6 +1788,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.dashboardDiffPair = undefined
         draft.backgroundPanel = false
         draft.billing = undefined
+        draft.subscription = undefined
         draft.bgTasks = []
         draft.status = undefined
         draft.lastNotification = undefined
@@ -1793,18 +1900,34 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('backgroundPanel', false)
   }
 
-  /** Open the /billing overlay with the fetched gateway state + ctx bundle. */
-  function openBilling(overlay: BillingOverlayState) {
-    setState('billing', overlay)
+  /** Open the /topup overlay with the fetched gateway state + ctx bundle. */
+  function openBilling(overlay: BillingOverlayState): OverlayOwner {
+    const owner = ++overlayOwnerSequence
+    setState('billing', { ...overlay, owner })
+    return owner
   }
-  function closeBilling() {
+  function closeBilling(owner: OverlayOwner) {
+    if (state.billing?.owner !== owner) return
     setState('billing', undefined)
   }
   /** Patch the open billing overlay (screen transitions + pending charge). The
    *  overlay is a state machine; the view drives transitions through this. */
-  function patchBilling(next: Partial<BillingOverlayState>) {
-    if (!state.billing) return
+  function patchBilling(owner: OverlayOwner, next: Partial<BillingOverlayState>) {
+    if (state.billing?.owner !== owner) return
     setState('billing', prev => (prev ? { ...prev, ...next } : prev))
+  }
+  function openSubscription(overlay: SubscriptionOverlayState): OverlayOwner {
+    const owner = ++overlayOwnerSequence
+    setState('subscription', { ...overlay, owner })
+    return owner
+  }
+  function closeSubscription(owner: OverlayOwner) {
+    if (state.subscription?.owner !== owner) return
+    setState('subscription', undefined)
+  }
+  function patchSubscription(owner: OverlayOwner, next: Partial<SubscriptionOverlayState>) {
+    if (state.subscription?.owner !== owner) return
+    setState('subscription', prev => (prev ? { ...prev, ...next } : prev))
   }
   /** Replace the OS-process snapshot (drives the /processes panel). */
   function setBackgroundProcesses(procs: BackgroundProcess[]) {
@@ -1889,7 +2012,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   /** Merge an authoritative voice.toggle/config response without allowing an
    * older gateway that omits record_key to clobber the cached custom binding. */
-  function setVoiceMode(patch: { enabled?: boolean; tts?: boolean; recordKey?: string }): void {
+  function setVoiceMode(patch: {
+    enabled?: boolean
+    tts?: boolean
+    recordKey?: string
+    submitMode?: VoiceSubmitMode
+  }): void {
     setState(
       'voice',
       produce(voice => {
@@ -1897,6 +2025,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         if (patch.tts !== undefined) voice.tts = patch.tts
         const key = patch.recordKey?.trim()
         if (key) voice.recordKey = key
+        if (patch.submitMode !== undefined) voice.submitMode = patch.submitMode
         if (patch.enabled === false) {
           voice.recording = false
           voice.processing = false
@@ -1939,7 +2068,42 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // this revision; the older hydration applies only if no command superseded it.
   let busyInputModeRevision = 0
   let compactRevision = 0
+  let focusViewRevision = 0
   let detailsRevision = 0
+  let batteryRevision = 0
+  let timestampsRevision = 0
+  let onBatteryEnabled = (_enabled: boolean) => {}
+
+  function registerBatteryEnabledHandler(handler: (enabled: boolean) => void): void {
+    onBatteryEnabled = handler
+    handler(state.batteryEnabled)
+  }
+
+  function commitBatteryEnabled(enabled: boolean): void {
+    setState('batteryEnabled', enabled)
+    if (!enabled) setState('batteryStatus', null)
+    onBatteryEnabled(enabled)
+  }
+
+  function setBatteryEnabled(enabled: boolean): void {
+    batteryRevision += 1
+    commitBatteryEnabled(enabled)
+  }
+
+  function hydrateBatteryEnabled(enabled: boolean, expectedRevision: number): boolean {
+    if (batteryRevision !== expectedRevision) return false
+    commitBatteryEnabled(enabled)
+    return true
+  }
+
+  function getBatteryRevision(): number {
+    return batteryRevision
+  }
+
+  function setBatteryStatus(reading: BatteryInfo | null): void {
+    if (!state.batteryEnabled && reading) return
+    setState('batteryStatus', reading)
+  }
 
   /** /compact — set the compact-transcript display flag (Epic 3). */
   function setCompact(on: boolean): void {
@@ -1955,6 +2119,22 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   function getCompactRevision(): number {
     return compactRevision
+  }
+
+  /** /focus — set the focus-view display flag (port of upstream d6fa2709de6). */
+  function setFocusView(on: boolean): void {
+    focusViewRevision += 1
+    setState('focusView', on)
+  }
+
+  function hydrateFocusView(on: boolean, expectedRevision: number): boolean {
+    if (focusViewRevision !== expectedRevision) return false
+    setState('focusView', on)
+    return true
+  }
+
+  function getFocusViewRevision(): number {
+    return focusViewRevision
   }
 
   /** /details — set the global tool/reasoning detail mode (Epic 3). */
@@ -1999,9 +2179,35 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return detailsRevision
   }
 
-  /** /timestamps — set the show-[HH:MM] display flag (port of upstream 5ff11a689). */
+  /** /timestamps — set the show-[HH:MM] display flag (port of upstream 5ff11a689).
+   *  Bumps the revision so an in-flight `config.get full` hydration snapshot
+   *  taken BEFORE this command can never overwrite it (same guard as /compact). */
   function setTimestamps(on: boolean): void {
+    timestampsRevision += 1
     setState('timestamps', on)
+  }
+
+  /** Hydrate `display.timestamps` from config (boot + config repoll — upstream
+   *  77fcc2ea31e0). Applies only when no local /timestamps command superseded
+   *  the captured revision. */
+  function hydrateTimestamps(on: boolean, expectedRevision: number): boolean {
+    if (timestampsRevision !== expectedRevision) return false
+    setState('timestamps', on)
+    return true
+  }
+
+  function getTimestampsRevision(): number {
+    return timestampsRevision
+  }
+
+  /** Hydrate the `approvals.destructive_slash_confirm` policy (upstream
+   *  77f35add0cc4). Config-scoped like `focusView`/`batteryEnabled` — it
+   *  deliberately survives session-owned resets, and the caller only invokes
+   *  this on a successfully decoded `config.get full`, so a transient config
+   *  failure preserves the last known policy instead of silently re-enabling
+   *  or disabling the safety gate. */
+  function setDestructiveSlashConfirm(on: boolean): void {
+    setState('destructiveSlashConfirm', on)
   }
 
   /** /reasoning full|clamp — set the expand-all-thinking display flag. */
@@ -2067,15 +2273,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
     }
   }
 
-  /** Set / clear the live completion candidates (composer dropdown). `from` is the
-   *  input char offset an accepted item replaces from (slash-arg / @-mention splice). */
-  function setCompletions(items: CompletionItem[], from = 0) {
+  /** Set / clear the live completion candidates (composer dropdown). `from` and
+   *  optional exclusive `end` bound the accepted item's buffer splice. */
+  function setCompletions(items: CompletionItem[], from = 0, end?: number) {
     setState('completions', items.length ? items : undefined)
     setState('completionFrom', items.length ? Math.max(0, from) : 0)
+    setState('completionEnd', items.length && typeof end === 'number' ? Math.max(from, end) : undefined)
   }
   function clearCompletions() {
     setState('completions', undefined)
     setState('completionFrom', 0)
+    setState('completionEnd', undefined)
   }
 
   /** Reduce a decoded gateway event into the store. The sole boundary->Solid sink. */
@@ -2102,8 +2310,32 @@ export function createSessionStore(options?: SessionStoreOptions) {
       case 'session.info':
         applyInfo(event.payload)
         break
+      case 'session.title': {
+        // Live auto-title push (upstream f726090d489d) — fires the moment the
+        // turn prologue titles the session. The entry gate already scoped the
+        // event by its top-level session_id (the payload's session_id is the
+        // DB key, not re-checked here). Only a nonblank title lands; a blank
+        // or absent one never clears existing chrome.
+        const title = event.payload?.title?.trim()
+        if (title) applyInfo({ title })
+        break
+      }
+      case 'session.usage': {
+        // Live mid-turn usage tick (upstream 2cabeba563cf) — the gateway's
+        // usage ticker pushes the growing token/context counters every ~1s
+        // while a turn runs. Route it through the SAME info/usage patch path
+        // as session.info / message.complete so the status-bar gauges update
+        // live. The gateway stops+joins the ticker before it emits
+        // message.complete, so the final authoritative usage always applies
+        // last and wins. A tick never carries `running`, so the busy-queue
+        // drain edge in applyInfo cannot fire from here.
+        const usage = event.payload?.usage
+        if (usage) applyInfo({ usage })
+        break
+      }
       case 'message.start':
         settlePendingSteers(event.payload?.client_submission_ids)
+        interimTextPartId = undefined
         clearStatusRestoreTimer()
         lastStatusNote = ''
         // A fresh turn gets one discovery credit. Archive terminal rows left by
@@ -2146,14 +2378,48 @@ export function createSessionStore(options?: SessionStoreOptions) {
         if (!text) break
         setState(
           produce(draft => {
-            const live = liveAssistant(draft, true)
-            if (live) appendPart(live, 'text', text)
+            const live = liveAssistant(draft, true) ?? ensureAssistant(draft)
+            appendPart(live, 'text', text)
           })
         )
         break
       }
-      case 'message.complete':
+      case 'message.interim': {
+        const text = event.payload.text.trimStart()
+        if (!text) break
+        setState(
+          produce(draft => {
+            const live = liveAssistant(draft, true) ?? ensureAssistant(draft)
+            reconcileFinalText(live, text)
+            live.streaming = false
+            const textParts = (live.parts ?? []).filter(part => part.type === 'text')
+            interimTextPartId = textParts.at(-1)?.id
+          })
+        )
+        break
+      }
+      case 'message.complete': {
         settlePendingSteers(event.payload?.client_submission_ids)
+        // Backstop for the clarify tool.complete flush above: a turn can settle
+        // with the timed-out batch prompt still open (no clarify.expire event
+        // exists on this wire) — persist the partials before the turn closes.
+        flushAbandonedClarify('timed out')
+        // Terminal error frame (upstream 57b351d3689/b8675a18990): the
+        // structured status/error/partial fields drive the failure state —
+        // free-form text is never re-classified. `partial` marks `text` as
+        // streamed output to keep visible. Billing failures are the other
+        // structured exception: their `billing` descriptor proves the frame's
+        // `text` is full recovery guidance, while `error` carries the short
+        // failure detail. Other non-partial error text must NOT settle as a
+        // healthy reply.
+        const failure =
+          event.payload?.status === 'error'
+            ? {
+                message: event.payload.error?.trim() || event.payload.text?.trim() || 'turn failed',
+                partialText:
+                  event.payload.partial === true || event.payload.billing !== undefined ? event.payload.text : undefined
+              }
+            : undefined
         if (event.payload?.reasoning) {
           setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning, event.payload?.text)))
         }
@@ -2161,20 +2427,67 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // before session.info(false); `agentsTurnArchived` prevents a duplicate.
         archiveAndClearSubagents(!agentsTurnArchived, true)
         agentsTurnArchived = true
-        setState(
-          produce(draft => {
-            // complete-only gateways may send `message.complete{text}` with no prior
-            // start/delta → create the turn so the final text isn't dropped.
-            const finalText = event.payload?.text
-            const live = liveAssistant(draft, true) ?? (finalText ? ensureAssistant(draft) : undefined)
-            if (!live) return
-            reconcileFinalText(live, finalText)
-            live.streaming = false
-            dropAnswerDuplicateReasoning(live, finalText)
-          })
-        )
+        if (failure) {
+          setState(
+            produce(draft => {
+              // A partial failure keeps its streamed text visible as a settled
+              // non-streaming turn (the frame's `text` IS the partial). A
+              // text-less failure settles like an `error` event: retain any
+              // streamed content, drop a wholly empty caret row.
+              const partial = failure.partialText?.trim() ? failure.partialText : undefined
+              if (partial) {
+                const live = liveAssistant(draft, true) ?? ensureAssistant(draft)
+                reconcileFinalText(live, partial)
+                live.streaming = false
+              } else {
+                settleFailedAssistant(draft)
+              }
+            })
+          )
+          // The visible failure marker — same system-row surface as the bare
+          // `error` event, so a failed turn never reads as a healthy reply.
+          pushSystem(`error: ${failure.message}`)
+        } else {
+          setState(
+            produce(draft => {
+              // complete-only gateways may send `message.complete{text}` with no prior
+              // start/delta → create the turn so the final text isn't dropped.
+              const finalText = event.payload?.text
+              const interim = interimTextPartId
+                ? draft.messages.find(message => message.parts?.some(part => part.id === interimTextPartId))
+                : undefined
+              const interimText = visibleText(interim).trim()
+              const previewMatches = Boolean(
+                event.payload?.response_previewed &&
+                finalText?.trim() &&
+                interimText &&
+                finalText.trim().startsWith(interimText)
+              )
+              const streaming = liveAssistant(draft, true)
+              if (previewMatches && streaming && streaming !== interim) {
+                const streamingIndex = draft.messages.indexOf(streaming)
+                if (streamingIndex >= 0) draft.messages.splice(streamingIndex, 1)
+              }
+              const live = previewMatches ? interim : (streaming ?? (finalText ? ensureAssistant(draft) : undefined))
+              if (!live) return
+              reconcileFinalText(live, finalText)
+              live.streaming = false
+              dropAnswerDuplicateReasoning(live, finalText)
+            })
+          )
+        }
+        interimTextPartId = undefined
         clearStatusRestoreTimer()
         setState('status', undefined)
+        // A terminal error frame can close a turn that never reached
+        // message.start (agent-init failure — upstream run_after_agent_ready
+        // now emits this frame instead of a bare `error` event). turnInFlight
+        // was never armed, so the authoritative session.info drain in applyInfo
+        // cannot fire; settle the optimistic busy flag and drain exactly once,
+        // mirroring the pre-start branch of the `error` case. For a turn that
+        // DID start, turnInFlight stays armed and session.info(false) owns the
+        // drain — never both.
+        const preStartFailure = failure !== undefined && state.info.running === true && !turnInFlight
         // LOCAL optimistic running:false flip — stops the busy spinner INSTANTLY
         // (statusLineSpinner.test.tsx) without waiting for the server's
         // session.info round-trip. NOTE: this does NOT drain the busy queue. The
@@ -2190,7 +2503,34 @@ export function createSessionStore(options?: SessionStoreOptions) {
         flushPendingNotice()
         // message.complete carries the latest usage/context — refresh the bar.
         if (event.payload) applyInfo(event.payload)
+        // Billing wall (out of credits / payment required — upstream
+        // 9c274db89ff): open the shared ConfirmPrompt with the ONE recovery
+        // action instead of a truncating status notice. The transcript already
+        // carries the full provider guidance (it rides this payload's `text`,
+        // settled above); the dialog is the concise actionable layer. Opened
+        // LAST in this case — after the turn settle, notice flush, and info
+        // refresh — mirroring Ink's set-after-recordMessageComplete ordering so
+        // no same-event reset can wipe it. Stale-session safety is upstreamed:
+        // live events are SID-filtered before apply (eventScope) and buffered
+        // resume events are filtered at commit (commitSessionSnapshot), so a
+        // rejected event never reaches this reducer; session replacement
+        // (resetSessionOwnedState) clears `prompt`, so an old wall can't bleed
+        // into a successor session. The confirm itself has NO external side
+        // effect — only an explicit Yes runs the recovery action.
+        {
+          const billing = event.payload?.billing
+          if (billing) {
+            setConfirm(billingWallCopy(billing), () =>
+              runBillingWallAction(billingWallAction(billing), { pushSystem, ...billingWallHost })
+            )
+          }
+        }
+        // Pre-start terminal error frame: fire the queue drain exactly once
+        // (see the preStartFailure comment above). Ordered LAST so the drained
+        // prompt submits against fully-settled local state.
+        if (preStartFailure) onTurnComplete?.()
         break
+      }
       // thinking.delta / status.update are the TRANSIENT busy indicator (kaomoji
       // face/verb) — route them to the status line, NOT the transcript (gotcha: Ink
       // shows these as a FaceTicker, not message content).
@@ -2348,6 +2688,29 @@ export function createSessionStore(options?: SessionStoreOptions) {
         setState('status', aggregator ? `aggregating with ${aggregator}…` : 'aggregating references…')
         break
       }
+      // Live MoA fan-out progress (upstream 89e6f4c989a/ad6a2ae401e): ONE
+      // status line replaced in place as each reference completes ("MoA: refs
+      // 2/3") so the user sees movement during the (potentially long)
+      // reference phase — never transcript rows, never one line per event.
+      case 'moa.progress': {
+        const done = event.payload?.refs_done
+        const total = event.payload?.refs_total
+        if (typeof done === 'number' && typeof total === 'number') {
+          clearStatusRestoreTimer()
+          setState('status', `MoA: refs ${done}/${total}`)
+        }
+        break
+      }
+      // Phase transition — currently only phase="aggregator" (fan-out done,
+      // aggregator acting). Swap the same status line for aggregator copy;
+      // unknown future phases are ignored (Ink parity).
+      case 'moa.phase': {
+        if (event.payload?.phase === 'aggregator') {
+          clearStatusRestoreTimer()
+          setState('status', 'MoA: aggregating…')
+        }
+        break
+      }
       case 'tool.progress': {
         const name = event.payload.name?.trim()
         const preview = event.payload.preview?.trim()
@@ -2382,6 +2745,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'voice.transcript': {
+        // Explicit user-intent stop: the user said (or typed) a bare stop
+        // phrase (upstream ba13132298). The backend already halted the capture
+        // loop and flipped voice mode off — mirror it here like a manual
+        // /voice off, and say so (this is intent, not the no-speech timeout
+        // below). The entry's transcript-submission side effect skips this
+        // event too: a stop phrase is never a turn.
+        if (event.payload?.stop_phrase) {
+          setVoiceMode({ enabled: false })
+          pushSystem('voice: stop phrase — voice chat ended')
+          break
+        }
         if (!event.payload?.no_speech_limit) break
         // Exact-f7 only drops the umbrella mode/activity here; TTS state is
         // retained until an explicit `/voice off` or gateway lifecycle reset.
@@ -2518,18 +2892,43 @@ export function createSessionStore(options?: SessionStoreOptions) {
           const snap = todoSnapshotFrom(event.payload['result'], event.payload['args'])
           if (snap) setState('latestTodos', snap)
         }
+        // Abandoned batch clarify: the clarify tool settling while its batch
+        // prompt is STILL open proves the server-side deadline fired (an
+        // answered batch clears the prompt before this event arrives). Flush
+        // the questions + locked partials as a persistent transcript record so
+        // they don't silently vanish while the agent's follow-up refers to them.
+        if (name === 'clarify') flushAbandonedClarify('timed out')
         break
       }
       // ── blocking prompts (spec §8 #6 — unhandled = the agent deadlocks) ──
-      case 'clarify.request':
-        setState('prompt', {
-          kind: 'clarify',
-          question: event.payload.question ?? '',
-          // decoded choices are readonly — copy to the store's mutable string[]
-          choices: event.payload.choices ? [...event.payload.choices] : null,
-          requestId: event.payload.request_id
-        })
+      case 'clarify.request': {
+        // Batch (multi-question) clarify: malformed entries (blank qid/question)
+        // are filtered; when none survive, the single-question payload fields
+        // stay authoritative (backward compatibility with the plain shape).
+        const batch = normalizeClarifyQuestions(event.payload.questions)
+        setState(
+          'prompt',
+          batch.length
+            ? {
+                kind: 'clarify',
+                question: '',
+                choices: null,
+                requestId: event.payload.request_id,
+                questions: batch,
+                // Locked answers replayed on reconnect (qid → answer) — seed the
+                // per-question ✓ state instead of presenting all as unanswered.
+                answers: { ...(event.payload.answers ?? {}) }
+              }
+            : {
+                kind: 'clarify',
+                question: event.payload.question ?? '',
+                // decoded choices are readonly — copy to the store's mutable string[]
+                choices: event.payload.choices ? [...event.payload.choices] : null,
+                requestId: event.payload.request_id
+              }
+        )
         break
+      }
       case 'approval.request':
         setState('prompt', {
           kind: 'approval',
@@ -2668,7 +3067,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
           tts: false,
           recording: false,
           processing: false,
-          recordKey: state.voice.recordKey
+          // Config-owned values (binding + submit mode) survive the child
+          // process exit; the next config hydration re-asserts them anyway.
+          recordKey: state.voice.recordKey,
+          submitMode: state.voice.submitMode
         })
         setBrowserState({ connected: false, url: '', lastProgress: '' })
         setState(produce(settleFailedAssistant))
@@ -2749,6 +3151,43 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('prompt', undefined)
   }
 
+  /** Lock one batch-clarify answer locally (call AFTER its per-question
+   *  `clarify.respond {question_id}` was acknowledged, so the local answers map
+   *  mirrors the gateway's accumulator exactly). Returns how many questions
+   *  remain unlocked — 0 means the batch is complete and the prompt can close. */
+  function recordClarifyAnswer(qid: string, answer: string): number {
+    const prompt = state.prompt
+    if (prompt?.kind !== 'clarify' || !prompt.questions?.length) return 0
+    setState(
+      produce(draft => {
+        const p = draft.prompt
+        if (p?.kind === 'clarify') (p.answers ??= {})[qid] = answer
+      })
+    )
+    const updated = state.prompt
+    if (updated?.kind !== 'clarify' || !updated.questions?.length) return 0
+    return remainingClarifyQids(updated.questions, updated.answers ?? {}).length
+  }
+
+  // Request IDs of batch clarify prompts already flushed to the transcript as
+  // an abandoned-prompt record, so the tool.complete and message.complete
+  // backstops (and an explicit cancel) can't persist the same prompt twice.
+  const persistedAbandonedClarify = new Set<string>()
+
+  /** Persist a still-open batch clarify prompt as a transcript record (locked
+   *  partials included — they survive the server-side deadline) and drop the
+   *  overlay. No-op for single-question prompts and already-flushed batches.
+   *  Fired by the clarify tool.complete / message.complete backstops with
+   *  'timed out', and by the Esc cancel-all path with 'cancelled'. */
+  function flushAbandonedClarify(reason: string): void {
+    const prompt = state.prompt
+    if (prompt?.kind !== 'clarify' || !prompt.questions?.length) return
+    if (persistedAbandonedClarify.has(prompt.requestId)) return
+    persistedAbandonedClarify.add(prompt.requestId)
+    pushSystem(formatAbandonedClarifyBatch(prompt.questions, prompt.answers ?? {}, reason))
+    clearPrompt()
+  }
+
   /** Persist the composer's in-progress draft (survives composer unmount when a
    *  blocking prompt replaces it). Cleared on submit. */
   function setComposerDraft(text: string): void {
@@ -2762,6 +3201,15 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('queueEditIndex', undefined)
     setState('composerDraft', text)
     setState('composerReplaceVersion', version => version + 1)
+  }
+
+  /** Insert a voice transcript (or other server-provided text) into the
+   * composer as an editable draft. An in-progress draft is preserved: trim its
+   * end and append after a single space (upstream 0ca78e5f32). Routes through
+   * the replace signal so the mounted uncontrolled textarea adopts the merge. */
+  function insertComposerDraft(text: string): void {
+    const current = state.composerDraft
+    replaceComposerDraft(current.trim() ? `${current.trimEnd()} ${text}` : text)
   }
 
   /** Clear both persisted state and the mounted native textarea via its
@@ -3037,6 +3485,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     queuedCount,
     registerTurnCompleteHandler,
     registerCommittedEventHandler,
+    registerBillingWallHost,
     nextSpawnTreeSaveIntent,
     settleSpawnTreeSaveIntent,
     loadSpawnTreeSnapshot,
@@ -3083,9 +3532,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setVoiceMode,
     setVoiceActivity,
     setBrowserState,
+    registerBatteryEnabledHandler,
+    setBatteryEnabled,
+    hydrateBatteryEnabled,
+    getBatteryRevision,
+    setBatteryStatus,
     setCompact,
     hydrateCompact,
     getCompactRevision,
+    setFocusView,
+    hydrateFocusView,
+    getFocusViewRevision,
     openJourney,
     openPluginsHub,
     closePluginsHub,
@@ -3097,6 +3554,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     hydrateDetails,
     getDetailsRevision,
     setTimestamps,
+    hydrateTimestamps,
+    getTimestampsRevision,
+    setDestructiveSlashConfirm,
     setReasoningFull,
     setBusyInputMode,
     hydrateBusyInputMode,
@@ -3108,6 +3568,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     openBilling,
     closeBilling,
     patchBilling,
+    openSubscription,
+    closeSubscription,
+    patchSubscription,
     setBackgroundProcesses,
     addBgTask,
     hydrate,
@@ -3115,8 +3578,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
     commitSnapshot,
     duplicate,
     clearPrompt,
+    recordClarifyAnswer,
+    flushAbandonedClarify,
     setComposerDraft,
     replaceComposerDraft,
+    insertComposerDraft,
     lastUserMessage,
     trimLastExchange,
     clearComposerDraft

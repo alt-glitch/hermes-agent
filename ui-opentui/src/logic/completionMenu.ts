@@ -84,17 +84,51 @@ export function routeMenuKey(name: string, modified: boolean, ctx: MenuKeyContex
  * submit). `from` is the gateway's `replace_from` / token start the composer
  * splices from; the composer appends a single space on accept (matched here).
  */
-export function acceptChangesToken(bufText: string, itemText: string, from: number): boolean {
-  const next = applyCompletion(bufText, itemText, from)
+export function acceptChangesToken(bufText: string, itemText: string, from: number, end?: number): boolean {
+  const next = applyCompletion(bufText, itemText, from, end)
   return next !== bufText && next.trimEnd() !== bufText.trimEnd()
 }
 
-/** Apply the gateway's replacement shape. Some TUI-local completion extras are
- * returned as `/fortune` while replace_from=1 (just after the buffer's leading
- * slash); strip that duplicate delimiter exactly as Ink does. */
-export function applyCompletion(bufText: string, itemText: string, from: number): string {
+export interface CompletionEdit {
+  cursor: number
+  text: string
+}
+
+/** Build the completion splice and its post-accept cursor. `end` is exclusive;
+ * legacy callers that only supply `from` retain the old replace-to-buffer-end
+ * behavior. Some TUI-local extras carry their own slash while `from` sits just
+ * after an existing slash, so normalize that duplicate delimiter as Ink does.
+ *
+ * A preserved whitespace suffix is already the completion separator. Reusing
+ * it avoids `"/clean  and"` while placing the cursor after that separator so
+ * the next typed character lands before the remaining prose.
+ *
+ * A replacement ending in `/` is a folder row (`@folder:docs/`, Ink parity):
+ * the accept is a drill-in, not a finished token, so no separator is added and
+ * the cursor parks right after the `/` — planCompletion re-queries inside the
+ * folder instead of seeing a space-terminated dead token. */
+export function completionEdit(
+  bufText: string,
+  itemText: string,
+  from: number,
+  end: number = bufText.length
+): CompletionEdit {
   const at = Math.min(Math.max(0, from), bufText.length)
+  const to = Math.min(Math.max(at, end), bufText.length)
   const before = bufText.slice(0, at)
+  const suffix = bufText.slice(to)
   const replacement = before.endsWith('/') && itemText.startsWith('/') ? itemText.slice(1) : itemText
-  return `${before}${replacement} `
+  const replacementEnd = before.length + replacement.length
+  if (replacement.startsWith('@folder:') && replacement.endsWith('/')) {
+    return { cursor: replacementEnd, text: `${before}${replacement}${suffix}` }
+  }
+  if (/^\s/u.test(suffix)) {
+    return { cursor: replacementEnd + 1, text: `${before}${replacement}${suffix}` }
+  }
+  return { cursor: replacementEnd + 1, text: `${before}${replacement} ${suffix}` }
+}
+
+/** Apply the gateway replacement while preserving legacy string-only callers. */
+export function applyCompletion(bufText: string, itemText: string, from: number, end?: number): string {
+  return completionEdit(bufText, itemText, from, end).text
 }

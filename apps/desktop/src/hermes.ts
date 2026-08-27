@@ -1,19 +1,27 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
+import type { HermesConnection } from '@/global'
+import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
+import { recordTranscriptTail } from '@/store/transcript-tail'
 import type {
   ActionResponse,
   ActionStatusResponse,
   AnalyticsResponse,
   AudioSpeakResponse,
   AudioTranscriptionResponse,
+  AutomationBlueprint,
   AuxiliaryModelsResponse,
   BackendUpdateCheckResponse,
   ComputerUseStatus,
   ConfigSchemaResponse,
+  CronDeliveryTarget,
   CronJob,
   CronJobCreatePayload,
   CronJobUpdates,
   CuratorStatusResponse,
+  CustomEndpointsResponse,
+  CustomEndpointUpdate,
+  CustomEndpointValidationResponse,
   DebugShareResponse,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
@@ -38,11 +46,15 @@ import type {
   OAuthStartResponse,
   OAuthSubmitResponse,
   PaginatedSessions,
+  PairingResponse,
+  PairingUser,
   ProfileCreatePayload,
+  ProfileDesktopOverlay,
   ProfileSetupCommand,
   ProfileSoul,
   ProfilesResponse,
   SessionInfo,
+  SessionMessage,
   SessionMessagesResponse,
   SessionSearchResponse,
   SkillHubPreview,
@@ -52,9 +64,14 @@ import type {
   SkillInfo,
   StarmapGraph,
   StatusResponse,
+  TerminalBackendsResponse,
   ToolsetConfig,
   ToolsetInfo,
-  ToolsetModelsResponse
+  ToolsetModelsResponse,
+  WebhookCreatePayload,
+  WebhookCreateResponse,
+  WebhookEnableResponse,
+  WebhooksResponse
 } from '@/types/hermes'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
@@ -71,6 +88,11 @@ import type {
 export const STARTUP_REQUEST_TIMEOUT_MS = 60_000
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
+// The cron trigger endpoint intentionally waits for the whole job so its
+// response reflects the persisted execution result. Agent jobs can run far
+// longer than the Electron fetch default; keep this override local to the one
+// synchronous long-operation endpoint rather than weakening all API timeouts.
+export const CRON_TRIGGER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000
 // prompt.submit is effectively fire-and-forget: turn completion is signaled by
 // stream / message.complete events, NOT by the RPC return. A long turn (MoA
 // presets running references + aggregator in series, deep reasoning, large tool
@@ -80,6 +102,36 @@ const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
 // agent-turn ceiling (agent.gateway_timeout = 1800s) so the ack timeout only
 // ever fires when the turn itself would have been abandoned server-side.
 export const PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1_800_000
+export const AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS = 180_000
+export const AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS = 600_000
+const AUDIO_SPEAK_TIMEOUT_MS_PER_CHAR = 35
+
+export function audioSpeakRequestTimeoutMs(text: string): number {
+  const estimated = Math.max(
+    AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS,
+    Math.ceil(String(text || '').length * AUDIO_SPEAK_TIMEOUT_MS_PER_CHAR)
+  )
+
+  return Math.min(AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS, estimated)
+}
+
+export const AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS = 180_000
+export const AUDIO_TRANSCRIBE_MAX_REQUEST_TIMEOUT_MS = 600_000
+// The transcribe payload is the base64 audio data URL itself, so its string
+// length tracks clip size. ~0.1ms/char keeps short clips at the floor while
+// letting multi-minute recordings scale toward the cap (a base64 char is
+// ~0.75 bytes, so at 128kbps ≈ 21k chars/s of audio this budgets ~2s of
+// timeout per 1s of audio before the cap clamps it).
+const AUDIO_TRANSCRIBE_TIMEOUT_MS_PER_CHAR = 0.1
+
+export function audioTranscribeRequestTimeoutMs(dataUrl: string): number {
+  const estimated = Math.max(
+    AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
+    Math.ceil(String(dataUrl || '').length * AUDIO_TRANSCRIBE_TIMEOUT_MS_PER_CHAR)
+  )
+
+  return Math.min(AUDIO_TRANSCRIBE_MAX_REQUEST_TIMEOUT_MS, estimated)
+}
 
 export type {
   ActionResponse,
@@ -92,6 +144,8 @@ export type {
   AnalyticsTotals,
   AudioSpeakResponse,
   AudioTranscriptionResponse,
+  AutomationBlueprint,
+  AutomationBlueprintField,
   AuxiliaryModelsResponse,
   BackendUpdateCheckResponse,
   ComputerUseCheck,
@@ -99,11 +153,16 @@ export type {
   ComputerUseStatus,
   ConfigFieldSchema,
   ConfigSchemaResponse,
+  CronDeliveryTarget,
   CronJob,
   CronJobCreatePayload,
   CronJobSchedule,
   CronJobUpdates,
   CuratorStatusResponse,
+  CustomEndpoint,
+  CustomEndpointsResponse,
+  CustomEndpointUpdate,
+  CustomEndpointValidationResponse,
   DebugShareResponse,
   ElevenLabsVoice,
   ElevenLabsVoicesResponse,
@@ -133,7 +192,10 @@ export type {
   ModelOptionProvider,
   ModelOptionsResponse,
   PaginatedSessions,
+  PairingResponse,
+  PairingUser,
   ProfileCreatePayload,
+  ProfileDesktopOverlay,
   ProfileInfo,
   ProfileSetupCommand,
   ProfileSoul,
@@ -164,7 +226,12 @@ export type {
   ToolsetConfig,
   ToolsetInfo,
   ToolsetModel,
-  ToolsetModelsResponse
+  ToolsetModelsResponse,
+  WebhookCreatePayload,
+  WebhookCreateResponse,
+  WebhookEnableResponse,
+  WebhookRoute,
+  WebhooksResponse
 } from '@/types/hermes'
 
 export class HermesGateway extends JsonRpcGatewayClient {
@@ -182,17 +249,245 @@ export class HermesGateway extends JsonRpcGatewayClient {
 // Profile that profile-scoped REST settings (config/env/skills/tools/model/…)
 // should target. Mirrors $activeGatewayProfile, pushed in from the store via
 // setApiRequestProfile so this module needs no store import (avoids a cycle).
-// Electron main consumes request.profile to pick which backend *process* serves
-// the call; each pooled backend already has its own HERMES_HOME, so no backend
-// change is needed. Null → primary, so single-profile users are unaffected.
+// Electron main consumes request.profile as request scope. Local calls whose
+// REST handlers accept profile reuse the primary dashboard via ?profile=;
+// unscoped handlers retain a profile backend. Remote overrides still route to
+// their owning backend. Null → primary, so single-profile users are unaffected.
 let _apiProfile: null | string = null
 
 export function setApiRequestProfile(profile: null | string): void {
   _apiProfile = profile || null
 }
 
-function profileScoped(): { profile?: string } {
-  return _apiProfile ? { profile: _apiProfile } : {}
+function profileScoped(profile?: null | string): { profile?: string } {
+  const selected = profile === undefined ? _apiProfile : profile
+
+  return selected ? { profile: selected } : {}
+}
+
+/** Profile that profile-scoped REST/WS calls should target (null → primary).
+ *  Read-only twin of setApiRequestProfile for modules (e.g. voice playback)
+ *  that build their own connection URLs and must stay on the same backend. */
+export function getApiRequestProfile(): null | string {
+  return _apiProfile
+}
+
+// Registry connection serving the active gateway (null → the local pool).
+// Pushed from store/gateway's setActive — the single seam BOTH
+// ensureGatewayProfile and ensureGatewayAgent funnel through — so WS calls
+// that dial their own backend (pluginSocket) resolve it through the SAME
+// source of truth those paths maintain for $connection. That makes the plugin
+// socket follow registry-agent activations too, not just profile switches.
+// Same no-store-import contract as _apiProfile (avoids a cycle).
+let _apiConnectionId: null | string = null
+
+export function setApiRequestConnection(connectionId: null | string): void {
+  _apiConnectionId = connectionId || null
+}
+
+// Registry connection scope for a REST request. A registered remote gateway
+// owns its own state.db — cron jobs and their run sessions live THERE — so
+// requests for gateway-owned data must carry the connection id for the main
+// process to route them to that host (hermes:api's registry branch). Null /
+// 'local' resolves to no tag, keeping single-source users byte-identical.
+function connectionScoped(): { connectionId?: string } {
+  return _apiConnectionId ? { connectionId: _apiConnectionId } : {}
+}
+
+// ── Capability scope: (connection, profile) routing for the Capabilities
+// surface (skills / toolsets / MCP / hub / env / toolset config) ────────────
+//
+// A profile is not a machine-global name — it belongs to ONE gateway. The
+// Capabilities surface can be pointed at any (connection, profile) pair
+// (SkillsView's scope selector, Bot Mode's fixedProfile/fixedConnection), so
+// its REST helpers accept either the legacy string form or an explicit scope
+// object:
+//
+//   - `undefined` / string → the legacy profile path, PLUS the active registry
+//     connection tag (connectionScoped, same contract the cron helpers adopted
+//     in #87882). Without the tag, a window activated onto a registered remote
+//     gateway read the LOCAL pool's skills/tools/MCP — the wrong machine.
+//   - `{ connectionId, profile }` → explicit pin. `''`/`'local'` connection
+//     ids mean the local pool and deliberately DROP the ambient connection
+//     tag, so a local-profile pick made while a remote gateway is active still
+//     routes to the local machine.
+export type ProfileScope = null | string | { connectionId?: null | string; profile?: null | string }
+
+function capabilityScoped(scope?: ProfileScope): { connectionId?: string; profile?: string } {
+  if (scope && typeof scope === 'object') {
+    const profile = (scope.profile ?? '').trim()
+    const connectionId = (scope.connectionId ?? '').trim()
+
+    return {
+      ...(profile ? { profile } : {}),
+      ...(connectionId && connectionId !== 'local' ? { connectionId } : {})
+    }
+  }
+
+  return { ...profileScoped(scope), ...connectionScoped() }
+}
+
+/** Stable cache-key for a capability scope: `profile` for the local/legacy
+ *  path, `connectionId::profile` for an explicit remote pin. Mirrors
+ *  normalizeProfileKey for plain strings so existing keys stay byte-identical. */
+export function profileScopeKey(scope?: ProfileScope): string {
+  if (scope && typeof scope === 'object') {
+    const profile = (scope.profile ?? '').trim() || 'default'
+    const connectionId = (scope.connectionId ?? '').trim()
+
+    return connectionId && connectionId !== 'local' ? `${connectionId}::${profile}` : profile
+  }
+
+  return (scope ?? '').trim() || 'default'
+}
+
+/** Registry connection id that connection-scoped WS calls should target
+ *  (null → the local pool). Read-only twin of setApiRequestConnection. */
+export function getApiRequestConnection(): null | string {
+  return _apiConnectionId
+}
+
+/** Resolve the ACTIVE backend's connection descriptor, (connectionId,
+ *  profile)-scoped — mirroring how store/profile resolves $connection: a
+ *  registry agent's descriptor comes from getConnectionFor (its SOURCE
+ *  connection), everything else from the profile-keyed local pool. The
+ *  getConnectionFor bridge is optional (older Desktop mains); without it the
+ *  profile-scoped pool lookup is the best available answer. */
+async function activeConnection(): Promise<HermesConnection> {
+  const getConnectionFor = window.hermesDesktop.getConnectionFor
+
+  if (_apiConnectionId && getConnectionFor) {
+    return getConnectionFor({ connectionId: _apiConnectionId, profile: _apiProfile })
+  }
+
+  return window.hermesDesktop.getConnection(_apiProfile)
+}
+
+/** Options for a plugin REST call — mirrors the app's own `hermesDesktop.api`
+ *  shape, minus the path (which is namespace-derived). */
+export interface PluginRestOptions {
+  method?: string
+  body?: unknown
+  /** Single-file multipart upload (see HermesApiRequest.upload). */
+  upload?: { filename: string; contentType?: string; bytes: ArrayBuffer }
+  timeoutMs?: number
+}
+
+// Normalize `path` to a leading-slash suffix relative to `/api/plugins/<id>`.
+// The namespace is the boundary — reject `..` so a relative segment can't
+// normalize out into another plugin's API or a core route. Check the path
+// portion only (before any query/hash).
+function pluginPathSuffix(caller: string, path: string): string {
+  const suffix = path.startsWith('/') ? path : `/${path}`
+
+  if (suffix.split(/[?#]/, 1)[0].split('/').includes('..')) {
+    throw new Error(`${caller}: illegal path traversal in "${path}"`)
+  }
+
+  return suffix
+}
+
+/** The plugin REST door. Every call is scoped BY CONSTRUCTION to the plugin's
+ *  own backend namespace — `path` is relative to `/api/plugins/<pluginId>`
+ *  ('/board' → `/api/plugins/kanban/board`), so a plugin can't address another
+ *  plugin's API or a core route through it. Profile-aware like every desktop
+ *  REST call. Broader reach (core endpoints, another namespace) is the future
+ *  declared-capability seam; today the namespace IS the boundary. */
+export async function pluginRest<T>(pluginId: string, path: string, opts: PluginRestOptions = {}): Promise<T> {
+  if (!window.hermesDesktop?.api) {
+    throw new Error('Hermes desktop bridge unavailable')
+  }
+
+  const suffix = pluginPathSuffix('pluginRest', path)
+
+  return window.hermesDesktop.api<T>({
+    path: `/api/plugins/${pluginId}${suffix}`,
+    method: opts.method,
+    body: opts.body,
+    upload: opts.upload,
+    timeoutMs: opts.timeoutMs,
+    ...profileScoped()
+  })
+}
+
+/** The plugin WebSocket door — the live twin of `pluginRest`, scoped the same
+ *  way: `path` is relative to `/api/plugins/<pluginId>` ('/events' → the
+ *  plugin's own event stream). Token-mode backends auth via the same query
+ *  credential the app's own sockets use; OAuth remotes resolve null (callers
+ *  keep their polling fallback — every consumer must have one anyway, since a
+ *  socket can drop). Auto-reconnects with backoff until disposed. */
+export function pluginSocket(pluginId: string, path: string, onMessage: (data: unknown) => void): () => void {
+  const suffix = pluginPathSuffix('pluginSocket', path)
+
+  let socket: null | WebSocket = null
+  let disposed = false
+  let attempt = 0
+
+  const connect = async () => {
+    const connection = await activeConnection().catch(() => null)
+
+    // No bridge / OAuth cookie auth (WS tickets are single-use, core-managed):
+    // stay on the polling fallback rather than half-working.
+    if (disposed || !connection || connection.authMode === 'oauth') {
+      return
+    }
+
+    const base = connection.baseUrl.replace(/^http/, 'ws')
+    const join = suffix.includes('?') ? '&' : '?'
+    socket = new WebSocket(
+      `${base}/api/plugins/${pluginId}${suffix}${join}token=${encodeURIComponent(connection.token)}`
+    )
+
+    socket.onmessage = event => {
+      attempt = 0
+
+      try {
+        onMessage(JSON.parse(String(event.data)))
+      } catch {
+        // Non-JSON frame — plugin streams are JSON by contract; skip it.
+      }
+    }
+
+    socket.onclose = () => {
+      socket = null
+
+      if (!disposed) {
+        // Full-jitter exponential backoff: same rationale as the gateway
+        // socket reconnect loops — an immediate-retry loop across many
+        // desktop clients floods the gateway with connection attempts
+        // during a restart.
+        window.setTimeout(() => void connect(), reconnectBackoffDelayMs(attempt, { baseDelayMs: 500, capMs: 30_000 }))
+        attempt += 1
+      }
+    }
+  }
+
+  void connect()
+
+  return () => {
+    disposed = true
+    socket?.close()
+  }
+}
+
+/**
+ * Trim a page to its window WITHOUT discarding pinned rows.
+ *
+ * The list endpoints deliberately back-fill pinned conversations past their
+ * LIMIT — a pin means "always reachable", so an aged-out pinned chat is
+ * appended after the recency window. A plain `slice(0, limit)` throws exactly
+ * those rows away again, which is why pins silently stopped rendering past
+ * some count: the sidebar could only ever show the pins that happened to fall
+ * inside the most-recent page.
+ */
+function pageWindow(sessions: SessionInfo[], limit: number): SessionInfo[] {
+  if (sessions.length <= limit) {
+    return sessions
+  }
+
+  const recent = sessions.slice(0, limit)
+
+  return [...recent, ...sessions.slice(limit).filter(session => session.pinned)]
 }
 
 export async function listSessions(
@@ -210,7 +505,7 @@ export async function listSessions(
 
   return {
     ...result,
-    sessions: result.sessions.slice(0, limit),
+    sessions: pageWindow(result.sessions, limit),
     offset: 0
   }
 }
@@ -251,21 +546,220 @@ export async function listAllProfileSessions(
 
   return {
     ...result,
-    sessions: result.sessions.slice(0, limit),
+    sessions: pageWindow(result.sessions, limit),
     offset: 0
   }
 }
 
-// Mutations take the owning `profile` so Electron routes them to that profile's
-// backend (remote pool or local primary) via request.profile — matching the
-// read path. A remote session's row lives only on its remote host, so a mutation
-// that hit the local primary would no-op or 404. Omit for the current/default.
+// Batched sidebar slices in one request: recents (scoped to the active profile),
+// cron, and messaging. The backend opens each profile's state.db once and runs
+// all three filtered queries, replacing three separate listAllProfileSessions
+// calls that each reopened + re-counted every profile DB per refresh. Electron
+// splices remote profiles per slice (see interceptSessionRequestForRemote).
+export interface SidebarSessionSlice {
+  sessions: SessionInfo[]
+  /** Per-profile "the window came back full, more rows exist on disk" flags —
+   *  what pagination needs, without a COUNT(*) per profile DB per refresh. */
+  profiles_truncated?: Record<string, boolean>
+  /** Per-profile tokens and spend over every session, not just this window.
+   *  Absent from the legacy per-slice endpoint, which has no aggregate. */
+  profiles_usage?: Record<string, { cost_usd: number; tokens: number }>
+}
+
+/** Which profiles filled their per-profile window in a returned page. The
+ *  legacy per-slice endpoint doesn't report this, so derive it from the rows:
+ *  a profile at (or over) the cap still has more on disk. Pinned rows are
+ *  discounted — they're back-filled past the LIMIT, so counting them fakes a
+ *  full page and leaves a "Load more" that can never resolve. */
+function profilesTruncatedFrom(sessions: SessionInfo[], cap: number): Record<string, boolean> {
+  const counts = new Map<string, number>()
+
+  for (const session of sessions) {
+    const key = session.profile || 'default'
+
+    counts.set(key, (counts.get(key) ?? 0) + (session.pinned ? 0 : 1))
+  }
+
+  return Object.fromEntries([...counts].map(([name, count]) => [name, count >= cap]))
+}
+
+export interface SidebarSessionsResponse {
+  recents: SidebarSessionSlice
+  cron: SidebarSessionSlice
+  messaging: SidebarSessionSlice
+  errors?: Array<{ profile: string; error: string }>
+}
+
+export interface SidebarSessionsRequest {
+  recentsProfile: 'all' | (string & {})
+  recentsLimit: number
+  recentsExclude: string[]
+  cronLimit: number
+  messagingLimit: number
+  messagingExclude: string[]
+}
+
+// The batched /sidebar endpoint shipped later than the per-slice route, so a
+// newer desktop can meet an older backend that 404s it ("No such API
+// endpoint"). Endpoint-missing is a capability signal, not a transient
+// failure: remember it (per renderer lifetime — a runtime home change reloads
+// the window and re-probes) and serve every subsequent refresh straight from
+// the three proven per-slice calls instead of re-probing a known-dead route
+// once per turn/broadcast.
+let sidebarBatchEndpointMissing = false
+
+// Capability flags are per-backend facts. A hard re-home reloads the window
+// (module state resets naturally), but a soft gateway switch re-dials in
+// place — the next backend may well have the batched route, so the switch
+// paths call this to re-probe rather than leak the old backend's capability.
+export function resetSidebarBatchCapability() {
+  sidebarBatchEndpointMissing = false
+}
+
+// True only for "the route does not exist on this backend" shapes: the
+// backend catch-all ('404: {"detail":"No such API endpoint: ...}'), FastAPI's
+// bare 404 on headless serve (surfaces as '404: ...' directly or as
+// "Error invoking remote method 'hermes:api': Error: 404: ..." through the
+// IPC bridge), and the Electron JSON-guard ("endpoint is likely missing").
+// This GET has no path params, so a 404 status can only mean route-missing —
+// but transient failures (timeouts, 5xx, connection refused) must NOT match,
+// or one blip would silently degrade the fast path for the whole session.
+function isEndpointMissingError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+
+  return (
+    /no such api endpoint/i.test(message) ||
+    /endpoint is likely missing/i.test(message) ||
+    /(?:^\s*|error:\s*)404\b/i.test(message)
+  )
+}
+
+// Compatibility fallback: reassemble the three sidebar slices from the
+// per-slice endpoint, mirroring the batched route's semantics (min_messages=1,
+// archived excluded, recency order; every slice scoped to the caller's profile).
+// Rides the same Electron remote-splice
+// interception as the pre-batching desktop, so remote profiles stay correct.
+async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<SidebarSessionsResponse> {
+  const [recents, cron, messaging] = await Promise.all([
+    listAllProfileSessions(req.recentsLimit, 1, 'exclude', 'recent', req.recentsProfile, {
+      excludeSources: req.recentsExclude
+    }),
+    listAllProfileSessions(req.cronLimit, 1, 'exclude', 'recent', req.recentsProfile, { source: 'cron' }),
+    listAllProfileSessions(req.messagingLimit, 1, 'exclude', 'recent', req.recentsProfile, {
+      excludeSources: req.messagingExclude
+    })
+  ])
+
+  const errors = [...(recents.errors ?? []), ...(cron.errors ?? []), ...(messaging.errors ?? [])]
+
+  return {
+    recents: {
+      profiles_truncated: profilesTruncatedFrom(recents.sessions, req.recentsLimit),
+      sessions: recents.sessions
+    },
+    cron: { sessions: cron.sessions },
+    messaging: { sessions: messaging.sessions },
+    ...(errors.length ? { errors } : {})
+  }
+}
+
+/** The PR each of these sessions opened, recovered from its own transcript —
+ *  for sessions whose recorded branch can't answer (they started on trunk and
+ *  did the work in a worktree). Also returns every id it looked at, so the
+ *  caller can remember a miss and never ask again. */
+export function scanSessionPullRequests(
+  ids: string[]
+): Promise<{ pull_requests: Record<string, { number: number; url: string }>; scanned: string[] }> {
+  return window.hermesDesktop.api<{
+    pull_requests: Record<string, { number: number; url: string }>
+    scanned: string[]
+  }>({
+    path: '/api/profiles/sessions/pull-requests',
+    method: 'POST',
+    body: { ids }
+  })
+}
+
+export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<SidebarSessionsResponse> {
+  if (sidebarBatchEndpointMissing) {
+    return listSidebarSessionsLegacy(req)
+  }
+
+  const params = new URLSearchParams({
+    recents_profile: req.recentsProfile,
+    recents_limit: String(Math.max(1, req.recentsLimit)),
+    cron_limit: String(Math.max(1, req.cronLimit)),
+    messaging_limit: String(Math.max(1, req.messagingLimit))
+  })
+
+  if (req.recentsExclude.length) {
+    params.set('recents_exclude', req.recentsExclude.join(','))
+  }
+
+  if (req.messagingExclude.length) {
+    params.set('messaging_exclude', req.messagingExclude.join(','))
+  }
+
+  let result: SidebarSessionsResponse
+
+  try {
+    result = await window.hermesDesktop.api<SidebarSessionsResponse>({
+      path: `/api/profiles/sessions/sidebar?${params.toString()}`,
+      timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
+    })
+  } catch (err) {
+    if (!isEndpointMissingError(err)) {
+      throw err
+    }
+
+    // Older backend without the batched route (desktop/runtime version skew).
+    sidebarBatchEndpointMissing = true
+
+    return listSidebarSessionsLegacy(req)
+  }
+
+  return {
+    recents: { ...result.recents, sessions: result.recents?.sessions ?? [] },
+    cron: { ...result.cron, sessions: result.cron?.sessions ?? [] },
+    messaging: { ...result.messaging, sessions: result.messaging?.sessions ?? [] },
+    errors: result.errors
+  }
+}
+
+// Mutations take the owning `profile` so Electron can route them to the correct
+// remote backend or local profile scope. Omit for the current/default profile.
 export function setSessionArchived(id: string, archived: boolean, profile?: string | null): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
     body: { archived }
+  })
+}
+
+// Mirror a sidebar pin to the backend "keep" flag so the sessions.auto_archive
+// sweep (which runs backend-side, blind to Desktop localStorage) never hides a
+// pinned chat. Best-effort: the sidebar stays localStorage-driven for its own
+// display; this only feeds the backend policy.
+export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: string | null): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...(profile ? { profile } : {}),
+    path: `/api/sessions/${encodeURIComponent(id)}`,
+    method: 'PATCH',
+    body: { pinned }
+  })
+}
+
+// Mirror a sidebar unread toggle to the backend read-state watermark
+// (sessions.last_read_at via SessionDB.set_session_read). Same profile
+// routing as the other session mutations: a remote session's row lives only
+// on its remote host, so the owning profile must travel with the request.
+export function setSessionUnreadRemote(id: string, unread: boolean, profile?: string | null): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...(profile ? { profile } : {}),
+    path: `/api/sessions/${encodeURIComponent(id)}`,
+    method: 'PATCH',
+    body: { unread }
   })
 }
 
@@ -292,13 +786,135 @@ export function getSession(id: string, profile?: string | null): Promise<Session
 // this GET to the remote backend (which serves its own state.db); for a local
 // profile the primary opens that profile's state.db via ?profile=. Omit for
 // the current/default profile.
-export function getSessionMessages(id: string, profile?: string | null): Promise<SessionMessagesResponse> {
-  const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+export function getSessionMessages(
+  id: string,
+  profile?: string | null,
+  page: { limit?: number; offset?: number; order?: 'latest' | 'oldest'; includeCompacted?: boolean } = {}
+): Promise<SessionMessagesResponse> {
+  const query = new URLSearchParams()
+
+  if (profile) {
+    query.set('profile', profile)
+  }
+
+  if (page.limit !== undefined) {
+    query.set('limit', String(page.limit))
+  }
+
+  if (page.offset !== undefined) {
+    query.set('offset', String(page.offset))
+  }
+
+  if (page.order) {
+    query.set('order', page.order)
+  }
+
+  if (page.includeCompacted !== undefined) {
+    query.set('include_compacted', String(page.includeCompacted))
+  }
+
+  const suffix = query.size ? `?${query.toString()}` : ''
 
   return window.hermesDesktop.api<SessionMessagesResponse>({
     ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
   })
+}
+
+/**
+ * The initial hydration page: enough tail to fill the transcript window a few
+ * times over, small enough that opening a long session doesn't ship (and
+ * convert) hundreds of rows nobody has scrolled to. Older rows load on demand
+ * via `getOlderSessionMessages` when "Show earlier" exhausts the in-memory
+ * store (see app/chat/transcript-backfill).
+ */
+export const LATEST_SESSION_MESSAGES_LIMIT = 120
+
+export function getLatestSessionMessages(id: string, profile?: string | null): Promise<SessionMessagesResponse> {
+  // includeCompacted: durable display history must include rows preserved by
+  // in-place compaction (active=0, compacted=1); without them the transcript
+  // silently ends at the compaction boundary and earlier turns are unreachable.
+  return getSessionMessages(id, profile, {
+    limit: LATEST_SESSION_MESSAGES_LIMIT,
+    order: 'latest',
+    includeCompacted: true
+  }).then(page => {
+    // Record whether the tail was truncated (page came back full) and where
+    // the next older page starts, so "Show earlier" can backfill over REST
+    // (app/chat/transcript-backfill). Keyed under both the requested id and
+    // the resolved id — callers hold either.
+    recordTranscriptTail(id, page, profile)
+
+    if (page.session_id && page.session_id !== id) {
+      recordTranscriptTail(page.session_id, page, profile)
+    }
+
+    return page
+  })
+}
+
+/**
+ * One page of messages OLDER than the `offset` newest rows.
+ *
+ * Backend semantics (`_handle_session_messages` → `SessionDB.get_messages`
+ * with `latest=True`): the offset is measured back from the NEWEST message
+ * and the selected page is returned in chronological order. So after a tail
+ * hydration of N rows, `getOlderSessionMessages(id, profile, N)` returns the
+ * page immediately preceding it, ready to prepend.
+ *
+ * Legacy backends without pagination support return the full transcript and
+ * no `pagination` metadata — callers detect that via the missing field and
+ * treat the response as the complete history (see transcript-backfill).
+ */
+export function getOlderSessionMessages(
+  id: string,
+  profile: string | null | undefined,
+  offset: number,
+  limit: number = LATEST_SESSION_MESSAGES_LIMIT
+): Promise<SessionMessagesResponse> {
+  return getSessionMessages(id, profile, { includeCompacted: true, limit, offset, order: 'latest' })
+}
+
+export async function getAllSessionMessages(
+  id: string,
+  profile?: string | null,
+  options: { maxJsonChars?: number } = {}
+): Promise<SessionMessagesResponse> {
+  const messages: SessionMessage[] = []
+  const pageSize = 500
+  const maxJsonChars = options.maxJsonChars ?? 32_000_000
+  let jsonChars = 0
+  let offset = 0
+  let resolvedSessionId = id
+
+  while (true) {
+    const page = await getSessionMessages(id, profile, {
+      limit: pageSize,
+      offset,
+      order: 'oldest',
+      includeCompacted: true
+    })
+
+    resolvedSessionId = page.session_id
+    jsonChars += (JSON.stringify(page.messages) ?? '').length
+
+    if (jsonChars > maxJsonChars) {
+      throw new Error(
+        'Session transcript exceeds the Desktop safe-load limit; use the Web Dashboard export for this session.'
+      )
+    }
+
+    messages.push(...page.messages)
+
+    // Legacy backends ignore pagination and return the full transcript.
+    if (!page.pagination || page.messages.length === 0 || page.messages.length < page.pagination.limit) {
+      break
+    }
+
+    offset += page.messages.length
+  }
+
+  return { session_id: resolvedSessionId, messages }
 }
 
 export function deleteSession(id: string, profile?: string | null): Promise<{ ok: boolean }> {
@@ -322,9 +938,9 @@ export function renameSession(
   })
 }
 
-export function getGlobalModelInfo(): Promise<ModelInfoResponse> {
+export function getGlobalModelInfo(profile?: null | string): Promise<ModelInfoResponse> {
   return window.hermesDesktop.api<ModelInfoResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/model/info',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
@@ -374,17 +990,17 @@ export function getLogs(params: {
   })
 }
 
-export function getHermesConfig(): Promise<HermesConfig> {
+export function getHermesConfig(profile?: string): Promise<HermesConfig> {
   return window.hermesDesktop.api<HermesConfig>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/config',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
-export function getHermesConfigRecord(): Promise<HermesConfigRecord> {
+export function getHermesConfigRecord(profile?: ProfileScope): Promise<HermesConfigRecord> {
   return window.hermesDesktop.api<HermesConfigRecord>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/config'
   })
 }
@@ -397,16 +1013,16 @@ export function getHermesConfigDefaults(): Promise<HermesConfigRecord> {
   })
 }
 
-export function getHermesConfigSchema(): Promise<ConfigSchemaResponse> {
+export function getHermesConfigSchema(profile?: null | string): Promise<ConfigSchemaResponse> {
   return window.hermesDesktop.api<ConfigSchemaResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/config/schema'
   })
 }
 
-export function saveHermesConfig(config: HermesConfigRecord): Promise<{ ok: boolean }> {
+export function saveHermesConfig(config: HermesConfigRecord, profile?: null | string): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/config',
     method: 'PUT',
     body: { config }
@@ -414,30 +1030,36 @@ export function saveHermesConfig(config: HermesConfigRecord): Promise<{ ok: bool
 }
 
 // surface=declared serves the curated desktop schema; the dashboard consumes the raw plugin schema.
-export function getMemoryProviderConfig(provider: string): Promise<MemoryProviderConfig> {
+export function getMemoryProviderConfig(provider: string, profile?: null | string): Promise<MemoryProviderConfig> {
   return window.hermesDesktop.api<MemoryProviderConfig>({
+    ...profileScoped(profile),
     path: `/api/memory/providers/${encodeURIComponent(provider)}/config?surface=declared`
   })
 }
 
-export function saveMemoryProviderConfig(provider: string, values: Record<string, string>): Promise<{ ok: boolean }> {
+export function saveMemoryProviderConfig(
+  provider: string,
+  values: Record<string, string>,
+  profile?: null | string
+): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(profile),
     path: `/api/memory/providers/${encodeURIComponent(provider)}/config?surface=declared`,
     method: 'PUT',
     body: { values }
   })
 }
 
-export function getEnvVars(): Promise<Record<string, EnvVarInfo>> {
+export function getEnvVars(profile?: null | string): Promise<Record<string, EnvVarInfo>> {
   return window.hermesDesktop.api<Record<string, EnvVarInfo>>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/env'
   })
 }
 
-export function setEnvVar(key: string, value: string): Promise<{ ok: boolean }> {
+export function setEnvVar(key: string, value: string, profile?: ProfileScope): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/env',
     method: 'PUT',
     body: { key, value }
@@ -457,18 +1079,58 @@ export function validateProviderCredential(
   })
 }
 
-export function deleteEnvVar(key: string): Promise<{ ok: boolean }> {
-  return window.hermesDesktop.api<{ ok: boolean }>({
+export function getCustomEndpoints(): Promise<CustomEndpointsResponse> {
+  return window.hermesDesktop.api<CustomEndpointsResponse>({
     ...profileScoped(),
+    path: '/api/providers/custom-endpoints'
+  })
+}
+
+export function saveCustomEndpoint(endpoint: CustomEndpointUpdate): Promise<CustomEndpointsResponse> {
+  return window.hermesDesktop.api<CustomEndpointsResponse>({
+    ...profileScoped(),
+    path: '/api/providers/custom-endpoints',
+    method: 'POST',
+    body: endpoint
+  })
+}
+
+export function validateCustomEndpoint(endpoint: CustomEndpointUpdate): Promise<CustomEndpointValidationResponse> {
+  return window.hermesDesktop.api<CustomEndpointValidationResponse>({
+    path: '/api/providers/custom-endpoints/validate',
+    method: 'POST',
+    body: endpoint
+  })
+}
+
+export function activateCustomEndpoint(id: string): Promise<{ ok: boolean; provider: string; model: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; provider: string; model: string }>({
+    ...profileScoped(),
+    path: `/api/providers/custom-endpoints/${encodeURIComponent(id)}/activate`,
+    method: 'POST'
+  })
+}
+
+export function deleteCustomEndpoint(id: string): Promise<CustomEndpointsResponse> {
+  return window.hermesDesktop.api<CustomEndpointsResponse>({
+    ...profileScoped(),
+    path: `/api/providers/custom-endpoints/${encodeURIComponent(id)}`,
+    method: 'DELETE'
+  })
+}
+
+export function deleteEnvVar(key: string, profile?: ProfileScope): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...capabilityScoped(profile),
     path: '/api/env',
     method: 'DELETE',
     body: { key }
   })
 }
 
-export function revealEnvVar(key: string): Promise<{ key: string; value: string }> {
+export function revealEnvVar(key: string, profile?: ProfileScope): Promise<{ key: string; value: string }> {
   return window.hermesDesktop.api<{ key: string; value: string }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/env/reveal',
     method: 'POST',
     body: { key }
@@ -490,9 +1152,9 @@ export function disconnectOAuthProvider(providerId: string): Promise<{ ok: boole
   })
 }
 
-export function startOAuthLogin(providerId: string): Promise<OAuthStartResponse> {
+export function startOAuthLogin(providerId: string, profile?: ProfileScope): Promise<OAuthStartResponse> {
   return window.hermesDesktop.api<OAuthStartResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/start`,
     method: 'POST',
     body: {}
@@ -508,9 +1170,13 @@ export function submitOAuthCode(providerId: string, sessionId: string, code: str
   })
 }
 
-export function pollOAuthSession(providerId: string, sessionId: string): Promise<OAuthPollResponse> {
+export function pollOAuthSession(
+  providerId: string,
+  sessionId: string,
+  profile?: ProfileScope
+): Promise<OAuthPollResponse> {
   return window.hermesDesktop.api<OAuthPollResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/poll/${encodeURIComponent(sessionId)}`
   })
 }
@@ -525,25 +1191,43 @@ export function cancelOAuthSession(sessionId: string): Promise<{ ok: boolean }> 
 
 // Memory-provider OAuth connect (provider-keyed; 404s for providers without an
 // OAuth flow). Profile-scoped: the grant lands in the active profile's config.
-export function startMemoryProviderOAuth(provider: string): Promise<MemoryProviderOAuthStatus> {
+export function startMemoryProviderOAuth(
+  provider: string,
+  profile?: null | string
+): Promise<MemoryProviderOAuthStatus> {
   return window.hermesDesktop.api<MemoryProviderOAuthStatus>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/memory/providers/${encodeURIComponent(provider)}/oauth/start`,
     method: 'POST'
   })
 }
 
-export function getMemoryProviderOAuthStatus(provider: string): Promise<MemoryProviderOAuthStatus> {
+export function getMemoryProviderOAuthStatus(
+  provider: string,
+  profile?: null | string
+): Promise<MemoryProviderOAuthStatus> {
   return window.hermesDesktop.api<MemoryProviderOAuthStatus>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/memory/providers/${encodeURIComponent(provider)}/oauth/status`
   })
 }
 
-export function getSkills(): Promise<SkillInfo[]> {
+export function getSkills(profile?: ProfileScope): Promise<SkillInfo[]> {
   return window.hermesDesktop.api<SkillInfo[]>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/skills'
+  })
+}
+
+/** Raw SKILL.md text (frontmatter included) for ANY skill — bundled, hub, or
+ *  learned — backing the Capabilities detail pane's full-skill view. */
+export function getSkillContent(
+  name: string,
+  profile?: ProfileScope
+): Promise<{ content: string; name: string; path: string }> {
+  return window.hermesDesktop.api<{ content: string; name: string; path: string }>({
+    ...capabilityScoped(profile),
+    path: `/api/skills/content?name=${encodeURIComponent(name)}`
   })
 }
 
@@ -563,34 +1247,42 @@ export interface LearningNodeDetail {
   ok: boolean
 }
 
-export function getLearningNode(id: string): Promise<LearningNodeDetail> {
+export function getLearningNode(id: string, profile?: ProfileScope): Promise<LearningNodeDetail> {
   return window.hermesDesktop.api<LearningNodeDetail>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/learning/node?id=${encodeURIComponent(id)}`
   })
 }
 
-export function deleteLearningNode(id: string): Promise<{ message: string; ok: boolean }> {
+export function deleteLearningNode(id: string, profile?: ProfileScope): Promise<{ message: string; ok: boolean }> {
   return window.hermesDesktop.api<{ message: string; ok: boolean }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/learning/node',
     method: 'DELETE',
     body: { id }
   })
 }
 
-export function editLearningNode(id: string, content: string): Promise<{ message: string; ok: boolean }> {
+export function editLearningNode(
+  id: string,
+  content: string,
+  profile?: ProfileScope
+): Promise<{ message: string; ok: boolean }> {
   return window.hermesDesktop.api<{ message: string; ok: boolean }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/learning/node',
     method: 'PUT',
     body: { content, id }
   })
 }
 
-export function toggleSkill(name: string, enabled: boolean): Promise<{ ok: boolean; name: string; enabled: boolean }> {
+export function setSkillEnabled(
+  name: string,
+  enabled: boolean,
+  profile?: ProfileScope
+): Promise<{ ok: boolean; name: string; enabled: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean; name: string; enabled: boolean }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/skills/toggle',
     method: 'PUT',
     body: { name, enabled }
@@ -600,17 +1292,28 @@ export function toggleSkill(name: string, enabled: boolean): Promise<{ ok: boole
 export interface McpTestResult {
   ok: boolean
   error?: string
-  tools: { name: string; description: string }[]
+  /** `schema_chars` (converted registry-schema size, chars) is additive —
+   *  older backends omit it and the cost overlay shows no token estimate. */
+  tools: { name: string; description: string; schema_chars?: number }[]
   /** Capability counts (absent on older backends / failed probes). */
   prompts?: number
   resources?: number
 }
 
+export interface McpOAuthFlow {
+  flow_id: string
+  server_name: string
+  status: 'starting' | 'authorization_required' | 'approved' | 'error'
+  authorization_url: string | null
+  error: string | null
+  tools?: { name: string; description: string }[]
+}
+
 /** Connect to the server, list its tools, disconnect. Slow (spawns/handshakes
  *  for real) — well past the 15s default fetch timeout. */
-export function testMcpServer(name: string): Promise<McpTestResult> {
+export function testMcpServer(name: string, profile?: ProfileScope): Promise<McpTestResult> {
   return window.hermesDesktop.api<McpTestResult>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/mcp/servers/${encodeURIComponent(name)}/test`,
     method: 'POST',
     timeoutMs: 60_000
@@ -620,57 +1323,86 @@ export function testMcpServer(name: string): Promise<McpTestResult> {
 /** Replace the whole `mcp_servers` map (the mcp.json editor's save). Unlike
  *  `saveHermesConfig`, this REPLACES rather than deep-merges, so deletes,
  *  re-enables (dropping `enabled: false`), and removed nested fields persist. */
-export function saveMcpServers(servers: Record<string, Record<string, unknown>>): Promise<{ ok: boolean }> {
+export function saveMcpServers(
+  servers: Record<string, Record<string, unknown>>,
+  profile?: ProfileScope
+): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/mcp/servers',
     method: 'PUT',
     body: { servers }
   })
 }
 
-/** Run the OAuth flow for an HTTP server — opens the system browser and blocks
- *  until the user finishes (or gives up), hence the very generous timeout. */
-export function authMcpServer(name: string): Promise<McpTestResult> {
-  return window.hermesDesktop.api<McpTestResult>({
-    ...profileScoped(),
+/** Start an MCP OAuth flow and return the authorization URL. */
+export function authMcpServer(name: string, profile?: ProfileScope): Promise<McpOAuthFlow> {
+  return window.hermesDesktop.api<McpOAuthFlow>({
+    ...capabilityScoped(profile),
     path: `/api/mcp/servers/${encodeURIComponent(name)}/auth`,
     method: 'POST',
-    timeoutMs: 300_000
+    timeoutMs: 60_000
   })
 }
 
-export function getToolsets(): Promise<ToolsetInfo[]> {
+export function getMcpOAuthFlow(flowId: string, profile?: ProfileScope): Promise<McpOAuthFlow> {
+  return window.hermesDesktop.api<McpOAuthFlow>({
+    ...capabilityScoped(profile),
+    path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`
+  })
+}
+
+/** Cancel an in-flight MCP OAuth flow server-side, freeing the per-server
+ *  "already in progress" slot so a retry doesn't 409. */
+export function cancelMcpOAuthFlow(flowId: string, profile?: null | string): Promise<{ ok: boolean; status: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; status: string }>({
+    ...profileScoped(profile),
+    path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`,
+    method: 'DELETE'
+  })
+}
+
+// The optional trailing `profile` on every capability fetcher below is the
+// Capabilities view's profile-scope override: it lets the Skills/Tools/MCP
+// panels configure ANY profile without swapping the app-wide active profile.
+// Omitting it (every pre-existing caller) means `profileScoped(undefined)`
+// falls back to the app-wide `_apiProfile`, so behavior is byte-identical.
+export function getToolsets(profile?: ProfileScope): Promise<ToolsetInfo[]> {
   return window.hermesDesktop.api<ToolsetInfo[]>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/tools/toolsets'
   })
 }
 
-export function toggleToolset(
+export function setToolsetEnabled(
   name: string,
-  enabled: boolean
+  enabled: boolean,
+  profile?: ProfileScope
 ): Promise<{ ok: boolean; name: string; enabled: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean; name: string; enabled: boolean }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/tools/toolsets/${encodeURIComponent(name)}`,
     method: 'PUT',
     body: { enabled }
   })
 }
 
-export function getToolsetConfig(name: string): Promise<ToolsetConfig> {
+export function getToolsetConfig(name: string, profile?: ProfileScope): Promise<ToolsetConfig> {
   return window.hermesDesktop.api<ToolsetConfig>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/tools/toolsets/${encodeURIComponent(name)}/config`
   })
 }
 
-export function getToolsetModels(name: string, provider?: string): Promise<ToolsetModelsResponse> {
+export function getToolsetModels(
+  name: string,
+  provider?: string,
+  profile?: ProfileScope
+): Promise<ToolsetModelsResponse> {
   const suffix = provider ? `?provider=${encodeURIComponent(provider)}` : ''
 
   return window.hermesDesktop.api<ToolsetModelsResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/tools/toolsets/${encodeURIComponent(name)}/models${suffix}`
   })
 }
@@ -678,34 +1410,71 @@ export function getToolsetModels(name: string, provider?: string): Promise<Tools
 export function selectToolsetModel(
   name: string,
   model: string,
-  provider?: string
+  provider?: string,
+  profile?: ProfileScope
 ): Promise<{ ok: boolean; name: string; model: string }> {
   return window.hermesDesktop.api<{ ok: boolean; name: string; model: string }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/tools/toolsets/${encodeURIComponent(name)}/model`,
     method: 'PUT',
     body: { model, provider }
   })
 }
 
+export interface SelectToolsetProviderResponse {
+  ok: boolean
+  name: string
+  provider: string
+  /** Present when the selection was scoped to one web capability. */
+  capability?: string
+  /** Present (true) when a managed Nous row was selected but the Portal
+   *  entitlement is missing — the row won't activate until the user signs
+   *  in to Nous Portal. */
+  needs_nous_auth?: boolean
+  /** The managed feature key (e.g. "browser") when needs_nous_auth is set. */
+  feature?: string
+}
+
 export function selectToolsetProvider(
   name: string,
-  provider: string
-): Promise<{ ok: boolean; name: string; provider: string }> {
-  return window.hermesDesktop.api<{ ok: boolean; name: string; provider: string }>({
-    ...profileScoped(),
+  provider: string,
+  capability?: 'search' | 'extract',
+  profile?: ProfileScope
+): Promise<SelectToolsetProviderResponse> {
+  return window.hermesDesktop.api<SelectToolsetProviderResponse>({
+    ...capabilityScoped(profile),
     path: `/api/tools/toolsets/${encodeURIComponent(name)}/provider`,
     method: 'PUT',
-    body: { provider }
+    body: capability ? { provider, capability } : { provider }
   })
 }
 
-export function runToolsetPostSetup(name: string, key: string): Promise<ActionResponse & { key: string }> {
+export function runToolsetPostSetup(
+  name: string,
+  key: string,
+  profile?: ProfileScope
+): Promise<ActionResponse & { key: string }> {
   return window.hermesDesktop.api<ActionResponse & { key: string }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/tools/toolsets/${encodeURIComponent(name)}/post-setup`,
     method: 'POST',
     body: { key }
+  })
+}
+
+export function getTerminalBackends(): Promise<TerminalBackendsResponse> {
+  return window.hermesDesktop.api<TerminalBackendsResponse>({
+    ...profileScoped(),
+    path: '/api/tools/terminal/backends'
+  })
+}
+
+export function selectTerminalBackend(backend: string): Promise<{ ok: boolean; backend: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; backend: string }>({
+    ...profileScoped(),
+    path: '/api/tools/terminal/backend',
+    method: 'PUT',
+    body: { backend }
   })
 }
 
@@ -724,53 +1493,175 @@ export function grantComputerUsePermissions(): Promise<ActionResponse> {
   })
 }
 
-export function getMessagingPlatforms(): Promise<MessagingPlatformsResponse> {
+export function getMessagingPlatforms(profile?: null | string): Promise<MessagingPlatformsResponse> {
   return window.hermesDesktop.api<MessagingPlatformsResponse>({
+    ...profileScoped(profile),
     path: '/api/messaging/platforms'
   })
 }
 
 export function updateMessagingPlatform(
   platformId: string,
-  body: MessagingPlatformUpdate
+  body: MessagingPlatformUpdate,
+  profile?: null | string
 ): Promise<{ ok: boolean; platform: string }> {
   return window.hermesDesktop.api<{ ok: boolean; platform: string }>({
+    ...profileScoped(profile),
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}`,
     method: 'PUT',
     body
   })
 }
 
-export function testMessagingPlatform(platformId: string): Promise<MessagingPlatformTestResponse> {
+export function testMessagingPlatform(
+  platformId: string,
+  profile?: null | string
+): Promise<MessagingPlatformTestResponse> {
   return window.hermesDesktop.api<MessagingPlatformTestResponse>({
+    ...profileScoped(profile),
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}/test`,
     method: 'POST'
   })
 }
 
-export function getCronJobs(): Promise<CronJob[]> {
+// -- Pairing (who may DM the bot) --------------------------------------------
+// Unknown DMers get a one-time code and land in `pending` until an admin
+// approves them. Approval grants on the row's `request_id`, never on the code:
+// the code is the requester's proof that the channel is theirs and is never
+// returned by the API, while an authenticated admin is only ever identifying
+// a row they can already see.
+
+export function getPairing(profile?: null | string): Promise<PairingResponse> {
+  return window.hermesDesktop.api<PairingResponse>({
+    ...profileScoped(profile),
+    path: '/api/pairing'
+  })
+}
+
+export function approvePairing(
+  platform: string,
+  requestId: string,
+  profile?: null | string
+): Promise<{ ok: boolean; user: PairingUser }> {
+  return window.hermesDesktop.api<{ ok: boolean; user: PairingUser }>({
+    ...profileScoped(profile),
+    path: '/api/pairing/approve',
+    method: 'POST',
+    // These endpoints read the profile off the body, not the query string —
+    // `profileScoped()` alone would approve into the wrong profile's store.
+    body: { platform, request_id: requestId, ...profileScoped(profile) }
+  })
+}
+
+export function revokePairing(platform: string, userId: string, profile?: null | string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(profile),
+    path: '/api/pairing/revoke',
+    method: 'POST',
+    body: { platform, user_id: userId, ...profileScoped(profile) }
+  })
+}
+
+// -- Webhooks (subscription CRUD) --------------------------------------------
+// The webhook receiver is its own gateway platform; subscriptions live in a
+// shared JSON store the CLI/dashboard also drive. Enable mutates config and
+// best-effort restarts the gateway; subscription changes hot-reload.
+
+export function getWebhooks(): Promise<WebhooksResponse> {
+  return window.hermesDesktop.api<WebhooksResponse>({
+    ...profileScoped(),
+    path: '/api/webhooks'
+  })
+}
+
+export function enableWebhooks(): Promise<WebhookEnableResponse> {
+  return window.hermesDesktop.api<WebhookEnableResponse>({
+    ...profileScoped(),
+    path: '/api/webhooks/enable',
+    method: 'POST'
+  })
+}
+
+export function createWebhook(body: WebhookCreatePayload): Promise<WebhookCreateResponse> {
+  return window.hermesDesktop.api<WebhookCreateResponse>({
+    ...profileScoped(),
+    path: '/api/webhooks',
+    method: 'POST',
+    body
+  })
+}
+
+export function deleteWebhook(name: string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(),
+    path: `/api/webhooks/${encodeURIComponent(name)}`,
+    method: 'DELETE'
+  })
+}
+
+export function setWebhookEnabled(
+  name: string,
+  enabled: boolean
+): Promise<{ enabled: boolean; name: string; ok: boolean }> {
+  return window.hermesDesktop.api<{ enabled: boolean; name: string; ok: boolean }>({
+    ...profileScoped(),
+    path: `/api/webhooks/${encodeURIComponent(name)}/enabled`,
+    method: 'PUT',
+    body: { enabled }
+  })
+}
+
+// Cron jobs are stored per-profile (<HERMES_HOME>/cron/jobs.json), and the
+// backend's list endpoint defaults to 'all'. Pass a concrete profile key to
+// list just that profile's jobs, or 'all' for the unified cross-profile view.
+// Omitting the arg keeps the legacy 'all' default for non-profile callers.
+// profileScoped() still rides along for backend-process routing.
+export function getCronJobs(profile?: string): Promise<CronJob[]> {
+  const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+
   return window.hermesDesktop.api<CronJob[]>({
-    path: '/api/cron/jobs',
+    ...profileScoped(),
+    ...connectionScoped(),
+    path: `/api/cron/jobs${suffix}`,
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
 export function getCronJob(jobId: string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
+    ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}`
   })
 }
 
 export async function getCronJobRuns(jobId: string, limit = 20): Promise<SessionInfo[]> {
   const { runs } = await window.hermesDesktop.api<{ runs: SessionInfo[] }>({
+    ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}/runs?limit=${limit}`
   })
 
   return runs ?? []
 }
 
+// The single source of truth for cron delivery targets (local + configured
+// gateways). Both the manual cron editor and the blueprint dialog use this so
+// they never offer a platform that isn't connected. Mirrors the dashboard.
+export async function getCronDeliveryTargets(): Promise<CronDeliveryTarget[]> {
+  const { targets } = await window.hermesDesktop.api<{ targets: CronDeliveryTarget[] }>({
+    ...profileScoped(),
+    ...connectionScoped(),
+    path: '/api/cron/delivery-targets'
+  })
+
+  return targets ?? []
+}
+
 export function createCronJob(body: CronJobCreatePayload): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
+    ...profileScoped(),
+    ...connectionScoped(),
     path: '/api/cron/jobs',
     method: 'POST',
     body
@@ -779,6 +1670,8 @@ export function createCronJob(body: CronJobCreatePayload): Promise<CronJob> {
 
 export function updateCronJob(jobId: string, updates: CronJobUpdates): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
+    ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
     method: 'PUT',
     body: { updates }
@@ -787,6 +1680,8 @@ export function updateCronJob(jobId: string, updates: CronJobUpdates): Promise<C
 
 export function pauseCronJob(jobId: string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
+    ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}/pause`,
     method: 'POST'
   })
@@ -794,6 +1689,8 @@ export function pauseCronJob(jobId: string): Promise<CronJob> {
 
 export function resumeCronJob(jobId: string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
+    ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}/resume`,
     method: 'POST'
   })
@@ -801,15 +1698,53 @@ export function resumeCronJob(jobId: string): Promise<CronJob> {
 
 export function triggerCronJob(jobId: string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
+    ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}/trigger`,
-    method: 'POST'
+    method: 'POST',
+    timeoutMs: CRON_TRIGGER_REQUEST_TIMEOUT_MS
   })
 }
 
 export function deleteCronJob(jobId: string): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
     method: 'DELETE'
+  })
+}
+
+// Automation Blueprints — parameterized cron templates the backend serves from
+// cron/blueprint_catalog.py. getAutomationBlueprints returns the gallery
+// (deliver options already rewritten to this machine's configured gateways);
+// instantiateAutomationBlueprint fills the slots and creates a real cron job via
+// the same create_job path as createCronJob.
+//
+// Profile-scoping is intentionally asymmetric: the GET catalog is global (the
+// list endpoint takes no profile — only deliver options are rewritten from the
+// configured gateways), so it carries only the profileScoped() header for
+// routing. instantiate creates a real per-profile job, so it names the target
+// profile explicitly via ?profile=. This mirrors the dashboard's api.ts.
+export function getAutomationBlueprints(): Promise<{ blueprints: AutomationBlueprint[] }> {
+  return window.hermesDesktop.api<{ blueprints: AutomationBlueprint[] }>({
+    ...profileScoped(),
+    ...connectionScoped(),
+    path: '/api/cron/blueprints',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+  })
+}
+
+export function instantiateAutomationBlueprint(
+  body: { blueprint: string; values: Record<string, string> },
+  profile: string
+): Promise<CronJob> {
+  return window.hermesDesktop.api<CronJob>({
+    ...profileScoped(),
+    ...connectionScoped(),
+    path: `/api/cron/blueprints/instantiate?profile=${encodeURIComponent(profile)}`,
+    method: 'POST',
+    body
   })
 }
 
@@ -863,18 +1798,51 @@ export function getProfileSetupCommand(name: string): Promise<ProfileSetupComman
   })
 }
 
-export function getUsageAnalytics(days = 30): Promise<AnalyticsResponse> {
+/** Export a profile to a shareable .tar.gz on the backend's filesystem.
+ *  `extraFiles` stages extra root-level files (desktop.json — the appearance/
+ *  interface overlay) into the archive alongside the profile's own artifacts. */
+export function exportProfileArchive(
+  name: string,
+  opts: { extraFiles?: Record<string, string>; output?: string } = {}
+): Promise<{ archive: string; ok: boolean }> {
+  return window.hermesDesktop.api<{ archive: string; ok: boolean }>({
+    path: `/api/profiles/${encodeURIComponent(name)}/export`,
+    method: 'POST',
+    body: { extra_files: opts.extraFiles ?? {}, output: opts.output ?? '' },
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+  })
+}
+
+/** Import a profile .tar.gz as a new profile. Returns the bundled desktop
+ *  appearance overlay too (when the archive carried one) so the caller can
+ *  apply theme/layout without another round-trip. */
+export function importProfileArchive(
+  archive: string,
+  name?: string
+): Promise<{ desktop: null | ProfileDesktopOverlay; name: string; ok: boolean; path: string }> {
+  return window.hermesDesktop.api<{ desktop: null | ProfileDesktopOverlay; name: string; ok: boolean; path: string }>({
+    path: '/api/profiles/import',
+    method: 'POST',
+    body: { archive, name: name || null },
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+  })
+}
+
+export function getUsageAnalytics(days = 30, profile?: ProfileScope): Promise<AnalyticsResponse> {
   return window.hermesDesktop.api<AnalyticsResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/analytics/usage?days=${Math.max(1, Math.floor(days))}`
   })
 }
 
-export function getGlobalModelOptions(opts?: {
-  refresh?: boolean
-  includeUnconfigured?: boolean
-  explicitOnly?: boolean
-}): Promise<ModelOptionsResponse> {
+export function getGlobalModelOptions(
+  opts?: {
+    refresh?: boolean
+    includeUnconfigured?: boolean
+    explicitOnly?: boolean
+  },
+  profile?: null | string
+): Promise<ModelOptionsResponse> {
   const params = new URLSearchParams()
 
   if (opts?.refresh) {
@@ -890,7 +1858,7 @@ export function getGlobalModelOptions(opts?: {
   }
 
   return window.hermesDesktop.api<ModelOptionsResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: params.size > 0 ? `/api/model/options?${params.toString()}` : '/api/model/options',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
@@ -906,9 +1874,12 @@ export interface RecommendedDefaultModel {
 // Recommended default model for a freshly-authenticated provider. Mirrors the
 // curation `hermes model` does — for Nous it honors the free/paid tier so a
 // free user gets a free model instead of a paid default.
-export function getRecommendedDefaultModel(provider: string): Promise<RecommendedDefaultModel> {
+export function getRecommendedDefaultModel(
+  provider: string,
+  profile?: null | string
+): Promise<RecommendedDefaultModel> {
   return window.hermesDesktop.api<RecommendedDefaultModel>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/model/recommended-default?provider=${encodeURIComponent(provider)}`
   })
 }
@@ -929,32 +1900,38 @@ export function setGlobalModel(
   })
 }
 
-export function getAuxiliaryModels(): Promise<AuxiliaryModelsResponse> {
+export function getAuxiliaryModels(profile?: null | string): Promise<AuxiliaryModelsResponse> {
   return window.hermesDesktop.api<AuxiliaryModelsResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/model/auxiliary'
   })
 }
 
-export function getMoaModels(): Promise<MoaConfigResponse> {
+export function getMoaModels(profile?: null | string): Promise<MoaConfigResponse> {
   return window.hermesDesktop.api<MoaConfigResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/model/moa'
   })
 }
 
-export function saveMoaModels(body: MoaConfigResponse): Promise<MoaConfigResponse & { ok: boolean }> {
+export function saveMoaModels(
+  body: MoaConfigResponse,
+  profile?: null | string
+): Promise<MoaConfigResponse & { ok: boolean }> {
   return window.hermesDesktop.api<MoaConfigResponse & { ok: boolean }>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/model/moa',
     method: 'PUT',
     body
   })
 }
 
-export function setModelAssignment(body: ModelAssignmentRequest): Promise<ModelAssignmentResponse> {
+export function setModelAssignment(
+  body: ModelAssignmentRequest,
+  profile?: null | string
+): Promise<ModelAssignmentResponse> {
   return window.hermesDesktop.api<ModelAssignmentResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/model/set',
     method: 'POST',
     body
@@ -987,9 +1964,9 @@ export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResp
   })
 }
 
-export function getActionStatus(name: string, lines = 200): Promise<ActionStatusResponse> {
+export function getActionStatus(name: string, lines = 200, profile?: ProfileScope): Promise<ActionStatusResponse> {
   return window.hermesDesktop.api<ActionStatusResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: `/api/actions/${encodeURIComponent(name)}/status?lines=${Math.max(1, lines)}`
   })
 }
@@ -998,24 +1975,35 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
   return window.hermesDesktop.api<AudioTranscriptionResponse>({
     path: '/api/audio/transcribe',
     method: 'POST',
+    ...profileScoped(),
     body: {
       data_url: dataUrl,
       mime_type: mimeType
-    }
+    },
+    // Transcription blocks until provider STT, file handling, and response
+    // encoding finish. Remote providers and long clips regularly exceed the
+    // default 15s Electron backend timeout.
+    timeoutMs: audioTranscribeRequestTimeoutMs(dataUrl)
   })
 }
 
 export function speakText(text: string): Promise<AudioSpeakResponse> {
   return window.hermesDesktop.api<AudioSpeakResponse>({
+    ...profileScoped(),
     path: '/api/audio/speak',
     method: 'POST',
-    body: { text }
+    body: { text },
+    // TTS blocks until provider synthesis, file read, and base64 encoding
+    // finish. Remote providers and large messages regularly exceed the
+    // default 15s Electron backend timeout.
+    timeoutMs: audioSpeakRequestTimeoutMs(text)
   })
 }
 
-export function getElevenLabsVoices(): Promise<ElevenLabsVoicesResponse> {
+export function getElevenLabsVoices(profile?: null | string): Promise<ElevenLabsVoicesResponse> {
   return window.hermesDesktop.api<ElevenLabsVoicesResponse>({
-    path: '/api/audio/elevenlabs/voices'
+    path: '/api/audio/elevenlabs/voices',
+    ...profileScoped(profile)
   })
 }
 
@@ -1027,61 +2015,66 @@ export function getElevenLabsVoices(): Promise<ElevenLabsVoicesResponse> {
 
 const HUB_REQUEST_TIMEOUT_MS = 45_000
 
-export function getSkillHubSources(): Promise<SkillHubSourcesResponse> {
+export function getSkillHubSources(profile?: null | string): Promise<SkillHubSourcesResponse> {
   return window.hermesDesktop.api<SkillHubSourcesResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/skills/hub/sources',
     timeoutMs: HUB_REQUEST_TIMEOUT_MS
   })
 }
 
-export function searchSkillsHub(query: string, source = 'all', limit = 20): Promise<SkillHubSearchResponse> {
+export function searchSkillsHub(
+  query: string,
+  source = 'all',
+  limit = 20,
+  profile?: null | string
+): Promise<SkillHubSearchResponse> {
   const params = new URLSearchParams({ q: query, source, limit: String(limit) })
 
   return window.hermesDesktop.api<SkillHubSearchResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/skills/hub/search?${params.toString()}`,
     timeoutMs: HUB_REQUEST_TIMEOUT_MS
   })
 }
 
-export function previewSkillHub(identifier: string): Promise<SkillHubPreview> {
+export function previewSkillHub(identifier: string, profile?: null | string): Promise<SkillHubPreview> {
   return window.hermesDesktop.api<SkillHubPreview>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/skills/hub/preview?identifier=${encodeURIComponent(identifier)}`,
     timeoutMs: HUB_REQUEST_TIMEOUT_MS
   })
 }
 
-export function scanSkillHub(identifier: string): Promise<SkillHubScanResult> {
+export function scanSkillHub(identifier: string, profile?: null | string): Promise<SkillHubScanResult> {
   return window.hermesDesktop.api<SkillHubScanResult>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/skills/hub/scan?identifier=${encodeURIComponent(identifier)}`,
     timeoutMs: HUB_REQUEST_TIMEOUT_MS
   })
 }
 
-export function installSkillFromHub(identifier: string): Promise<ActionResponse> {
+export function installSkillFromHub(identifier: string, profile?: ProfileScope): Promise<ActionResponse> {
   return window.hermesDesktop.api<ActionResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/skills/hub/install',
     method: 'POST',
     body: { identifier }
   })
 }
 
-export function uninstallSkillFromHub(name: string): Promise<ActionResponse> {
+export function uninstallSkillFromHub(name: string, profile?: ProfileScope): Promise<ActionResponse> {
   return window.hermesDesktop.api<ActionResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/skills/hub/uninstall',
     method: 'POST',
     body: { name }
   })
 }
 
-export function updateSkillsFromHub(): Promise<ActionResponse> {
+export function updateSkillsFromHub(profile?: ProfileScope): Promise<ActionResponse> {
   return window.hermesDesktop.api<ActionResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/skills/hub/update',
     method: 'POST',
     body: {}
@@ -1101,6 +2094,34 @@ export function listMcpServers(): Promise<{ servers: McpServerSummary[] }> {
   })
 }
 
+/** Add one server to `mcp_servers` (validated + name-collision-checked
+ *  server-side — the same endpoint the dashboard's add form uses). */
+export function addMcpServer(body: {
+  name: string
+  url?: string
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  auth?: string
+}): Promise<McpServerSummary> {
+  return window.hermesDesktop.api<McpServerSummary>({
+    ...profileScoped(),
+    path: '/api/mcp/servers',
+    method: 'POST',
+    body
+  })
+}
+
+/** Remove one server from `mcp_servers` (the inline setup card's rollback
+ *  when a directory install is cancelled after the config write). */
+export function removeMcpServer(name: string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(),
+    path: `/api/mcp/servers/${encodeURIComponent(name)}`,
+    method: 'DELETE'
+  })
+}
+
 export function setMcpServerEnabled(name: string, enabled: boolean): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...profileScoped(),
@@ -1110,19 +2131,30 @@ export function setMcpServerEnabled(name: string, enabled: boolean): Promise<{ o
   })
 }
 
-export function getMcpCatalog(): Promise<McpCatalogResponse> {
+export function getMcpCatalog(profile?: ProfileScope): Promise<McpCatalogResponse> {
   return window.hermesDesktop.api<McpCatalogResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/mcp/catalog'
+  })
+}
+
+/** `gh` CLI presence + auth state, for the composer's GitHub skill pill
+ *  (GitHub is deliberately not an MCP — the github/* skills are the
+ *  integration). Backend caches for 5 minutes; `refresh` bypasses. */
+export function getGhAuthStatus(refresh = false): Promise<{ available: boolean; authenticated: boolean }> {
+  return window.hermesDesktop.api<{ available: boolean; authenticated: boolean }>({
+    ...profileScoped(),
+    path: `/api/git/gh-auth${refresh ? '?refresh=true' : ''}`
   })
 }
 
 export function installMcpCatalogEntry(
   name: string,
-  env: Record<string, string> = {}
+  env: Record<string, string> = {},
+  profile?: ProfileScope
 ): Promise<{ ok: boolean; name?: string; pid?: number; action?: string; background?: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean; name?: string; pid?: number; action?: string; background?: boolean }>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/mcp/catalog/install',
     method: 'POST',
     body: { name, env, enable: true },

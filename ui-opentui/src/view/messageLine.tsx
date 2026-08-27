@@ -33,6 +33,7 @@
 import { For, Match, Show, Switch } from 'solid-js'
 
 import { copyBlock } from '../logic/blockCopy.ts'
+import { splitComposerHighlights, type ComposerHighlight } from '../logic/composerHighlights.ts'
 import { collapseHiddenPartsBy, hiddenRunLabel, sectionMode } from '../logic/details.ts'
 import type { Message, Part } from '../logic/store.ts'
 import type { ThemeColors } from '../logic/theme.ts'
@@ -121,6 +122,24 @@ export function formatTimestamp(unixSeconds: number): string {
 }
 
 /**
+ * Per-reasoning-phase liveness (upstream 2b0b4a219195 adaptation): a reasoning
+ * (or MoA) part is LIVE — and therefore auto-expanded under the default
+ * collapsed thinking mode — only while the turn is still streaming AND no later
+ * part has begun. The moment a tool/text/reasoning part is appended after it,
+ * that phase is over and the earlier part folds immediately; settling the turn
+ * (streaming=false) or resuming history folds everything. Pure — exported for
+ * tests.
+ */
+export function isLiveReasoningPart(
+  parts: readonly Part[] | undefined,
+  id: string,
+  streaming: boolean | undefined
+): boolean {
+  if (!streaming || !parts?.length) return false
+  return parts[parts.length - 1]?.id === id
+}
+
+/**
  * The quiet per-block copy chip — a muted `⧉ copy` run on its own line at the
  * block's BOTTOM-LEFT (never the right edge: that column belongs to the
  * scrollbar). `alignSelf: flex-start` shrinks the click target to the run
@@ -178,6 +197,14 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
     const ts = m().timestamp
     return display().timestamps && ts != null ? formatTimestamp(ts) : undefined
   }
+
+  // Slash commands/skills, `@` refs, and attachment/paste tokens in a SENT
+  // user message keep the accent they wore in the composer instead of
+  // flattening into the body (Ink messageLine parity). Splitting is render-only: the segments
+  // concatenate back to m().text exactly, so CopyChip / selection / the wire
+  // text stay the untouched source. Other roles stay one plain run.
+  const bodySegments = (): ComposerHighlight[] =>
+    m().role === 'user' ? splitComposerHighlights(m().text) : [{ ref: false, text: m().text }]
   return (
     <Show
       when={skillRow()}
@@ -229,7 +256,15 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                             <Show when={tsLabel()}>
                               {label => <span style={{ fg: theme().color.muted }}>{label() + ' '}</span>}
                             </Show>
-                            <span style={{ fg: bodyFg() }}>{m().text}</span>
+                            {/* flat SIBLING spans (OpenTUI <text> is flat spans, not nested
+                        text): references accent, prose keeps bodyFg. */}
+                            <For each={bodySegments()}>
+                              {segment => (
+                                <span style={{ fg: segment.ref ? theme().color.accent : bodyFg() }}>
+                                  {segment.text}
+                                </span>
+                              )}
+                            </For>
                           </text>
                           <Show when={m().role !== 'system' && m().text.trim() && !display().compact}>
                             <CopyChip source={() => m().text} />
@@ -248,12 +283,25 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                     {part => (
                       <Switch>
                         <Match when={part.type === 'tool' && part}>{tool => <ToolPart part={tool()} />}</Match>
+                        {/* PER-PART liveness (not the message-level streaming
+                      flag): only the currently-live reasoning phase stays
+                      expanded; a part with any later sibling folded already —
+                      see isLiveReasoningPart. */}
                         <Match when={part.type === 'reasoning' && part}>
-                          {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
+                          {r => (
+                            <ReasoningPart
+                              text={r().text}
+                              streaming={isLiveReasoningPart(m().parts, r().id, m().streaming)}
+                            />
+                          )}
                         </Match>
                         <Match when={part.type === 'moa' && part}>
                           {r => (
-                            <ReasoningPart text={r().text} streaming={m().streaming ?? false} section="subagents" />
+                            <ReasoningPart
+                              text={r().text}
+                              streaming={isLiveReasoningPart(m().parts, r().id, m().streaming)}
+                              section="subagents"
+                            />
                           )}
                         </Match>
                         <Match when={part.type === 'hiddenRun' && part}>

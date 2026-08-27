@@ -10,6 +10,7 @@
  */
 import { describe, expect, test } from 'vitest'
 
+import { REASONING_TAIL_BOUND } from '../logic/reasoningTail.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
@@ -91,6 +92,54 @@ describe('/reasoning full — expands all thinking (frame)', () => {
       store.setReasoningFull(false)
       const back = await probe.waitForFrame(f => f.includes('◐ Thought: Plan'))
       expect(back).toContain('◐ Thought: Plan')
+    } finally {
+      probe.destroy()
+    }
+  })
+})
+
+describe('long reasoning stream — bounded live render (upstream 64882bc6 port)', () => {
+  test('a >24k accumulated stream keeps the head title in the header while the store keeps the full text', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({ type: 'message.start' })
+    store.apply({ payload: { text: '**Deep Plan**\n\n' }, type: 'reasoning.delta' })
+    const chunk = 'weighing the options over and over again to pick a path\n'
+    for (let i = 0; i < 500; i++) store.apply({ payload: { text: chunk }, type: 'reasoning.delta' })
+    store.apply({ payload: { text: 'UNIQUE-TAIL-MARKER-7f3a' }, type: 'reasoning.delta' })
+    store.apply({ payload: { text: 'done' }, type: 'message.delta' })
+    store.apply({ type: 'message.complete' })
+
+    // Store contract intact: the full accumulated text lives in the ordered
+    // parts — the tail bound is a VIEW-side window, never a store truncation.
+    const parts = store.state.messages.at(-1)?.parts ?? []
+    const reasoning = parts.find(p => p.type === 'reasoning')
+    expect(reasoning?.text.length).toBeGreaterThan(REASONING_TAIL_BOUND)
+    expect(reasoning?.text.startsWith('**Deep Plan**')).toBe(true)
+    expect(reasoning?.text.endsWith('UNIQUE-TAIL-MARKER-7f3a')).toBe(true)
+
+    // The title lives at the HEAD of the string — outside the tail window — so
+    // this frame assertion regresses if the bound ever slices it away. Collapse
+    // the section so the one header row is on-screen (an expanded 24k body
+    // scrolls the header out of a 30-row viewport; the markdown body itself
+    // never paints headlessly — see displayModes.test.tsx).
+    store.setDetailSection('thinking', 'collapsed')
+    const probe = await mountApp(store)
+    try {
+      const frame = await probe.waitForFrame(f => f.includes('Thought: Deep Plan'))
+      expect(frame).toContain('◐ Thought: Deep Plan')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('a short titled stream renders the header unchanged (short path untouched)', async () => {
+    const store = createSessionStore()
+    seedReasoningTurn(store)
+    const probe = await mountApp(store)
+    try {
+      const frame = await probe.waitForFrame(f => f.includes('Thought: Plan'))
+      expect(frame).toContain('Thought: Plan')
     } finally {
       probe.destroy()
     }

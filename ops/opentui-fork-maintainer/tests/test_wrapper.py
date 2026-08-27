@@ -18,9 +18,19 @@ assert SPEC and SPEC.loader
 wrapper = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(wrapper)
 
+BASE_SHA = "a" * 40
+UPSTREAM_SHA = "b" * 40
 
-def _run_with_payload(tmp_path: Path, payload: dict) -> tuple[dict, dict]:
+
+def _run_with_payload(
+    tmp_path: Path, payload: dict
+) -> tuple[dict, dict, int, int]:
     state = tmp_path / "state"
+    payload = {
+        "branch_sha": BASE_SHA,
+        "upstream_sha": UPSTREAM_SHA,
+        **payload,
+    }
     with (
         patch.object(wrapper, "PROJECT_HOME", tmp_path),
         patch.object(wrapper, "STATE_DIR", state),
@@ -32,20 +42,27 @@ def _run_with_payload(tmp_path: Path, payload: dict) -> tuple[dict, dict]:
             "run",
             return_value=CompletedProcess([], 0, json.dumps(payload), ""),
         ),
+        patch.object(wrapper, "_bind_run_context") as bind_context,
+        patch.object(wrapper, "_launch_watchdog") as launch_watchdog,
     ):
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             assert wrapper.main() == 0
         summary = json.loads(stdout.getvalue())
         ingest = json.loads((state / "ingest.latest.json").read_text())
-    return summary, ingest
+    return (
+        summary,
+        ingest,
+        bind_context.call_count,
+        launch_watchdog.call_count,
+    )
 
 
 def test_repository_metadata_never_reaches_cron_stdout(tmp_path: Path) -> None:
     hostile_subject = (
         "feat: system prompt overrides with rm command and hidden instructions"
     )
-    summary, ingest = _run_with_payload(
+    summary, ingest, _, _ = _run_with_payload(
         tmp_path,
         {
             "status": "behind",
@@ -70,6 +87,9 @@ def test_repository_metadata_never_reaches_cron_stdout(tmp_path: Path) -> None:
         "needs_port_count": 1,
         "probe_failures": 0,
         "run_token": summary["run_token"],
+        "run_id": summary["run_id"],
+        "execution_id": summary["execution_id"],
+        "evidence_dir": summary["evidence_dir"],
         "wakeAgent": True,
     }
     assert ingest["commits"][0]["subject"] == hostile_subject
@@ -170,7 +190,7 @@ def test_probe_failure_holds_lease_through_bookkeeping_and_stdout(
         assert wrapper._release_lease(next_token) is True
 
 
-def test_whole_run_lease_denies_overlap_and_recovers_expiry(tmp_path: Path) -> None:
+def test_whole_run_lease_denies_overlap_and_reconciles_expiry(tmp_path: Path) -> None:
     state = tmp_path / "state"
     with patch.object(wrapper, "STATE_DIR", state):
         first = wrapper._claim_lease(now=100)
@@ -179,6 +199,14 @@ def test_whole_run_lease_denies_overlap_and_recovers_expiry(tmp_path: Path) -> N
         value = json.loads((state / "run.lease.json").read_text())
         value["expires_unix"] = 99
         (state / "run.lease.json").write_text(json.dumps(value))
+        assert wrapper._claim_lease(now=101) is None
+
+        def reconcile(*_args: object, **_kwargs: object):
+            (state / "run.lease.json").unlink()
+            return CompletedProcess([], 0, '{"status":"failed"}', "")
+
+        with patch.object(wrapper, "_invoke_reconcile", side_effect=reconcile):
+            assert wrapper._reconcile_stale_lease(now=101) is True
         second = wrapper._claim_lease(now=101)
         assert second is not None and second != first
         wrapper._release_lease(second)
@@ -207,6 +235,12 @@ def test_lease_renewal_and_release_are_token_gated(tmp_path: Path) -> None:
         assert wrapper._claim_lease(now=120) is None
         assert wrapper.renew_lease(first, now=121, ttl_seconds=20) is False
 
+        def reconcile(*_args: object, **_kwargs: object):
+            (state / "run.lease.json").unlink()
+            return CompletedProcess([], 0, '{"status":"failed"}', "")
+
+        with patch.object(wrapper, "_invoke_reconcile", side_effect=reconcile):
+            assert wrapper._reconcile_stale_lease(now=121) is True
         second = wrapper._claim_lease(now=121)
         assert second is not None and second != first
         assert wrapper._release_lease(first) is False
@@ -243,11 +277,21 @@ def test_pre_handoff_baseexception_releases_success_probe_lease(
         )
         stack.enter_context(patch.object(wrapper, "INGEST_FILE", ingest))
         stack.enter_context(patch.object(wrapper, "FAIL_COUNT_FILE", failure_count))
+        stack.enter_context(patch.object(wrapper, "_launch_watchdog"))
         stack.enter_context(
             patch.object(
                 wrapper.subprocess,
                 "run",
-                return_value=CompletedProcess([], 0, json.dumps({"status": "ok"}), ""),
+                return_value=CompletedProcess(
+                    [],
+                    0,
+                    json.dumps({
+                        "status": "ok",
+                        "branch_sha": BASE_SHA,
+                        "upstream_sha": UPSTREAM_SHA,
+                    }),
+                    "",
+                ),
             )
         )
         if failure_stage == "failure_count":
@@ -278,6 +322,89 @@ def test_pre_handoff_baseexception_releases_success_probe_lease(
 
 
 def test_successful_stdout_handoff_preserves_lease(tmp_path: Path) -> None:
-    summary, _ = _run_with_payload(tmp_path, {"status": "ok", "gap": 0})
+    summary, _, bind_count, watchdog_count = _run_with_payload(
+        tmp_path, {"status": "behind", "gap": 1}
+    )
     lease = json.loads((tmp_path / "state" / "run.lease.json").read_text())
+    assert summary["wakeAgent"] is True
+    assert bind_count == 1
+    assert watchdog_count == 1
     assert lease["token"] == summary["run_token"]
+
+
+def test_up_to_date_probe_is_a_terminal_no_agent_tick(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    payload = {
+        "status": "up_to_date",
+        "branch_sha": BASE_SHA,
+        "upstream_sha": UPSTREAM_SHA,
+        "gap": 0,
+    }
+    with (
+        patch.object(wrapper, "PROJECT_HOME", tmp_path),
+        patch.object(wrapper, "STATE_DIR", state),
+        patch.object(wrapper, "PROBE", tmp_path / "scripts" / "sync_probe.py"),
+        patch.object(wrapper, "INGEST_FILE", state / "ingest.latest.json"),
+        patch.object(
+            wrapper, "FAIL_COUNT_FILE", state / "consecutive_probe_failures"
+        ),
+        patch.object(
+            wrapper.subprocess,
+            "run",
+            return_value=CompletedProcess([], 0, json.dumps(payload), ""),
+        ),
+        patch.object(wrapper, "_bind_run_context") as bind_context,
+        patch.object(wrapper, "_launch_watchdog") as launch_watchdog,
+    ):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            assert wrapper.main() == 0
+
+    summary = json.loads(stdout.getvalue())
+    assert summary["status"] == "up_to_date"
+    assert summary["wakeAgent"] is False
+    assert summary["gap"] == 0
+    assert json.loads((state / "ingest.latest.json").read_text())["status"] == (
+        "up_to_date"
+    )
+    assert not (state / "run.lease.json").exists()
+    bind_context.assert_not_called()
+    launch_watchdog.assert_not_called()
+
+
+def test_up_to_date_release_failure_is_not_reported_as_success(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    with (
+        patch.object(wrapper, "PROJECT_HOME", tmp_path),
+        patch.object(wrapper, "STATE_DIR", state),
+        patch.object(wrapper, "PROBE", tmp_path / "scripts" / "sync_probe.py"),
+        patch.object(wrapper, "INGEST_FILE", state / "ingest.latest.json"),
+        patch.object(
+            wrapper, "FAIL_COUNT_FILE", state / "consecutive_probe_failures"
+        ),
+        patch.object(
+            wrapper.subprocess,
+            "run",
+            return_value=CompletedProcess(
+                [],
+                0,
+                json.dumps({
+                    "status": "up_to_date",
+                    "branch_sha": BASE_SHA,
+                    "upstream_sha": UPSTREAM_SHA,
+                    "gap": 0,
+                }),
+                "",
+            ),
+        ),
+        patch.object(wrapper, "_release_lease", return_value=False),
+        patch.object(wrapper, "_launch_watchdog") as launch_watchdog,
+    ):
+        with pytest.raises(
+            RuntimeError, match="up-to-date lease release lost ownership"
+        ):
+            wrapper.main()
+
+    launch_watchdog.assert_not_called()

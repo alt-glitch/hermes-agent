@@ -303,7 +303,9 @@ def test_apply_uses_supported_cron_api_after_deploy(
     (source / "prompts").mkdir(parents=True)
     (source / "scripts").mkdir()
     (source / "prompts/maintainer.md").write_text("policy\n")
-    (source / "scripts/opentui_fork_sync.py").write_text("#!/usr/bin/env python3\n")
+    (source / "scripts/opentui_fork_sync.py").write_text(
+        "#!/usr/bin/env python3\nprint('ok')\n"
+    )
     (source / "scripts/sync_probe.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/maintainer_runtime.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/worktree.sh").write_text("#!/usr/bin/env bash\n")
@@ -364,13 +366,6 @@ def test_apply_uses_supported_cron_api_after_deploy(
     from cron import scheduler
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: hermes_home)
-    monkeypatch.setattr(
-        scheduler.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args=args[0], returncode=0, stdout="ok\n", stderr=""
-        ),
-    )
     accepted, output = scheduler._run_job_script(calls[1]["script"])
     assert accepted is True
     assert output == "ok"

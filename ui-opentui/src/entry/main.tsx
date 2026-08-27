@@ -44,13 +44,18 @@ import { decodeSubagentInterruptResponse } from '../boundary/schema/Delegation.t
 import { decodeImageAttachResponse, decodeSetupStatusResponse } from '../boundary/schema/ExternalInputResponses.ts'
 import { decodeVoiceRecordResponse } from '../boundary/schema/VoiceResponses.ts'
 import { decodePetGalleryResponse, decodePetSelectResponse } from '../boundary/schema/PetResponses.ts'
-import { decodePluginsListResponse, decodePluginsToggleResponse } from '../boundary/schema/PluginResponses.ts'
+import {
+  decodePluginsListResponse,
+  decodePluginsToggleResponse,
+  type PluginRow
+} from '../boundary/schema/PluginResponses.ts'
 import {
   classifySessionSteerResponse,
   decodeCommandsCatalogResponse,
   decodeConfigFullResponse,
   decodeConfigMtimeResponse,
   decodeConfigValueResponse,
+  decodePromptSubmitAck,
   type SessionSteerDisposition
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
@@ -61,8 +66,10 @@ import {
   replaceSession,
   resumeSession
 } from '../boundary/sessionLifecycle.ts'
-import { configSyncBlocked, createConfigSyncTracker, mcpReloadSucceeded } from '../logic/configSync.ts'
-import { compactFromConfig, detailsFromConfig } from '../logic/details.ts'
+import { configSyncBlocked, createConfigSyncTracker } from '../logic/configSync.ts'
+import { batteryEnabledFromConfig, createBatteryPoller } from '../logic/battery.ts'
+import { destructiveSlashConfirmFromConfig, skipDestructiveConfirm } from '../logic/approval.ts'
+import { compactFromConfig, detailsFromConfig, focusViewFromConfig, timestampsFromConfig } from '../logic/details.ts'
 import {
   createDelegationStatusRefresher,
   createSpawnTreeSaveDrainer,
@@ -76,18 +83,25 @@ import {
   envFlag,
   heapdumpOnStart,
   launchCwd,
-  noConfirmDestructive,
   resolveMouseEnabled,
   startupImage,
   startupPrompt,
   STARTUP_IMAGE_DEFAULT_PROMPT
 } from '../logic/env.ts'
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
-import { actionExitBlocked, DASHBOARD_NEW_SESSION_MESSAGE, isExitHotkey, isRedrawHotkey } from '../logic/hotkeys.ts'
+import {
+  actionExitBlocked,
+  ctrlCAction,
+  DASHBOARD_NEW_SESSION_MESSAGE,
+  isExitHotkey,
+  isRedrawHotkey
+} from '../logic/hotkeys.ts'
 import { isVoiceRecordKey, voiceRecordKeyFromConfig } from '../logic/voiceKey.ts'
+import { deliverVoiceTranscript, voiceSubmitModeFromConfig } from '../logic/voiceSubmit.ts'
 import { parseProcessList } from '../logic/backgroundActivity.ts'
 import { eventMayEnterStore } from '../logic/eventScope.ts'
 import { createPasteStore } from '../logic/pastes.ts'
+import { pluginToggleParams } from '../logic/pluginsHub.ts'
 import {
   heldTransitionBlocks,
   planTransitionDrain,
@@ -111,6 +125,7 @@ import {
   clientCommandNames,
   createCompletionGate,
   dispatchSlash,
+  isModelPickerKey,
   mapCompletions,
   mapModelOptions,
   modelOptionsParams,
@@ -119,6 +134,7 @@ import {
   startModelPrefetch,
   type SlashContext
 } from '../logic/slash.ts'
+import { handleWakeDetected, isWakeUserDisabled, type WakeDetectedPayload } from '../logic/wake.ts'
 import {
   busyInputModeFromConfig,
   BUSY_QUEUE_MAX_CHARS,
@@ -127,7 +143,9 @@ import {
 } from '../logic/busyQueue.ts'
 import { coordinatePromptLiveSession } from '../logic/promptLiveSession.ts'
 import {
+  acceptedSteerNotice,
   advancePreStartCancellationFence,
+  classifyBusyPromptSubmitResponse,
   createAutomaticQueueDrainGate,
   createPreAdmissionRetryTimer,
   createQueueEditDrainGate,
@@ -141,6 +159,7 @@ import {
   steerSlotAvailable,
   submitWhileBusy,
   takeSettledSteerPrefix,
+  type InterruptCorrectionDelivery,
   type SteerDelivery
 } from '../logic/busySubmit.ts'
 import {
@@ -153,6 +172,10 @@ import {
 import { App } from '../view/App.tsx'
 import { refreshLearnedNames, seedLearnedNames } from '../view/composer.tsx'
 import { TerminalChrome } from '../view/terminalChrome.tsx'
+import { mergeWidgetCompletionItems } from '../widgets/completion.ts'
+import { registerWidgetNotifier } from '../widgets/host.ts'
+import { listWidgetApps } from '../widgets/registry.ts'
+import { loadUserWidgets, onUserWidgets, watchUserWidgets } from '../widgets/userWidgets.ts'
 
 // Syntax-highlighting language expansion: register the remote tree-sitter
 // grammars (python/rust/go/bash/json/c/html/css/yaml/toml) before the first
@@ -191,6 +214,7 @@ const PENDING_STEER_MAX_CHARS = 4 * 1024 * 1024
 
 interface PendingPrompt {
   readonly clientMessageId: string
+  readonly queued: boolean
   readonly retryDeadlineAt: number
   retryNoticeShown: boolean
   readonly submissionId: string
@@ -198,9 +222,17 @@ interface PendingPrompt {
   readonly text: string
 }
 
+interface PendingCorrection {
+  admission?: 'queued' | 'redirected'
+  readonly clientMessageId: string
+  readonly front: boolean
+  readonly submissionId: string
+  readonly sessionId: string
+  readonly text: string
+}
+
 interface PendingSteerRequest {
   readonly front: boolean
-  readonly onAccepted: ((clientSubmissionId: string) => void) | undefined
   outcome?: SessionSteerDisposition
   readonly resolve: (delivery: SteerDelivery) => void
   readonly submissionId: string
@@ -332,7 +364,10 @@ const postSessionSetup = (
     const isActive = () => gateway.sessionId() === sid && store.state.sessionId === sid
     const busyModeRevision = store.getBusyInputModeRevision()
     const compactRevision = store.getCompactRevision()
+    const focusViewRevision = store.getFocusViewRevision()
     const detailsRevision = store.getDetailsRevision()
+    const batteryRevision = store.getBatteryRevision()
+    const timestampsRevision = store.getTimestampsRevision()
 
     // Claim model hydration for this SID before the first async yield. Session
     // transitions clear the previous claim, so an immediate `/model` can only
@@ -391,10 +426,17 @@ const postSessionSetup = (
     if (isActive() && decodedBusyConfig) {
       store.hydrateBusyInputMode(busyInputModeFromConfig(decodedBusyConfig.config), busyModeRevision)
       store.hydrateCompact(compactFromConfig(decodedBusyConfig.config), compactRevision)
+      store.hydrateFocusView(focusViewFromConfig(decodedBusyConfig.config), focusViewRevision)
       const details = detailsFromConfig(decodedBusyConfig.config)
       store.hydrateDetails(details.mode, details.sections, detailsRevision)
+      store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedBusyConfig.config), batteryRevision)
+      store.hydrateTimestamps(timestampsFromConfig(decodedBusyConfig.config), timestampsRevision)
+      store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedBusyConfig.config))
       store.configureAgentsNudge(tuiAgentsNudgeConfigValue(decodedBusyConfig.config))
-      store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedBusyConfig.config) })
+      store.setVoiceMode({
+        recordKey: voiceRecordKeyFromConfig(decodedBusyConfig.config),
+        submitMode: voiceSubmitModeFromConfig(decodedBusyConfig.config)
+      })
     }
 
     // A session switch may have completed while either best-effort catalog RPC
@@ -543,6 +585,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // `recoverSid === undefined`, so the normal bootstrap path is untouched.
       const gateway = yield* GatewayService
 
+      const batteryPoller = createBatteryPoller({
+        apply: reading => store.setBatteryStatus(reading),
+        request: () => Effect.runPromise(gateway.request('system.battery', {}))
+      })
+      store.registerBatteryEnabledHandler(enabled => batteryPoller.setEnabled(enabled))
+      yield* Effect.addFinalizer(() => Effect.sync(() => batteryPoller.dispose()))
+
       let sessionTransitionInFlight = false
       let gatewayUnavailable = false
       let historyMutationInFlight = false
@@ -554,10 +603,12 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const isTurnBusy = () => store.state.info.running === true || store.isTurnInFlight()
       const configSync = createConfigSyncTracker()
       let drainQueuedIfIdle = () => {}
-      let sendPromptNow: (text: string, skillCommand?: string) => boolean = () => false
+      let sendPromptNow: (text: string, skillCommand?: string, queued?: boolean) => boolean = () => false
       let promoteHeldTransitionSubmissions = () => {}
       let promoteHeldAfterRecovery = false
       let pendingPrompt: PendingPrompt | undefined
+      let pendingCorrection: PendingCorrection | undefined
+      const hasPendingDelivery = () => pendingPrompt !== undefined || pendingCorrection !== undefined
       const pendingPromptRetry = createPreAdmissionRetryTimer()
       const cancelPendingPromptRetry = pendingPromptRetry.cancel
       // A deferred-build interrupt can receive its ACK before the Python build
@@ -623,6 +674,25 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         return true
       }
 
+      /** Retain one interrupt-mode correction without touching the primary
+       * prompt's independently correlated recovery copy. */
+      const retainPendingCorrectionForRetry = (current: PendingCorrection, notice: string): boolean => {
+        if (pendingCorrection !== current) return false
+        pendingCorrection = undefined
+        if (!store.enqueuePrompt(current.text, current.front)) {
+          pendingCorrection = current
+          getLog().error('submit', 'reserved correction queue insertion failed')
+          store.pushSystem(
+            'correction delivery uncertain — input is retained internally; clear queue capacity to retry'
+          )
+          return false
+        }
+        store.removeClientMessage(current.clientMessageId)
+        automaticQueueDrain.halt()
+        if (notice) store.pushSystem(notice)
+        return true
+      }
+
       const spawnTreeSaveDrainer = createSpawnTreeSaveDrainer({
         next: () => store.nextSpawnTreeSaveIntent(),
         settle: id => store.settleSpawnTreeSaveIntent(id),
@@ -676,39 +746,75 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // delayed until SID filtering accepts it; stale-session events never open
       // a browser or leak their code into the successor transcript.
       let submitVoiceTranscript: (text: string) => void = () => {}
+      // Late-bound: wake.detected needs startNewSession/slash wiring declared
+      // further down; events can arrive as soon as the subscription opens, so
+      // the handler indirects through this assignable seam (the same pattern
+      // as submitVoiceTranscript above).
+      let onWakeDetected: (payload: WakeDetectedPayload) => void = () => {}
       store.registerCommittedEventHandler(event => {
         if (event.type === 'billing.step_up.verification') {
           presentBillingVerification(event.payload, { pushSystem: text => store.pushSystem(text) })
-        } else if (event.type === 'voice.transcript' && !event.payload?.no_speech_limit) {
-          const text = event.payload?.text?.trim()
-          if (text) {
-            store.clearComposerDraft()
-            queueMicrotask(() => submitVoiceTranscript(text))
+        } else if (event.type === 'voice.transcript') {
+          // Stop-phrase/no-speech guards and the voice.submit_mode decision
+          // (direct: clear + defer one submit; draft: edit the composer only)
+          // live in logic/voiceSubmit.ts.
+          deliverVoiceTranscript(store, event.payload, text => submitVoiceTranscript(text))
+        } else if (event.type === 'wake.detected') {
+          onWakeDetected(event.payload ?? {})
+        }
+
+        if (event.type === 'message.start' || event.type === 'message.complete') {
+          if (pendingPrompt && pendingPromptBoundaryMatches(pendingPrompt.submissionId, event.type, event.payload)) {
+            if (event.type === 'message.start') store.clearPendingImages()
+            pendingPrompt = pendingPromptAfterBoundary(pendingPrompt, event.type)
           }
-        } else if (
-          pendingPrompt &&
-          (event.type === 'message.start' || event.type === 'message.complete') &&
-          pendingPromptBoundaryMatches(pendingPrompt.submissionId, event.type, event.payload)
-        ) {
-          if (event.type === 'message.start') store.clearPendingImages()
-          pendingPrompt = pendingPromptAfterBoundary(pendingPrompt, event.type)
-        } else if (
-          event.type === 'error' &&
-          pendingPrompt &&
-          pendingPromptBoundaryMatches(pendingPrompt.submissionId, event.type, event.payload)
-        ) {
-          if (pendingPromptDecision(event.type) === 'retain') {
+          if (
+            pendingCorrection &&
+            pendingPromptBoundaryMatches(pendingCorrection.submissionId, event.type, event.payload)
+          ) {
+            pendingCorrection = pendingPromptAfterBoundary(pendingCorrection, event.type)
+          }
+        } else if (event.type === 'error') {
+          // Restore in reverse insertion order so two correlated build-window
+          // failures remain [primary, correction] after front insertion.
+          const failedCorrection = pendingCorrection
+          if (
+            failedCorrection &&
+            pendingPromptBoundaryMatches(failedCorrection.submissionId, event.type, event.payload) &&
+            pendingPromptDecision(event.type) === 'retain'
+          ) {
+            retainPendingCorrectionForRetry(
+              failedCorrection,
+              'correction failed before it settled — message retained; send it explicitly to retry'
+            )
+          }
+          const failedPrompt = pendingPrompt
+          if (
+            failedPrompt &&
+            pendingPromptBoundaryMatches(failedPrompt.submissionId, event.type, event.payload) &&
+            pendingPromptDecision(event.type) === 'retain'
+          ) {
             retainPendingPromptForRetry(
-              pendingPrompt,
+              failedPrompt,
               'prompt failed before it started — message retained; send it explicitly to retry'
             )
           }
-        } else if (event.type === 'gateway.exited' && pendingPrompt) {
-          if (pendingPromptDecision(event.type) === 'retain') {
-            retainPendingPromptForRetry(
-              pendingPrompt,
-              'prompt delivery uncertain after gateway exit — message retained; send it explicitly to retry'
+        } else if (event.type === 'gateway.exited') {
+          const exitedCorrection = pendingCorrection
+          if (exitedCorrection && pendingPromptDecision(event.type) === 'retain') {
+            retainPendingCorrectionForRetry(
+              exitedCorrection,
+              'correction delivery uncertain after gateway exit — message retained; send it explicitly to retry'
             )
+          }
+          const exitedPrompt = pendingPrompt
+          if (pendingPromptDecision(event.type) === 'retain') {
+            if (exitedPrompt) {
+              retainPendingPromptForRetry(
+                exitedPrompt,
+                'prompt delivery uncertain after gateway exit — message retained; send it explicitly to retry'
+              )
+            }
           }
         }
 
@@ -721,6 +827,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         } else if (event.type === 'gateway.ready') {
           void delegationStatusRefresher.refresh(true)
           if (gateway.sessionId()) void activeSessionsRefresher.refresh(true)
+          // Arm "Hey Hermes" if this surface owns it (the server gates on
+          // config — upstream 86d5b8b90f). Fire-and-forget + idempotent
+          // server-side, so recovery reconnects are harmless. Skipped when the
+          // user explicitly ran `/wake off` this process — an explicit opt-out
+          // must survive gateway reconnects (logic/wake.ts).
+          if (!isWakeUserDisabled()) {
+            void Effect.runPromise(gateway.request('wake.start', { surface: 'tui' })).catch(() => undefined)
+          }
         }
         void spawnTreeSaveDrainer.drain()
       })
@@ -782,7 +896,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem(`wait for the history update before trying to ${what}`)
           return true
         }
-        if (pendingPrompt) {
+        if (hasPendingDelivery()) {
           store.pushSystem(`wait for the pending prompt request before trying to ${what}`)
           return true
         }
@@ -972,21 +1086,34 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                 .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
               const decodedMtime = decodeConfigMtimeResponse(rawMtime)
               const nextMtime = decodedMtime?.mtime ?? 0
+              const nextMcpRev = decodedMtime?.mcp_rev ?? ''
               // `isTurnBusy` includes the server-confirmed-idle settle latch,
               // not just the optimistic spinner flag. A changed mtime remains
               // pending until an idle poll can safely request the global MCP
               // mutation; a server-side 4009 closes the final admission race.
-              const plan = configSync.plan(nextMtime, configSyncBlocked(isTurnBusy(), isSessionTransitioning()))
+              const plan = configSync.plan(
+                nextMtime,
+                nextMcpRev,
+                configSyncBlocked(isTurnBusy(), isSessionTransitioning())
+              )
               if (!plan) return
               const busyModeRevision = store.getBusyInputModeRevision()
               const compactRevision = store.getCompactRevision()
+              const focusViewRevision = store.getFocusViewRevision()
               const detailsRevision = store.getDetailsRevision()
+              const batteryRevision = store.getBatteryRevision()
+              const timestampsRevision = store.getTimestampsRevision()
 
               if (plan.reload) {
                 const reload = yield* gateway
-                  .request<unknown>('reload.mcp', { confirm: true, session_id: sid })
+                  .request<unknown>('reload.mcp', {
+                    confirm: true,
+                    session_id: sid,
+                    ...(plan.mcpRev ? { rev: plan.mcpRev } : {})
+                  })
                   .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-                if (!configSync.completeReload(plan, mcpReloadSucceeded(reload))) return
+                if (!configSync.completeReload(plan, reload)) return
+                store.pushSystem('MCP reloaded after config change')
               }
 
               const rawConfig = yield* gateway
@@ -998,12 +1125,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
               store.hydrateBusyInputMode(busyInputModeFromConfig(decodedConfig.config), busyModeRevision)
               store.hydrateCompact(compactFromConfig(decodedConfig.config), compactRevision)
+              store.hydrateFocusView(focusViewFromConfig(decodedConfig.config), focusViewRevision)
               const details = detailsFromConfig(decodedConfig.config)
               store.hydrateDetails(details.mode, details.sections, detailsRevision)
-              store.setVoiceMode({ recordKey: voiceRecordKeyFromConfig(decodedConfig.config) })
-              if (configSync.completeHydration(plan, true) && plan.kind === 'change') {
-                store.pushSystem('MCP reloaded after config change')
-              }
+              store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedConfig.config), batteryRevision)
+              store.hydrateTimestamps(timestampsFromConfig(decodedConfig.config), timestampsRevision)
+              store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedConfig.config))
+              store.setVoiceMode({
+                recordKey: voiceRecordKeyFromConfig(decodedConfig.config),
+                submitMode: voiceSubmitModeFromConfig(decodedConfig.config)
+              })
+              configSync.completeHydration(plan, true)
             })
           )
         })
@@ -1038,6 +1170,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         cancelPendingPromptRetry()
         const interruptedBeforeStart = !store.isTurnInFlight()
         const interruptedPrompt = pendingPrompt
+        const interruptedCorrection = pendingCorrection
         Effect.runFork(
           gateway.request('session.interrupt', { session_id: sid }).pipe(
             Effect.tap(() =>
@@ -1073,6 +1206,26 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                     )
                   }
                 }
+                if (
+                  pendingCorrection === interruptedCorrection &&
+                  interruptedCorrection?.sessionId === sid &&
+                  gateway.sessionId() === sid
+                ) {
+                  if (interruptedCorrection.admission === 'redirected') {
+                    // The correction already entered the active turn; the hard
+                    // stop is its explicit cancellation boundary. Keep the
+                    // visible user bubble, matching the durable checkpoint.
+                    pendingCorrection = undefined
+                  } else {
+                    // queued (build window) and not-yet-ACKed corrections are
+                    // cleared server-side by session.interrupt. Restore the
+                    // sole local copy for an explicit retry.
+                    retainPendingCorrectionForRetry(
+                      interruptedCorrection,
+                      'queued correction cancelled with the interrupted turn — message retained; send it explicitly to retry'
+                    )
+                  }
+                }
               })
             ),
             Effect.catchCause(cause =>
@@ -1085,6 +1238,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   retainPendingPromptForRetry(
                     interruptedPrompt,
                     'prompt cancellation uncertain — message retained; verify the turn state before retrying'
+                  )
+                }
+                if (
+                  pendingCorrection === interruptedCorrection &&
+                  interruptedCorrection?.sessionId === sid &&
+                  gateway.sessionId() === sid
+                ) {
+                  retainPendingCorrectionForRetry(
+                    interruptedCorrection,
+                    'correction cancellation uncertain — message retained; verify the turn state before retrying'
                   )
                 }
                 getLog().warn('interrupt', 'failed', { cause: String(cause) })
@@ -1122,21 +1285,20 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
       const onCtrlC = () => {
-        // Busy Ctrl+C ONLY interrupts (Ink parity). It must not leave a sticky
-        // hosted hint that masks subsequent status lines.
-        if (isTurnBusy()) {
-          interruptTurn()
-          if (!hostedDashboard) armQuit('⏹ stopped — Ctrl+C again to quit')
-          return
-        }
-        // An idle non-empty composer clears before any exit gesture, matching
-        // Ink's input-first Ctrl+C precedence.
-        if (store.state.composerDraft) {
+        const action = ctrlCAction(isTurnBusy(), Boolean(store.state.composerDraft))
+        if (action === 'clear-draft') {
           // This is an explicit abandon, not a session clear→restore. Release
           // every large-paste body before clearing the visible token/draft.
           pasteStore.clear()
           store.clearComposerDraft()
           disarmQuit()
+          return
+        }
+        // With no draft, busy Ctrl+C interrupts. It must not leave a sticky
+        // hosted hint that masks subsequent status lines.
+        if (action === 'interrupt') {
+          interruptTurn()
+          if (!hostedDashboard) armQuit('⏹ stopped — Ctrl+C again to quit')
           return
         }
         // Dashboard PTYs cannot be destroyed and restarted in-page. Publish the
@@ -1178,7 +1340,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // into the composer as an inline, removable token.
       const onImagePaste = async (hotkey = false): Promise<string | undefined> => {
         if (imageAttachInFlight) return undefined
-        if (pendingPrompt) {
+        if (hasPendingDelivery()) {
           if (hotkey) {
             const text = await readClipboardText()
             if (text) return text
@@ -1285,6 +1447,28 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // diagnostic dump. No auto heap-snapshot (memlog is the diagnosis path).
       const stopMemoryMonitor = startMemoryMonitor(line => store.pushSystem(line))
       yield* Effect.addFinalizer(() => Effect.sync(stopMemoryMonitor))
+      // User widget apps ($HERMES_HOME/tui-widgets): initial scan is silent
+      // (boot inventory, like Ink), then hot-loads announce themselves in the
+      // transcript — a silently-registered widget is indistinguishable from a
+      // failed one. Watcher + announce subscription release with the scope.
+      registerWidgetNotifier(text => store.pushSystem(text))
+      const stopWidgetWatch = watchUserWidgets()
+      yield* Effect.addFinalizer(() => Effect.sync(stopWidgetWatch))
+      let unsubscribeWidgets: () => void = () => {}
+      void loadUserWidgets()
+        .then(() => {
+          seedLearnedNames(listWidgetApps().map(app => ({ text: `/${app.id}` })))
+          unsubscribeWidgets = onUserWidgets(({ added, errors, removed }) => {
+            for (const id of added) {
+              store.pushSystem(`widget /${id} is live — type /${id} to open`)
+              seedLearnedNames([{ text: `/${id}` }])
+            }
+            for (const id of removed) store.pushSystem(`widget /${id} removed (file deleted)`)
+            for (const err of errors) store.pushSystem(`widget ${err.file} failed to load: ${err.message}`)
+          })
+        })
+        .catch(() => {})
+      yield* Effect.addFinalizer(() => Effect.sync(() => unsubscribeWidgets()))
       // HERMES_HEAPDUMP_ON_START (Ink parity): a deliberate baseline snapshot at
       // boot. Bypasses the diagnostics master switch (you set it on purpose).
       // Best-effort + synchronous (writeHeapSnapshot blocks V8) — a failure must
@@ -1306,6 +1490,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // interpret them. Redraw invalidates buffers without resetting the input
       // parser; action+D shares Ink's local-exit / hosted-new-chat contract.
       let toggleVoiceRecording: () => void = () => {}
+      let openModelPicker: () => void = () => {}
       const onGlobalAction = (key: KeyEvent) => {
         if (
           isVoiceRecordKey(key, store.state.voice.recordKey) &&
@@ -1316,6 +1501,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         ) {
           key.preventDefault()
           toggleVoiceRecording()
+          return
+        }
+        // Ctrl+O opens the model picker without disturbing a typed draft
+        // (upstream f27d45e288): the same overlay `/model` opens, but reachable
+        // without clearing what you've typed to run the command. Consumed here
+        // (pre-composer, like the voice record key) so the textarea never sees
+        // the byte; the composer draft is untouched. Works mid-stream — the
+        // gateway queues a busy-session pick and applies it next turn.
+        if (isModelPickerKey(key) && !actionExitBlocked(store.state)) {
+          key.preventDefault()
+          openModelPicker()
           return
         }
         if (isRedrawHotkey(key)) {
@@ -1340,8 +1536,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // close (and confirm) layers against it through useCloseLayer/useBindings.
       const keymap = createDefaultOpenTuiKeymap(renderer)
 
-      const nonTransitionReservedQueueItems = () => pendingSteerCount + (pendingPrompt ? 1 : 0)
-      const nonTransitionReservedQueueChars = () => pendingSteerCharacters + (pendingPrompt?.text.length ?? 0)
+      const nonTransitionReservedQueueItems = () =>
+        pendingSteerCount + (pendingPrompt ? 1 : 0) + (pendingCorrection ? 1 : 0)
+      const nonTransitionReservedQueueChars = () =>
+        pendingSteerCharacters + (pendingPrompt?.text.length ?? 0) + (pendingCorrection?.text.length ?? 0)
       const heldQueueReservation = () =>
         promoteHeldAfterRecovery ? transitionQueueReservation(transitionSubmissions) : { chars: 0, count: 0 }
       const reservedQueueItems = () => nonTransitionReservedQueueItems() + heldQueueReservation().count
@@ -1367,17 +1565,91 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         return false
       }
 
+      const canRedirectCorrection = (text: string, _front = false): boolean =>
+        pendingCorrection === undefined &&
+        store.state.pendingImages.length === 0 &&
+        text.length <= BUSY_QUEUE_MAX_CHARS &&
+        queueAccepts(store.state.queuedPrompts, text, undefined, reservedQueueItems(), reservedQueueChars())
+
+      /** Interrupt-mode text corrections use prompt.submit so the gateway can
+       * atomically redirect a capable active agent or queue the build-window
+       * race. The optimistic user row remains paired with exactly one local
+       * recovery copy until a lifecycle event names this submission id. */
+      const issueInterruptCorrection = (
+        sessionId: string,
+        text: string,
+        front = false
+      ): Promise<InterruptCorrectionDelivery> => {
+        if (!canRedirectCorrection(text, front)) throw new Error('correction reservation unavailable')
+        const current: PendingCorrection = {
+          clientMessageId: store.pushUser(text),
+          front,
+          submissionId: randomUUID(),
+          sessionId,
+          text
+        }
+        pendingCorrection = current
+
+        const fallback = (): InterruptCorrectionDelivery => {
+          // A correlated lifecycle event can settle before this continuation
+          // runs. That is stronger admission proof than the RPC result.
+          if (pendingCorrection !== current) return 'redirected'
+          pendingCorrection = undefined
+          if (!enqueueClientPrompt(current.text, current.front)) {
+            pendingCorrection = current
+            return 'retained'
+          }
+          store.removeClientMessage(current.clientMessageId)
+          interruptTurn()
+          return 'fallback'
+        }
+
+        const retain = (): InterruptCorrectionDelivery => {
+          if (pendingCorrection !== current) return 'redirected'
+          return retainPendingCorrectionForRetry(current, '') ? 'uncertain' : 'retained'
+        }
+
+        const consume = (): InterruptCorrectionDelivery => {
+          // The gateway consumed a typed bare voice stop phrase server-side
+          // (upstream ba13132298): the voice chat ended and NO turn starts, so
+          // no message.start/complete/error will ever correlate. This is NOT a
+          // rejection — retire the optimistic user row and the one recovery
+          // slot WITHOUT queuing the phrase or interrupting the live turn. The
+          // voice.transcript {stop_phrase} event owns the mode flags + notice.
+          if (pendingCorrection === current) pendingCorrection = undefined
+          store.removeClientMessage(current.clientMessageId)
+          return 'consumed'
+        }
+
+        return Effect.runPromise(
+          gateway
+            .request<unknown>('prompt.submit', {
+              client_submission_id: current.submissionId,
+              session_id: current.sessionId,
+              text: current.text
+            })
+            .pipe(
+              Effect.map(response => {
+                const disposition = classifyBusyPromptSubmitResponse(response)
+                if (disposition === 'voice-stopped') return consume()
+                if (disposition === 'rejected') return fallback()
+                current.admission = disposition
+                return disposition
+              }),
+              Effect.catchTag('GatewayError', error =>
+                Effect.sync(() => (deliveryFailureIsUncertain(error) ? retain() : fallback()))
+              ),
+              Effect.catchCause(() => Effect.sync(retain))
+            )
+        )
+      }
+
       /** Best-effort steer admission. Pending text reserves bounded fallback
        * capacity only until the RPC settles; no id, ledger, or post-crash proof
        * is invented. Definite rejection joins the normal queue. Ambiguous
        * transport delivery also joins it, but closes automatic draining until
        * the user explicitly chooses to retry. */
-      const issueSteer = (
-        sessionId: string,
-        text: string,
-        front = false,
-        onAccepted?: (clientSubmissionId: string) => void
-      ): Promise<SteerDelivery> => {
+      const issueSteer = (sessionId: string, text: string, front = false): Promise<SteerDelivery> => {
         if (!canSteer(text, front)) throw new Error('steer reservation unavailable')
         pendingSteerCount += 1
         pendingSteerCharacters += text.length
@@ -1411,7 +1683,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           for (const request of settled) {
             const delivery = request.outcome === 'accepted' ? 'accepted' : (deliveries.get(request) ?? 'retained')
             if (delivery === 'fallback') shouldDrain = true
-            if (delivery === 'accepted') request.onAccepted?.(request.submissionId)
+            if (delivery === 'accepted') {
+              store.pushPendingSteer(request.submissionId, acceptedSteerNotice(request.text))
+            }
             request.resolve(delivery)
           }
           if (shouldDrain && automaticQueueDrain.canDrain() && !isTurnBusy()) {
@@ -1421,7 +1695,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
         const submissionId = randomUUID()
         return new Promise<SteerDelivery>(resolve => {
-          pendingSteers.set(sequence, { front, onAccepted, resolve, submissionId, text })
+          pendingSteers.set(sequence, { front, resolve, submissionId, text })
           void Effect.runPromise(
             gateway
               .request<unknown>('session.steer', {
@@ -1470,12 +1744,29 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           gateway
             .request('prompt.submit', {
               client_submission_id: current.submissionId,
+              queued: current.queued,
               session_id: current.sessionId,
               text: current.text
             })
             .pipe(
-              Effect.tap(() =>
+              Effect.tap(response =>
                 Effect.sync(() => {
+                  // The gateway consumed a typed bare voice stop phrase
+                  // server-side (upstream ba13132298): the voice chat ended and
+                  // NO turn starts, so no message.start/complete/error will
+                  // ever correlate with this submission. Release the pending
+                  // body and the optimistic spinner here; the voice.transcript
+                  // {stop_phrase} event owns the mode flags + notice.
+                  if (decodePromptSubmitAck(response)?.voice_stopped) {
+                    if (pendingPrompt === current) pendingPrompt = undefined
+                    // A queued phrase drained into this submission carries an
+                    // optimistic user row; the stop is consumed, never a turn,
+                    // so retire the row rather than leaving a phantom prompt.
+                    store.removeClientMessage(current.clientMessageId)
+                    store.applyInfo({ running: false })
+                    queueMicrotask(drainQueuedIfIdle)
+                    return
+                  }
                   if (pendingPrompt === current) {
                     pendingPrompt = pendingPromptAfterBoundary(current, 'rpc-ack')
                   }
@@ -1518,7 +1809,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
-      sendPromptNow = (text: string, skillCommand?: string): boolean => {
+      sendPromptNow = (text: string, skillCommand?: string, queued = false): boolean => {
         if (imageDetachInFlight.size > 0) {
           store.pushSystem('wait for the image removal before sending')
           return false
@@ -1529,7 +1820,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('no active session — run /new to retry')
           return false
         }
-        if (pendingPrompt) {
+        if (hasPendingDelivery()) {
           store.pushSystem('a prompt is still waiting for gateway acceptance — input retained')
           return false
         }
@@ -1553,6 +1844,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         const clientMessageId = skillCommand ? store.pushSkill(skillCommand, text) : store.pushUser(text)
         const current: PendingPrompt = {
           clientMessageId,
+          queued,
           retryDeadlineAt: Date.now() + PRE_ADMISSION_RETRY_WINDOW_MS,
           retryNoticeShown: false,
           submissionId: randomUUID(),
@@ -1572,6 +1864,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         submitWhileBusy(
           {
             enqueue: enqueueClientPrompt,
+            canRedirect: canRedirectCorrection,
             canSteer,
             haltAutomaticDrain: () => {
               automaticQueueDrain.halt()
@@ -1579,6 +1872,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             interrupt: interruptTurn,
             mode: () => store.state.busyInputMode,
             pushSystem: message => store.pushSystem(message),
+            redirect: issueInterruptCorrection,
             sessionId: () => gateway.sessionId(),
             setStatus: message => store.setStatus(message),
             steer: issueSteer
@@ -1593,10 +1887,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       ): Promise<'fallback' | 'queued' | 'retained' | 'saturated' | 'uncertain'> => {
         if (!canSteer(text)) return Promise.resolve('saturated')
         try {
-          return issueSteer(sessionId, text, false, submissionId => {
-            const preview = `${text.slice(0, 50)}${text.length > 50 ? '…' : ''}`
-            store.pushPendingSteer(submissionId, `steer queued — arrives after next tool call: "${preview}"`)
-          }).then(delivery => (delivery === 'accepted' ? 'queued' : delivery))
+          return issueSteer(sessionId, text).then(delivery => (delivery === 'accepted' ? 'queued' : delivery))
         } catch {
           return Promise.resolve('saturated')
         }
@@ -1844,9 +2135,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           if (!decoded) throw new Error('invalid plugins.manage list response')
           return decoded
         },
-        toggle: async (name: string, enable: boolean) => {
+        toggle: async (row: PluginRow, enable: boolean) => {
           const decoded = decodePluginsToggleResponse(
-            await Effect.runPromise(gateway.request('plugins.manage', { action: 'toggle', enable, name }))
+            await Effect.runPromise(gateway.request('plugins.manage', pluginToggleParams(row, enable)))
           )
           if (!decoded) throw new Error('invalid plugins.manage toggle response')
           return decoded
@@ -1942,8 +2233,12 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
-      const startNewSession = (message?: string, title?: string): void => {
-        if (guardBusySessionSwitch('start a new session', 'new')) return
+      // Resolves with whether a fresh session was actually adopted, so callers
+      // that must sequence on the replacement (the wake.detected voice arm) can
+      // await it; fire-and-forget callers just drop the promise. The pipeline
+      // below totalizes its own failures, so the promise never rejects.
+      const startNewSession = (message?: string, title?: string): Promise<boolean> => {
+        if (guardBusySessionSwitch('start a new session', 'new')) return Promise.resolve(false)
         clearModelPrefetch()
         activeTransitionOwner = 'new'
         sessionTransitionInFlight = true
@@ -1951,7 +2246,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         const previousLiveSessionId = gateway.sessionId()
         let transitionSucceeded = false
 
-        Effect.runFork(
+        return Effect.runPromise(
           Effect.gen(function* () {
             const result = yield* replaceSession(gateway, {
               activeSessionId: previousLiveSessionId,
@@ -2062,6 +2357,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               })
             )
           )
+        ).then(
+          () => transitionSucceeded,
+          () => transitionSucceeded
         )
       }
 
@@ -2078,7 +2376,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('a session switch is already in progress')
           return undefined
         }
-        if (imageAttachInFlight || historyMutationInFlight || pendingPrompt || pendingSteerCount > 0) {
+        if (imageAttachInFlight || historyMutationInFlight || hasPendingDelivery() || pendingSteerCount > 0) {
           store.pushSystem('finish the current session mutation before starting a live sibling')
           return undefined
         }
@@ -2168,7 +2466,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('wait for the history update before switching live sessions')
           return
         }
-        if (pendingPrompt) {
+        if (hasPendingDelivery()) {
           store.pushSystem('wait for the pending prompt request before switching live sessions')
           return
         }
@@ -2426,14 +2724,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           return
         }
         store.pushSystem('setup complete — starting session…')
-        startNewSession('new session started')
+        void startNewSession('new session started')
       }
 
       // Slash dispatch context (Solid logic; the boundary just hands it a
       // Promise-returning `request` + the host capabilities it needs).
       const slashCtx: SlashContext = {
         guardBusySessionSwitch,
-        newSession: startNewSession,
+        newSession: (message, title) => void startNewSession(message, title),
         branchSession: startBranchSession,
         newLiveSession: (message, title) => void startNewLiveSession(message, title),
         beginToolsConfigure: () => {
@@ -2491,12 +2789,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         dashboardMode: () => hostedDashboard,
         compact: () => store.state.compact,
         setCompact: on => store.setCompact(on),
+        batteryEnabled: () => store.state.batteryEnabled,
+        setBatteryEnabled: on => store.setBatteryEnabled(on),
         details: () => store.state.details,
         setDetails: (mode, commandOverride) => store.setDetails(mode, commandOverride),
         detailSections: () => store.state.detailsSections,
         setDetailSection: (section, mode) => store.setDetailSection(section, mode),
         timestamps: () => store.state.timestamps,
         setTimestamps: on => store.setTimestamps(on),
+        focusView: () => store.state.focusView,
+        setFocusView: on => store.setFocusView(on),
         reasoningFull: () => store.state.reasoningFull,
         setReasoningFull: on => store.setReasoningFull(on),
         isBusy: isTurnBusy,
@@ -2568,10 +2870,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             return undefined
           }
         },
-        // HERMES_TUI_NO_CONFIRM (Ink parity): skip the destructive-action confirm
-        // step and run the action immediately. Read per call so a wrapper that
-        // mutates env before launch sees the live value.
-        confirm: (message, onConfirm) => (noConfirmDestructive() ? onConfirm() : store.setConfirm(message, onConfirm)),
+        // Skip the destructive-action confirm step and run the action
+        // immediately when EITHER HERMES_TUI_NO_CONFIRM (Ink-parity env
+        // alias/override, read per call so a wrapper that mutates env before
+        // launch sees the live value) OR the hydrated
+        // `approvals.destructive_slash_confirm: false` config policy disables
+        // it (upstream 77f35add0cc4; boolean-false-only, fail-safe decode).
+        confirm: (message, onConfirm) =>
+          skipDestructiveConfirm(store.state.destructiveSlashConfirm)
+            ? onConfirm()
+            : store.setConfirm(message, onConfirm),
         copyResponse: n => {
           const text = nthAssistantResponse(store.state.messages, n)
           if (!text) return false
@@ -2604,6 +2912,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         openPetPicker: () => store.openPetPicker(),
         openBackgroundPanel: () => store.openBackgroundPanel(),
         openBilling: overlay => store.openBilling(overlay),
+        openSubscription: overlay => store.openSubscription(overlay),
         addBgTask: id => store.addBgTask(id),
         openPager: (title, text) => store.openPager(title, text),
         openPicker: picker => store.openPicker(picker),
@@ -2643,6 +2952,39 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         return submitPrompt(route.payload)
       }
 
+      // Billing-wall confirm recovery (store `message.complete{billing}` →
+      // ConfirmPrompt): Yes routes through the SAME slash ladder as the
+      // composer — `/topup` opens the native billing overlay, `/model` the
+      // picker. URL recovery stays inside logic/billingWall.ts via the safe
+      // external-URL boundary; only the slash capability is entry-owned.
+      store.registerBillingWallHost({ submitSlash: command => void submit(command) })
+
+      // Ctrl+O (bound in onGlobalAction above) routes through the SAME slash
+      // ladder as typing /model, so picker caching/refresh seams are shared —
+      // but without ever touching the composer's half-typed draft.
+      openModelPicker = () => {
+        void dispatchSlash('/model', slashCtx).catch(error => {
+          store.pushSystem(`model picker failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+      }
+
+      // "Hey Hermes" (upstream 86d5b8b90f): open a fresh session (unless the
+      // gateway says start_new_session:false), then arm voice capture. All the
+      // orchestration lives in logic/wake.ts; this wires the entry capabilities.
+      onWakeDetected = payload => {
+        void handleWakeDetected(
+          {
+            request: (method, params) => Effect.runPromise(gateway.request(method, params)),
+            sessionId: () => gateway.sessionId(),
+            ownProfile: () => store.state.info.profileName,
+            newSession: () => startNewSession(),
+            setVoiceEnabled: () => store.setVoiceMode({ enabled: true }),
+            pushSystem: text => store.pushSystem(text)
+          },
+          payload
+        )
+      }
+
       // Drain ONE row per authoritative settle. Queue editing pins the selected
       // row; ending that edit while already idle retries this same drain seam.
       const sendQueuedAt = (index: number): boolean => {
@@ -2676,14 +3018,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           return accepted
         }
 
-        if (pendingPrompt) return false
+        if (hasPendingDelivery()) return false
         const removed = store.removeQueuedPrompt(index)
         if (removed === undefined) return false
         // Explicit queue submission is the retry boundary after ambiguous
         // delivery. Because rows are still plain strings, one successful send
         // cannot prove that every sibling row is safe to auto-replay: the drain
         // gate stays explicit-only until this queue provenance epoch is empty.
-        const accepted = sendPromptNow(removed)
+        const accepted = sendPromptNow(removed, undefined, true)
         if (!accepted) enqueueClientPrompt(removed, true)
         else automaticQueueDrain.resetIfEmpty(store.queuedCount())
         return accepted
@@ -2739,7 +3081,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           isSessionTransitioning() ||
           historyMutationInFlight ||
           store.state.pendingImages.length > 0 ||
-          pendingPrompt !== undefined ||
+          hasPendingDelivery() ||
           isTurnBusy() ||
           !gateway.sessionId()
         )
@@ -2802,11 +3144,33 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         Effect.runPromise(gateway.request(plan.method, plan.params))
           .then(result => {
             if (!completionGate.isCurrent(token)) return // a newer keystroke superseded this query
-            store.setCompletions(mapCompletions(result), readReplaceFrom(result, plan.from))
+            // Client-side widget apps live in the TUI registry, not the
+            // gateway — merge their ids/help into slash-name completions.
+            // An INLINE skill reference (`plan.skillsOnly`) offers skills
+            // only: a built-in `/model` or a widget app acts on the app, so
+            // it's meaningless as a reference inside prose — filter to the
+            // gateway's `kind === 'skill'` rows and never merge widgets.
+            const mapped = mapCompletions(result)
+            const items =
+              plan.method === 'complete.slash'
+                ? plan.skillsOnly
+                  ? mapped.filter(item => item.kind === 'skill')
+                  : mergeWidgetCompletionItems(text, mapped)
+                : mapped
+            // An inline plan replaces its own token: the gateway's
+            // `replace_from` indexes the synthetic `/query` it was sent, so
+            // the plan's absolute buffer offset is authoritative.
+            store.setCompletions(items, plan.skillsOnly ? plan.from : readReplaceFrom(result, plan.from), plan.end)
           })
           .catch(() => {
             if (!completionGate.isCurrent(token)) return
-            store.clearCompletions()
+            // Widget commands stay completable even when the gateway RPC fails
+            // (they dispatch client-side and never need the server) — but they
+            // never back-fill an inline skills-only plan.
+            const items =
+              plan.method === 'complete.slash' && !plan.skillsOnly ? mergeWidgetCompletionItems(text, []) : []
+            if (items.length) store.setCompletions(items, plan.from, plan.end)
+            else store.clearCompletions()
           })
       }
 

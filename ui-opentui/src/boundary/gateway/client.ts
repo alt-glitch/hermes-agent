@@ -177,6 +177,17 @@ export function formatRpcErrorLog(
   return `[rpc] ${method} failed${code}: ${message || 'rpc error'}`
 }
 
+/** Native libraries can bypass Python's text streams and write diagnostics
+ * directly to the gateway child's stdout file descriptor. Keep the allowlist
+ * deliberately exact: every other non-JSON line is still a protocol error.
+ *
+ * PortAudio's macOS AUHAL backend emits this prefix while probing/opening an
+ * audio device (for example OSStatus -50). It is diagnostic noise, not a
+ * JSON-RPC frame and not evidence that the gateway transport is corrupt. */
+export function isNativeStdoutDiagnostic(line: string): boolean {
+  return /^\|\|PaMacCore(?: \([^\r\n|]*\))?\|\|(?:\s|$)/.test(line.trim())
+}
+
 /** Establish transport-down/recovery state before rejected RPC continuations
  * run. Promise rejection handlers are microtasks, but keeping this ordering
  * explicit is load-bearing: pending prompt/steer ownership must see recovery
@@ -723,6 +734,13 @@ export class RawGatewayClient {
     try {
       msg = JSON.parse(line)
     } catch {
+      if (isNativeStdoutDiagnostic(line)) {
+        const diagnostic = boundTransportLogLine(line.trim())
+        this.log.debug('gateway.stdout-diagnostic', diagnostic)
+        this.pushTransportLog(`[stdout-diagnostic] ${diagnostic}`)
+        this.onEvent({ type: 'gateway.stderr', payload: { line: diagnostic } })
+        return
+      }
       this.log.warn('gateway', 'unparseable frame', { preview: line.slice(0, 120) })
       this.pushTransportLog(`[protocol] unparseable frame: ${line.slice(0, 120)}`)
       this.onEvent({ type: 'gateway.protocol_error', payload: { preview: line.slice(0, 120) } })

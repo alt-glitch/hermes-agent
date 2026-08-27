@@ -48,6 +48,13 @@ const UsageSchema = Schema.Struct({
   cost_usd: opt(Num)
 })
 
+const ProjectInfoSchema = Schema.Struct({
+  id: Str,
+  name: Str,
+  primary_path: opt(Schema.NullOr(Str)),
+  slug: Str
+})
+
 export const SessionInfoPatchSchema = Schema.Struct({
   model: opt(Str),
   reasoning_effort: opt(Str),
@@ -57,6 +64,7 @@ export const SessionInfoPatchSchema = Schema.Struct({
   provider: opt(Str),
   cwd: opt(Str),
   branch: opt(Str),
+  project: opt(Schema.NullOr(ProjectInfoSchema)),
   // session title ("" until the first exchange titles it) — drives the
   // terminal window-title chrome (OSC 0/2 via renderer.setTerminalTitle).
   title: opt(Str),

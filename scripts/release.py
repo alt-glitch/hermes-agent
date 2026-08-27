@@ -21,14 +21,11 @@ Usage:
 """
 
 import argparse
-import hashlib
 import json
 import re
 import shutil
 import subprocess
 import sys
-import tarfile
-import zipfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -37,22 +34,61 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 
-# ACP Registry manifest must stay version-locked with pyproject.toml.
-# tests/acp/test_registry_manifest.py enforces this lockstep so the release
-# bump touches both files atomically.
-ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
-
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
 # ──────────────────────────────────────────────────────────────────────
 
-# Auto-extracted from noreply emails + manual overrides
-AUTHOR_MAP = {
+# FROZEN legacy mappings — do NOT add new entries here. New contributor
+# mappings live as one-file-per-email entries under contributors/emails/
+# (see contributors/README.md), which merge-conflict-free by construction.
+# This dict is kept only so existing history keeps resolving; the effective
+# AUTHOR_MAP below merges it with the directory (directory wins).
+LEGACY_AUTHOR_MAP = {
+    "declanbatesmith@outlook.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option)
+    "drbs2004@me.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option; historical merge email)
+    "122438640+ragingbulld@users.noreply.github.com": "ragingbulld",  # PR #65606 salvage (non-finite API wait deadlines; #65746)
+    "shady2k@gmail.com": "shady2k",  # PR #60104 salvage of #66143 (MCP loop-owned shutdown drain)
+    "zzpigpinggai@users.noreply.github.com": "zzpigpinggai",  # PR #66017 salvage of #63617 (OpenRouter explicit-provider picker visibility)
+    "stellarisw@users.noreply.github.com": "StellarisW",  # PR #66222 salvage (Discord WebSocket liveness + systemd watchdog; #26656 follow-up)
+    "wx.xw@bytedance.com": "wxy-nlp",  # PR #66222 salvage (systemd event-loop watchdog co-author)
+    "sam7894604@gmail.com": "sam7894604",  # PR #55803 salvage (discord: /reasoning slash choices)
+    "bryan@users.noreply.github.com": "hydraxman",  # PR #62028 salvage (copilot xhigh) — regression-test commit authored under a bare-noreply local git identity; PR author is @hydraxman
+    "antydizajn@gmail.com": "antydizajn",  # PR #36043 salvage (auxiliary: route custom:<name> through named-provider arm + Palantir Bearer auth)
+    "252620095+briandevans@users.noreply.github.com": "briandevans",  # PR #64951 salvage (lmstudio: clamp max/ultra reasoning effort)
+    "kar.iskakov@gmail.com": "karfly",  # PR #64012 salvage (gateway: surface extended reasoning efforts)
+    "enzo.eliott.adami@gmail.com": "enzo-adami",  # PR #66637 salvage (compression: preserve human intent and durable handoffs)
+    "kimyeon30@naver.com": "rlaehddus302",  # PR #61985 salvage (gateway: secondary-adapter auth callback profile)
+    "burke@autreymail.com": "bautrey",  # PR #66479 salvage (gateway reliability hardening: Bedrock liveness, supervised watchers, launchd respawn throttle)
+    "agungsubastian1963@gmail.com": "aguung",  # PR #64461 salvage (gateway: multiplex secret_scope for authz/Slack/webhooks)
+    "jtstothard@gmail.com": "jtstothard",  # PR #63256 salvage (gateway: multiplex secondary adapter config validation)
+    "fjlaowan@proton.me": "fjlaowan1983",  # PR #11256 salvage (honcho: reject whitespace-only reasoning queries)
+    "RainbowAndSun@users.noreply.github.com": "RainbowAndSun",  # PR #62982 salvage (honcho: observer target in prefetch context)
+    "pi@hermes.local": "Elektrofussel",  # PR #61675 salvage (honcho: defaultHost + private-range local URL detection)
+    "doogie@spark.local": "SAMBAS123",  # PR #64986 salvage (gateway: multiplex primary bot token scope)
+    "maartendormenatteysen@hotmail.com": "MaartenDMT",  # PR #65637 salvage (gateway: retry failed transcript appends and rebuild corrupted FTS)
+    "emrekoca2003@gmail.com": "kocaemre",  # PR #36051 salvage (docs: audit round 3 code/doc reconciliation)
+    "focusedmiqa@gmail.com": "m1qaweb",  # PR #29290 salvage (gateway: strip /queue prefix when idle)
+    "13574+otsune@users.noreply.github.com": "otsune",  # PR #36019 salvage (kanban: attachment toolset + CLI)
+    "205466933+wesleion@users.noreply.github.com": "wesleion",  # PR #36049 salvage (telegram: per-topic free-response allowlist)
+    "evefromwayback@gmail.com": "evefromwayback",  # PR #64611 salvage (agent: never load install-tree AGENTS.md as project context)
+    "Regina@Andreys-Mini.true.true": "Rival",  # PR #64935/#64936 salvage (state: restore-boundary alternation repair; agent: turn-overlap tripwire)
+    "embwl0x@users.noreply.github.com": "embwl0x",  # PR #65105 salvage (gateway: preserve external supervisor ownership)
+    "41409874+2751738943@users.noreply.github.com": "2751738943",  # PR #54785 salvage (tui: post-turn completion ownership routing)
+    "Burgunthy@users.noreply.github.com": "Burgunthy",  # PR #20096 salvage (gateway: profile-based routing for inbound messages)
+    "BB-light@users.noreply.github.com": "BB-light",  # PR #76015 salvage (caching: honor cache_ttl disable; #33555)
     "75556242+webtecnica@users.noreply.github.com": "webtecnica",  # PR #63360 salvage (nous: restore inference-api base_url)
+    "contato@webtecnica.com.br": "webtecnica",  # PR #70888 salvage
+    "webtecnica@gmail.com": "webtecnica",  # PR #75838 salvage (aux: free-only fallback guard; #75803)
+    "ckaznocha@gmail.com": "ckaznocha",  # PR #71543 salvage (matrix: crypto store reset + pickle migration)
+    "skosarevivan@yandex.ru": "Epoxidex",  # PR #29820 salvage (ollama: top-level reasoning_effort=none; #25758)
+    "jdjiayou@163.com": "JiaDe-Wu",  # PR #34742 salvage (bedrock: bearer routing + streaming fallback + image decode; #28156)
     "changhyun.min@gmail.com": "minchang",  # PR #42231 salvage (providers: add Upstage Solar)
     "neo@neodeMac-mini.local": "neo-claw-bot",  # PR #58465 salvage (moa: drop empty user turns from advisory view)
     "2024104039@mails.szu.edu.cn": "pixel4039",  # PR #64420 salvage (streaming: retry zero-chunk streams)
+    "marceloparra.hm@gmail.com": "marcelohildebrand",  # PR #42346 salvage (lmstudio: JIT load mode)
+    "qlskssk@gmail.com": "Soju06",  # agent turn-latency perf PRs
     "m.guttmann@journaway.com": "mguttmann",  # PR #63738 salvage (Anthropic setup-token pool auth normalization)
+    "wangzhe00zju@gmail.com": "flyingdoubleG",  # PR #18166 salvage (memory-provider tools honor disabled_toolsets in initial and MCP-refresh injection)
     "VrtxOmega@pm.me": "VrtxOmega",  # PR #43809 salvage (desktop: WSL folder-picker path bridge)
     "gn00742754@gmail.com": "SemonCat",  # PR #56786 salvage (Slack Agent View manifests and Assistant APIs)
     "KCAYAAI@users.noreply.github.com": "KCAYAAI",  # PR #62248 partial salvage (resume typing after clarify reply)
@@ -65,10 +101,17 @@ AUTHOR_MAP = {
     "true@supersynergy.de": "Supersynergy",  # PR #59241 salvage (desktop: workspace path status-bar action)
     "me@roryford.com": "roryford",  # PR #63132 salvage (compression: fail closed for errors from a resolved lock API, preserving lineage)
     "esthon@gmail.com": "esthonjr",  # PR #61950 salvage (desktop: legacy non-git workspace grouping + Windows path identity)
+    "drexux0@gmail.com": "Drexuxux",  # PR #36042 salvage (gateway: /footer reachable mid-run via safe-toggle set)
     "iganapolsky@gmail.com": "IgorGanapolsky",  # PR #62125 salvage (compaction anti-thrash threshold verification)
+    "275853971+aeyeopsdev@users.noreply.github.com": "aeyeopsdev",  # PRs #36035/#36068 salvage (google-chat: http inbound without pubsub; clarify cards)
     "tturney1@gmail.com": "TheTom",  # PR #62696 salvage (gateway: expand @ context references under runtime/session model resolution)
+    "1822947159@qq.com": "ljy-2000",  # PR #62204 adopted in #62290
+    "xwolf.live@gmail.com": "vizi0uz",  # PR #59795 adopted in #62290
     "wilsonkinyuam@gmail.com": "WilsonKinyua",  # PR #62052 (tui: persist unflushed conversations on disconnect/restart)
     "humphreysun98@gmail.com": "HumphreySun98",  # PR #61142 salvage (web: null web/backend config value guards)
+    "merlin@threewizards.agency": "light-merlin-dark",  # PR #7821 salvage (zai: parallel endpoint detection probes)
+    "4850809+frizikk@users.noreply.github.com": "frizikk",  # PR #63389 salvage (session-search: fields projection skips unused context enrichment)
+    "endeavorisforever@gmail.com": "EndeavorYen",  # PR #33971 salvage (image: parallel image_generate batches + FileSyncManager transaction lock)
     "sonxi@nous.local": "17324393074",  # PR #53196 salvage (tools_config: known_plugin_toolsets null guard; commit under unlinked local identity)
     "lemonwan@users.noreply.github.com": "lemonwan",  # PR #59430 sibling salvage (adapter reconnect contract guard)
     "luxuguangno1@163.com": "luxuguang-leo",  # PR #52966 + #52908 salvage (QQBot reconnect + Feishu Channel signaling)
@@ -89,6 +132,7 @@ AUTHOR_MAP = {
     "austin@openvm067.space": "austinlaw076",  # PR #57563 partial salvage (auth: lazy per-profile Anthropic OAuth file; gateway: whatsapp_cloud/line added to port-binding platform set)
     "sunsky.lau@gmail.com": "liuhao1024",  # PR #56993 salvage (gateway: process-level HERMES_HOME for pid/lock/status identity files; #56986)
     "roseycomanagement@roseyco.co.uk": "Roseyco-management",  # PR #63581 salvage (telegram: require getUpdates progress before polling is healthy; #63243, #63766)
+    "nima20002000@users.noreply.github.com": "nima20002000",  # PR #36022/#36025 salvage (code-exec truncation metadata; achievements hover loop)
     "gauravsaxena.jaipur@gmail.com": "gauravsaxena1997",  # PR #59868 partial salvage (agent: guard response.text against httpx.ResponseNotRead in _summarize_api_error; #59769)
     "blueirobin02@gmail.com": "irresi",  # PR #59048 salvage (gateway: scope reset banners' session info to the serving profile; #59003)
     "jashlee+microsoft@microsoft.com": "s905060",  # PR #57943 salvage (photon: auto-reinstall stale sidecar node_modules when lockfile is newer than npm's install marker; #59169)
@@ -184,11 +228,13 @@ AUTHOR_MAP = {
     "39369769+jasonQin6@users.noreply.github.com": "jasonQin6",  # PR #15093 salvage (session staleness guard on stream consumer run() loop; #11016 follow-up)
     "znding04@gmail.com": "znding04",  # PR #15487 salvage (distinguish OpenRouter upstream 429 from account 429; upstream_rate_limit failover reason)
     "zkowkmdx@sharklasers.com": "nnnet",  # PR #25142 salvage (stop STT-failure chatter poisoning the LLM prompt; drop hardcoded English notice)
+    "21066097+nnnet@users.noreply.github.com": "nnnet",  # PR #36024 salvage (dashboard: inline critical-CSS bootstrap for user themes)
     "vladimsmirnoff33@gmail.com": "londo161",  # PR #15795 salvage (redact status --all API keys; tolerate dict/str compression message shape)
     "neo.assistant2026@gmail.com": "neo-2026",  # PR #14026 salvage (clear input-blocking overlays on interrupt so the CLI doesn't freeze; #13618)
     "cypher@augmentl.com": "Nickperillo",  # PR #8008 salvage (Discord channel-name matching + flush pending sends on shutdown)
     "tenoryang@outlook.com": "MarioYounger",  # PR #9028 salvage (bash/sh heredoc approval, NFKC homograph fold, execute_code CREDS/BEARER/APIKEY env filter)
     "peet.wannasarnmetha@gmail.com": "peetwan",  # PR #51841 salvage (loopback ws-ping tuning + token-frame coalescing + loop heartbeat; #48445/#50005)
+    "peter.skaronis@techimpossible.com": "Peterskaronis",  # PR #63889 salvage (mcp-oauth: WAF-safe redirect_host for loopback callback URIs)
     "297292863+Zyxxx-xxxyZ@users.noreply.github.com": "Zyxxx-xxxyZ",  # PR #54287 salvage (route frontend-polled inline RPCs to _LONG_HANDLERS; #48445/#50005)
     "kevenyanisme@gmail.com": "DataAdvisory",  # PR #9562 salvage (flatten multi-part user_message in codex intermediate-ack detector so vision turns don't crash)
     "huangsen365@gmail.com": "huangsen365",  # PR #42334 (CVE dependency pins + pin-drift guard)
@@ -206,6 +252,7 @@ AUTHOR_MAP = {
     "jmmaloney4@gmail.com": "jmmaloney4",  # PR #25206 salvage (re-select credential pool on primary runtime restore; #25205)
     "hmirin@users.noreply.github.com": "hmirin",
     "dale@dalenguyen.me": "dalenguyen",  # PR #53678 salvage (strip VIRTUAL_ENV/CONDA_PREFIX from terminal subprocess env; #23473)
+    "prashantjain25@gmail.com": "prashantjain25",  # PR #80740 salvage (custom-endpoint /v1/models disk cache; #72762)
     "liruixinch@outlook.com": "HexLab98",  # PR #53863 salvage (env-only proxy policy for auxiliary OpenAI clients on macOS; #53702)
     "blaryx@gmail.com": "Blaryxoff",  # PR #32602 salvage (deep-merge PUT /api/config to preserve unrelated sections; #13396)
     "diamondeyesfox@gmail.com": "DiamondEyesFox",  # PR #53351 salvage (rebaseline in-place compression flushes to prevent duplicate compacted rows; #9096)
@@ -239,6 +286,7 @@ AUTHOR_MAP = {
     "21178861+ScotterMonk@users.noreply.github.com": "ScotterMonk",  # PR #50145 salvage (cron output truncation: adapter-aware chunking, #50126)
     "rrandqua@gmail.com": "TutkuEroglu",  # PR #50481 salvage (AGENTS.md stale token-lock adapter path)
     "f@trycua.com": "f-trycua",  # PR #50507 salvage (cross-platform computer_use; supersedes #44221/#30660)
+    "fburka@noidea.de": "flewe",  # PR #47755 salvage (mcp-oauth: configurable redirect_uri for proxied callbacks, e.g. Tailscale Funnel)
     "pedro.m.simoes@gmail.com": "pmos69",  # PR #29474 salvage (native Antigravity OAuth provider; Gemini CLI sunset #29294/#49701)
     "mediratta01.pally@gmail.com": "orbisai0security",  # PR #9560 salvage (session.py path-traversal guard, V-009)
     "panghuer023@users.noreply.github.com": "panghuer023",  # PR #37994 salvage (interrupt unblocks pending gateway approval; #8697)
@@ -290,6 +338,8 @@ AUTHOR_MAP = {
     "dkobi16@gmail.com": "Diyoncrz18",
     "arnaud@nolimitdevelopment.com": "ali-nld",
     "sswdarius@gmail.com": "necoweb3",
+    "wei-yujie@qq.com": "DNAlec",  # PR #61743 salvage (honor reset policy in #54878 stale-heal recovery)
+    "joelbrilliant1@gmail.com": "joelbrilliant",  # PR #58486 salvage (session-expiry cleanup must not end row as agent_close)
     "bassisho@Mac-mini-bassis.local": "hydracoco7",  # PR #61382 salvage (id-less cron job freeze)
     "AlexFucuson9@users.noreply.github.com": "AlexFucuson9",  # PR #61209 salvage (hygiene compression data loss)
     "email@adambig.gs": "adambiggs",  # PR #43819 salvage (holographic shared SQLite connection)
@@ -337,6 +387,25 @@ AUTHOR_MAP = {
     "290859878+synapsesx@users.noreply.github.com": "synapsesx",
     "157689911+itsflownium@users.noreply.github.com": "itsflownium",
     "dirtyren@users.noreply.github.com": "dirtyren",
+    "juniperbevensee@users.noreply.github.com": "juniperbevensee",
+    "krowd3v@users.noreply.github.com": "krowd3v",
+    "dfein38347g@users.noreply.github.com": "dfein38347g",
+    "nicktaylor@TheWorldofNick-Lappy.local": "thegoodguysla",
+    "s96919@gmail.com": "s96919",
+    "rasitakyol@hotmail.com": "rasitakyol",
+    "thatgfsj@gmail.com": "Thatgfsj",
+    "141703117+seagpt@users.noreply.github.com": "seagpt",
+    "dr@nevernet.com": "davidrobertson",
+    "59045242+HaiderSultanArc@users.noreply.github.com": "HaiderSultanArc",
+    "jjadeo@gmail.com": "jjadeo-oss",
+    "94815906+juanfradb@users.noreply.github.com": "juanfradb",
+    "eva@100yen.org": "100yenadmin",
+    "yakimenkoleksander228@gmail.com": "doxe0x",
+    "a54983334@163.com": "Code-suphub",
+    "78542984+Code-suphub@users.noreply.github.com": "Code-suphub",
+    "shuangxinniao@gmail.com": "shuangxinniao",
+    "hi@neueway.com": "brendandebeasi",
+    "dorokuma@users.noreply.github.com": "dorokuma",
     "liuwei666888@users.noreply.github.com": "liuwei666888",
     "527711370@qq.com": "liuwei666888",
     "217401759+justinschille@users.noreply.github.com": "justinschille",
@@ -501,6 +570,7 @@ AUTHOR_MAP = {
     "frowte3k@gmail.com": "Frowtek",
     "211828103+julio-cloudvisor@users.noreply.github.com": "julio-cloudvisor",
     "17778+kweiner@users.noreply.github.com": "kweiner",
+    "ken@kenweiner.com": "kweiner",
     "223516181+faisfamilytravel@users.noreply.github.com": "faisfamilytravel",
     "45189813+baofuen@users.noreply.github.com": "baofuen",
     "interstellar.consulting@gmail.com": "Interstellar-code",
@@ -657,6 +727,7 @@ AUTHOR_MAP = {
     "mike@grossmann.at": "ReqX",
     "axmaiqiu@gmail.com": "qWaitCrypto",
     "44045911+kidonng@users.noreply.github.com": "kidonng",
+    "ayushere@users.noreply.github.com": "ayushere",
     "daniellsmarta@gmail.com": "DanielLSM",
     "264291321+v1b3coder@users.noreply.github.com": "v1b3coder",
     "silverchris@foxmail.com": "ming1523",
@@ -862,6 +933,7 @@ AUTHOR_MAP = {
     "thomasjhon6666@gmail.com": "ThomassJonax",
     "focusflow.app.help@gmail.com": "yes999zc",
     "rob@atlas.lan": "rmoen",
+    "huajiang@tubi.tv": "thirstycrow",  # PR #23630 salvage (config-aware memory status labels)
     # Slack ephemeral slash-ack salvage (May 2026)
     "probepark@users.noreply.github.com": "probepark",
     # Slack batch salvage (May 2026)
@@ -931,6 +1003,7 @@ AUTHOR_MAP = {
     "massivemassimo@users.noreply.github.com": "MassiveMassimo",
     "82637225+kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
     "keifergu@tencent.com": "keifergu",
+    "kshitij@kshitij.dev": "kshitijk4poor",
     "kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
     "SHL0MS@users.noreply.github.com": "SHL0MS",
     "abner.the.foreman@agentmail.to": "Abnertheforeman",
@@ -1115,6 +1188,7 @@ AUTHOR_MAP = {
     "jan@mg5.org": "mijanx",
     "incharge.automation@gmail.com": "inchargeautomation-lab",
     "danielrpike9@gmail.com": "Bartok9",
+    "kuangmi@deeparchi.com": "kuangmi-bit",
     "96944678+ymylive@users.noreply.github.com": "sweetcornna",
     "laflamme@illinoisalumni.org": "briancl2",
     "skozyuk@cruxexperts.com": "CruxExperts",
@@ -1279,6 +1353,7 @@ AUTHOR_MAP = {
     "iamagenius00@users.noreply.github.com": "iamagenius00",
     "9219265+cresslank@users.noreply.github.com": "cresslank",
     "trevmanthony@gmail.com": "trevthefoolish",
+    "at828@proton.me": "ATran28",  # PR #77270 whatsapp bridge reconnect wedge fix
     "ziliangpeng@users.noreply.github.com": "ziliangpeng",
     "ziliangdotme@gmail.com": "ziliangpeng",
     "centripetal-star@users.noreply.github.com": "centripetal-star",
@@ -1372,6 +1447,7 @@ AUTHOR_MAP = {
     "xiayh17@gmail.com": "xiayh0107",
     "zhujianxyz@gmail.com": "opriz",
     "tuancanhnguyen706@gmail.com": "xxxigm",
+    "j.brownemoore@gmail.com": "ElSnacko",
     "timchris.roth@pm.me": "x9x9x9x9x9x91",
     "larcombe.n@gmail.com": "NickLarcombe",
     "54813621+xxxigm@users.noreply.github.com": "xxxigm",
@@ -1484,6 +1560,7 @@ AUTHOR_MAP = {
     "2114364329@qq.com": "cuyua9",
     "2557058999@qq.com": "Disaster-Terminator",
     "cine.dreamer.one@gmail.com": "LeonSGP43",
+    "willies578@gmail.com": "grimmjoww578",  # PR #52142 co-author (direct CUA window targeting)
     "zyprothh@gmail.com": "Zyproth",
     "amitgaur@gmail.com": "amitgaur",
     "albuquerque.abner@gmail.com": "mrbob-git",
@@ -1502,6 +1579,7 @@ AUTHOR_MAP = {
     "17683456+wanazhar@users.noreply.github.com": "wanazhar",
     "26782336+cixuuz@users.noreply.github.com": "cixuuz",
     "aleksandr.pasevin@openzeppelin.com": "pasevin",
+    "pasevin@gmail.com": "pasevin",
     "ubuntu@localhost.localdomain": "holynn-q",
     "holynn@placeholder.local": "holynn-q",
     "agent@hermes.local": "jacdevos",
@@ -1935,6 +2013,8 @@ AUTHOR_MAP = {
     "andrewdmwalker@gmail.com": "capt-marbles",  # PR #38440 salvage (resolve xAI OAuth credentials across profiles; #43589)
     "infinitycrew39@gmail.com": "infinitycrew39",  # PR #47945 salvage (scope langfuse trace state by turn/request ids; #48292)
     "eurekaxun@163.com": "huangxun375-stack",  # PR #37251 / #48894 structured OpenViking sync
+    "koshaji@gmail.com": "koshaji",  # PR #49832 salvage (OpenViking runtime autostart shutdown drain)
+    "thor753@foxmail.com": "wgd753",  # PR #59454 salvage (OpenViking trusted-mode retry matching)
     "218421507+Sahil-SS9@users.noreply.github.com": "Sahil-SS9",  # PR #48466/#44919/#44909/#42209 salvage (cron/checkpoint/kanban/skill)
     "mango001@126.com": "max-chen",  # PR #51194 salvage (single-pass list_profiles alias map + skill-count cache; #54751)
     # v0.17.0 additions
@@ -1955,6 +2035,7 @@ AUTHOR_MAP = {
     "marvin@photon.codes": "underthestars-zhy",  # PR #46907 co-author (Photon Spectrum project ids)
     "omar@kostudios.io": "OmarB97",  # PR #43977 (desktop session model metadata)
     "omarbaradei21@gmail.com": "OmarB97",  # PR #43977 (desktop session model metadata)
+    "p.fabiszewski@gmail.com": "szafranski",  # PR #36020 (Telegram voice/audio duration)
     "philip.a.dsouza@gmail.com": "PhilipAD",  # direct email match
     "qs2816661685@gmail.com": "qingshan89",  # PR #46895 co-author (desktop remote artifact download)
     "yspdev@gmail.com": "AJ",  # PR #44510 co-author (desktop named-profile boot loop)
@@ -1982,19 +2063,56 @@ AUTHOR_MAP = {
     "rodisoft1@gmail.com": "0disoft",  # PR #53511 salvage (gateway PID probe TTL cache)
     "craigs.seller.sixx@gmail.com": "0-CYBERDYNE-SYSTEMS-0",  # PR #53966 salvage (session DB reads off event loop)
     "sebastianlutycz@users.noreply.github.com": "sebastianlutycz",  # PR #39140 salvage (descendant CTE); bare noreply (no NNN+ prefix) needs explicit mapping
+    "bobclawblaw@users.noreply.github.com": "BobClawblaw",  # PR #77870 salvage (output-cap compression on retry path; #55546)
     "wafy.081107@gmail.com": "mahdiwafy",  # PR #60347 salvage (session messages pagination)
     "codeforgenet@icloud.com": "CodeForgeNet",  # PR #47437 salvage (compact_rows blob skip)
     "i@dex.moe": "dexhunter",  # PR #60339 salvage (skills snapshot manifest speedup)
     "1torhan@protonmail.com": "uzaylisak",  # PR #29988 salvage (detect_local_server_type process-lifetime cache)
     "zhchl@hermes-agent.local": "8294",  # PR #50572 salvage (honor config context_length on banner)
+    "yansh2017@gmail.com": "ya-nsh",  # PR #26790 salvage (normalize local terminal relative cwd; #26783)
 }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Directory-based mappings: contributors/emails/<email> → login
+# ──────────────────────────────────────────────────────────────────────
+CONTRIBUTORS_EMAILS_DIR = REPO_ROOT / "contributors" / "emails"
+
+
+def _load_contributor_dir(directory: "Path | None" = None) -> dict:
+    """Load one-file-per-email mappings from contributors/emails/.
+
+    Filename = commit-author email, first non-comment line = GitHub login.
+    Additions never merge-conflict (each mapping is a distinct file), which
+    is why new entries go here instead of the frozen LEGACY_AUTHOR_MAP.
+    """
+    directory = directory or CONTRIBUTORS_EMAILS_DIR
+    mapping = {}
+    if not directory.is_dir():
+        return mapping
+    for path in sorted(directory.iterdir()):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    mapping[path.name] = line.lstrip("@")
+                    break
+        except OSError:
+            continue
+    return mapping
+
+
+# Effective map: frozen legacy dict + directory entries (directory wins).
+AUTHOR_MAP = {**LEGACY_AUTHOR_MAP, **_load_contributor_dir()}
 
 
 def git(*args, cwd=None):
     """Run a git command and return stdout."""
     result = subprocess.run(
         ["git"] + list(args),
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         cwd=cwd or str(REPO_ROOT),
     )
     if result.returncode != 0:
@@ -2008,7 +2126,7 @@ def git_result(*args, cwd=None):
     return subprocess.run(
         ["git"] + list(args),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         cwd=cwd or str(REPO_ROOT),
     )
 
@@ -2035,7 +2153,7 @@ def next_available_tag(base_tag: str) -> tuple[str, str]:
 
 def get_current_version():
     """Read current semver from __init__.py."""
-    content = VERSION_FILE.read_text()
+    content = VERSION_FILE.read_text(encoding="utf-8")
     match = re.search(r'__version__\s*=\s*"([^"]+)"', content)
     return match.group(1) if match else "0.0.0"
 
@@ -2065,7 +2183,7 @@ def bump_version(current: str, part: str) -> str:
 def update_version_files(semver: str, calver_date: str):
     """Update version strings in source files."""
     # Update __init__.py
-    content = VERSION_FILE.read_text()
+    content = VERSION_FILE.read_text(encoding="utf-8")
     content = re.sub(
         r'__version__\s*=\s*"[^"]+"',
         f'__version__ = "{semver}"',
@@ -2076,17 +2194,17 @@ def update_version_files(semver: str, calver_date: str):
         f'__release_date__ = "{calver_date}"',
         content,
     )
-    VERSION_FILE.write_text(content)
+    VERSION_FILE.write_text(content, encoding="utf-8")
 
     # Update pyproject.toml
-    pyproject = PYPROJECT_FILE.read_text()
+    pyproject = PYPROJECT_FILE.read_text(encoding="utf-8")
     pyproject = re.sub(
         r'^version\s*=\s*"[^"]+"',
         f'version = "{semver}"',
         pyproject,
         flags=re.MULTILINE,
     )
-    PYPROJECT_FILE.write_text(pyproject)
+    PYPROJECT_FILE.write_text(pyproject, encoding="utf-8")
 
     # Keep the desktop Electron app's package.json version in lockstep with the
     # Python package version. The desktop About panel reads the live Hermes
@@ -2103,219 +2221,49 @@ def update_version_files(semver: str, calver_date: str):
         )
         desktop_pkg.write_text(pkg_text, encoding="utf-8")
 
-    # Update ACP Registry manifest + npm launcher (must stay version-locked
-    # with pyproject — enforced by tests/acp/test_registry_manifest.py).
-    _update_acp_registry_versions(semver)
+    # OpenTUI ships from the same source checkout and is version-locked to
+    # Hermes even though upstream no longer publishes Python wheel/sdist
+    # artifacts. Keep both npm metadata files synchronized with the release.
+    _update_opentui_package_versions(semver)
 
 
-def _update_acp_registry_versions(semver: str) -> None:
-    """Bump the ACP Registry manifest's version + uvx package pin in lockstep
-    with pyproject.
+def _update_opentui_package_versions(semver: str) -> None:
+    """Bump the OpenTUI package and lockfile root versions together."""
+    app_dir = REPO_ROOT / "ui-opentui"
+    if not app_dir.exists():
+        # Older release branches predate the native OpenTUI engine.
+        return
 
-    Skips silently if the manifest is missing — older release branches predate
-    the ACP Registry assets.
-    """
-    if ACP_REGISTRY_MANIFEST.exists():
-        manifest = json.loads(ACP_REGISTRY_MANIFEST.read_text(encoding="utf-8"))
-        manifest["version"] = semver
-        uvx = manifest.get("distribution", {}).get("uvx", {})
-        if "package" in uvx:
-            uvx["package"] = f"hermes-agent[acp]=={semver}"
-        # Preserve trailing newline + 2-space indent the file already uses.
-        ACP_REGISTRY_MANIFEST.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    package_path = app_dir / "package.json"
+    lock_path = app_dir / "package-lock.json"
+
+    # Validate both files before writing either so malformed npm metadata
+    # cannot leave a partially bumped release tree.
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    if not isinstance(package, dict):
+        raise ValueError("ui-opentui/package.json must contain a JSON object")
+    if not isinstance(lock, dict):
+        raise ValueError("ui-opentui/package-lock.json must contain a JSON object")
+    lock_packages = lock.get("packages")
+    lock_root = lock_packages.get("") if isinstance(lock_packages, dict) else None
+    if not isinstance(lock_root, dict):
+        raise ValueError(
+            "ui-opentui/package-lock.json must contain a root packages entry"
         )
 
+    package["version"] = semver
+    lock["version"] = semver
+    lock_root["version"] = semver
 
-def _opentui_release_payload(app_dir: Path) -> dict[str, bytes] | None:
-    """Return the exact portable OpenTUI seed that Python archives must carry."""
-    fixed = (
-        ".node-version",
-        "README.md",
-        "package.json",
-        "package-lock.json",
-        "tsconfig.json",
-        "scripts/build.mjs",
-        "dist/main.js",
+    package_path.write_text(
+        json.dumps(package, indent=2) + "\n",
+        encoding="utf-8",
     )
-    paths = [app_dir / relative for relative in fixed]
-    source = app_dir / "src"
-    paths.extend(
-        path
-        for path in source.rglob("*")
-        if path.is_file()
-        and path.suffix in {".json", ".ts", ".tsx"}
-        and path.relative_to(source).parts[:1] != ("test",)
+    lock_path.write_text(
+        json.dumps(lock, indent=2) + "\n",
+        encoding="utf-8",
     )
-    try:
-        payload = {
-            (Path("ui-opentui") / path.relative_to(app_dir)).as_posix():
-            path.read_bytes()
-            for path in paths
-        }
-    except OSError:
-        return None
-    if not payload or not payload.get("ui-opentui/dist/main.js"):
-        return None
-    return payload
-
-
-def _archive_opentui_payload(artifact: Path) -> dict[str, bytes] | None:
-    """Read only the portable OpenTUI subtree from a wheel or sdist."""
-    try:
-        if artifact.suffix == ".whl":
-            with zipfile.ZipFile(artifact) as archive:
-                return {
-                    name: archive.read(name)
-                    for name in archive.namelist()
-                    if name.startswith("ui-opentui/") and not name.endswith("/")
-                }
-        if artifact.name.endswith(".tar.gz"):
-            payload: dict[str, bytes] = {}
-            with tarfile.open(artifact, mode="r:gz") as archive:
-                for member in archive.getmembers():
-                    if not member.isfile():
-                        continue
-                    parts = Path(member.name).parts
-                    if "ui-opentui" not in parts:
-                        continue
-                    start = parts.index("ui-opentui")
-                    name = Path(*parts[start:]).as_posix()
-                    handle = archive.extractfile(member)
-                    if handle is None or name in payload:
-                        return None
-                    with handle:
-                        payload[name] = handle.read()
-            return payload
-    except (OSError, tarfile.TarError, zipfile.BadZipFile):
-        return None
-    return None
-
-
-def validate_opentui_release_artifacts(
-    artifacts: list[Path], *, app_dir: Path | None = None
-) -> bool:
-    """Require one universal wheel and one sdist with the exact source seed."""
-    app_dir = app_dir or REPO_ROOT / "ui-opentui"
-    expected = _opentui_release_payload(app_dir)
-    wheels = [path for path in artifacts if path.suffix == ".whl"]
-    sdists = [path for path in artifacts if path.name.endswith(".tar.gz")]
-    if (
-        expected is None
-        or len(artifacts) != 2
-        or len(wheels) != 1
-        or len(sdists) != 1
-        or not wheels[0].name.endswith("-py3-none-any.whl")
-    ):
-        return False
-    return all(_archive_opentui_payload(path) == expected for path in artifacts)
-
-
-def _prepare_opentui_release_seed() -> bool:
-    """Build dist/main.js with the same Node/npm selection as the launcher."""
-    try:
-        from hermes_cli import main as hermes_main
-        from hermes_cli import opentui_runtime
-    except ImportError as exc:
-        print(f"  ⚠ Could not load OpenTUI release helpers: {exc}")
-        return False
-
-    node = hermes_main._node26_bin_or_none()
-    npm = opentui_runtime.npm_command(node) if node else None
-    if node is None or npm is None:
-        print("  ⚠ Node.js >= 26.3.0 with its paired npm is required.")
-        return False
-
-    app_dir = REPO_ROOT / "ui-opentui"
-    bundle = app_dir / "dist" / "main.js"
-    try:
-        bundle.unlink(missing_ok=True)
-    except OSError as exc:
-        print(f"  ⚠ Could not clear the stale OpenTUI bundle: {exc}")
-        return False
-
-    env = opentui_runtime.build_environment(node)
-    install = (
-        *npm,
-        "ci",
-        "--include=dev",
-        "--no-audit",
-        "--no-fund",
-        "--progress=false",
-    )
-    for command in (install, (*npm, "run", "build")):
-        try:
-            result = subprocess.run(
-                command,
-                cwd=str(app_dir),
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-        except OSError as exc:
-            print(f"  ⚠ OpenTUI release build could not start: {exc}")
-            return False
-        if result.returncode != 0:
-            output = (result.stderr or result.stdout).strip().splitlines()
-            print("  ⚠ OpenTUI release seed build failed.")
-            if output:
-                print(f"    {output[-1]}")
-            return False
-
-    payload = _opentui_release_payload(app_dir)
-    if payload is None:
-        print("  ⚠ OpenTUI release seed is incomplete after build.")
-        return False
-    digest = hashlib.sha256(payload["ui-opentui/dist/main.js"]).hexdigest()
-    print(f"  ✓ Built portable OpenTUI seed ({digest[:12]})")
-    return True
-
-
-def build_release_artifacts(semver: str) -> list[Path]:
-    """Build sdist/wheel artifacts for the current release.
-
-    Tries ``uv build`` first (matching the CI workflow), falls back to
-    ``python -m build`` if uv is unavailable.
-    """
-    if not _prepare_opentui_release_seed():
-        return []
-
-    dist_dir = REPO_ROOT / "dist"
-    shutil.rmtree(dist_dir, ignore_errors=True)
-
-    # Prefer uv build (matches CI workflow), fall back to python -m build.
-    uv_bin = shutil.which("uv")
-    if uv_bin:
-        cmd = [uv_bin, "build", "--sdist", "--wheel"]
-    else:
-        cmd = [sys.executable, "-m", "build", "--sdist", "--wheel"]
-
-    result = subprocess.run(
-        cmd,
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print("  ⚠ Could not build Python release artifacts.")
-        stderr = result.stderr.strip()
-        stdout = result.stdout.strip()
-        if stderr:
-            print(f"    {stderr.splitlines()[-1]}")
-        elif stdout:
-            print(f"    {stdout.splitlines()[-1]}")
-        print("    Install uv or the 'build' package to attach sdist/wheel assets.")
-        return []
-
-    artifacts = sorted(p for p in dist_dir.iterdir() if p.is_file())
-    matching = [p for p in artifacts if semver in p.name]
-    if not matching:
-        print("  ⚠ Built artifacts did not match the expected release version.")
-        return []
-    if not validate_opentui_release_artifacts(matching):
-        print("  ⚠ Built artifacts do not contain the exact portable OpenTUI seed.")
-        return []
-    return matching
 
 
 def resolve_author(name: str, email: str) -> str:
@@ -2656,8 +2604,13 @@ def main():
 
             # Commit version bump
             add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
-            if ACP_REGISTRY_MANIFEST.exists():
-                add_files.append(str(ACP_REGISTRY_MANIFEST))
+            for package_metadata in (
+                REPO_ROOT / "apps" / "desktop" / "package.json",
+                REPO_ROOT / "ui-opentui" / "package.json",
+                REPO_ROOT / "ui-opentui" / "package-lock.json",
+            ):
+                if package_metadata.exists():
+                    add_files.append(str(package_metadata))
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
@@ -2690,14 +2643,6 @@ def main():
             print("    Continue manually after fixing access:")
             print("    git push origin HEAD --tags")
 
-        # Build semver-named Python artifacts so downstream packagers
-        # (e.g. Homebrew) can target them without relying on CalVer tag names.
-        artifacts = build_release_artifacts(new_version)
-        if artifacts:
-            print("  ✓ Built release artifacts:")
-            for artifact in artifacts:
-                print(f"    - {artifact.relative_to(REPO_ROOT)}")
-
         # Create GitHub release
         changelog_file = REPO_ROOT / ".release_notes.md"
         changelog_file.write_text(changelog, encoding="utf-8")
@@ -2707,13 +2652,12 @@ def main():
             "--title", f"Hermes Agent v{new_version} ({calver_date})",
             "--notes-file", str(changelog_file),
         ]
-        gh_cmd.extend(str(path) for path in artifacts)
 
         gh_bin = shutil.which("gh")
         if gh_bin:
             result = subprocess.run(
                 gh_cmd,
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=str(REPO_ROOT),
             )
         else:
@@ -2732,9 +2676,9 @@ def main():
             print("    Tag was created locally. Create the release manually:")
             print(
                 f"    gh release create {tag_name} --title 'Hermes Agent v{new_version} ({calver_date})' "
-                f"--notes-file .release_notes.md {' '.join(str(path) for path in artifacts)}"
+                f"--notes-file .release_notes.md"
             )
-            print(f"\n  ✓ Release artifacts prepared for manual publish: v{new_version} ({tag_name})")
+            print(f"\n  ✓ Release v{new_version} ({tag_name}) prepared for manual publish.")
     else:
         print(f"\n{'='*60}")
         print("  Dry run complete. To publish, add --publish")

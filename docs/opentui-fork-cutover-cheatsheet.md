@@ -11,7 +11,6 @@ Two audiences:
 ## A. Fresh install (coworkers / anyone) — the simple path
 
 ```bash
-fnm install 26.3.0 && fnm default 26.3.0        # Node ≥ 26.3 (else OpenTUI → Ink fallback)
 git clone -b sid/opentui https://github.com/alt-glitch/hermes-agent.git
 cd hermes-agent && ./scripts/install.sh         # auto-detects this fork's branch+repo
 ```
@@ -32,23 +31,25 @@ one-time machine-specific cutover — not needed for a fresh install.
 # B. glitch's cutover cheat-sheet — replace the existing dual install with `sid/opentui`
 
 Copy-paste. Reversible. Live setup is **untouched** until you run these.
-Generated 2026-06-16 with glitch's actual machine state. **Model: B — replace the
+Originally generated 2026-06-16 and updated 2026-07-17 for the
+worktree-aware launcher. **Model: B — replace the
 canonical install at `~/.hermes/hermes-agent` with the fork's `sid/opentui`.**
 
 ## Your actual topology (read this — it's interconnected)
 - **Canonical install:** `~/.hermes/hermes-agent` — a **git checkout** of
   NousResearch on `main`, **venv at `~/.hermes/hermes-agent/venv`**. The **gateway
   runs from here** (`ExecStart=…/.hermes/hermes-agent/venv/bin/python …`).
-- **Your `hermes` command:** `~/.local/bin/hermes` → symlinks into the **quiet-quill
-  worktree** (`/home/daimon/github/worktrees/.../quiet-quill/hermes-agent/.venv`) —
-  a SEPARATE clone (NousResearch). (There's also a `/usr/local/bin/hermes` lower on PATH.)
+- **Your `hermes` command:** `~/.local/bin/hermes` is a worktree-aware launcher.
+  It uses the managed install outside a Hermes checkout and the current source
+  tree inside one. (There may also be `/usr/local/bin/hermes` lower on PATH.)
 - **Fork:** `/home/daimon/side-quests/hermes-agent` on `sid/opentui`
   (`origin`=alt-glitch, `upstream`=NousResearch).
 - **Data/config/state:** `~/.hermes` (auth, sessions, skills, cron) — **never moves.**
 
 **What "replace" means here:** point `~/.hermes/hermes-agent` at the fork's
-`sid/opentui`, rebuild it, and repoint BOTH the gateway unit and your `hermes`
-command at it. After this, one install, one branch, the fork.
+`sid/opentui`, rebuild it, and keep the gateway unit on that managed checkout.
+The launcher selects it outside development worktrees. After this, one managed
+install, one fork branch.
 
 > We do NOT delete `~/.hermes/hermes-agent` and re-clone — it has linked worktrees
 > (`/tmp/fable-fix`) and shared git objects. We add the fork as a remote and switch
@@ -56,10 +57,10 @@ command at it. After this, one install, one branch, the fork.
 
 ---
 
-## STEP 0 — Node 26.3 must be the default (do FIRST; silent-Ink trap otherwise)
-`install.sh` does NOT install Node; it only *finds* one ≥26.3. The launcher
-re-checks at runtime. Your fnm default is **v25.9.0** → too old → OpenTUI silently
-falls back to Ink at both install and run. Fix:
+## STEP 0 — Optional: pin Node 26.3 for direct engine development
+`install.sh` provisions a managed Node when the host Node is too old, and the
+launcher re-checks compatibility at runtime. Pinning Node 26 explicitly is still
+useful for direct `ui-opentui` development:
 ```bash
 fnm default 26.3.0 && fnm use 26.3.0 && node --version    # must be v26.3.x
 # (optional, scoped instead of global default — keeps 25.9 default for other projects:)
@@ -70,7 +71,7 @@ fnm default 26.3.0 && fnm use 26.3.0 && node --version    # must be v26.3.x
 ```bash
 cp ~/.config/systemd/user/hermes-gateway.service \
    ~/.config/systemd/user/hermes-gateway.service.bak-$(date +%Y%m%d)
-readlink ~/.local/bin/hermes > ~/.local/bin/hermes.symlink.bak-$(date +%Y%m%d)
+cp ~/.local/bin/hermes ~/.local/bin/hermes.bak-$(date +%Y%m%d)
 cd ~/.hermes/hermes-agent && git branch backup/pre-opentui-$(date +%Y%m%d)   # tag current main state
 git stash list; git status --short | head    # note any uncommitted state here
 ```
@@ -96,15 +97,25 @@ unset NODE_ENV
 ls -la ui-opentui/dist/main.js                            # confirm built
 ```
 
-## STEP 4 — Repoint your `hermes` command at the canonical install
-Your command currently points at the quiet-quill worktree; move it to the
-(now-fork) canonical install so CLI + gateway agree:
+## STEP 4 — Install the worktree-aware `hermes` launcher
+Do not repoint a global symlink each time you change checkouts. Generate the
+launcher through the same path as `install.sh`:
 ```bash
-ln -sf ~/.hermes/hermes-agent/venv/bin/hermes ~/.local/bin/hermes
-hash -r; hermes --version && readlink -f ~/.local/bin/hermes   # → ~/.hermes/hermes-agent/venv/...
+bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
+  ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes \
+  /home/daimon/side-quests/hermes-agent /home/daimon/github/hermes-agent
+hash -r
 ```
-(If `/usr/local/bin/hermes` shadows it on PATH, either remove that or ensure
-`~/.local/bin` is earlier in PATH.)
+Outside an explicitly trusted Hermes checkout this runs the managed fork. Inside
+the registered fork/upstream clones or any of their linked worktrees it imports
+that exact tree (including its Python gateway and terminal UI source — OpenTUI in
+the fork, Ink upstream) while reusing the nearest available venv. Verify with:
+```bash
+cd ~/.hermes/hermes-agent && hermes --version
+cd /path/to/a/hermes-worktree && hermes --version
+```
+`~/.local/bin/hermes` is intentionally a regular script, not a symlink. If
+`/usr/local/bin/hermes` shadows it, ensure `~/.local/bin` is earlier on PATH.
 
 ## STEP 5 — Restart the gateway (already points at ~/.hermes/hermes-agent/venv — no unit edit needed!)
 The gateway `ExecStart` already uses `~/.hermes/hermes-agent/venv/bin/python`, and
@@ -126,13 +137,12 @@ hermes                    # auto-selects OpenTUI; or force: HERMES_TUI_ENGINE=op
 
 ## STEP 7 — Updating later
 ```bash
-cd ~/.hermes/hermes-agent && git pull fork sid/opentui && \
-  ~/.local/bin/uv sync && (cd ui-opentui && node scripts/build.mjs)
-# OR via the CLI (defaults to main — must pass the branch):
+hermes update                         # follows the managed checkout's current branch
+# explicit equivalent:
 hermes update --branch sid/opentui
-# zsh wrapper so bare `hermes update` follows the fork:
-#   hermes() { if [ "$1" = update ]; then shift; command hermes update --branch sid/opentui "$@"; else command hermes "$@"; fi; }
 ```
+The update rebuilds the managed runtime. The worktree-aware launcher remains in
+place and automatically selects source when you enter another Hermes checkout.
 The maintainer cron keeps `fork/sid/opentui` fresh 2×/day + rebuilds `dist/`.
 
 ---
@@ -141,22 +151,23 @@ The maintainer cron keeps `fork/sid/opentui` fresh 2×/day + rebuilds `dist/`.
 The fork's `install.sh` has a `--repo` flag (commit `a4ad46ba1` on `sid/opentui`)
 so a clean install lands on the fork, not upstream:
 ```bash
-fnm install 26.3.0 && fnm default 26.3.0    # Node 26.3 (or OpenTUI → Ink fallback)
 git clone -b sid/opentui git@github.com:alt-glitch/hermes-agent.git
 cd hermes-agent
 ./scripts/install.sh --repo alt-glitch/hermes-agent --branch sid/opentui
 # updates thereafter:  hermes update --branch sid/opentui
 ```
 `--repo` accepts a full git URL or `owner/repo` shorthand and repoints `origin`
-at the fork before fetch. Plain `install.sh` (no `--repo`) still installs upstream
-main — the default is unchanged.
+at the fork before fetch. When run from this fork checkout, plain `install.sh`
+auto-detects its repository and branch; `--repo`/`--branch` are explicit
+overrides for scripted installs.
 
 ---
 
 ## ROLLBACK (back to stock main install)
 ```bash
 cd ~/.hermes/hermes-agent && git checkout main && ~/.local/bin/uv sync
-ln -sf /home/daimon/github/worktrees/hermes-agent/quiet-quill/hermes-agent/.venv/bin/hermes ~/.local/bin/hermes
+bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
+  ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes
 cp ~/.config/systemd/user/hermes-gateway.service.bak-* ~/.config/systemd/user/hermes-gateway.service
 systemctl --user daemon-reload && systemctl --user restart hermes-gateway.service
 fnm default 25.9.0    # only if you want the old node default back
@@ -170,8 +181,8 @@ fnm default 25.9.0    # only if you want the old node default back
    both end up on the fork. That's the intent of model B.
 2. **`~/.hermes` data is untouched** — auth, sessions, skills, cron all survive (only
    the *code* checkout's branch + venv change).
-3. **The quiet-quill worktree is NOT touched** — your old CLI source still exists
-   there; rollback STEP just re-points the symlink back to it.
+3. **The quiet-quill worktree is NOT touched** — the launcher selects it only
+   while your shell is inside that worktree; elsewhere it uses the managed install.
 4. **Linked worktree `/tmp/fable-fix`** shares this repo's `.git`. Switching branches
    in `~/.hermes/hermes-agent` is fine (worktrees are independent checkouts), but
    don't `git checkout sid/opentui` *there* while fable-fix also wants it — it's on

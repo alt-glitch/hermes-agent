@@ -43,7 +43,10 @@ export function PromptOverlay(props: PromptOverlayProps) {
 
   // Keep prompt ownership until the exact RPC acknowledgement arrives. Deferring
   // the clear prevents the answering key from leaking into the remounted composer.
-  const respond = (method: PromptResponseMethod, params: Record<string, unknown>) => {
+  // `onAcknowledged` (batch clarify) runs on a decoded ack and decides whether
+  // the prompt closes: false keeps it open (more batch questions remain) — the
+  // busy flip then remounts the prompt on its next unanswered question.
+  const respond = (method: PromptResponseMethod, params: Record<string, unknown>, onAcknowledged?: () => boolean) => {
     if (busy()) return
     const expected = prompt()
     const token = generation
@@ -56,6 +59,10 @@ export function PromptOverlay(props: PromptOverlayProps) {
         if (!acknowledged) {
           setBusy(false)
           setError('response was not acknowledged — retry or cancel')
+          return
+        }
+        if (onAcknowledged && !onAcknowledged()) {
+          setBusy(false)
           return
         }
         deferClose(() => {
@@ -110,8 +117,36 @@ export function PromptOverlay(props: PromptOverlayProps) {
               <ClarifyPrompt
                 question={p().question}
                 choices={p().choices}
+                questions={p().questions}
+                answers={p().answers}
                 onAnswer={answer => respond('clarify.respond', { answer, request_id: p().requestId })}
-                onCancel={() => respond('clarify.respond', { answer: '', request_id: p().requestId })}
+                onCancel={() =>
+                  // Batch cancel-all (respond WITHOUT question_id): the gateway
+                  // resolves the whole prompt as a plain cancel, so the locked
+                  // partials would silently vanish — persist them as the
+                  // 'cancelled' transcript record before the prompt closes.
+                  respond(
+                    'clarify.respond',
+                    { answer: '', request_id: p().requestId },
+                    p().questions?.length
+                      ? () => {
+                          props.store.flushAbandonedClarify('cancelled')
+                          return true
+                        }
+                      : undefined
+                  )
+                }
+                onQuestionAnswer={(qid, answer) =>
+                  // Per-question lock: the prompt stays open (and remounts on
+                  // the next unanswered question) until no questions remain —
+                  // the local answers map mirrors the gateway's accumulator, so
+                  // "remaining === 0" is exactly the server's batch resolution.
+                  respond(
+                    'clarify.respond',
+                    { answer, question_id: qid, request_id: p().requestId },
+                    () => props.store.recordClarifyAnswer(qid, answer) === 0
+                  )
+                }
               />
             )}
           </Match>

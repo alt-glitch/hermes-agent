@@ -260,10 +260,21 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
       if (!disposed && measured !== undefined && measured !== listHeight()) setListHeight(measured)
     })
   }
+  const scrollTimeline = (event: MouseEvent) => {
+    if (mode() !== 'timeline') return
+    const direction = event.scroll?.direction
+    if (direction !== 'up' && direction !== 'down') return
+    event.preventDefault()
+    event.stopPropagation()
+    if (busy() || confirm()) return
+    const distance = Math.max(1, Math.ceil(Math.abs(event.scroll?.delta ?? 1)))
+    setCursor(index => journeyStep(rows(), index, direction === 'up' ? -distance : distance))
+  }
   return (
     <box
       ref={e => (root = e)}
       border
+      onMouseScroll={scrollTimeline}
       style={{ borderColor: theme().color.border, flexDirection: 'column', flexGrow: 1, padding: 1 }}
     >
       <text flexShrink={0} fg={theme().color.accent} truncate wrapMode="none">

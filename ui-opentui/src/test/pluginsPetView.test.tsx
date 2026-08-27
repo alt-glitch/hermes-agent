@@ -7,9 +7,13 @@ import { renderProbe } from './lib/render.ts'
 
 describe('PluginsHub native overlay', () => {
   test('loads user scope, tabs to bundled rows, and toggles selection', async () => {
-    const toggle = vi.fn(async (name: string, enable: boolean) => ({
+    const toggle = vi.fn(async (row: { name: string }, enable: boolean) => ({
       ok: true,
-      plugin: { name, source: name === 'core' ? 'bundled' : 'user', status: enable ? 'enabled' : 'disabled' }
+      plugin: {
+        name: row.name,
+        source: row.name === 'core' ? 'bundled' : 'user',
+        status: enable ? 'enabled' : 'disabled'
+      }
     }))
     const closed = { value: false }
     const probe = await renderProbe(
@@ -42,10 +46,49 @@ describe('PluginsHub native overlay', () => {
       probe.keys.pressArrow('down')
       probe.keys.pressEnter()
       await probe.settle()
-      expect(toggle).toHaveBeenCalledWith('core', true)
+      expect(toggle).toHaveBeenCalledWith(expect.objectContaining({ name: 'core' }), true)
       probe.keys.pressEscape()
       await probe.settle()
       expect(closed.value).toBe(true)
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('toggles and updates only the selected canonical key when names collide', async () => {
+    const toggle = vi.fn(async (row: { key?: string; name: string; version?: string }, enable: boolean) => ({
+      ok: true,
+      plugin: { ...row, source: 'user', status: enable ? 'enabled' : 'disabled' }
+    }))
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider theme={() => DEFAULT_THEME}>
+          <PluginsHub
+            ops={{
+              list: async () => ({
+                bundled_count: 0,
+                user_count: 2,
+                plugins: [
+                  { key: 'image_gen/fal', name: 'fal', source: 'user', status: 'disabled', version: 'image' },
+                  { key: 'video_gen/fal', name: 'fal', source: 'user', status: 'disabled', version: 'video' }
+                ]
+              }),
+              toggle
+            }}
+            onClose={() => {}}
+          />
+        </ThemeProvider>
+      ),
+      { height: 24, kittyKeyboard: true, width: 90 }
+    )
+    try {
+      await probe.waitForFrame(frame => frame.includes('fal vvideo'))
+      probe.keys.pressArrow('down')
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(toggle).toHaveBeenCalledWith(expect.objectContaining({ key: 'video_gen/fal' }), true)
+      expect(probe.frame()).toContain('✗ fal vimage (disabled)')
+      expect(probe.frame()).toContain('✓ fal vvideo')
     } finally {
       probe.destroy()
     }

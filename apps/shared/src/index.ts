@@ -1,21 +1,100 @@
+export { backendScopeKey, backendScopePrefix, LOCAL_CONNECTION_ID, registryBackendScopeKey } from './backend-scope'
 export {
-  JsonRpcGatewayClient,
+  BILLING_REFUSAL_POLICY,
+  type BillingRecovery,
+  type BillingRefusalPolicy,
+  refusalPolicy
+} from './billing-policy'
+export type {
+  BillingAutoReload,
+  BillingBlock,
+  BillingCardInfo,
+  BillingChargeResponse,
+  BillingChargeStatusResponse,
+  BillingErrorPayload,
+  BillingMonthlyCap,
+  BillingMutationResponse,
+  BillingPaymentMethod,
+  BillingRefusalCode,
+  BillingStateResponse,
+  ChargeFailureReason,
+  KnownBillingRefusalCode,
+  KnownChargeFailureReason,
+  SubscriptionPreviewResponse,
+  SubscriptionStateResponse,
+  SubscriptionTierOption,
+  SubscriptionUpgradeResponse,
+  UsageBarData,
+  UsageModelData
+} from './billing-types'
+export {
+  driveChargeSettlement,
+  SETTLEMENT_MAX_RETRY_AFTER_MS,
+  SETTLEMENT_POLL_CAP_MS,
+  SETTLEMENT_POLL_INTERVAL_MS,
+  type SettlementDeps,
+  type SettlementOutcome
+} from './charge-settlement'
+export {
+  createCronTriggerController,
+  type CronTriggerController,
+  type CronTriggerRunResult
+} from './cron-trigger-controller'
+export {
   type ConnectionState,
   type GatewayClientOptions,
   type GatewayEvent,
   type GatewayEventName,
   type GatewayRequestId,
+  type JsonRpcErrorPayload,
   type JsonRpcFrame,
+  JsonRpcGatewayClient,
+  JsonRpcGatewayError,
   type WebSocketLike
 } from './json-rpc-gateway'
+export { skillInvocationText } from './skill-scaffold'
 export {
-  GatewayReauthRequiredError,
+  type HermesSkin,
+  SKIN_BRANDING_TOKENS,
+  SKIN_COLOR_TOKENS,
+  type SkinBranding,
+  type SkinBrandingToken,
+  type SkinColors,
+  type SkinColorToken
+} from './skin'
+export {
+  clampIntensity,
+  DEFAULT_GLASS_MATERIAL,
+  DEFAULT_GLASS_SCOPE,
+  GLASS_MATERIALS,
+  GLASS_SCOPES,
+  glassActive,
+  type GlassMaterial,
+  type GlassScope,
+  glassSurfaceKeep,
+  normalizeMaterial,
+  normalizeMode,
+  normalizeScope,
+  normalizeState,
+  TRANSLUCENCY_CURVE,
+  TRANSLUCENCY_MAX,
+  TRANSLUCENCY_MIN,
+  TRANSLUCENCY_OPACITY_FLOOR,
+  TRANSLUCENCY_STEP,
+  type TranslucencyMode,
+  type TranslucencyState,
+  vibrancyFor,
+  windowOpacityFor
+} from './translucency'
+export {
   buildHermesWebSocketUrl,
+  type GatewayAuthMode,
+  GatewayReauthRequiredError,
+  type GatewayWsConnection,
+  type GatewayWsUrlResult,
+  type HermesWebSocketUrlOptions,
   isGatewayReauthRequired,
   resolveGatewayWsUrl,
-  type GatewayAuthMode,
-  type GatewayWsConnection,
-  type HermesWebSocketUrlOptions,
   type ResolveGatewayWsUrlDeps,
   type WebSocketAuthParam
 } from './websocket-url'

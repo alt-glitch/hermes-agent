@@ -62,7 +62,11 @@ def make_upstream_merge_repo(
     git(repo, "config", "user.email", "test@example.invalid")
     git(repo, "config", "user.name", "Test")
     (repo / "shared").write_text("common\n")
-    git(repo, "add", "shared")
+    (repo / "ui-opentui").mkdir()
+    (repo / "ui-opentui" / "package-lock.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    git(repo, "add", "shared", "ui-opentui/package-lock.json")
     git(repo, "commit", "-m", "common")
     common = git(repo, "rev-parse", "HEAD")
 
@@ -101,7 +105,7 @@ def make_upstream_merge_repo(
         git(repo, "commit", "-m", "merge upstream")
     merge_commit = git(repo, "rev-parse", "HEAD")
     if not ours:
-        (repo / "ui-opentui").mkdir()
+        (repo / "ui-opentui").mkdir(exist_ok=True)
         (repo / "ui-opentui" / "adaptation.ts").write_text(
             "export const ported = true\n"
         )
@@ -117,6 +121,26 @@ def gate_argv(gate_id: str) -> list[str]:
     if gate_id in runtime.CANONICAL_CODE_GATES:
         return runtime.CANONICAL_CODE_GATES[gate_id]
     return ["verify-artifact", gate_id, "artifact"]
+
+
+def review_gate_records(evidence_root: Path) -> list[dict[str, object]]:
+    logs = evidence_root / "gate-logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, object]] = []
+    for gate_id in runtime.REVIEW_PREREQUISITE_GATES:
+        output_path = logs / f"{gate_id}.log"
+        output_path.write_text("1 passed in 0.01s\n", encoding="utf-8")
+        records.append(
+            {
+                "id": gate_id,
+                "argv": gate_argv(gate_id),
+                "exit_code": 0,
+                "status": "passed",
+                "output_path": str(output_path),
+                "output_sha256": runtime._file_sha256(output_path),
+            }
+        )
+    return records
 
 
 def manifest(
@@ -160,6 +184,8 @@ def manifest(
                 "mode": "backport",
                 "request_sha256": None,
                 "last_synced_upstream": None,
+                "captured_upstream": None,
+                "captured_base": None,
             },
             "review_proof": review_proof,
             "checks": checks,
@@ -192,15 +218,43 @@ def write_live_lease(
 ) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "run.lease.json").write_text(
-        json.dumps({"token": token, "expires_unix": expires_unix})
+        json.dumps(
+            {
+                "token": token,
+                "expires_unix": expires_unix,
+                "max_expires_unix": expires_unix,
+            }
+        ),
+        encoding="utf-8",
     )
 
 
-def claim_backport(state: Path, evidence: Path) -> None:
+def claim_backport(state: Path, evidence: Path, base: str, upstream: str) -> None:
     (state / "run-request.json").write_text(
-        json.dumps({"mode": "backport", "commits": ["abcdef1"]})
+        json.dumps({"mode": "backport", "commits": ["abcdef1"]}),
+        encoding="utf-8",
     )
     runtime.claim_request(state, evidence)
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text(encoding="utf-8"))
+    context = {
+        "schema_version": 1,
+        "run_id": "test-run",
+        "execution_id": "test-execution",
+        "lease_token_sha256": hashlib.sha256(lease["token"].encode()).hexdigest(),
+        "base_sha": base,
+        "upstream_sha": upstream,
+    }
+    context_path = evidence / "run-context.json"
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    lease.update({
+        "run_id": context["run_id"],
+        "evidence_dir": str(evidence.resolve()),
+        "captured_base": base,
+        "captured_upstream": upstream,
+        "run_context_sha256": file_hash(context_path),
+    })
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
 
 
 def test_worker_and_gate_renewals_bypass_nonblocking_run_lock(
@@ -368,6 +422,27 @@ def test_focused_contracts_accept_fixed_uv_pytest_dependency() -> None:
     ]
     assert runtime._is_focused_contract_command(argv)
     assert runtime._focused_output_proves_execution(argv, "350 passed in 7.5s\n")
+
+
+def test_focused_contracts_accept_fixed_pytest_asyncio_dependency() -> None:
+    argv = [
+        "uv",
+        "run",
+        "--with",
+        "pytest",
+        "--with",
+        "pytest-asyncio",
+        "pytest",
+        "tests/gateway/test_async.py",
+        "-q",
+    ]
+    assert runtime._is_focused_contract_command(argv)
+    assert runtime._focused_output_proves_execution(argv, "2 passed in 0.2s\n")
+    assert not runtime._is_focused_contract_command([
+        *argv[:5],
+        "arbitrary-package",
+        *argv[6:],
+    ])
 
 
 def test_focused_contracts_require_package_aware_vitest_command() -> None:
@@ -647,7 +722,7 @@ def install_success_mocks(
                 argv, 0, json.dumps(payload).encode(), b""
             )
         if argv[0] == "show":
-            visible = b"Hermes Agent - ready\n"
+            visible = b"Hermes Agent - ready\nWelcome to Hermes Agent!\n"
             if sent and stable_after_send:
                 visible += b"Available Commands\n"
             return subprocess.CompletedProcess(argv, 0, visible, b"")
@@ -659,10 +734,14 @@ def install_success_mocks(
         argv: list[str], prompt: bytes, cwd: Path
     ) -> subprocess.CompletedProcess[bytes]:
         assert b"REVIEW_SCOPE_SHA256:" in prompt
-        assert b"BEGIN BOUNDED EXACT DIFF" in prompt
-        return subprocess.CompletedProcess(
-            argv, 0, b"No blockers.\nVERDICT: APPROVED\n", b""
-        )
+        if b"BEGIN BOUNDED EXACT DIFF" in prompt:
+            assert b"Do not spawn, delegate to, or invoke other" in prompt
+            output = b"No candidate blocker.\nCHUNK_REVIEW: COMPLETE\n"
+        else:
+            assert b"BEGIN ORDERED CHUNK REVIEWS" in prompt
+            assert b"AUTHENTICATED DETERMINISTIC GATE EVIDENCE" in prompt
+            output = b"No blockers.\nVERDICT: APPROVED\n"
+        return subprocess.CompletedProcess(argv, 0, output, b"")
 
     monkeypatch.setattr(runtime.subprocess, "run", fake_run)
     monkeypatch.setattr(runtime.time, "sleep", lambda _seconds: None)
@@ -749,7 +828,7 @@ def test_termctrl_uses_dependency_complete_fork_python_and_exact_candidate(
                 b"",
             )
         if argv[0] == "show":
-            visible = b"Hermes Agent\n"
+            visible = b"Hermes Agent\nWelcome to Hermes Agent!\n"
             if sent:
                 visible += b"Available Commands\n"
             return subprocess.CompletedProcess(argv, 0, visible, b"")
@@ -1083,13 +1162,15 @@ def test_review_runtime_rejects_blocker_even_with_approved_tail(
     _, _, base, candidate, gate_worktree = make_repo(tmp_path)
     evidence = tmp_path / "evidence"
     evidence.mkdir()
-    monkeypatch.setattr(
-        runtime,
-        "_run_reviewer",
-        lambda argv, prompt, cwd: subprocess.CompletedProcess(
-            argv, 0, b"Inline BLOCKER: race remains\nVERDICT: APPROVED\n", b""
-        ),
-    )
+    def review(argv: list[str], prompt: bytes, cwd: Path):
+        output = (
+            b"CHUNK_REVIEW: COMPLETE\n"
+            if b"BEGIN BOUNDED EXACT DIFF" in prompt
+            else b"Inline BLOCKER: race remains\nVERDICT: APPROVED\n"
+        )
+        return subprocess.CompletedProcess(argv, 0, output, b"")
+
+    monkeypatch.setattr(runtime, "_run_reviewer", review)
     with pytest.raises(runtime.ControlError, match="did not approve"):
         runtime.run_adversarial_review(
             {"tool": "claude", "model": "fable-5"},
@@ -1097,6 +1178,7 @@ def test_review_runtime_rejects_blocker_even_with_approved_tail(
             gate_worktree,
             base,
             candidate,
+            verified_checks=review_gate_records(evidence),
         )
 
 
@@ -1110,7 +1192,12 @@ def test_scheduled_review_excludes_trusted_upstream_and_includes_owned_deltas(
 
     def approve(argv: list[str], prompt: bytes, cwd: Path):
         prompts.append(prompt)
-        return subprocess.CompletedProcess(argv, 0, b"VERDICT: APPROVED\n", b"")
+        output = (
+            b"CHUNK_REVIEW: COMPLETE\n"
+            if b"BEGIN BOUNDED EXACT DIFF" in prompt
+            else b"VERDICT: APPROVED\n"
+        )
+        return subprocess.CompletedProcess(argv, 0, output, b"")
 
     monkeypatch.setattr(runtime, "_trusted_upstream_tip", lambda _repo: upstream)
     monkeypatch.setattr(runtime, "_run_reviewer", approve)
@@ -1120,13 +1207,17 @@ def test_scheduled_review_excludes_trusted_upstream_and_includes_owned_deltas(
         repo,
         base,
         candidate,
+        expected_mode="scheduled",
+        captured_upstream=upstream,
+        verified_checks=review_gate_records(evidence),
     )
 
     assert result["review_mode"] == "upstream-merge"
     assert result["upstream_sha"] == upstream
     assert result["merge_commit"] == merge_commit
     assert result["chunk_count"] == 1
-    [prompt] = prompts
+    prompt = prompts[0]
+    assert len(prompts) == 2
     assert b"TRUSTED-UPSTREAM-BULK" not in prompt
     assert b"+resolved" in prompt
     assert b"adaptation.ts" in prompt
@@ -1161,7 +1252,7 @@ def test_scheduled_review_rejects_noncanonical_second_parent(
 ) -> None:
     repo, base, _upstream, _merge_commit, candidate = make_upstream_merge_repo(tmp_path)
     monkeypatch.setattr(runtime, "_trusted_upstream_tip", lambda _repo: base)
-    with pytest.raises(runtime.ControlError, match="not canonical upstream main"):
+    with pytest.raises(runtime.ControlError, match="not in canonical upstream main"):
         runtime._review_scope(repo, base, candidate)
 
 
@@ -1238,7 +1329,7 @@ def test_review_chunks_require_independent_approval(
     repo, _, base, _, _ = make_repo(tmp_path)
     git(repo, "checkout", "integration")
     for index in range(3):
-        (repo / f"chunk-{index}").write_text(str(index) * 300)
+        (repo / f"chunk-{index}").write_text(str(index) * 9_000)
     git(repo, "add", "chunk-0", "chunk-1", "chunk-2")
     git(repo, "commit", "-m", "large adaptation")
     candidate = git(repo, "rev-parse", "HEAD")
@@ -1248,9 +1339,14 @@ def test_review_chunks_require_independent_approval(
 
     def approve(argv: list[str], prompt: bytes, cwd: Path):
         prompts.append(prompt)
-        return subprocess.CompletedProcess(argv, 0, b"VERDICT: APPROVED\n", b"")
+        output = (
+            b"CHUNK_REVIEW: COMPLETE\n"
+            if b"BEGIN BOUNDED EXACT DIFF" in prompt
+            else b"VERDICT: APPROVED\n"
+        )
+        return subprocess.CompletedProcess(argv, 0, output, b"")
 
-    monkeypatch.setattr(runtime, "REVIEW_PROMPT_MAX_BYTES", 700)
+    monkeypatch.setattr(runtime, "REVIEW_PROMPT_MAX_BYTES", 8_000)
     monkeypatch.setattr(runtime, "_run_reviewer", approve)
     result = runtime.run_adversarial_review(
         {"tool": "claude", "model": "fable-5"},
@@ -1258,13 +1354,15 @@ def test_review_chunks_require_independent_approval(
         repo,
         base,
         candidate,
+        verified_checks=review_gate_records(evidence),
     )
-    assert result["chunk_count"] == len(prompts)
-    assert len(prompts) >= 2
+    assert result["chunk_count"] == len(prompts) - 1
+    assert len(prompts) >= 3
     assert all(
-        f"CHUNK: {index}/{len(prompts)}".encode() in prompt
-        for index, prompt in enumerate(prompts, start=1)
+        f"CHUNK: {index}/{result['chunk_count']}".encode() in prompt
+        for index, prompt in enumerate(prompts[:-1], start=1)
     )
+    assert b"BEGIN ORDERED CHUNK REVIEWS" in prompts[-1]
 
 
 def test_run_lock_records_inactive_release_state(tmp_path: Path) -> None:
@@ -1309,7 +1407,7 @@ def test_atomic_gate_and_ship_is_only_publish_cli(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
-    claim_backport(state, evidence)
+    claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     runtime.gate_and_ship(
@@ -1327,6 +1425,25 @@ def test_atomic_gate_and_ship_is_only_publish_cli(
     lease = json.loads((state / "run.lease.json").read_text())
     remaining = lease["expires_unix"] - int(runtime.time.time())
     assert 0 < remaining <= runtime.POST_PUBLISH_LEASE_TTL_SECONDS
+    prepared = json.loads((state / "publish-journal.json").read_text())[
+        "prepared_unix"
+    ]
+    runtime.renew_lease(
+        state,
+        "test-token",
+        now=prepared + 600,
+        ttl_seconds=runtime.POST_PUBLISH_LEASE_TTL_SECONDS,
+    )
+    lease = json.loads((state / "run.lease.json").read_text())
+    assert lease["expires_unix"] == prepared + runtime.POST_PUBLISH_LEASE_TTL_SECONDS
+    lease["expires_unix"] = prepared + runtime.POST_PUBLISH_LEASE_TTL_SECONDS + 60
+    (state / "run.lease.json").write_text(json.dumps(lease), encoding="utf-8")
+    with pytest.raises(runtime.ControlError, match="fixed deadline"):
+        runtime.renew_lease(
+            state,
+            "test-token",
+            now=prepared + runtime.POST_PUBLISH_LEASE_TTL_SECONDS,
+        )
     for removed in ("ship", "run-gate"):
         with pytest.raises(SystemExit):
             runtime._parser().parse_args([removed])
@@ -1341,7 +1458,7 @@ def test_gate_cli_completes_publish_finalization_and_release(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
-    claim_backport(state, evidence)
+    claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     manifest = evidence / "gate.json"
@@ -1395,6 +1512,8 @@ def test_gate_cli_run_lock_blocks_interleaved_release(
                 "release-lease",
                 "--state",
                 str(state),
+                "--evidence",
+                str(tmp_path / "evidence"),
                 "--token",
                 "token",
             ])
@@ -1433,7 +1552,7 @@ def test_failed_atomic_gate_never_moves_remote(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
-    claim_backport(state, evidence)
+    claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     monkeypatch.setattr(
@@ -1514,10 +1633,7 @@ def test_finalize_success_consumes_request_and_removes_proven_worktree(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
-    (state / "run-request.json").write_text(
-        json.dumps({"mode": "backport", "commits": ["abcdef1"]})
-    )
-    runtime.claim_request(state, evidence)
+    claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     manifest_path = evidence / "gate.json"
@@ -1558,7 +1674,7 @@ def test_finalize_success_rejects_arbitrary_detached_worktree(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
-    claim_backport(state, evidence)
+    claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     manifest_path = evidence / "gate.json"
@@ -1593,10 +1709,7 @@ def test_finalize_success_rejects_unbound_evidence_directory(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
-    (state / "run-request.json").write_text(
-        json.dumps({"mode": "backport", "commits": ["abcdef1"]})
-    )
-    runtime.claim_request(state, evidence)
+    claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     manifest_path = evidence / "gate.json"
@@ -1658,10 +1771,7 @@ def test_finalize_success_rejects_replaced_inflight_request(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
-    (state / "run-request.json").write_text(
-        json.dumps({"mode": "backport", "commits": ["abcdef1"]})
-    )
-    runtime.claim_request(state, evidence)
+    claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     manifest_path = evidence / "gate.json"
@@ -1701,7 +1811,7 @@ def test_failure_after_publish_is_truthful_and_preserves_request(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
-    claim_backport(state, evidence)
+    claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     runtime.gate_and_ship(
@@ -1738,7 +1848,7 @@ def test_finalize_success_retries_after_cleanup_before_outcome(
     state = tmp_path / "state"
     write_live_lease(state)
     evidence = tmp_path / "evidence"
-    claim_backport(state, evidence)
+    claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
     manifest_path = evidence / "gate.json"
@@ -1773,13 +1883,16 @@ def test_finalize_success_retries_after_cleanup_before_outcome(
             token="test-token",
         )
     assert not gate_worktree.exists()
+    assert (
+        json.loads((state / "publish-journal.json").read_text())["phase"]
+        == "finalized"
+    )
+    assert (evidence / "success-finalization.json").is_file()
+    assert not (evidence / "run-outcome.json").exists()
 
-    result = runtime.finalize_success(
-        repo,
-        manifest_path,
-        state_dir=state,
-        evidence_dir=evidence,
-        cwd=gate_worktree,
+    result = runtime.reconcile_run(
+        state,
+        evidence,
         token="test-token",
     )
     assert result["candidate_sha"] == candidate
@@ -1787,6 +1900,7 @@ def test_finalize_success_retries_after_cleanup_before_outcome(
         json.loads((state / "publish-journal.json").read_text())["phase"] == "finalized"
     )
     assert json.loads((state / "last-run.json").read_text())["published"] is True
+    assert not (state / "run.lease.json").exists()
 
 
 def test_video_raw_output_rejects_symlink(

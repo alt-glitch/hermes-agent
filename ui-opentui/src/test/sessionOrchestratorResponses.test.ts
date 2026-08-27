@@ -70,6 +70,30 @@ describe('session-orchestrator RPC Effect boundaries', () => {
     })
   })
 
+  test('decodes a retained failed-turn inflight snapshot (upstream 57b351d3689)', () => {
+    const decoded = decodeSessionResumeResponse({
+      inflight: {
+        assistant: 'partial before the failure',
+        error: 'provider exploded',
+        recoverable: true,
+        status: 'error',
+        streaming: false,
+        user: 'do the thing'
+      },
+      messages: [],
+      running: false,
+      session_id: 'live-1'
+    })
+    expect(decoded?.inflight).toMatchObject({
+      assistant: 'partial before the failure',
+      error: 'provider exploded',
+      recoverable: true,
+      status: 'error',
+      streaming: false,
+      user: 'do the thing'
+    })
+  })
+
   test('rejects malformed live snapshot arrays and field types', () => {
     expect(decodeSessionActivateResponse({ messages: {}, session_id: 'live-1' })).toBeUndefined()
     expect(decodeSessionActivateResponse({ messages: [], running: 'yes', session_id: 'live-1' })).toBeUndefined()

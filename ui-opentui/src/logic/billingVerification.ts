@@ -24,7 +24,7 @@ export function presentBillingVerification(
   if (!parsed) return false
 
   const url = parsed.toString()
-  host.pushSystem('💳 Open this link to grant terminal billing access:')
+  host.pushSystem('💳 Open this link to allow Remote Spending:')
   host.pushSystem(url)
   if (payload.user_code) host.pushSystem(`If prompted, enter code: ${payload.user_code}`)
   const openUrl = host.openUrl ?? openExternalUrl

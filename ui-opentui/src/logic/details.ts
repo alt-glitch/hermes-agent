@@ -34,7 +34,14 @@ export const DETAILS_SECTION_USAGE =
 const SECTION_DEFAULTS: DetailsSections = {
   activity: 'hidden',
   delegation: 'collapsed',
-  thinking: 'expanded',
+  // thinking defaults COLLAPSED (upstream 2b0b4a219195 adaptation): the view's
+  // per-part liveness rule keeps the CURRENTLY-STREAMING reasoning part open
+  // regardless of this mode, so "collapsed" means live-open → auto-fold the
+  // moment the reasoning phase ends (next tool/text part, settle, resume).
+  // An explicit `/details expanded`, config `display.sections.thinking:
+  // expanded` (or details_mode/thinking_mode expanded — see detailsFromConfig),
+  // or `/reasoning full` still force settled reasoning open.
+  thinking: 'collapsed',
   tools: 'expanded'
 }
 
@@ -45,6 +52,8 @@ export interface DetailsConfig {
 
 const DetailsDisplayConfigSchema = Schema.Struct({
   details_mode: Schema.optionalKey(Schema.Unknown),
+  focus_view: Schema.optionalKey(Schema.Unknown),
+  timestamps: Schema.optionalKey(Schema.Unknown),
   tui_compact: Schema.optionalKey(Schema.Unknown),
   sections: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
   thinking_mode: Schema.optionalKey(Schema.Unknown)
@@ -56,6 +65,22 @@ const decodeDetailsRootConfig = Schema.decodeUnknownOption(DetailsRootConfigSche
 export function compactFromConfig(config: unknown): boolean {
   const decoded = decodeDetailsRootConfig(config)
   return Option.isSome(decoded) && Boolean(decoded.value.display?.tui_compact)
+}
+
+/** Decode the persisted focus-view flag (`display.focus_view`, /focus) from
+ * `config.get full` — Ink applyDisplay's `!!d.focus_view` parity. */
+export function focusViewFromConfig(config: unknown): boolean {
+  const decoded = decodeDetailsRootConfig(config)
+  return Option.isSome(decoded) && Boolean(decoded.value.display?.focus_view)
+}
+
+/** Decode the persisted `display.timestamps` flag from `config.get full`
+ * (upstream 77fcc2ea31e0 — the SAME key that stamps [HH:MM] on classic-CLI
+ * labels; no separate TUI knob). Boolean-true-ONLY, matching Ink applyDisplay's
+ * `d.timestamps === true`: absent/null/"on"/1 all stay OFF (the default). */
+export function timestampsFromConfig(config: unknown): boolean {
+  const decoded = decodeDetailsRootConfig(config)
+  return Option.isSome(decoded) && decoded.value.display?.timestamps === true
 }
 
 /** Decode the display subset of `config.get full`; invalid overrides are ignored. */
@@ -79,6 +104,12 @@ export function detailsFromConfig(config: unknown): DetailsConfig {
       if (value) sections[section] = value
     }
   }
+  // A config-level expanded preference (`display.details_mode: expanded` or
+  // `display.thinking_mode: full`) must keep settled reasoning open even though
+  // the built-in thinking default is now `collapsed` (live-only expansion):
+  // hydrateDetails applies with commandOverride=false, where SECTION_DEFAULTS
+  // beats the global mode, so pin the explicit section here.
+  if (mode === 'expanded' && sections.thinking === undefined) sections.thinking = 'expanded'
   return { mode, sections }
 }
 
@@ -136,8 +167,12 @@ export function collapseHiddenPartsBy(
   const out: DisplayPart[] = []
   let run: HiddenRun | undefined
   for (const part of parts) {
-    const section =
-      part.type === 'tool' ? 'tools' : part.type === 'reasoning' ? 'thinking' : part.type === 'moa' ? 'subagents' : null
+    // MoA reference parts NEVER fold: they are the mixture-of-agents process
+    // the user explicitly opted into, not private model reasoning, so they
+    // stay visible even when every section is hidden (upstream #64657 —
+    // 07a732c2e5b's shouldShowThinkingTrail override, folded into the one
+    // hidden-mode seam this engine has).
+    const section = part.type === 'tool' ? 'tools' : part.type === 'reasoning' ? 'thinking' : null
     if (!section || !hidden(section)) {
       run = undefined
       out.push(part)

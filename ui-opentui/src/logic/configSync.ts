@@ -1,33 +1,37 @@
-/** Two-phase live-config synchronization state.
+/** Revision-aware live-config synchronization state.
  *
- * A changed config file requires an idle-only MCP reload followed by a full
- * config hydration. The observed mtime advances only after both phases finish.
- * Keeping the phases separate is important: if hydration fails after a
- * successful reload, the next poll retries hydration without mutating the
- * process-global MCP registry a second time.
+ * Config mtime controls local display hydration. MCP reloads are controlled by
+ * the gateway's independent `mcp_rev`: cosmetic writes still hydrate config,
+ * but they never reconnect MCP servers. A revision is accepted only after the
+ * gateway confirms `status: reloaded`, so transient failures remain retryable
+ * on the next poll even when mtime no longer changes.
  */
 
 export type ConfigSyncKind = 'baseline' | 'change'
 
 export interface ConfigSyncPlan {
   readonly kind: ConfigSyncKind
+  readonly mcpRev: string
   readonly mtime: number
-  /** True only until the changed mtime has completed its MCP reload. */
+  /** True until this MCP revision has been confirmed loaded. */
   readonly reload: boolean
 }
 
 export interface ConfigSyncTracker {
+  /** Last revision confirmed by boot baseline or a successful reload. */
+  readonly acceptedMcpRev: () => string
   /** Commit a successfully decoded, active-session config hydration. */
   readonly completeHydration: (plan: ConfigSyncPlan, succeeded: boolean) => boolean
-  /** Record the result of the process-global MCP reload phase. */
-  readonly completeReload: (plan: ConfigSyncPlan, succeeded: boolean) => boolean
+  /** Accept only an authoritative reload response, using its loaded_rev. */
+  readonly completeReload: (plan: ConfigSyncPlan, response: unknown) => boolean
   readonly observedMtime: () => number
   /** Return the next safe phase, or undefined while busy/unchanged. */
-  readonly plan: (nextMtime: number, busy: boolean) => ConfigSyncPlan | undefined
+  readonly plan: (nextMtime: number, nextMcpRev: string, busy: boolean) => ConfigSyncPlan | undefined
 }
 
 interface PendingSync {
   kind: ConfigSyncKind
+  mcpRev: string
   mtime: number
   reloadComplete: boolean
 }
@@ -36,22 +40,42 @@ function validMtime(value: number): boolean {
   return Number.isFinite(value) && value > 0
 }
 
+function responseRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined
+}
+
 export function configSyncBlocked(turnBusy: boolean, sessionTransitioning: boolean): boolean {
   return turnBusy || sessionTransitioning
 }
 
 export function mcpReloadSucceeded(value: unknown): boolean {
-  return typeof value === 'object' && value !== null && 'status' in value && value.status === 'reloaded'
+  return responseRecord(value)?.status === 'reloaded'
+}
+
+/** The revision the gateway actually loaded. Older revision-aware gateways may
+ * omit loaded_rev, in which case the requested revision is the best available
+ * acknowledgement. Non-reloaded responses never produce an accepted value. */
+export function mcpLoadedRevision(value: unknown, requestedRev: string): string | undefined {
+  const response = responseRecord(value)
+  if (response?.status !== 'reloaded') return undefined
+  const loaded = typeof response.loaded_rev === 'string' ? response.loaded_rev.trim() : ''
+  return loaded || requestedRev
 }
 
 export function createConfigSyncTracker(): ConfigSyncTracker {
   let observedMtime = 0
+  let acceptedMcpRev = ''
   let pending: PendingSync | undefined
 
   const matches = (plan: ConfigSyncPlan): boolean =>
-    pending !== undefined && pending.kind === plan.kind && pending.mtime === plan.mtime
+    pending !== undefined &&
+    pending.kind === plan.kind &&
+    pending.mtime === plan.mtime &&
+    pending.mcpRev === plan.mcpRev
 
   return {
+    acceptedMcpRev: () => acceptedMcpRev,
+
     completeHydration(plan, succeeded) {
       if (!succeeded || !matches(plan) || !pending?.reloadComplete) return false
       observedMtime = plan.mtime
@@ -59,31 +83,40 @@ export function createConfigSyncTracker(): ConfigSyncTracker {
       return true
     },
 
-    completeReload(plan, succeeded) {
-      if (!succeeded || !plan.reload || !matches(plan) || pending?.kind !== 'change') return false
+    completeReload(plan, response) {
+      if (!plan.reload || !matches(plan) || pending?.kind !== 'change') return false
+      const loadedRev = mcpLoadedRevision(response, plan.mcpRev)
+      if (loadedRev === undefined) return false
+      // Empty revisions are the legacy mtime-only path. There is no revision
+      // acknowledgement to advance, but the authoritative status still proves
+      // that this reload phase completed.
+      if (loadedRev) acceptedMcpRev = loadedRev
       pending.reloadComplete = true
       return true
     },
 
     observedMtime: () => observedMtime,
 
-    plan(nextMtime, busy) {
+    plan(nextMtime, nextMcpRev, busy) {
       if (busy || !validMtime(nextMtime)) return undefined
-      if (pending === undefined && nextMtime === observedMtime) return undefined
+      const mcpRev = nextMcpRev.trim()
 
-      if (pending?.mtime !== nextMtime) {
+      // The first observation describes the registry built during session
+      // startup. Seed it as a baseline rather than needlessly reloading it.
+      if (observedMtime === 0 && acceptedMcpRev === '' && mcpRev) acceptedMcpRev = mcpRev
+
+      const unchanged = nextMtime === observedMtime && (!mcpRev || mcpRev === acceptedMcpRev)
+      if (pending === undefined && unchanged) return undefined
+
+      if (pending?.mtime !== nextMtime || pending.mcpRev !== mcpRev) {
         const kind: ConfigSyncKind = observedMtime === 0 ? 'baseline' : 'change'
-        pending = {
-          kind,
-          mtime: nextMtime,
-          // Establishing the first baseline only hydrates local config. Every
-          // subsequent distinct mtime must reload MCP before it can commit.
-          reloadComplete: kind === 'baseline'
-        }
+        const reload = kind === 'change' && (!mcpRev || mcpRev !== acceptedMcpRev)
+        pending = { kind, mcpRev, mtime: nextMtime, reloadComplete: !reload }
       }
 
       return {
         kind: pending.kind,
+        mcpRev: pending.mcpRev,
         mtime: pending.mtime,
         reload: !pending.reloadComplete
       }

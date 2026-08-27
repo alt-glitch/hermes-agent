@@ -142,4 +142,122 @@ describe('mapResumeHistory (Phase 4b)', () => {
     expect(message?.notification?.detail).toBe(detail)
     expect(message?.notification?.alwaysVisible).toBe(true)
   })
+
+  test('skips hidden persisted display rows without changing ordinary history', () => {
+    const msgs = mapResumeHistory([
+      { role: 'user', text: 'real question' },
+      { role: 'user', text: '[CONTEXT COMPACTION — REFERENCE ONLY]', display_kind: 'hidden' },
+      { role: 'assistant', text: 'real answer' }
+    ])
+
+    expect(msgs.map(message => [message.role, message.text])).toEqual([
+      ['user', 'real question'],
+      ['assistant', 'real answer']
+    ])
+  })
+
+  test('maps delegation completions to dim system markers with robust count fallback', () => {
+    const msgs = mapResumeHistory([
+      {
+        role: 'user',
+        text: '[IMPORTANT: internal delegation prompt]',
+        display_kind: 'async_delegation_complete',
+        display_metadata: { task_count: 3 },
+        timestamp: 1_753_300_000
+      },
+      {
+        role: 'user',
+        text: '[IMPORTANT: internal single delegation prompt]',
+        display_kind: 'async_delegation_complete',
+        display_metadata: { task_count: 1 }
+      },
+      {
+        role: 'user',
+        text: '[IMPORTANT: malformed delegation prompt]',
+        display_kind: 'async_delegation_complete',
+        display_metadata: { task_count: 'many' }
+      },
+      {
+        role: 'user',
+        text: '[IMPORTANT: missing delegation metadata]',
+        display_kind: 'async_delegation_complete'
+      }
+    ])
+
+    expect(msgs).toEqual([
+      { role: 'system', text: '◈ 3 background agents finished', timestamp: 1_753_300_000 },
+      { role: 'system', text: '◈ 1 background agent finished' },
+      { role: 'system', text: '◈ background agent work finished' },
+      { role: 'system', text: '◈ background agent work finished' }
+    ])
+  })
+
+  test('maps auto-continued interruption notes to a concise system row (upstream 082bd17122d)', () => {
+    const msgs = mapResumeHistory([
+      { role: 'user', text: 'original prompt' },
+      { role: 'assistant', text: 'recovered partial' },
+      {
+        role: 'user',
+        text: '[System note: Your previous turn was interrupted mid-run — …The interrupted request was:]\n\noriginal prompt',
+        display_kind: 'auto_continue',
+        timestamp: 1_753_400_000
+      },
+      { role: 'assistant', text: 'finished after the crash' }
+    ])
+
+    expect(msgs).toEqual([
+      { role: 'user', text: 'original prompt' },
+      expect.objectContaining({ role: 'assistant', text: 'recovered partial' }),
+      { role: 'system', text: '↻ resumed interrupted turn', timestamp: 1_753_400_000 },
+      expect.objectContaining({ role: 'assistant', text: 'finished after the crash' })
+    ])
+    // the raw interruption note never renders as a user bubble
+    expect(msgs.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  test('maps persisted personality pivots to a concise system row (upstream 327f7efab8b)', () => {
+    const msgs = mapResumeHistory([
+      { role: 'user', text: 'before' },
+      {
+        role: 'user',
+        text: '[System: adopt the following personality — verbose provider-facing pivot prompt]',
+        display_kind: 'personality_switch',
+        timestamp: 1_753_500_000
+      },
+      { role: 'assistant', text: 'after' }
+    ])
+
+    expect(msgs).toEqual([
+      { role: 'user', text: 'before' },
+      { role: 'system', text: 'personality changed', timestamp: 1_753_500_000 },
+      expect.objectContaining({ role: 'assistant', text: 'after' })
+    ])
+    // the raw provider-facing pivot never renders as a user bubble
+    expect(msgs.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  test('omits the timestamp on a personality pivot lacking one and drops a pending tool trail at the boundary', () => {
+    const msgs = mapResumeHistory([
+      { role: 'tool', name: 'orphan', context: 'x' },
+      { role: 'user', text: 'pivot marker', display_kind: 'personality_switch' },
+      { role: 'assistant', text: 'fresh answer' }
+    ])
+
+    expect(msgs[0]).toEqual({ role: 'system', text: 'personality changed' })
+    // the orphaned tool row is cleared at the display-only boundary, not folded forward
+    expect(msgs[1]?.parts?.map(part => part.type)).toEqual(['text'])
+  })
+
+  test('keeps model-switch bookkeeping hidden instead of resurrecting a user bubble', () => {
+    const msgs = mapResumeHistory([
+      { role: 'user', text: 'before' },
+      { role: 'user', text: '[System: model changed to gpt-5]', display_kind: 'model_switch' },
+      { role: 'assistant', text: 'after' }
+    ])
+
+    expect(msgs.map(message => [message.role, message.text])).toEqual([
+      ['user', 'before'],
+      ['assistant', 'after']
+    ])
+  })
 })

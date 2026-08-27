@@ -2,7 +2,7 @@
  * Slash dispatch test (spec §5 Layer 3/4). Pure logic: parse + the dispatch
  * ladder (client → slash.exec → command.dispatch) against a fake SlashContext.
  */
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import type { DetailsMode, DetailsSections } from '../logic/details.ts'
 import type { BusyInputMode } from '../logic/busyQueue.ts'
@@ -18,6 +18,7 @@ import {
   DASHBOARD_UPDATE_DISABLED_MESSAGE,
   dispatchSlash,
   formatHistory,
+  isModelPickerKey,
   HISTORY_MAX_MESSAGES,
   HISTORY_MAX_PAGER_CHARS,
   HISTORY_MAX_PREVIEW,
@@ -35,9 +36,11 @@ import {
   startModelPrefetch,
   type SlashContext
 } from '../logic/slash.ts'
+import { normalizeSlashSearchQuery, scoreSlashMenuItem } from '../logic/slashFuzzy.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
+import { isWakeUserDisabled, setWakeUserDisabled } from '../logic/wake.ts'
 import type { ConfirmRequest, Message, PickerItem } from '../logic/store.ts'
-import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
+import type { BillingOverlayState, BillingStateResponse, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { SessionCompressResponse } from '../boundary/compression.ts'
 
 // the picker-refresh/tabs/prefetch seams are module-level state — never leak them across tests
@@ -146,6 +149,19 @@ describe('mapCompletions', () => {
     expect(mapCompletions({ items: [] })).toEqual([])
     expect(mapCompletions(null)).toEqual([])
   })
+
+  test('carries the gateway row `kind` through; rows without one stay kind-less', () => {
+    const items = mapCompletions({
+      items: [
+        { kind: 'skill', meta: '⚡ skill', text: '/clean' },
+        { kind: 'command', meta: 'switch model', text: '/model' },
+        { meta: 'legacy row', text: '/fortune' }
+      ]
+    })
+    expect(items.map(i => i.kind)).toEqual(['skill', 'command', undefined])
+    // absent, not `kind: undefined` — exactOptionalPropertyTypes-clean shape
+    expect('kind' in (items[2] ?? {})).toBe(false)
+  })
 })
 
 describe('catalogCommandItems (slash-highlight boot seed — glitch 2026-06-14)', () => {
@@ -240,28 +256,57 @@ describe('planCompletion (items 5 + 13)', () => {
 
   test('@-mention is the only path trigger (F8b) — `~`/`./`/bare paths no longer fire', () => {
     expect(planCompletion('explain @src/fo')).toEqual({
+      end: 'explain @src/fo'.length,
       from: 'explain '.length,
       method: 'complete.path',
       params: { word: '@src/fo' }
     })
-    expect(planCompletion('@foo')).toEqual({ from: 0, method: 'complete.path', params: { word: '@foo' } })
+    expect(planCompletion('@foo')).toEqual({ end: 4, from: 0, method: 'complete.path', params: { word: '@foo' } })
     // dropped triggers:
     expect(planCompletion('cat ./rea')).toBeNull()
     expect(planCompletion('open ~/proj')).toBeNull()
     expect(planCompletion('see path/to/x')).toBeNull()
   })
 
+  test('a mid-buffer @-mention carries the exclusive token end — accept must not eat the suffix', () => {
+    // cursor at the end of the token, prose after it: `end` stops AT the
+    // cursor (the following whitespace opens the preserved suffix).
+    expect(planCompletion('see @fo and more', 'see @fo'.length)).toEqual({
+      end: 'see @fo'.length,
+      from: 4,
+      method: 'complete.path',
+      params: { word: '@fo' }
+    })
+    // cursor INSIDE the token: `end` extends PAST the cursor to the token's
+    // whitespace boundary, so accepting replaces the whole token.
+    expect(planCompletion('see @foo.ts rest', 'see @fo'.length)).toEqual({
+      end: 'see @foo.ts'.length,
+      from: 4,
+      method: 'complete.path',
+      params: { word: '@fo' }
+    })
+    // a newline is whitespace too — the token never spans lines.
+    expect(planCompletion('see @fo\nmore', 'see @fo'.length)).toEqual({
+      end: 'see @fo'.length,
+      from: 4,
+      method: 'complete.path',
+      params: { word: '@fo' }
+    })
+  })
+
   test('completion survives newlines, computed at the cursor (F7/F8)', () => {
     // a `@`-mention on a later line (after Shift+Enter) still completes
     const text = 'first line\nexplain @src/fo'
     expect(planCompletion(text, text.length)).toEqual({
+      end: text.length,
       from: 'first line\nexplain '.length,
       method: 'complete.path',
       params: { word: '@src/fo' }
     })
-    // mid-buffer: cursor inside the @token on line 2
+    // mid-buffer: cursor inside the @token on line 2 — the end runs to the
+    // token's real boundary (the newline), never into the next line.
     const t2 = 'see @foo\nmore'
-    expect(planCompletion(t2, 8)).toEqual({ from: 4, method: 'complete.path', params: { word: '@foo' } })
+    expect(planCompletion(t2, 8)).toEqual({ end: 8, from: 4, method: 'complete.path', params: { word: '@foo' } })
   })
 
   test('a `/` after a newline is prose, never a slash command', () => {
@@ -271,6 +316,139 @@ describe('planCompletion (items 5 + 13)', () => {
   test('plain prose → no completion', () => {
     expect(planCompletion('just some words')).toBeNull()
     expect(planCompletion('hello')).toBeNull()
+  })
+})
+
+describe('planCompletion — inline skill references (Ink useCompletion parity)', () => {
+  test('a whitespace-preceded `/token` at the cursor → skills-only complete.slash on the synthetic query', () => {
+    expect(planCompletion('please run /cle')).toEqual({
+      end: 15,
+      from: 12, // absolute buffer offset just past the `/` — NOT an offset into the synthetic query
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/cle' },
+      skillsOnly: true
+    })
+    // the plan's `from` replaces exactly the typed name, leaving the prose intact
+    const text = 'please run /cle'
+    const plan = planCompletion(text)
+    expect(text.slice(0, plan?.from ?? -1)).toBe('please run /')
+  })
+
+  test('a bare `/` after whitespace fires with an empty query (browse skills)', () => {
+    expect(planCompletion('please run /')).toEqual({
+      end: 12,
+      from: 12,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/' },
+      skillsOnly: true
+    })
+  })
+
+  test('fires after a newline, not just a space', () => {
+    expect(planCompletion('text\n/skill')).toEqual({
+      end: 11,
+      from: 6,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/skill' },
+      skillsOnly: true
+    })
+  })
+
+  test('fires after NBSP with the same whitespace grammar as sent inline refs', () => {
+    expect(planCompletion('text\u00a0/skill')).toEqual({
+      end: 11,
+      from: 6,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/skill' },
+      skillsOnly: true
+    })
+  })
+
+  test('position 0 keeps the FULL command plan — an invocation, not a reference', () => {
+    expect(planCompletion('/cle')).toEqual({ from: 0, method: 'complete.slash', params: { text: '/cle' } })
+    expect(planCompletion('/')).toEqual({ from: 0, method: 'complete.slash', params: { text: '/' } })
+  })
+
+  test('rejects paths and arithmetic', () => {
+    expect(planCompletion('look at /usr/local/bin')).toBeNull()
+    expect(planCompletion('check src/foo/bar')).toBeNull()
+    expect(planCompletion('and/or')).toBeNull()
+    expect(planCompletion('3 /4')).toBeNull()
+  })
+
+  test('the token must END at the cursor — a reference takes no args', () => {
+    expect(planCompletion('hello there /personality alic')).toBeNull()
+  })
+
+  test('cursor-aware: an inline token mid-buffer completes from the text through the cursor', () => {
+    const text = 'run /cle and more'
+    expect(planCompletion(text, 8)).toEqual({
+      end: 8,
+      from: 5,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/cle' },
+      skillsOnly: true
+    })
+    // same position but the cursor past the following space → the token ended
+    expect(planCompletion(text, 9)).toBeNull()
+  })
+
+  test('a mid-token cursor replaces the complete inline name token, not only the typed prefix', () => {
+    const text = 'run /clean and more'
+    expect(planCompletion(text, 7)).toEqual({
+      end: 10,
+      from: 5,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/cl' },
+      skillsOnly: true
+    })
+  })
+
+  test('an @-mention token still wins path completion over the inline trigger', () => {
+    expect(planCompletion('explain @src/fo')).toEqual({
+      end: 'explain @src/fo'.length,
+      from: 8,
+      method: 'complete.path',
+      params: { word: '@src/fo' }
+    })
+  })
+
+  test('completes a second slash in a line that starts with a command (upstream 40ec9834b2)', () => {
+    // Only the first slash is an invocation. Routing the whole line to the
+    // gateway completer offered nothing, so `/work /cle` went dead while
+    // `do /work then /cle` completed fine.
+    expect(planCompletion('/work /cle')).toEqual({
+      end: 10,
+      from: 7,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/cle' },
+      skillsOnly: true
+    })
+    // a bare trailing inline slash browses skills, same as in prose
+    expect(planCompletion('/help /')).toEqual({
+      end: 7,
+      from: 7,
+      method: 'complete.slash',
+      params: { skills_only: true, text: '/' },
+      skillsOnly: true
+    })
+  })
+
+  test("leaves a command's own arguments to the command (`/cron ad` unchanged)", () => {
+    for (const input of ['/personality alic', '/cron ad', '/details ']) {
+      expect(planCompletion(input)).toEqual({ from: 0, method: 'complete.slash', params: { text: input } })
+    }
+  })
+
+  test('an invalid inline token inside a command line falls back to the command plan', () => {
+    // `/cle/x` is a path-shaped token, not a skill reference — the caret sits
+    // before the second `/`, so the leading-command branch reclaims the line.
+    const text = '/work /cle/x'
+    expect(planCompletion(text, '/work /cle'.length)).toEqual({
+      from: 0,
+      method: 'complete.slash',
+      params: { text }
+    })
   })
 })
 
@@ -330,6 +508,7 @@ interface Probe {
   resumed: string[]
   pickers: Array<{ title: string; items: PickerItem[]; onPick: (value: string) => void }>
   billed: BillingOverlayState[]
+  subscribed: SubscriptionOverlayState[]
   quit: { value: boolean }
   exitCodes: Array<number | undefined>
   redraws: { value: number }
@@ -354,11 +533,14 @@ interface Probe {
   copySelection: { value: string | undefined }
   /** The cached /model rows (Epic 7) — seed to simulate a prefetched catalog. */
   modelCache: { value: PickerItem[] | undefined }
-  /** Display flags (/compact, /details — Epic 3). */
+  /** Display flags (/density, /details — Epic 3). */
   compactFlag: { value: boolean }
+  batteryFlag: { value: boolean }
   detailsFlag: { value: DetailsMode }
   /** /timestamps display flag — show [HH:MM] on messages (port of 5ff11a689). */
   timestampsFlag: { value: boolean }
+  /** /focus display flag — reduced-output view badge (port of d6fa2709de6). */
+  focusFlag: { value: boolean }
   /** /reasoning full|clamp display flag — expand all thinking. */
   reasoningFullFlag: { value: boolean }
   busyMode: { value: BusyInputMode }
@@ -384,6 +566,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const resumed: string[] = []
   const pickers: Probe['pickers'] = []
   const billed: Probe['billed'] = []
+  const subscribed: Probe['subscribed'] = []
   const quit = { value: false }
   const exitCodes: Array<number | undefined> = []
   const redraws = { value: 0 }
@@ -408,9 +591,11 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const copySelection: Probe['copySelection'] = { value: undefined }
   const modelCache: Probe['modelCache'] = { value: undefined }
   const compactFlag: Probe['compactFlag'] = { value: false }
+  const batteryFlag: Probe['batteryFlag'] = { value: false }
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
   const detailSections = { value: {} as DetailsSections }
   const timestampsFlag: Probe['timestampsFlag'] = { value: false }
+  const focusFlag: Probe['focusFlag'] = { value: false }
   const reasoningFullFlag: Probe['reasoningFullFlag'] = { value: false }
   const busyMode: Probe['busyMode'] = { value: 'queue' }
   const queued: string[] = []
@@ -454,6 +639,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     dashboardMode: () => dashboardMode.value,
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
+    batteryEnabled: () => batteryFlag.value,
+    setBatteryEnabled: on => (batteryFlag.value = on),
     details: () => detailsFlag.value,
     setDetails: mode => (detailsFlag.value = mode),
     detailSections: () => detailSections.value,
@@ -463,6 +650,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     },
     timestamps: () => timestampsFlag.value,
     setTimestamps: on => (timestampsFlag.value = on),
+    focusView: () => focusFlag.value,
+    setFocusView: on => (focusFlag.value = on),
     reasoningFull: () => reasoningFullFlag.value,
     setReasoningFull: on => (reasoningFullFlag.value = on),
     isBusy: () => busy.value,
@@ -528,6 +717,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     openDashboard: () => (dashboard.value = true),
     openBackgroundPanel: () => {},
     openBilling: overlay => billed.push(overlay),
+    openSubscription: overlay => subscribed.push(overlay),
     addBgTask: () => {},
     openPager: (title, text) => paged.push({ text, title }),
     openPicker: p => pickers.push(p),
@@ -574,6 +764,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     dashboard,
     detailsFlag,
     timestampsFlag,
+    focusFlag,
     reasoningFullFlag,
     busyMode,
     browserStates,
@@ -585,6 +776,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     paged,
     pickers,
     billed,
+    batteryFlag,
+    subscribed,
     cachedCatalog,
     dashboardMode,
     exitCodes,
@@ -651,9 +844,146 @@ describe('voice command parity', () => {
     await dispatchSlash('/voice', p.ctx)
     expect(p.system).toEqual(['error: invalid response: voice.toggle'])
   })
+
+  test('/voice on renders the gateway-sourced stop hint between the key line and the tips (6fdfdc1597)', async () => {
+    const p = makeCtx(async () => ({
+      enabled: true,
+      record_key: 'ctrl+b',
+      stop_hint: 'Say "stop" to end the voice chat',
+      tts: false
+    }))
+    await dispatchSlash('/voice on', p.ctx)
+    expect(p.system).toEqual([
+      'Voice mode enabled',
+      '  Press Ctrl+B to start/stop recording',
+      '  Say "stop" to end the voice chat',
+      '  /voice tts  to toggle speech output',
+      '  /voice off  to disable voice mode'
+    ])
+  })
+
+  test('an absent/empty stop hint (older gateway, stop_phrases: []) shows no hint line', async () => {
+    const p = makeCtx(async () => ({ enabled: true, record_key: 'ctrl+b', stop_hint: '', tts: false }))
+    await dispatchSlash('/voice on', p.ctx)
+    expect(p.system).toEqual([
+      'Voice mode enabled',
+      '  Press Ctrl+B to start/stop recording',
+      '  /voice tts  to toggle speech output',
+      '  /voice off  to disable voice mode'
+    ])
+  })
+})
+
+describe('wake command parity (upstream 71a2feeade)', () => {
+  beforeEach(() => setWakeUserDisabled(false))
+
+  test('/wake on clears the opt-out and arms with the explicit-gesture persist flag', async () => {
+    setWakeUserDisabled(true)
+    const p = makeCtx(async () => ({ phrase: 'hey hermes', provider: 'openwakeword', started: true }))
+    await dispatchSlash('/wake on', p.ctx)
+    expect(isWakeUserDisabled()).toBe(false)
+    expect(p.calls).toEqual([{ method: 'wake.start', params: { persist: true, surface: 'tui' } }])
+    expect(p.system).toEqual(['wake: listening for “hey hermes” · openwakeword'])
+  })
+
+  test('/wake off records the opt-out (reconnects must not re-arm) and stops with persist', async () => {
+    const p = makeCtx(async () => ({ disabled_persisted: true, stopped: true }))
+    await dispatchSlash('/wake off', p.ctx)
+    expect(isWakeUserDisabled()).toBe(true)
+    expect(p.calls).toEqual([{ method: 'wake.stop', params: { persist: true } }])
+    expect(p.system).toEqual(['wake: listener off · disabled in config'])
+  })
+
+  test('bare /wake reports status without changing the opt-out', async () => {
+    const p = makeCtx(async () => ({ listening: false, phrase: 'hey hermes' }))
+    await dispatchSlash('/wake', p.ctx)
+    expect(p.calls).toEqual([{ method: 'wake.status', params: {} }])
+    expect(p.system).toEqual(['wake: off for “hey hermes” · /wake on to arm'])
+    expect(isWakeUserDisabled()).toBe(false)
+  })
+
+  test('a refusal renders the friendly reason; garbage args show usage without an RPC', async () => {
+    const refused = makeCtx(async () => ({ reason: 'disabled_for_surface', started: false }))
+    await dispatchSlash('/wake on', refused.ctx)
+    expect(refused.system).toEqual(['wake: not started — scoped to another surface (config wake_word.surface)'])
+
+    const garbage = makeCtx(async () => ({}))
+    await dispatchSlash('/wake maybe', garbage.ctx)
+    expect(garbage.calls).toHaveLength(0)
+    expect(garbage.system).toEqual(['usage: /wake [on|off|status]'])
+  })
+
+  test('a malformed wake response is visible, and the opt-out set by /wake off sticks', async () => {
+    const p = makeCtx(async () => 'not-an-object')
+    await dispatchSlash('/wake off', p.ctx)
+    expect(p.system).toEqual(['error: invalid response: wake.stop'])
+    expect(isWakeUserDisabled()).toBe(true)
+  })
+})
+
+describe('Ctrl+O model picker (upstream f27d45e288)', () => {
+  test('matches plain Ctrl+O presses only — never releases, shifted chords, or other modifiers', () => {
+    expect(isModelPickerKey({ ctrl: true, name: 'o' })).toBe(true)
+    expect(isModelPickerKey({ ctrl: true, name: 'O' })).toBe(true)
+    expect(isModelPickerKey({ ctrl: true, name: 'o', eventType: 'release' })).toBe(false)
+    expect(isModelPickerKey({ ctrl: true, name: 'o', shift: true })).toBe(false)
+    expect(isModelPickerKey({ ctrl: true, name: 'o', option: true })).toBe(false)
+    expect(isModelPickerKey({ ctrl: true, name: 'o', super: true })).toBe(false)
+    expect(isModelPickerKey({ ctrl: false, name: 'o' })).toBe(false)
+    expect(isModelPickerKey({ ctrl: true, name: 'x' })).toBe(false)
+  })
+
+  test('opening the picker never prefill/clears the composer or submits — the draft survives', async () => {
+    // Ctrl+O routes through this same bare `/model` open; the whole point is
+    // reaching the picker WITHOUT wiping a half-typed draft the way typing
+    // `/model` over it would. The open must not touch any composer seam.
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : {}))
+    await dispatchSlash('/model', p.ctx)
+    expect(p.pickers).toHaveLength(1)
+    expect(p.prefills).toEqual([])
+    expect(p.submitted).toEqual([])
+    expect(p.skillSubmitted).toEqual([])
+  })
 })
 
 describe('browser command parity', () => {
+  test.each(['/browser use', '/browser use on'])(
+    '%s enables Browser Use and replaces the session after persistence',
+    async command => {
+      const p = makeCtx(async () => ({ key: 'browser_backend', value: 'on' }))
+      await dispatchSlash(command, p.ctx)
+      expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'on' } }])
+      expect(p.newSessions).toEqual([
+        ['Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0', undefined]
+      ])
+    }
+  )
+
+  test('/browser use off disables Browser Use and replaces the session after persistence', async () => {
+    const p = makeCtx(async () => ({ key: 'browser_backend', value: 'off' }))
+    await dispatchSlash('/browser use off', p.ctx)
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'off' } }])
+    expect(p.newSessions).toEqual([['Browser Use mode disabled — built-in browser tools restored', undefined]])
+  })
+
+  test('/browser use rejects invalid arguments without persistence or a session replacement', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/browser use maybe', p.ctx)
+    expect(p.calls).toEqual([])
+    expect(p.newSessions).toEqual([])
+    expect(p.system).toEqual(['usage: /browser use [off]'])
+  })
+
+  test('/browser use surfaces RPC failure without replacing the session', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('config unavailable')
+    })
+    await dispatchSlash('/browser use', p.ctx)
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'on' } }])
+    expect(p.newSessions).toEqual([])
+    expect(p.system).toEqual(['/browser: config unavailable'])
+  })
+
   test('connect uses the direct browser.manage boundary and commits live CDP chrome state', async () => {
     const p = makeCtx(async () => ({ connected: true, url: 'http://127.0.0.1:9333' }))
     await dispatchSlash('/browser connect http://127.0.0.1:9333', p.ctx)
@@ -969,6 +1299,34 @@ describe('dispatchSlash — client commands', () => {
     ])
     expect(sparse.compressionKeys).toEqual(['durable-rotated'])
     expect(sparse.system).toEqual(['compressed 2 messages · 1.5k tok'])
+
+    const aborted = makeCtx(async () => ({ removed: 0, status: 'aborted' }))
+    aborted.history.value = [{ role: 'user', text: 'unchanged after abort' }]
+    await dispatchSlash('/compress', aborted.ctx)
+    expect(aborted.history.value[0]?.text).toBe('unchanged after abort')
+    expect(aborted.compressionMutations).toEqual([])
+    expect(aborted.system).toEqual(['nothing to compress'])
+  })
+
+  test('/compress shows the exact lock-holder message and never no-op copy', async () => {
+    const message =
+      '⏳ Compression already in progress for this session (holder: pid=4242). Please wait for it to finish.'
+    const locked = makeCtx(async () => ({ compressed: false, lock_held: true, message }))
+    locked.history.value = [{ role: 'user', text: 'keep this transcript' }]
+
+    await dispatchSlash('/compress   retain partial focus  ', locked.ctx)
+
+    expect(locked.calls).toEqual([
+      {
+        method: 'session.compress',
+        params: { focus_topic: 'retain partial focus', session_id: 'sid-1' }
+      }
+    ])
+    expect(locked.history.value).toEqual([{ role: 'user', text: 'keep this transcript' }])
+    expect(locked.compressionMutations).toEqual([])
+    expect(locked.compressionKeys).toEqual([])
+    expect(locked.system).toEqual([message])
+    expect(locked.system).not.toContain('nothing to compress')
   })
 
   test('/compress leaves history intact on malformed/error/stale responses and respects guards', async () => {
@@ -1006,6 +1364,37 @@ describe('dispatchSlash — client commands', () => {
     expect(stale.compressionMutations).toEqual([])
     expect(stale.history.value[0]?.text).toBe('old visible')
     expect(stale.historyMutation.ends).toBe(1)
+  })
+
+  test('/density toggles local compact state and persists the density key', async () => {
+    const p = makeCtx(async () => ({}))
+
+    await dispatchSlash('/density', p.ctx)
+    expect(p.compactFlag.value).toBe(true)
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'density', value: 'on' } }])
+    expect(p.system).toEqual(['density on'])
+
+    await dispatchSlash('/density off', p.ctx)
+    expect(p.compactFlag.value).toBe(false)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'density', value: 'off' } })
+    expect(p.system.at(-1)).toBe('density off')
+
+    await dispatchSlash('/density crowded', p.ctx)
+    expect(p.compactFlag.value).toBe(false)
+    expect(p.calls).toHaveLength(2)
+    expect(p.system.at(-1)).toBe('usage: /density [on|off|toggle]')
+  })
+
+  test('/compact is not a native display handler and falls through to the registry alias', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'compression alias handled' } : {}))
+
+    expect(clientCommandNames()).toContain('density')
+    expect(clientCommandNames()).not.toContain('compact')
+    await dispatchSlash('/compact', p.ctx)
+
+    expect(p.compactFlag.value).toBe(false)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'compact', session_id: 'sid-1' } }])
+    expect(p.system).toEqual(['compression alias handled'])
   })
 
   test('/undo rewinds gateway + visible exchange and guards no-session/busy/malformed cases', async () => {
@@ -1183,6 +1572,46 @@ describe('dispatchSlash — client commands', () => {
     expect(p.system.at(-1)).toContain('poseidon')
   })
 
+  test('/theme is client-owned, validates modes, and persists through config.set', async () => {
+    const p = makeCtx(async (method, params) => (method === 'config.set' ? { value: params.value } : { value: 'auto' }))
+    await dispatchSlash('/theme dark', p.ctx)
+    await dispatchSlash('/theme', p.ctx)
+    await dispatchSlash('/theme sepia', p.ctx)
+
+    expect(p.calls).toEqual([
+      { method: 'config.set', params: { key: 'theme', value: 'dark' } },
+      { method: 'config.get', params: { key: 'theme' } }
+    ])
+    expect(p.system).toEqual(['theme → dark', 'theme: auto', 'usage: /theme [auto|light|dark]'])
+  })
+
+  test('/battery persists on/off and status reads live battery without enabling its poller', async () => {
+    const p = makeCtx(async (method, params) => {
+      if (method === 'config.set') return { value: params.value }
+      if (method === 'system.battery') {
+        return { available: true, category: 'good', percent: 82, plugged: true }
+      }
+      return {}
+    })
+
+    await dispatchSlash('/battery on', p.ctx)
+    expect(p.batteryFlag.value).toBe(true)
+    await dispatchSlash('/battery status', p.ctx)
+    await dispatchSlash('/battery off', p.ctx)
+    expect(p.batteryFlag.value).toBe(false)
+
+    expect(p.calls).toEqual([
+      { method: 'config.set', params: { key: 'battery', value: 'on' } },
+      { method: 'system.battery', params: {} },
+      { method: 'config.set', params: { key: 'battery', value: 'off' } }
+    ])
+    expect(p.system).toEqual([
+      'battery indicator on',
+      'battery indicator on — currently ⚡ 82%',
+      'battery indicator off'
+    ])
+  })
+
   test('/resume <id|name> keeps the DIRECT path: resolves against session.list and resumes', async () => {
     const rows = {
       sessions: [
@@ -1241,12 +1670,14 @@ describe('dispatchSlash — client commands', () => {
     ).toBe(true)
   })
 
-  test('/model --refresh busy-guards, refetches, and opens the picker without config.set', async () => {
+  test('/model --refresh refetches and opens the picker without config.set — even mid-turn (f27d45e288)', async () => {
+    // No busy guard: refreshing the catalog and opening the picker are
+    // read-only; a pick made mid-turn defers server-side instead of rejecting.
     const busy = makeCtx(async () => MODEL_OPTIONS)
     busy.busy.value = true
     await dispatchSlash('/model --refresh', busy.ctx)
-    expect(busy.calls).toHaveLength(0)
-    expect(busy.pickers).toHaveLength(0)
+    expect(busy.calls.map(call => call.method)).toEqual(['model.options'])
+    expect(busy.pickers).toHaveLength(1)
 
     const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : {}))
     p.modelCache.value = [{ label: 'stale', value: 'stale' }]
@@ -1533,11 +1964,56 @@ describe('dispatchSlash — client commands', () => {
     })
   })
 
-  test('/model guards busy sessions and confirms an expensive selection before retrying', async () => {
-    const busy = makeCtx(async () => ({ value: 'unused' }))
+  test('/model <name> --provider <slug> preserves provider selection for the session-default gateway path', async () => {
+    const p = makeCtx(async () => ({ value: 'claude-opus-4.6' }))
+    await dispatchSlash('/model claude-opus-4.6 --provider anthropic', p.ctx)
+    expect(p.calls[0]).toEqual({
+      method: 'config.set',
+      params: {
+        confirm_expensive_model: false,
+        key: 'model',
+        session_id: 'sid-1',
+        value: 'claude-opus-4.6 --provider anthropic'
+      }
+    })
+  })
+
+  test('/model --once routes a one-turn override and labels its ephemeral scope', async () => {
+    const p = makeCtx(async () => ({ scope: 'once', value: 'anthropic/claude-opus-4.6' }))
+    await dispatchSlash('/model --once anthropic/claude-opus-4.6', p.ctx)
+    expect(p.calls[0]).toEqual({
+      method: 'config.set',
+      params: {
+        confirm_expensive_model: false,
+        key: 'model',
+        session_id: 'sid-1',
+        value: 'anthropic/claude-opus-4.6 --once'
+      }
+    })
+    expect(p.system).toContain('model → anthropic/claude-opus-4.6 (next turn only)')
+  })
+
+  test('/model --once without a model is rejected locally', async () => {
+    const p = makeCtx(async () => ({ value: 'unused' }))
+    await dispatchSlash('/model --once', p.ctx)
+    expect(p.calls).toHaveLength(0)
+    expect(p.system).toEqual(['usage: /model <name> --once'])
+  })
+
+  test('/model switches DURING a busy turn — the gateway queues it and answers deferred (f27d45e288)', async () => {
+    // The old 4009 busy guard is gone: a mid-turn pick is a session-scoped
+    // config.set the gateway QUEUES and applies at the next turn start.
+    const busy = makeCtx(async method =>
+      method === 'config.set' ? { deferred: true, scope: 'session', value: 'claude-opus' } : MODEL_OPTIONS
+    )
     busy.busy.value = true
-    await dispatchSlash('/model claude-opus', busy.ctx)
-    expect(busy.calls).toHaveLength(0)
+    const models: string[] = []
+    await dispatchSlash('/model claude-opus', { ...busy.ctx, setCurrentModel: model => models.push(model) })
+    expect(busy.calls.some(call => call.method === 'config.set')).toBe(true)
+    // deferred:true is decoded and surfaced — the pick paints optimistically
+    // but the transcript says it applies at the NEXT turn, not the live one.
+    expect(busy.system).toContain('model → claude-opus (applies next turn)')
+    expect(models).toEqual(['claude-opus'])
 
     const expensive = makeCtx(async (_method, params) =>
       params.confirm_expensive_model
@@ -1838,10 +2314,10 @@ describe('dispatchSlash — client commands', () => {
     expect(invalid.system).toEqual(['usage: /fortune [random|daily]'])
   })
 
-  test('/billing fetches billing.state and opens the overlay on overview', async () => {
+  test('/topup fetches billing.state and opens the overlay on overview', async () => {
     const state = fakeBillingState({ logged_in: true })
     const p = makeCtx(async method => (method === 'billing.state' ? state : {}))
-    await dispatchSlash('/billing', p.ctx)
+    await dispatchSlash('/topup', p.ctx)
     expect(p.calls[0]?.method).toBe('billing.state')
     expect(p.billed).toHaveLength(1)
     expect(p.billed[0]!.screen).toBe('overview')
@@ -1850,22 +2326,121 @@ describe('dispatchSlash — client commands', () => {
     // the ctx bundle is wired (RPC + validation reachable from the overlay)
     expect(typeof p.billed[0]!.ctx.charge).toBe('function')
     expect(p.billed[0]!.ctx.validate('10').amount).toBe('10')
+    p.session.value = 'sid-2'
+    await p.billed[0]!.ctx.requestRemoteSpending()
+    expect(p.calls.at(-1)).toEqual({ method: 'billing.step_up', params: { session_id: 'sid-1' } })
   })
 
-  test('/billing on a logged-out portal explains how to log in (no overlay)', async () => {
+  test('/topup drops a deferred response after a newer same-session slash flight', async () => {
+    let resolve!: (value: unknown) => void
+    const pending = new Promise<unknown>(done => (resolve = done))
+    const p = makeCtx(async () => pending)
+    const run = dispatchSlash('/topup', p.ctx)
+
+    await dispatchSlash('/fortune', p.ctx)
+    resolve(fakeBillingState({ logged_in: true }))
+    await run
+
+    expect(p.billed).toHaveLength(0)
+    expect(p.system).toHaveLength(1)
+    expect(p.system[0]).toMatch(/^(?:🔮|🌟) /u)
+  })
+
+  test('/topup still reports deferred settlement after a newer same-session slash flight', async () => {
+    let resolveStatus!: (value: unknown) => void
+    const pendingStatus = new Promise<unknown>(done => (resolveStatus = done))
+    const p = makeCtx(async method => {
+      if (method === 'billing.state') return fakeBillingState({ logged_in: true })
+      if (method === 'billing.charge') return { ok: true, charge_id: 'charge-1' }
+      if (method === 'billing.charge_status') return pendingStatus
+      return {}
+    })
+
+    await dispatchSlash('/topup', p.ctx)
+    await expect(p.billed[0]!.ctx.charge('25', 'stable-key')).resolves.toBe('submitted')
+    await dispatchSlash('/fortune', p.ctx)
+    resolveStatus({ ok: true, status: 'settled', amount_usd: '25' })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(p.system).toContain('✅ $25 added.')
+  })
+
+  test('/topup on a logged-out portal explains how to log in (no overlay)', async () => {
     const p = makeCtx(async method => (method === 'billing.state' ? fakeBillingState({ logged_in: false }) : {}))
-    await dispatchSlash('/billing', p.ctx)
+    await dispatchSlash('/topup', p.ctx)
     expect(p.billed).toHaveLength(0)
     expect(p.system.join('\n')).toContain('Not logged into Nous Portal')
   })
 
-  test('/billing surfaces a request failure instead of throwing', async () => {
+  test('/topup surfaces a request failure instead of throwing', async () => {
     const p = makeCtx(async () => {
       throw new Error('gateway down')
     })
-    await dispatchSlash('/billing', p.ctx)
+    await dispatchSlash('/topup', p.ctx)
     expect(p.billed).toHaveLength(0)
-    expect(p.system.join('\n')).toContain('/billing: gateway down')
+    expect(p.system.join('\n')).toContain('/topup: gateway down')
+  })
+
+  test('/subscription and /upgrade open the native plan overlay', async () => {
+    const state = {
+      ok: true,
+      logged_in: true,
+      is_admin: true,
+      can_change_plan: true,
+      org_name: 'Nous',
+      org_id: 'org-1',
+      role: 'OWNER',
+      context: 'personal' as const,
+      current: null,
+      tiers: [],
+      portal_url: 'https://portal.example/billing'
+    }
+    for (const command of ['/subscription', '/upgrade']) {
+      const p = makeCtx(async method => (method === 'subscription.state' ? state : {}))
+      await dispatchSlash(command, p.ctx)
+      expect(p.calls[0]).toEqual({ method: 'subscription.state', params: {} })
+      expect(p.subscribed).toHaveLength(1)
+      expect(p.subscribed[0]?.state.org_id).toBe('org-1')
+    }
+  })
+
+  test('/subscription drops an old-session fetch and freezes step-up to its opening SID', async () => {
+    let resolve!: (value: unknown) => void
+    const pending = new Promise<unknown>(done => (resolve = done))
+    const stale = makeCtx(async () => pending)
+    const run = dispatchSlash('/subscription', stale.ctx)
+    stale.session.value = 'sid-2'
+    resolve({
+      ok: true,
+      logged_in: true,
+      is_admin: true,
+      can_change_plan: true,
+      context: 'personal',
+      current: null,
+      tiers: []
+    })
+    await run
+    expect(stale.subscribed).toHaveLength(0)
+    expect(stale.system).toEqual([])
+
+    const current = makeCtx(async method =>
+      method === 'subscription.state'
+        ? {
+            ok: true,
+            logged_in: true,
+            is_admin: true,
+            can_change_plan: true,
+            context: 'personal',
+            current: null,
+            tiers: []
+          }
+        : { ok: true, granted: true }
+    )
+    await dispatchSlash('/subscription', current.ctx)
+    current.session.value = 'sid-2'
+    await current.subscribed[0]?.ctx.requestRemoteSpending()
+    expect(current.calls.at(-1)).toEqual({ method: 'billing.step_up', params: { session_id: 'sid-1' } })
   })
 
   test('/tools enable uses the live configure RPC, resets same-SID state, and reports every result class', async () => {
@@ -2293,6 +2868,27 @@ describe('dispatchSlash — server ladder', () => {
     expect(p.system).not.toContain('/goal: no output')
   })
 
+  test('a send display projection renders the display while submitting the model-facing message', async () => {
+    const continuation = '[Continuing toward your standing goal]\nTake the next step without asking.'
+    const p = makeCtx(async method =>
+      method === 'slash.exec'
+        ? { type: 'send', notice: '▶ Goal resumed', message: continuation, display: '/goal resume' }
+        : {}
+    )
+    await dispatchSlash('/goal resume', p.ctx)
+    expect(p.submitted).toHaveLength(0)
+    expect(p.skillSubmitted).toEqual([{ command: '/goal resume', body: continuation }])
+    expect(p.system).toContain('▶ Goal resumed')
+  })
+
+  test('a rejected send display projection restores the display, never the hidden message', async () => {
+    const p = makeCtx(async () => ({ type: 'send', message: 'hidden continuation scaffold', display: '/goal resume' }))
+    const ctx = { ...p.ctx, submitSkill: () => false }
+    await dispatchSlash('/goal resume', ctx)
+    expect(p.prefills).toEqual(['/goal resume'])
+    expect(p.prefills).not.toContain('hidden continuation scaffold')
+  })
+
   test('a rejected {type:send} result restores the generated body instead of dropping it', async () => {
     const p = makeCtx(async () => ({ type: 'send', message: 'release-critical generated prompt' }))
     const ctx = { ...p.ctx, submit: () => false }
@@ -2452,5 +3048,135 @@ describe('diagnostic command gating (HERMES_TUI_DIAGNOSTICS)', () => {
     await dispatchSlash('/mem', p.ctx)
     const out = [...p.system, ...p.paged.map(x => x.text)].join('\n')
     expect(out).toMatch(/rss|heap/i)
+  })
+})
+
+describe('dispatchSlash — tiered catalog resolution (upstream 1405d330e7e5)', () => {
+  /** A canon fixture with a CLIENT-local command (/density), server commands,
+   *  an alias, and names that collide by prefix (/status↔/statistics) and by
+   *  substring only (den ⊂ goldenrod). */
+  const seedCatalog = (p: Probe) => {
+    p.cachedCatalog.value = {
+      canon: {
+        '/context': '/context',
+        '/density': '/density',
+        '/goldenrod': '/goldenrod',
+        '/hb': '/heartbeat',
+        '/heartbeat': '/heartbeat',
+        '/statistics': '/statistics',
+        '/status': '/status'
+      },
+      pairs: []
+    }
+  }
+
+  test('a unique SUBSTRING resolves a server command and forwards its args (/beat → /heartbeat)', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'thump' } : {}))
+    seedCatalog(p)
+    await dispatchSlash('/beat 5', p.ctx)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'heartbeat 5', session_id: 'sid-1' } }])
+    expect(p.system).toEqual(['thump'])
+  })
+
+  test('a unique PREFIX of a CLIENT command dispatches locally with its args (/dens on → densityCmd)', async () => {
+    const p = makeCtx(async method => {
+      if (method !== 'config.set') throw new Error('must resolve locally, not via ' + method)
+      return {}
+    })
+    seedCatalog(p)
+    await dispatchSlash('/dens on', p.ctx)
+    expect(p.compactFlag.value).toBe(true)
+    expect(p.system).toEqual(['density on'])
+    expect(p.calls.map(c => c.method)).toEqual(['config.set']) // densityCmd's own persist, no slash.exec
+  })
+
+  test('prefix outranks substring — only the best tier survives, so /den is NOT ambiguous', async () => {
+    const p = makeCtx(async () => ({}))
+    seedCatalog(p)
+    await dispatchSlash('/den off', p.ctx)
+    expect(p.system).toEqual(['density off']) // goldenrod's substring hit never widens the prefix hit
+    expect(p.compactFlag.value).toBe(false)
+  })
+
+  test('same-tier collisions report ambiguity and execute NOTHING (/stat)', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('an ambiguous command must not reach the gateway')
+    })
+    seedCatalog(p)
+    await dispatchSlash('/stat', p.ctx)
+    expect(p.calls).toHaveLength(0)
+    expect(p.system).toEqual(['ambiguous command: /statistics, /status'])
+  })
+
+  test('an exact canonical name keeps the plain slash.exec ladder (no recursion)', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'ctx dump' } : {}))
+    seedCatalog(p)
+    await dispatchSlash('/context', p.ctx)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'context', session_id: 'sid-1' } }])
+    expect(p.system).toEqual(['ctx dump'])
+  })
+
+  test('an exact ALIAS re-dispatches as its canonical name with args (/hb now → heartbeat now)', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'thump' } : {}))
+    seedCatalog(p)
+    await dispatchSlash('/hb now', p.ctx)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'heartbeat now', session_id: 'sid-1' } }])
+  })
+
+  test('an unmatched name keeps the full slash.exec → command.dispatch ladder', async () => {
+    const p = makeCtx(async method => {
+      if (method === 'slash.exec') throw new Error('unknown command')
+      return { output: 'dispatched', type: 'exec' }
+    })
+    seedCatalog(p)
+    await dispatchSlash('/zzz', p.ctx)
+    expect(p.calls.map(c => c.method)).toEqual(['slash.exec', 'command.dispatch'])
+    expect(p.system).toEqual(['dispatched'])
+  })
+
+  test('without a cached catalog the ladder is untouched (abbreviation goes to the gateway verbatim)', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'raw' } : {}))
+    await dispatchSlash('/hea', p.ctx)
+    expect(p.calls).toEqual([{ method: 'slash.exec', params: { command: 'hea', session_id: 'sid-1' } }])
+  })
+
+  test('fuzzy resolution cannot bypass diagnostic gating (/me → /mem still shows the enable hint)', async () => {
+    const KEY = 'HERMES_TUI_DIAGNOSTICS'
+    const prev = process.env[KEY]
+    delete process.env[KEY]
+    try {
+      const p = makeCtx(async () => ({}))
+      p.cachedCatalog.value = { canon: { '/mem': '/mem' }, pairs: [] }
+      await dispatchSlash('/me', p.ctx)
+      expect(p.calls).toHaveLength(0)
+      expect(p.system).toHaveLength(1)
+      expect(p.system[0]).toContain('HERMES_TUI_DIAGNOSTICS=1')
+    } finally {
+      if (prev === undefined) delete process.env[KEY]
+      else process.env[KEY] = prev
+    }
+  })
+})
+
+describe('scoreSlashMenuItem (grok-cli tier contract)', () => {
+  test('tiers: exact 0 < prefix 1 < substring 2; no match is Infinity', () => {
+    expect(scoreSlashMenuItem({ id: 'heartbeat' }, 'heartbeat')).toBe(0)
+    expect(scoreSlashMenuItem({ id: 'heartbeat' }, 'hea')).toBe(1)
+    expect(scoreSlashMenuItem({ id: 'heartbeat' }, 'beat')).toBe(2)
+    expect(scoreSlashMenuItem({ id: 'heartbeat' }, 'pulse')).toBe(Number.POSITIVE_INFINITY)
+  })
+
+  test('description matches score at the +3 offset — dispatch (< 3) can never auto-execute them', () => {
+    const item = { description: 'Summarize older turns to reclaim context', id: 'compress' }
+    expect(scoreSlashMenuItem(item, 'summarize')).toBe(3)
+    expect(scoreSlashMenuItem(item, 'summar')).toBe(4)
+    expect(scoreSlashMenuItem(item, 'ummar')).toBe(5)
+    expect(scoreSlashMenuItem(item, 'compress')).toBe(0) // name always outranks description
+  })
+
+  test('aliases and labels count as command fields; queries normalize slashes/case', () => {
+    expect(scoreSlashMenuItem({ aliases: ['hb'], id: 'heartbeat' }, 'hb')).toBe(0)
+    expect(scoreSlashMenuItem({ id: 'model', label: 'Model picker' }, 'picker')).toBe(0) // label word token
+    expect(normalizeSlashSearchQuery(' /Model ')).toBe('model')
   })
 })

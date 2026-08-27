@@ -25,6 +25,11 @@ export const GatewaySkinSchema = Schema.Struct({
   banner_logo: opt(Str),
   branding: opt(Schema.Record(Str, Str)),
   colors: opt(Schema.Record(Str, Str)),
+  // Paired polarity palettes (theme-sdk): hand-tuned overlays the engine picks
+  // by the terminal's detected polarity (light_colors on light terminals,
+  // dark_colors on dark). Additive + optional (back-compat with older gateways).
+  light_colors: opt(Schema.Record(Str, Str)),
+  dark_colors: opt(Schema.Record(Str, Str)),
   help_header: opt(Str),
   tool_prefix: opt(Str),
   // Spinner animation data (faces/verbs/wings) — mixed array/tuple shapes, kept
@@ -54,6 +59,16 @@ const SessionInfoEvent = Schema.Struct({
   // the chrome phase narrows the fields it actually reads.
   payload: Schema.Record(Str, Schema.Unknown)
 })
+// Live session-title push (upstream f726090d489d): auto-titling now runs in
+// the shared turn prologue and the gateway emits the landed title immediately
+// instead of waiting for the next list refresh. The payload's session_id is
+// the DB session_key (it can differ from the live sid); scoping rides the
+// top-level session_id, which the entry event gate already checks.
+const SessionTitle = Schema.Struct({
+  type: Schema.Literal('session.title'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ session_id: opt(Str), title: opt(Str) }))
+})
 
 const ClientSubmissionIds = opt(Schema.Array(Str))
 
@@ -68,6 +83,29 @@ const MessageDelta = Schema.Struct({
   session_id: opt(Str),
   payload: opt(Schema.Struct({ text: opt(Str), rendered: opt(Str) }))
 })
+const MessageInterim = Schema.Struct({
+  type: Schema.Literal('message.interim'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ text: Str, already_streamed: opt(Schema.Boolean) })
+})
+// Structured billing-wall descriptor forwarded on `message.complete` when an
+// inference call failed because the account is out of credits / payment is
+// required (upstream 960d339f86f — mirrors the Python
+// `agent/billing_links.py::BillingBlock` and `@hermes/shared` BillingBlock).
+// Detection is backend-only; the TUI renders from this one signal and never
+// re-classifies free-form error text. Fields are typed but individually
+// optional so a partial block from an older gateway can never drop the whole
+// completion event (the final answer text rides the same payload).
+export const BillingBlockSchema = Schema.Struct({
+  provider: opt(Str),
+  provider_label: opt(Str),
+  model: opt(Str),
+  billing_url: opt(Schema.NullOr(Str)),
+  is_nous: opt(Schema.Boolean),
+  message: opt(Str)
+})
+export type BillingBlockDecoded = typeof BillingBlockSchema.Type
+
 const MessageComplete = Schema.Struct({
   type: Schema.Literal('message.complete'),
   session_id: opt(Str),
@@ -76,12 +114,38 @@ const MessageComplete = Schema.Struct({
   payload: opt(
     Schema.Struct({
       client_submission_ids: ClientSubmissionIds,
+      billing: opt(BillingBlockSchema),
+      failure_reason: opt(Str),
       text: opt(Str),
       rendered: opt(Str),
       reasoning: opt(Str),
+      response_previewed: opt(Schema.Boolean),
+      // Terminal error frame (upstream 57b351d3689): status "error" closes a
+      // failed turn through the SAME message.complete shape as success. `error`
+      // is the failure message; `partial` marks `text` as streamed output to
+      // keep visible (not the error string); `recoverable` says the gateway
+      // retained the failed turn for session.resume replay. All additive +
+      // optional — an older gateway's frames decode unchanged.
+      status: opt(Str),
+      error: opt(Str),
+      partial: opt(Schema.Boolean),
+      recoverable: opt(Schema.Boolean),
       usage: opt(Schema.Record(Str, Schema.Unknown))
     })
   )
+})
+
+// Live mid-turn usage tick (upstream 2cabeba563cf): the gateway's
+// `_start_usage_ticker` emits this every ~1s while a turn runs so the
+// status-bar context gauge tracks growth live instead of only jumping at
+// `message.complete`. Same nested `usage` shape as session.info/_get_usage —
+// kept loose (Record); the SessionInfo patch reader narrows what it needs.
+// The gateway stops+joins the ticker BEFORE emitting message.complete, so the
+// final frame's usage always lands last and wins.
+const SessionUsage = Schema.Struct({
+  type: Schema.Literal('session.usage'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ usage: opt(Schema.Record(Str, Schema.Unknown)) }))
 })
 
 // reasoning / thinking — toTaggedUnion needs ONE literal per member, so the
@@ -108,6 +172,27 @@ const MoaAggregating = Schema.Struct({
   type: Schema.Literal('moa.aggregating'),
   session_id: opt(Str),
   payload: opt(Schema.Struct({ aggregator: opt(Str) }))
+})
+// Live MoA fan-out progress (upstream 89e6f4c989a/ad6a2ae401e): `moa.progress`
+// fires once per reference completion; `moa.phase` marks phase transitions
+// (currently the single phase="aggregator" edge once the fan-out finishes).
+// The legacy moa.reference/moa.aggregating pair above is unchanged.
+const MoaProgress = Schema.Struct({
+  type: Schema.Literal('moa.progress'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ label: opt(Str), refs_done: opt(Schema.Number), refs_total: opt(Schema.Number) }))
+})
+const MoaPhase = Schema.Struct({
+  type: Schema.Literal('moa.phase'),
+  session_id: opt(Str),
+  payload: opt(
+    Schema.Struct({
+      aggregator: opt(Str),
+      phase: opt(Str),
+      refs_done: opt(Schema.Number),
+      refs_total: opt(Schema.Number)
+    })
+  )
 })
 const ThinkingDelta = Schema.Struct({
   type: Schema.Literal('thinking.delta'),
@@ -138,15 +223,30 @@ const ToolGenerating = Schema.Struct({
 })
 
 // blocking prompts (deadlock-critical — Phase 3 renders these)
+// Batch clarify (multi-question): every entry field is optional at the
+// boundary — malformed entries (blank qid/question) are FILTERED by the store
+// (logic/clarifyBatch.ts), never allowed to fail the whole event decode (a
+// dropped clarify.request deadlocks the agent).
+const ClarifyBatchQuestionWire = Schema.Struct({
+  choices: opt(Schema.NullOr(Schema.Array(Str))),
+  multi_select: opt(Schema.Boolean),
+  qid: opt(Str),
+  question: opt(Str)
+})
 const ClarifyRequest = Schema.Struct({
   type: Schema.Literal('clarify.request'),
   session_id: opt(Str),
   payload: Schema.Struct({
+    // Answers already locked server-side (qid → answer) — present only on the
+    // reconnect-replay snapshot of a partially answered batch.
+    answers: opt(Schema.Record(Str, Str)),
     choices: opt(Schema.NullOr(Schema.Array(Str))),
     question: opt(Str),
+    questions: opt(Schema.Array(ClarifyBatchQuestionWire)),
     request_id: Str
   })
 })
+export type ClarifyBatchQuestionWireDecoded = typeof ClarifyBatchQuestionWire.Type
 const ApprovalRequest = Schema.Struct({
   type: Schema.Literal('approval.request'),
   session_id: opt(Str),
@@ -204,7 +304,34 @@ const VoiceStatus = Schema.Struct({
 const VoiceTranscript = Schema.Struct({
   type: Schema.Literal('voice.transcript'),
   session_id: opt(Str),
-  payload: opt(Schema.Struct({ no_speech_limit: opt(Schema.Boolean), text: opt(Str) }))
+  // `stop_phrase` marks explicit user intent to END the voice chat (a bare
+  // configured stop phrase, spoken or typed — upstream ba13132298). The server
+  // already tore the capture loop down; the client mirrors /voice off and MUST
+  // NOT submit the text as a turn. `typed` distinguishes the prompt.submit
+  // consumption path from a spoken transcript.
+  payload: opt(
+    Schema.Struct({
+      no_speech_limit: opt(Schema.Boolean),
+      stop_phrase: opt(Schema.Boolean),
+      text: opt(Str),
+      typed: opt(Schema.Boolean)
+    })
+  )
+})
+// "Hey Hermes" fired on the gateway's shared listener (upstream 86d5b8b90f):
+// the client opens a fresh session (unless start_new_session:false) and arms
+// voice capture. `profile` routes multi-profile engines — a phrase enrolled by
+// another profile is surfaced, never answered by this process.
+const WakeDetected = Schema.Struct({
+  type: Schema.Literal('wake.detected'),
+  session_id: opt(Str),
+  payload: opt(
+    Schema.Struct({
+      phrase: opt(Str),
+      profile: opt(Schema.NullOr(Str)),
+      start_new_session: opt(Schema.Boolean)
+    })
+  )
 })
 const BrowserProgress = Schema.Struct({
   type: Schema.Literal('browser.progress'),
@@ -272,17 +399,27 @@ const GatewayRecovering = Schema.Struct({
 })
 
 // ── The union ─────────────────────────────────────────────────────────
-export const GatewayEventSchema = Schema.Union([
+// Two nested member groups, ONE tagged union: `toTaggedUnion`'s type-level
+// `Flatten` recursion is depth-linear in tuple length, and one flat 46-member
+// tuple exceeds tsc's instantiation-depth limit (TS2589). Nested unions are
+// explicitly flattened (type AND runtime), so the decoded Type, the tag
+// dispatch, and Option.none skipping are identical to the flat spelling.
+const SessionTurnEvents = Schema.Union([
   GatewayReady,
   SkinChanged,
   SessionInfoEvent,
+  SessionTitle,
   MessageStart,
   MessageDelta,
+  MessageInterim,
   MessageComplete,
+  SessionUsage,
   ReasoningDelta,
   ReasoningAvailable,
   MoaReference,
   MoaAggregating,
+  MoaProgress,
+  MoaPhase,
   ThinkingDelta,
   ToolStart,
   ToolComplete,
@@ -293,13 +430,16 @@ export const GatewayEventSchema = Schema.Union([
   SudoRequest,
   SecretRequest,
   SudoExpire,
-  SecretExpire,
+  SecretExpire
+])
+const ChromeTransportEvents = Schema.Union([
   StatusUpdate,
   NotificationShow,
   NotificationClear,
   BillingStepUpVerification,
   VoiceStatus,
   VoiceTranscript,
+  WakeDetected,
   BrowserProgress,
   BackgroundComplete,
   ReviewSummary,
@@ -316,7 +456,10 @@ export const GatewayEventSchema = Schema.Union([
   GatewayProtocolError,
   GatewayExited,
   GatewayRecovering
-]).pipe(Schema.toTaggedUnion('type'))
+])
+export const GatewayEventSchema = Schema.Union([SessionTurnEvents, ChromeTransportEvents]).pipe(
+  Schema.toTaggedUnion('type')
+)
 
 /** The decoded, typed event. Inferred from the schema — never hand-declared. */
 export type GatewayEvent = typeof GatewayEventSchema.Type

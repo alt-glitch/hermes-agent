@@ -46,6 +46,8 @@ Examples:
     hermes -c                     Resume the most recent session
     hermes -c "my project"        Resume a session by name (latest in lineage)
     hermes --resume <session_id>  Resume a specific session by ID
+    hermes --resume latest        Resume the most recent session (same as -c)
+    hermes --tui --resume latest --in ./dir   Resume ./dir's latest session in the TUI
     hermes setup                  Run setup wizard
     hermes logout                 Clear stored authentication
     hermes auth add <provider>    Add a pooled credential
@@ -147,6 +149,18 @@ def build_top_level_parser():
             "under model.provider — use `hermes setup` or edit the file to change it."
         ),
     )
+    _inherited_flag(
+        parser,
+        "--reasoning",
+        default=None,
+        metavar="LEVEL",
+        help=(
+            "Reasoning effort for this invocation: none, minimal, low, medium, "
+            "high, xhigh, max, or ultra. Overrides agent.reasoning_effort in "
+            "config.yaml for this run only; the persistent level lives there "
+            "(or per-model under agent.reasoning_overrides)."
+        ),
+    )
     parser.add_argument(
         "-t",
         "--toolsets",
@@ -164,8 +178,9 @@ def build_top_level_parser():
         const=True,
         default=None,
         help=(
-            "Resume a previous session by ID or title. With --tui, bare "
-            "--resume (no argument) opens the session picker."
+            "Resume a previous session by ID or title, or pass 'latest' for "
+            "the most recent session (workspace-scoped, like -c with no name). "
+            "With --tui, bare --resume opens the session picker."
         ),
     )
     parser.add_argument(
@@ -173,6 +188,18 @@ def build_top_level_parser():
         action="store_true",
         default=False,
         help="Don't cd into a resumed session's recorded working directory.",
+    )
+    parser.add_argument(
+        "--in",
+        dest="in_dir",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Change into DIR before starting or resuming. Combined with "
+            "'--resume latest' or -c, the most recent session for DIR's "
+            "workspace is picked, and the session stays in DIR (skips the "
+            "recorded-cwd restore)."
+        ),
     )
     parser.add_argument(
         "--continue",
@@ -309,6 +336,17 @@ def build_top_level_parser():
     )
     _inherited_flag(
         chat_parser,
+        "--reasoning",
+        default=argparse.SUPPRESS,
+        metavar="LEVEL",
+        help=(
+            "Reasoning effort for this session: none, minimal, low, medium, "
+            "high, xhigh, max, or ultra. Overrides agent.reasoning_effort for "
+            "this run only (same levels as the /reasoning slash command)."
+        ),
+    )
+    _inherited_flag(
+        chat_parser,
         "-s",
         "--skills",
         action="append",
@@ -347,8 +385,9 @@ def build_top_level_parser():
         const=True,
         default=argparse.SUPPRESS,
         help=(
-            "Resume a previous session by ID (shown on exit). With --tui, "
-            "bare --resume opens the session picker."
+            "Resume a previous session by ID (shown on exit), or 'latest' "
+            "for the most recent session. With --tui, bare --resume opens "
+            "the session picker."
         ),
     )
     chat_parser.add_argument(
@@ -356,6 +395,16 @@ def build_top_level_parser():
         action="store_true",
         default=argparse.SUPPRESS,
         help="Don't cd into a resumed session's recorded working directory.",
+    )
+    chat_parser.add_argument(
+        "--in",
+        dest="in_dir",
+        metavar="DIR",
+        default=argparse.SUPPRESS,
+        help=(
+            "Change into DIR before starting or resuming (scopes "
+            "'--resume latest' / -c lookups to DIR's workspace)."
+        ),
     )
     chat_parser.add_argument(
         "--continue",
@@ -366,6 +415,17 @@ def build_top_level_parser():
         default=argparse.SUPPRESS,
         metavar="SESSION_NAME",
         help="Resume a session by name, or the most recent if no name given",
+    )
+    chat_parser.add_argument(
+        "--create-if-missing",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "With -c/--continue <name>: if no session matches the name, "
+            "create a new session with that title and proceed (instead of "
+            "failing with a not-found error). Programmatic callers that "
+            "want 'send to this named thread, making it if needed'."
+        ),
     )
     chat_parser.add_argument(
         "--worktree",
@@ -396,7 +456,7 @@ def build_top_level_parser():
         type=int,
         default=None,
         metavar="N",
-        help="Maximum tool-calling iterations per conversation turn (default: 90, or agent.max_turns in config)",
+        help="Maximum tool-calling iterations per conversation turn (default: 500, or agent.max_turns in config)",
     )
     _inherited_flag(
         chat_parser,

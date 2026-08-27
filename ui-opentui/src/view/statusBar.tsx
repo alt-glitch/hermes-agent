@@ -3,7 +3,7 @@
  * EVERY width (status chrome v3 — user feedback: "everything left-aligned,
  * all on one line, no random scatter"):
  *
- *   ● model ·effort │ ctx: ██████░░░░░░ 42% · 84k │ cost: $0.41 │ up: 23m │ cmp: 2 │ profile │ mcp: 2 │ …/cwd (branch)
+ *   🔋 82% │ ● model ·effort │ ctx: ██████░░░░░░ 42% · 84k │ cost: $0.41 │ up: 23m │ cmp: 2 │ profile │ mcp: 2 │ project · …/cwd (branch)
  *
  * Design rules (this pass):
  *   - Every segment is LABELED and terse (`ctx:`, `cost:`, `up:`, `cmp:`,
@@ -18,8 +18,10 @@
  *   - Responsive = drop, don't restack: as the terminal narrows, tail segments
  *     drop WHOLE in reverse priority (mcp → bg → profile → cmp → up → cost →
  *     ctx detail collapsing to a bare `ctx: 42%`, then the `⛓ agents` chip) via
- *     the pure, table-tested `statusSegments` ladder. The health dot, model and
- *     ctx % are pinned. Nothing truncates mid-segment, so the row NEVER wraps.
+ *     the pure, table-tested `statusSegments` ladder. The health dot, model,
+ *     the `◉ focus` badge (/focus — reduced-output mode must never be active
+ *     invisibly) and ctx % are pinned. Nothing truncates mid-segment, so the
+ *     row NEVER wraps.
  *
  * A pending update (`info.update_behind > 0`) BORROWS the whole line as a
  * transient notice; it dismisses on Esc or after NOTICE_TTL_MS.
@@ -50,9 +52,10 @@ import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, onCleanup, Show } from 'solid-js'
 
 import { delegationPressure, idleSubagentResumeStatus, type DelegationState } from '../logic/agentStatus.ts'
+import { batteryLabel, type BatteryCategory } from '../logic/battery.ts'
 import type { SessionStore, SubagentInfo } from '../logic/store.ts'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../logic/subagentTree.ts'
-import { truncLeft, truncRight } from '../logic/truncate.ts'
+import { truncLeft, truncRight, truncRightCells } from '../logic/truncate.ts'
 import { useDimensions } from './dimensions.tsx'
 import { elapsedSeconds, useElapsedTick } from './elapsed.ts'
 import { useTheme } from './theme.tsx'
@@ -73,8 +76,8 @@ const NOTICE_TTL_MS = 30_000
 /** Which tail segments are visible at a given column count. Drop order as the
  *  terminal narrows (reverse priority): mcp → bg → profile → cmp → up →
  *  cost → ctxDetail (the bar+token read-out collapses to a bare `ctx: 42%`).
- *  Dot+model and the ctx % are pinned and never gated here; the cwd is gated
- *  by its own leftover-width budget instead. */
+ *  Dot+model, the `◉ focus` badge and the ctx % are pinned and never gated
+ *  here; the cwd is gated by its own leftover-width budget instead. */
 export interface StatusSegments {
   /** Active-background-delegations `⛓ N` chip — survives narrowest (drops last). */
   agents: boolean
@@ -246,6 +249,16 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     const level = cmpLevel(n)
     return level === 'bad' ? theme().color.error : level === 'warn' ? theme().color.warn : theme().color.muted
   }
+  const batteryColorOf = (category: BatteryCategory) =>
+    category === 'good'
+      ? theme().color.statusGood
+      : category === 'warn'
+        ? theme().color.statusWarn
+        : category === 'bad'
+          ? theme().color.statusBad
+          : category === 'critical'
+            ? theme().color.statusCritical
+            : theme().color.muted
 
   const dot = () => (info().running ? '◐' : props.store.state.ready ? '●' : '○')
   const dotColor = () =>
@@ -327,7 +340,11 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     return segs().profile && p && p !== 'default' && p !== 'custom' ? p : ''
   })
   const mcpText = createMemo(() => {
-    const n = info().mcpServers ?? 0
+    // The home catalog contains enabled MCP server names (disabled config
+    // entries are filtered by the gateway). Keep the connected-only session
+    // count as a compatibility fallback for older gateways or a catalog that
+    // has not arrived yet.
+    const n = props.store.state.catalog?.mcp.servers.length ?? info().mcpServers ?? 0
     return segs().mcp && n > 0 ? `mcp: ${n}` : ''
   })
   // `bg: N` — in-flight background-PROMPT tasks (`/bg` → prompt.background,
@@ -371,14 +388,31 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     if (!snap || snap.counts.total === 0) return ''
     return `☑ ${snap.counts.completed}/${snap.counts.total}`
   })
+  // `◉ focus` — the /focus reduced-output badge (Ink StatusRule parity:
+  // flexShrink=0, warn-tinted). PINNED on purpose — never width-gated in the
+  // statusSegments ladder and never truncated: the whole point of the
+  // indicator is that the user can never be in reduced-output mode without
+  // seeing it. It's short + fixed-width, so instead of dropping it the
+  // variable-width tail (resume hint, cwd) budgets around it via baseLeftLen.
+  const focusText = createMemo(() => (props.store.state.focusView ? '◉ focus' : ''))
+  const batteryText = createMemo(() => {
+    const reading = props.store.state.batteryStatus
+    return props.store.state.batteryEnabled && reading?.available ? batteryLabel(reading) : ''
+  })
+  const batteryColor = () => {
+    const reading = props.store.state.batteryStatus
+    return reading ? batteryColorOf(reading.category) : theme().color.muted
+  }
 
   // Fixed/higher-priority left run. The parked-subagent reassurance is
   // variable-width, so it budgets against this real length instead of gaining
   // a brittle fixed-column breakpoint.
   const baseLeftLen = createMemo(() => {
     let len = 1 // dot
+    if (batteryText()) len += batteryText().length + SEP.length
     if (model()) len += 1 + model().length + effort().length
     for (const seg of [
+      focusText(),
       agentsText(),
       todoText(),
       ctxText(),
@@ -397,12 +431,13 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     }
     return len
   })
+  const sessionTitle = () => info().title?.trim() ?? ''
   const resumeHintText = createMemo(() => {
     const active = activeSubagents()
     // Only the registry-backed count can promise an automatic future resume;
     // local rows are a compatibility signal, not proof of parked background work.
     const count = active.source === 'usage' ? active.count : 0
-    const cwdReserve = info().cwd ? SEP.length + CWD_MIN : 0
+    const cwdReserve = sessionTitle() || info().cwd ? SEP.length + CWD_MIN : 0
     const availableCells = dims().width - ROW_PADDING - baseLeftLen() - SEP.length - cwdReserve
     return idleSubagentResumeStatus({
       availableCells,
@@ -418,13 +453,30 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   // and stranded empty space at the right edge. Pinned right with a flex spacer,
   // the dirname + branch hug the edge and only the head clips (truncLeft). Its
   // budget is the row width minus the left run; it drops whole below CWD_MIN.
+  // The session title OWNS the right-tail slot when set (upstream 5a16635f409c
+  // — Ink swaps cwdLabel for a bold accent ` title ` label): a compact,
+  // padded chip on the same leftover budget as the cwd, tail-truncated
+  // (truncRight) so the row can never wrap, dropped whole below CWD_MIN.
+  const titleChip = createMemo(() => {
+    const title = sessionTitle()
+    if (!title) return ''
+    const budget = dims().width - ROW_PADDING - leftLen() - SEP.length
+    if (budget < CWD_MIN) return ''
+    return ` ${truncRightCells(title, budget - 2)} `
+  })
   const cwdText = createMemo(() => {
+    if (sessionTitle()) return '' // the title chip replaces the cwd/project/branch tail
     const cwd = info().cwd
     const c = cwd ? shortCwd(cwd) : ''
     if (!c) return ''
-    const full = info().branch ? `${c} (${info().branch})` : c
+    const cwdBranch = info().branch ? `${c} (${info().branch})` : c
+    const project = info().projectName?.trim() ?? ''
     const budget = dims().width - ROW_PADDING - leftLen() - SEP.length
-    return budget >= CWD_MIN ? truncLeft(full, budget) : ''
+    if (budget < CWD_MIN) return ''
+    if (!project) return truncLeft(cwdBranch, budget)
+    const projectLabel = truncRight(project, budget)
+    const remainder = budget - projectLabel.length - DOT_SEP.length
+    return remainder < CWD_MIN ? projectLabel : `${projectLabel}${DOT_SEP}${truncLeft(cwdBranch, remainder)}`
   })
 
   /** A muted label + value span pair (`cost: $0.41`) with its leading ` │ `. */
@@ -460,11 +512,16 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
         {/* ONE left-flowing text run: dot+model, then the labeled segments in
             priority order, the (pre-truncated) cwd last. No spacers, no pinning. */}
         <text selectable={false} wrapMode="none">
+          <Show when={batteryText()}>
+            <span style={{ fg: batteryColor() }}>{batteryText()}</span>
+            <span style={{ fg: theme().color.border }}>{SEP}</span>
+          </Show>
           <span style={{ fg: dotColor() }}>{dot()}</span>
           <Show when={model()}>
             <span style={{ fg: theme().color.statusFg }}>{` ${model()}`}</span>
             <span style={{ fg: theme().color.muted }}>{effort()}</span>
           </Show>
+          <Seg text={focusText()} fg={theme().color.warn} />
           <Seg text={agentsText()} fg={theme().color.accent} />
           <Seg text={todoText()} fg={theme().color.statusGood} />
           <Show when={ctxText()}>
@@ -495,12 +552,16 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
               after the width-gated tail segments just like Ink's SpawnHud. */}
           <Seg text={spawnHud().text} fg={spawnHudColor()} />
         </text>
-        {/* the cwd is RIGHT-PINNED (F10): a flex spacer eats the slack so the
-            dirname + branch hug the right edge instead of stranding empty navy. */}
-        <Show when={cwdText()}>
+        {/* the right tail is RIGHT-PINNED (F10): a flex spacer eats the slack so
+            the tail hugs the right edge instead of stranding empty navy. When a
+            session title exists, its bold accent label takes the slot;
+            otherwise the muted dirname + branch render as before. */}
+        <Show when={titleChip() || cwdText()}>
           <box style={{ flexGrow: 1 }} />
           <text selectable={false}>
-            <span style={{ fg: theme().color.muted }}>{cwdText()}</span>
+            <Show when={titleChip()} fallback={<span style={{ fg: theme().color.muted }}>{cwdText()}</span>}>
+              <b style={{ fg: theme().color.accent }}>{titleChip()}</b>
+            </Show>
           </text>
         </Show>
       </Show>

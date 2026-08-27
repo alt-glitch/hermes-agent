@@ -27,6 +27,7 @@ import { ThemeProvider } from '../view/theme.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
 interface Harness {
+  history: ReturnType<typeof createPromptHistory>
   probe: RenderProbe
   store: ReturnType<typeof createSessionStore>
   submitted: string[]
@@ -45,8 +46,191 @@ async function mountComposer(opts?: { kitty?: boolean; history?: string[] }): Pr
     ),
     { height: 30, kittyKeyboard: opts?.kitty ?? false, width: 70 }
   )
-  return { probe, store, submitted }
+  return { history, probe, store, submitted }
 }
+
+async function pressDoubleEsc(h: Harness): Promise<void> {
+  h.probe.keys.pressEscape()
+  await h.probe.settle()
+  h.probe.keys.pressEscape()
+  await h.probe.settle()
+}
+
+describe('readline line editing parity', () => {
+  test('Super+Backspace kills to the current line start', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressBackspace({ super: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('one\n')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('Super+Delete kills to line end and joins the next line at EOL', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('DELETE', { super: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('one\n')
+
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('DELETE', { super: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('onetwo')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('Ctrl+K joins the next line at EOL while Ctrl+U stays current-line scoped', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('k', { ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('onetwo')
+
+      h.probe.keys.pressKey('u', { ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('two')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('Ctrl+K on an earlier unequal-length line only joins at that line EOL', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('abcdef')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('xy')
+      h.probe.keys.pressKey('HOME')
+      h.probe.keys.pressKey('HOME')
+      for (let i = 0; i < 4; i++) h.probe.keys.pressArrow('left')
+      h.probe.keys.pressKey('k', { ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('ab\nxy')
+
+      h.probe.keys.pressKey('k', { ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('abxy')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('Ctrl+Backspace and Option+Backspace remain delete-word', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('alpha beta')
+      h.probe.keys.pressBackspace({ ctrl: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('alpha ')
+
+      await h.probe.keys.typeText('gamma')
+      h.probe.keys.pressBackspace({ meta: true })
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('alpha ')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+})
+
+describe('double Escape draft discard', () => {
+  test('discards a non-empty draft, records it first, and Up recalls it', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('recover this draft')
+      await pressDoubleEsc(h)
+      expect(h.store.state.composerDraft).toBe('')
+      expect(h.history.entries()).toEqual(['recover this draft'])
+
+      h.probe.keys.pressArrow('up')
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('recover this draft')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('still discards while a turn is streaming', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      h.store.apply({ type: 'message.start' })
+      await h.probe.keys.typeText('mid-stream draft')
+      await pressDoubleEsc(h)
+      expect(h.store.state.info.running).toBe(true)
+      expect(h.store.state.composerDraft).toBe('')
+      expect(h.history.entries()).toEqual(['mid-stream draft'])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('an EOL Ctrl+K between Esc presses disarms draft discard', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ shift: true })
+      await h.probe.keys.typeText('two')
+      h.probe.keys.pressArrow('up')
+      h.probe.keys.pressEscape()
+      h.probe.keys.pressKey('k', { ctrl: true })
+      h.probe.keys.pressEscape()
+      await h.probe.settle()
+
+      expect(h.store.state.composerDraft).toBe('onetwo')
+      expect(h.history.entries()).toEqual([])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('a kitty repeat Escape is ignored instead of becoming the second press', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('keep until a real second press')
+      h.probe.keys.pressEscape()
+      h.probe.renderer.stdin.emit('data', Buffer.from('\x1b[27;1:2u'))
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('keep until a real second press')
+
+      h.probe.keys.pressEscape()
+      await h.probe.settle()
+      expect(h.store.state.composerDraft).toBe('')
+      expect(h.history.entries()).toEqual(['keep until a real second press'])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('keeps empty-buffer double Escape opening the prompt-history viewer', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      h.store.pushUser('session prompt')
+      await pressDoubleEsc(h)
+      expect(h.store.state.promptHistory).toBe(true)
+    } finally {
+      h.probe.destroy()
+    }
+  })
+})
 
 /** Row index of the first frame line containing `text` (-1 when absent). */
 function rowOf(frame: string, text: string): number {
@@ -108,6 +292,73 @@ describe('shift+enter — kitty protocol inserts a newline', () => {
       await h.probe.keys.typeText('two')
       await h.probe.settle()
       expect(h.submitted).toEqual([]) // Alt+Enter = newline, not the stock submit
+      h.probe.keys.pressEnter()
+      await h.probe.settle()
+      expect(h.submitted).toEqual(['one\ntwo'])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+})
+
+describe('ctrl/cmd+enter — atomic CSI u modified Enter inserts a newline (Ink terminal-setup parity)', () => {
+  // The exact bytes boundary/terminalSetup.ts binds to ctrl+enter / cmd+enter in
+  // VS Code-family terminals. The IDE sends them verbatim via sendSequence, so
+  // these tests feed the raw wire bytes through the stdin parser rather than a
+  // synthetic key event: modifier 5 = ctrl, 9 = super (Cmd), on codepoint 13.
+  const CSI_U_CTRL_ENTER = '\x1b[13;5u'
+  const CSI_U_SUPER_ENTER = '\x1b[13;9u'
+
+  // VS Code's terminal does not negotiate the kitty protocol; the CSI u bytes
+  // arrive on a legacy-mode session. The parser accepts them either way (the
+  // production renderer config keeps CSI u parsing on), pinned here in BOTH modes.
+  for (const kitty of [false, true]) {
+    const label = kitty ? 'kitty' : 'legacy'
+
+    test(`${label}: CSI-u Ctrl+Enter → newline; plain Enter then submits the multi-line text`, async () => {
+      const h = await mountComposer({ kitty })
+      try {
+        await h.probe.keys.typeText('one')
+        h.probe.renderer.stdin.emit('data', Buffer.from(CSI_U_CTRL_ENTER))
+        await h.probe.settle()
+        await h.probe.keys.typeText('two')
+        await h.probe.settle()
+        expect(h.submitted).toEqual([]) // Ctrl+Enter = newline, never a submit
+        h.probe.keys.pressEnter()
+        await h.probe.settle()
+        expect(h.submitted).toEqual(['one\ntwo'])
+      } finally {
+        h.probe.destroy()
+      }
+    })
+
+    test(`${label}: CSI-u Cmd+Enter → newline; plain Enter then submits the multi-line text`, async () => {
+      const h = await mountComposer({ kitty })
+      try {
+        await h.probe.keys.typeText('one')
+        h.probe.renderer.stdin.emit('data', Buffer.from(CSI_U_SUPER_ENTER))
+        await h.probe.settle()
+        await h.probe.keys.typeText('two')
+        await h.probe.settle()
+        expect(h.submitted).toEqual([]) // Cmd+Enter = newline, never a submit
+        h.probe.keys.pressEnter()
+        await h.probe.settle()
+        expect(h.submitted).toEqual(['one\ntwo'])
+      } finally {
+        h.probe.destroy()
+      }
+    })
+  }
+
+  test('kitty: natively-reported Ctrl+Enter inserts a newline too', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('one')
+      h.probe.keys.pressEnter({ ctrl: true })
+      await h.probe.settle()
+      await h.probe.keys.typeText('two')
+      await h.probe.settle()
+      expect(h.submitted).toEqual([])
       h.probe.keys.pressEnter()
       await h.probe.settle()
       expect(h.submitted).toEqual(['one\ntwo'])

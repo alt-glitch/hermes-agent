@@ -1,6 +1,12 @@
+import { colorize } from '@hermes/ink'
 import { describe, expect, it } from 'vitest'
 
-import { canFastAppendShape, canFastBackspaceShape, supportsFastEchoTerminal } from '../components/textInput.js'
+import {
+  canFastAppendShape,
+  canFastBackspaceShape,
+  colorizeEcho,
+  supportsFastEchoTerminal
+} from '../components/textInput.js'
 
 // The fast-echo path bypasses Ink and writes characters directly to stdout
 // for the common case of typing plain English at the end of the line. These
@@ -170,6 +176,35 @@ describe('canFastBackspaceShape', () => {
     // must always pass `columns`; this case is for unit tests of the
     // pre-wrap shape contract.
     expect(canFastBackspaceShape('hello ', 'hello '.length)).toBe(true)
+  })
+})
+
+describe('colorizeEcho', () => {
+  // The fast-echo bypass writes raw cells past Ink, so a themed input must
+  // carry the theme fg explicitly — a default-fg glyph goes invisible when a
+  // skin repaints the background to the opposite polarity (dark skin on a
+  // light terminal ⇒ black-on-black).
+
+  it('matches Ink exactly, never a hand-rolled truecolor escape', () => {
+    // The bypass and the Ink render paint the same cells, so they must agree
+    // byte-for-byte at whatever depth the terminal supports. Hand-rolling
+    // `38;2;r;g;b` shipped an escape a 256-color terminal (Apple Terminal)
+    // cannot parse: the accent fell back to the default fg and read GRAY.
+    // Asserted as an equality rather than a literal because chalk resolves
+    // its depth at import time — under vitest that's level 0 (no color).
+    for (const tone of ['#ff2d95', '#e77fa3', 'ansi256(211)']) {
+      expect(colorizeEcho('x', tone)).toBe(colorize('x', tone, 'foreground'))
+    }
+  })
+
+  it('passes through untouched without a color (unthemed keeps terminal default)', () => {
+    expect(colorizeEcho('x')).toBe('x')
+    expect(colorizeEcho('x', undefined)).toBe('x')
+  })
+
+  it('passes through on a non-color value (never emit a garbage SGR)', () => {
+    expect(colorizeEcho('x', 'red')).toBe('x')
+    expect(colorizeEcho('x', '#fff')).toBe('x')
   })
 })
 

@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest'
 import {
   actionExitBlocked,
   actionModifier,
+  ctrlCAction,
   isActionHotkey,
   isExitHotkey,
   isRedrawHotkey,
@@ -20,6 +21,13 @@ const key = (
 })
 
 describe('platform action hotkeys', () => {
+  test('Ctrl+C clears a draft before interrupting a busy turn', () => {
+    expect(ctrlCAction(true, true)).toBe('clear-draft')
+    expect(ctrlCAction(false, true)).toBe('clear-draft')
+    expect(ctrlCAction(true, false)).toBe('interrupt')
+    expect(ctrlCAction(false, false)).toBe('exit')
+  })
+
   test('redraw is Ctrl+L off macOS and Cmd+L on macOS, never on release', () => {
     expect(isRedrawHotkey(key('l', { ctrl: true }), 'linux')).toBe(true)
     expect(isRedrawHotkey(key('l', { meta: true }), 'linux')).toBe(false)
@@ -55,6 +63,13 @@ describe('platform action hotkeys', () => {
     expect(openTuiHotkeys('linux')).toContainEqual([
       'Enter Enter (empty)',
       'stop the turn / force the next queued message'
+    ])
+    expect(openTuiHotkeys('linux')).toContainEqual(['Cmd/Super+Backspace/Delete', 'kill to current line start / end'])
+    expect(openTuiHotkeys('darwin')).toContainEqual(['Option/Ctrl+Backspace', 'delete word'])
+    expect(openTuiHotkeys('linux')).toContainEqual(['Ctrl+U/K', 'kill to line start / end (repeat across lines)'])
+    expect(openTuiHotkeys('darwin')).toContainEqual([
+      'Esc Esc',
+      'discard draft (recall with ↑) / open prompt history when empty'
     ])
   })
 

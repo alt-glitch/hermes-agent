@@ -30,19 +30,21 @@ from typing import Any, Iterator
 BRANCH = "sid/opentui"
 REMOTE = "origin"
 UPSTREAM_URL = "https://github.com/NousResearch/hermes-agent.git"
-REQUIRED_GATES = frozenset({
-    "opentui-install",
-    "focused-contracts",
-    "opentui-check",
-    "opentui-build",
-    "termctrl-smoke",
-    "adversarial-review",
-    "video-analysis",
-})
+REQUIRED_GATES = frozenset(
+    {
+        "opentui-install",
+        "focused-contracts",
+        "opentui-check",
+        "opentui-build",
+        "termctrl-smoke",
+        "adversarial-review",
+        "video-analysis",
+    }
+)
 SHA_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHORT_SHA_RE = __import__("re").compile(r"^[0-9a-fA-F]{7,40}$")
 GATE_SCHEMA_VERSION = 3
-LEASE_TTL_SECONDS = 6 * 60 * 60
+LEASE_TTL_SECONDS = 11 * 60 * 60
 POST_PUBLISH_LEASE_TTL_SECONDS = 15 * 60
 PACKET_TIMEOUT_SECONDS = 4 * 60 * 60
 WORKER_SLOT_COUNT = 2
@@ -63,13 +65,32 @@ CANONICAL_CODE_GATES = {
     "opentui-check": [str(NPM26), "--prefix", "ui-opentui", "run", "check"],
     "opentui-build": [str(NPM26), "--prefix", "ui-opentui", "run", "build"],
 }
+SHARED_VENV_PYTEST_PREFIX = [
+    "uv",
+    "run",
+    "--no-project",
+    "--python",
+    str(FORK_VENV_PYTHON),
+    "-m",
+    "pytest",
+]
 VIDEO_MODEL = "google/gemini-3.5-flash"
 VIDEO_TAIL_MS = 3_000
 TERMCTRL_READY_HOLD_SECONDS = 1.5
 TERMCTRL_MIN_ACTION_TIMELINE_MS = 1_000
+TERMCTRL_HYDRATION_TIMEOUT_SECONDS = 60
+TERMCTRL_HYDRATION_POLL_SECONDS = 0.25
 VIDEO_ANALYSIS_TIMEOUT_SECONDS = 10 * 60
-REVIEW_TIMEOUT_SECONDS = 15 * 60
-REVIEW_PROMPT_MAX_BYTES = 900_000
+REVIEW_TIMEOUT_SECONDS = 30 * 60
+REVIEW_PROMPT_MAX_BYTES = 350_000
+TRUSTED_FETCH_TIMEOUT_SECONDS = 10 * 60
+TRUSTED_FETCH_ATTEMPTS = 3
+REVIEW_PREREQUISITE_GATES = (
+    "opentui-install",
+    "focused-contracts",
+    "opentui-check",
+    "opentui-build",
+)
 VIDEO_RESULT_PREFIX = b"HERMES_VIDEO_RESULT_B64="
 VIDEO_PROMPT = (
     "Review this Hermes OpenTUI acceptance recording. End with exactly "
@@ -109,6 +130,50 @@ REVIEWER_COMMANDS: dict[tuple[str, str], list[str]] = {
         "--safe-mode",
         "--tools",
         "",
+        "--no-session-persistence",
+        "--output-format",
+        "text",
+    ],
+}
+
+# Chunk reviewers receive only the bounded diff.  The final verifier must be
+# able to resolve provisional findings against the candidate that will ship,
+# but remains strictly read-only: no shell, edits, writes, or agent fan-out.
+REVIEWER_VERIFIER_COMMANDS: dict[tuple[str, str], list[str]] = {
+    ("codex", "gpt-5.6-sol"): [
+        "/home/daimon/.local/bin/codex",
+        "exec",
+        "-s",
+        "read-only",
+        "--skip-git-repo-check",
+        "-m",
+        "gpt-5.6-sol",
+        "-",
+    ],
+    ("claude", "fable-5"): [
+        "/home/daimon/.local/bin/claude",
+        "-p",
+        "--model",
+        "claude-fable-5",
+        "--safe-mode",
+        "--tools",
+        "Read,Grep",
+        "--permission-mode",
+        "dontAsk",
+        "--no-session-persistence",
+        "--output-format",
+        "text",
+    ],
+    ("claude", "opus-4.8"): [
+        "/home/daimon/.local/bin/claude",
+        "-p",
+        "--model",
+        "opus",
+        "--safe-mode",
+        "--tools",
+        "Read,Grep",
+        "--permission-mode",
+        "dontAsk",
         "--no-session-persistence",
         "--output-format",
         "text",
@@ -238,12 +303,14 @@ def run_lock(state_dir: Path) -> Iterator[None]:
             handle.seek(0)
             handle.truncate()
             handle.write(
-                json.dumps({
-                    "pid": os.getpid(),
-                    "acquired_unix": int(time.time()),
-                    "active": False,
-                    "released_unix": int(time.time()),
-                })
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "acquired_unix": int(time.time()),
+                        "active": False,
+                        "released_unix": int(time.time()),
+                    }
+                )
                 + "\n"
             )
             handle.flush()
@@ -316,11 +383,13 @@ def _record_retry_context(
     ):
         artifact = previous / relative
         if artifact.is_file() and not artifact.is_symlink():
-            artifacts.append({
-                "kind": kind,
-                "path": str(artifact.resolve()),
-                "sha256": _file_sha256(artifact),
-            })
+            artifacts.append(
+                {
+                    "kind": kind,
+                    "path": str(artifact.resolve()),
+                    "sha256": _file_sha256(artifact),
+                }
+            )
     if not artifacts:
         return
     _atomic_json(
@@ -412,7 +481,9 @@ def _canonical_json_sha256(value: Any) -> str:
     ).hexdigest()
 
 
-def _derive_run_binding(state_dir: Path, evidence_dir: Path) -> dict[str, Any]:
+def _derive_run_binding(
+    state_dir: Path, evidence_dir: Path, token: str
+) -> dict[str, Any]:
     """Bind a gate to either the scheduled sync or one exact claimed backport."""
     evidence_root = Path(os.path.abspath(evidence_dir))
     with _request_lock(state_dir):
@@ -445,10 +516,44 @@ def _derive_run_binding(state_dir: Path, evidence_dir: Path) -> dict[str, Any]:
     )
     if last_synced is not None and not SHA_RE.fullmatch(last_synced):
         raise ControlError("last synced upstream marker is invalid")
+    context_path = evidence_root / "run-context.json"
+    try:
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError("captured run context is missing or invalid") from exc
+    expected_context = {
+        "schema_version",
+        "run_id",
+        "execution_id",
+        "lease_token_sha256",
+        "base_sha",
+        "upstream_sha",
+    }
+    if not isinstance(context, dict) or set(context) != expected_context:
+        raise ControlError("captured run context has an invalid shape")
+    lease = _lease_value(state_dir)
+    if (
+        context.get("schema_version") != 1
+        or not isinstance(context.get("run_id"), str)
+        or not isinstance(context.get("execution_id"), str)
+        or not context["execution_id"]
+        or context.get("lease_token_sha256")
+        != hashlib.sha256(token.encode()).hexdigest()
+        or lease.get("run_id") != context["run_id"]
+        or lease.get("evidence_dir") != str(evidence_root)
+        or lease.get("captured_base") != context.get("base_sha")
+        or lease.get("captured_upstream") != context.get("upstream_sha")
+        or lease.get("run_context_sha256") != _file_sha256(context_path)
+        or not SHA_RE.fullmatch(str(context.get("base_sha", "")))
+        or not SHA_RE.fullmatch(str(context.get("upstream_sha", "")))
+    ):
+        raise ControlError("captured run context does not match the active lease")
     return {
         "mode": mode,
         "request_sha256": request_sha,
         "last_synced_upstream": last_synced,
+        "captured_upstream": context["upstream_sha"],
+        "captured_base": context["base_sha"],
     }
 
 
@@ -506,9 +611,32 @@ def renew_lease(
             "prepared",
             "published",
             "finalizing",
+            "finalized",
         }:
             ttl_seconds = min(ttl_seconds, POST_PUBLISH_LEASE_TTL_SECONDS)
-        value["expires_unix"] = now + ttl_seconds
+        try:
+            max_expires = int(value.get("max_expires_unix", 0))
+        except (TypeError, ValueError) as exc:
+            raise ControlError("run lease absolute deadline is invalid") from exc
+        if max_expires <= now:
+            raise ControlError("run lease reached its absolute deadline")
+        expires = min(now + ttl_seconds, max_expires)
+        if journal is not None and journal["phase"] in {
+            "prepared",
+            "published",
+            "finalizing",
+            "finalized",
+        }:
+            post_publish_deadline = (
+                int(journal["prepared_unix"]) + POST_PUBLISH_LEASE_TTL_SECONDS
+            )
+            if post_publish_deadline <= now:
+                raise ControlError("post-publish lease reached its fixed deadline")
+            expires = min(
+                expires,
+                post_publish_deadline,
+            )
+        value["expires_unix"] = expires
         _atomic_json(state_dir / "run.lease.json", value)
 
 
@@ -665,7 +793,9 @@ def _is_focused_contract_command(argv: list[str]) -> bool:
     ):
         return False
     pytest_args = None
-    if argv[:3] == ["uv", "run", "pytest"]:
+    if argv[: len(SHARED_VENV_PYTEST_PREFIX)] == SHARED_VENV_PYTEST_PREFIX:
+        pytest_args = argv[len(SHARED_VENV_PYTEST_PREFIX) :]
+    elif argv[:3] == ["uv", "run", "pytest"]:
         pytest_args = argv[3:]
     elif argv[:5] == ["uv", "run", "--with", "pytest", "pytest"]:
         # Fresh detached worktrees do not necessarily have pytest installed in
@@ -673,6 +803,18 @@ def _is_focused_contract_command(argv: list[str]) -> bool:
         # explicit instead of mutating the candidate environment before the
         # trusted gate can run.
         pytest_args = argv[5:]
+    elif argv[:7] == [
+        "uv",
+        "run",
+        "--with",
+        "pytest",
+        "--with",
+        "pytest-asyncio",
+        "pytest",
+    ]:
+        # Async upstream contracts need one additional, fixed plugin. Do not
+        # accept arbitrary repeated --with values at this trust boundary.
+        pytest_args = argv[7:]
     if pytest_args is not None:
         return bool(pytest_args) and any(
             "::" in arg or arg.endswith(".py") or "/tests/" in f"/{arg}"
@@ -711,13 +853,21 @@ def _validate_code_command(gate_id: str, argv: list[str]) -> None:
 
 def _focused_output_proves_execution(argv: list[str], output: str) -> bool:
     plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
-    if argv[:3] == ["uv", "run", "pytest"] or argv[:5] == [
-        "uv",
-        "run",
-        "--with",
-        "pytest",
-        "pytest",
-    ]:
+    if (
+        argv[: len(SHARED_VENV_PYTEST_PREFIX)] == SHARED_VENV_PYTEST_PREFIX
+        or argv[:3] == ["uv", "run", "pytest"]
+        or argv[:5] == ["uv", "run", "--with", "pytest", "pytest"]
+        or argv[:7]
+        == [
+            "uv",
+            "run",
+            "--with",
+            "pytest",
+            "--with",
+            "pytest-asyncio",
+            "pytest",
+        ]
+    ):
         counts = re.findall(r"\b(\d+)\s+(?:passed|failed|xfailed|xpassed)\b", plain)
         return sum(int(value) for value in counts) > 0
     counts = re.findall(r"\bTests\s+(\d+)\s+(?:passed|failed)\b", plain)
@@ -840,7 +990,14 @@ def validate_gate_manifest(
     binding = value.get("run_binding")
     if (
         not isinstance(binding, dict)
-        or set(binding) != {"mode", "request_sha256", "last_synced_upstream"}
+        or set(binding)
+        != {
+            "mode",
+            "request_sha256",
+            "last_synced_upstream",
+            "captured_upstream",
+            "captured_base",
+        }
         or binding.get("mode") not in {"scheduled", "backport"}
     ):
         raise ControlError("gate manifest run binding is invalid")
@@ -993,7 +1150,7 @@ def ship_candidate(
         if current_remote not in {base_sha, candidate_sha}:
             raise ControlError("remote branch moved since base capture")
         if current_remote == base_sha:
-            result = subprocess.run(
+            subprocess.run(
                 [
                     "git",
                     "-C",
@@ -1297,7 +1454,35 @@ def _validate_drive(value: Any) -> tuple[int, int, list[dict[str, Any]], list[st
         raise ControlError("termctrl drive must require visible acceptance text")
     if actions[-1]["wait"] not in required:
         raise ControlError("termctrl final wait text must be required at acceptance")
+    if (
+        actions[0]["send"] != ["text:/help", "enter"]
+        or actions[0]["wait"] != "Available Commands"
+        or not {"Hermes Agent", "Available Commands"}.issubset(required)
+    ):
+        raise ControlError(
+            "termctrl drive must begin with the canonical /help acceptance flow"
+        )
     return cols, rows, actions, required
+
+
+def _wait_for_hydrated_session(
+    session: str,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: float = TERMCTRL_HYDRATION_TIMEOUT_SECONDS,
+) -> str:
+    """Wait for backend hydration, not merely the optimistic ready header."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        visible = _run_termctrl(
+            ["show", session], cwd=cwd, env=env
+        ).stdout.decode("utf-8", errors="replace")
+        starting = "starting session…" in visible or "starting session..." in visible
+        if "Welcome to Hermes Agent!" in visible and not starting:
+            return visible
+        time.sleep(TERMCTRL_HYDRATION_POLL_SECONDS)
+    raise ControlError("OpenTUI did not finish session hydration before smoke actions")
 
 
 def verify_termctrl_drive(
@@ -1362,6 +1547,7 @@ def verify_termctrl_drive(
             cwd=candidate,
             env=child_env,
         )
+        _wait_for_hydrated_session(session, cwd=candidate, env=child_env)
         _run_termctrl(["mark", session, "ready"], cwd=candidate, env=child_env)
         time.sleep(TERMCTRL_READY_HOLD_SECONDS)
         for action in actions:
@@ -1538,13 +1724,15 @@ def _trusted_git_environment(root: Path) -> dict[str, str]:
         if not key.startswith("GIT_")
         and key not in {"HOME", "XDG_CONFIG_HOME", "SSH_AUTH_SOCK"}
     }
-    env.update({
-        "HOME": str(root),
-        "XDG_CONFIG_HOME": str(root / "xdg"),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_TERMINAL_PROMPT": "0",
-    })
+    env.update(
+        {
+            "HOME": str(root),
+            "XDG_CONFIG_HOME": str(root / "xdg"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
     return env
 
 
@@ -1556,7 +1744,9 @@ def _trusted_upstream_tip(repo: Path) -> str:
         bundle = root / "canonical.bundle"
         env = _trusted_git_environment(root)
 
-        def trusted_git(*args: str) -> subprocess.CompletedProcess[str]:
+        def trusted_git(
+            *args: str, timeout_seconds: int = 180
+        ) -> subprocess.CompletedProcess[str]:
             return subprocess.run(
                 [
                     "/usr/bin/git",
@@ -1569,23 +1759,33 @@ def _trusted_upstream_tip(repo: Path) -> str:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=180,
+                timeout=timeout_seconds,
                 env=env,
             )
 
         if trusted_git("init", "--bare", "--template=", str(quarantine)).returncode:
             raise ControlError("could not initialize canonical upstream quarantine")
-        fetched = trusted_git(
-            "-C",
-            str(quarantine),
-            "fetch",
-            "--no-tags",
-            "--force",
-            "--quiet",
-            UPSTREAM_URL,
-            "refs/heads/main:refs/heads/main",
-        )
-        if fetched.returncode != 0:
+        fetched: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(TRUSTED_FETCH_ATTEMPTS):
+            try:
+                fetched = trusted_git(
+                    "-C",
+                    str(quarantine),
+                    "fetch",
+                    "--no-tags",
+                    "--force",
+                    "--quiet",
+                    UPSTREAM_URL,
+                    "refs/heads/main:refs/heads/main",
+                    timeout_seconds=TRUSTED_FETCH_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                fetched = None
+            if fetched is not None and fetched.returncode == 0:
+                break
+            if attempt + 1 < TRUSTED_FETCH_ATTEMPTS:
+                time.sleep(2**attempt)
+        if fetched is None or fetched.returncode != 0:
             raise ControlError("could not resolve canonical upstream main")
         resolved = trusted_git(
             "-C", str(quarantine), "rev-parse", "refs/heads/main^{commit}"
@@ -1612,6 +1812,7 @@ def _review_scope(
     candidate_sha: str,
     expected_mode: str | None = None,
     last_synced_upstream: str | None = None,
+    captured_upstream: str | None = None,
 ) -> dict[str, Any]:
     """Derive the trusted-upstream boundary and fork-owned review ranges."""
     commits = _first_parent_commits(repo, base_sha, candidate_sha)
@@ -1638,10 +1839,26 @@ def _review_scope(
     if any(len(_commit_parents(repo, commit)) != 1 for commit in commits[1:]):
         raise ControlError("post-merge adaptation history must be linear")
     upstream_sha = parents[1]
+    if expected_mode == "scheduled":
+        if not isinstance(captured_upstream, str) or not SHA_RE.fullmatch(
+            captured_upstream
+        ):
+            raise ControlError("scheduled review has no captured upstream snapshot")
+        if upstream_sha != captured_upstream:
+            raise ControlError(
+                "scheduled review merge parent does not match captured upstream snapshot"
+            )
     trusted_tip = _trusted_upstream_tip(repo)
-    if upstream_sha != trusted_tip:
+    # Bind the run to the canonical upstream snapshot captured when integration
+    # began. A later upstream advance belongs to the next run; it must not
+    # starve an otherwise-green candidate. Still fail closed if history was
+    # replaced and the captured commit is no longer canonical.
+    if _git_status(
+        repo,
+        ["merge-base", "--is-ancestor", upstream_sha, trusted_tip],
+    ):
         raise ControlError(
-            "scheduled review merge parent is not canonical upstream main"
+            "scheduled review merge parent is not in canonical upstream main"
         )
     if _git_status(repo, ["merge-base", "--is-ancestor", upstream_sha, base_sha]) == 0:
         raise ControlError(
@@ -1717,6 +1934,33 @@ def _split_diff_patches(diff: bytes) -> list[bytes]:
     return patches
 
 
+def _split_review_patch(patch: bytes, max_bytes: int) -> list[bytes]:
+    """Split one canonical file patch losslessly at line boundaries.
+
+    A mechanical extraction can make a single file patch larger than a
+    reviewer's practical prompt budget.  The canonical range hash remains the
+    integrity proof; these segments are only a transport framing, and must
+    concatenate byte-for-byte back to the original patch.
+    """
+    if max_bytes <= 0:
+        raise ControlError("review segment budget must be positive")
+    segments: list[bytes] = []
+    start = 0
+    while start < len(patch):
+        end = min(start + max_bytes, len(patch))
+        if end < len(patch):
+            newline = patch.rfind(b"\n", start, end)
+            if newline >= start:
+                end = newline + 1
+        if end <= start:
+            end = min(start + max_bytes, len(patch))
+        segments.append(patch[start:end])
+        start = end
+    if b"".join(segments) != patch:
+        raise ControlError("review patch segmentation was not lossless")
+    return segments or [b""]
+
+
 def _review_chunks(
     repo: Path, scope: dict[str, Any]
 ) -> tuple[list[bytes], list[dict[str, Any]]]:
@@ -1726,28 +1970,37 @@ def _review_chunks(
     for label, before, after in scope["ranges"]:
         canonical = _canonical_range_diff(repo, before, after)
         patches = _split_diff_patches(canonical)
+        segmented = [
+            _split_review_patch(patch, REVIEW_PROMPT_MAX_BYTES - 1024)
+            for patch in patches
+        ]
         range_hash = hashlib.sha256(canonical).hexdigest()
-        ranges.append({
-            "label": label,
-            "before": before,
-            "after": after,
-            "patches": len(patches),
-            "diff_bytes": len(canonical),
-            "diff_sha256": range_hash,
-        })
-        for patch_index, diff in enumerate(patches, start=1):
-            framed = (
-                f"\n--- SCOPE {label} PATCH {patch_index}/{len(patches)} ---\n".encode()
-                + diff
-            )
-            if len(framed) > REVIEW_PROMPT_MAX_BYTES:
-                raise ControlError(
-                    f"single review patch exceeds the bounded reviewer limit: {label}"
+        ranges.append(
+            {
+                "label": label,
+                "before": before,
+                "after": after,
+                "patches": len(patches),
+                "segments": sum(len(parts) for parts in segmented),
+                "diff_bytes": len(canonical),
+                "diff_sha256": range_hash,
+            }
+        )
+        for patch_index, parts in enumerate(segmented, start=1):
+            for segment_index, diff in enumerate(parts, start=1):
+                framed = (
+                    f"\n--- SCOPE {label} PATCH {patch_index}/{len(patches)} "
+                    f"SEGMENT {segment_index}/{len(parts)} ---\n".encode()
+                    + diff
                 )
-            if current and len(current) + len(framed) > REVIEW_PROMPT_MAX_BYTES:
-                chunks.append(bytes(current))
-                current.clear()
-            current.extend(framed)
+                if len(framed) > REVIEW_PROMPT_MAX_BYTES:
+                    raise ControlError(
+                        f"review segment exceeds the bounded reviewer limit: {label}"
+                    )
+                if current and len(current) + len(framed) > REVIEW_PROMPT_MAX_BYTES:
+                    chunks.append(bytes(current))
+                    current.clear()
+                current.extend(framed)
     if current:
         chunks.append(bytes(current))
     if not chunks:
@@ -1777,6 +2030,61 @@ def _run_reviewer(
     return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
+def _verified_review_gate_evidence(
+    evidence_root: Path, checks: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Authenticate the deterministic checks supplied to final synthesis."""
+    if not isinstance(checks, list) or len(checks) != len(REVIEW_PREREQUISITE_GATES):
+        raise ControlError("review requires all preceding deterministic gates")
+    verified: list[dict[str, Any]] = []
+    required_keys = {
+        "id",
+        "argv",
+        "exit_code",
+        "status",
+        "output_path",
+        "output_sha256",
+    }
+    gate_logs = Path(os.path.abspath(evidence_root / "gate-logs"))
+    for expected_id, check in zip(REVIEW_PREREQUISITE_GATES, checks, strict=True):
+        if not isinstance(check, dict) or set(check) != required_keys:
+            raise ControlError("review gate evidence has an invalid shape")
+        gate_id = check.get("id")
+        if gate_id != expected_id:
+            raise ControlError("review gate evidence is missing or out of order")
+        if (
+            check.get("status") != "passed"
+            or check.get("exit_code") != 0
+            or not isinstance(check.get("argv"), list)
+            or not all(isinstance(value, str) for value in check["argv"])
+        ):
+            raise ControlError("review received an unproven deterministic gate")
+        _validate_code_command(gate_id, check["argv"])
+        path = _evidence_path(
+            check.get("output_path"), evidence_root, label=f"{gate_id} output"
+        )
+        digest = check.get("output_sha256")
+        if path.parent != gate_logs or path.name != f"{gate_id}.log":
+            raise ControlError("review gate evidence used a noncanonical output path")
+        if (
+            not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or _file_sha256(path) != digest
+        ):
+            raise ControlError("review gate evidence hash mismatch")
+        command_sha256 = hashlib.sha256(
+            json.dumps(check["argv"], separators=(",", ":")).encode()
+        ).hexdigest()
+        verified.append({
+            "id": gate_id,
+            "exit_code": 0,
+            "status": "passed",
+            "output_sha256": digest,
+            "command_sha256": command_sha256,
+        })
+    return verified
+
+
 def run_adversarial_review(
     reviewer: Any,
     evidence_root: Path,
@@ -1786,21 +2094,26 @@ def run_adversarial_review(
     *,
     expected_mode: str | None = None,
     last_synced_upstream: str | None = None,
+    captured_upstream: str | None = None,
+    verified_checks: list[dict[str, Any]],
 ) -> dict[str, Any]:
     if not isinstance(reviewer, dict) or set(reviewer) != {"tool", "model"}:
         raise ControlError("adversarial review must select an allowlisted reviewer")
     key = (reviewer.get("tool"), reviewer.get("model"))
     template = REVIEWER_COMMANDS.get(key)
-    if template is None:
+    verifier_template = REVIEWER_VERIFIER_COMMANDS.get(key)
+    if template is None or verifier_template is None:
         raise ControlError("adversarial reviewer tool/model is not allowlisted")
-    if not Path(template[0]).is_file():
+    if not Path(template[0]).is_file() or not Path(verifier_template[0]).is_file():
         raise ControlError("allowlisted adversarial reviewer executable is unavailable")
+    gate_evidence = _verified_review_gate_evidence(evidence_root, verified_checks)
     scope = _review_scope(
         repo,
         base_sha,
         candidate_sha,
         expected_mode=expected_mode,
         last_synced_upstream=last_synced_upstream,
+        captured_upstream=captured_upstream,
     )
     chunks, ranges = _review_chunks(repo, scope)
     scope_hash = hashlib.sha256(
@@ -1825,9 +2138,12 @@ def run_adversarial_review(
                 f"REVIEW_MODE: {scope['mode']}\nREVIEW_SCOPE_SHA256: {scope_hash}\n"
                 f"CHUNK: {index}/{len(chunks)}\n"
                 "Trusted upstream commits are not reproduced here. The runtime proved the exact merge topology and derived the conflict-resolution baseline with git merge-tree.\n"
+                "This reviewer process intentionally has no filesystem, shell, or agent tools. The bounded exact diff below is the complete review input for this chunk. Review it directly: do not ask to run commands, inspect the tree, or defer the verdict to a later turn.\n"
+                "Perform the review directly in this process. Do not spawn, delegate to, or invoke other Codex, Claude, or agent processes; the parent maintainer already bounded this review and recursive fan-out violates the gate's resource budget.\n"
                 "Find correctness, race, security, UX, and test-fidelity defects. Do not modify files.\n"
-                "For every release-blocking issue emit a line beginning exactly BLOCKER:.\n"
-                "The final non-empty output line must be exactly VERDICT: APPROVED only when no blocker remains; otherwise VERDICT: REJECTED.\n"
+                "This is one ordered slice of a multi-range delta. A later slice may intentionally repair code shown here, so report precise provisional findings but do not issue the release verdict yet.\n"
+                "For every possible release-blocking issue emit a line beginning exactly CANDIDATE_BLOCKER:.\n"
+                "The final non-empty output line must be exactly CHUNK_REVIEW: COMPLETE.\n"
                 "--- BEGIN BOUNDED EXACT DIFF ---\n"
             ).encode()
             + chunk
@@ -1849,15 +2165,55 @@ def run_adversarial_review(
             stdout_path.write_bytes(b"\n".join(stdout_parts))
             stderr_path.write_bytes(b"\n".join(stderr_parts))
             raise ControlError("adversarial reviewer exited unsuccessfully")
-        if not lines or lines[-1] != "VERDICT: APPROVED" or "BLOCKER:" in output:
+        if not lines or lines[-1] != "CHUNK_REVIEW: COMPLETE":
             stdout_path.write_bytes(b"\n".join(stdout_parts))
             stderr_path.write_bytes(b"\n".join(stderr_parts))
-            raise ControlError("adversarial review did not approve the candidate")
+            raise ControlError("adversarial chunk review was incomplete")
+
+    gate_evidence_json = json.dumps(gate_evidence, sort_keys=True, indent=2).encode()
+    candidate_before = _worktree_proof(repo, candidate_sha)
+    synthesis = (
+        "Issue the final release verdict for the complete ordered fork sync delta.\n"
+        f"BASE_SHA: {base_sha}\nCANDIDATE_SHA: {candidate_sha}\n"
+        f"REVIEW_MODE: {scope['mode']}\nREVIEW_SCOPE_SHA256: {scope_hash}\n"
+        "Your cwd is the clean, candidate-bound worktree at CANDIDATE_SHA. You have read-only Read/Grep tools solely to verify provisional findings against the final candidate. Do not use shell, network, writes, edits, or agent delegation.\n"
+        f"CANDIDATE_TREE_SHA: {candidate_before['tree_sha']}\n"
+        "The runtime authenticated the deterministic gate records below by re-reading each canonical in-root log and matching its SHA-256. Only safe hashes and statuses are included; do not seek or read gate logs. Treat a passed gate as authoritative evidence that its allowlisted command completed successfully.\n"
+        "Ranges and chunks are ordered. The conflict-resolution range compares a synthetic conflicted merge tree to the resolved merge commit: lines prefixed '-' are removed from the resolved candidate and MUST NOT be reported as retained conflict markers or live code. A later fork-adaptation slice may repair an earlier finding.\n"
+        "Investigate every provisional CANDIDATE_BLOCKER with Read/Grep in the final candidate. Reject only a concrete release blocker proven to remain at an exact final-candidate path. Hypothetical, conditional, stale, or unverified concerns are not blockers.\n"
+        "Do not modify files.\n"
+        "For every release-blocking issue that remains in the final candidate emit a line beginning exactly BLOCKER:.\n"
+        "The final non-empty output line must be exactly VERDICT: APPROVED only when no blocker remains; otherwise VERDICT: REJECTED.\n"
+        "--- BEGIN AUTHENTICATED DETERMINISTIC GATE EVIDENCE ---\n"
+    ).encode() + gate_evidence_json + (
+        "\n--- END AUTHENTICATED DETERMINISTIC GATE EVIDENCE ---\n"
+        "--- BEGIN ORDERED CHUNK REVIEWS ---\n"
+    ).encode() + b"\n".join(stdout_parts) + b"\n--- END ORDERED CHUNK REVIEWS ---\n"
+    if len(synthesis) > REVIEW_PROMPT_MAX_BYTES:
+        stdout_path.write_bytes(b"\n".join(stdout_parts))
+        stderr_path.write_bytes(b"\n".join(stderr_parts))
+        raise ControlError("review synthesis exceeds the bounded reviewer limit")
+    prompt_hashes.append(hashlib.sha256(synthesis).hexdigest())
+    verifier_argv = list(verifier_template)
+    result = _run_reviewer(verifier_argv, synthesis, repo)
+    candidate_after = _worktree_proof(repo, candidate_sha)
+    if candidate_after["tree_sha"] != candidate_before["tree_sha"]:
+        raise ControlError("candidate changed during adversarial review synthesis")
+    stdout_parts.append(b"--- SYNTHESIS ---\n" + result.stdout)
+    stderr_parts.append(b"--- SYNTHESIS ---\n" + result.stderr)
     stdout_path.write_bytes(b"\n".join(stdout_parts))
     stderr_path.write_bytes(b"\n".join(stderr_parts))
+    output = result.stdout.decode("utf-8", errors="replace")
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if result.returncode != 0:
+        raise ControlError("adversarial review synthesis exited unsuccessfully")
+    if not lines or lines[-1] != "VERDICT: APPROVED" or "BLOCKER:" in output:
+        raise ControlError("adversarial review did not approve the candidate")
     return {
         "reviewer": {"tool": key[0], "model": key[1]},
-        "argv": argv,
+        "argv": verifier_argv,
+        "chunk_argv": argv,
+        "verifier_argv": verifier_argv,
         "base_sha": base_sha,
         "candidate_sha": candidate_sha,
         "review_mode": scope["mode"],
@@ -1867,7 +2223,10 @@ def run_adversarial_review(
         "review_ranges": ranges,
         "review_scope_sha256": scope_hash,
         "chunk_count": len(chunks),
+        "review_call_count": len(chunks) + 1,
         "prompt_sha256": prompt_hashes,
+        "verified_gate_evidence": gate_evidence,
+        "candidate_tree_sha": candidate_before["tree_sha"],
         "verdict": "approved",
         "stdout_path": str(stdout_path),
         "stdout_sha256": _file_sha256(stdout_path),
@@ -2126,10 +2485,19 @@ def run_gate(
             "mode": "backport",
             "request_sha256": None,
             "last_synced_upstream": None,
+            "captured_upstream": None,
+            "captured_base": None,
         }
     if (
         not isinstance(run_binding, dict)
-        or set(run_binding) != {"mode", "request_sha256", "last_synced_upstream"}
+        or set(run_binding)
+        != {
+            "mode",
+            "request_sha256",
+            "last_synced_upstream",
+            "captured_upstream",
+            "captured_base",
+        }
         or run_binding.get("mode") not in {"scheduled", "backport"}
     ):
         raise ControlError("gate run binding is invalid")
@@ -2161,14 +2529,16 @@ def run_gate(
                 f"skipped: prerequisite gate {failed_gate} failed\n",
                 encoding="utf-8",
             )
-            recorded.append({
-                "id": gate_id,
-                "argv": argv,
-                "exit_code": 125,
-                "status": "skipped",
-                "output_path": str(output_path),
-                "output_sha256": _file_sha256(output_path),
-            })
+            recorded.append(
+                {
+                    "id": gate_id,
+                    "argv": argv,
+                    "exit_code": 125,
+                    "status": "skipped",
+                    "output_path": str(output_path),
+                    "output_sha256": _file_sha256(output_path),
+                }
+            )
             continue
         if gate_id in {"termctrl-smoke", "video-analysis", "adversarial-review"}:
             try:
@@ -2208,6 +2578,8 @@ def run_gate(
                         candidate_sha,
                         expected_mode=run_binding["mode"],
                         last_synced_upstream=run_binding["last_synced_upstream"],
+                        captured_upstream=run_binding["captured_upstream"],
+                        verified_checks=recorded,
                     )
                     review_evidence = details
                     argv = details["argv"]
@@ -2261,14 +2633,16 @@ def run_gate(
                     returncode = 1
                     with output_path.open("a", encoding="utf-8") as handle:
                         handle.write("runtime: no executed focused test was proven\n")
-        recorded.append({
-            "id": gate_id,
-            "argv": argv,
-            "exit_code": returncode,
-            "status": "passed" if returncode == 0 else "failed",
-            "output_path": str(output_path),
-            "output_sha256": _file_sha256(output_path),
-        })
+        recorded.append(
+            {
+                "id": gate_id,
+                "argv": argv,
+                "exit_code": returncode,
+                "status": "passed" if returncode == 0 else "failed",
+                "output_path": str(output_path),
+                "output_sha256": _file_sha256(output_path),
+            }
+        )
         if returncode != 0:
             failed_gate = gate_id
     after_raw = _worktree_proof(cwd, candidate_sha)
@@ -2312,7 +2686,9 @@ def gate_and_ship(
     branch: str = BRANCH,
 ) -> dict[str, Any]:
     """Run every gate and immediately publish by remote CAS in one invocation."""
-    run_binding = _derive_run_binding(state_dir, manifest_path.parent)
+    run_binding = _derive_run_binding(state_dir, manifest_path.parent, token)
+    if run_binding["captured_base"] != base_sha:
+        raise ControlError("gate base does not match captured fork snapshot")
     result = run_gate(
         packet_path,
         manifest_path,
@@ -2379,7 +2755,23 @@ def finalize_success(
         final_path = evidence_root / "success-finalization.json"
         if not final_path.is_file():
             raise ControlError("finalized publication is missing success evidence")
-        return json.loads(final_path.read_text(encoding="utf-8"))
+        result = json.loads(final_path.read_text(encoding="utf-8"))
+        upstream_sha = journal["upstream_sha"]
+        if isinstance(upstream_sha, str):
+            _atomic_text(state_dir / "last_synced_upstream.sha", upstream_sha + "\n")
+        _record_run_outcome(
+            state_dir,
+            evidence_root,
+            {
+                "status": "success",
+                "stage": "finalized",
+                "base_sha": journal["base_sha"],
+                "candidate_sha": journal["candidate_sha"],
+                "upstream_sha": upstream_sha,
+                "published": True,
+            },
+        )
+        return result
     current_remote = _remote_sha(repo, remote, branch)
     if current_remote != candidate_sha:
         raise ControlError("remote branch does not match the published candidate")
@@ -2401,12 +2793,15 @@ def finalize_success(
     recorded_cwd = Path(journal["worktree"]).resolve()
     resolved_cwd = cwd.resolve()
     temp_root = Path(tempfile.gettempdir()).resolve()
-    managed_root = MAINTAINER_WORKTREE_ROOT.resolve()
+    managed_roots = {
+        MAINTAINER_WORKTREE_ROOT.resolve(),
+        (state_dir / "worktrees").resolve(),
+    }
     is_scratch_worktree = resolved_cwd.is_relative_to(
         temp_root
     ) and resolved_cwd.name.startswith("opentui-maint-")
     is_managed_worktree = (
-        resolved_cwd.parent == managed_root and resolved_cwd.name.startswith("sync-")
+        resolved_cwd.parent in managed_roots and resolved_cwd.name.startswith("sync-")
     )
     if (
         resolved_cwd != recorded_cwd
@@ -2463,6 +2858,17 @@ def finalize_success(
         "worktree_removed": worktree_removed,
         "upstream_sha": upstream_sha,
     }
+    if isinstance(upstream_sha, str):
+        _atomic_text(state_dir / "last_synced_upstream.sha", upstream_sha + "\n")
+    _atomic_json(evidence_root / "success-finalization.json", result)
+    _atomic_json(
+        _journal_path(state_dir),
+        {**journal, "phase": "finalized", "finalized_unix": int(time.time())},
+    )
+    # The terminal outcome is the final durable commit. Reconciliation can
+    # reconstruct it from the finalized journal and success evidence after a
+    # crash at any earlier point, but must never release a lease for a partial
+    # success transaction.
     _record_run_outcome(
         state_dir,
         evidence_root,
@@ -2474,13 +2880,6 @@ def finalize_success(
             "upstream_sha": upstream_sha,
             "published": True,
         },
-    )
-    if isinstance(upstream_sha, str):
-        _atomic_text(state_dir / "last_synced_upstream.sha", upstream_sha + "\n")
-    _atomic_json(evidence_root / "success-finalization.json", result)
-    _atomic_json(
-        _journal_path(state_dir),
-        {**journal, "phase": "finalized", "finalized_unix": int(time.time())},
     )
     return result
 
@@ -2583,6 +2982,132 @@ def finalize_failure(
     )
 
 
+def _bound_terminal_outcome(state_dir: Path, evidence_dir: Path) -> dict[str, Any]:
+    evidence_root = Path(os.path.abspath(evidence_dir))
+    outcome_path = evidence_root / "run-outcome.json"
+    if not outcome_path.is_file() or outcome_path.is_symlink():
+        raise ControlError("run outcome is missing")
+    try:
+        outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+        durable = json.loads((state_dir / "last-run.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError("run outcome is invalid") from exc
+    if not isinstance(outcome, dict) or outcome.get("status") not in {
+        "success",
+        "failed",
+    }:
+        raise ControlError("run outcome is not terminal")
+    if (
+        not isinstance(durable, dict)
+        or durable.get("evidence_path") != str(outcome_path)
+        or durable.get("evidence_sha256") != _file_sha256(outcome_path)
+        or durable.get("status") != outcome.get("status")
+    ):
+        raise ControlError("run outcome is not bound to durable state")
+    if outcome.get("status") == "success":
+        journal = _load_publish_journal(state_dir)
+        final_path = evidence_root / "success-finalization.json"
+        if (
+            journal is None
+            or journal.get("phase") != "finalized"
+            or Path(journal["evidence_dir"]).resolve() != evidence_root.resolve()
+            or not final_path.is_file()
+        ):
+            raise ControlError("success outcome is not fully finalized")
+        upstream_sha = outcome.get("upstream_sha")
+        if isinstance(upstream_sha, str):
+            marker = state_dir / "last_synced_upstream.sha"
+            if (
+                not marker.is_file()
+                or marker.read_text(encoding="utf-8").strip() != upstream_sha
+            ):
+                raise ControlError("success upstream marker is not finalized")
+    return outcome
+
+
+def release_completed_lease(
+    state_dir: Path, evidence_dir: Path, token: str
+) -> dict[str, Any]:
+    outcome = _bound_terminal_outcome(state_dir, evidence_dir)
+    release_lease(state_dir, token)
+    return outcome
+
+
+def reconcile_run(
+    state_dir: Path,
+    evidence_dir: Path,
+    *,
+    token: str,
+    allow_expired: bool = False,
+) -> dict[str, Any]:
+    """Deterministically close a run after its Hermes parent has exited."""
+    evidence_root = Path(os.path.abspath(evidence_dir))
+    if allow_expired:
+        with _lease_lock(state_dir):
+            lease = _lease_value(state_dir)
+            if lease.get("token") != token:
+                raise ControlError("run lease token changed before stale recovery")
+            try:
+                expires = int(lease.get("expires_unix", 0))
+            except (TypeError, ValueError) as exc:
+                raise ControlError("stale run lease expiry is invalid") from exc
+            if expires > int(time.time()):
+                raise ControlError("stale recovery requires an expired lease")
+            if (
+                lease.get("run_id") != evidence_root.name
+                or lease.get("evidence_dir") != str(evidence_root)
+            ):
+                raise ControlError("stale run lease is not bound to this evidence")
+    else:
+        validate_lease(state_dir, token)
+
+    outcome_path = evidence_root / "run-outcome.json"
+    journal = _load_publish_journal(state_dir)
+    journal_matches = (
+        journal is not None
+        and Path(journal["evidence_dir"]).resolve() == evidence_root.resolve()
+        and journal["phase"] in {"prepared", "published", "finalizing", "finalized"}
+    )
+    if outcome_path.is_file() and not outcome_path.is_symlink():
+        try:
+            return release_completed_lease(state_dir, evidence_root, token)
+        except ControlError:
+            # A success outcome written by an older/interrupted runtime is not
+            # terminal authority until the publication journal is finalized.
+            # Continue through journal recovery instead of releasing the lease.
+            if not journal_matches:
+                raise
+
+    if (
+        journal_matches
+        and journal is not None
+    ):
+        repo = Path(journal["repo"])
+        remote_sha = _remote_sha(repo, journal["remote"], journal["branch"])
+        if remote_sha == journal["candidate_sha"]:
+            result = finalize_success(
+                repo,
+                Path(journal["manifest_path"]),
+                state_dir=state_dir,
+                evidence_dir=evidence_root,
+                cwd=Path(journal["worktree"]),
+                token=token,
+                remote=journal["remote"],
+                branch=journal["branch"],
+            )
+            release_lease(state_dir, token)
+            return {"status": "success", **result}
+
+    outcome = finalize_failure(
+        state_dir,
+        evidence_root,
+        stage="external",
+        reason_code="external-blocker",
+    )
+    release_lease(state_dir, token)
+    return outcome
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2619,11 +3144,17 @@ def _parser() -> argparse.ArgumentParser:
     packet.add_argument("--token", required=True)
     release = sub.add_parser("release-lease")
     release.add_argument("--state", type=Path, required=True)
+    release.add_argument("--evidence", type=Path, required=True)
     release.add_argument("--token", required=True)
     renew = sub.add_parser("renew-lease")
     renew.add_argument("--state", type=Path, required=True)
     renew.add_argument("--token", required=True)
     publish = sub.add_parser("gate-and-ship")
+    reconcile = sub.add_parser("reconcile-run")
+    reconcile.add_argument("--state", type=Path, required=True)
+    reconcile.add_argument("--evidence", type=Path, required=True)
+    reconcile.add_argument("--token", required=True)
+    reconcile.add_argument("--allow-expired", action="store_true")
     publish.add_argument("--state", type=Path, required=True)
     publish.add_argument("--token", required=True)
     publish.add_argument("--packet", type=Path, required=True)
@@ -2721,9 +3252,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "renew-lease":
         renew_lease(args.state, args.token)
         return 0
+    if args.command == "reconcile-run":
+        with run_lock(args.state):
+            result = reconcile_run(
+                args.state,
+                args.evidence,
+                token=args.token,
+                allow_expired=args.allow_expired,
+            )
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "release-lease":
         with run_lock(args.state):
-            release_lease(args.state, args.token)
+            release_completed_lease(args.state, args.evidence, args.token)
         return 0
     raise ControlError("unknown runtime command")
 

@@ -1,5 +1,5 @@
 /**
- * Terminal billing — the SOLID-side RPC + error-mapping logic (mirrors Ink
+ * Remote Spending / billing — the SOLID-side RPC + error-mapping logic (mirrors Ink
  * `app/slash/commands/billing.ts`). Plain functions; the slash opener injects a
  * Promise-returning `request` (the gateway RPC), `pushSystem` (transcript
  * lines), `confirm` (the step-up Y/N), and `sessionId`.
@@ -33,6 +33,8 @@ export interface BillingHost {
 }
 
 interface BillingErrorEnvelope {
+  actor?: string
+  code?: string
   error?: string
   message?: string
   payload?: BillingErrorPayload
@@ -47,15 +49,52 @@ function renderBillingError(host: BillingHost, env: BillingErrorEnvelope): void 
 
   switch (env.error) {
     case 'insufficient_scope':
-      armStepUp(host)
-      return
+      sys('This needs Remote Spending allowed. Start a top-up to allow it, then retry.')
+      break
+    case 'remote_spending_revoked':
+      sys(
+        env.actor === 'admin'
+          ? 'An admin stopped remote spending for this terminal. Reconnect with /portal to restore it.'
+          : 'You stopped remote spending for this terminal. Reconnect with /portal to restore it.'
+      )
+      break
+    case 'session_revoked':
+      sys('Your session was logged out. Run /portal to log in again.')
+      break
     case 'no_payment_method':
       sys(
         '💳 No saved card for terminal charges yet. Set one up on the portal (one-time credit buys don’t save a reusable card).'
       )
       break
     case 'cli_billing_disabled':
-      sys('🔴 Terminal billing is turned off for this org — an admin must enable it on the portal.')
+    case 'remote_spending_disabled':
+      sys(
+        "🔴 Remote spending is off for this account — a billing admin can turn it on from the portal's Hermes Agent page."
+      )
+      break
+    case 'role_required':
+      sys('Adding funds needs someone with billing permissions (owner, admin, or finance admin).')
+      break
+    case 'consent_required':
+      sys('This action needs a one-time card confirmation and consent step on the portal before it can proceed.')
+      break
+    case 'org_access_denied':
+      sys("This token isn't bound to an org you can manage. Sign in with the right org, or manage this on the portal.")
+      break
+    case 'upgrade_cap_exceeded':
+      sys('🔴 Daily plan-change limit reached (5 per org) — try again tomorrow, or manage this on the portal.')
+      break
+    case 'auto_top_up_disabled_failures':
+      sys(
+        'Auto-reload was turned off after repeated charge failures. Fix the card issue, then re-enable it from /topup → Auto-reload.'
+      )
+      break
+    case 'idempotency_conflict':
+      sys('🔴 That charge key was already used for a different amount. Start a fresh top-up.')
+      break
+    case 'stripe_unavailable':
+    case 'temporarily_unavailable':
+      sys('🟡 Billing is temporarily unavailable — try again shortly. This isn’t a payment failure.')
       break
     case 'monthly_cap_exceeded': {
       const remaining = env.payload?.remainingUsd
@@ -76,48 +115,6 @@ function renderBillingError(host: BillingHost, env: BillingErrorEnvelope): void 
   }
 
   if (portal) sys(`Portal: ${portal}`)
-}
-
-/** 403 insufficient_scope → arm a confirm that runs the lazy step-up device flow. */
-function armStepUp(host: BillingHost): void {
-  const sys = host.pushSystem
-  sys('💳 Terminal billing needs an extra permission (billing:manage).')
-  host.confirm('Grant terminal billing access? An org admin/owner must allow terminal billing in the portal.', () => {
-    // session_id lets the gateway route the verification link back to this
-    // session (the device flow runs headless in the gateway).
-    host
-      .request('billing.step_up', { session_id: host.sessionId() })
-      .then(raw => {
-        const r = raw as BillingMutationResponse
-        if (r.ok && r.granted) {
-          sys('✅ Billing permission granted.')
-          // Step-up grants the TOKEN scope only; the ORG kill-switch is a
-          // separate gate. Re-fetch /state so we don't over-promise "enabled".
-          host
-            .request('billing.state', {})
-            .then(sraw => {
-              const s = sraw as BillingStateResponse
-              if (s.cli_billing_enabled) {
-                sys('Run /billing again to continue.')
-              } else {
-                sys(
-                  '🟡 Permission granted, but terminal billing is still turned off for this org. Enable it in the portal, then run /billing again.'
-                )
-                if (s.portal_url) sys(`Portal: ${s.portal_url}`)
-              }
-            })
-            .catch(() => sys('Run /billing again to continue.'))
-        } else {
-          sys('🟡 Terminal billing was not granted (an admin must allow it).')
-        }
-      })
-      .catch(() => {
-        // The device flow can outlive the RPC timeout while the user authorizes
-        // in the browser. A reject here is NOT a hard failure — the grant (if it
-        // lands) is persisted gateway-side; tell the user to re-run.
-        sys('🟡 Still waiting on approval — finish in the browser, then run /billing again.')
-      })
-  })
 }
 
 function renderChargeFailed(host: BillingHost, reason?: string | null, portalUrl?: string | null): void {
@@ -169,14 +166,14 @@ function pollCharge(host: BillingHost, chargeId: string, portalUrl?: string | nu
         // pending → keep polling until the 5-min cap, then call it a timeout.
         if (Date.now() - start >= POLL_CAP_MS) {
           sys(
-            '🟡 Still processing after 5 minutes — this is a timeout, not a failure. Check /billing or the portal shortly.'
+            '🟡 Still processing after 5 minutes — this is a timeout, not a failure. Check /topup or the portal shortly.'
           )
           if (portalUrl) sys(`Portal: ${portalUrl}`)
           return
         }
         setTimeout(tick, POLL_INTERVAL_MS)
       })
-      .catch(() => sys('🔴 Could not check the charge (request failed).'))
+      .catch(() => sys('🟡 Your last charge’s outcome is unconfirmed — check your balance/history before retrying.'))
   }
 
   tick()
@@ -218,16 +215,27 @@ export function buildBillingCtx(host: BillingHost, s: BillingStateResponse): Bil
           host.pushSystem('🔴 Auto-reload update failed (request error).')
           return false
         }),
-    charge: (amount: string) => {
+    charge: (amount: string, idempotencyKey?: string) => {
       host.pushSystem('💳 Charge submitted — confirming settlement…')
-      host
-        .request('billing.charge', { amount_usd: amount })
+      return host
+        .request('billing.charge', {
+          amount_usd: amount,
+          ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {})
+        })
         .then(raw => {
           const r = raw as BillingChargeResponse
-          if (r.ok && r.charge_id) pollCharge(host, r.charge_id, s.portal_url)
-          else renderBillingError(host, r)
+          if (r.ok && r.charge_id) {
+            pollCharge(host, r.charge_id, s.portal_url)
+            return 'submitted' as const
+          }
+          if (r.error === 'insufficient_scope') return 'needs_remote_spending' as const
+          renderBillingError(host, r)
+          return 'error' as const
         })
-        .catch(() => host.pushSystem('🔴 Charge failed (request error).'))
+        .catch(() => {
+          host.pushSystem('🔴 Charge failed (request error).')
+          return 'error' as const
+        })
     },
     openPortal: (url: string) => {
       // Try the browser; whether or not the spawn lands, always print the URL so
@@ -235,6 +243,19 @@ export function buildBillingCtx(host: BillingHost, s: BillingStateResponse): Bil
       openExternalUrl(url)
       host.pushSystem(`Opening portal: ${url}`)
     },
+    refreshState: () =>
+      host
+        .request('billing.state', {})
+        .then(raw => raw as BillingStateResponse)
+        .catch(() => null),
+    requestRemoteSpending: () =>
+      host
+        .request('billing.step_up', { session_id: host.sessionId() })
+        .then(raw => {
+          const response = raw as BillingMutationResponse
+          return Boolean(response.ok && response.granted)
+        })
+        .catch(() => false),
     sys: host.pushSystem,
     validate: (raw: string) => validateAmount(raw, s)
   }

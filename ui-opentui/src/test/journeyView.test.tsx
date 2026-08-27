@@ -59,6 +59,23 @@ const CROWDED_FRAME = {
   summary: [`2 learnings · ${'summary '.repeat(20)}SUMMARY_TAIL_SHOULD_BE_CLIPPED`]
 }
 
+const LONG_FRAME = {
+  ...FRAME,
+  buckets: [
+    {
+      ...FRAME.buckets[0],
+      nodes: Array.from({ length: 24 }, (_, index) => ({
+        glyph: '✦',
+        id: `s${index}`,
+        label: `Journey skill ${index}`,
+        meta: 'skill',
+        style: 'skill'
+      }))
+    }
+  ],
+  count: 24
+}
+
 interface Harness {
   readonly closed: { value: number }
   readonly deletes: string[]

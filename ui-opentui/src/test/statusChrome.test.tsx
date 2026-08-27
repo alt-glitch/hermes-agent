@@ -12,6 +12,7 @@
  *      the line.
  */
 import { Option } from 'effect'
+import { RGBA } from '@opentui/core'
 import { describe, expect, test } from 'vitest'
 
 import { decodeSessionInfoPatch } from '../boundary/schema/SessionInfo.ts'
@@ -61,6 +62,18 @@ describe('SessionInfoPatchSchema — chrome wire fields', () => {
 
   test('all chrome fields absent still decodes (every key optional)', () => {
     expect(Option.isSome(decodeSessionInfoPatch({ model: 'm' }))).toBe(true)
+  })
+
+  test('decodes the gateway project identity and its explicit null clearing value', () => {
+    const named = decodeSessionInfoPatch({
+      project: { id: 'p1', name: 'Hermes Agent', primary_path: '/work/hermes', slug: 'hermes-agent' }
+    })
+    expect(Option.isSome(named)).toBe(true)
+    if (Option.isSome(named)) expect(named.value.project?.name).toBe('Hermes Agent')
+
+    const cleared = decodeSessionInfoPatch({ project: null })
+    expect(Option.isSome(cleared)).toBe(true)
+    if (Option.isSome(cleared)) expect(cleared.value.project).toBeNull()
   })
 })
 
@@ -303,6 +316,69 @@ function bar(store: SessionStore) {
 }
 
 describe('StatusBar frames (one left-aligned labeled line)', () => {
+  test('battery is the first category-coloured chip, uses -- for unknown percent, and hides off', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.applyInfo({ model: 'm' })
+    store.setBatteryEnabled(true)
+    store.setBatteryStatus({ available: true, category: 'critical', percent: null, plugged: false })
+    const probe = await renderProbe(bar(store), { width: 60, height: 3 })
+    try {
+      const row =
+        probe
+          .frame()
+          .split('\n')
+          .find(value => value.includes('🔋')) ?? ''
+      expect(row).toContain('🔋 --% │ ● m')
+      const chip = probe
+        .spans()
+        .lines.flatMap(line => line.spans)
+        .find(span => span.text.includes('🔋 --%'))
+      expect(chip).toBeDefined()
+      expect(chip?.fg.toInts().slice(0, 3)).toEqual(
+        RGBA.fromHex(store.state.theme.color.statusCritical).toInts().slice(0, 3)
+      )
+
+      store.setBatteryEnabled(false)
+      await probe.settle()
+      expect(probe.frame()).not.toContain('🔋')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('battery chip stays on one physical status row across narrow widths', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.applyInfo({ model: 'm' })
+    store.setBatteryEnabled(true)
+    store.setBatteryStatus({ available: true, category: 'good', percent: 82, plugged: true })
+
+    for (const width of [20, 24, 30, 40, 60]) {
+      const frame = await captureFrame(bar(store), { width, height: 3 })
+      const rows = frame.split('\n').filter(row => row.trim())
+      expect(rows, `width ${String(width)}`).toHaveLength(1)
+      expect(rows[0], `width ${String(width)}`).toContain('⚡ 82%')
+    }
+  })
+
+  test('named project identity leads the cwd tail and clears on an unowned workspace', async () => {
+    const store = seededStore()
+    store.applyInfo({
+      project: { id: 'p1', name: 'Hermes Agent', primary_path: '/tmp/proj', slug: 'hermes-agent' }
+    })
+    const probe = await renderProbe(bar(store), { width: 220, height: 3 })
+    try {
+      expect(probe.frame()).toContain('Hermes Agent · /tmp/proj (main)')
+      store.applyInfo({ project: null })
+      await probe.settle()
+      expect(probe.frame()).not.toContain('Hermes Agent')
+      expect(probe.frame()).toContain('/tmp/proj (main)')
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('a session.info effort update repaints medium immediately', async () => {
     const store = seededStore()
     const probe = await renderProbe(bar(store), { width: 120, height: 3 })
@@ -359,6 +435,32 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     expect([...positions].sort((a, b) => a - b)).toEqual(positions)
     // …and no other row carries chrome: the bar never restacks to two lines.
     expect(rows.filter(r => r.includes('│')).length).toBe(1)
+  })
+
+  test('the MCP segment reports enabled servers while retaining the connected fallback', async () => {
+    const store = seededStore()
+    const probe = await renderProbe(bar(store), { width: 160, height: 3 })
+
+    try {
+      // Before startup.catalog arrives, older gateways still provide the
+      // connected-only session.info count.
+      expect(probe.frame()).toContain('mcp: 2')
+
+      // startup.catalog is authoritative for enabled servers and deliberately
+      // includes enabled-but-not-yet-connected entries. The mounted bar must
+      // repaint as soon as that catalog arrives.
+      store.setCatalog({
+        tools: { total: 0, toolsets: [] },
+        skills: { total: 0, categories: [] },
+        mcp: { servers: ['atlassian', 'betterstack', 'granola', 'linear', 'railway', 'vercel'] }
+      })
+      await probe.settle()
+
+      expect(probe.frame()).toContain('mcp: 6')
+      expect(probe.frame()).not.toContain('mcp: 2')
+    } finally {
+      probe.destroy()
+    }
   })
 
   test('right-pinned cwd (F10) — the path hugs the right edge of the wide row', async () => {
@@ -535,5 +637,117 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     } finally {
       probe.destroy()
     }
+  })
+})
+
+// ── 5. session title right tail (upstream 5a16635f409c) ─────────────────
+
+describe('StatusBar frames — session title replaces the cwd tail', () => {
+  test('a titled session shows the accent-backed bold chip instead of cwd/project/branch', async () => {
+    const store = seededStore()
+    store.applyInfo({
+      project: { id: 'p1', name: 'Hermes Agent', primary_path: '/tmp/proj', slug: 'hermes-agent' }
+    })
+    store.apply({ type: 'session.title', session_id: 'live-1', payload: { title: 'maint-title' } })
+    const probe = await renderProbe(bar(store), { width: 220, height: 3 })
+    try {
+      const frame = probe.frame()
+      const row = frame.split('\n').find(r => r.includes('claude-opus-4-8')) ?? ''
+      expect(row).toContain(' maint-title ')
+      // the chip REPLACES the whole cwd/project/branch tail (Ink rightLabel swap)
+      expect(row).not.toContain('/tmp/proj')
+      expect(row).not.toContain('(main)')
+      expect(row).not.toContain('Hermes Agent')
+      // …and stays right-pinned: the padded chip hugs the right edge.
+      expect(row.trimEnd().endsWith('maint-title')).toBe(true)
+      // Ink parity: bold accent ink on the normal status surface. Painting a
+      // second theme token over accent can become unreadable in custom skins.
+      const chip = probe
+        .spans()
+        .lines.flatMap(line => line.spans)
+        .find(span => span.text.includes('maint-title'))
+      expect(chip).toBeDefined()
+      if (!chip) throw new Error('title chip span missing')
+      expect(chip.bg.toInts().slice(0, 3)).toEqual(RGBA.fromHex(store.state.theme.color.statusBg).toInts().slice(0, 3))
+      expect(chip.fg.toInts().slice(0, 3)).toEqual(RGBA.fromHex(store.state.theme.color.accent).toInts().slice(0, 3))
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('a live session.title push swaps the mounted tail without restart; clearing restores the cwd', async () => {
+    const store = seededStore()
+    const probe = await renderProbe(bar(store), { width: 220, height: 3 })
+    try {
+      expect(probe.frame()).toContain('/tmp/proj (main)')
+      store.apply({ type: 'session.title', session_id: 'live-1', payload: { title: 'name it live' } })
+      await probe.settle()
+      expect(probe.frame()).toContain(' name it live ')
+      expect(probe.frame()).not.toContain('/tmp/proj')
+      // active-list chrome clearing the title (e.g. session switch) restores the cwd tail.
+      store.setLiveSessionChrome(1, '')
+      await probe.settle()
+      expect(probe.frame()).not.toContain('name it live')
+      expect(probe.frame()).toContain('/tmp/proj (main)')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('the /title client path (applyInfo title) drives the same chip', async () => {
+    const store = seededStore()
+    store.applyInfo({ title: 'maint-title' })
+    const frame = await captureFrame(bar(store), { width: 220, height: 3 })
+    const row = frame.split('\n').find(r => r.includes('claude-opus-4-8')) ?? ''
+    expect(row).toContain(' maint-title ')
+    expect(row).not.toContain('/tmp/proj')
+  })
+
+  test('width sweep: the titled bar keeps ONE row at every width — truncate or drop, never wrap', async () => {
+    const store = seededStore()
+    store.applyInfo({ title: 'a long descriptive session title that cannot possibly fit narrow terminals' })
+    for (const width of [40, 60, 70, 78, 100, 120, 220]) {
+      const frame = await captureFrame(bar(store), { width, height: 3 })
+      const rows = frame.split('\n').filter(row => row.trim())
+      expect(rows, `width ${String(width)}`).toHaveLength(1)
+      expect(rows.filter(row => row.includes('│')).length, `width ${String(width)}`).toBe(1)
+    }
+  })
+
+  test('wide CJK and emoji titles are budgeted in terminal cells and never wrap', async () => {
+    const store = seededStore()
+    store.applyInfo({ title: '规划发布窗口与回滚步骤 🚀🚀🚀' })
+    for (const width of [78, 100, 120, 160]) {
+      const frame = await captureFrame(bar(store), { width, height: 3 })
+      const rows = frame.split('\n').filter(row => row.trim())
+      expect(rows, `width ${String(width)}`).toHaveLength(1)
+      expect(rows.filter(row => row.includes('│')).length, `width ${String(width)}`).toBe(1)
+    }
+  })
+
+  test('deterministic truncation: the chip tail-clips with … inside the leftover budget', async () => {
+    const store = seededStore()
+    const longTitle = 'a long descriptive session title that cannot possibly fit this terminal width'
+    store.applyInfo({ title: longTitle })
+    const frame = await captureFrame(bar(store), { width: 120, height: 3 })
+    const row = frame.split('\n').find(r => r.includes('claude-opus-4-8')) ?? ''
+    // truncRight keeps the HEAD of the title and clips the tail with an ellipsis
+    expect(row).toContain('a long descr')
+    expect(row).toContain('…')
+    expect(row).not.toContain(longTitle)
+  })
+
+  test('below the minimum tail budget the chip drops WHOLE (narrow-width behavior stays stable)', async () => {
+    const store = seededStore()
+    store.applyInfo({ title: 'maint-title' })
+    // At 44 cols the seeded left run (`● claude-opus-4-8 ·high │ ctx: 42%`)
+    // leaves under CWD_MIN cells of tail budget — the pre-title bar drops the
+    // cwd here, and the titled bar must drop the chip the same way (never a
+    // squeezed fragment, never a second row).
+    const frame = await captureFrame(bar(store), { width: 44, height: 3 })
+    expect(frame).toContain('claude-opus-4-8')
+    expect(frame).not.toContain('maint')
+    const rows = frame.split('\n').filter(row => row.trim())
+    expect(rows).toHaveLength(1)
   })
 })

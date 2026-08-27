@@ -9,6 +9,7 @@
  */
 import { describe, expect, test } from 'vitest'
 
+import { timestampsFromConfig } from '../logic/details.ts'
 import { mapResumeHistory } from '../logic/resume.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { formatTimestamp } from '../view/messageLine.tsx'
@@ -48,6 +49,22 @@ describe('store timestamps flag', () => {
     expect(store.state.timestamps).toBe(true)
     store.setTimestamps(false)
     expect(store.state.timestamps).toBe(false)
+  })
+})
+
+describe('timestampsFromConfig (display.timestamps — upstream 77fcc2ea31e0)', () => {
+  test('boolean true only — everything else stays OFF', () => {
+    expect(timestampsFromConfig({ display: { timestamps: true } })).toBe(true)
+    // Ink applyDisplay parity: `d.timestamps === true`, never truthiness.
+    expect(timestampsFromConfig({ display: { timestamps: false } })).toBe(false)
+    expect(timestampsFromConfig({ display: { timestamps: 'true' } })).toBe(false)
+    expect(timestampsFromConfig({ display: { timestamps: 'on' } })).toBe(false)
+    expect(timestampsFromConfig({ display: { timestamps: 1 } })).toBe(false)
+    expect(timestampsFromConfig({ display: { timestamps: null } })).toBe(false)
+    expect(timestampsFromConfig({ display: {} })).toBe(false)
+    expect(timestampsFromConfig({})).toBe(false)
+    expect(timestampsFromConfig(undefined)).toBe(false)
+    expect(timestampsFromConfig('garbage')).toBe(false)
   })
 })
 

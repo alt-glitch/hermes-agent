@@ -7,8 +7,10 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { approvalChoices } from '../logic/approval.ts'
+import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { DEFAULT_THEME } from '../logic/theme.ts'
 import { createSessionStore, startupCatalogRetryDelay, type Message } from '../logic/store.ts'
+import type { BillingBlockDecoded } from '../boundary/schema/GatewayEvent.ts'
 
 describe('session store — theming / dedup / hydrate (Phase 1)', () => {
   test('gateway.ready{skin} re-themes; default before', () => {
@@ -157,6 +159,48 @@ describe('session store — ordered parts (Phase 2b)', () => {
     } else {
       throw new Error('expected a tool part at index 1')
     }
+  })
+
+  test('seals interim commentary and keeps a distinct terminal reply', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'interim answer' } })
+    store.apply({ type: 'message.interim', payload: { text: 'interim answer', already_streamed: true } })
+    store.apply({ type: 'message.delta', payload: { text: 'final answer' } })
+    store.apply({ type: 'message.complete', payload: { text: 'final answer' } })
+
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(2)
+    expect(assistants.map(message => message.parts?.find(part => part.type === 'text')?.text)).toEqual([
+      'interim answer',
+      'final answer'
+    ])
+    expect(assistants.every(message => message.streaming === false)).toBe(true)
+  })
+
+  test('settles a previewed final onto its interim without a duplicate bubble', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'same reply' } })
+    store.apply({ type: 'message.interim', payload: { text: 'same reply', already_streamed: true } })
+    store.apply({ type: 'message.complete', payload: { text: 'same reply plus tail', response_previewed: true } })
+
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.parts?.find(part => part.type === 'text')?.text).toBe('same reply plus tail')
+    expect(assistants[0]?.streaming).toBe(false)
+  })
+
+  test('drops a post-interim streaming duplicate when the final was previewed', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.interim', payload: { text: 'preview', already_streamed: true } })
+    store.apply({ type: 'message.delta', payload: { text: ' plus tail' } })
+    store.apply({ type: 'message.complete', payload: { text: 'preview plus tail', response_previewed: true } })
+
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.parts?.find(part => part.type === 'text')?.text).toBe('preview plus tail')
   })
 
   test('keeps one live assistant across mid-turn shell and notification rows', () => {
@@ -698,6 +742,311 @@ describe('session store — blocking prompts (Phase 3)', () => {
   })
 })
 
+describe('session store — batch (multi-question) clarify', () => {
+  const BATCH = {
+    questions: [
+      { choices: ['a', 'b'], qid: 'q0', question: 'One?' },
+      { choices: null, qid: 'q1', question: 'Two?' }
+    ],
+    request_id: 'req-batch'
+  }
+
+  /** The active clarify prompt, asserted into its narrowed shape. */
+  function clarifyPrompt(store: ReturnType<typeof createSessionStore>) {
+    const prompt = store.state.prompt
+    if (prompt?.kind !== 'clarify') throw new Error(`expected a clarify prompt, got ${prompt?.kind ?? 'none'}`)
+    return prompt
+  }
+
+  test('a batch clarify.request sets a questions prompt with an empty answers map', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: BATCH })
+    const p = clarifyPrompt(store)
+    expect(p.requestId).toBe('req-batch')
+    expect(p.questions).toHaveLength(2)
+    expect(p.questions?.[0]).toEqual({ choices: ['a', 'b'], multiSelect: false, qid: 'q0', question: 'One?' })
+    expect(p.questions?.[1]?.choices).toBeNull()
+    expect(p.answers).toEqual({})
+  })
+
+  test('a reconnect-replay batch clarify.request seeds the locked answers', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { ...BATCH, answers: { q0: 'a' }, request_id: 'req-replay' } })
+    expect(clarifyPrompt(store).answers).toEqual({ q0: 'a' })
+  })
+
+  test('malformed batch entries are dropped; single-question shape wins when none survive', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'clarify.request',
+      payload: {
+        choices: ['x', 'y'],
+        question: 'Fallback?',
+        questions: [
+          { qid: '', question: 'no qid' },
+          { qid: 'q1', question: '   ' }
+        ],
+        request_id: 'req-bad'
+      }
+    })
+    const p = clarifyPrompt(store)
+    expect(p.questions).toBeUndefined()
+    expect(p.question).toBe('Fallback?')
+    expect(p.choices).toEqual(['x', 'y'])
+  })
+
+  test('recordClarifyAnswer locks answers one at a time and reports the remaining count', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: BATCH })
+    // out-of-order lock (Tab affordance) — q1 first
+    expect(store.recordClarifyAnswer('q1', 'beta')).toBe(1)
+    expect(clarifyPrompt(store).answers).toEqual({ q1: 'beta' })
+    expect(store.state.prompt?.kind).toBe('clarify') // prompt stays open
+    // an empty lock is a deliberate skip — it still counts toward completion
+    expect(store.recordClarifyAnswer('q0', '')).toBe(0)
+    expect(clarifyPrompt(store).answers).toEqual({ q0: '', q1: 'beta' })
+  })
+
+  test('re-locking a question overwrites its earlier answer (revisit edit)', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: BATCH })
+    store.recordClarifyAnswer('q0', 'first')
+    expect(store.recordClarifyAnswer('q0', 'changed')).toBe(1)
+    expect(clarifyPrompt(store).answers).toEqual({ q0: 'changed' })
+  })
+
+  test('an abandoned batch persists its locked partials on the clarify tool.complete', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-timeout' } })
+    store.recordClarifyAnswer('q0', 'alpha')
+    // server-side deadline: the clarify tool settles while the prompt is open
+    store.apply({ type: 'tool.complete', payload: { name: 'clarify', tool_id: 'clar-b' } })
+    const record = store.state.messages.find(
+      message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+    )
+    expect(record).toBeDefined()
+    expect(record?.text).toContain('✓ One? → alpha')
+    expect(record?.text).toContain('· Two? (no answer)')
+    expect(record?.text).toContain('(timed out)')
+    expect(store.state.prompt).toBeUndefined()
+    // the message.complete backstop must not persist the same prompt twice
+    store.apply({ type: 'message.complete' })
+    const records = store.state.messages.filter(
+      message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+    )
+    expect(records).toHaveLength(1)
+  })
+
+  test('message.complete is the backstop flush when no clarify tool.complete arrived', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-backstop' } })
+    store.apply({ type: 'message.complete' })
+    expect(store.state.prompt).toBeUndefined()
+    const record = store.state.messages.find(
+      message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+    )
+    expect(record?.text).toContain('(timed out)')
+  })
+
+  test('flushAbandonedClarify("cancelled") records the Esc cancel-all with its partials', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-cancel' } })
+    store.recordClarifyAnswer('q0', 'kept')
+    store.flushAbandonedClarify('cancelled')
+    const record = store.state.messages.find(
+      message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+    )
+    expect(record?.text).toContain('✓ One? → kept')
+    expect(record?.text).toContain('(cancelled)')
+    expect(store.state.prompt).toBeUndefined()
+  })
+
+  test('a single-question clarify prompt is never batch-flushed (behavior preserved)', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { choices: ['a'], question: 'One?', request_id: 'r-single' } })
+    store.apply({ type: 'tool.complete', payload: { name: 'clarify', tool_id: 'clar-s' } })
+    store.apply({ type: 'message.complete' })
+    expect(store.state.prompt).toMatchObject({ kind: 'clarify', question: 'One?' })
+    expect(store.state.messages.some(message => message.text.startsWith('ask ('))).toBe(false)
+  })
+})
+
+describe('session store — billing wall confirm (upstream 960d339f86f + 9c274db89ff)', () => {
+  const nousBlock: BillingBlockDecoded = {
+    billing_url: null,
+    is_nous: true,
+    message: 'out of credits',
+    model: 'nous/hermes-4',
+    provider: 'nous',
+    provider_label: 'Nous Portal'
+  }
+  const openRouterBlock: BillingBlockDecoded = {
+    billing_url: 'https://openrouter.ai/settings/credits',
+    is_nous: false,
+    message: 'out of credits',
+    model: 'anthropic/claude-fable-5',
+    provider: 'openrouter',
+    provider_label: 'OpenRouter'
+  }
+
+  /** The active confirm prompt, asserted into its narrowed shape. */
+  function activeConfirm(store: ReturnType<typeof createSessionStore>) {
+    const prompt = store.state.prompt
+    if (prompt?.kind !== 'confirm') throw new Error(`expected a confirm prompt, got ${prompt?.kind ?? 'none'}`)
+    return prompt
+  }
+
+  test('live completion settles the turn FIRST, keeps the full guidance, then opens the confirm', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'partial…' } })
+    store.apply({
+      type: 'message.complete',
+      payload: {
+        billing: nousBlock,
+        error: 'insufficient credits',
+        failure_reason: 'billing',
+        recoverable: true,
+        status: 'error',
+        text: 'Billing or credits exhausted: full guidance'
+      }
+    })
+    // turn-completion ordering: spinner stopped, turn settled, no streaming row
+    expect(store.state.info.running).toBe(false)
+    expect(store.state.status).toBeUndefined()
+    const assistant = store.state.messages.find(message => message.role === 'assistant')
+    expect(assistant?.streaming).toBe(false)
+    // the FULL provider guidance stays in the transcript…
+    expect(assistant?.parts?.some(part => part.type === 'text' && part.text.includes('full guidance'))).toBe(true)
+    expect(store.state.messages.some(message => message.text === 'error: insufficient credits')).toBe(true)
+    // …and the concise actionable dialog sits on top (Ink billingDialog copy)
+    const confirm = activeConfirm(store)
+    expect(confirm.spec).toMatchObject({
+      cancelLabel: 'Dismiss',
+      confirmLabel: 'Top up',
+      title: 'Out of Nous credits'
+    })
+    expect(confirm.spec.detail).toContain('top up to keep going')
+  })
+
+  test('confirm Yes routes Nous → /topup through the registered slash seam', () => {
+    const store = createSessionStore()
+    const submitSlash = vi.fn()
+    store.registerBillingWallHost({ submitSlash })
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { billing: nousBlock, text: 'guidance' } })
+    activeConfirm(store).onConfirm()
+    expect(submitSlash).toHaveBeenCalledWith('/topup')
+  })
+
+  test('confirm Yes deep-links a third-party billing page via the safe opener', () => {
+    const store = createSessionStore()
+    const submitSlash = vi.fn()
+    const openUrl = vi.fn(() => true)
+    store.registerBillingWallHost({ openUrl, submitSlash })
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { billing: openRouterBlock, text: 'guidance' } })
+    const confirm = activeConfirm(store)
+    expect(confirm.spec.confirmLabel).toBe('Open billing page')
+    confirm.onConfirm()
+    expect(openUrl).toHaveBeenCalledWith('https://openrouter.ai/settings/credits')
+    expect(submitSlash).not.toHaveBeenCalled()
+  })
+
+  test('confirm Yes with no billing URL recovers via /model', () => {
+    const store = createSessionStore()
+    const submitSlash = vi.fn()
+    store.registerBillingWallHost({ submitSlash })
+    store.apply({ type: 'message.start' })
+    store.apply({
+      type: 'message.complete',
+      payload: { billing: { ...openRouterBlock, billing_url: null }, text: 'guidance' }
+    })
+    const confirm = activeConfirm(store)
+    expect(confirm.spec.confirmLabel).toBe('Switch provider')
+    confirm.onConfirm()
+    expect(submitSlash).toHaveBeenCalledWith('/model')
+  })
+
+  test('a stale-session buffered completion is filtered at commit — no overlay bleed', () => {
+    const store = createSessionStore()
+    store.beginBuffer()
+    store.apply({
+      type: 'message.complete',
+      session_id: 'old-session',
+      payload: { billing: nousBlock, text: 'stale wall' }
+    })
+    store.commitSessionSnapshot('new-live', [], {}, event => eventBelongsToSession(event, 'new-live'))
+    expect(store.state.prompt).toBeUndefined()
+    // the rejected event was dropped whole: no replayed turn, no transcript row
+    expect(store.state.messages).toHaveLength(0)
+  })
+
+  test('a buffered completion for the COMMITTED session replays and opens the confirm', () => {
+    const store = createSessionStore()
+    store.beginBuffer()
+    store.apply({
+      type: 'message.complete',
+      session_id: 'new-live',
+      payload: { billing: nousBlock, text: 'real wall' }
+    })
+    store.commitSessionSnapshot('new-live', [], {}, event => eventBelongsToSession(event, 'new-live'))
+    expect(activeConfirm(store).spec.title).toBe('Out of Nous credits')
+  })
+
+  test('session replacement clears an open billing confirm (no cross-session bleed)', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { billing: nousBlock, text: 'guidance' } })
+    expect(store.state.prompt).toMatchObject({ kind: 'confirm' })
+    store.adoptFreshSession('successor')
+    expect(store.state.prompt).toBeUndefined()
+  })
+
+  test('a completion without billing never opens a confirm', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { text: 'ordinary answer' } })
+    expect(store.state.prompt).toBeUndefined()
+  })
+})
+
+describe('session store — MoA fan-out progress (upstream 89e6f4c989a/ad6a2ae401e)', () => {
+  test('moa.progress maintains ONE replace-in-place status line, then phase swaps to aggregating', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    const rowsBefore = store.state.messages.length
+    store.apply({ type: 'moa.progress', payload: { label: 'provider/model-a', refs_done: 1, refs_total: 3 } })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.progress', payload: { label: 'provider/model-b', refs_done: 2, refs_total: 3 } })
+    // replaced in place — the same single status line, never appended
+    expect(store.state.status).toBe('MoA: refs 2/3')
+    store.apply({ type: 'moa.phase', payload: { aggregator: 'provider/model-z', phase: 'aggregator' } })
+    expect(store.state.status).toBe('MoA: aggregating…')
+    // no transcript spam: progress/phase events add zero rows and zero parts
+    expect(store.state.messages.length).toBe(rowsBefore)
+    expect(store.state.messages.at(-1)?.parts).toHaveLength(0)
+    // the completed turn clears the line like every other transient status
+    store.apply({ type: 'message.complete', payload: { text: 'final' } })
+    expect(store.state.status).toBeUndefined()
+  })
+
+  test('incomplete progress payloads and unknown phases are inert', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'moa.progress', payload: { refs_done: 1, refs_total: 3 } })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.progress', payload: { label: 'no numbers' } })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.progress' })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.phase', payload: { phase: 'warmup' } })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+    store.apply({ type: 'moa.phase' })
+    expect(store.state.status).toBe('MoA: refs 1/3')
+  })
+})
+
 describe('session store — subagents (Phase 5e agents dashboard)', () => {
   test('subagent.* events build + update a subagent by id', () => {
     const store = createSessionStore()
@@ -884,6 +1233,46 @@ describe('session store — session chrome / status bar (item 14)', () => {
     expect(store.state.info).toMatchObject({ model: 'opus', branch: 'dev', running: true })
   })
 
+  test('session.info project identity survives partial patches and explicit null clears it', () => {
+    const store = createSessionStore()
+    store.applyInfo({
+      cwd: '/work/hermes',
+      project: { id: 'p1', name: 'Hermes Agent', primary_path: '/work/hermes', slug: 'hermes-agent' }
+    })
+    expect(store.state.info.projectName).toBe('Hermes Agent')
+    store.applyInfo({ branch: 'main' })
+    expect(store.state.info.projectName).toBe('Hermes Agent')
+    store.applyInfo({ project: null })
+    expect(store.state.info.projectName).toBeNull()
+  })
+
+  test('session.title live push (upstream f726090d489d) sets the chrome title, trimmed', () => {
+    const store = createSessionStore()
+    store.applyInfo({ model: 'opus', cwd: '/p' })
+    store.apply({
+      type: 'session.title',
+      session_id: 'live-1',
+      payload: { session_id: 'db-key-9', title: '  fix the flaky tests  ' }
+    })
+    expect(store.state.info.title).toBe('fix the flaky tests')
+    // partial-patch rule holds — unrelated chrome survives the title merge.
+    expect(store.state.info).toMatchObject({ model: 'opus', cwd: '/p' })
+  })
+
+  test('session.title with a blank title never clears an existing one', () => {
+    const store = createSessionStore()
+    store.applyInfo({ title: 'first exchange title' })
+    store.apply({ type: 'session.title', session_id: 'live-1', payload: { title: '   ' } })
+    expect(store.state.info.title).toBe('first exchange title')
+  })
+
+  test('session.title with an absent payload is inert (no crash, no chrome change)', () => {
+    const store = createSessionStore()
+    store.applyInfo({ title: 'kept' })
+    store.apply({ type: 'session.title', session_id: 'live-1' })
+    expect(store.state.info.title).toBe('kept')
+  })
+
   test('message.start sets running, message.complete clears it + refreshes usage', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start' })
@@ -1062,6 +1451,98 @@ describe('session store — gateway lifecycle / transport errors (auto-heal foun
     store.apply({ type: 'review.summary', payload: {} })
     store.apply({ type: 'review.summary' })
     expect(store.state.messages.filter(m => m.role === 'system')).toHaveLength(0)
+  })
+})
+
+describe('session store — terminal error frames (upstream 57b351d3689/b8675a18990)', () => {
+  test('a status:error frame never settles the error text as a healthy reply', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({
+      type: 'message.complete',
+      payload: { error: 'provider exploded', recoverable: true, status: 'error', text: 'Error: provider exploded' }
+    })
+    // the empty caret row is removed, not filled with the "Error: …" string
+    expect(store.state.messages.some(message => message.role === 'assistant')).toBe(false)
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: provider exploded' })
+    expect(store.state.info.running).toBe(false)
+    expect(store.state.status).toBeUndefined()
+  })
+
+  test('a partial failure keeps its streamed text visible as a settled failed turn', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'partial answer' } })
+    store.apply({
+      type: 'message.complete',
+      payload: { error: 'stream cut', partial: true, recoverable: true, status: 'error', text: 'partial answer' }
+    })
+    const assistants = store.state.messages.filter(message => message.role === 'assistant')
+    // no duplicate assistant turn — the live row settles in place
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]).toMatchObject({ role: 'assistant', streaming: false })
+    expect(assistants[0]?.parts).toEqual([expect.objectContaining({ type: 'text', text: 'partial answer' })])
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: stream cut' })
+  })
+
+  test('an error frame after message.start leaves the drain to authoritative session.info (once)', () => {
+    const store = createSessionStore()
+    const settled = vi.fn()
+    store.registerTurnCompleteHandler(settled)
+    store.apply({ type: 'message.start' })
+    store.apply({
+      type: 'message.complete',
+      payload: { error: 'turn failed', recoverable: true, status: 'error', text: 'Error: turn failed' }
+    })
+    expect(store.state.info.running).toBe(false)
+    expect(store.isTurnInFlight()).toBe(true)
+    expect(settled).not.toHaveBeenCalled()
+    store.apply({ type: 'session.info', payload: { running: false } })
+    expect(settled).toHaveBeenCalledTimes(1)
+  })
+
+  test('a pre-start terminal error frame settles optimistic busy and drains exactly once', () => {
+    const store = createSessionStore()
+    const settled = vi.fn()
+    store.registerTurnCompleteHandler(settled)
+    store.applyInfo({ running: true }) // optimistic submit flag; agent build failed before message.start
+    store.apply({
+      type: 'message.complete',
+      payload: {
+        error: 'agent initialization failed',
+        recoverable: true,
+        status: 'error',
+        text: 'Error: agent initialization failed'
+      }
+    })
+    expect(store.state.info.running).toBe(false)
+    expect(store.isTurnInFlight()).toBe(false)
+    expect(settled).toHaveBeenCalledTimes(1)
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: agent initialization failed' })
+    // the trailing session.info the gateway emits after this frame must not double-drain
+    store.apply({ type: 'session.info', payload: { running: false } })
+    expect(settled).toHaveBeenCalledTimes(1)
+  })
+
+  test('an error frame with no error field falls back to the frame text for the failure row', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { status: 'error', text: 'Error: boom' } })
+    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: Error: boom' })
+  })
+
+  test('a healthy message.complete is untouched by the terminal-frame path', () => {
+    const store = createSessionStore()
+    const settled = vi.fn()
+    store.registerTurnCompleteHandler(settled)
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.complete', payload: { text: 'all good' } })
+    const assistant = store.state.messages.find(message => message.role === 'assistant')
+    expect(assistant).toMatchObject({ role: 'assistant', streaming: false })
+    expect(assistant?.parts).toEqual([expect.objectContaining({ type: 'text', text: 'all good' })])
+    expect(store.state.messages.filter(message => message.role === 'system')).toHaveLength(0)
+    // healthy completes never fire the pre-start drain; session.info owns it
+    expect(settled).not.toHaveBeenCalled()
   })
 })
 
@@ -1375,6 +1856,64 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     const current = store.getCompactRevision()
     expect(store.hydrateCompact(false, current)).toBe(true)
     expect(store.state.compact).toBe(false)
+  })
+
+  test('late timestamps hydration cannot overwrite a newer /timestamps command', () => {
+    const store = createSessionStore()
+    const revision = store.getTimestampsRevision()
+    store.setTimestamps(true)
+    expect(store.hydrateTimestamps(false, revision)).toBe(false)
+    expect(store.state.timestamps).toBe(true)
+
+    const current = store.getTimestampsRevision()
+    expect(store.hydrateTimestamps(false, current)).toBe(true)
+    expect(store.state.timestamps).toBe(false)
+  })
+
+  test('session.usage live tick refreshes the context gauges mid-turn without settling the turn', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({
+      payload: { usage: { context_max: 128000, context_percent: 12.5, context_used: 16000 } },
+      type: 'session.usage'
+    })
+    expect(store.state.info.contextUsed).toBe(16000)
+    expect(store.state.info.contextMax).toBe(128000)
+    expect(store.state.info.contextPercent).toBe(12.5)
+    // the tick carries no `running`, so it must neither stop the spinner nor
+    // fire the busy-queue drain edge, and the streaming row stays live.
+    expect(store.state.info.running).toBe(true)
+    expect(store.isTurnInFlight()).toBe(true)
+    expect(store.state.messages.at(-1)?.streaming).toBe(true)
+
+    // a later tick advances the gauge in place
+    store.apply({ payload: { usage: { context_percent: 15.6, context_used: 20000 } }, type: 'session.usage' })
+    expect(store.state.info.contextUsed).toBe(20000)
+    expect(store.state.info.contextPercent).toBe(15.6)
+  })
+
+  test('message.complete usage still wins over the last mid-turn session.usage tick', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ payload: { usage: { context_percent: 15.6, context_used: 20000 } }, type: 'session.usage' })
+    store.apply({
+      payload: { text: 'done', usage: { context_percent: 18.8, context_used: 24000, cost_usd: 0.42 } },
+      type: 'message.complete'
+    })
+    expect(store.state.info.contextUsed).toBe(24000)
+    expect(store.state.info.contextPercent).toBe(18.8)
+    expect(store.state.info.costUsd).toBe(0.42)
+    expect(store.state.info.running).toBe(false)
+  })
+
+  test('a usage-less session.usage tick is inert', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ payload: { usage: { context_used: 16000 } }, type: 'session.usage' })
+    store.apply({ type: 'session.usage' })
+    store.apply({ payload: {}, type: 'session.usage' })
+    expect(store.state.info.contextUsed).toBe(16000)
+    expect(store.state.info.running).toBe(true)
   })
 
   test('late details hydration cannot overwrite a newer /details command', () => {

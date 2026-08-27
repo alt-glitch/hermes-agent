@@ -1,123 +1,230 @@
-"""Regression for #21454: re-running install.sh on a symlinked prior install.
-
-Older versions of ``install.sh`` created ``$command_link_dir/hermes`` as a
-symlink to the pip-generated entry point at ``$HERMES_BIN`` (i.e.
-``venv/bin/hermes``). When ``setup_path()`` later switched to writing a bash
-shim with ``cat > "$command_link_dir/hermes" <<EOF``, the redirect followed
-the existing symlink and overwrote the pip entry point with the shim. The
-shim's ``exec "$HERMES_BIN" "$@"`` then self-recursed and ``hermes`` hung on
-every invocation.
-
-These tests pin the fix: ``setup_path()`` must remove ``$command_link_dir/hermes``
-before writing through the redirect, so the shim is created as a regular file
-in ``command_link_dir`` and the venv entry point is left intact.
-"""
+"""Contracts for the user-facing, worktree-aware Hermes launcher."""
 
 from __future__ import annotations
 
-import re
+import os
 import stat
 import subprocess
 from pathlib import Path
 
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
-INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
+GENERATOR = REPO_ROOT / "scripts" / "write-hermes-launcher.sh"
 
 
-def _extract_setup_path_shim_block() -> str:
-    """Return the install.sh shim-write block used by setup_path()."""
-    text = INSTALL_SH.read_text()
-    match = re.search(
-        r"(?P<block>mkdir -p \"\$command_link_dir\".*?chmod \+x \"\$command_link_dir/hermes\")",
-        text,
-        re.DOTALL,
-    )
-    assert match is not None, (
-        "Could not locate the setup_path shim-write block in scripts/install.sh"
-    )
-    return match["block"]
+def _executable(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
 
 
-def test_setup_path_shim_block_removes_old_link_before_writing() -> None:
-    """Static guard: the rm must precede the cat heredoc, not follow it."""
-    block = _extract_setup_path_shim_block()
-    rm_idx = block.find('rm -f "$command_link_dir/hermes"')
-    cat_idx = block.find('cat > "$command_link_dir/hermes" <<EOF')
-    assert rm_idx != -1, (
-        "setup_path() must `rm -f` $command_link_dir/hermes before the "
-        "`cat >` heredoc, otherwise an existing symlink (left by older "
-        "installs) will be followed and the pip entry point overwritten. "
-        "See #21454."
-    )
-    assert cat_idx != -1, "expected `cat >` heredoc still present"
-    assert rm_idx < cat_idx, (
-        "`rm -f` must come *before* the `cat >` heredoc, not after."
-    )
-
-
-def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -> None:
-    """Behavioral repro: simulate prior-install symlink + new-install heredoc.
-
-    Layout mirrors a real install:
-
-        tmp/
-          venv/bin/hermes        <- pip entry point (the one we must preserve)
-          local_bin/hermes       <- symlink → ../venv/bin/hermes  (old install)
-
-    Then we run the exact shim-write block from setup_path() with
-    ``HERMES_BIN`` and ``command_link_dir`` pointed at this fixture. The fix
-    requires that, after the run:
-
-      * ``venv/bin/hermes`` still contains its original pip-script body
-      * ``local_bin/hermes`` is a regular file (not a symlink) holding the shim
-    """
-    venv_bin = tmp_path / "venv" / "bin"
-    venv_bin.mkdir(parents=True)
-    pip_entry = venv_bin / "hermes"
-    pip_marker = "#!/usr/bin/env python\n# pip-generated entry point — must not be overwritten\n"
-    pip_entry.write_text(pip_marker)
-    pip_entry.chmod(pip_entry.stat().st_mode | stat.S_IXUSR)
-
-    command_link_dir = tmp_path / "local_bin"
-    command_link_dir.mkdir()
-    shim_path = command_link_dir / "hermes"
-    # Reproduce the prior-install state: shim path is a symlink to the
-    # pip-generated entry point.
-    shim_path.symlink_to(pip_entry)
-    assert shim_path.is_symlink()
-
-    block = _extract_setup_path_shim_block()
-    # Drive the block with the real env vars setup_path() sets.
-    script = f'set -e\nHERMES_BIN={pip_entry!s}\ncommand_link_dir={command_link_dir!s}\n{block}\n'
-    result = subprocess.run(
-        ["bash", "-c", script],
+def _generate(target: Path, managed_cli: Path, *trusted: Path) -> None:
+    subprocess.run(
+        [
+            "bash",
+            str(GENERATOR),
+            str(target),
+            str(managed_cli),
+            *(str(path) for path in trusted),
+        ],
+        check=True,
         capture_output=True,
         text=True,
-        cwd=tmp_path,
-    )
-    assert result.returncode == 0, (
-        f"shim-write block failed:\nstdout={result.stdout}\nstderr={result.stderr}"
     )
 
-    # The pip entry point must still be the original pip script — not a
-    # re-written self-recursing bash shim.
-    assert pip_entry.read_text() == pip_marker, (
-        "venv/bin/hermes was overwritten by setup_path() — symlink-stomp "
-        "regression (#21454)."
+
+def _mark_hermes_checkout(root: Path) -> None:
+    (root / "hermes_cli").mkdir(parents=True, exist_ok=True)
+    (root / "pyproject.toml").write_text('[project]\nname = "hermes-agent"\n')
+    (root / "run_agent.py").write_text("")
+    (root / "hermes_cli" / "main.py").write_text("")
+
+
+def _capture_python(path: Path) -> Path:
+    return _executable(
+        path,
+        """#!/usr/bin/env bash
+{
+  printf 'PYTHONPATH=%s\\n' "$PYTHONPATH"
+  printf 'HERMES_PYTHON_SRC_ROOT=%s\\n' "$HERMES_PYTHON_SRC_ROOT"
+  printf 'HERMES_PYTHON=%s\\n' "$HERMES_PYTHON"
+  printf 'ARG=%s\\n' "$@"
+} > "$CAPTURE"
+""",
     )
 
-    # The shim path itself must now be a regular file holding the launcher.
-    assert shim_path.exists()
-    assert not shim_path.is_symlink(), (
-        "command_link_dir/hermes must be replaced with a regular file, not "
-        "left as a symlink — otherwise the next install will stomp again."
+
+def test_generator_replaces_old_symlink_without_stomping_entrypoint(
+    tmp_path: Path,
+) -> None:
+    managed_cli = _executable(
+        tmp_path / "venv" / "bin" / "hermes",
+        "#!/usr/bin/env bash\nexit 0\n",
     )
-    shim_text = shim_path.read_text()
-    assert "unset PYTHONPATH" in shim_text
-    assert "unset PYTHONHOME" in shim_text
-    assert "export PYTHONSAFEPATH=1" in shim_text
-    assert f'exec "{pip_entry}"' in shim_text
-    shim_mode = shim_path.stat().st_mode
-    assert shim_mode & stat.S_IXUSR, "shim must be user-executable"
+    target = tmp_path / "bin" / "hermes"
+    target.parent.mkdir()
+    target.symlink_to(managed_cli)
+
+    _generate(target, managed_cli)
+
+    assert managed_cli.read_text() == "#!/usr/bin/env bash\nexit 0\n"
+    assert target.is_file()
+    assert not target.is_symlink()
+    assert target.stat().st_mode & stat.S_IXUSR
+    trust_file = Path(f"{target}.trusted-roots")
+    assert stat.S_IMODE(trust_file.stat().st_mode) == 0o600
+
+
+def test_launcher_uses_current_checkout_python_and_source(tmp_path: Path) -> None:
+    repo = tmp_path / "hermes source"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _mark_hermes_checkout(repo)
+    source_python = _capture_python(repo / ".venv" / "bin" / "python")
+    managed_cli = _executable(
+        tmp_path / "managed" / "bin" / "hermes",
+        "#!/usr/bin/env bash\nexit 91\n",
+    )
+    target = tmp_path / "bin" / "hermes"
+    _generate(target, managed_cli, repo)
+    nested = repo / "nested"
+    nested.mkdir()
+    capture = tmp_path / "capture.txt"
+
+    env = {**os.environ, "CAPTURE": str(capture), "PYTHONPATH": "/wrong"}
+    result = subprocess.run(
+        [str(target), "--tui", "--yolo"],
+        cwd=nested,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == [
+        f"PYTHONPATH={repo}",
+        f"HERMES_PYTHON_SRC_ROOT={repo}",
+        f"HERMES_PYTHON={source_python}",
+        "ARG=-m",
+        "ARG=hermes_cli.main",
+        "ARG=--tui",
+        "ARG=--yolo",
+    ]
+
+
+def test_launcher_uses_primary_checkout_venv_for_linked_worktree(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    subprocess.run(["git", "init", "-q", str(primary)], check=True)
+    _mark_hermes_checkout(primary)
+    subprocess.run(["git", "-C", str(primary), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(primary),
+            "-c",
+            "user.name=Hermes Test",
+            "-c",
+            "user.email=hermes@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "-C", str(primary), "worktree", "add", "-q", "--detach", str(linked)],
+        check=True,
+    )
+    shared_python = _capture_python(primary / ".venv" / "bin" / "python")
+    managed_cli = _executable(
+        tmp_path / "managed" / "bin" / "hermes",
+        "#!/usr/bin/env bash\nexit 92\n",
+    )
+    target = tmp_path / "bin" / "hermes"
+    _generate(target, managed_cli, primary)
+    # Trust is stored beside the launcher and survives a later installer rerun.
+    _generate(target, managed_cli)
+    capture = tmp_path / "capture.txt"
+
+    result = subprocess.run(
+        [str(target), "doctor"],
+        cwd=linked,
+        env={**os.environ, "CAPTURE": str(capture)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = capture.read_text().splitlines()
+    assert lines[:3] == [
+        f"PYTHONPATH={linked}",
+        f"HERMES_PYTHON_SRC_ROOT={linked}",
+        f"HERMES_PYTHON={shared_python}",
+    ]
+    assert lines[3:] == ["ARG=-m", "ARG=hermes_cli.main", "ARG=doctor"]
+
+
+def test_launcher_falls_back_to_managed_entrypoint_outside_checkout(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "managed.txt"
+    managed_cli = _executable(
+        tmp_path / "managed" / "bin" / "hermes",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$@" > "$CAPTURE"
+""",
+    )
+    target = tmp_path / "bin" / "hermes"
+    _generate(target, managed_cli)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    result = subprocess.run(
+        [str(target), "--version"],
+        cwd=outside,
+        env={**os.environ, "CAPTURE": str(capture)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == ["--version"]
+
+
+def test_launcher_does_not_execute_untrusted_lookalike_checkout(tmp_path: Path) -> None:
+    lookalike = tmp_path / "lookalike"
+    lookalike.mkdir()
+    subprocess.run(["git", "init", "-q", str(lookalike)], check=True)
+    _mark_hermes_checkout(lookalike)
+    attacked = tmp_path / "attacked.txt"
+    _executable(
+        lookalike / ".venv" / "bin" / "python",
+        f"#!/usr/bin/env bash\nprintf attacked > {attacked!s}\nexit 93\n",
+    )
+    capture = tmp_path / "managed.txt"
+    managed_cli = _executable(
+        tmp_path / "managed" / "bin" / "hermes",
+        """#!/usr/bin/env bash
+printf 'managed\n' > "$CAPTURE"
+""",
+    )
+    target = tmp_path / "bin" / "hermes"
+    _generate(target, managed_cli)
+
+    result = subprocess.run(
+        [str(target)],
+        cwd=lookalike,
+        env={**os.environ, "CAPTURE": str(capture)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text() == "managed\n"
+    assert not attacked.exists()

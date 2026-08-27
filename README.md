@@ -26,7 +26,7 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 <tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
-<tr><td><b>Runs anywhere, not just your laptop</b></td><td>Six terminal backends — local, Docker, SSH, Singularity, Modal, and Daytona. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
+<tr><td><b>Runs anywhere, not just your laptop</b></td><td>Seven terminal backends — local, Docker, SSH, Singularity, Modal, Daytona, and Vercel Sandbox. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
 <tr><td><b>Research-ready</b></td><td>Batch trajectory generation, trajectory compression for training the next generation of tool-calling models.</td></tr>
 </table>
 
@@ -36,19 +36,37 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 
 > **This is a fork** (`alt-glitch/hermes-agent`, branch `sid/opentui`) — it ships the
 > **native OpenTUI terminal UI** on top of upstream Hermes. To install *this fork's*
-> TUI (Node 26.3+ required for the native engine; older Node auto-falls-back to Ink):
+> TUI (the installer provisions Node 26.3+ for the native engine when needed):
 >
 > ```bash
-> fnm install 26.3.0 && fnm default 26.3.0        # or any Node ≥ 26.3 on PATH
 > git clone -b sid/opentui https://github.com/alt-glitch/hermes-agent.git
-> cd hermes-agent && ./scripts/install.sh         # auto-detects the fork branch+repo
+> cd hermes-agent && ./scripts/install.sh         # provisions Node 26.3+ when needed
 > ```
+> Use `fnm install 26.3.0` first only if you prefer your own Node over the
+> installer's isolated managed runtime.
 >
 > Update later with `hermes update` (follows the current branch). Already have a
 > stock Hermes install? `install.sh` switches `~/.hermes/hermes-agent` to this fork
 > (reversible: `cd ~/.hermes/hermes-agent && git checkout main`); pass
 > `--dir ~/.hermes/hermes-opentui` to keep both side-by-side. See
 > [`docs/opentui-fork-cutover-cheatsheet.md`](docs/opentui-fork-cutover-cheatsheet.md).
+>
+> **Worktree-aware `hermes`:** the installer writes a regular launcher at
+> `~/.local/bin/hermes` (or the platform command directory). Outside a Hermes
+> checkout it runs the managed install. Inside the explicitly trusted install
+> checkout or any linked worktree, it runs that exact tree's Python/TUI source,
+> borrowing dependencies from the tree's `.venv`/`venv`, the primary checkout's
+> venv, or finally the managed venv. Trust is keyed to Git's common directory,
+> persisted beside the launcher, and never inferred from filenames alone.
+>
+> Register another clone once (for example, an upstream development checkout):
+> ```bash
+> bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
+>   ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes \
+>   ~/github/hermes-agent
+> ```
+> Its linked worktrees then select themselves automatically; unregistered clones
+> continue to use the managed fork.
 >
 > Everything below is the **upstream** install (NousResearch/main — the Ink TUI).
 
@@ -127,6 +145,7 @@ hermes              # Interactive CLI — start a conversation
 hermes model        # Choose your LLM provider and model
 hermes tools        # Configure which tools are enabled
 hermes config set   # Set individual config values
+hermes config get   # Print individual config values
 hermes gateway      # Start the messaging gateway (Telegram, Discord, etc.)
 hermes setup        # Run the full setup wizard (configures everything at once)
 hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)
@@ -248,6 +267,14 @@ cd "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
 uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
 ```
+
+The installed `~/.local/bin/hermes` launcher explicitly trusts the checkout used
+to install it. After you `cd` into that checkout or one of its linked worktrees,
+bare `hermes` imports that exact tree while reusing an available
+checkout/managed venv. Outside a trusted Hermes checkout it continues to run the
+managed installation. Register a separate clone with
+`scripts/write-hermes-launcher.sh` as shown in Quick Install; trust persists
+across installer reruns.
 
 Manual clone fallback (for throwaway clones/CI where you intentionally do not
 want the managed install layout):

@@ -21,6 +21,7 @@ export type SessionSaveResponse = typeof SessionSaveResponseSchema.Type
 export const ReloadEnvResponseSchema = Schema.Struct({ updated: Num })
 export type ReloadEnvResponse = typeof ReloadEnvResponseSchema.Type
 export const ReloadMcpResponseSchema = Schema.Struct({
+  loaded_rev: opt(Str),
   message: opt(Str),
   status: Schema.Literals(['confirm_required', 'reloaded'])
 })
@@ -32,18 +33,73 @@ export type ConfigValueResponse = typeof ConfigValueResponseSchema.Type
 export const ModelSwitchResponseSchema = Schema.Struct({
   confirm_message: opt(Str),
   confirm_required: opt(Schema.Boolean),
+  // A model pick made mid-turn is queued by the gateway and applied at the
+  // next turn start, not live yet (upstream f27d45e288) — the handler says
+  // "(applies next turn)" instead of pretending the swap already happened.
+  deferred: opt(Schema.Boolean),
+  scope: opt(Schema.Literals(['global', 'once', 'session'])),
   value: opt(Str),
   warning: opt(Str)
 })
 export type ModelSwitchResponse = typeof ModelSwitchResponseSchema.Type
+
+/** prompt.submit acknowledgement. `voice_stopped` marks a typed bare voice
+ * stop phrase consumed server-side to end the voice chat (upstream
+ * ba13132298): the request succeeded but NO turn starts — no message.start /
+ * message.complete will ever correlate with the submission. */
+export const PromptSubmitAckSchema = Schema.Struct({
+  voice_stopped: opt(Schema.Boolean)
+})
+export type PromptSubmitAck = typeof PromptSubmitAckSchema.Type
+
+// ── Wake word (upstream 86d5b8b90f / 71a2feeade wire contract) ────────
+export const WakeStartResponseSchema = Schema.Struct({
+  enabled_persisted: opt(Schema.Boolean),
+  hint: opt(Str),
+  owner_surface: opt(Schema.NullOr(Str)),
+  phrase: opt(Str),
+  provider: opt(Str),
+  reason: opt(Str),
+  started: opt(Schema.Boolean)
+})
+export type WakeStartResponse = typeof WakeStartResponseSchema.Type
+
+export const WakeStopResponseSchema = Schema.Struct({
+  disabled_persisted: opt(Schema.Boolean),
+  reason: opt(Schema.NullOr(Str)),
+  stopped: opt(Schema.Boolean)
+})
+export type WakeStopResponse = typeof WakeStopResponseSchema.Type
+
+export const WakeStatusResponseSchema = Schema.Struct({
+  audio_silent: opt(Schema.Boolean),
+  available: opt(Schema.Boolean),
+  /** Config truth (wake_word.enabled). */
+  enabled: opt(Schema.Boolean),
+  hint: opt(Str),
+  listening: opt(Schema.Boolean),
+  owned_by_caller: opt(Schema.Boolean),
+  owner_surface: opt(Schema.NullOr(Str)),
+  phrase: opt(Str),
+  provider: opt(Str)
+})
+export type WakeStatusResponse = typeof WakeStatusResponseSchema.Type
 
 export const ConfigFullResponseSchema = Schema.Struct({
   config: Schema.Record(Str, Schema.Unknown)
 })
 export type ConfigFullResponse = typeof ConfigFullResponseSchema.Type
 
-export const ConfigMtimeResponseSchema = Schema.Struct({ mtime: Num })
+export const ConfigMtimeResponseSchema = Schema.Struct({ mcp_rev: opt(Str), mtime: Num })
 export type ConfigMtimeResponse = typeof ConfigMtimeResponseSchema.Type
+
+export const SystemBatteryResponseSchema = Schema.Struct({
+  available: Schema.Boolean,
+  category: opt(Str),
+  percent: opt(Schema.NullOr(Num)),
+  plugged: opt(Schema.NullOr(Schema.Boolean))
+})
+export type SystemBatteryResponse = typeof SystemBatteryResponseSchema.Type
 
 export const SessionSteerResponseSchema = Schema.Struct({
   status: Schema.Literals(['queued', 'rejected']),
@@ -93,8 +149,13 @@ const decodeReloadEnv = Schema.decodeUnknownOption(ReloadEnvResponseSchema)
 const decodeReloadMcp = Schema.decodeUnknownOption(ReloadMcpResponseSchema)
 const decodeConfigValue = Schema.decodeUnknownOption(ConfigValueResponseSchema)
 const decodeModelSwitch = Schema.decodeUnknownOption(ModelSwitchResponseSchema)
+const decodePromptSubmit = Schema.decodeUnknownOption(PromptSubmitAckSchema)
+const decodeWakeStart = Schema.decodeUnknownOption(WakeStartResponseSchema)
+const decodeWakeStop = Schema.decodeUnknownOption(WakeStopResponseSchema)
+const decodeWakeStatus = Schema.decodeUnknownOption(WakeStatusResponseSchema)
 const decodeConfigFull = Schema.decodeUnknownOption(ConfigFullResponseSchema)
 const decodeConfigMtime = Schema.decodeUnknownOption(ConfigMtimeResponseSchema)
+const decodeSystemBattery = Schema.decodeUnknownOption(SystemBatteryResponseSchema)
 const decodeSessionSteer = Schema.decodeUnknownOption(SessionSteerResponseSchema)
 const decodeSessionUndo = Schema.decodeUnknownOption(SessionUndoResponseSchema)
 const decodeSkillsReload = Schema.decodeUnknownOption(SkillsReloadResponseSchema)
@@ -119,11 +180,21 @@ export const decodeConfigValueResponse = (value: unknown): ConfigValueResponse |
 export const decodeModelSwitchResponse = (value: unknown): ModelSwitchResponse | undefined =>
   some(decodeModelSwitch(value))
 
+export const decodePromptSubmitAck = (value: unknown): PromptSubmitAck | undefined => some(decodePromptSubmit(value))
+
+export const decodeWakeStartResponse = (value: unknown): WakeStartResponse | undefined => some(decodeWakeStart(value))
+export const decodeWakeStopResponse = (value: unknown): WakeStopResponse | undefined => some(decodeWakeStop(value))
+export const decodeWakeStatusResponse = (value: unknown): WakeStatusResponse | undefined =>
+  some(decodeWakeStatus(value))
+
 export const decodeConfigFullResponse = (value: unknown): ConfigFullResponse | undefined =>
   some(decodeConfigFull(value))
 
 export const decodeConfigMtimeResponse = (value: unknown): ConfigMtimeResponse | undefined =>
   some(decodeConfigMtime(value))
+
+export const decodeSystemBatteryResponse = (value: unknown): SystemBatteryResponse | undefined =>
+  some(decodeSystemBattery(value))
 
 export const decodeSessionSteerResponse = (value: unknown): SessionSteerResponse | undefined =>
   some(decodeSessionSteer(value))

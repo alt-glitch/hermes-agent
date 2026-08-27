@@ -6,6 +6,7 @@ import {
   pluginCursor,
   pluginLabel,
   pluginQuickIndex,
+  replacePluginRow,
   pluginToggleTarget,
   pluginWindow,
   scopePlugins,
@@ -17,7 +18,7 @@ import { useTheme } from '../theme.tsx'
 
 export interface PluginOps {
   list(): Promise<PluginsListResponse>
-  toggle(name: string, enable: boolean): Promise<PluginsToggleResponse>
+  toggle(row: PluginRow, enable: boolean): Promise<PluginsToggleResponse>
 }
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
@@ -61,11 +62,11 @@ export function PluginsHub(props: { ops: PluginOps; onClose(): void }) {
     setBusy(true)
     setError('')
     try {
-      const response = await props.ops.toggle(row.name, pluginToggleTarget(row))
+      const response = await props.ops.toggle(row, pluginToggleTarget(row))
       if (disposed || current !== generation) return
       if (response.plugin) {
         const next = response.plugin
-        setRows(previous => previous.map(item => (item.name === next.name ? next : item)))
+        setRows(previous => replacePluginRow(previous, row, next))
       } else await load()
     } catch (cause) {
       if (!disposed && current === generation) setError(errorText(cause))

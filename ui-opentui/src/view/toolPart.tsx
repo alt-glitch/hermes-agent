@@ -144,11 +144,11 @@ export function ToolPart(props: { part: ToolPartState }) {
           ? '▼'
           : glyphFor(props.part.name, theme().toolEmojis)
   // Settled machinery is BLUE (`shellDollar` — "blue is the hum of machinery");
-  // running is accent heat; failed is error. The NAME is muted-bright bold (see
+  // running is tool-marker heat (`tool`, the theme-sdk `ui_tool` token —
+  // defaults to accent); failed is error. The NAME is muted-bright bold (see
   // toolNameStyle); subtitle/metadata stay muted grey — the machinery tier
   // below the bright assistant answer.
-  const headColor = () =>
-    failed() ? theme().color.error : running() ? theme().color.accent : theme().color.shellDollar
+  const headColor = () => (failed() ? theme().color.error : running() ? theme().color.tool : theme().color.shellDollar)
   const subWidth = () => Math.max(1, bodyWidth() - props.part.name.length - 2)
   // Args are context, not content: cap the collapsed args preview to ~half the
   // pane (argsCapColumns) so a long command/path can never become the loudest

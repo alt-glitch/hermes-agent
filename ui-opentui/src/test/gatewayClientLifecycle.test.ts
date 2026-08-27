@@ -18,6 +18,7 @@ import {
   STARTUP_TIMEOUT_MS,
   STDERR_LINE_MAX_BYTES,
   STDOUT_FRAME_MAX_BYTES,
+  isNativeStdoutDiagnostic,
   sessionResponseFrameLimitForHeap
 } from '../boundary/gateway/client.ts'
 import { Log } from '../boundary/log.ts'
@@ -109,6 +110,32 @@ describe('RawGatewayClient child lifecycle isolation', () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.unstubAllEnvs()
+  })
+
+  test('classifies PortAudio AUHAL stdout noise as a diagnostic without poisoning JSON-RPC', () => {
+    const child = fakeChild()
+    spawnMock.mockReturnValueOnce(child.process)
+    const events: unknown[] = []
+    const client = new RawGatewayClient({
+      log: new Log(null, 'debug'),
+      onEvent: event => events.push(event)
+    })
+
+    client.start()
+    const diagnostic = "||PaMacCore (AUHAL)|| Error on line 2523: err='-50', msg=Unknown Error"
+    child.stdout.write(`${diagnostic}\n${readyFrame()}`)
+
+    expect(isNativeStdoutDiagnostic(diagnostic)).toBe(true)
+    expect(stderrLines(events)).toEqual([diagnostic])
+    expect(eventTypes(events)).toContain('gateway.ready')
+    expect(eventTypes(events)).not.toContain('gateway.protocol_error')
+    expect(client.getLogTail()).toContain(`[stdout-diagnostic] ${diagnostic}`)
+    client.stop()
+  })
+
+  test('does not disguise arbitrary non-JSON stdout as a native diagnostic', () => {
+    expect(isNativeStdoutDiagnostic('not-json')).toBe(false)
+    expect(isNativeStdoutDiagnostic('PaMacCore-ish')).toBe(false)
   })
 
   test('pins the Python import cwd to the runtime while retaining the worktree workspace env', () => {

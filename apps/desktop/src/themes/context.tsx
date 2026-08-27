@@ -12,14 +12,16 @@
 import { useStore } from '@nanostores/react'
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 
+import { $registryVersion } from '@/contrib/registry'
 import { matchesQuery, useMediaQuery } from '@/hooks/use-media-query'
 import { persistString, persistStringRecord, storedString, storedStringRecord } from '@/lib/storage'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 
+import { $backendThemes, $pendingSkinApply } from './backend-sync'
 import { hexToRgb, mix, readableOn } from './color'
-import { BUILTIN_THEME_LIST, BUILTIN_THEMES, DEFAULT_SKIN_NAME, DEFAULT_TYPOGRAPHY, nousTheme } from './presets'
+import { BUILTIN_THEME_LIST, DEFAULT_SKIN_NAME, DEFAULT_TYPOGRAPHY, nousTheme } from './presets'
 import type { DesktopTheme, DesktopThemeColors } from './types'
-import { $userThemes, resolveTheme } from './user-themes'
+import { $userThemes, listAllThemes, resolveTheme } from './user-themes'
 
 // Legacy global skin (pre per-profile themes). Still the inheritance fallback
 // for any profile without its own assignment, so single-profile users and old
@@ -66,6 +68,9 @@ const profilePref = <T extends string>(record: string, legacy: string, normalize
 
 export const skinPref = profilePref(PROFILE_SKINS_KEY, SKIN_KEY, normalizeSkin)
 export const modePref = profilePref(PROFILE_MODES_KEY, MODE_KEY, normalizeMode)
+
+/** Everything a peer window could change that this one has to repaint for. */
+const APPEARANCE_KEYS = new Set([SKIN_KEY, PROFILE_SKINS_KEY, MODE_KEY, PROFILE_MODES_KEY])
 
 // Last active profile — lets the boot paint pick its appearance before the
 // gateway reports which profile actually launched.
@@ -293,6 +298,13 @@ interface ThemeContextValue {
   availableThemes: Array<{ name: string; label: string; description: string }>
   setTheme: (name: string) => void
   setMode: (mode: ThemeMode) => void
+  /**
+   * Paint a theme with an explicit light/dark, without persistence. This is
+   * the highlight preview for the palette. A commit (`setTheme`) or
+   * `clearThemePreview` repaints the committed appearance.
+   */
+  previewTheme: (name: string, mode: 'light' | 'dark') => void
+  clearThemePreview: () => void
 }
 
 const SKIN_LIST = BUILTIN_THEME_LIST.map(({ name, label, description }) => ({ name, label, description }))
@@ -305,7 +317,9 @@ const ThemeContext = createContext<ThemeContextValue>({
   renderedMode: 'light',
   availableThemes: SKIN_LIST,
   setTheme: () => {},
-  setMode: () => {}
+  setMode: () => {},
+  previewTheme: () => {},
+  clearThemePreview: () => {}
 })
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
@@ -314,18 +328,23 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // behavior is unchanged.
   const profileKey = normalizeProfileKey(useStore($activeGatewayProfile))
 
-  // Built-ins + user-installed themes. Reactive so an import shows up live in
-  // the palette, settings grid, and `/skin` without a reload.
+  // Built-ins + user-installed + registry-contributed themes. Reactive so an
+  // import or a plugin registration shows up live in the palette, settings
+  // grid, and `/skin` without a reload.
   const userThemes = useStore($userThemes)
+  const backendThemes = useStore($backendThemes)
+  const registryVersion = useStore($registryVersion)
 
   const availableThemes = useMemo(
     () =>
-      [...Object.values(BUILTIN_THEMES), ...Object.values(userThemes)].map(({ name, label, description }) => ({
+      listAllThemes().map(({ name, label, description }) => ({
         name,
         label,
         description
       })),
-    [userThemes]
+    // userThemes + backendThemes + registryVersion ARE listAllThemes' reactivity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [userThemes, backendThemes, registryVersion]
   )
 
   const [themeName, setThemeNameState] = useState(() =>
@@ -344,14 +363,51 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setModeState(modePref.resolve(profileKey))
   }, [profileKey])
 
+  // Appearance is per-profile localStorage, and every desktop window is another
+  // renderer on the same origin — so a switch made in the HUD (or any peer
+  // window) only ever repainted the window it was made in. `storage` fires in
+  // the OTHER windows, which is exactly the set that needs to catch up.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key && !APPEARANCE_KEYS.has(event.key)) {
+        return
+      }
+
+      const live = normalizeProfileKey($activeGatewayProfile.get())
+
+      setThemeNameState(skinPref.resolve(live))
+      setModeState(modePref.resolve(live))
+    }
+
+    window.addEventListener('storage', onStorage)
+
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
   const systemDark = useMediaQuery('(prefers-color-scheme: dark)')
   const resolvedMode = resolveMode(mode, systemDark)
-  const activeTheme = useMemo(() => deriveTheme(themeName, resolvedMode), [themeName, resolvedMode])
+
+  // Transient highlight preview (palette theme picker). It is never
+  // persisted. A commit or an explicit clear returns the paint to the
+  // committed appearance.
+  const [preview, setPreview] = useState<{ name: string; mode: 'light' | 'dark' } | null>(null)
+
+  const paintedName = preview ? preview.name : themeName
+  const paintedMode = preview ? preview.mode : resolvedMode
+
+  const activeTheme = useMemo(
+    () => deriveTheme(paintedName, paintedMode),
+    // deriveTheme resolves its seed through the merged registry, so the theme
+    // stores are its reactivity too — an in-place palette edit of the ACTIVE
+    // skin (live theme authoring) must repaint, not just a name switch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [paintedName, paintedMode, userThemes, backendThemes, registryVersion]
+  )
 
   // What actually gets painted (matches the `.dark` class applyTheme toggles).
-  const renderedMode = useMemo(() => renderedModeFor(activeTheme.colors, resolvedMode), [activeTheme, resolvedMode])
+  const renderedMode = useMemo(() => renderedModeFor(activeTheme.colors, paintedMode), [activeTheme, paintedMode])
 
-  useEffect(() => applyTheme(activeTheme, resolvedMode), [activeTheme, resolvedMode])
+  useEffect(() => applyTheme(activeTheme, paintedMode), [activeTheme, paintedMode])
 
   // Keep the native window appearance pinned to the app theme (vibrancy
   // material, titlebar, new-window pre-paint background).
@@ -363,33 +419,66 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setTheme = useCallback((name: string) => {
     const next = normalizeSkin(name)
+    setPreview(null)
     setThemeNameState(next)
     skinPref.assign(liveProfile(), next)
   }, [])
 
   const setMode = useCallback((next: ThemeMode) => {
+    setPreview(null)
     setModeState(next)
     modePref.assign(liveProfile(), next)
   }, [])
+
+  const previewTheme = useCallback((name: string, previewMode: 'light' | 'dark') => {
+    setPreview(resolveTheme(name) ? { name, mode: previewMode } : null)
+  }, [])
+
+  const clearThemePreview = useCallback(() => setPreview(null), [])
+
+  // Drain a backend-driven skin switch (Hermes authoring/activating a skin from a
+  // prompt, or `/skin` on another surface). setTheme persists it per profile, so
+  // the choice sticks like any manual pick.
+  const pendingSkin = useStore($pendingSkinApply)
+
+  useEffect(() => {
+    if (pendingSkin) {
+      setTheme(pendingSkin)
+      $pendingSkinApply.set(null)
+    }
+  }, [pendingSkin, setTheme])
 
   // The light/dark toggle (Shift+X by default) is owned by the keybind runtime
   // (`appearance.toggleMode`) so it shows up in the hotkey map and is rebindable.
 
   const value = useMemo<ThemeContextValue>(
-    () => ({ theme: activeTheme, themeName, mode, resolvedMode, renderedMode, availableThemes, setTheme, setMode }),
-    [activeTheme, themeName, mode, resolvedMode, renderedMode, availableThemes, setTheme, setMode]
+    () => ({
+      theme: activeTheme,
+      themeName,
+      mode,
+      resolvedMode,
+      renderedMode,
+      availableThemes,
+      setTheme,
+      setMode,
+      previewTheme,
+      clearThemePreview
+    }),
+    [
+      activeTheme,
+      themeName,
+      mode,
+      resolvedMode,
+      renderedMode,
+      availableThemes,
+      setTheme,
+      setMode,
+      previewTheme,
+      clearThemePreview
+    ]
   )
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>
 }
 
 export const useTheme = (): ThemeContextValue => useContext(ThemeContext)
-
-/** Sync the desktop skin with the active Hermes backend theme on connect. */
-export function useSyncThemeFromBackend(backendThemeName: string | undefined, setTheme: (name: string) => void) {
-  useEffect(() => {
-    if (backendThemeName && BUILTIN_THEMES[backendThemeName]) {
-      setTheme(backendThemeName)
-    }
-  }, [backendThemeName, setTheme])
-}

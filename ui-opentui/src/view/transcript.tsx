@@ -448,6 +448,28 @@ export function Transcript(props: { store: SessionStore }) {
   // grows/shrinks, so a burst of appends can't balloon the mounted set between
   // frames. `on(..., { defer })` keeps the tick untracked — only the length
   // re-runs it (content deltas are the frame driver's scrollHeight check).
+  // A locally-authored user row is an explicit request to return to the live
+  // edge. This includes a busy-queue row promoted by entry.sendQueuedAt().
+  // OpenTUI correctly preserves a manual/off-bottom position while content
+  // changes, but title/status/fixed-chrome layout updates can leave the
+  // scrollbox in that state just before promotion. Without an explicit
+  // re-engage, the assistant then streams below the viewport until another
+  // prompt happens to move it. Key this to the optimistic client id rather
+  // than messages.length so the rolling transcript cap cannot hide an append.
+  createComputed(
+    on(
+      () => {
+        const tail = props.store.state.messages.at(-1)
+        return tail?.role === 'user' ? tail.clientId : undefined
+      },
+      clientId => {
+        if (!clientId) return
+        scroll()?.scrollTo(Number.MAX_SAFE_INTEGER)
+        if (windowing) tick(true)
+      },
+      { defer: true }
+    )
+  )
   if (windowing) {
     createComputed(
       on(

@@ -14,6 +14,8 @@ describe('billing step-up verification event', () => {
     ).toBe(true)
     expect(lines.join('\n')).toContain('https://portal.example/device?code=WXYZ')
     expect(lines.join('\n')).toContain('WXYZ-9999')
+    expect(lines.join('\n')).toContain('allow Remote Spending')
+    expect(lines.join('\n')).not.toMatch(/terminal billing/i)
     expect(openUrl).toHaveBeenCalledWith('https://portal.example/device?code=WXYZ')
   })
 

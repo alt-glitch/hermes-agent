@@ -168,6 +168,23 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
     }
   })
 
+  test('a live session.title push retitles the window chrome without restart', () => {
+    const { dispose, store, titles } = mount()
+    try {
+      store.apply({
+        type: 'session.title',
+        session_id: 'live-1',
+        payload: { session_id: 'db-key-9', title: 'name it the moment it starts' }
+      })
+      expect(titles).toEqual([undefined, 'name it the moment it starts'])
+      // a blank push is inert — the window keeps the landed title.
+      store.apply({ type: 'session.title', session_id: 'live-1', payload: { title: '  ' } })
+      expect(titles).toEqual([undefined, 'name it the moment it starts'])
+    } finally {
+      dispose()
+    }
+  })
+
   test('a blocking prompt notifies once; initial state is silent', () => {
     const { dispose, notifications, store } = mount()
     try {

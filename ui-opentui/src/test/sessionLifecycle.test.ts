@@ -189,6 +189,80 @@ describe('resumeSession', () => {
     })
   })
 
+  it.effect('renders a retained failed turn as a settled failure, not a healthy stream (upstream 57b351d3689)', () => {
+    const store = createSessionStore()
+    const service = fakeGateway(() =>
+      Effect.succeed({
+        inflight: {
+          assistant: 'partial before the failure',
+          error: 'provider exploded',
+          recoverable: true,
+          status: 'error',
+          streaming: false,
+          user: 'do the thing'
+        },
+        messages: [],
+        running: false,
+        session_id: 'failed-live',
+        status: 'idle'
+      })
+    ).service
+    return Effect.gen(function* () {
+      yield* resumeSession(service, store, { cols: 80, targetSessionId: 'durable-key' })
+      assert.deepStrictEqual(
+        store.state.messages.map(message => [message.role, message.text]),
+        [
+          ['user', 'do the thing'],
+          ['assistant', 'partial before the failure'],
+          ['system', 'error: provider exploded']
+        ]
+      )
+      // non-streaming failed result: no spinner, no armed drain latch
+      const assistant = store.state.messages.find(message => message.role === 'assistant')
+      assert.isFalse(assistant?.streaming ?? false)
+      assert.isFalse(store.isTurnInFlight())
+      assert.isFalse(store.state.info.running === true)
+    })
+  })
+
+  it.effect('an error-only retained snapshot still surfaces the failure row', () => {
+    const store = createSessionStore()
+    const service = fakeGateway(() =>
+      Effect.succeed({
+        inflight: { error: 'agent initialization failed', recoverable: true, status: 'error', streaming: false },
+        messages: [],
+        running: false,
+        session_id: 'failed-live'
+      })
+    ).service
+    return Effect.gen(function* () {
+      yield* resumeSession(service, store, { cols: 80, targetSessionId: 'durable-key' })
+      assert.deepStrictEqual(
+        store.state.messages.map(message => [message.role, message.text]),
+        [['system', 'error: agent initialization failed']]
+      )
+      assert.isFalse(store.isTurnInFlight())
+    })
+  })
+
+  it.effect('a malformed snapshot pairing error with streaming never forces a live spinner', () => {
+    const store = createSessionStore()
+    const service = fakeGateway(() =>
+      Effect.succeed({
+        inflight: { assistant: 'partial', error: 'boom', status: 'error', streaming: true },
+        messages: [],
+        running: false,
+        session_id: 'failed-live'
+      })
+    ).service
+    return Effect.gen(function* () {
+      yield* resumeSession(service, store, { cols: 80, targetSessionId: 'durable-key' })
+      const assistant = store.state.messages.find(message => message.role === 'assistant')
+      assert.isFalse(assistant?.streaming ?? false)
+      assert.isFalse(store.isTurnInFlight())
+    })
+  })
+
   it.effect('adopts the returned live SID, filters old buffered events, and returns the prior live SID', () => {
     const store = createSessionStore()
     store.setSessionId('old-live')
@@ -415,6 +489,26 @@ describe('branchSession', () => {
       assert.strictEqual(store.state.resumeId, 'child-key')
     })
   })
+
+  it.effect('adopts the shared stored identity when session_key is absent', () => {
+    const store = createSessionStore()
+    store.setSessionId('parent-live')
+    const fake = fakeGateway(
+      method =>
+        Effect.succeed(
+          method === 'session.branch'
+            ? { parent: 'parent-key', session_id: 'child-live', stored_session_id: 'child-stored', title: 'forked' }
+            : { closed: true }
+        ),
+      'parent-live'
+    )
+    return Effect.gen(function* () {
+      const result = yield* branchSession(fake.service, store, { name: 'forked' })
+      assert.strictEqual(result.resumeId, 'child-stored')
+      assert.strictEqual(store.state.resumeId, 'child-stored')
+    })
+  })
+
   it('preserves composer edits authored while the branch RPC is pending', async () => {
     let release: ((value: unknown) => void) | undefined
     const pending = new Promise<unknown>(resolve => (release = resolve))

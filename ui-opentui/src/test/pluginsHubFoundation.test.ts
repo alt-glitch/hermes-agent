@@ -7,10 +7,13 @@ import {
 } from '../boundary/schema/PluginResponses.ts'
 import {
   pluginCursor,
+  pluginIdentity,
   pluginLabel,
   pluginQuickIndex,
+  pluginToggleParams,
   pluginToggleTarget,
   pluginWindow,
+  replacePluginRow,
   scopePlugins
 } from '../logic/pluginsHub.ts'
 
@@ -21,13 +24,15 @@ const ROWS: PluginRow[] = [ALPHA, BETA, GAMMA]
 
 describe('Plugins Hub Effect boundaries', () => {
   test('decodes list/toggle responses leniently and rejects malformed contract fields', () => {
+    const portableAlpha = { ...ALPHA, key: 'skills/alpha', portable: true }
     const list = decodePluginsListResponse({
-      plugins: ROWS,
+      plugins: [portableAlpha, BETA, GAMMA],
       user_count: 1,
       bundled_count: 2,
       future: { compatible: true }
     })
     expect(list?.plugins).toHaveLength(3)
+    expect(list?.plugins?.[0]).toMatchObject({ key: 'skills/alpha', portable: true })
     expect(list?.future).toEqual({ compatible: true })
     expect(decodePluginsListResponse({ plugins: [{ name: 7 }] })).toBeUndefined()
 
@@ -52,6 +57,22 @@ describe('Plugins Hub pure model', () => {
     expect(pluginLabel(GAMMA, 'all')).toBe('○ gamma [bundled] (available)')
     expect(pluginToggleTarget(ALPHA)).toBe(false)
     expect(pluginToggleTarget(BETA)).toBe(true)
+  })
+
+  test('addresses and updates duplicate names by canonical key with a legacy name fallback', () => {
+    const imageFal: PluginRow = { key: 'image_gen/fal', name: 'fal', portable: true, status: 'disabled' }
+    const videoFal: PluginRow = { key: 'video_gen/fal', name: 'fal', portable: false, status: 'disabled' }
+
+    expect(pluginIdentity(imageFal)).toBe('image_gen/fal')
+    expect(pluginToggleParams(imageFal, true)).toEqual({ action: 'toggle', enable: true, key: 'image_gen/fal' })
+    expect(pluginToggleParams({ name: 'legacy' }, false)).toEqual({
+      action: 'toggle',
+      enable: false,
+      name: 'legacy'
+    })
+
+    const updated = replacePluginRow([imageFal, videoFal], videoFal, { ...videoFal, status: 'enabled' })
+    expect(updated).toEqual([imageFal, { ...videoFal, status: 'enabled' }])
   })
 
   test('clamps navigation, centers a bounded window, and resolves 1-9/0 quick keys', () => {

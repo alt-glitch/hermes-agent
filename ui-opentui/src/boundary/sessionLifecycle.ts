@@ -146,7 +146,25 @@ function liveSnapshotMessages(response: LiveSessionSnapshot): Message[] {
   const inflightUser = response.inflight?.user?.trim()
   if (inflightUser) messages.push({ role: 'user', text: inflightUser })
   const inflightAssistant = response.inflight?.assistant ?? ''
-  if (inflightAssistant || response.inflight?.streaming) {
+  const inflightError = response.inflight?.error?.trim()
+  if (inflightError) {
+    // Retained failed turn (upstream 57b351d3689/b8675a18990): the terminal
+    // error frame was (possibly) lost to a disconnect, so this snapshot is the
+    // only carrier of the failure. Render it exactly like the live terminal
+    // frame settles: any partial assistant text stays visible as a settled
+    // NON-streaming row (never a spinner — no completion event will ever
+    // arrive for it), and the failure itself is a system error row. An
+    // error-only snapshot (no user/assistant text) still yields that row.
+    if (inflightAssistant) {
+      messages.push({
+        role: 'assistant',
+        text: inflightAssistant,
+        parts: [{ id: 'inflight-1', text: inflightAssistant, type: 'text' }],
+        streaming: false
+      })
+    }
+    messages.push({ role: 'system', text: `error: ${inflightError}` })
+  } else if (inflightAssistant || response.inflight?.streaming) {
     messages.push({
       role: 'assistant',
       text: inflightAssistant,
@@ -172,7 +190,10 @@ function liveSnapshotRunning(response: LiveSessionSnapshot): boolean {
     response.status === 'working' ||
     response.status === 'waiting' ||
     response.status === 'streaming' ||
-    response.inflight?.streaming === true
+    // A retained failed turn is terminal: even a malformed snapshot that pairs
+    // `error` with a stale streaming flag must not arm the turn-in-flight
+    // latch — no completion event will ever settle it.
+    (response.inflight?.streaming === true && !response.inflight?.error?.trim())
   )
 }
 
@@ -348,7 +369,7 @@ export const branchSession = Effect.fn('SessionLifecycle.branch')(function* (
         method: 'session.branch'
       })
     }
-    const resumeId = response.session_key?.trim() || childSessionId
+    const resumeId = response.stored_session_id?.trim() || response.session_key?.trim() || childSessionId
     const preservedDraft = store.state.composerDraft
     store.commitSessionSnapshot(
       childSessionId,

@@ -14,6 +14,7 @@
 import { Option } from 'effect'
 
 import { decodeSessionCompressResponse } from '../boundary/compression.ts'
+import { buildManageSubscriptionUrl } from '../boundary/billing.ts'
 
 import { delegationStatusText, type DelegationState } from './agentStatus.ts'
 import { diagnosticsEnabled } from './env.ts'
@@ -33,7 +34,15 @@ import { mapResumeHistory } from './resume.ts'
 import { mapSessionRows, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
 import type { SpawnHistoryState, SpawnSnapshot } from './spawnHistory.ts'
 import type { CompletionItem, ConfirmRequest, CustomModelSetupState, PickerItem, PickerState } from './store.ts'
-import type { BillingOverlayState, BillingStateResponse } from '../boundary/billing.ts'
+import type {
+  BillingMutationResponse,
+  BillingOverlayState,
+  BillingStateResponse,
+  SubscriptionOverlayState,
+  SubscriptionPreviewResponse,
+  SubscriptionStateResponse,
+  SubscriptionUpgradeResponse
+} from '../boundary/billing.ts'
 import {
   type CommandsCatalogResponse,
   type SessionUndoResponse,
@@ -46,14 +55,16 @@ import {
   decodeSessionStatusResponse,
   decodeSessionTitleResponse,
   decodeSessionUndoResponse,
-  decodeSkillsReloadResponse
+  decodeSkillsReloadResponse,
+  decodeWakeStartResponse,
+  decodeWakeStatusResponse,
+  decodeWakeStopResponse
 } from '../boundary/schema/SessionCommandResponses.ts'
 import { decodeToolsConfigureResponse } from '../boundary/schema/ToolsConfigureResponse.ts'
 import { decodeBrowserManageResponse } from '../boundary/schema/BrowserResponses.ts'
 import { decodeVoiceToggleResponse } from '../boundary/schema/VoiceResponses.ts'
 import { openExternalUrl } from '../boundary/openExternalUrl.ts'
 import {
-  decodeCreditsViewResponse,
   decodePersonalityResponse,
   decodeRollbackDiffResponse,
   decodeRollbackListResponse,
@@ -61,13 +72,19 @@ import {
   decodeSessionUsageResponse
 } from '../boundary/schema/SecondaryCommandResponses.ts'
 import { formatVoiceRecordKey } from './voiceKey.ts'
+import { isWakeSub, setWakeUserDisabled, WAKE_USAGE, wakeStartLine, wakeStatusLine, wakeStopLine } from './wake.ts'
 import { decodeDelegationPauseResponse, decodeSpawnTreeListResponse } from '../boundary/schema/Delegation.ts'
 import { decodeProcessStopResponse } from '../boundary/schema/ProcessResponses.ts'
 import { buildBillingCtx } from './billing.ts'
 import { dailyFortune, randomFortune } from './fortunes.ts'
 import { formatHelp } from './help.ts'
+import { launchWidget } from '../widgets/host.ts'
+import { getWidgetApp } from '../widgets/registry.ts'
+import { loadUserWidgets } from '../widgets/userWidgets.ts'
 import type { Message } from './store.ts'
 import { normalizeBusyInputMode, type BusyInputMode } from './busyQueue.ts'
+import { batteryInfoFromResponse, batteryLabel } from './battery.ts'
+import { scoreSlashMenuItem } from './slashFuzzy.ts'
 
 export interface ParsedSlash {
   name: string
@@ -194,8 +211,9 @@ export interface SlashContext {
   readonly openJourney?: () => void
   readonly openPluginsHub?: () => void
   readonly openPetPicker?: () => void
-  /** Open the /billing overlay with a fetched state snapshot + ctx bundle. */
+  /** Open the /topup overlay with a fetched state snapshot + ctx bundle. */
   readonly openBilling: (overlay: BillingOverlayState) => void
+  readonly openSubscription: (overlay: SubscriptionOverlayState) => void
   /** Track an in-flight background-prompt task id (`/bg` → prompt.background). */
   readonly addBgTask: (id: string) => void
   /** Commit the authoritative process-global CDP state returned by browser.manage. */
@@ -207,9 +225,12 @@ export interface SlashContext {
   /** Update the cached `/model` picker rows. */
   readonly setModelItems: (items: PickerItem[]) => void
   readonly setCurrentModel: (model: string) => void
-  /** Read / set the compact-transcript display flag (/compact — Epic 3). */
+  /** Read / set the compact-transcript display flag (/density — Epic 3). */
   readonly compact: () => boolean
   readonly setCompact: (on: boolean) => void
+  /** Read / set the persisted, launch-level status-bar battery indicator. */
+  readonly batteryEnabled: () => boolean
+  readonly setBatteryEnabled: (on: boolean) => void
   /** Read / set the global tool/reasoning detail mode (/details — Epic 3). */
   readonly details: () => DetailsMode
   readonly setDetails: (mode: DetailsMode, commandOverride?: boolean) => void
@@ -218,6 +239,9 @@ export interface SlashContext {
   /** Read / set the show-[HH:MM] display flag (/timestamps — port of upstream 5ff11a689). */
   readonly timestamps: () => boolean
   readonly setTimestamps: (on: boolean) => void
+  /** Read / set the focus-view display flag (/focus — port of upstream d6fa2709de6). */
+  readonly focusView: () => boolean
+  readonly setFocusView: (on: boolean) => void
   /** Read / set the expand-all-thinking display flag (/reasoning full|clamp). */
   readonly reasoningFull: () => boolean
   readonly setReasoningFull: (on: boolean) => void
@@ -273,6 +297,14 @@ export interface CompletionPlan {
   method: 'complete.slash' | 'complete.path'
   params: Record<string, unknown>
   from: number
+  /** Exclusive buffer offset for an inline token replacement. Omitted on
+   * legacy slash/path plans, which continue replacing through buffer end. */
+  end?: number
+  /** Inline `/skill`-reference query (a whitespace-preceded `/token` in prose,
+   *  Ink `useCompletion` parity): `skills_only` makes the gateway enumerate
+   *  authoritative skill/bundle sources, and `from`/`end` bound the real
+   *  composer token rather than the synthetic `/query` sent in `params`. */
+  skillsOnly?: boolean
 }
 
 /** The command-name grammar for the lead `/token` (mirrors skillMatch NAME_RE):
@@ -287,6 +319,15 @@ function isPathLike(word: string): boolean {
   return word.startsWith('@')
 }
 
+/** An inline `/skill` reference being typed in prose: a whitespace-preceded
+ *  slash whose (possibly empty) name runs to the cursor — `run /cle▌`. The
+ *  name grammar (`[A-Za-z][\w-]*`, Ink INLINE_SLASH_RE parity) is tighter than
+ *  SLASH_NAME_RE: a reference reads as a word, never a version/number. The
+ *  required single bare segment keeps real paths and arithmetic out —
+ *  `/usr/local/bin`, `src/foo/bar`, `and/or` and `3 /4` never match, and
+ *  typing a second `/` flips a bare `/us` straight back out of the trigger. */
+const INLINE_SLASH_RE = /\s\/([A-Za-z][\w-]*)?$/
+
 /**
  * Decide what to complete for the composer text + cursor offset:
  *   - the text is a slash command — `/` at the very start → `complete.slash
@@ -294,7 +335,15 @@ function isPathLike(word: string): boolean {
  *     2026-06-13); `/m`, `/model foo` narrow it. A `/abs/path` whose first token
  *     isn't a valid name (F2) → no slash menu.
  *   - the WORD under the cursor is an `@`-mention → `complete.path {word}` for
- *     file/dir tagging (F8b).
+ *     file/dir tagging (F8b). The plan carries `from`/`end` bounding the whole
+ *     token (through the cursor to the next whitespace), so accepting a
+ *     mid-buffer mention preserves the rest of the draft.
+ *   - a whitespace-preceded `/token` ENDING AT THE CURSOR is an inline skill
+ *     reference dropped into prose (`clean this up with /cle`) → a synthetic
+ *     `complete.slash {text: '/cle'}` marked `skillsOnly` (Ink useCompletion
+ *     parity). Only the token queries the gateway, so the plan's `from` (just
+ *     past the slash, absolute in the buffer) is where an accepted skill
+ *     replaces — the RPC's own `replace_from` indexes the synthetic query.
  *   - otherwise nothing.
  *
  * Cursor-aware (F7/F8): completion is computed from the line/token at the cursor,
@@ -305,6 +354,33 @@ function isPathLike(word: string): boolean {
  * Returns null when there's no completion to run (so the dropdown clears).
  */
 export function planCompletion(text: string, cursor: number = text.length): CompletionPlan | null {
+  const pos = Math.max(0, Math.min(cursor, text.length))
+  const head = text.slice(0, pos)
+  // Inline skill reference — detected BEFORE the leading-command branch because
+  // only the FIRST slash can be an invocation (upstream 40ec9834b2): `/work /cle`
+  // is a command whose argument names a skill, and routing the whole line to the
+  // gateway's completer offered nothing at all. The trigger requires a
+  // whitespace-preceded slash token ENDING at the caret (the text submits as an
+  // ordinary message, so a reference takes no args — once a space follows the
+  // name the trigger is over), so ordinary argument completion (`/cron ad`,
+  // `/personality alic`) is untouched. An invalid token (a second `/`, a
+  // non-name) falls through so the leading-command branch can still claim it.
+  const inline = INLINE_SLASH_RE.exec(head)
+  if (inline) {
+    const query = inline[1] ?? ''
+    const tail = /^[\w-]*/.exec(text.slice(pos))?.[0] ?? ''
+    const fullName = query + tail
+    const end = pos + tail.length
+    if (!((fullName && !/^[A-Za-z][\w-]*$/.test(fullName)) || text[end] === '/')) {
+      return {
+        end,
+        from: pos - query.length,
+        method: 'complete.slash',
+        params: { skills_only: true, text: `/${query}` },
+        skillsOnly: true
+      }
+    }
+  }
   // Slash command: only when the WHOLE buffer's lead token is a command. A `/`
   // after a newline is prose, so a slash command never spans lines.
   if (text.startsWith('/') && !text.includes('\n')) {
@@ -321,13 +397,17 @@ export function planCompletion(text: string, cursor: number = text.length): Comp
     return null
   }
   // @-mention: the whitespace-delimited token the cursor sits in/just after.
-  const pos = Math.max(0, Math.min(cursor, text.length))
-  const head = text.slice(0, pos)
   const tokenStart = head.search(/\S+$/)
   if (tokenStart === -1) return null
   const word = head.slice(tokenStart)
   if (isPathLike(word)) {
-    return { from: tokenStart, method: 'complete.path', params: { word } }
+    // Exclusive end at the real @-token boundary PAST the cursor (stop at
+    // whitespace): a mid-buffer mention accepted via completionEdit replaces
+    // only its own token and re-appends the suffix. Without it the plan fell
+    // back to replace-to-buffer-end, deleting everything after the token
+    // (recalled prompt tails, later lines).
+    const tail = /^\S*/.exec(text.slice(pos))?.[0] ?? ''
+    return { end: pos + tail.length, from: tokenStart, method: 'complete.path', params: { word } }
   }
   return null
 }
@@ -341,7 +421,9 @@ export function readReplaceFrom(result: unknown, fallback: number): number {
   return fallback
 }
 
-/** Map a `complete.slash`/`complete.path` result ({items:[{text,display,meta}]}) into candidates. */
+/** Map a `complete.slash`/`complete.path` result ({items:[{text,display,meta,kind?}]})
+ *  into candidates. `kind` (`skill` | `command`) rides along when the gateway
+ *  sends it — the inline skill-reference plan filters on it. */
 export function mapCompletions(result: unknown): CompletionItem[] {
   if (!result || typeof result !== 'object') return []
   const items = (result as { items?: unknown }).items
@@ -350,7 +432,10 @@ export function mapCompletions(result: unknown): CompletionItem[] {
   for (const it of items) {
     const text = readStr(it, 'text')
     if (!text) continue
-    out.push({ display: readStr(it, 'display') ?? text, meta: readStr(it, 'meta') ?? '', text })
+    const item: CompletionItem = { display: readStr(it, 'display') ?? text, meta: readStr(it, 'meta') ?? '', text }
+    const kind = readStr(it, 'kind')
+    if (kind) item.kind = kind
+    out.push(item)
   }
   return out
 }
@@ -749,16 +834,20 @@ async function switchModel(
   ctx: SlashContext,
   name: string,
   confirmExpensiveModel = false,
-  sessionScoped = false
+  scope: 'direct' | 'once' | 'session' = 'direct'
 ): Promise<void> {
-  if (ctx.guardBusySessionSwitch('change models')) return
+  // No busy guard here (unlike session switching — upstream f27d45e288). A
+  // model change is a session-scoped config.set: idle it switches immediately;
+  // mid-turn the gateway QUEUES it and applies it at the next turn start
+  // (returning deferred:true) instead of rejecting with 4009. Either way the
+  // pick sticks without interrupting the stream or waiting on the swap.
   const sid = ctx.sessionId()
   try {
     const raw = await ctx.request('config.set', {
       confirm_expensive_model: confirmExpensiveModel,
       key: 'model',
       session_id: sid,
-      value: `${name.trim()}${sessionScoped ? ' --session' : ''}`
+      value: `${name.trim()}${scope === 'session' ? ' --session' : scope === 'once' ? ' --once' : ''}`
     })
     if (ctx.sessionId() !== sid) return
     const response = decodeModelSwitchResponse(raw)
@@ -775,7 +864,7 @@ async function switchModel(
           detail: response.confirm_message || response.warning || 'This model has unusually high known pricing.',
           title: 'Expensive model selection'
         },
-        () => void switchModel(ctx, name, true, sessionScoped)
+        () => void switchModel(ctx, name, true, scope)
       )
       return
     }
@@ -784,7 +873,11 @@ async function switchModel(
       ctx.pushSystem('error: invalid response: model switch')
       return
     }
-    ctx.pushSystem(`model → ${value}`)
+    // A deferred pick is queued server-side and applied at the next turn start
+    // (the in-flight turn keeps streaming on the old model) — paint it
+    // optimistically but say so.
+    const suffix = response.deferred ? ' (applies next turn)' : response.scope === 'once' ? ' (next turn only)' : ''
+    ctx.pushSystem(`model → ${value}${suffix}`)
     if (response.warning) ctx.pushSystem(`warning: ${response.warning}`)
     ctx.setCurrentModel(value)
     void refreshModelItems(ctx).catch(() => {})
@@ -831,13 +924,13 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
           if (ctx.openCustomModelSetup) {
             ctx.openCustomModelSetup({
               request: ctx.request,
-              onSaved: value => void switchModel(ctx, value, false, true)
+              onSaved: value => void switchModel(ctx, value, false, 'session')
             })
           } else {
             ctx.pushSystem('Custom model setup is unavailable in this TUI host.')
           }
         } else {
-          void switchModel(ctx, name, false, true)
+          void switchModel(ctx, name, false, 'session')
         }
       },
       title: 'Switch model'
@@ -845,16 +938,21 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
   }
   const requested = arg.trim()
   if (requested === '--refresh') {
-    if (ctx.guardBusySessionSwitch('change models')) return
     const items = await refreshModelItems(ctx, true)
     open(items)
     return
   }
   if (requested) {
-    await switchModel(ctx, requested)
+    const tokens = requested.split(/\s+/)
+    const once = tokens.includes('--once')
+    const model = tokens.filter(token => token !== '--once').join(' ')
+    if (once && !model) {
+      ctx.pushSystem('usage: /model <name> --once')
+      return
+    }
+    await switchModel(ctx, model, false, once ? 'once' : 'direct')
     return
   }
-  if (ctx.guardBusySessionSwitch('change models')) return
   const cached = ctx.modelItems()
   if (cached?.length) {
     open(cached)
@@ -863,6 +961,24 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
   // Paint the complete picker shell now. Mount-time hydration reuses the
   // in-flight prefetch and only falls back to one model.options RPC.
   open([], true)
+}
+
+/** Ctrl+O — reach the model picker without wrecking a typed draft (upstream
+ *  f27d45e288): the same overlay `/model` opens, but reachable without clearing
+ *  what you've typed to run the command. Works mid-stream: picking a model
+ *  writes the session model (config.set), which the next turn reads while the
+ *  in-flight turn keeps streaming. Structural key shape matches @opentui/core's
+ *  KeyEvent; release/shift'd events never match (isVoiceRecordKey convention). */
+export function isModelPickerKey(key: {
+  readonly ctrl: boolean
+  readonly name: string
+  readonly eventType?: string
+  readonly shift?: boolean
+  readonly option?: boolean
+  readonly super?: boolean
+}): boolean {
+  if (key.eventType === 'release' || key.shift) return false
+  return key.ctrl && !key.option && key.super !== true && key.name.toLowerCase() === 'o'
 }
 
 /** `/skills` — open the skills hub; picking a skill shows its info in the pager. */
@@ -894,20 +1010,20 @@ function flagFromArg(arg: string, current: boolean): boolean | null {
   return null
 }
 
-/** `/compact [on|off|toggle]` — compact transcript spacing. The flag flips locally
+/** `/density [on|off|toggle]` — compact transcript spacing. The flag flips locally
  *  (the store drives the render); persistence mirrors Ink: a fire-and-forget
- *  `config.set {key:'compact'}` so the Ink TUI + future launches share the pref
+ *  `config.set {key:'density'}` so the Ink TUI + future launches share the pref
  *  (the gateway does NOT send the persisted value to this TUI, so each launch
  *  starts off — see store.ts `compact`). */
-const compactCmd: ClientHandler = (arg, ctx) => {
+const densityCmd: ClientHandler = (arg, ctx) => {
   const next = flagFromArg(arg, ctx.compact())
   if (next === null) {
-    ctx.pushSystem('usage: /compact [on|off|toggle]')
+    ctx.pushSystem('usage: /density [on|off|toggle]')
     return
   }
   ctx.setCompact(next)
-  void ctx.request('config.set', { key: 'compact', value: next ? 'on' : 'off' }).catch(() => {})
-  ctx.pushSystem(`compact ${next ? 'on' : 'off'}`)
+  void ctx.request('config.set', { key: 'density', value: next ? 'on' : 'off' }).catch(() => {})
+  ctx.pushSystem(`density ${next ? 'on' : 'off'}`)
 }
 
 /** `/timestamps [on|off|status]` (alias `/ts`) — toggle the muted `[HH:MM]` shown
@@ -917,12 +1033,13 @@ const compactCmd: ClientHandler = (arg, ctx) => {
  *  JUDGMENT CALLS:
  *  - `status` (or `?`) reports `Message timestamps: ON|OFF` WITHOUT toggling.
  *  - Otherwise `flagFromArg` parses on/off/toggle (bare = toggle); garbage → usage.
- *  - Persisted via the same fire-and-forget `config.set` seam as /compact, with
- *    key `timestamps` (matching compactCmd's `key: 'compact'` convention — the
+ *  - Persisted via the same fire-and-forget `config.set` seam as /density, with
+ *    key `timestamps` (matching densityCmd's `key: 'density'` convention — the
  *    classic CLI's `display.timestamps` is its dotted config path, but this RPC
- *    uses the short flag name, so we mirror compact). The flag flips locally
- *    regardless (the store drives the render); each launch starts OFF (the
- *    persisted pref doesn't reach this TUI via session.info — see store.ts). */
+ *    uses the short flag name, so we mirror density). The flag flips locally
+ *    immediately (the store drives the render), and the persisted
+ *    `display.timestamps` value hydrates on launch/config repoll with a revision
+ *    guard so a stale reply cannot overwrite this command. */
 const timestampsCmd: ClientHandler = (arg, ctx) => {
   const mode = arg.trim().toLowerCase()
   if (mode === 'status' || mode === '?') {
@@ -937,6 +1054,30 @@ const timestampsCmd: ClientHandler = (arg, ctx) => {
   ctx.setTimestamps(next)
   void ctx.request('config.set', { key: 'timestamps', value: next ? 'on' : 'off' }).catch(() => {})
   ctx.pushSystem(`timestamps ${next ? 'on' : 'off'}`)
+}
+
+/** `/focus [on|off|status]` — display-only reduced-output view (port of upstream
+ *  d6fa2709de6; Ink core.ts `focus`). The flag flips locally FIRST so the pinned
+ *  `◉ focus` badge repaints on the same frame; persistence AND the
+ *  tool_progress stash/restore live gateway-side behind `config.set
+ *  {key:'focus'}` — the same state machine the Ink TUI and classic CLI use, so
+ *  nothing about it is duplicated here. `status`/`show`/`?` reports without
+ *  writing, matching the CLI surface. */
+const focusCmd: ClientHandler = (arg, ctx) => {
+  const mode = arg.trim().toLowerCase()
+  const current = ctx.focusView()
+  if (mode === 'status' || mode === 'show' || mode === '?') {
+    ctx.pushSystem(current ? 'focus view on — only your prompt and the final response' : 'focus view off')
+    return
+  }
+  const next = flagFromArg(mode, current)
+  if (next === null) {
+    ctx.pushSystem('usage: /focus [on|off|status]')
+    return
+  }
+  ctx.setFocusView(next)
+  void ctx.request('config.set', { key: 'focus', value: next ? 'on' : 'off' }).catch(() => {})
+  ctx.pushSystem(next ? 'focus view enabled — just your prompt and the final response' : 'focus view disabled')
 }
 
 /**
@@ -988,9 +1129,9 @@ const detailsCmd: ClientHandler = async (arg, ctx) => {
  * `/reasoning [full|clamp]` — expand/collapse ALL thinking ("Thinking"/"Thought")
  * sections, independently of the global /details mode. Mirrors detailsCmd.
  *
- *   - bare `/reasoning`: `config.get {key:'reasoning'}` → read the persisted
- *     `reasoning_full` boolean (added server-side), sync the local flag, and
- *     report `reasoning: full|clamp`. On error, report the current local flag.
+ *   - bare `/reasoning`: read this session's effort/visibility plus the
+ *     persisted `reasoning_full` boolean, sync the local flag, and report both
+ *     the agent setting and OpenTUI's full/clamp transcript-display setting.
  *   - `full` (alias `all`): expand all → local flag on + persist `value:'full'`.
  *   - `clamp` (aliases `collapse`, `short`): collapse all → flag off + `value:'clamp'`.
  *
@@ -1001,13 +1142,23 @@ const detailsCmd: ClientHandler = async (arg, ctx) => {
 const reasoningCmd: ClientHandler = async (arg, ctx, flight) => {
   const first = arg.trim().toLowerCase().split(/\s+/)[0] ?? ''
   if (!first) {
+    const sid = ctx.sessionId()
     try {
-      const r = await ctx.request('config.get', { key: 'reasoning' })
+      const r = await ctx.request('config.get', { key: 'reasoning', session_id: sid })
+      if (!currentSessionIs(ctx, sid, flight)) return
       const full = !!(r && typeof r === 'object' && (r as { [k: string]: unknown }).reasoning_full)
       ctx.setReasoningFull(full)
-      ctx.pushSystem(`reasoning: ${full ? 'full' : 'clamp'}`)
+      const value = readStr(r, 'value')
+      const display = readStr(r, 'display')
+      ctx.pushSystem(
+        value
+          ? `reasoning: ${value} · display ${display || 'hide'} · sections ${full ? 'full' : 'clamp'}`
+          : `reasoning: ${full ? 'full' : 'clamp'}`
+      )
     } catch {
-      ctx.pushSystem(`reasoning: ${ctx.reasoningFull() ? 'full' : 'clamp'}`)
+      if (currentSessionIs(ctx, sid, flight)) {
+        ctx.pushSystem(`reasoning: ${ctx.reasoningFull() ? 'full' : 'clamp'}`)
+      }
     }
     return
   }
@@ -1030,10 +1181,31 @@ const reasoningCmd: ClientHandler = async (arg, ctx, flight) => {
     ctx.pushSystem('reasoning: no active session')
     return
   }
+  const parts = arg.trim().split(/\s+/).filter(Boolean)
+  let scope: 'global' | 'session' | undefined
+  const valueParts: string[] = []
+  for (const part of parts) {
+    const flag = part.toLowerCase()
+    if (flag === '--global') {
+      scope = 'global'
+    } else if (flag === '--session') {
+      // Session is the gateway default. Preserve an explicit flag for parity
+      // with /model, while allowing --global to win regardless of order.
+      scope ??= 'session'
+    } else {
+      valueParts.push(part)
+    }
+  }
+  const value = valueParts.join(' ')
   try {
-    const r = await ctx.request('config.set', { key: 'reasoning', value: first, session_id: sid })
+    const r = await ctx.request('config.set', {
+      key: 'reasoning',
+      value,
+      session_id: sid,
+      ...(scope ? { scope } : {})
+    })
     if (!currentSessionIs(ctx, sid, flight)) return
-    ctx.pushSystem(`reasoning: ${readStr(r, 'value') || first}`)
+    ctx.pushSystem(`reasoning: ${readStr(r, 'value') || value}`)
   } catch {
     if (currentSessionIs(ctx, sid, flight)) ctx.pushSystem('reasoning: failed to update')
   }
@@ -1061,6 +1233,81 @@ const skinCmd: ClientHandler = async (arg, ctx) => {
     ctx.pushSystem(`skin → ${readStr(r, 'value') || name}`)
   } catch (error) {
     ctx.pushSystem(`/skin: ${error instanceof Error ? error.message : 'config.set failed'}`)
+  }
+}
+
+/** `/theme [auto|light|dark]` stays client-owned so it persists through the
+ * config RPC instead of falling through to the slash-worker subprocess. */
+const themeCmd: ClientHandler = async (arg, ctx) => {
+  const value = arg.trim().toLowerCase()
+  if (!value) {
+    try {
+      const response = decodeConfigValueResponse(await ctx.request('config.get', { key: 'theme' }))
+      ctx.pushSystem(`theme: ${response?.value || 'auto'}`)
+    } catch {
+      ctx.pushSystem('theme: auto')
+    }
+    return
+  }
+  if (value !== 'auto' && value !== 'light' && value !== 'dark') {
+    ctx.pushSystem('usage: /theme [auto|light|dark]')
+    return
+  }
+  try {
+    const response = decodeConfigValueResponse(await ctx.request('config.set', { key: 'theme', value }))
+    if (!response) {
+      ctx.pushSystem('/theme: invalid config.set response')
+      return
+    }
+    ctx.pushSystem(`theme → ${response.value || value}`)
+  } catch (error) {
+    ctx.pushSystem(`/theme: ${error instanceof Error ? error.message : 'config.set failed'}`)
+  }
+}
+
+/** `/battery [on|off|status]` owns both persistence and the native poller.
+ * Bare/toggle parity with the classic CLI is retained. */
+const batteryCmd: ClientHandler = async (arg, ctx, flight) => {
+  const mode = arg.trim().toLowerCase()
+  const sid = ctx.sessionId()
+  if (mode === 'status' || mode === 'show') {
+    const state = ctx.batteryEnabled() ? 'on' : 'off'
+    try {
+      const raw = await ctx.request('system.battery', {})
+      if (!currentSessionIs(ctx, sid, flight)) return
+      const reading = batteryInfoFromResponse(raw)
+      ctx.pushSystem(
+        reading?.available
+          ? `battery indicator ${state} — currently ${batteryLabel(reading)}`
+          : `battery indicator ${state} — no battery detected on this machine`
+      )
+    } catch {
+      if (currentSessionIs(ctx, sid, flight)) ctx.pushSystem(`battery indicator ${state}`)
+    }
+    return
+  }
+
+  const next = flagFromArg(arg, ctx.batteryEnabled())
+  if (next === null) {
+    ctx.pushSystem('usage: /battery [on|off|status]')
+    return
+  }
+  try {
+    const response = decodeConfigValueResponse(
+      await ctx.request('config.set', { key: 'battery', value: next ? 'on' : 'off' })
+    )
+    if (!currentSessionIs(ctx, sid, flight)) return
+    if (!response) {
+      ctx.pushSystem('/battery: invalid config.set response')
+      return
+    }
+    const enabled = response.value === 'on'
+    ctx.setBatteryEnabled(enabled)
+    ctx.pushSystem(`battery indicator ${enabled ? 'on' : 'off'}`)
+  } catch (error) {
+    if (currentSessionIs(ctx, sid, flight)) {
+      ctx.pushSystem(`/battery: ${error instanceof Error ? error.message : 'config.set failed'}`)
+    }
   }
 }
 
@@ -1237,40 +1484,38 @@ const replayCmd: ClientHandler = async (arg, ctx, flight) => {
   }
   ctx.openDashboard({ initialHistoryIndex: index })
 }
-const creditsCmd: ClientHandler = async (_arg, ctx, flight) => {
-  const sid = ctx.sessionId()
-  const response = decodeCreditsViewResponse(await ctx.request('credits.view', { session_id: sid }))
-  if (!currentSessionIs(ctx, sid, flight)) return
-  if (!response) return ctx.pushSystem('error: invalid response: credits.view')
-  if (!response.logged_in) return ctx.pushSystem('💳 Not logged into Nous Portal — run /portal to log in.')
-  const lines = ['💳 Nous credits', ...response.balance_lines]
-  if (response.identity_line) lines.push('', response.identity_line)
-  if (response.topup_url) lines.push('', `Top up: ${response.topup_url}`)
-  ctx.pushSystem(lines.join('\n'))
-  if (response.topup_url) {
-    const url = response.topup_url
-    ctx.confirm(
-      { title: 'Add credits?', detail: url, confirmLabel: 'Open top-up in browser', cancelLabel: 'Cancel' },
-      () => {
-        const opened = openExternalUrl(url)
-        ctx.pushSystem(
-          opened
-            ? 'Complete your top-up in the browser — credits will appear in /credits shortly.'
-            : `Open this URL to top up: ${url}`
-        )
-      }
-    )
-  }
-}
-
 const usageCmd: ClientHandler = async (_arg, ctx, flight) => {
   const sid = ctx.sessionId()
   const response = decodeSessionUsageResponse(await ctx.request('session.usage', { session_id: sid }))
   if (!currentSessionIs(ctx, sid, flight)) return
   if (!response) return ctx.pushSystem('error: invalid response: session.usage')
   const credits = response.credits_lines ?? []
-  if (!(response.calls ?? 0) && !credits.length) return ctx.pushSystem('no API calls yet')
-  const lines = credits.length ? ['Nous credits', ...credits, ''] : []
+  const model = response.usage
+  const bars: string[] = []
+  if (model?.plan_bar) {
+    const b = model.plan_bar
+    const filled = Math.max(0, Math.min(10, Math.round(b.fill_fraction * 10)))
+    bars.push(
+      `${model.plan_name ?? 'plan'} [${'█'.repeat(filled)}${'░'.repeat(10 - filled)}] ${b.remaining_display} left of ${b.total_display}${b.pct_used == null ? '' : ` · ${String(b.pct_used)}% used`}`
+    )
+  }
+  if (model?.topup_bar) bars.push(`top-up [${'█'.repeat(10)}] ${model.topup_bar.remaining_display} · never expires`)
+  if (model?.total_spendable_display && model.has_topup) bars.push(`Total spendable: ${model.total_spendable_display}`)
+  const hasBalance = Boolean((model?.available && (bars.length || model.status === 'free')) || credits.length)
+  if (!(response.calls ?? 0) && !hasBalance) ctx.pushSystem('no API calls yet')
+  const lines = model?.available
+    ? [
+        `Plan: ${model.plan_name ?? (model.status === 'free' ? 'Free' : '')}${model.renews_display ? ` · renews ${model.renews_display}` : ''}`,
+        ...bars,
+        ...(model.status === 'free' ? ['> Free · free models only. Run /subscription to reach paid models.'] : []),
+        ...(model.status === 'low'
+          ? [`! Low balance · ${model.total_spendable_display ?? 'under $5'} left. Run /topup or /subscription.`]
+          : []),
+        ''
+      ]
+    : credits.length
+      ? ['Nous balance', ...credits, '']
+      : []
   if ((response.calls ?? 0) > 0) {
     const f = (value: number | undefined) => (value ?? 0).toLocaleString()
     lines.push(
@@ -1287,7 +1532,8 @@ const usageCmd: ClientHandler = async (_arg, ctx, flight) => {
       )
     if (response.compressions) lines.push(`Compressions: ${String(response.compressions)}`)
   }
-  ctx.openPager('Usage', lines.join('\n').trim())
+  if (lines.length) ctx.openPager('Usage', lines.join('\n').trim())
+  ctx.pushSystem('Run /subscription to change plan · /topup to add to your balance')
 }
 
 const personalityCmd: ClientHandler = async (arg, ctx, flight) => {
@@ -1392,6 +1638,10 @@ const fastCmd: ClientHandler = async (arg, ctx, flight) => {
     return
   }
   const sid = ctx.sessionId()
+  if (!sid && mode !== '' && mode !== 'status') {
+    ctx.pushSystem('fast mode: no active session')
+    return
+  }
   const response = decodeConfigValueResponse(
     await ctx.request(mode === '' || mode === 'status' ? 'config.get' : 'config.set', {
       key: 'fast',
@@ -1729,22 +1979,33 @@ const toolsCmd: ClientHandler = async (arg, ctx) => {
   }
 }
 
-/** `/billing` — fetch the gateway billing state and open the interactive overlay
+/** `/topup` — fetch the gateway billing state and open the interactive overlay
  *  (buy credits / auto-reload / monthly limit). ZERO sub-commands (CLI/TUI
  *  parity): any arg is ignored. All RPC + error mapping lives in logic/billing.ts
  *  (`buildBillingCtx`); this handler just fetches state and opens. */
-const billingCmd: ClientHandler = async (_arg, ctx) => {
+const topupCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const expectedSid = ctx.sessionId()
+  const pushInitialSystem = (text: string) => {
+    if (currentSessionIs(ctx, expectedSid, flight)) ctx.pushSystem(text)
+  }
+  // Billing actions outlive the slash-command flight: charge settlement is
+  // polled after the overlay closes. Keep those outcomes session-scoped so a
+  // later same-session slash command cannot suppress success/failure copy.
+  const pushSessionSystem = (text: string) => {
+    if (ctx.sessionId() === expectedSid) ctx.pushSystem(text)
+  }
   try {
     const s = (await ctx.request('billing.state', {})) as BillingStateResponse
+    if (!currentSessionIs(ctx, expectedSid, flight)) return
     if (!s.logged_in) {
-      ctx.pushSystem('💳 Not logged into Nous Portal — run /portal to log in, then /billing.')
+      pushInitialSystem('💳 Not logged into Nous Portal — run /portal to log in, then /topup.')
       return
     }
     const billingHost = {
       request: ctx.request,
-      pushSystem: ctx.pushSystem,
+      pushSystem: pushSessionSystem,
       confirm: ctx.confirm,
-      sessionId: ctx.sessionId
+      sessionId: () => expectedSid
     }
     ctx.openBilling({
       ctx: buildBillingCtx(billingHost, s),
@@ -1753,7 +2014,107 @@ const billingCmd: ClientHandler = async (_arg, ctx) => {
       state: s
     })
   } catch (error) {
-    ctx.pushSystem(`/billing: ${error instanceof Error ? error.message : 'billing.state failed'}`)
+    if (currentSessionIs(ctx, expectedSid, flight)) {
+      pushInitialSystem(`/topup: ${error instanceof Error ? error.message : 'billing.state failed'}`)
+    }
+  }
+}
+
+const subscriptionCmd: ClientHandler = async (_arg, ctx, flight) => {
+  const expectedSid = ctx.sessionId()
+  const pushInitialSystem = (text: string) => {
+    if (currentSessionIs(ctx, expectedSid, flight)) ctx.pushSystem(text)
+  }
+  const pushSessionSystem = (text: string) => {
+    if (ctx.sessionId() === expectedSid) ctx.pushSystem(text)
+  }
+  try {
+    const state = (await ctx.request('subscription.state', {})) as SubscriptionStateResponse
+    if (!currentSessionIs(ctx, expectedSid, flight)) return
+    if (!state.logged_in) {
+      pushInitialSystem('Not logged into Nous Portal — run /portal to log in, then /subscription.')
+      return
+    }
+    const openPortal = (url: string) => {
+      const opened = openExternalUrl(url)
+      pushSessionSystem(opened ? `Opening portal: ${url}` : `Could not open browser — visit ${url}`)
+    }
+    ctx.openSubscription({
+      ctx: {
+        fetchCard: () =>
+          ctx
+            .request('billing.state', {})
+            .then(raw => (raw as BillingStateResponse).card ?? null)
+            .catch(() => null),
+        openManageLink: (tierId?: string) => {
+          const url = buildManageSubscriptionUrl(state, tierId)
+          if (!url) {
+            pushSessionSystem('Could not build manage URL — is your portal configured?')
+            return Promise.resolve(false)
+          }
+          const opened = openExternalUrl(url)
+          pushSessionSystem(
+            opened
+              ? 'Opening your subscription page in the browser — finish there, then re-run /subscription.'
+              : `Could not open browser — visit ${url}`
+          )
+          return Promise.resolve(opened)
+        },
+        openPortal,
+        preview: tierId =>
+          ctx
+            .request('subscription.preview', { subscription_type_id: tierId })
+            .then(raw => raw as SubscriptionPreviewResponse)
+            .catch(() => null),
+        refreshState: () =>
+          ctx
+            .request('subscription.state', {})
+            .then(raw => raw as SubscriptionStateResponse)
+            .catch(() => null),
+        requestRemoteSpending: () =>
+          ctx
+            .request('billing.step_up', { session_id: expectedSid })
+            .then(raw => {
+              const r = raw as BillingMutationResponse
+              return {
+                ...(r.error ? { error: r.error } : {}),
+                granted: Boolean(r.ok && r.granted),
+                ...(r.message ? { message: r.message } : {})
+              }
+            })
+            .catch(() => ({ granted: false, message: 'Could not reach the billing service.' })),
+        resume: () =>
+          ctx
+            .request('subscription.resume', {})
+            .then(raw => raw as BillingMutationResponse)
+            .catch(() => null),
+        scheduleCancellation: () =>
+          ctx
+            .request('subscription.change', { cancel: true })
+            .then(raw => raw as BillingMutationResponse)
+            .catch(() => null),
+        scheduleChange: tierId =>
+          ctx
+            .request('subscription.change', { subscription_type_id: tierId })
+            .then(raw => raw as BillingMutationResponse)
+            .catch(() => null),
+        sys: pushSessionSystem,
+        upgrade: (tierId, idempotencyKey) =>
+          ctx
+            .request('subscription.upgrade', {
+              subscription_type_id: tierId,
+              ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {})
+            })
+            .then(raw => raw as SubscriptionUpgradeResponse)
+            .catch(() => null)
+      },
+      screen: 'overview',
+      state
+    })
+  } catch (error) {
+    if (currentSessionIs(ctx, expectedSid, flight)) {
+      pushInitialSystem(`/subscription: ${error instanceof Error ? error.message : 'subscription.state failed'}`)
+    }
   }
 }
 
@@ -1972,7 +2333,15 @@ const compressCmd: ClientHandler = async (arg, ctx) => {
     }
     const sessionKey = response.session_key?.trim()
     if (sessionKey) ctx.setCompressedSessionKey(sessionKey)
-    if (response.summary?.headline) {
+    const lockSkipMessage =
+      response.lock_held === true
+        ? response.message?.trim()
+          ? response.message
+          : '/compress: compression lock held'
+        : undefined
+    if (lockSkipMessage) {
+      ctx.pushSystem(lockSkipMessage)
+    } else if (response.summary?.headline) {
       ctx.pushSystem((response.summary.noop ? '' : '✓ ') + response.summary.headline)
       if (response.summary.token_line) ctx.pushSystem('  ' + response.summary.token_line)
       if (response.summary.note) ctx.pushSystem('  ' + response.summary.note)
@@ -2176,6 +2545,17 @@ const updateCmd: ClientHandler = (_arg, ctx) => {
 const redrawCmd: ClientHandler = (_arg, ctx) => {
   ctx.redraw()
   ctx.pushSystem('ui redrawn')
+}
+
+/** Rescan $HERMES_HOME/tui-widgets (Ink `widgets-reload` parity). The watcher
+ *  hot-loads automatically; this is the explicit "prove it" path. */
+const widgetsReloadCmd: ClientHandler = async (_arg, ctx) => {
+  const { errors, loaded } = await loadUserWidgets()
+  const parts = [
+    loaded.length ? `loaded: ${loaded.join(', ')}` : 'no user widgets found',
+    ...errors.map(e => `${e.file}: ${e.message}`)
+  ]
+  ctx.pushSystem(`widgets — ${parts.join(' · ')}`)
 }
 
 const fortuneCmd: ClientHandler = (arg, ctx) => {
@@ -2425,15 +2805,70 @@ async function voiceCmd(arg: string, ctx: SlashContext, flight: number): Promise
   }
   ctx.pushSystem(`Voice mode enabled${tts ? ' (TTS enabled)' : ''}`)
   ctx.pushSystem(`  Press ${keyLabel} to start/stop recording`)
+  // Spoken-stop hint (upstream 6fdfdc1597) — gateway-sourced from
+  // voice.stop_phrases so a custom phrase renders correctly; absent/empty means
+  // the feature is disabled (stop_phrases: []) or an older gateway — no hint.
+  // Rides the toggle response's additive rest fields (VoiceToggleResponse
+  // StructWithRest), so no schema change is needed for back-compat.
+  const stopHint = readStr(response, 'stop_hint')?.trim()
+  if (stopHint) ctx.pushSystem(`  ${stopHint}`)
   ctx.pushSystem('  /voice tts  to toggle speech output')
   ctx.pushSystem('  /voice off  to disable voice mode')
+}
+
+/** `/wake [on|off|status]` — the "Hey Hermes" listener (upstream 71a2feeade).
+ *  TUI-local handler over the wake.start/stop/status RPCs with friendly
+ *  transcript one-liners. `/wake off` sets a process-scoped opt-out the
+ *  gateway.ready auto-arm respects (logic/wake.ts), and both explicit gestures
+ *  pass `persist: true` so the choice is written to config wake_word.enabled. */
+async function wakeCmd(arg: string, ctx: SlashContext): Promise<void> {
+  const sub = arg.trim().toLowerCase() || 'status'
+  if (!isWakeSub(sub)) {
+    ctx.pushSystem(WAKE_USAGE)
+    return
+  }
+  if (sub === 'on') {
+    setWakeUserDisabled(false)
+    const response = decodeWakeStartResponse(await ctx.request('wake.start', { persist: true, surface: 'tui' }))
+    ctx.pushSystem(response ? wakeStartLine(response) : 'error: invalid response: wake.start')
+    return
+  }
+  if (sub === 'off') {
+    // Remember the explicit opt-out BEFORE the RPC so a reconnect racing the
+    // stop can't re-arm the listener behind the user's back.
+    setWakeUserDisabled(true)
+    const response = decodeWakeStopResponse(await ctx.request('wake.stop', { persist: true }))
+    ctx.pushSystem(response ? wakeStopLine(response) : 'error: invalid response: wake.stop')
+    return
+  }
+  const response = decodeWakeStatusResponse(await ctx.request('wake.status', {}))
+  ctx.pushSystem(response ? wakeStatusLine(response) : 'error: invalid response: wake.status')
 }
 
 async function browserCmd(arg: string, ctx: SlashContext, flight: number): Promise<void> {
   const [rawAction = 'status', ...rest] = arg.trim().split(/\s+/).filter(Boolean)
   const action = rawAction.toLowerCase()
+  if (action === 'use') {
+    const mode = (rest[0] ?? 'on').toLowerCase()
+    if (rest.length > 1 || (mode !== 'on' && mode !== 'off')) {
+      ctx.pushSystem('usage: /browser use [off]')
+      return
+    }
+
+    const sid = ctx.sessionId()
+    await ctx.request('config.set', { key: 'browser_backend', value: mode })
+    if (!currentSessionIs(ctx, sid, flight)) return
+    ctx.newSession(
+      mode === 'on'
+        ? 'Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0'
+        : 'Browser Use mode disabled — built-in browser tools restored'
+    )
+    return
+  }
   if (action !== 'connect' && action !== 'disconnect' && action !== 'status') {
-    ctx.pushSystem('usage: /browser [connect|disconnect|status] [url] · persistent: set browser.cdp_url in config.yaml')
+    ctx.pushSystem(
+      'usage: /browser [connect|disconnect|status|use] [url] · persistent: set browser.cdp_url in config.yaml'
+    )
     return
   }
 
@@ -2478,14 +2913,15 @@ async function browserCmd(arg: string, ctx: SlashContext, flight: number): Promi
 const CLIENT: Record<string, ClientHandler> = {
   agents: agentsCmd,
   background: backgroundCmd,
+  battery: batteryCmd,
   bg: backgroundCmd,
-  billing: billingCmd,
+  subscription: subscriptionCmd,
+  upgrade: subscriptionCmd,
   browser: browserCmd,
   busy: busyCmd,
   btw: backgroundCmd,
   clear: freshSessionCmd(false),
-  compact: compactCmd,
-  credits: creditsCmd,
+  density: densityCmd,
   compress: compressCmd,
   branch: branchCmd,
   fork: branchCmd,
@@ -2507,6 +2943,7 @@ const CLIENT: Record<string, ClientHandler> = {
   detail: detailsCmd,
   details: detailsCmd,
   exit: quitCmd,
+  focus: focusCmd,
   fortune: fortuneCmd,
   fast: fastCmd,
   heapdump: heapdumpCmd,
@@ -2542,12 +2979,15 @@ const CLIENT: Record<string, ClientHandler> = {
   switch: sessionsCmd,
   stop: stopCmd,
   tasks: agentsCmd,
+  theme: themeCmd,
   timestamps: timestampsCmd,
+  topup: topupCmd,
   title: titleCmd,
   ts: timestampsCmd,
   tools: toolsCmd,
   verbose: verboseCmd,
   voice: voiceCmd,
+  wake: wakeCmd,
   yolo: yoloCmd,
   status: statusCmd,
   setup: setupCmd,
@@ -2564,7 +3004,9 @@ const CLIENT: Record<string, ClientHandler> = {
   steer: steerCmd,
   undo: undoCmd,
   usage: usageCmd,
-  update: updateCmd
+  update: updateCmd,
+  'widgets-reload': widgetsReloadCmd,
+  widgets_reload: widgetsReloadCmd
 }
 
 /** The registered client-command names (catalog introspection — tests/menus). */
@@ -2613,8 +3055,10 @@ function handleDispatchResult(parsed: ParsedSlash, raw: unknown, ctx: SlashConte
       if (notice) ctx.pushSystem(notice)
       const message = readStr(raw, 'message')
       if (message?.trim()) {
-        if (ctx.submit(message) === false) {
-          ctx.prefillComposer(message)
+        const display = readStr(raw, 'display')
+        const accepted = display?.trim() ? ctx.submitSkill(display, message) : ctx.submit(message)
+        if (accepted === false) {
+          ctx.prefillComposer(display?.trim() ? display : message)
           ctx.pushSystem('generated prompt could not be queued — message restored to composer')
         }
       } else ctx.pushSystem(`/${parsed.name}: empty message`)
@@ -2659,6 +3103,56 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
       }
     }
     return
+  }
+
+  // Registry-first widget fallback (Ink createSlashHandler parity): user
+  // widgets hot-loaded from $HERMES_HOME/tui-widgets dispatch straight off
+  // the live registry — `/<id>` opens (or toggles) the app client-side, no
+  // gateway round-trip. launchWidget fails closed with a printable line.
+  if (getWidgetApp(parsed.name)) {
+    const err = launchWidget(parsed.name, parsed.arg)
+    if (err) ctx.pushSystem(err)
+    return
+  }
+
+  // Abbreviation resolution against the cached commands.catalog `canon` map
+  // (Ink createSlashHandler parity, upstream 1405d330e7e5). An exact alias
+  // re-dispatches as its canonical name; otherwise tiered name scoring —
+  // prefix matches rank above substring matches, so `/hea` still resolves to
+  // /heartbeat while `/beat` now finds it too instead of dead-ending. Only the
+  // best tier survives — a substring hit never widens an unambiguous prefix
+  // hit into an "ambiguous command" complaint. Description tiers (score >= 3)
+  // are a completion-menu concern and never auto-execute a command here.
+  // Re-dispatch recurses so a canonical CLIENT command runs locally; an exact
+  // canonical name (or no match at all) keeps the slash.exec/command.dispatch
+  // ladder below. Backwards-compatible embedders may inject a SlashContext
+  // without the catalog accessor (see the AgentsSlashControl note above) — no
+  // catalog means no resolution, never a crash.
+  const canon = (ctx as Partial<SlashContext>).commandCatalog?.()?.canon
+  if (canon) {
+    const needle = `/${parsed.name}`
+    const argTail = parsed.arg ? ` ${parsed.arg}` : ''
+    const exact = Object.entries(canon).find(([alias]) => alias.toLowerCase() === needle)?.[1]
+    if (exact) {
+      if (exact.toLowerCase() !== needle) return dispatchSlash(`${exact}${argTail}`, ctx)
+    } else {
+      const scored = Object.entries(canon)
+        .map(([alias, canonical]) => ({
+          canonical,
+          score: scoreSlashMenuItem({ id: alias.replace(/^\//, '') }, parsed.name)
+        }))
+        .filter(entry => entry.score < 3)
+      const best = Math.min(...scored.map(entry => entry.score))
+      const matches = [...new Set(scored.filter(entry => entry.score === best).map(entry => entry.canonical))]
+      const [only] = matches
+      if (matches.length === 1 && only !== undefined && only.toLowerCase() !== needle) {
+        return dispatchSlash(`${only}${argTail}`, ctx)
+      }
+      if (matches.length > 1) {
+        ctx.pushSystem(`ambiguous command: ${matches.slice(0, 6).join(', ')}${matches.length > 6 ? ', …' : ''}`)
+        return
+      }
+    }
   }
 
   try {

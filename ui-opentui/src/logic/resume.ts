@@ -80,6 +80,13 @@ function readOptNum(value: unknown, key: string): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined
 }
 
+function delegationEventLabel(metadata: unknown): string {
+  const raw = metadata && typeof metadata === 'object' ? (metadata as { task_count?: unknown }).task_count : undefined
+  const count = typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : undefined
+  if (count === undefined) return 'background agent work finished'
+  return `${count} background agent${count === 1 ? '' : 's'} finished`
+}
+
 /** Map a `session.list` result into switcher rows (loose-typed read). */
 export function mapSessionList(result: unknown): SessionItem[] {
   if (!result || typeof result !== 'object') return []
@@ -112,6 +119,44 @@ export function mapResumeHistory(history: unknown): Message[] {
     // Optional stored send/receive time (unix seconds). Carried onto the produced
     // Message so /timestamps can render [HH:MM]; undefined when the entry lacks it.
     const ts = readOptNum(raw, 'timestamp')
+
+    // Persisted display-only rows are not ordinary conversation turns. Hidden
+    // handoffs and model-switch bookkeeping follow the gateway's current
+    // transcript policy and stay invisible. Delegation completions remain
+    // useful timeline facts, rendered through the existing dim system-row
+    // surface as a typed ◈ marker instead of resurrecting their raw user prompt.
+    const displayKind = readStr(raw, 'display_kind')
+    if (displayKind === 'hidden' || displayKind === 'model_switch') continue
+    // A crash-interrupted turn the gateway auto-continued (upstream
+    // 082bd17122d): the stored user row is the synthesized interruption note
+    // (system note + embedded original prompt). Render the timeline fact as a
+    // concise system row instead of resurrecting the raw note as a user bubble.
+    if (displayKind === 'auto_continue') {
+      const message: Message = { role: 'system', text: '↻ resumed interrupted turn' }
+      if (ts !== undefined) message.timestamp = ts
+      out.push(message)
+      pendingTools = []
+      continue
+    }
+    // A persisted personality pivot (upstream 327f7efab8b): the stored user row
+    // is the provider-facing pivot prompt. Surface the timeline fact as a concise
+    // system row, matching Ink's toTranscriptMessages.
+    if (displayKind === 'personality_switch') {
+      const message: Message = { role: 'system', text: 'personality changed' }
+      if (ts !== undefined) message.timestamp = ts
+      out.push(message)
+      pendingTools = []
+      continue
+    }
+    if (displayKind === 'async_delegation_complete') {
+      const metadata =
+        raw && typeof raw === 'object' ? (raw as { display_metadata?: unknown }).display_metadata : undefined
+      const message: Message = { role: 'system', text: `◈ ${delegationEventLabel(metadata)}` }
+      if (ts !== undefined) message.timestamp = ts
+      out.push(message)
+      pendingTools = []
+      continue
+    }
 
     if (role === 'notification') {
       const payload = raw && typeof raw === 'object' ? (raw as { notification?: unknown }).notification : undefined

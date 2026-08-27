@@ -22,6 +22,7 @@
  */
 import { ScrollBoxRenderable, type Renderable } from '@opentui/core'
 import { useRenderer } from '@opentui/solid'
+import { createSignal, Show } from 'solid-js'
 import { afterEach, describe, expect, test } from 'vitest'
 
 import { createSessionStore, type Message } from '../logic/store.ts'
@@ -152,6 +153,74 @@ function clipScrollbar(frame: string): string {
 }
 
 describe('transcript windowing — S2 append-time adjudication', () => {
+  test.each(['1', '0'] as const)(
+    'a promoted queued turn stays bottom-followed when fixed composer chrome disappears (windowing=%s)',
+    async windowing => {
+      process.env.HERMES_TUI_WINDOWING = windowing
+      const store = seedRows(120)
+      const [queued, setQueued] = createSignal(true)
+      let root: Renderable | undefined
+      function Grab() {
+        root = useRenderer().root
+        return null
+      }
+      const probe = await renderProbe(
+        () => (
+          <ThemeProvider theme={() => store.state.theme}>
+            <Grab />
+            <box style={{ flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
+              <Transcript store={store} />
+              <Show when={queued()}>
+                <box style={{ flexShrink: 0, height: 4 }}>
+                  <text>queued (1)\n1. review this change\nEnter send now</text>
+                </box>
+              </Show>
+            </box>
+          </ThemeProvider>
+        ),
+        { width: 60, height: 18 }
+      )
+      try {
+        for (let i = 0; i < 6; i++) await probe.settle()
+        let sb: ScrollBoxRenderable | undefined
+        if (root) {
+          walk(root, node => {
+            if (node instanceof ScrollBoxRenderable) sb ??= node
+          })
+        }
+        if (!sb) throw new Error('no transcript scrollbox')
+        expect(probe.frame()).toContain('queued (1)')
+
+        // A title/status/chrome update can leave OpenTUI's scrollbox off
+        // its sticky re-engage point. A user submission is an explicit intent to
+        // return to the live edge, even from that transient/manual state.
+        sb.scrollTo(Math.max(0, sb.scrollTop - 10))
+        expect(sb.scrollTop).toBeLessThan(sb.scrollHeight - sb.viewport.height)
+
+        // Queue promotion removes fixed-height composer chrome and appends the
+        // optimistic user row. The assistant then streams into the SAME row, so
+        // subsequent deltas do not change messages.length.
+        setQueued(false)
+        store.pushUser('review this change')
+        store.apply({ type: 'message.start' })
+        await probe.settle()
+        for (let i = 0; i < 24; i++) {
+          store.apply({
+            payload: { text: `${i === 0 ? '' : '\n'}streamed answer after promotion line ${i}` },
+            type: 'message.delta'
+          })
+          await probe.settle()
+        }
+        for (let i = 0; i < 3; i++) await probe.settle()
+
+        expect(probe.frame()).toContain('streamed answer after promotion line 23')
+        expect(sb.scrollTop).toBe(sb.scrollHeight - sb.viewport.height)
+      } finally {
+        probe.destroy()
+      }
+    }
+  )
+
   test('bursting 1500 appends keeps the peak mounted-row count bounded (< 120)', async () => {
     // Pin the cap below the burst size: this test ALSO exercises the
     // cap-trim × windowing interplay (trimmed rows' spacers must be pruned,

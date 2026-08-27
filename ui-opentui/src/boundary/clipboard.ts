@@ -9,6 +9,13 @@ import { existsSync } from 'node:fs'
 import { platform } from 'node:os'
 import { join } from 'node:path'
 
+const POWERSHELL_READ_ARGS = [
+  '-NoProfile',
+  '-NonInteractive',
+  '-Command',
+  '[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((Get-Clipboard -Raw)))'
+] as const
+
 /** Whether `cmd` resolves on PATH (cached). We DON'T spawn missing tools: a failed
  *  spawn + writing to its dead stdin pipe raises EPIPE/SIGPIPE, and OpenTUI used to
  *  treat SIGPIPE as a shutdown signal — i.e. a clipboard miss would quit the TUI.
@@ -33,7 +40,9 @@ function run(cmd: string, args: string[] = [], input?: string): Promise<Buffer> 
   return new Promise((resolve, reject) => {
     let child
     try {
-      child = spawn(cmd, args, { stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'ignore'] })
+      child = spawn(cmd, args, {
+        stdio: [input === undefined ? 'ignore' : 'pipe', input === undefined ? 'pipe' : 'ignore', 'ignore']
+      })
     } catch (cause) {
       reject(cause instanceof Error ? cause : new Error(String(cause)))
       return
@@ -43,13 +52,19 @@ function run(cmd: string, args: string[] = [], input?: string): Promise<Buffer> 
     child.stdout?.on('error', () => {}) // a closed stdout pipe must not throw
     child.stdout?.on('data', (c: Buffer) => out.push(c))
     child.on('close', code => (code === 0 ? resolve(Buffer.concat(out)) : reject(new Error(`${cmd} exit ${code}`))))
-    if (input !== undefined && child.stdin) {
-      // Writing to a tool that died/closed early raises EPIPE (→ SIGPIPE). Swallow it.
-      child.stdin.on('error', () => {})
-      try {
-        child.stdin.end(input)
-      } catch {
-        // pipe already gone — nothing to flush
+    if (input !== undefined) {
+      // Copy is best-effort during shutdown: do not let its child keep Node alive.
+      // Its stdout is ignored above because a referenced stdout pipe defeats
+      // child.unref(); reads stay referenced and piped because they need output.
+      child.unref()
+      if (child.stdin) {
+        // Writing to a tool that died/closed early raises EPIPE (→ SIGPIPE). Swallow it.
+        child.stdin.on('error', () => {})
+        try {
+          child.stdin.end(input)
+        } catch {
+          // pipe already gone — nothing to flush
+        }
       }
     }
   })
@@ -75,18 +90,23 @@ function copyCandidates(): Array<[string, string[]]> {
   return list
 }
 
-function textCandidates(): Array<[string, string[]]> {
-  const os = platform()
-  if (os === 'darwin') return [['pbpaste', []]]
+interface TextCandidate {
+  readonly args: readonly string[]
+  readonly base64?: boolean
+  readonly cmd: string
+}
+
+function textCandidates(os: NodeJS.Platform, env: NodeJS.ProcessEnv): TextCandidate[] {
+  if (os === 'darwin') return [{ args: [], cmd: 'pbpaste' }]
   if (os === 'win32') {
-    return [['powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard -Raw']]]
+    return [{ args: POWERSHELL_READ_ARGS, base64: true, cmd: 'powershell.exe' }]
   }
-  const list: Array<[string, string[]]> = []
-  if (process.env.WSL_INTEROP || process.env.WSL_DISTRO_NAME) {
-    list.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard -Raw']])
+  const list: TextCandidate[] = []
+  if (env.WSL_INTEROP || env.WSL_DISTRO_NAME) {
+    list.push({ args: POWERSHELL_READ_ARGS, base64: true, cmd: 'powershell.exe' })
   }
-  if (process.env.WAYLAND_DISPLAY) list.push(['wl-paste', ['--type', 'text']])
-  list.push(['xclip', ['-selection', 'clipboard', '-out']])
+  if (env.WAYLAND_DISPLAY) list.push({ args: ['--type', 'text'], cmd: 'wl-paste' })
+  list.push({ args: ['-selection', 'clipboard', '-out'], cmd: 'xclip' })
   return list
 }
 
@@ -102,11 +122,19 @@ export function isUsableClipboardText(text: string | undefined): text is string 
 
 /** Explicit Ctrl/Cmd+V text fallback. Native bracketed paste remains the fast
  * path; this covers terminals (notably macOS) that surface only the hotkey. */
-export async function readClipboardText(): Promise<string | undefined> {
-  for (const [cmd, args] of textCandidates()) {
-    if (!commandExists(cmd)) continue
+export async function readClipboardText(
+  os: NodeJS.Platform = platform(),
+  execute: typeof run = run,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (cmd: string) => boolean = commandExists
+): Promise<string | undefined> {
+  for (const candidate of textCandidates(os, env)) {
+    if (!exists(candidate.cmd)) continue
     try {
-      const text = (await run(cmd, args)).toString('utf8')
+      const stdout = await execute(candidate.cmd, [...candidate.args])
+      const text = candidate.base64
+        ? Buffer.from(stdout.toString('utf8').trim(), 'base64').toString('utf8')
+        : stdout.toString('utf8')
       if (isUsableClipboardText(text)) return text
     } catch {
       // try the next backend

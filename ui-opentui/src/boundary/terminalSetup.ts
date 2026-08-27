@@ -26,7 +26,56 @@ export type TerminalSetupResult = {
 
 const DEFAULT_FILE_OPS: FileOps = { copyFile, mkdir, readFile, writeFile }
 const COPY_SEQUENCE = '\u001b[99;13u'
-const MULTILINE_SEQUENCE = '\\\r\n'
+// Kitty keyboard protocol CSI u sequences for modified Enter keys.
+// Codepoint 13 = Enter; modifier encoding: 1 + (shift?1:0) + (alt?2:0) + (ctrl?4:0) + (super?8:0).
+// OpenTUI kitty input parses these into a single `return` key event with the
+// matching modifier flag, so the composer newline keybindings insert a
+// newline atomically (no stray backslash + submit).
+const SHIFT_ENTER_SEQUENCE = '\u001b[13;2u' // modifier 2 = shift
+const CTRL_ENTER_SEQUENCE = '\u001b[13;5u' // modifier 5 = ctrl
+const SUPER_ENTER_SEQUENCE = '\u001b[13;9u' // modifier 9 = super (Cmd on macOS)
+
+// Legacy multiline sequence used before the CSI u migration. Old keybindings
+// that still send this will be auto-replaced on the next terminal setup.
+const LEGACY_MULTILINE_SEQUENCE = '\\\r\n'
+
+/**
+ * Migrate legacy keybindings that used the old \\\r\n escape sequence for
+ * modified Enter keys. Those bytes arrived as separate key events (backslash +
+ * return), causing unintended submissions; the replacement CSI u sequences
+ * parse as one modified-return event.
+ */
+function migrateLegacyBindings(keybindings: unknown[]): number {
+  let migrated = 0
+
+  const replacements: Map<string, string> = new Map([
+    ['shift+enter', SHIFT_ENTER_SEQUENCE],
+    ['ctrl+enter', CTRL_ENTER_SEQUENCE],
+    ['cmd+enter', SUPER_ENTER_SEQUENCE]
+  ])
+
+  for (let i = 0; i < keybindings.length; i++) {
+    const entry = keybindings[i]
+
+    if (!isKeybinding(entry)) {
+      continue
+    }
+
+    const replacement = replacements.get(entry.key ?? '')
+
+    if (
+      replacement &&
+      entry.command === 'workbench.action.terminal.sendSequence' &&
+      entry.when === 'terminalFocus' &&
+      entry.args?.text === LEGACY_MULTILINE_SEQUENCE
+    ) {
+      keybindings[i] = { ...entry, args: { text: replacement } }
+      migrated += 1
+    }
+  }
+
+  return migrated
+}
 
 const TERMINAL_META: Record<SupportedTerminal, { appName: string; label: string }> = {
   vscode: { appName: 'Code', label: 'VS Code' },
@@ -46,19 +95,19 @@ const BASE_BINDINGS: Keybinding[] = [
     key: 'shift+enter',
     command: 'workbench.action.terminal.sendSequence',
     when: 'terminalFocus',
-    args: { text: MULTILINE_SEQUENCE }
+    args: { text: SHIFT_ENTER_SEQUENCE }
   },
   {
     key: 'ctrl+enter',
     command: 'workbench.action.terminal.sendSequence',
     when: 'terminalFocus',
-    args: { text: MULTILINE_SEQUENCE }
+    args: { text: CTRL_ENTER_SEQUENCE }
   },
   {
     key: 'cmd+enter',
     command: 'workbench.action.terminal.sendSequence',
     when: 'terminalFocus',
-    args: { text: MULTILINE_SEQUENCE }
+    args: { text: SUPER_ENTER_SEQUENCE }
   },
   {
     key: 'cmd+z',
@@ -335,6 +384,7 @@ export async function configureTerminalKeybindings(
       }
     }
 
+    const migrated = migrateLegacyBindings(keybindings)
     const targets = targetBindings(platform)
 
     const conflicts = targets.filter(target =>
@@ -360,7 +410,7 @@ export async function configureTerminalKeybindings(
       }
     }
 
-    if (!added) {
+    if (!added && !migrated) {
       return {
         success: true,
         message: `${meta.label} terminal keybindings already configured.`
@@ -373,10 +423,20 @@ export async function configureTerminalKeybindings(
 
     await ops.writeFile(keybindingsFile, `${JSON.stringify(keybindings, null, 2)}\n`, 'utf8')
 
+    const parts: string[] = []
+
+    if (added) {
+      parts.push(`Added ${added} ${meta.label} terminal keybinding${added === 1 ? '' : 's'}`)
+    }
+
+    if (migrated) {
+      parts.push(`migrated ${migrated} legacy binding${migrated === 1 ? '' : 's'} to CSI u encoding`)
+    }
+
     return {
       success: true,
       requiresRestart: true,
-      message: `Added ${added} ${meta.label} terminal keybinding${added === 1 ? '' : 's'} in ${keybindingsFile}`
+      message: `${parts.join(', ')} in ${keybindingsFile}`
     }
   } catch (error) {
     return {

@@ -349,6 +349,7 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).toContain('42 tools')
     expect(frame).toContain('7 skills')
     expect(frame).toContain('2 MCP') // mcp.servers.length
+    expect(frame).toContain('MCP Servers (2) enabled')
   })
 
   test('the home screen distinguishes a pending tool catalog from zero tools', async () => {

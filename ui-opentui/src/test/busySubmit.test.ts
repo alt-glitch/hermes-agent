@@ -2,8 +2,10 @@ import { describe, expect, test, vi } from 'vitest'
 
 import { GatewayError } from '../boundary/errors.ts'
 import {
+  acceptedSteerNotice,
   advancePreStartCancellationFence,
   cancelledPreStartInfoIsStale,
+  classifyBusyPromptSubmitResponse,
   createAutomaticQueueDrainGate,
   createPreAdmissionRetryTimer,
   createQueueEditDrainGate,
@@ -30,6 +32,7 @@ function host(overrides: Partial<BusySubmitHost> = {}) {
   const statuses: string[] = []
   const interrupts = vi.fn()
   const haltAutomaticDrain = vi.fn()
+  const redirect = vi.fn(async () => 'redirected' as const)
   const steer = vi.fn(async () => 'accepted' as const)
   const value: BusySubmitHost = {
     mode: () => mode.value,
@@ -40,6 +43,8 @@ function host(overrides: Partial<BusySubmitHost> = {}) {
       return true
     },
     interrupt: interrupts,
+    canRedirect: () => true,
+    redirect,
     canSteer: () => true,
     steer,
     haltAutomaticDrain,
@@ -47,12 +52,21 @@ function host(overrides: Partial<BusySubmitHost> = {}) {
     setStatus: text => statuses.push(text),
     ...overrides
   }
-  return { haltAutomaticDrain, interrupts, mode, notes, queued, sid, statuses, steer, value }
+  return { haltAutomaticDrain, interrupts, mode, notes, queued, redirect, sid, statuses, steer, value }
 }
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 0))
 
 describe('busy submit policy', () => {
+  test('accepted steer feedback is immediate and bounded while the tool is running', () => {
+    expect(acceptedSteerNotice('check the failing branch')).toBe(
+      'steer accepted — waiting for next tool boundary: "check the failing branch"'
+    )
+    expect(acceptedSteerNotice('x'.repeat(80))).toBe(
+      `steer accepted — waiting for next tool boundary: "${'x'.repeat(50)}…"`
+    )
+  })
+
   test('an explicit clean-row send cannot reopen drain for an uncertain sibling', () => {
     const gate = createAutomaticQueueDrainGate()
 
@@ -149,6 +163,42 @@ describe('busy submit policy', () => {
     })
   })
 
+  test('redirected and queued corrections keep one copy until their own terminal lifecycle', () => {
+    const redirected = { text: 'correct active turn' }
+    const afterRedirectAck = pendingPromptAfterBoundary(redirected, 'rpc-ack')
+    expect(afterRedirectAck).toBe(redirected)
+    expect(
+      pendingPromptBoundaryMatches('redirect-1', 'message.complete', {
+        client_submission_ids: ['other-send']
+      })
+    ).toBe(false)
+    expect(afterRedirectAck).toBe(redirected)
+    expect(
+      pendingPromptBoundaryMatches('redirect-1', 'message.complete', {
+        client_submission_ids: ['active-send', 'redirect-1']
+      })
+    ).toBe(true)
+    expect(pendingPromptAfterBoundary(afterRedirectAck, 'message.complete')).toBeUndefined()
+
+    const queued = { text: 'send after build' }
+    const afterQueueAck = pendingPromptAfterBoundary(queued, 'rpc-ack')
+    expect(afterQueueAck).toBe(queued)
+    expect(pendingPromptBoundaryMatches('queued-1', 'message.start', undefined)).toBe(false)
+    expect(
+      pendingPromptBoundaryMatches('queued-1', 'message.start', {
+        client_submission_ids: ['queued-1']
+      })
+    ).toBe(true)
+    expect(pendingPromptAfterBoundary(afterQueueAck, 'message.start')).toBeUndefined()
+
+    expect(
+      pendingPromptBoundaryMatches('failed-1', 'error', {
+        client_submission_ids: ['failed-1']
+      })
+    ).toBe(true)
+    expect(pendingPromptDecision('error')).toBe('retain')
+  })
+
   test('out-of-order front steer failures retain final issuance order', () => {
     interface Request {
       readonly front: boolean
@@ -196,16 +246,149 @@ describe('busy submit policy', () => {
     expect(submitWhileBusy(h.value, 'tail')).toBe(true)
     expect(submitWhileBusy(h.value, 'head', true)).toBe(true)
     expect(h.queued).toEqual(['head', 'tail'])
+    expect(h.redirect).not.toHaveBeenCalled()
     expect(h.steer).not.toHaveBeenCalled()
   })
 
-  test('interrupt queues first, marks status, then interrupts exactly once', () => {
+  test('interrupt redirects a text correction through the active prompt submission', async () => {
     const h = host()
     h.mode.value = 'interrupt'
     expect(submitWhileBusy(h.value, 'next')).toBe(true)
-    expect(h.queued).toEqual(['next'])
+    await tick()
+    expect(h.redirect).toHaveBeenCalledWith('sid-1', 'next', false)
+    expect(h.queued).toEqual([])
+    expect(h.statuses).toEqual([])
+    expect(h.interrupts).not.toHaveBeenCalled()
+  })
+
+  test('interrupt keeps a build-window queued correction on the redirect path', async () => {
+    const h = host({ redirect: async () => 'queued' })
+    h.mode.value = 'interrupt'
+    expect(submitWhileBusy(h.value, 'after build')).toBe(true)
+    await tick()
+    expect(h.queued).toEqual([])
+    expect(h.interrupts).not.toHaveBeenCalled()
+    expect(h.notes).toEqual([])
+  })
+
+  test('definite redirect RPC failure uses the legacy enqueue and interrupt fallback', async () => {
+    const fallbackQueue: string[] = []
+    const fallbackInterrupt = vi.fn()
+    const h = host({
+      redirect: async (_sid, text, front) => {
+        if (front) fallbackQueue.unshift(text)
+        else fallbackQueue.push(text)
+        fallbackInterrupt()
+        return 'fallback'
+      }
+    })
+    h.mode.value = 'interrupt'
+    expect(submitWhileBusy(h.value, 'survive old gateway')).toBe(true)
+    await tick()
+    expect(fallbackQueue).toEqual(['survive old gateway'])
+    expect(fallbackInterrupt).toHaveBeenCalledTimes(1)
+    expect(h.statuses).toEqual(['interrupting…'])
+    expect(h.queued).toEqual([])
+  })
+
+  test('media-bearing interrupt input cannot take the text redirect path', () => {
+    const h = host({ canRedirect: () => false })
+    h.mode.value = 'interrupt'
+    expect(submitWhileBusy(h.value, 'caption with attached image')).toBe(true)
+    expect(h.redirect).not.toHaveBeenCalled()
+    expect(h.queued).toEqual(['caption with attached image'])
     expect(h.statuses).toEqual(['interrupting…'])
     expect(h.interrupts).toHaveBeenCalledTimes(1)
+  })
+
+  test('busy prompt response accepts only redirected and queued statuses', () => {
+    expect(classifyBusyPromptSubmitResponse({ status: 'redirected' })).toBe('redirected')
+    expect(classifyBusyPromptSubmitResponse({ status: 'queued' })).toBe('queued')
+    expect(classifyBusyPromptSubmitResponse({ status: 'streaming' })).toBe('rejected')
+    expect(classifyBusyPromptSubmitResponse(undefined)).toBe('rejected')
+  })
+
+  test('a consumed voice-stop ack is neither an admission nor a rejection', () => {
+    // {voice_stopped:true} (upstream ba13132298) means the gateway ended the
+    // voice chat with a typed bare stop phrase; NO turn starts, so it must not
+    // be totalized into the interrupt + enqueue rejection fallback.
+    expect(classifyBusyPromptSubmitResponse({ voice_stopped: true })).toBe('voice-stopped')
+    // Genuine non-admissions still reject so real failures keep the fallback.
+    expect(classifyBusyPromptSubmitResponse({ voice_stopped: false })).toBe('rejected')
+    expect(classifyBusyPromptSubmitResponse({ voice_stopped: 'yes' })).toBe('rejected')
+    expect(classifyBusyPromptSubmitResponse({ status: 'streaming', voice_stopped: false })).toBe('rejected')
+  })
+
+  test('interrupt: a consumed voice-stop redirect neither requeues, interrupts, nor notifies', async () => {
+    // The entry maps a `voice-stopped` classification to a `consumed` delivery
+    // (drop the optimistic row, keep the live turn). submitWhileBusy must treat
+    // that terminal ack as a clean no-op.
+    const redirect = vi.fn(async () => 'consumed' as const)
+    const h = host({ redirect })
+    h.mode.value = 'interrupt'
+    expect(submitWhileBusy(h.value, 'stop')).toBe(true)
+    await tick()
+    expect(redirect).toHaveBeenCalledWith('sid-1', 'stop', false)
+    expect(h.queued).toEqual([])
+    expect(h.interrupts).not.toHaveBeenCalled()
+    expect(h.notes).toEqual([])
+    expect(h.statuses).toEqual([])
+  })
+
+  test('interrupt: the entry redirect consumes a voice stop but still falls back on a genuine rejection', async () => {
+    // Faithfully model the entry's redirect: classify the raw prompt.submit
+    // response, consume a voice stop, and only interrupt + enqueue on a real
+    // rejection. This pins both branches of the fix at once.
+    const requeued: string[] = []
+    const interruptedFor: string[] = []
+    const redirect = (response: unknown) =>
+      host({
+        interrupt: () => interruptedFor.push('x'),
+        redirect: async (_sid, text, front) => {
+          const disposition = classifyBusyPromptSubmitResponse(response)
+          if (disposition === 'voice-stopped') return 'consumed'
+          if (front) requeued.unshift(text)
+          else requeued.push(text)
+          interruptedFor.push(text)
+          return 'fallback'
+        }
+      })
+
+    const stopHost = redirect({ voice_stopped: true })
+    stopHost.mode.value = 'interrupt'
+    expect(submitWhileBusy(stopHost.value, 'stop')).toBe(true)
+    await tick()
+    expect(requeued).toEqual([])
+    expect(interruptedFor).toEqual([])
+
+    const failHost = redirect({ status: 'streaming' })
+    failHost.mode.value = 'interrupt'
+    expect(submitWhileBusy(failHost.value, 'real correction')).toBe(true)
+    await tick()
+    expect(requeued).toEqual(['real correction'])
+    expect(interruptedFor).toEqual(['real correction'])
+  })
+
+  test('queue: a queued voice-stop phrase is consumed on drain, never run as a normal prompt', () => {
+    const h = host()
+    // While busy the client cannot know a typed phrase is a stop phrase without
+    // a round-trip, so queue mode enqueues it. This preserved behavior stands.
+    expect(submitWhileBusy(h.value, 'stop')).toBe(true)
+    expect(h.queued).toEqual(['stop'])
+
+    // On drain the entry submits the row and classifies the ack. A
+    // {voice_stopped:true} ack is consumed: the row leaves the queue and is
+    // NOT resubmitted or re-run as a model prompt.
+    const drained = h.queued.shift()
+    expect(drained).toBe('stop')
+    const submittedAsPrompt: string[] = []
+    const disposition = classifyBusyPromptSubmitResponse({ voice_stopped: true })
+    if (disposition !== 'voice-stopped' && drained !== undefined) submittedAsPrompt.push(drained)
+    expect(disposition).toBe('voice-stopped')
+    expect(submittedAsPrompt).toEqual([])
+    expect(h.queued).toEqual([])
+    expect(h.interrupts).not.toHaveBeenCalled()
+    expect(h.notes).toEqual([])
   })
 
   test('accepted steer does not create a separate queued turn', async () => {
@@ -214,6 +397,7 @@ describe('busy submit policy', () => {
     expect(submitWhileBusy(h.value, 'inject')).toBe(true)
     await tick()
     expect(h.steer).toHaveBeenCalledWith('sid-1', 'inject', false)
+    expect(h.redirect).not.toHaveBeenCalled()
     expect(h.queued).toEqual([])
     expect(h.notes).toEqual([])
   })

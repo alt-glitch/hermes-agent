@@ -54,6 +54,7 @@ interface Probe {
   detailsFlag: { value: DetailsMode }
   detailSections: { value: DetailsSections }
   timestampsFlag: { value: boolean }
+  focusFlag: { value: boolean }
   reasoningFullFlag: { value: boolean }
   renderables: { value: number | undefined }
   sessionId: { value: string | undefined }
@@ -73,6 +74,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const detailsFlag: Probe['detailsFlag'] = { value: 'collapsed' }
   const detailSections: Probe['detailSections'] = { value: {} }
   const timestampsFlag = { value: false }
+  const focusFlag = { value: false }
   const reasoningFullFlag = { value: false }
   const busyMode: { value: BusyInputMode } = { value: 'queue' }
   const queue: string[] = []
@@ -81,6 +83,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const compressionMutations: Probe['compressionMutations'] = []
   const trimCalls = { value: 0 }
   const ctx: SlashContext = {
+    batteryEnabled: () => false,
     guardBusySessionSwitch: () => false,
     newSession: () => {},
     newLiveSession: () => {},
@@ -98,6 +101,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     dashboardMode: () => false,
     compact: () => compactFlag.value,
     setCompact: on => (compactFlag.value = on),
+    setBatteryEnabled: () => {},
     details: () => detailsFlag.value,
     setDetails: (mode, commandOverride) => {
       detailsFlag.value = mode
@@ -110,6 +114,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     },
     timestamps: () => timestampsFlag.value,
     setTimestamps: on => (timestampsFlag.value = on),
+    focusView: () => focusFlag.value,
+    setFocusView: on => (focusFlag.value = on),
     reasoningFull: () => reasoningFullFlag.value,
     setReasoningFull: on => (reasoningFullFlag.value = on),
     isBusy: () => false,
@@ -145,6 +151,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     openDashboard: () => {},
     openBackgroundPanel: () => {},
     openBilling: () => {},
+    openSubscription: () => {},
     addBgTask: () => {},
     openPager: (title, text) => paged.push({ text, title }),
     openPicker: () => {},
@@ -175,7 +182,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     reasoningFullFlag,
     sessionId,
     system,
-    timestampsFlag
+    timestampsFlag,
+    focusFlag
   }
 }
 
@@ -185,37 +193,37 @@ const tick = () => new Promise(r => setTimeout(r, 0))
 describe('client command catalog (registration)', () => {
   test('all five utility commands (and the /detail alias) are registered', () => {
     const names = clientCommandNames()
-    for (const name of ['compact', 'details', 'detail', 'replay', 'heapdump', 'mem', 'verbose']) {
+    for (const name of ['density', 'details', 'detail', 'replay', 'heapdump', 'mem', 'verbose']) {
       expect(names).toContain(name)
     }
   })
 })
 
-describe('/compact', () => {
-  test('bare /compact toggles on, persists via config.set, reports', async () => {
+describe('/density', () => {
+  test('bare /density toggles on, persists via config.set, reports', async () => {
     const p = makeCtx(async () => ({}))
-    await dispatchSlash('/compact', p.ctx)
+    await dispatchSlash('/density', p.ctx)
     expect(p.compactFlag.value).toBe(true)
-    expect(p.system).toEqual(['compact on'])
-    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'compact', value: 'on' } }])
+    expect(p.system).toEqual(['density on'])
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'density', value: 'on' } }])
   })
 
-  test('/compact on|off|toggle set explicitly', async () => {
+  test('/density on|off|toggle set explicitly', async () => {
     const p = makeCtx(async () => ({}))
-    await dispatchSlash('/compact on', p.ctx)
+    await dispatchSlash('/density on', p.ctx)
     expect(p.compactFlag.value).toBe(true)
-    await dispatchSlash('/compact off', p.ctx)
+    await dispatchSlash('/density off', p.ctx)
     expect(p.compactFlag.value).toBe(false)
-    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'compact', value: 'off' } })
-    await dispatchSlash('/compact toggle', p.ctx)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'density', value: 'off' } })
+    await dispatchSlash('/density toggle', p.ctx)
     expect(p.compactFlag.value).toBe(true)
-    expect(p.system).toEqual(['compact on', 'compact off', 'compact on'])
+    expect(p.system).toEqual(['density on', 'density off', 'density on'])
   })
 
-  test('/compact garbage → usage line, no flag change, no RPC', async () => {
+  test('/density garbage → usage line, no flag change, no RPC', async () => {
     const p = makeCtx(async () => ({}))
-    await dispatchSlash('/compact sideways', p.ctx)
-    expect(p.system).toEqual(['usage: /compact [on|off|toggle]'])
+    await dispatchSlash('/density sideways', p.ctx)
+    expect(p.system).toEqual(['usage: /density [on|off|toggle]'])
     expect(p.compactFlag.value).toBe(false)
     expect(p.calls).toHaveLength(0)
   })
@@ -224,10 +232,73 @@ describe('/compact', () => {
     const p = makeCtx(async () => {
       throw new Error('gateway down')
     })
-    await dispatchSlash('/compact on', p.ctx)
+    await dispatchSlash('/density on', p.ctx)
     await tick()
     expect(p.compactFlag.value).toBe(true)
-    expect(p.system).toEqual(['compact on'])
+    expect(p.system).toEqual(['density on'])
+  })
+})
+
+describe('/focus (port of upstream d6fa2709de6)', () => {
+  test('registered as a client command (catalog/completion discovery)', () => {
+    expect(clientCommandNames()).toContain('focus')
+  })
+
+  test('/focus on flips the flag optimistically and writes config.set {key:focus, value:on}', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/focus on', p.ctx)
+    expect(p.focusFlag.value).toBe(true)
+    expect(p.system).toEqual(['focus view enabled — just your prompt and the final response'])
+    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'focus', value: 'on' } }])
+  })
+
+  test('/focus off and bare toggle write the exact on/off values', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/focus on', p.ctx)
+    await dispatchSlash('/focus off', p.ctx)
+    expect(p.focusFlag.value).toBe(false)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'focus', value: 'off' } })
+    await dispatchSlash('/focus', p.ctx)
+    expect(p.focusFlag.value).toBe(true)
+    expect(p.calls.at(-1)).toEqual({ method: 'config.set', params: { key: 'focus', value: 'on' } })
+    expect(p.system).toEqual([
+      'focus view enabled — just your prompt and the final response',
+      'focus view disabled',
+      'focus view enabled — just your prompt and the final response'
+    ])
+  })
+
+  test('/focus status (and show/?) reports the current state WITHOUT a config write', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/focus status', p.ctx)
+    p.focusFlag.value = true
+    await dispatchSlash('/focus show', p.ctx)
+    await dispatchSlash('/focus ?', p.ctx)
+    expect(p.system).toEqual([
+      'focus view off',
+      'focus view on — only your prompt and the final response',
+      'focus view on — only your prompt and the final response'
+    ])
+    expect(p.calls).toHaveLength(0)
+    expect(p.focusFlag.value).toBe(true)
+  })
+
+  test('/focus garbage → usage line, no flag change, no RPC', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/focus sideways', p.ctx)
+    expect(p.system).toEqual(['usage: /focus [on|off|status]'])
+    expect(p.focusFlag.value).toBe(false)
+    expect(p.calls).toHaveLength(0)
+  })
+
+  test('a failing config.set never breaks the local optimistic flip', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('gateway down')
+    })
+    await dispatchSlash('/focus on', p.ctx)
+    await tick()
+    expect(p.focusFlag.value).toBe(true)
+    expect(p.system).toEqual(['focus view enabled — just your prompt and the final response'])
   })
 })
 
@@ -263,6 +334,14 @@ describe('/fast, /yolo, /reload-mcp', () => {
     ])
   })
 
+  test('fast refuses to mutate global config before a session exists', async () => {
+    const p = makeCtx(async () => ({ value: 'fast' }))
+    p.sessionId.value = undefined
+    await dispatchSlash('/fast fast', p.ctx)
+    expect(p.calls).toHaveLength(0)
+    expect(p.system).toEqual(['fast mode: no active session'])
+  })
+
   test('yolo toggles only the live session', async () => {
     const p = makeCtx(async () => ({ value: '1' }))
     await dispatchSlash('/yolo', p.ctx)
@@ -285,32 +364,65 @@ describe('/fast, /yolo, /reload-mcp', () => {
 })
 
 describe('account, personality, and rollback commands', () => {
-  test('credits and usage render decoded account data locally', async () => {
-    const p = makeCtx(async method =>
-      method === 'credits.view'
-        ? {
-            logged_in: true,
-            balance_lines: ['$4.00'],
-            identity_line: 'user@example.com',
-            topup_url: null,
-            depleted: false
-          }
-        : {
-            calls: 1,
-            input: 10,
-            output: 4,
-            total: 14,
-            model: 'test-model',
-            context_used: 20,
-            context_max: 100,
-            context_percent: 20
-          }
-    )
-    await dispatchSlash('/credits', p.ctx)
+  test('usage renders decoded account data locally and always shows the account CTA', async () => {
+    const p = makeCtx(async () => ({
+      calls: 1,
+      input: 10,
+      output: 4,
+      total: 14,
+      model: 'test-model',
+      context_used: 20,
+      context_max: 100,
+      context_percent: 20
+    }))
     await dispatchSlash('/usage', p.ctx)
-    expect(p.system[0]).toContain('💳 Nous credits')
     expect(p.paged.at(-1)).toMatchObject({ title: 'Usage' })
     expect(p.paged.at(-1)?.text).toContain('Total tokens: 14')
+    expect(p.system).toContain('Run /subscription to change plan · /topup to add to your balance')
+  })
+
+  test('credits is no longer a native alias and follows the gateway dispatch ladder', async () => {
+    const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'unknown command: credits' } : {}))
+    await dispatchSlash('/credits', p.ctx)
+    expect(p.calls[0]).toEqual({ method: 'slash.exec', params: { command: 'credits', session_id: 'sid-1' } })
+  })
+
+  test('usage renders dollar plan and top-up bars without credits wording', async () => {
+    const p = makeCtx(async () => ({
+      calls: 0,
+      input: 0,
+      output: 0,
+      total: 0,
+      usage: {
+        available: true,
+        status: 'healthy',
+        plan_name: 'Plus',
+        renews_display: 'Aug 1',
+        total_spendable_display: '$26.00',
+        has_topup: true,
+        plan_bar: {
+          kind: 'plan',
+          remaining_display: '$14.00',
+          total_display: '$20.00',
+          spent_display: '$6.00',
+          pct_used: 30,
+          fill_fraction: 0.7
+        },
+        topup_bar: {
+          kind: 'topup',
+          remaining_display: '$12.00',
+          total_display: '$12.00',
+          spent_display: '$0.00',
+          pct_used: null,
+          fill_fraction: 1
+        }
+      }
+    }))
+    await dispatchSlash('/usage', p.ctx)
+    const body = p.paged.at(-1)?.text ?? ''
+    expect(body).toContain('$14.00 left of $20.00')
+    expect(body).toContain('top-up')
+    expect(body.toLowerCase()).not.toContain('credits')
   })
 
   test('personality resets visible history only when the gateway says so', async () => {
@@ -455,12 +567,14 @@ describe('/reasoning', () => {
     }
   })
 
-  test('bare /reasoning reads config.get reasoning_full and syncs the flag', async () => {
-    const p = makeCtx(async method => (method === 'config.get' ? { value: 'medium', reasoning_full: true } : {}))
+  test('bare /reasoning reads this session and reports effort, visibility, and native section mode', async () => {
+    const p = makeCtx(async method =>
+      method === 'config.get' ? { value: 'medium', display: 'show', reasoning_full: true } : {}
+    )
     await dispatchSlash('/reasoning', p.ctx)
-    expect(p.calls[0]).toEqual({ method: 'config.get', params: { key: 'reasoning' } })
+    expect(p.calls[0]).toEqual({ method: 'config.get', params: { key: 'reasoning', session_id: 'sid-1' } })
     expect(p.reasoningFullFlag.value).toBe(true)
-    expect(p.system).toEqual(['reasoning: full'])
+    expect(p.system).toEqual(['reasoning: medium · display show · sections full'])
   })
 
   test('bare /reasoning with config.get failing falls back to the live flag', async () => {
@@ -480,6 +594,26 @@ describe('/reasoning', () => {
       { method: 'config.set', params: { key: 'reasoning', value: 'high', session_id: 'sid-1' } }
     ])
     expect(p.system).toEqual(['reasoning: high'])
+  })
+
+  test('reasoning accepts explicit session/global scope without treating flags as the effort', async () => {
+    const session = makeCtx(async () => ({ value: 'medium' }))
+    await dispatchSlash('/reasoning --session medium', session.ctx)
+    expect(session.calls).toEqual([
+      {
+        method: 'config.set',
+        params: { key: 'reasoning', scope: 'session', session_id: 'sid-1', value: 'medium' }
+      }
+    ])
+
+    const global = makeCtx(async () => ({ value: 'low' }))
+    await dispatchSlash('/reasoning --session low --global', global.ctx)
+    expect(global.calls).toEqual([
+      {
+        method: 'config.set',
+        params: { key: 'reasoning', scope: 'global', session_id: 'sid-1', value: 'low' }
+      }
+    ])
   })
 
   test('effort requires an active session', async () => {
@@ -680,6 +814,10 @@ describe('details logic (pure)', () => {
   })
 
   test('detailsFromConfig hydrates global mode and only validated section overrides', () => {
+    // An invalid section value ('loud') is dropped — but a config-level
+    // expanded mode then pins thinking expanded explicitly, because the
+    // built-in thinking default is collapsed (live-only expansion) and
+    // SECTION_DEFAULTS would otherwise beat the global mode at lookup time.
     expect(
       detailsFromConfig({
         display: {
@@ -687,8 +825,28 @@ describe('details logic (pure)', () => {
           sections: { activity: 'hidden', thinking: 'loud', tools: 'collapsed', future: 'hidden' }
         }
       })
-    ).toEqual({ mode: 'expanded', sections: { activity: 'hidden', tools: 'collapsed' } })
-    expect(detailsFromConfig({ display: { thinking_mode: 'full' } })).toEqual({ mode: 'expanded', sections: {} })
+    ).toEqual({ mode: 'expanded', sections: { activity: 'hidden', thinking: 'expanded', tools: 'collapsed' } })
+    expect(detailsFromConfig({ display: { thinking_mode: 'full' } })).toEqual({
+      mode: 'expanded',
+      sections: { thinking: 'expanded' }
+    })
+    // An explicit thinking section always wins over the expanded-mode pin.
+    expect(detailsFromConfig({ display: { details_mode: 'expanded', sections: { thinking: 'collapsed' } } })).toEqual({
+      mode: 'expanded',
+      sections: { thinking: 'collapsed' }
+    })
+    // Non-expanded modes never pin thinking — the built-in collapsed default
+    // (live-only expansion) governs.
+    expect(detailsFromConfig({ display: { details_mode: 'collapsed' } })).toEqual({ mode: 'collapsed', sections: {} })
+  })
+
+  test('thinking defaults to collapsed (live-only expansion) at sectionMode lookup', () => {
+    // upstream 2b0b4a219195 adaptation: the built-in default must be collapsed
+    // so only the per-part liveness rule (view) expands the streaming phase.
+    expect(sectionMode('thinking', 'collapsed', {})).toBe('collapsed')
+    // /details expanded (commandOverride) and an explicit section still expand.
+    expect(sectionMode('thinking', 'expanded', {}, true)).toBe('expanded')
+    expect(sectionMode('thinking', 'collapsed', { thinking: 'expanded' })).toBe('expanded')
   })
 
   test('parseDetailsMode + nextDetailsMode', () => {
@@ -732,6 +890,22 @@ describe('details logic (pure)', () => {
     const out = collapseHiddenPartsBy(parts, section => section === 'tools')
     expect(out.map(part => part.type)).toEqual(['reasoning', 'hiddenRun'])
     expect(out[1]).toMatchObject({ thoughts: 0, tools: 1 })
+  })
+
+  test('MoA reference parts NEVER fold, even when every section is hidden (#64657)', () => {
+    const parts: Part[] = [
+      { id: 'p1', name: 'bash', state: 'complete', type: 'tool' },
+      { id: 'p2', text: '**Reference 1/2 — provider/model-a**\n\nadvice-a', type: 'moa' },
+      { id: 'p3', text: 'mull', type: 'reasoning' }
+    ]
+    // /details hidden — global fold of every section
+    const out = collapseHiddenParts(parts)
+    expect(out.map(part => part.type)).toEqual(['hiddenRun', 'moa', 'hiddenRun'])
+    // identity preserved → the reference block does not remount
+    expect(out[1]).toBe(parts[1])
+    // hidden-run counts exclude the visible MoA part
+    expect(out[0]).toMatchObject({ thoughts: 0, tools: 1 })
+    expect(out[2]).toMatchObject({ thoughts: 1, tools: 0 })
   })
 
   test('hiddenRunLabel pluralizes honestly and points back to /details', () => {

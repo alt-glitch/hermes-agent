@@ -60,11 +60,15 @@ function buildSyntaxStyle(theme: Theme): SyntaxStyle {
     // (glitch's report). Palette stays on existing theme tokens: keywords/
     // numbers warm accent, strings label-gold, comments muted italic,
     // functions the machinery blue, types ok-green; punctuation recedes.
-    comment: { fg: rgba(c.muted), italic: true },
-    keyword: { bold: true, fg: rgba(c.accent) },
-    string: { fg: rgba(c.label) },
-    'string.special': { fg: rgba(c.label) },
-    number: { fg: rgba(c.accent) },
+    // The four core families route through the dedicated syntax_* skin tokens
+    // (theme-sdk); their DEFAULTS are these same brand tokens (string→label,
+    // number/keyword→accent, comment→muted), so a skin without them paints
+    // byte-identically.
+    comment: { fg: rgba(c.syntaxComment), italic: true },
+    keyword: { bold: true, fg: rgba(c.syntaxKeyword) },
+    string: { fg: rgba(c.syntaxString) },
+    'string.special': { fg: rgba(c.syntaxString) },
+    number: { fg: rgba(c.syntaxNumber) },
     boolean: { fg: rgba(c.accent) },
     constant: { fg: rgba(c.accent) },
     function: { fg: rgba(c.shellDollar) },

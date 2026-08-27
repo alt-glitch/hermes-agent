@@ -9,6 +9,31 @@ export interface ScopedPlugins {
   scope: PluginScope
 }
 
+export type PluginToggleParams =
+  | { action: 'toggle'; enable: boolean; key: string }
+  | { action: 'toggle'; enable: boolean; name: string }
+
+export function pluginIdentity(row: PluginRow): string {
+  return row.key?.trim() || row.name
+}
+
+/** New gateways address canonical keys; legacy rows remain name-addressed. */
+export function pluginToggleParams(row: PluginRow, enable: boolean): PluginToggleParams {
+  const key = row.key?.trim()
+  return key ? { action: 'toggle', enable, key } : { action: 'toggle', enable, name: row.name }
+}
+
+/** Replace only the selected canonical row, even when another category shares its bare name. */
+export function replacePluginRow(
+  rows: readonly PluginRow[],
+  selected: PluginRow,
+  updated: PluginRow
+): readonly PluginRow[] {
+  const identity = pluginIdentity(selected)
+  const replacement = selected.key && !updated.key ? { ...updated, key: selected.key } : updated
+  return rows.map(row => (pluginIdentity(row) === identity ? replacement : row))
+}
+
 /** Apply the Ink hub's user-only default, falling back to all when only bundled plugins exist. */
 export function scopePlugins(rows: readonly PluginRow[], requested: PluginScope): ScopedPlugins {
   if (requested === 'all') return { rows, scope: 'all' }

@@ -32,6 +32,7 @@ import { QueuedMessages } from './queuedMessages.tsx'
 import { AgentsDashboard } from './overlays/agentsDashboard.tsx'
 import { BackgroundPanel } from './overlays/backgroundPanel.tsx'
 import { BillingOverlay } from './overlays/billing.tsx'
+import { SubscriptionOverlay } from './overlays/subscription.tsx'
 import { Pager } from './overlays/pager.tsx'
 import { JourneyOverlay, type JourneyOps } from './overlays/journey.tsx'
 import { PetPicker, type PetOps } from './overlays/petPicker.tsx'
@@ -48,6 +49,8 @@ import { TodoPanel } from './todoPanel.tsx'
 import { StatusLine } from './statusLine.tsx'
 import { useTheme } from './theme.tsx'
 import { Transcript } from './transcript.tsx'
+import { WidgetDock, WidgetModal } from '../widgets/dock.tsx'
+import { modalWidget } from '../widgets/host.ts'
 
 export interface AppProps {
   readonly store: SessionStore
@@ -137,6 +140,7 @@ export function App(props: AppProps) {
   const dashboard = () => props.store.state.dashboard
   const backgroundPanel = () => props.store.state.backgroundPanel
   const billing = () => props.store.state.billing
+  const subscription = () => props.store.state.subscription
   const sessionPicker = () => props.store.state.sessionPicker
   const picker = () => props.store.state.picker
   const customModelSetup = () => props.store.state.customModelSetup
@@ -161,7 +165,6 @@ export function App(props: AppProps) {
   const closePager = () => deferClose(() => props.store.closePager())
   const closeDashboard = () => deferClose(() => props.store.closeDashboard())
   const closeBackgroundPanel = () => deferClose(() => props.store.closeBackgroundPanel())
-  const closeBilling = () => deferClose(() => props.store.closeBilling())
   const closeJourney = () => deferClose(() => props.store.closeJourney())
   const closePluginsHub = () => deferClose(() => props.store.closePluginsHub())
   const closePetPicker = () => deferClose(() => props.store.closePetPicker())
@@ -207,6 +210,9 @@ export function App(props: AppProps) {
           <Switch
             fallback={
               <>
+                {/* ambient widget rail under the header — in-flow chrome OUTSIDE
+                    the transcript scrollbox/windowing boundary, bounded rows. */}
+                <WidgetDock placement="dock-top" />
                 <Transcript store={props.store} />
                 {/* transient busy face floats at the bottom of the transcript area */}
                 <StatusLine store={props.store} />
@@ -223,6 +229,9 @@ export function App(props: AppProps) {
                     queued={props.store.state.queuedPrompts}
                     editIndex={props.store.state.queueEditIndex}
                   />
+                  {/* ambient widget dock — reserves ≤6 rows directly above the
+                      status bar; the composer below stays mounted + focused. */}
+                  <WidgetDock placement="dock-bottom" />
                   <StatusBar store={props.store} subagentsVisible={subagentsVisible()} />
                   <Switch
                     fallback={
@@ -231,6 +240,7 @@ export function App(props: AppProps) {
                         onType={props.onType}
                         completions={() => props.store.state.completions ?? []}
                         completionFrom={() => props.store.state.completionFrom}
+                        completionEnd={() => props.store.state.completionEnd}
                         onDismiss={() => props.store.clearCompletions()}
                         history={props.history}
                         onImagePaste={props.onImagePaste}
@@ -268,6 +278,9 @@ export function App(props: AppProps) {
                         sessionId={props.sessionId ?? NO_SESSION}
                       />
                     </Match>
+                    {/* modal widget app: owns every keypress while open (the
+                        composer is replaced, Picker-style); its reducer closes it. */}
+                    <Match when={modalWidget()}>{active => <WidgetModal active={active()} />}</Match>
                     <Match when={sessionPicker()}>
                       <SessionOrchestrator
                         ops={props.sessionOps ?? NOOP_OPS}
@@ -372,9 +385,34 @@ export function App(props: AppProps) {
               <JourneyOverlay ops={props.journeyOps ?? NOOP_JOURNEY_OPS} onClose={closeJourney} />
             </Match>
             <Match when={billing()}>
-              {b => (
-                <BillingOverlay overlay={b()} onPatch={next => props.store.patchBilling(next)} onClose={closeBilling} />
-              )}
+              <Show when={billing()?.owner} keyed>
+                {owner => (
+                  <Show when={billing()}>
+                    {b => (
+                      <BillingOverlay
+                        overlay={b()}
+                        onPatch={next => props.store.patchBilling(owner, next)}
+                        onClose={() => deferClose(() => props.store.closeBilling(owner))}
+                      />
+                    )}
+                  </Show>
+                )}
+              </Show>
+            </Match>
+            <Match when={subscription()}>
+              <Show when={subscription()?.owner} keyed>
+                {owner => (
+                  <Show when={subscription()}>
+                    {s => (
+                      <SubscriptionOverlay
+                        overlay={s()}
+                        onPatch={next => props.store.patchSubscription(owner, next)}
+                        onClose={() => deferClose(() => props.store.closeSubscription(owner))}
+                      />
+                    )}
+                  </Show>
+                )}
+              </Show>
             </Match>
           </Switch>
         </box>
