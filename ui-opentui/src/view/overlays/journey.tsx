@@ -1,4 +1,4 @@
-import type { BoxRenderable, ScrollBoxRenderable, TextareaRenderable } from '@opentui/core'
+import type { BoxRenderable, MouseEvent, ScrollBoxRenderable, TextareaRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from 'solid-js'
 import {
@@ -398,7 +398,7 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
       <Show when={notice()}>{n => <text fg={theme().color.muted}>{n()}</text>}</Show>
       <text flexShrink={0} fg={theme().color.muted} truncate wrapMode="none">
         {mode() === 'timeline'
-          ? '↑↓/jk move · Enter open · e edit · d delete · r retry · q close'
+          ? 'wheel/↑↓/jk move · Enter open · e edit · d delete · r retry · q close'
           : '↑↓ scroll · e edit · d delete · Esc back · q close'}
       </text>
     </box>

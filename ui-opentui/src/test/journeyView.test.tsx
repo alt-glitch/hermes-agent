@@ -212,6 +212,24 @@ describe('JourneyOverlay', () => {
     }
   })
 
+  test('mouse wheel moves the timeline cursor without retargeting a pending confirmation', async () => {
+    const h = await mount({ frames: async () => LONG_FRAME }, { height: 18, width: 90 })
+    try {
+      await h.probe.settle()
+      const footer = point(h.probe.frame(), 'wheel/↑↓/jk move')
+      await h.probe.scroll(footer.x, footer.y, 'up')
+      h.probe.keys.pressKey('d')
+      await h.probe.settle()
+      await h.probe.scroll(footer.x, footer.y, 'up')
+      h.probe.keys.pressKey('y')
+      await new Promise(resolve => setTimeout(resolve, 10))
+      await h.probe.settle()
+      expect(h.deletes).toEqual(['s22'])
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
   test('surfaces malformed/errors and retries without closing the overlay', async () => {
     const frames = vi
       .fn<JourneyOps['frames']>()

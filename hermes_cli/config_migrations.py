@@ -218,25 +218,6 @@ def _migrate_to_14(results: Dict[str, Any], quiet: bool) -> None:
             print("  ✓ Migrated legacy stt.model to provider-specific config")
 
 
-def _migrate_to_15(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 14 → 15: add explicit gateway interim-message gate ──
-    _c = _cfg()
-    read_raw_config = _c.read_raw_config
-    _persist_migration = _c._persist_migration
-
-    config = read_raw_config()
-    display = config.get("display", {})
-    if not isinstance(display, dict):
-        display = {}
-    if "interim_assistant_messages" not in display:
-        display["interim_assistant_messages"] = True
-        config["display"] = display
-        results["config_added"].append("display.interim_assistant_messages=true (default)")
-        _persist_migration(config)
-        if not quiet:
-            print("  ✓ Added display.interim_assistant_messages=true")
-
-
 def _migrate_to_16(results: Dict[str, Any], quiet: bool) -> None:
     # ── Version 15 → 16: migrate tool_progress_overrides into display.platforms ──
     _c = _cfg()
@@ -815,6 +796,37 @@ def _migrate_to_37(results: Dict[str, Any], quiet: bool) -> None:
             )
 
 
+def _migrate_to_38(results: Dict[str, Any], quiet: bool) -> None:
+    # Version 37 → 38: the bundled observability/nemo_relay plugin was
+    # removed when Relay lifecycle ownership moved into the agent core.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    from hermes_cli.relay_plugin_cutover import legacy_relay_plugin_keys
+
+    config = read_raw_config()
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict):
+        return
+    enabled = plugins.get("enabled")
+    removed = legacy_relay_plugin_keys(enabled)
+    if not removed or not isinstance(enabled, list):
+        return
+
+    plugins["enabled"] = [value for value in enabled if value not in removed]
+    config["plugins"] = plugins
+    _persist_migration(config)
+    message = (
+        "Removed legacy Relay plugin from plugins.enabled: "
+        f"{', '.join(removed)}. Configure native Relay plugins with "
+        "HERMES_NEMO_RELAY_PLUGINS_TOML."
+    )
+    results["warnings"].append(message)
+    if not quiet:
+        print(f"  ⚠ {message}")
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: observe earlier steps' writes via read_raw_config() (filesystem state).
@@ -825,7 +837,8 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (12, _migrate_to_12),
     (13, _migrate_to_13),
     (14, _migrate_to_14),
-    (15, _migrate_to_15),
+    # v15 only added a schema default; runtime merging supplies it without a
+    # write. Registering a migration would falsely report or materialise it.
     (16, _migrate_to_16),
     (17, _migrate_to_17),
     (21, _migrate_to_21),
@@ -839,6 +852,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (35, _migrate_to_35),
     (36, _migrate_to_36),
     (37, _migrate_to_37),
+    (38, _migrate_to_38),
 )
 
 

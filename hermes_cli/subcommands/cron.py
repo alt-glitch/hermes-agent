@@ -36,7 +36,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument("--name", help="Optional human-friendly job name")
     cron_create.add_argument(
         "--deliver",
-        help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id",
+        help=(
+            "Delivery target: origin, local, telegram, discord, signal, "
+            "platform:chat_id, or bot-chat[:profile] (inject output into a "
+            "local profile's canonical Bot Chat as a message the bot responds to)"
+        ),
     )
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument(
@@ -112,6 +116,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
+    )
+    cron_create.add_argument(
+        "--reasoning-effort",
+        dest="reasoning_effort",
+        help=(
+            "Pin this job's reasoning (thinking) effort: none, minimal, low, "
+            "medium, high, xhigh, max, or ultra. Overrides agent.reasoning_effort "
+            "and agent.reasoning_overrides for this job; unsupported levels are "
+            "clamped by the provider at request time. Omit to follow config."
+        ),
     )
     cron_create.add_argument(
         "--continuity",
@@ -247,6 +261,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--reasoning-effort",
+        dest="reasoning_effort",
+        help=(
+            "Pin this job's reasoning (thinking) effort: none, minimal, low, "
+            "medium, high, xhigh, max, or ultra. Pass empty string to clear "
+            "the pin and follow config resolution."
+        ),
+    )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
@@ -254,6 +277,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
     cron_resume.add_argument("job_id", help="Job ID to resume")
+    cron_resume.add_argument("--at", dest="run_at", help="Re-arm at an ISO-8601 time")
+    cron_resume.add_argument("--run-now", action="store_true", help="Re-arm to run now")
 
     cron_run = cron_subparsers.add_parser(
         "run", help="Run a job on the next scheduler tick"

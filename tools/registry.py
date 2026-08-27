@@ -245,13 +245,13 @@ class _PluginOverridePolicy:
 # ---------------------------------------------------------------------------
 # check_fn TTL cache
 #
-# check_fn callables like tools/terminal_tool.check_terminal_requirements
-# probe external state (Docker daemon, Modal SDK install, playwright binary
+# external state (Docker daemon, Modal SDK install, playwright binary
 # availability). For a long-lived CLI or gateway process, calling them on
 # every get_definitions() is pure waste — external state changes on human
 # timescales. Cache results for ~30 s so env-var flips via ``hermes tools``
 # or live credential file changes propagate within a turn or two without
 # requiring any explicit invalidation.
+#
 #
 # Transient-failure suppression (issue #21658 / #5304): these probes can flap.
 # A single ``subprocess.run([docker, "version"], timeout=5)`` that times out
@@ -272,11 +272,20 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
 _CHECK_FN_CACHE_MAX = 512
+_VERDICT_SNAPSHOT_TTL_SECONDS = 5.0
 _check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
-# Monotonic timestamp of the most recent True result per check_fn.
 _check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
+_verdict_snapshot_cache: Dict[tuple, tuple[float, tuple]] = {}
+_verdict_snapshot_epoch = 0
 _check_fn_cache_lock = threading.Lock()
 CHECK_FN_CACHE_BYPASS = ""
+_NO_CACHE_CHECK_FNS: Set[Callable] = set()
+
+
+def no_cache_check_fn(fn: Callable) -> Callable:
+    """Mark a local, config-backed availability check as uncached."""
+    _NO_CACHE_CHECK_FNS.add(fn)
+    return fn
 
 
 def _prune_check_fn_caches(now: float) -> None:
@@ -292,6 +301,8 @@ def _prune_check_fn_caches(now: float) -> None:
             _check_fn_last_good.pop(key, None)
     while len(_check_fn_cache) >= _CHECK_FN_CACHE_MAX:
         _check_fn_cache.pop(next(iter(_check_fn_cache)))
+    # Same hard cap as _check_fn_cache: TTL pruning alone leaves last-good
+    # unbounded under high (fn, scope) churn inside one grace window.
     while len(_check_fn_last_good) >= _CHECK_FN_CACHE_MAX:
         _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
 
@@ -299,11 +310,30 @@ def _prune_check_fn_caches(now: float) -> None:
 def check_fn_cache_scope() -> Optional[str]:
     """Return the active profile key when availability is profile-scoped.
 
+    Browser-controller availability is request-bound and can change on every
+    attach/detach. A fully bound browser-control request therefore bypasses both
+    this check cache and model_tools' outer definition cache; the same sentinel
+    is consumed by both layers. This prevents one Browser session's live tools
+    from leaking into any unrelated session.
+
     Single-profile processes intentionally keep the historical process-wide
     cache. A multiplex gateway installs a Hermes-home override for every
     profile turn, so the canonical profile key is the stable isolation
     boundary across repeated turns for that profile.
     """
+    try:
+        from gateway.session_context import get_session_env
+
+        browser_identity = (
+            get_session_env("HERMES_SESSION_ID", ""),
+            get_session_env("HERMES_BROWSER_CONTROL_PRINCIPAL", ""),
+            get_session_env("HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY", ""),
+        )
+        if all(str(value or "").strip() for value in browser_identity):
+            return CHECK_FN_CACHE_BYPASS
+    except Exception:
+        pass
+
     try:
         from agent.secret_scope import is_multiplex_active
 
@@ -321,28 +351,29 @@ def check_fn_cache_scope() -> Optional[str]:
         return CHECK_FN_CACHE_BYPASS
 
 
-def _check_fn_cached(fn: Callable) -> bool:
-    """Return bool(fn()), TTL-cached across calls.
+def _run_check_fn_uncached(fn: Callable, *, unresolved_scope: bool = False) -> bool:
+    """Run an availability check without cache/grace handling."""
+    try:
+        return bool(fn())
+    except Exception:
+        detail = " while profile cache scope was unresolved" if unresolved_scope else ""
+        logger.warning(
+            "check_fn %s raised%s; dependent tools will be unavailable this turn",
+            getattr(fn, "__qualname__", fn),
+            detail,
+            exc_info=True,
+        )
+        return False
 
-    Exceptions are swallowed as False. A transient False/exception within
-    ``_CHECK_FN_FAILURE_GRACE_SECONDS`` of the last True is suppressed (the
-    last-good True is returned and the failure is NOT cached, so the next call
-    re-probes) to keep flaky external checks (Docker daemon busy, socket
-    contention, probe timeout) from silently stripping tools mid-session.
-    """
+
+def _check_fn_cached(fn: Callable) -> bool:
+    """Return bool(fn()), TTL-cached across calls."""
     now = time.monotonic()
+    if fn in _NO_CACHE_CHECK_FNS:
+        return _run_check_fn_uncached(fn)
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
-        try:
-            return bool(fn())
-        except Exception:
-            logger.warning(
-                "check_fn %s raised while profile cache scope was unresolved; "
-                "dependent tools will be unavailable this turn",
-                getattr(fn, "__qualname__", fn),
-                exc_info=True,
-            )
-            return False
+        return _run_check_fn_uncached(fn, unresolved_scope=True)
     cache_key = (fn, scope)
     with _check_fn_cache_lock:
         _prune_check_fn_caches(now)
@@ -392,11 +423,16 @@ def _check_fn_cached(fn: Callable) -> bool:
 
 
 def invalidate_check_fn_cache() -> None:
-    """Drop all cached ``check_fn`` results. Call after config changes that
-    affect tool availability (e.g. ``hermes tools enable``)."""
+    """Drop cached probes and aggregate verdict snapshots.
+
+    Call after config changes that affect tool availability.
+    """
+    global _verdict_snapshot_epoch
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+        _verdict_snapshot_cache.clear()
+        _verdict_snapshot_epoch += 1
 
 
 def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
@@ -482,6 +518,67 @@ class ToolRegistry:
     def _snapshot_entries(self) -> List[ToolEntry]:
         """Return a stable snapshot of registered tool entries."""
         return self._snapshot_state()[0]
+
+    def check_fn_verdict_snapshot(self, scope: Optional[str] = None) -> tuple:
+        """Return a hashable snapshot of every availability probe's verdict.
+
+        Built for outer memo keys (``get_tool_definitions``' cache): the
+        registry generation captures registry *mutations*, but a ``check_fn``
+        verdict can flip without any mutation — a daemon starts, a credential
+        file appears, an OAuth login lands. Before this existed, an outer
+        memo keyed only on the generation served stale tool lists
+        indefinitely after such a flip, because nothing on the cache-hit
+        path ever re-probed.
+
+        Aggregate snapshots are cached briefly per registry and profile, so a
+        hot-path hit is one dictionary lookup. On a snapshot miss, each
+        distinct probe runs through :func:`_check_fn_cached`. A verdict flip
+        changes the tuple after the probe TTL plus the snapshot TTL (~35 s),
+        or immediately after :func:`invalidate_check_fn_cache`, which clears
+        both layers. Request-bound cache-bypass scopes are never aggregated.
+
+        Probes marked :func:`no_cache_check_fn` are skipped: they are local,
+        config-backed checks that execute UNCACHED on every call (some with
+        deliberate side effects, e.g. the memory tool's flag snapshot), and
+        their verdicts only change when config changes — which the outer
+        memo key already captures through the config-file fingerprint.
+        """
+        registry_scope = scope or self.current_scope_key()
+        probe_scope = check_fn_cache_scope()
+        cache_key = (self, registry_scope, probe_scope, self._generation)
+        now = time.monotonic()
+        snapshot_epoch = -1
+        if probe_scope != CHECK_FN_CACHE_BYPASS:
+            with _check_fn_cache_lock:
+                snapshot_epoch = _verdict_snapshot_epoch
+                cached = _verdict_snapshot_cache.get(cache_key)
+                if cached is not None and now - cached[0] < _VERDICT_SNAPSHOT_TTL_SECONDS:
+                    return cached[1]
+
+        entries, toolset_checks = self._snapshot_state(registry_scope)
+        fns: Dict[Callable, str] = {}
+        for entry in entries:
+            if entry.check_fn is not None and entry.check_fn not in fns:
+                fns[entry.check_fn] = getattr(
+                    entry.check_fn, "__qualname__", repr(entry.check_fn)
+                )
+        for fn in toolset_checks.values():
+            if fn is not None and fn not in fns:
+                fns[fn] = getattr(fn, "__qualname__", repr(fn))
+        verdicts = [
+            (label, id(fn), _check_fn_cached(fn))
+            for fn, label in fns.items()
+            if fn not in _NO_CACHE_CHECK_FNS
+        ]
+        verdicts.sort(key=lambda item: (item[0], item[1]))
+        snapshot = tuple((label, value) for label, _, value in verdicts)
+        if probe_scope != CHECK_FN_CACHE_BYPASS:
+            with _check_fn_cache_lock:
+                if snapshot_epoch == _verdict_snapshot_epoch:
+                    while len(_verdict_snapshot_cache) >= _CHECK_FN_CACHE_MAX:
+                        _verdict_snapshot_cache.pop(next(iter(_verdict_snapshot_cache)))
+                    _verdict_snapshot_cache[cache_key] = (time.monotonic(), snapshot)
+        return snapshot
 
     def _toolset_has_exposable_tools(
         self,

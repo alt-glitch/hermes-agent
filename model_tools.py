@@ -297,9 +297,11 @@ _LEGACY_TOOLSET_MAP = {
 # because quiet_mode=False has stdout side effects (tool-selection prints).
 #
 # Invalidation happens transparently via the registry's _generation counter,
-# which bumps on register() / deregister() / register_toolset_alias(). The
-# inner check_fn TTL cache in registry.py handles environment drift (Docker
-# daemon start/stop, env var changes, etc.) on a 30 s horizon.
+# which bumps on register() / deregister() / register_toolset_alias(), plus a
+# Short-TTL aggregate snapshot of every cached check_fn verdict in the cache
+# key. The snapshot lets external availability drift propagate through THIS
+# cache on the combined probe/snapshot TTL horizon — the generation counter
+# alone never re-probes on a hit.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 _tool_defs_cache_lock = threading.Lock()
 
@@ -353,6 +355,8 @@ def get_tool_definitions(
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
     cache_key = None
+    verdict_snapshot: tuple = ()
+    key_generation: int = -1
     if quiet_mode:
         try:
             from hermes_cli.config import get_config_path
@@ -363,17 +367,37 @@ def get_tool_definitions(
             cfg_fp = None
         profile_scope = check_fn_cache_scope()
         if profile_scope != CHECK_FN_CACHE_BYPASS:
+            # check_fn verdicts: the registry generation only captures
+            # registry MUTATIONS. An availability probe can flip without
+            # one (Docker daemon starts, credential lands, OAuth login),
+            # and before this key member a memo hit skipped probing
+            # entirely — the tool list stayed stale for the process
+            # lifetime. The aggregate is TTL-cached, so hits cost one lookup; a flip
+            # changes the tuple and forces a recompute within ~35 s worst case.
+            # Held in a named local (not just a key slot) because the
+            # TOCTOU guard below re-checks it after compute.
+            verdict_snapshot = registry.check_fn_verdict_snapshot()
+            key_generation = registry._generation
+            if verdict_snapshot != registry.check_fn_verdict_snapshot():
+                # Probes executed by the first snapshot can lazily import
+                # and register tools, bumping the generation — the first
+                # snapshot then describes a registry state older than the
+                # key's. Re-take once so key_generation and the snapshot
+                # agree; the second pass runs no new registrations.
+                key_generation = registry._generation
+                verdict_snapshot = registry.check_fn_verdict_snapshot()
             cache_key = (
                 registry.current_scope_key(),
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
-                registry._generation,
+                key_generation,
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                verdict_snapshot,
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -389,6 +413,22 @@ def get_tool_definitions(
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
     if quiet_mode and cache_key is not None:
+        # TOCTOU guard: the verdict snapshot in cache_key was taken BEFORE
+        # compute. If a verdict flipped (and the snapshot cache was
+        # invalidated) while compute ran — with NO registry mutation — the
+        # result reflects the NEW verdicts but cache_key carries the OLD
+        # ones; caching would poison the old key (flip back later and the
+        # memo serves this mismatched list). Skip caching in that case.
+        # When the GENERATION moved during compute (first call in a process
+        # triggers lazy tool registration), the old key can never be looked
+        # up again, so caching under it is harmless — and skipping would
+        # leave the first call permanently uncached. (cache_key is not None
+        # implies verdict_snapshot was bound above.)
+        if (
+            registry._generation == key_generation
+            and verdict_snapshot != registry.check_fn_verdict_snapshot()
+        ):
+            return list(result)
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
@@ -456,6 +496,48 @@ def _compute_tool_definitions(
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
+
+    # `manage_connections` rides with the connector bridge, not with a bundle.
+    #
+    # It is registered into the toolset "connections", which exists only in the
+    # registry — never in TOOLSETS. Real sessions do not pass composite bundle
+    # names: CLI, TUI/desktop, cron and every messaging platform resolve their
+    # selection through hermes_cli/tools_config.py::_get_platform_tools, which
+    # returns per-CAPABILITY toolset names (`file`, `terminal`, `web`, …) and
+    # deliberately skips posture toolsets and anything absent from
+    # CONFIGURABLE_TOOLSETS / TOOLSETS. A registry-only toolset can therefore
+    # never appear in any real session's enabled list, so listing the tool in
+    # toolsets._HERMES_CORE_TOOLS only reached callers that hand-pass the
+    # literal name "hermes-cli" — which nothing in production does. Result: a
+    # signed-in engineer in a code workspace could call Gmail through the
+    # bridge but had no tool to ask which accounts were connected.
+    #
+    # So enable it on exactly the condition that activates the bridge trio
+    # (tool_search / tool_describe / tool_call): connectors reachable for this
+    # account. No second gate is written here — the name is added
+    # unconditionally and the tool's own check_fn (_connectors_available, the
+    # same predicate tools/tool_search.py::should_activate consults) drops it
+    # in registry.get_definitions below for a signed-out or non-entitled
+    # session. One predicate, so the two tiers cannot drift apart.
+    #
+    # Added BEFORE the disabled_toolsets subtraction, so naming `connections`
+    # in agent.disabled_toolsets still turns it off like any other toolset.
+    #
+    # Deliberately NOT conditioned on the platform or the bundle. This
+    # function is platform-blind and its result is memoized on a cache key
+    # with no platform member, so an env-derived platform gate would leak one
+    # session's surface into another's tool list inside a gateway process that
+    # multiplexes platforms (the hazard the browser_exec gate below avoids by
+    # keying off the resolved toolset instead). The narrow, injection-
+    # constrained bundles (hermes-webhook, hermes-api-server) are not special-
+    # cased for the same reason and one more: the bridge ALREADY activates
+    # there under this very condition, so withholding the one tool that
+    # reports connection state — while the connector action tools stay
+    # callable — would leave a CONNECTION_REQUIRED failure unexplainable
+    # rather than prevent anything. Whether untrusted-content surfaces should
+    # reach connectors at all is a question about connectors_available(), and
+    # it is tracked separately; it is not answered by hiding this tool.
+    tools_to_include.add("manage_connections")
 
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)
@@ -1305,6 +1387,109 @@ def handle_function_call(
             if err or not underlying_name:
                 return _return_bridge_result(
                     tool_error(err or "tool_call could not be resolved")
+                )
+            if underlying_name == _ts_mod.CONNECTOR_BATCH_SENTINEL:
+                # A calls[] batch (any connector entry, or >1 entry). The
+                # connector bridge partitions it: connector entries travel as
+                # ONE gateway request; local entries run through the SAME
+                # gates as the single-call path below via this closure —
+                # repair hint, session scope, probe validation, then the
+                # normal recursive dispatch. The three skip flags are FORCED
+                # off: the executor's own hook/middleware pass fired against
+                # the tool_call wrapper, never against these entry names, so
+                # the recursion must own the per-entry policy pipeline —
+                # otherwise a 2-entry batch would evade every pre_tool_call
+                # block and middleware rewrite keyed on a real tool name.
+                _scoped_batch = _ts_mod.scoped_deferrable_names(current_defs)
+
+                # Returns (ok, payload): THIS closure owns the success/failure
+                # call because only it knows which returns are its own refusals.
+                # The bridge must not guess from the payload — a legitimate tool
+                # result can carry an "error" field of its own.
+                def _local_dispatch(_name: str, _args: Dict[str, Any]):
+                    if not _ts_mod.is_deferrable_tool_name(_name):
+                        return False, tool_error(
+                            f"'{_name}' is not a deferrable tool. If it appears in the "
+                            "model-facing tools list already, call it directly instead "
+                            "of via tool_call."
+                        )
+                    if _name not in _scoped_batch:
+                        return False, tool_error(
+                            f"'{_name}' is not available in this session. "
+                            "Use tool_search to find tools you can call."
+                        )
+                    _perr = _ts_mod.validate_deferred_call_args(_name, _args)
+                    if _perr is not None:
+                        return False, _perr
+                    return True, handle_function_call(
+                        function_name=_name,
+                        function_args=_args,
+                        task_id=task_id,
+                        tool_call_id=tool_call_id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        user_task=user_task,
+                        enabled_tools=enabled_tools,
+                        skip_pre_tool_call_hook=False,
+                        skip_tool_request_middleware=False,
+                        skip_tool_execution_middleware=False,
+                        tool_request_middleware_trace=list(_tool_middleware_trace),
+                        enabled_toolsets=enabled_toolsets,
+                        disabled_toolsets=disabled_toolsets,
+                    )
+
+                def _connector_pre_dispatch(_name: str, _args: Dict[str, Any]):
+                    # Connector entries never reach handle_function_call
+                    # individually, so their pre_tool_call pass fires here —
+                    # same single-fire contract, keyed on the composed
+                    # connectors__ name. Returns the bridge's
+                    # (block_message, replacement_arguments) pair: a block
+                    # becomes that entry's USER_DENIED slot and siblings still
+                    # run, while modified args from a `modify` directive go out
+                    # on the wire for that entry.
+                    #
+                    # Rewrite semantics are the single-entry path's, verbatim
+                    # (see the skip_pre_tool_call_hook branch below): the hook
+                    # dispatcher returns modified args as None when NO hook
+                    # asked for a change and as the merged dict when one did,
+                    # so None here means "send the original arguments" and a
+                    # dict — empty included — replaces them. Anything else is
+                    # not a rewrite the wire can carry, so it is dropped
+                    # rather than guessed at.
+                    try:
+                        from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+                        block_message, _modified = _dispatch_pre_tool_call_hooks(
+                            _name,
+                            _args,
+                            task_id=task_id or "",
+                            session_id=session_id or "",
+                            tool_call_id=tool_call_id or "",
+                            turn_id=turn_id or "",
+                            api_request_id=api_request_id or "",
+                            middleware_trace=list(_tool_middleware_trace),
+                        )
+                        return (
+                            block_message,
+                            _modified if isinstance(_modified, dict) else None,
+                        )
+                    except Exception as _hook_err:
+                        logger.debug("connector pre_tool_call hook error: %s", _hook_err)
+                        return None, None
+
+                try:
+                    from tools.tool_gateway.bridge import dispatch_calls as _connector_dispatch
+                except Exception as _imp_exc:
+                    return _return_bridge_result(
+                        tool_error(f"tool_call batch dispatch is unavailable: {_imp_exc}")
+                    )
+                return _return_bridge_result(
+                    _connector_dispatch(
+                        underlying_args.get("calls") or [],
+                        tool_call_id,
+                        local_dispatch=_local_dispatch,
+                        pre_dispatch=_connector_pre_dispatch,
+                    )
                 )
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks

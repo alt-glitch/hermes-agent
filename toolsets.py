@@ -89,6 +89,15 @@ _HERMES_CORE_TOOLS = [
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Remote connector accounts. Core because it is the ONLY way the model can
+    # answer "am I connected?" or hand the user an authorization link, and the
+    # connector tools it services reach every platform — not just the GUI ones.
+    # Its registered toolset ("connections") is registry-only, so leaving it
+    # out of here made it unreachable: every real session passes
+    # enabled_toolsets, and a name absent from those bundles is never resolved.
+    # check_fn (_connectors_available) keeps it out of non-entitled sessions,
+    # which is what the entitlement gate is for.
+    "manage_connections",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -264,7 +273,7 @@ TOOLSETS = {
     },
 
     # Affordances that only exist because a GUI renderer is on the other end of
-    # the connection: read/close the embedded terminal pane, open and read the
+    # the connection: read/close the embedded terminal pane, open/read/close the
     # in-app browser, focus a pane, tapback a message.
     #
     # Enabled by the GUI gateway for a session whose SOURCE is the desktop app
@@ -276,10 +285,10 @@ TOOLSETS = {
         "description": "Desktop GUI affordances — in-app terminal/browser panes, pane focus, reactions (GUI sessions only)",
         "tools": [
             "read_terminal", "close_terminal",
-            "open_preview", "read_preview",
+            "open_preview", "close_preview", "read_preview", "drive_preview", "annotate_preview",
             "read_window_below",
             "focus_pane", "react_to_message",
-            "setup_mcp",
+            "setup_mcp", "tour",
         ],
         "includes": []
     },
