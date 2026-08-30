@@ -215,7 +215,11 @@ const PENDING_STEER_MAX_CHARS = 4 * 1024 * 1024
 interface PendingPrompt {
   readonly clientMessageId: string
   readonly queued: boolean
-  readonly retryDeadlineAt: number
+  /** Rolling: re-armed by every structured reload rejection (server proof the
+   * prompt was NOT admitted). Only bounds silence — a reload that stops
+   * answering — never a long reload that keeps rejecting. */
+  retryDeadlineAt: number
+  retryAttempts: number
   retryNoticeShown: boolean
   readonly submissionId: string
   readonly sessionId: string
@@ -1774,8 +1778,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               ),
               Effect.catchTag('GatewayError', error =>
                 Effect.sync(() => {
-                  const retryDelay = preAdmissionRetryDelay(error)
+                  const retryDelay = preAdmissionRetryDelay(error, current.retryAttempts)
                   if (retryDelay !== undefined && Date.now() < current.retryDeadlineAt) {
+                    // A structured reload rejection is server proof this
+                    // submission was NOT admitted, so keep retrying while the
+                    // gateway keeps answering: full reloads routinely run for
+                    // minutes (teardown + rediscovery serialized behind slow
+                    // or parked servers). The rolling deadline only bounds a
+                    // gateway that stops responding between rejections.
+                    current.retryAttempts += 1
+                    current.retryDeadlineAt = Date.now() + PRE_ADMISSION_RETRY_WINDOW_MS
                     if (!current.retryNoticeShown) {
                       current.retryNoticeShown = true
                       store.pushSystem('MCP reload finishing — prompt will retry automatically')
@@ -1846,6 +1858,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           clientMessageId,
           queued,
           retryDeadlineAt: Date.now() + PRE_ADMISSION_RETRY_WINDOW_MS,
+          retryAttempts: 0,
           retryNoticeShown: false,
           submissionId: randomUUID(),
           sessionId: sid,
