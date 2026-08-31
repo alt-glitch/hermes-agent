@@ -112,3 +112,28 @@ describe('user-message composer references (frame spans)', () => {
     }
   })
 })
+
+describe('live interrupt correction ordering (native frame)', () => {
+  test('paints the user correction before assistant output that follows it', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'BEFORE_CORRECTION' } })
+    store.pushCorrection('USER_CORRECTION')
+    store.apply({ type: 'message.delta', payload: { text: 'AFTER_CORRECTION' } })
+
+    const probe = await mountApp(store)
+    try {
+      await probe.waitForFrame(frame => frame.includes('AFTER_CORRECTION'))
+      const frame = probe.frame()
+      const before = frame.indexOf('BEFORE_CORRECTION')
+      const correction = frame.indexOf('USER_CORRECTION')
+      const after = frame.indexOf('AFTER_CORRECTION')
+      expect(before).toBeGreaterThanOrEqual(0)
+      expect(correction).toBeGreaterThan(before)
+      expect(after).toBeGreaterThan(correction)
+    } finally {
+      probe.destroy()
+    }
+  })
+})

@@ -19,7 +19,7 @@ import {
 import { TodoStateSchema, type TodoState } from './schema/TodoState.ts'
 import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { mapResumeHistory } from '../logic/resume.ts'
-import type { Message, SessionStore } from '../logic/store.ts'
+import type { Message, Part, SessionStore } from '../logic/store.ts'
 
 const InfoRecord = Schema.Record(Schema.String, Schema.Unknown)
 const SetupStatusResponseSchema = Schema.Struct({ provider_configured: Schema.optionalKey(Schema.Boolean) })
@@ -147,11 +147,53 @@ export interface ResumeSessionResult {
   readonly previousSessionId?: string
 }
 
+/** Rebuild the gateway's compact live-turn projection without losing the
+ * arrival boundary of accepted corrections. New gateways provide assistant
+ * character offsets; older/malformed snapshots degrade honestly by placing
+ * their corrections after the assistant text rather than dropping them. */
+function inflightParts(
+  assistant: string,
+  corrections: readonly string[] | undefined,
+  offsets: readonly number[] | undefined
+): Part[] {
+  const cleanCorrections = (corrections ?? []).map(text => text.trim()).filter(Boolean)
+  const assistantCodePoints = [...assistant]
+  if (cleanCorrections.length === 0) {
+    return assistant ? [{ id: 'inflight-text-1', text: assistant, type: 'text' }] : []
+  }
+  const validOffsets =
+    offsets?.length === cleanCorrections.length &&
+    offsets.every((offset, index) => {
+      const previous = index === 0 ? 0 : (offsets[index - 1] ?? 0)
+      return Number.isInteger(offset) && offset >= previous && offset <= assistantCodePoints.length
+    })
+  const parts: Part[] = []
+  if (!validOffsets) {
+    if (assistant) parts.push({ id: 'inflight-text-1', text: assistant, type: 'text' })
+    for (const [index, text] of cleanCorrections.entries()) {
+      parts.push({ id: `inflight-correction-${String(index + 1)}`, text, type: 'correction' })
+    }
+    return parts
+  }
+  let cursor = 0
+  for (const [index, text] of cleanCorrections.entries()) {
+    const offset = offsets[index] ?? cursor
+    const before = assistantCodePoints.slice(cursor, offset).join('')
+    if (before) parts.push({ id: `inflight-text-${String(index + 1)}`, text: before, type: 'text' })
+    parts.push({ id: `inflight-correction-${String(index + 1)}`, text, type: 'correction' })
+    cursor = offset
+  }
+  const tail = assistantCodePoints.slice(cursor).join('')
+  if (tail) parts.push({ id: 'inflight-text-tail', text: tail, type: 'text' })
+  return parts
+}
+
 function liveSnapshotMessages(response: LiveSessionSnapshot): Message[] {
   const messages = mapResumeHistory(response.messages)
   const inflightUser = response.inflight?.user?.trim()
   if (inflightUser) messages.push({ role: 'user', text: inflightUser })
   const inflightAssistant = response.inflight?.assistant ?? ''
+  const parts = inflightParts(inflightAssistant, response.inflight?.corrections, response.inflight?.correction_offsets)
   const inflightError = response.inflight?.error?.trim()
   if (inflightError) {
     // Retained failed turn (upstream 57b351d3689/b8675a18990): the terminal
@@ -161,20 +203,20 @@ function liveSnapshotMessages(response: LiveSessionSnapshot): Message[] {
     // NON-streaming row (never a spinner — no completion event will ever
     // arrive for it), and the failure itself is a system error row. An
     // error-only snapshot (no user/assistant text) still yields that row.
-    if (inflightAssistant) {
+    if (parts.length > 0) {
       messages.push({
         role: 'assistant',
         text: inflightAssistant,
-        parts: [{ id: 'inflight-1', text: inflightAssistant, type: 'text' }],
+        parts,
         streaming: false
       })
     }
     messages.push({ role: 'system', text: `error: ${inflightError}` })
-  } else if (inflightAssistant || response.inflight?.streaming) {
+  } else if (parts.length > 0 || response.inflight?.streaming) {
     messages.push({
       role: 'assistant',
       text: inflightAssistant,
-      parts: inflightAssistant ? [{ id: 'inflight-1', text: inflightAssistant, type: 'text' }] : [],
+      parts,
       streaming: true
     })
   }

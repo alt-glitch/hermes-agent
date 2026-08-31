@@ -38,6 +38,8 @@ export type SessionActiveListResponse = typeof SessionActiveListResponseSchema.T
 export const SessionInflightSchema = Schema.StructWithRest(
   Schema.Struct({
     assistant: opt(Str),
+    correction_offsets: opt(Schema.Array(Num)),
+    corrections: opt(Schema.Array(Str)),
     // Retained failed turn (upstream 57b351d3689): the gateway keeps a compact
     // error snapshot when the terminal frame may have been lost to a
     // disconnect. `error` is the failure message; `status` is "error";

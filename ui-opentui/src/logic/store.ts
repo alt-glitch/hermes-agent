@@ -138,11 +138,24 @@ export interface ToolPartState {
   diffStats?: DiffStats
 }
 
+/** A user-authored correction admitted while an assistant turn is already
+ * streaming. It lives in that turn's ordered parts so later deltas cannot
+ * repaint above the text that caused them. `clientId` keeps the same exact
+ * rollback lease as an optimistic top-level user row. */
+export interface CorrectionPart {
+  type: 'correction'
+  id: string
+  clientId?: string
+  text: string
+  timestamp?: number
+}
+
 /** One ordered piece of an assistant turn (§7). */
 export type Part =
   | { type: 'text'; id: string; text: string }
   | { type: 'reasoning'; id: string; text: string }
   | { type: 'moa'; id: string; text: string }
+  | CorrectionPart
   | ToolPartState
 
 export interface Message {
@@ -1450,6 +1463,37 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return clientId
   }
 
+  /** Insert an interrupt-mode correction at its actual arrival boundary.
+   *
+   * A live assistant is one mutable ordered-parts row. Appending a separate
+   * top-level user message while that row keeps streaming lets every later
+   * delta grow *above* the correction. Keeping the correction as an ordered
+   * part makes chronology structural. During the pre-start/build window there
+   * is no live row yet, so the correction is an ordinary optimistic user row
+   * ahead of the eventual message.start. */
+  function pushCorrection(text: string): string {
+    const clientId = nextClientMessageId()
+    const timestamp = Math.floor(Date.now() / 1000)
+    setState(
+      produce(draft => {
+        const live = liveAssistant(draft, true)
+        if (live) {
+          ;(live.parts ??= []).push({
+            type: 'correction',
+            id: nextId(),
+            clientId,
+            text,
+            timestamp
+          })
+        } else {
+          draft.messages.push({ clientId, role: 'user', text, timestamp })
+          capMessages(draft)
+        }
+      })
+    )
+    return clientId
+  }
+
   function pushLocalUser(text: string, localOnly: 'shell') {
     const clientId = nextClientMessageId()
     setState(
@@ -1495,12 +1539,28 @@ export function createSessionStore(options?: SessionStoreOptions) {
    * already removed it, which is harmless and keeps the operation idempotent. */
   function removeClientMessage(clientId: string): boolean {
     const index = state.messages.findIndex(message => message.clientId === clientId)
-    if (index < 0) return false
+    if (index >= 0) {
+      setState(
+        'messages',
+        state.messages.filter(message => message.clientId !== clientId)
+      )
+      return true
+    }
+    let removed = false
     setState(
-      'messages',
-      state.messages.filter(message => message.clientId !== clientId)
+      produce(draft => {
+        for (let messageIndex = draft.messages.length - 1; messageIndex >= 0; messageIndex--) {
+          const parts = draft.messages[messageIndex]?.parts
+          if (!parts) continue
+          const partIndex = parts.findIndex(part => part.type === 'correction' && part.clientId === clientId)
+          if (partIndex < 0) continue
+          parts.splice(partIndex, 1)
+          removed = true
+          break
+        }
+      })
     )
-    return true
+    return removed
   }
 
   /** Push a pending direct-steer notice. Unlike ordinary slash output, this is
@@ -3662,6 +3722,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     state,
     apply,
     pushUser,
+    pushCorrection,
     pushLocalUser,
     pushSkill,
     removeClientMessage,

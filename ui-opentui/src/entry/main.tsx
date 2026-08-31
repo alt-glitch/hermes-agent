@@ -1598,7 +1598,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       ): Promise<InterruptCorrectionDelivery> => {
         if (!canRedirectCorrection(text, front)) throw new Error('correction reservation unavailable')
         const current: PendingCorrection = {
-          clientMessageId: store.pushUser(text),
+          clientMessageId: store.pushCorrection(text),
           front,
           submissionId: randomUUID(),
           sessionId,

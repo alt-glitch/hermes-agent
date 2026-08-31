@@ -313,6 +313,55 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                             </text>
                           )}
                         </Match>
+                        <Match when={part.type === 'correction' && part}>
+                          {correction => (
+                            <box
+                              style={{
+                                flexDirection: 'column',
+                                flexShrink: 0,
+                                marginTop: display().compact ? 0 : 1,
+                                marginBottom: display().compact ? 0 : 1
+                              }}
+                            >
+                              <box style={{ flexDirection: 'row', flexShrink: 0 }}>
+                                <box style={{ flexShrink: 0, width: GUTTER }}>
+                                  <text selectable={false}>
+                                    <span style={{ fg: theme().color.primary }}>
+                                      <b>{theme().brand.prompt}</b>
+                                    </span>
+                                  </text>
+                                </box>
+                                <text selectionBg={theme().color.selectionBg}>
+                                  <Show
+                                    when={
+                                      display().timestamps && correction().timestamp != null
+                                        ? correction().timestamp
+                                        : undefined
+                                    }
+                                  >
+                                    {timestamp => (
+                                      <span style={{ fg: theme().color.muted }}>
+                                        {formatTimestamp(timestamp()) + ' '}
+                                      </span>
+                                    )}
+                                  </Show>
+                                  <For each={splitComposerHighlights(correction().text)}>
+                                    {segment => (
+                                      <span style={{ fg: segment.ref ? theme().color.accent : theme().color.muted }}>
+                                        {segment.text}
+                                      </span>
+                                    )}
+                                  </For>
+                                </text>
+                              </box>
+                              <Show when={!display().compact}>
+                                <box style={{ marginLeft: GUTTER }}>
+                                  <CopyChip source={() => correction().text} />
+                                </box>
+                              </Show>
+                            </box>
+                          )}
+                        </Match>
                         <Match when={part.type === 'text' && part}>
                           {/* ONE stable native <markdown> fed the growing text in place (no
                       per-delta remount → no scrollbar flicker, #2); it renders GFM

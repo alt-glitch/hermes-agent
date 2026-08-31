@@ -203,6 +203,43 @@ describe('resumeSession', () => {
     })
   })
 
+  it.effect('rebuilds mid-turn corrections at their persisted assistant offsets', () => {
+    const store = createSessionStore()
+    const service = fakeGateway(() =>
+      Effect.succeed({
+        inflight: {
+          assistant: 'before🤝after',
+          correction_offsets: [7],
+          corrections: ['stop changing directories'],
+          streaming: true,
+          user: 'start the task'
+        },
+        messages: [],
+        running: true,
+        session_id: 'corrected-live',
+        status: 'streaming'
+      })
+    ).service
+    return Effect.gen(function* () {
+      yield* resumeSession(service, store, { cols: 80, targetSessionId: 'durable-key' })
+      assert.deepStrictEqual(
+        store.state.messages.map(message => [message.role, message.text]),
+        [
+          ['user', 'start the task'],
+          ['assistant', 'before🤝after']
+        ]
+      )
+      assert.deepStrictEqual(
+        store.state.messages[1]?.parts?.map(part => [part.type, 'text' in part ? part.text : '']),
+        [
+          ['text', 'before🤝'],
+          ['correction', 'stop changing directories'],
+          ['text', 'after']
+        ]
+      )
+    })
+  })
+
   it.effect('renders a retained failed turn as a settled failure, not a healthy stream (upstream 57b351d3689)', () => {
     const store = createSessionStore()
     const service = fakeGateway(() =>
