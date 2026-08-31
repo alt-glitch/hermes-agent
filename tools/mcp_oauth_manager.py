@@ -134,9 +134,19 @@ def _make_hermes_provider_class() -> Optional[type]:
             *args: Any,
             server_name: str = "",
             preregistered: bool = False,
+            token_user_agent: "str | None" = None,
             **kwargs: Any,
         ):
             super().__init__(*args, **kwargs)
+            # mcp 2.0.0 uses a task-owned anyio.Lock and holds it across the
+            # yielded resource request.  A session-long GET therefore blocks
+            # every concurrent POST, and HTTPX may later close the auth-flow
+            # generator from a different task than the lock owner.  A binary
+            # semaphore preserves mutual exclusion without task ownership;
+            # async_auth_flow below narrows its scope around resource I/O.
+            import anyio
+
+            self.context.lock = anyio.Semaphore(1, max_value=1)
             self._hermes_server_name = server_name
             self._hermes_home = ""
             # When the client_id comes from config.yaml (pre-registered), an
@@ -145,6 +155,15 @@ def _make_hermes_provider_class() -> Optional[type]:
             # registration can't help. Only auto-heal dynamically-registered
             # clients. See _maybe_flag_poisoned_client.
             self._hermes_preregistered = preregistered
+            # oauth.user_agent — stamped onto token-endpoint requests only;
+            # some authorization servers/WAFs reject httpx's default (#75576).
+            self._hermes_token_user_agent = token_user_agent
+
+        def _stamp_token_user_agent(self, request):
+            ua = getattr(self, "_hermes_token_user_agent", None)
+            if ua:
+                request.headers["User-Agent"] = ua
+            return request
 
         def _coerce_client_secret_post(self) -> None:
             """Use client_secret_post when dynamic registration returned a secret.
@@ -171,11 +190,13 @@ def _make_hermes_provider_class() -> Optional[type]:
 
         async def _exchange_token_authorization_code(self, *args: Any, **kwargs: Any):
             self._coerce_client_secret_post()
-            return await super()._exchange_token_authorization_code(*args, **kwargs)
+            request = await super()._exchange_token_authorization_code(*args, **kwargs)
+            return self._stamp_token_user_agent(request)
 
         async def _refresh_token(self):
             self._coerce_client_secret_post()
-            return await super()._refresh_token()
+            request = await super()._refresh_token()
+            return self._stamp_token_user_agent(request)
 
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
@@ -519,10 +540,43 @@ def _make_hermes_provider_class() -> Optional[type]:
             # contract. Regression from PR #11383 caught by
             # tests/tools/test_mcp_oauth_bidirectional.py.
             inner = super().async_auth_flow(request)
+            resource_lock_released = False
+            sent_access_token = None
+            retry_after_concurrent_auth = False
             try:
                 outgoing = await inner.__anext__()
                 while True:
+                    # The SDK holds context.lock for its entire generator,
+                    # including while HTTPX waits on the actual MCP request.
+                    # Release it only for that request.  OAuth discovery,
+                    # refresh, registration, and token exchange remain
+                    # serialized exactly as the SDK implements them.
+                    if outgoing is request:
+                        tokens = self.context.current_tokens
+                        sent_access_token = (
+                            tokens.access_token if tokens is not None else None
+                        )
+                        self.context.lock.release()
+                        resource_lock_released = True
                     incoming = yield outgoing
+                    if resource_lock_released:
+                        await self.context.lock.acquire()
+                        resource_lock_released = False
+                    # A different request may have completed refresh or full
+                    # authorization while this resource request was in
+                    # flight.  Retry with that token instead of starting a
+                    # duplicate OAuth transition from the stale 401/403.
+                    tokens = self.context.current_tokens
+                    if (
+                        getattr(incoming, "status_code", None) in (401, 403)
+                        and self.context.is_token_valid()
+                        and tokens is not None
+                        and tokens.access_token != sent_access_token
+                    ):
+                        self._add_auth_header(request)
+                        await inner.aclose()
+                        retry_after_concurrent_auth = True
+                        break
                     # Sniff the response for a dead-client-registration signal
                     # before handing it back to the SDK (best-effort, GH#36767).
                     await self._maybe_flag_poisoned_client(incoming)
@@ -530,6 +584,22 @@ def _make_hermes_provider_class() -> Optional[type]:
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the
                 # 401 branch so a subsequent cold-load skips discovery.
+                self._persist_oauth_metadata_if_changed()
+                return
+            finally:
+                if resource_lock_released:
+                    # Balance the SDK's surrounding ``async with`` even when
+                    # HTTPX cancels or closes the flow while the resource
+                    # request is still in flight.  Shield only this local
+                    # bookkeeping; general inner-generator teardown remains
+                    # the separate concern tracked by the cleanup PR.
+                    import anyio
+
+                    with anyio.CancelScope(shield=True):
+                        await self.context.lock.acquire()
+
+            if retry_after_concurrent_auth:
+                yield request
                 self._persist_oauth_metadata_if_changed()
                 return
 
@@ -643,6 +713,7 @@ class MCPOAuthManager:
             _make_callback_waiter,
             _make_redirect_handler,
             cimd_provider_kwargs,
+            token_request_user_agent,
         )
 
         if not _OAUTH_AVAILABLE:
@@ -692,6 +763,7 @@ class MCPOAuthManager:
             storage=storage,
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
+            token_user_agent=token_request_user_agent(cfg),
             **cimd_provider_kwargs(cfg),
         )
 

@@ -1816,6 +1816,8 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._connect_with_retry()
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
+            # Plugin-registered native handlers (lark_oapi client).
+            self._wire_plugin_handlers(self._client)
             return True
         except Exception as exc:
             await self._release_app_lock()
@@ -2245,15 +2247,36 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send audio to Feishu as a file attachment plus optional caption."""
-        return await self._send_uploaded_file_message(
-            chat_id=chat_id,
-            file_path=audio_path,
-            reply_to=reply_to,
-            metadata=metadata,
-            caption=caption,
-            outbound_message_type="audio",
-        )
+        """Send audio to Feishu as a native voice message (opus) or file.
+
+        Feishu's voice channel only accepts Opus (msg_type='audio' with an
+        opus upload). Non-opus audio (mp3/wav/flac/...) is transcoded on the
+        fly via the shared ffmpeg engine so audio actually arrives as a
+        playable voice message; when ffmpeg is unavailable the original
+        file is sent as a file attachment (previous behavior).
+        """
+        transcoded_path: Optional[str] = None
+        ext = Path(audio_path).suffix.lower()
+        if ext not in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
+            from gateway.platforms.base import transcode_to_ogg_opus
+            transcoded_path = await asyncio.to_thread(transcode_to_ogg_opus, audio_path)
+            if transcoded_path:
+                audio_path = transcoded_path
+        try:
+            return await self._send_uploaded_file_message(
+                chat_id=chat_id,
+                file_path=audio_path,
+                reply_to=reply_to,
+                metadata=metadata,
+                caption=caption,
+                outbound_message_type="audio",
+            )
+        finally:
+            if transcoded_path:
+                try:
+                    os.unlink(transcoded_path)
+                except OSError:
+                    pass
 
     async def send_document(
         self,
@@ -3428,6 +3451,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(event.source),
         )
         return f"{session_key}:media:{event.message_type.value}"
 
@@ -3736,7 +3760,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     @staticmethod

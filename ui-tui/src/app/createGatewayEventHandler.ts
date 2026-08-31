@@ -423,7 +423,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   const { bellOnComplete, stdout, sys } = ctx.system
   const { appendMessage, panel, setHistoryItems } = ctx.transcript
   const { setInput } = ctx.composer
-  const { submitRef } = ctx.submission
+  const { submitLiteralRef, submitRef } = ctx.submission
   const { setProcessing: setVoiceProcessing, setRecording: setVoiceRecording, setVoiceEnabled } = ctx.voice
 
   let pendingThinkingStatus = ''
@@ -635,7 +635,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
       }
 
-      submitRef.current(STARTUP_QUERY || 'What do you see in this image?')
+      // Startup queries are arbitrary launcher/script text (Omarchy prompted
+      // launches, `hermes --tui -q "…"`) — submit LITERALLY, bypassing the
+      // slash/!/interpolation dispatcher, matching one-shot's semantics.
+      submitLiteralRef.current(STARTUP_QUERY || 'What do you see in this image?')
     }, 0)
   }
 
@@ -1291,6 +1294,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'background.complete':
         dropBgTask(ev.payload.task_id)
         sys(`[bg ${ev.payload.task_id}] ${ev.payload.text}`)
+
+        return
+
+      case 'btw.complete':
+        sys(`[btw${ev.payload.question ? ` "${ev.payload.question}"` : ''}] ${ev.payload.text}`)
 
         return
       case 'review.summary': {

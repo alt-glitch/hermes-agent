@@ -167,7 +167,7 @@ When `fallback_chain` is absent, `auto` uses the top-level `fallback_providers` 
 
 ## Per-provider request options
 
-Provider entries (`providers.<name>` in the `providers:` dict, or items in the legacy `custom_providers` list) accept two knobs that shape how Hermes talks to the endpoint:
+Provider entries (`providers.<name>` in the `providers:` dict, or items in the legacy `custom_providers` list) accept knobs that shape how Hermes talks to the endpoint:
 
 **`extra_headers`** — a mapping of extra HTTP headers attached to every LLM request routed to that provider's base URL. They are applied last, after URL/profile defaults and user header overrides, so they survive credential swaps and client rebuilds. Useful for Cloudflare Access service tokens, proxy auth, or custom bearer schemes:
 
@@ -197,15 +197,25 @@ providers:
 
 With discovery off, the model picker (`hermes model`, `/model`) shows the configured list instead of a live probe.
 
-For an Anthropic-compatible gateway that resolves a bare model alias only
-after receiving the request, opt the alias into native prompt-cache markers
-with the per-model `prompt_caching` capability:
+**`openai_native_compaction`** — set this capability to `true` only for an OpenAI-compatible endpoint that you trust with conversation content. Native compaction sends its payload to that provider's configured `base_url`:
 
 ```yaml
 providers:
-  anthropic-proxy:
-    api: https://gateway.example.com/anthropic
-    transport: anthropic_messages
+  trusted-proxy:
+    api: https://llm.internal.example.com/v1
+    capabilities:
+      openai_native_compaction: true
+```
+
+For a gateway that resolves a bare model alias only after receiving the
+request, opt the alias into prompt-cache markers with the per-model
+`prompt_caching` capability:
+
+```yaml
+providers:
+  model-proxy:
+    api: https://gateway.example.com/v1
+    transport: openai_chat  # or anthropic_messages
     models:
       fable:
         context_length: 1000000
@@ -213,9 +223,12 @@ providers:
 ```
 
 Hermes matches this declaration to the exact provider route and runtime model
-id, without rewriting the alias. Set `prompt_caching: false` to explicitly
-disable cache markers for a model; when omitted, Hermes keeps its normal
-provider and model capability detection.
+id, without rewriting the alias or inferring support from its provider name,
+host, or model family. The marker layout follows the configured transport:
+`openai_chat` uses the OpenAI-compatible envelope layout and
+`anthropic_messages` uses the native inner-block layout. Set
+`prompt_caching: false` to explicitly disable cache markers for a model; when
+omitted, Hermes keeps its normal provider and model capability detection.
 
 :::note Legacy format
 Older configs used a top-level `custom_providers:` list (with `base_url` instead of `api`). It still works and is auto-migrated to the `providers:` dict on `hermes update` (config v12).

@@ -19,6 +19,7 @@ npub_to_hex = _buzz_mod.npub_to_hex
 _normalize_user_ref = _buzz_mod._normalize_user_ref
 _cli_error_message = _buzz_mod._cli_error_message
 _resolve_private_key = _buzz_mod._resolve_private_key
+_resolve_auth_tag = _buzz_mod._resolve_auth_tag
 check_requirements = _buzz_mod.check_requirements
 validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
@@ -43,8 +44,10 @@ _ENV_VARS = (
     "BUZZ_ALLOWED_USERS",
     "BUZZ_ALLOW_ALL_USERS",
     "BUZZ_POLL_INTERVAL",
+    "BUZZ_AUTH_TAG",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_AUTH_TAG",
 )
 
 
@@ -141,6 +144,450 @@ class TestBuzzAdapterInit:
         from gateway.config import PlatformConfig
         adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
         assert adapter.relay_url == "https://env.relay"
+
+
+# ── Multiplex secondary-profile scope (#98738) ─────────────────────────────
+
+
+@pytest.fixture
+def multiplex_scope():
+    """Install multiplex + a secondary-profile secret scope; restore after."""
+
+    tokens = []
+
+    def install(scope=None):
+        from agent.secret_scope import set_multiplex_active, set_secret_scope
+
+        set_multiplex_active(True)
+        tokens.append(set_secret_scope(scope or {}))
+        return tokens[-1]
+
+    yield install
+
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active
+
+    for token in reversed(tokens):
+        reset_secret_scope(token)
+    set_multiplex_active(False)
+
+
+@pytest.fixture
+def default_profile_env(monkeypatch):
+    """The default profile's YAML-to-env bridge output in os.environ."""
+    monkeypatch.setenv("BUZZ_RELAY_URL", "https://default.relay")
+    monkeypatch.setenv("BUZZ_CHANNELS", "chan-a,chan-b,chan-c")
+    monkeypatch.setenv("BUZZ_HOME_CHANNEL", "chan-a")
+    monkeypatch.setenv("BUZZ_POLL_INTERVAL", "9")
+    monkeypatch.setenv("BUZZ_CLI_PATH", "/default/bin/buzz")
+    monkeypatch.setenv("BUZZ_TRANSPORT", "poll")
+    monkeypatch.setenv("BUZZ_ALLOWED_USERS", "default-user-npub")
+    monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", "/default/creds.json")
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1default")
+    monkeypatch.setenv("BUZZ_AUTH_TAG", '["auth","default-profile-tag","","x"]')
+
+
+class TestMultiplexProfileScope:
+
+    def test_secondary_extra_wins_over_default_profile_env(
+        self, multiplex_scope, default_profile_env, tmp_path
+    ):
+        """The secondary profile's PlatformConfig is authoritative (#98738)."""
+        from gateway.config import PlatformConfig
+
+        cli = tmp_path / "buzz"
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        multiplex_scope()
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={
+                "relay_url": "https://profile.relay",
+                "channels": ["pchan"],
+                "home_channel": "pchan",
+                "poll_interval": 2,
+                "cli_path": str(cli),
+                "transport": "websocket",
+                "allowed_users": [SELF_NPUB],
+            },
+        )
+        adapter = BuzzAdapter(cfg)
+        assert adapter.relay_url == "https://profile.relay"
+        assert adapter.channels == ["pchan"]
+        assert adapter.home_channel == "pchan"
+        assert adapter.poll_interval == 2.0
+        assert adapter.cli_path == str(cli)
+        assert adapter.transport == "websocket"
+        assert adapter._allowed_pubkeys == {SELF_PUBKEY}
+
+    def test_secondary_missing_keys_fail_closed(
+        self, multiplex_scope, default_profile_env
+    ):
+        """Keys absent from the profile's config must NOT borrow the default
+        profile's bridged env values — that would connect this adapter to the
+        default profile's relay and watch its channels."""
+        from gateway.config import PlatformConfig
+
+        multiplex_scope()
+        adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={}))
+        assert adapter.relay_url == ""
+        assert adapter.channels == []
+        assert adapter.home_channel == ""
+        assert adapter.poll_interval == _buzz_mod._DEFAULT_POLL_INTERVAL
+        assert adapter.transport == "auto"
+        assert adapter._allowed_pubkeys == set()
+
+    def test_secondary_credentials_file_not_borrowed(
+        self, multiplex_scope, default_profile_env, tmp_path, monkeypatch
+    ):
+        """BUZZ_CREDENTIALS_FILE in env points at the DEFAULT profile's key
+        file; the scoped adapter must not read the default identity's key."""
+        default_creds = tmp_path / "default-creds.json"
+        default_creds.write_text(
+            json.dumps({"nsec": "nsec1default-identity"}), encoding="utf-8"
+        )
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(default_creds))
+        multiplex_scope()
+        # Scope has no key: the profile is unconfigured and must fail closed
+        # to "" rather than resolving the default profile's credentials.
+        assert _buzz_mod._resolve_private_key({}) == ""
+
+    def test_default_profile_unscoped_keeps_env_precedence(
+        self, monkeypatch, default_profile_env
+    ):
+        """Multiplex ON but no scope (the DEFAULT profile constructs
+        unscoped): env is its own bridge output and still wins."""
+        from agent.secret_scope import set_multiplex_active
+        from gateway.config import PlatformConfig
+
+        set_multiplex_active(True)
+        try:
+            adapter = BuzzAdapter(
+                PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"})
+            )
+        finally:
+            set_multiplex_active(False)
+        assert adapter.relay_url == "https://default.relay"
+
+    def test_check_requirements_scoped_reads_profile_config(
+        self, multiplex_scope, default_profile_env, tmp_path
+    ):
+        """The gate must consult the profile's own config.yaml + secret scope,
+        not the default profile's env values."""
+        import yaml
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"nsec": "nsec1profile"}), encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "gateway": {
+                        "platforms": {
+                            "buzz": {
+                                "enabled": True,
+                                "extra": {
+                                    "relay_url": "https://profile.relay",
+                                    "credentials_file": str(creds),
+                                },
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        multiplex_scope()
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            # The default profile's env relay+key must NOT pass the gate on
+            # their own for a profile without a buzz config...
+            assert check_requirements() is True  # profile config passes
+        finally:
+            reset_hermes_home_override(token)
+
+        # A profile whose config.yaml has no buzz entry fails closed even
+        # though the default profile's env values are present.
+        empty_home = tmp_path / "empty-profile"
+        empty_home.mkdir()
+        multiplex_scope()
+        token = set_hermes_home_override(str(empty_home))
+        try:
+            assert check_requirements() is False
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_env_enablement_scoped_returns_none(self, multiplex_scope, default_profile_env):
+        """Scoped env enablement must not fabricate Buzz for a profile from
+        the default profile's env values."""
+        multiplex_scope()
+        assert _env_enablement() is None
+
+    def test_apply_yaml_config_scoped_skips_env_bridge(
+        self, multiplex_scope, default_profile_env, monkeypatch
+    ):
+        """A secondary profile's YAML values must not be pinned into the
+        process env for every other profile (first-writer-wins)."""
+        for var in ("BUZZ_RELAY_URL", "BUZZ_HOME_CHANNEL", "BUZZ_CHANNELS"):
+            monkeypatch.delenv(var, raising=False)
+        multiplex_scope()
+        _buzz_mod._apply_yaml_config(
+            {},
+            {"extra": {"relay_url": "https://profile.relay", "home_channel": "pchan"}},
+        )
+        import os as _os
+
+        assert "BUZZ_RELAY_URL" not in _os.environ
+        assert "BUZZ_HOME_CHANNEL" not in _os.environ
+        assert "BUZZ_CHANNELS" not in _os.environ
+
+    def test_standalone_send_scoped_uses_profile_extra(
+        self, multiplex_scope, default_profile_env, monkeypatch, tmp_path
+    ):
+        multiplex_scope()
+        from gateway.config import PlatformConfig
+
+        cli = tmp_path / "buzz"
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        calls = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=None):
+            calls["relay"] = relay_url
+            return 0, '{"event_id": "e1"}', ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1profile"
+        )
+        result = asyncio.run(
+            _standalone_send(
+                PlatformConfig(
+                    enabled=True,
+                    extra={"relay_url": "https://profile.relay", "cli_path": str(cli)},
+                ),
+                "chan-x",
+                "hello",
+            )
+        )
+        assert result.get("success") is True
+        assert calls["relay"] == "https://profile.relay"
+
+    def test_secondary_partial_extra_fills_missing_keys_from_defaults(
+        self, multiplex_scope, default_profile_env
+    ):
+        """Partial config: configured keys win, unconfigured keys fall back to
+        their own defaults — never to the default profile's env values."""
+        from gateway.config import PlatformConfig
+
+        multiplex_scope()
+        adapter = BuzzAdapter(
+            PlatformConfig(enabled=True, extra={"relay_url": "https://profile.relay"})
+        )
+        assert adapter.relay_url == "https://profile.relay"
+        assert adapter.channels == []
+        assert adapter.home_channel == ""
+        assert adapter.poll_interval == _buzz_mod._DEFAULT_POLL_INTERVAL
+        assert adapter.transport == "auto"
+        assert adapter._allowed_pubkeys == set()
+
+    def test_ws_auth_tag_not_borrowed_from_default_profile_env(
+        self, multiplex_scope, default_profile_env
+    ):
+        """BUZZ_AUTH_TAG is per-identity NIP-OA owner attestation: a scoped
+        secondary profile without one must not sign its NIP-42 auth event
+        with the default profile's tag from os.environ (#98738)."""
+        import asyncio as _asyncio
+
+        multiplex_scope()
+        adapter = BuzzAdapter.__new__(BuzzAdapter)
+        adapter._private_key = "00" * 31 + "03"
+        adapter._websocket_url = lambda: "wss://relay.example"
+
+        class _FakeWS:
+            def __init__(self):
+                self.sent = []
+
+            async def recv(self):
+                if self.sent:
+                    return json.dumps(["OK", self.sent[0][1]["id"], True, "ok"])
+                return json.dumps(["AUTH", "challenge-1"])
+
+            async def send(self, raw):
+                self.sent.append(json.loads(raw))
+
+        ws = _FakeWS()
+        _asyncio.run(adapter._authenticate_websocket(ws))
+        tags = [t for t in ws.sent[0][1]["tags"] if t and t[0] == "auth"]
+        assert tags == []
+
+    def test_ws_auth_tag_scoped_profile_uses_its_own_tag(
+        self, multiplex_scope
+    ):
+        """Positive control: a tag present in the profile's own secret scope
+        IS attached to the NIP-42 auth event."""
+        import asyncio as _asyncio
+
+        profile_tag = json.dumps(["auth", "p" * 64, "", "q" * 128])
+        multiplex_scope({"BUZZ_AUTH_TAG": profile_tag})
+        adapter = BuzzAdapter.__new__(BuzzAdapter)
+        adapter._private_key = "00" * 31 + "03"
+        adapter._websocket_url = lambda: "wss://relay.example"
+
+        class _FakeWS:
+            def __init__(self):
+                self.sent = []
+
+            async def recv(self):
+                if self.sent:
+                    return json.dumps(["OK", self.sent[0][1]["id"], True, "ok"])
+                return json.dumps(["AUTH", "challenge-1"])
+
+            async def send(self, raw):
+                self.sent.append(json.loads(raw))
+
+        ws = _FakeWS()
+        _asyncio.run(adapter._authenticate_websocket(ws))
+        tags = [t for t in ws.sent[0][1]["tags"] if t and t[0] == "auth"]
+        assert tags == [json.loads(profile_tag)]
+
+    def test_ws_auth_tag_unscoped_default_profile_keeps_env(
+        self, default_profile_env
+    ):
+        """The default profile constructs unscoped even under multiplex, so
+        its env-provided auth tag still applies (legacy behavior kept)."""
+        import asyncio as _asyncio
+
+        from agent.secret_scope import set_multiplex_active
+
+        set_multiplex_active(True)
+        try:
+            adapter = BuzzAdapter.__new__(BuzzAdapter)
+            adapter._private_key = "00" * 31 + "03"
+            adapter._websocket_url = lambda: "wss://relay.example"
+
+            class _FakeWS:
+                def __init__(self):
+                    self.sent = []
+
+                async def recv(self):
+                    if self.sent:
+                        return json.dumps(["OK", self.sent[0][1]["id"], True, "ok"])
+                    return json.dumps(["AUTH", "challenge-1"])
+
+                async def send(self, raw):
+                    self.sent.append(json.loads(raw))
+
+            ws = _FakeWS()
+            _asyncio.run(adapter._authenticate_websocket(ws))
+        finally:
+            set_multiplex_active(False)
+        tags = [t for t in ws.sent[0][1]["tags"] if t and t[0] == "auth"]
+        assert tags == [["auth", "default-profile-tag", "", "x"]]
+
+    def test_validate_config_scoped_extra_is_authoritative(
+        self, multiplex_scope, default_profile_env, tmp_path
+    ):
+        """Scoped validation reads the profile's extra, not the default
+        profile's env relay/key: unconfigured fails closed, configured
+        passes via its own credentials file."""
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"nsec": "nsec1profile"}), encoding="utf-8")
+        from gateway.config import PlatformConfig
+
+        multiplex_scope()
+        assert validate_config(PlatformConfig(enabled=True, extra={})) is False
+        assert (
+            validate_config(
+                PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "relay_url": "https://profile.relay",
+                        "credentials_file": str(creds),
+                    },
+                )
+            )
+            is True
+        )
+
+    def test_validate_config_unscoped_keeps_env_precedence(
+        self, default_profile_env
+    ):
+        """Single-profile/unscoped: env relay + env key still validate even
+        with an empty extra mapping."""
+        from gateway.config import PlatformConfig
+
+        assert validate_config(PlatformConfig(enabled=True, extra={})) is True
+
+    def test_standalone_send_scoped_target_falls_back_to_profile_home(
+        self, multiplex_scope, default_profile_env, monkeypatch, tmp_path
+    ):
+        """With no explicit chat_id, the scoped standalone send targets the
+        profile's own home_channel — never the default profile's env one."""
+        multiplex_scope()
+        from gateway.config import PlatformConfig
+
+        cli = tmp_path / "buzz"
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        calls = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=None):
+            calls["args"] = args
+            return 0, '{"event_id": "e1"}', ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1profile"
+        )
+        result = asyncio.run(
+            _standalone_send(
+                PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "relay_url": "https://profile.relay",
+                        "cli_path": str(cli),
+                        "home_channel": "pchan",
+                    },
+                ),
+                "",
+                "hello",
+            )
+        )
+        assert result.get("success") is True
+        assert calls["args"][calls["args"].index("--channel") + 1] == "pchan"
+
+    def test_standalone_send_scoped_without_target_fails_closed(
+        self, multiplex_scope, default_profile_env, monkeypatch, tmp_path
+    ):
+        """No chat_id and no profile home_channel: the error is returned —
+        the default profile's env BUZZ_HOME_CHANNEL must not be borrowed."""
+        multiplex_scope()
+        from gateway.config import PlatformConfig
+
+        cli = tmp_path / "buzz"
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=None):
+            raise AssertionError("CLI must not run without a resolved target")
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1profile"
+        )
+        result = asyncio.run(
+            _standalone_send(
+                PlatformConfig(
+                    enabled=True,
+                    extra={"relay_url": "https://profile.relay", "cli_path": str(cli)},
+                ),
+                "",
+                "hello",
+            )
+        )
+        assert result == {
+            "error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"
+        }
 
 
 # ── CLI error contract ────────────────────────────────────────────────────
@@ -381,6 +828,36 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(CHANNEL) is False
 
 
+class TestThreadRoots:
+
+    @pytest.mark.asyncio
+    async def test_inbound_root_e_tag_propagates_to_session_source(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        dispatched = []
+
+        async def capture(event):
+            dispatched.append(event)
+
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = capture
+        adapter._run_cli = _ScriptedCli()
+        adapter.send_reaction = AsyncMock(return_value=True)
+        event = _tagged_event("latest-child", CHANNEL, content="@Chip follow-up")
+        event["tags"] += [
+            ["e", "stable-root", "", "root"],
+            ["e", "latest-parent", "", "reply"],
+        ]
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], event)
+
+        assert dispatched[0].source.thread_id == "stable-root"
+
+
 # ── Sending ───────────────────────────────────────────────────────────────
 
 
@@ -407,6 +884,64 @@ class TestBuzzAdapterSend:
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
+    @pytest.mark.asyncio
+    async def test_send_metadata_thread_id_uses_reply_to_flag(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt124", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            CHANNEL,
+            "working",
+            metadata={"thread_id": "buzz-event-123"},
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "buzz-event-123"
+
+    @pytest.mark.asyncio
+    async def test_send_uses_metadata_reply_to_message_id(self):
+        """Gateway stream/progress pass reply anchors via metadata.
+
+        Without honoring reply_to_message_id, mid-turn commentary posts as
+        new top-level channel messages instead of thread replies.
+        """
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-reply", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            CHANNEL,
+            "threaded reply",
+            metadata={"reply_to_message_id": "root-event-abc"},
+        )
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--reply-to" in args
+        assert args[args.index("--reply-to") + 1] == "root-event-abc"
+
+    @pytest.mark.asyncio
+    async def test_send_prefers_stable_thread_root_over_latest_reply(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt124"})
+        adapter._run_cli = cli
+
+        await adapter.send(
+            CHANNEL,
+            "threaded reply",
+            reply_to="latest-child",
+            metadata={"thread_id": "stable-root"},
+        )
+
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "stable-root"
+
+
 
     @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
@@ -420,6 +955,100 @@ class TestBuzzAdapterSend:
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+
+    @pytest.mark.asyncio
+    async def test_send_image_local_file_prefers_stable_thread_root(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt127"})
+        adapter._run_cli = cli
+
+        await adapter.send_image(
+            CHANNEL,
+            str(img),
+            reply_to="latest-child",
+            metadata={"thread_id": "stable-root"},
+        )
+
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "stable-root"
+
+
+# ── Thread anchoring ──────────────────────────────────────────────────────
+
+
+class TestThreadAnchoring:
+    """A reply must JOIN the thread it was triggered from, not nest a new one.
+
+    The gateway hands adapters the triggering message's own id as the reply
+    anchor. For a top-level message that correctly opens a thread; for a
+    message already inside a thread it used to nest a fresh sub-thread under
+    every answer (an endless ladder of one-message threads in Buzz).
+    """
+
+    @staticmethod
+    def _event(eid, *e_tags):
+        return {"id": eid, "tags": [["h", CHANNEL], *e_tags]}
+
+    def test_top_level_message_has_no_root(self):
+        a = _make_adapter()
+        assert a._extract_thread_root(self._event("m1")) is None
+
+    def test_thread_opener_roots_at_its_parent(self):
+        a = _make_adapter()
+        ev = self._event("m2", ["e", "root1", "", "reply"])
+        assert a._extract_thread_root(ev) == "root1"
+
+    def test_in_thread_message_uses_root_marker_not_parent(self):
+        a = _make_adapter()
+        ev = self._event("m3", ["e", "root1", "", "root"], ["e", "m2", "", "reply"])
+        assert a._extract_thread_root(ev) == "root1"
+
+    def test_legacy_unmarked_etag_treated_as_parent(self):
+        a = _make_adapter()
+        assert a._extract_thread_root(self._event("m4", ["e", "root1"])) == "root1"
+
+    def test_reply_to_top_level_still_opens_a_thread(self):
+        """Regression guard: the original (correct) behaviour must survive."""
+        a = _make_adapter()
+        a._record_thread_root("m1", self._event("m1"))
+        assert a._resolve_reply_anchor("m1") == "m1"
+
+    def test_reply_inside_thread_joins_that_thread(self):
+        a = _make_adapter()
+        a._record_thread_root("m3", self._event(
+            "m3", ["e", "root1", "", "root"], ["e", "m2", "", "reply"]))
+        assert a._resolve_reply_anchor("m3") == "root1"
+
+    def test_unknown_and_empty_anchors_pass_through(self):
+        a = _make_adapter()
+        assert a._resolve_reply_anchor("never-seen") == "never-seen"
+        assert a._resolve_reply_anchor(None) is None
+
+    def test_root_cache_is_bounded_and_evicts_oldest(self):
+        a = _make_adapter()
+        for i in range(a._THREAD_ROOT_CACHE + 50):
+            a._record_thread_root(f"id{i}", self._event(f"id{i}"))
+        assert len(a._thread_roots) == a._THREAD_ROOT_CACHE
+        assert "id0" not in a._thread_roots
+        assert f"id{a._THREAD_ROOT_CACHE + 49}" in a._thread_roots
+
+    @pytest.mark.asyncio
+    async def test_send_anchors_to_root_not_trigger(self):
+        """End-to-end through send(): argv must carry the thread root."""
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "dm", "last_ts": 0, "seen": {}}
+        adapter._record_thread_root("m3", self._event(
+            "m3", ["e", "root1", "", "root"], ["e", "m2", "", "reply"]))
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "e9", "message": ""})
+        adapter._run_cli = cli
+
+        await adapter.send(CHANNEL, "in-thread answer", reply_to="m3")
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "root1"
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -481,6 +1110,65 @@ class TestCredentialResolution:
         monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
         assert _resolve_private_key() == "nsec1fromfile"
 
+    def test_owner_auth_tag_from_credentials_file(self, monkeypatch, tmp_path):
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(json.dumps({"nsec": "nsec1fromfile", "auth_tag": tag}), encoding="utf-8")
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        assert json.loads(_resolve_auth_tag()) == tag
+
+    def test_invalid_owner_auth_tag_fails_closed(self, monkeypatch, tmp_path):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(json.dumps({"nsec": "nsec1fromfile", "auth_tag": ["bad"]}), encoding="utf-8")
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        with pytest.raises(ValueError, match="auth tag"):
+            _resolve_auth_tag()
+
+    def test_scoped_credentials_and_tag_do_not_borrow_ambient_profile(self, monkeypatch, tmp_path):
+        from agent import secret_scope as ss
+
+        ambient_tag = ["auth", "a" * 64, "", "d" * 128]
+        scoped_tag = ["auth", "b" * 64, "", "c" * 128]
+        ambient = tmp_path / "ambient.json"
+        scoped = tmp_path / "scoped.json"
+        ambient.write_text(json.dumps({"nsec": "nsec1ambient", "auth_tag": ambient_tag}))
+        scoped.write_text(json.dumps({"nsec": "nsec1scoped", "auth_tag": scoped_tag}))
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(ambient))
+        monkeypatch.setenv("BUZZ_AUTH_TAG", json.dumps(ambient_tag))
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"BUZZ_CREDENTIALS_FILE": str(scoped)})
+        try:
+            assert _resolve_private_key() == "nsec1scoped"
+            assert json.loads(_resolve_auth_tag()) == scoped_tag
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+    def test_owner_auth_tag_uses_credentials_autodiscovery(self, monkeypatch, tmp_path):
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(json.dumps({"nsec": "nsec1fromfile", "auth_tag": tag}), encoding="utf-8")
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path)
+        assert _resolve_private_key() == "nsec1fromfile"
+        assert json.loads(_resolve_auth_tag()) == tag
+
+    def test_empty_multiplex_scope_never_autodiscovers_ambient_credentials(self, monkeypatch, tmp_path):
+        from agent import secret_scope as ss
+
+        tag = ["auth", "a" * 64, "", "d" * 128]
+        (tmp_path / "general_credentials.json").write_text(
+            json.dumps({"nsec": "nsec1ambient", "auth_tag": tag}), encoding="utf-8"
+        )
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path)
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            assert _resolve_private_key() == ""
+            assert _resolve_auth_tag() == ""
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
 
 # ── Env enablement / registration / standalone send ──────────────────────
 
@@ -524,8 +1212,8 @@ class TestStandaloneSend:
 
         captured = {}
 
-        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
-            captured.update(cli_path=cli_path, args=args, relay_url=relay_url, input_text=input_text)
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=30.0):
+            captured.update(cli_path=cli_path, args=args, relay_url=relay_url, auth_tag=auth_tag, input_text=input_text)
             return 0, json.dumps({"accepted": True, "event_id": "evt-cron", "message": ""}), ""
 
         monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
@@ -537,4 +1225,223 @@ class TestStandaloneSend:
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
 
+    @pytest.mark.asyncio
+    async def test_standalone_send_injects_owner_auth_tag_from_credentials_file(
+        self, monkeypatch, tmp_path
+    ):
+        """Cron/standalone path must load NIP-OA auth_tag from credentials JSON.
 
+        Main-line regression: when only BUZZ_PRIVATE_KEY is ambient and the
+        credentials file holds auth_tag, omitting injection causes relay 403
+        membership failures on owner-gated relays.
+        """
+        from gateway.config import PlatformConfig
+
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": tag}),
+            encoding="utf-8",
+        )
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        monkeypatch.delenv("BUZZ_PRIVATE_KEY", raising=False)
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+
+        captured = {}
+
+        async def fake_exec(
+            cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=30.0
+        ):
+            captured.update(
+                private_key=private_key,
+                auth_tag=auth_tag,
+                args=args,
+                input_text=input_text,
+            )
+            return 0, json.dumps({"accepted": True, "event_id": "evt-auth", "message": ""}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={}), CHANNEL, "cron needs owner auth"
+        )
+        assert result == {"success": True, "message_id": "evt-auth"}
+        assert captured["private_key"] == "nsec1fromfile"
+        assert json.loads(captured["auth_tag"]) == tag
+        # Secrets stay out of argv (auth_tag is env-injected by _exec_buzz).
+        joined_args = " ".join(str(a) for a in captured["args"])
+        assert "nsec1fromfile" not in joined_args
+        assert tag[1] not in joined_args
+        assert tag[3] not in joined_args
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_key_only_does_not_invent_auth_tag(
+        self, monkeypatch, tmp_path
+    ):
+        """Direct private key without credentials_file must not invent an auth tag."""
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        monkeypatch.delenv("BUZZ_CREDENTIALS_FILE", raising=False)
+        # Ambient credentials dir must not be borrowed when a direct key is set.
+        ambient = tmp_path / "ambient_credentials.json"
+        ambient.write_text(
+            json.dumps({"nsec": "nsec1ambient", "auth_tag": ["auth", "a" * 64, "", "d" * 128]}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path)
+
+        captured = {}
+
+        async def fake_exec(
+            cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=30.0
+        ):
+            captured.update(private_key=private_key, auth_tag=auth_tag)
+            return 0, json.dumps({"accepted": True, "event_id": "evt-key", "message": ""}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={}), CHANNEL, "key only"
+        )
+        assert result == {"success": True, "message_id": "evt-key"}
+        assert captured["private_key"] == "nsec1x"
+        assert captured["auth_tag"] == ""
+
+
+# ── Editing and deleting (streaming) ──────────────────────────────────
+
+
+class TestBuzzAdapterEdit:
+
+    @pytest.mark.asyncio
+    async def test_edit_targets_the_original_event_and_uses_stdin(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "edit", {"accepted": True, "event_id": "edit1", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.edit_message(CHANNEL, "orig1", "partial answer")
+        assert result.success is True
+
+        args, stdin_text = cli.calls[0]
+        assert args[:2] == ["messages", "edit"]
+        assert args[args.index("--event") + 1] == "orig1"
+        # Content travels via stdin (--content -), never argv, same as send
+        assert args[args.index("--content") + 1] == "-"
+        assert stdin_text == "partial answer"
+
+    @pytest.mark.asyncio
+    async def test_edit_returns_the_original_id_not_the_cli_event_id(self):
+        """The stream consumer re-edits ONE message id for the whole stream.
+
+        buzz-cli reports a fresh event id for each edit; returning that would
+        make the second edit address a message that was never sent.
+        """
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "edit", {"accepted": True, "event_id": "edit1"})
+        adapter._run_cli = cli
+
+        result = await adapter.edit_message(CHANNEL, "orig1", "text")
+        assert result.message_id == "orig1"
+
+    @pytest.mark.asyncio
+    async def test_edit_marks_its_own_event_seen(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "edit", {"accepted": True, "event_id": "edit1"})
+        adapter._run_cli = cli
+
+        await adapter.edit_message(CHANNEL, "orig1", "text")
+        assert "edit1" in adapter._channel_state[CHANNEL]["seen"]
+
+    @pytest.mark.asyncio
+    async def test_edit_accepts_finalize_without_changing_behaviour(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "edit", {"accepted": True, "event_id": "edit1"})
+        adapter._run_cli = cli
+
+        result = await adapter.edit_message(CHANNEL, "orig1", "text", finalize=True)
+        assert result.success is True
+        assert len(cli.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_edit_without_a_message_id_never_calls_the_cli(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        result = await adapter.edit_message(CHANNEL, "", "text")
+        assert result.success is False
+        assert cli.calls == []
+
+    @pytest.mark.asyncio
+    async def test_edit_with_empty_content_never_calls_the_cli(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        result = await adapter.edit_message(CHANNEL, "orig1", "")
+        assert result.success is False
+        assert cli.calls == []
+
+    @pytest.mark.asyncio
+    async def test_edit_relay_error_is_retryable_but_bad_input_is_not(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "edit", "", code=2, stderr="relay unreachable")
+        adapter._run_cli = cli
+        relay_failure = await adapter.edit_message(CHANNEL, "orig1", "text")
+        assert relay_failure.success is False
+        assert relay_failure.retryable is True
+
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "edit", "", code=1, stderr="bad input")
+        adapter._run_cli = cli
+        input_failure = await adapter.edit_message(CHANNEL, "orig1", "text")
+        assert input_failure.success is False
+        assert input_failure.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_delete_targets_the_event(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "delete", {"accepted": True, "event_id": "del1"})
+        adapter._run_cli = cli
+
+        assert await adapter.delete_message(CHANNEL, "orig1") is True
+        assert cli.calls[0][0] == ["messages", "delete", "--event", "orig1"]
+
+    @pytest.mark.asyncio
+    async def test_delete_failure_returns_false(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "delete", "", code=2, stderr="relay unreachable")
+        adapter._run_cli = cli
+
+        assert await adapter.delete_message(CHANNEL, "orig1") is False
+
+    @pytest.mark.asyncio
+    async def test_delete_without_a_message_id_never_calls_the_cli(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        assert await adapter.delete_message(CHANNEL, "") is False
+        assert cli.calls == []

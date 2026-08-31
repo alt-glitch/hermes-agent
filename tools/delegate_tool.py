@@ -162,6 +162,63 @@ _RECENT_SUBAGENTS_CAP = 200
 _recent_subagents: Dict[str, Dict[str, Any]] = {}
 
 
+# Terminal child statuses that mean "the subagent did NOT deliver a usable
+# result". Shared by the CLI spinner echo, the gateway failure notice, and
+# the parent-facing failure summary so every surface agrees on what counts
+# as a failure.
+SUBAGENT_FAILURE_STATUSES = frozenset({"failed", "error", "timeout"})
+
+
+def _clean_error_text(error: Any, max_chars: int = 200) -> str:
+    """Reduce an arbitrary error payload to one clean human-readable line.
+
+    Provider/SDK errors routinely arrive as multi-line tracebacks or JSON
+    walls. For a chat-facing notice we want the single most informative
+    line: the exception message (last line of a traceback) or the first
+    non-empty line otherwise, hard-capped in length.
+    """
+    text = str(error or "").strip()
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    # A traceback's last line is the actual exception message.
+    line = lines[-1] if lines[0].startswith("Traceback") else lines[0]
+    if len(line) > max_chars:
+        line = line[: max_chars - 3] + "..."
+    return line
+
+
+def format_subagent_failure_line(
+    goal: Optional[str],
+    status: Optional[str],
+    error: Any = None,
+    duration_seconds: Any = None,
+) -> str:
+    """One clean, human-readable line describing a failed subagent.
+
+    Rendered directly to the user (CLI spinner echo, gateway platform
+    notice) — no JSON, no traceback, no internal field names. Example:
+
+        ⚠️ Subagent failed — "research competitor pricing": Error code: 404 —
+        model not found (after 12s)
+    """
+    goal_label = (goal or "").strip().replace("\n", " ")
+    if len(goal_label) > 60:
+        goal_label = goal_label[:57] + "..."
+    verb = "timed out" if status == "timeout" else "failed"
+    line = f"⚠️ Subagent {verb}"
+    if goal_label:
+        line += f' — "{goal_label}"'
+    err = _clean_error_text(error)
+    if err:
+        line += f": {err}"
+    if isinstance(duration_seconds, (int, float)) and duration_seconds > 0:
+        line += f" (after {round(duration_seconds)}s)"
+    return line
+
+
 def get_subagent_attribution(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Resolve a process task_id to its originating delegation, if any.
 
@@ -1203,6 +1260,34 @@ def _build_child_system_prompt(
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
+        # Project context files (AGENTS.md / CLAUDE.md / .cursorrules ...)
+        # from the workspace, via the SAME discovery/priority/cap logic the
+        # main agent's system prompt uses. Children are constructed with
+        # skip_context_files=True (their prompt is this focused one), so
+        # without this a subagent works in a repo without the repo's own
+        # conventions unless it thinks to go read them. SOUL.md is skipped —
+        # identity belongs to the parent. workspace_path comes only from
+        # explicit sources (_resolve_workspace_hint: TERMINAL_CWD / agent cwd
+        # hints, never bare getcwd), so the #64590 install-tree-fallback leak
+        # doesn't apply here. Best-effort: on any failure the child prompt is
+        # simply built without the block.
+        try:
+            from agent.prompt_builder import build_context_files_prompt
+
+            _ctx_files = build_context_files_prompt(
+                cwd=str(workspace_path), skip_soul=True
+            )
+        except Exception:
+            logger.debug(
+                "subagent: workspace context-files load failed", exc_info=True
+            )
+            _ctx_files = ""
+        if _ctx_files.strip():
+            parts.append(
+                "\nThe workspace's project context files are reproduced "
+                "below. Their conventions and invariants are binding for "
+                "your work in this workspace.\n\n" + _ctx_files.strip()
+            )
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -1435,6 +1520,21 @@ def _build_child_progress_callback(
             return
 
         if event_type == "subagent.complete":
+            # Failed child: echo one clean reason line into the CLI tree so
+            # the human sees WHY, not just a vanished branch. Gateway-side
+            # rendering happens in TurnRunner.progress_callback off the
+            # relayed event below.
+            if spinner and kwargs.get("status") in SUBAGENT_FAILURE_STATUSES:
+                _fail_line = format_subagent_failure_line(
+                    goal_label,
+                    kwargs.get("status"),
+                    error=kwargs.get("summary") or preview,
+                    duration_seconds=kwargs.get("duration_seconds"),
+                )
+                try:
+                    spinner.print_above(f" {prefix}├─ {_fail_line}")
+                except Exception as e:
+                    logger.debug("Spinner print_above failed: %s", e)
             _relay("subagent.complete", preview=preview, **kwargs)
             return
 
@@ -1544,6 +1644,30 @@ def _normalized_runtime_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
 
+def _inherit_parent_capabilities(
+    parent_agent, override_provider, override_base_url
+) -> Optional[dict]:
+    """Return the parent's endpoint-trust capability map for a child, or None.
+
+    The trusted-proxy capability map (``agent.capabilities``, e.g.
+    ``openai_native_compaction`` from a custom_providers entry) is a trust
+    decision scoped to one provider+endpoint. A child inherits it ONLY when
+    it runs against the parent's exact route — any delegation override that
+    changes provider or base_url stays DEFAULT-DENY, matching the /model
+    switch posture (#94036/#97292).
+    """
+    if override_provider or override_base_url:
+        return None
+    parent_caps = getattr(parent_agent, "capabilities", None)
+    if not isinstance(parent_caps, dict):
+        return None
+    return {
+        key: value
+        for key, value in parent_caps.items()
+        if isinstance(key, str) and isinstance(value, bool)
+    }
+
+
 def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> Optional[str]:
     """Return the base URL the parent is actually calling, not a stale attribute.
 
@@ -1615,15 +1739,15 @@ def _build_child_agent(
     import uuid as _uuid
 
     # ── Role resolution ─────────────────────────────────────────────────
-    # Honor the caller's role only when BOTH the kill switch and the
-    # child's depth allow it.  This is the single point where role
-    # degrades to 'leaf' — keeps the rule predictable.  Callers pass
-    # the normalised role (_normalize_role ran in delegate_task) so
-    # we only deal with 'leaf' or 'orchestrator' here.
+    # Depth-derived, not caller-declared: a child may delegate iff the
+    # kill switch is on and depth budget remains below max_spawn_depth.
+    # The legacy `role` arg no longer participates (it asked the caller
+    # to guess a fact the config already knows); it is still accepted and
+    # normalised for wire compat, but capability comes from depth alone.
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
     max_spawn = _get_max_spawn_depth()
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
-    effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
+    effective_role = "orchestrator" if orchestrator_ok else "leaf"
 
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
@@ -1761,6 +1885,16 @@ def _build_child_agent(
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
     effective_api_key = override_api_key or parent_api_key
+    # Same-class follow-up to #94036/#97292: the trusted-proxy capability map
+    # (`agent.capabilities`, e.g. ``openai_native_compaction`` from a
+    # custom_providers entry) is an endpoint-scoped trust decision. Children
+    # inherit it ONLY when they run against the parent's exact provider and
+    # base_url — a provider- or endpoint-changing delegation override stays
+    # DEFAULT-DENY, matching the /model switch posture. Without this, a child
+    # on the same trusted proxy silently falls back to local summarization.
+    child_capabilities = _inherit_parent_capabilities(
+        parent_agent, override_provider, override_base_url
+    )
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -1942,6 +2076,7 @@ def _build_child_agent(
                 api_key=effective_api_key,
                 model=effective_model,
                 provider=effective_provider,
+                capabilities=child_capabilities,
                 api_mode=effective_api_mode,
                 acp_command=effective_acp_command,
                 acp_args=effective_acp_args,
@@ -1969,9 +2104,17 @@ def _build_child_agent(
                 provider_require_parameters=child_provider_require_parameters,
                 provider_data_collection=child_provider_data_collection,
                 request_overrides=(
-                    dict(override_request_overrides or {})
-                    if override_provider
-                    else dict(getattr(parent_agent, "request_overrides", {}) or {})
+                    # override_request_overrides is honored whenever set —
+                    # including the inherit branch (override_provider=None),
+                    # where _resolve_delegation_credentials already merged
+                    # delegation.request_overrides OVER the parent's values.
+                    dict(override_request_overrides)
+                    if override_request_overrides is not None
+                    else (
+                        {}
+                        if override_provider
+                        else dict(getattr(parent_agent, "request_overrides", {}) or {})
+                    )
                 ),
                 openrouter_min_coding_score=child_openrouter_min_coding_score,
                 tool_progress_callback=child_progress_cb,
@@ -2443,7 +2586,27 @@ def _run_single_child(
 ) -> Dict[str, Any]:
     """
     Run a pre-built child agent. Called from within a thread.
-    Returns a structured result dict.
+    Returns a structured result dict with a ``status`` and ``exit_reason``
+    that are derived honestly from the child's structured completion fields.
+
+    ``status`` ∈ {``"completed"``, ``"interrupted"``, ``"failed"``}:
+        * ``"completed"``  — the child reached a normal finish (may still have
+          hit its iteration budget; see ``exit_reason``).
+        * ``"interrupted"`` — the child was interrupted (``interrupted=True``).
+        * ``"failed"``    — a structured failure (``failed=True`` or a non-empty
+          ``error``) or a summary-less/invalid terminal state.
+
+    ``exit_reason`` ∈ {``"completed"``, ``"max_iterations"``, ``"interrupted"``,
+    ``"error"``}:
+        * ``"completed"``       — normal finish.
+        * ``"max_iterations"``  — genuine per-child iteration-budget exhaustion
+          (``completed=False`` with no failure fields).
+        * ``"interrupted"``     — interrupted by the parent.
+        * ``"error"``           — provider rejection / terminal failure; NOT
+          budget exhaustion (this is the case #97655 fixed).
+
+    ``truncated`` is derived as ``exit_reason == "max_iterations"`` only, so the
+    parent-visible truncation flag stays truthful for all of the above.
     """
     child_start = time.monotonic()
 
@@ -3033,6 +3196,26 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif result.get("failed") or result.get("error"):
+            # A structured failure (provider rejection / terminal exception)
+            # must WIN over the summary-presence heuristic below. The child's
+            # conversation loop returns the error text as final_response, so an
+            # error-shaped summary would otherwise be labeled "completed" here
+            # despite completed=False. The heuristic is only a fallback for
+            # legacy/mock results that omit the structured failure fields.
+            # (Community report Aug 2026; #97655.)
+            status = "failed"
+        elif _schema_valid is False:
+            # T1-24 follow-up: a schema was declared and the final answer —
+            # after the one bounded retry — still violates it (empty `{}`
+            # fallback included). A summary exists, but it is unusable under
+            # the contract the caller asked for, so it must not be reported
+            # as a completed delegation: the batch line would print ✓ and
+            # orchestrators that read only status/icon would accept an
+            # empty verdict. schema_valid/schema_errors (below) carry the
+            # detail; status has to agree with them. _schema_valid stays
+            # None on schema-less runs, which never take this branch.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -3082,9 +3265,15 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif result.get("failed") or result.get("error"):
+            # Provider rejection / terminal failure. Do NOT report this as
+            # iteration-budget exhaustion — "max_iterations" is only truthful
+            # when the child actually hit its per-delegation iteration cap.
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
         else:
+            # Genuine budget exhaustion: completed=False with no failure.
             exit_reason = "max_iterations"
 
         # Extract token counts (safe for mock objects)
@@ -3092,6 +3281,10 @@ def _run_single_child(
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
 
+        # --- result entry contract (see _run_single_child docstring) ---
+        # status ∈ {completed, interrupted, failed}
+        # exit_reason ∈ {completed, max_iterations, interrupted, error}
+        # truncated is exactly (exit_reason == "max_iterations").
         entry: Dict[str, Any] = {
             "task_index": task_index,
             "status": status,
@@ -3146,7 +3339,28 @@ def _run_single_child(
             else "unknown"
         )
         if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            if _schema_valid is False and summary and not _empty_sentinel:
+                # The child DID respond — the response just violates the
+                # declared contract. Name that instead of the generic
+                # "no response" error; schema_errors (below) hold the
+                # validator's specifics verbatim.
+                entry["error"] = (
+                    "Final answer does not satisfy the declared "
+                    "output_schema (after 1 retry)."
+                    if _schema_retries
+                    else "Final answer does not satisfy the declared "
+                    "output_schema."
+                )
+            else:
+                entry["error"] = result.get(
+                    "error", "Subagent did not produce a response."
+                )
+            # Classified reason from the child loop (e.g. "rate_limit",
+            # "billing", "server_error") — lets the parent distinguish a
+            # quota wall from a real task error without parsing prose.
+            _failure_reason = result.get("failure_reason")
+            if isinstance(_failure_reason, str) and _failure_reason:
+                entry["failure_reason"] = _failure_reason
 
         # T1-24: schema-validation outcome — emitted ONLY when a schema was
         # requested, so legacy (schema-less) payloads keep their exact shape.
@@ -3564,19 +3778,16 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     """Validate a tasks=[...] batch beyond per-task goal presence.
 
     Returns an actionable error string, or None when the batch is valid.
-    Batch-only by design: the single-`goal` form legitimately uses short
-    goals, so these checks must never run on it.
+
+    A one-entry array is the canonical single-task shape (the advertised
+    interface is tasks-only; legacy top-level `goal` is wrapped into a
+    one-entry batch), so no minimum count is enforced. The placeholder/
+    template checks below still run on every entry.
 
     Duplicate goals are deliberately NOT rejected: identical-goal fan-outs
     are a legitimate pattern (best-of-N / ensemble sampling), and blocking
     them broke real workflows (post-merge audit of #81141).
     """
-    if len(task_list) < 2:
-        return (
-            "Batch mode requires at least 2 tasks. For a single task, use "
-            "the `goal` parameter instead of `tasks`: "
-            'delegate_task(goal="...", context="...").'
-        )
 
     for i, task in enumerate(task_list):
         goal = str(task.get("goal", "")).strip()
@@ -3596,7 +3807,11 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
                 "calling delegate_task — subagents cannot resolve "
                 "placeholders."
             )
-        if len(goal) < _MIN_BATCH_GOAL_LEN:
+        if len(goal) < _MIN_BATCH_GOAL_LEN and len(task_list) >= 2:
+            # Multi-task fan-outs with terse goals are usually unexpanded
+            # templates; a SINGLE task legitimately uses short goals
+            # ("Fix the tests"), so one-entry arrays keep the historical
+            # single-`goal` exemption.
             return (
                 f"Task {i} goal is too short ({goal!r}). Write a specific, "
                 "self-contained goal of at least "
@@ -3618,6 +3833,7 @@ def delegate_task(
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
     parent_agent=None,
+    credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -3711,8 +3927,16 @@ def delegate_task(
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
+    #
+    # ``credentials_cfg`` (internal callers only — never model-facing) is a
+    # per-call override shaped like the delegation config section
+    # ({provider, model, base_url, api_key, api_mode}); the /review engine
+    # uses it to route its reviewer subagent onto ``auxiliary.review``
+    # without touching the global delegation pin.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(
+            credentials_cfg if credentials_cfg else cfg, parent_agent
+        )
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -3747,7 +3971,11 @@ def delegate_task(
             single_task["output_schema"] = output_schema
         task_list = [single_task]
     else:
-        return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
+        return tool_error(
+            "No tasks provided. Pass tasks=[{goal: '...', context: '...'}, "
+            "...] — one entry per subagent (a single task is a one-entry "
+            "array)."
+        )
 
     if not task_list:
         return tool_error("No tasks provided.")
@@ -4033,6 +4261,15 @@ def delegate_task(
                         icon = "✓" if status == "completed" else "✗"
                         remaining = n_tasks - completed_count
                         completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
+                        # Failed/errored/timed-out children: say WHY on the
+                        # same line, cleaned to one short human-readable
+                        # fragment — a bare ✗ reads as "silently dropped".
+                        if status in SUBAGENT_FAILURE_STATUSES:
+                            _err_line = _clean_error_text(
+                                entry.get("error"), max_chars=120
+                            )
+                            if _err_line:
+                                completion_line += f" — {_err_line}"
                         if spinner_ref:
                             try:
                                 spinner_ref.print_above(completion_line)
@@ -4426,6 +4663,43 @@ def _resolve_child_credential_pool(
     return None
 
 
+def _merge_request_overrides(runtime_overrides, explicit_overrides):
+    """Merge explicit ``delegation.request_overrides`` over runtime-derived ones.
+
+    Precedence contract: the explicit config key WINS over runtime-derived
+    (provider-catalog or parent-inherited) overrides. Top-level keys from the
+    explicit dict replace same-named runtime keys; the ``extra_body`` sub-dict
+    is deep-merged ONE level — runtime ``extra_body`` keys survive unless the
+    explicit dict redefines that exact key. This keeps provider personality
+    (e.g. ``thinking: {type: disabled}``) intact while letting users layer
+    routing hints (e.g. ``extra_body.provider = {"sort": "throughput"}``) on
+    top.
+
+    Both inputs are deep-copied (``copy.deepcopy``) so transport-side mutation
+    of the child's request kwargs can never leak back into the loaded config
+    dict or the provider runtime cache.
+
+    Returns ``None`` when both sides are empty/non-dict.
+    """
+    import copy as _copy
+
+    runtime_overrides = runtime_overrides if isinstance(runtime_overrides, dict) else None
+    explicit_overrides = explicit_overrides if isinstance(explicit_overrides, dict) else None
+    if not runtime_overrides and not explicit_overrides:
+        return None
+    merged = _copy.deepcopy(runtime_overrides) if runtime_overrides else {}
+    explicit = _copy.deepcopy(explicit_overrides) if explicit_overrides else {}
+    runtime_extra = merged.get("extra_body")
+    explicit_extra = explicit.pop("extra_body", None)
+    merged.update(explicit)
+    if isinstance(runtime_extra, dict) and isinstance(explicit_extra, dict):
+        runtime_extra.update(explicit_extra)
+        merged["extra_body"] = runtime_extra
+    elif explicit_extra is not None:
+        merged["extra_body"] = explicit_extra
+    return merged or None
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
@@ -4453,6 +4727,18 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
+    # delegation.request_overrides: explicit per-child request settings from
+    # config. Honored on EVERY resolution branch (direct base_url, named
+    # provider, and parent-inherit) so the key never silently no-ops.
+    # Precedence: explicit merges OVER runtime/parent-derived overrides via
+    # _merge_request_overrides (top-level explicit keys win; extra_body is
+    # deep-merged one level). Non-dict values are ignored.
+    explicit_request_overrides = (
+        cfg.get("request_overrides")
+        if isinstance(cfg.get("request_overrides"), dict)
+        else None
+    )
+
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
     # a base_url. For these, always fall through to resolve_runtime_provider()
@@ -4464,6 +4750,24 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     _is_native_sdk_provider = _provider_lower in _NATIVE_SDK_PROVIDERS
 
     if configured_base_url and not _is_native_sdk_provider:
+        # delegation.request_overrides: an explicit dict of per-child request
+        # settings merged into the child's API kwargs by the transport's
+        # profile path. Keys are top-level kwargs (e.g. service_tier); an
+        # "extra_body" sub-dict is merged into extra_body. This is how a
+        # direct-endpoint delegation (provider=custom) forwards OpenRouter
+        # routing hints such as extra_body.provider = {"sort": "throughput"}
+        # to its children — the child's CustomProfile does not emit provider
+        # preferences, and the parent-inheritance path is deliberately cleared
+        # when delegation.provider/base_url overrides the parent (see the
+        # provider-preference clearing in _build_child_agent).
+        #
+        # Precedence: explicit delegation.request_overrides MERGES OVER any
+        # runtime-derived overrides (see _merge_request_overrides) — top-level
+        # explicit keys win; extra_body is deep-merged one level so runtime
+        # extra_body keys survive unless the explicit key redefines them.
+        # (explicit_request_overrides is parsed once at the top of this
+        # function and applied to every branch.)
+
         # When delegation.api_key is not set, return None so _build_child_agent
         # falls back to the parent agent's API key via the credential inheritance
         # path (effective_api_key = override_api_key or parent_api_key). This
@@ -4501,23 +4805,67 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         if configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
             api_mode = configured_api_mode
 
+        # A provider configured ALONGSIDE base_url means the user wants that
+        # provider's request personality on an explicit endpoint. This
+        # short-circuit runs before the resolve_runtime_provider() call below,
+        # so without this block the runtime-carried request_overrides
+        # (extra_body / extra_headers, e.g. `thinking: {type: disabled}`) and
+        # max_output_tokens are silently dropped for subagents (#65035).
+        # Best-effort: the explicit endpoint worked before this change even
+        # when the provider can't resolve, so a resolution failure only skips
+        # the overrides — it must not fail the dispatch.
+        request_overrides = None
+        max_output_tokens = None
+        if configured_provider:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                runtime = resolve_runtime_provider(
+                    requested=configured_provider, target_model=configured_model
+                )
+                request_overrides = dict(runtime.get("request_overrides") or {}) or None
+                max_output_tokens = runtime.get("max_output_tokens")
+            except Exception as exc:
+                logger.debug(
+                    "delegation.base_url: runtime resolution for provider '%s' "
+                    "failed; proceeding without request_overrides: %s",
+                    configured_provider,
+                    exc,
+                )
+
+        # Explicit delegation.request_overrides merges OVER the runtime-derived
+        # overrides (explicit wins; extra_body deep-merged one level).
+        request_overrides = _merge_request_overrides(
+            request_overrides, explicit_request_overrides
+        )
+
         return {
             "model": configured_model,
             "provider": provider,
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "request_overrides": request_overrides,
+            "max_output_tokens": max_output_tokens,
         }
 
     if not configured_provider:
-        # No provider override — child inherits everything from parent
+        # No provider override — child inherits everything from parent.
+        # delegation.request_overrides still applies: merge the explicit key
+        # OVER the parent's own request_overrides so the config key works even
+        # in pure-inherit setups (never a silent no-op). None when neither
+        # side has values → _build_child_agent falls back to the parent's
+        # request_overrides unchanged.
         return {
             "model": configured_model,
             "provider": None,
             "base_url": None,
             "api_key": None,
             "api_mode": None,
-            "request_overrides": None,
+            "request_overrides": _merge_request_overrides(
+                getattr(parent_agent, "request_overrides", None),
+                explicit_request_overrides,
+            ),
             "max_output_tokens": None,
         }
 
@@ -4561,7 +4909,13 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
-        "request_overrides": dict(runtime.get("request_overrides") or {}),
+        # Explicit delegation.request_overrides merges OVER the named
+        # provider's runtime overrides (explicit wins; extra_body deep-merged
+        # one level) — same precedence as the direct-base_url branch above.
+        "request_overrides": _merge_request_overrides(
+            runtime.get("request_overrides"), explicit_request_overrides
+        )
+        or {},
         "max_output_tokens": runtime.get("max_output_tokens"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
@@ -4623,20 +4977,45 @@ def _build_top_level_description() -> str:
     top-level text stays static and duplication-free. If you add text
     here, check it is not already stated in a parameter description.
     """
+    try:
+        orchestration_available = _get_max_spawn_depth() >= 2 and _get_orchestrator_enabled()
+    except Exception:
+        orchestration_available = False
+
+    # The child-restrictions rule renders per config: on nesting-enabled
+    # installs the orchestrator clause is load-bearing; on depth-1/disabled
+    # installs (the default) it would describe an unreachable state — the
+    # role param already explains that 'orchestrator' is inert there.
+    # send_message is deliberately not named: it's gateway-internal
+    # vocabulary most sessions never see. The list below is the fail-safe
+    # superset; model_tools session-filters it to the tools the session
+    # actually has, dropping the whole line when none apply.
+    # Delegation capability is depth-derived (no role param): mention
+    # recursion only where it's actually available.
+    if orchestration_available:
+        restrictions_rule = (
+            "- Children cannot call clarify, memory, or cronjob.\n"
+            "- Children can themselves delegate while depth remains "
+            f"(max_spawn_depth={_get_max_spawn_depth()}); the runtime "
+            "derives this from depth automatically.\n"
+        )
+    else:
+        restrictions_rule = (
+            "- Children cannot call delegate_task, clarify, memory, or "
+            "cronjob.\n"
+        )
+
     return (
         "Spawn subagents in isolated contexts; each gets its own conversation, "
         "terminal session, and toolset, and only its final summary returns to "
-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
-        "(limits and nesting rules are in the parameter descriptions).\n\n"
+        "you. Pass every task in `tasks` — one entry spawns one subagent, "
+        "several run in parallel (limit in the tasks description).\n\n"
         "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
-        "(subagent_id + message, redirect without stopping), action='stop' "
-        "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
+        "transcript paths, and the completed result (one consolidated message, "
+        "results in task order) re-enters the conversation on its own. Do NOT "
+        "wait or poll; continue other work. While children run, `action` "
+        "(list/steer/stop) controls them live — steer when a transcript shows "
+        "a child drifting.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4644,7 +5023,7 @@ def _build_top_level_description() -> str:
         "- A single tool call -> call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot ask questions\n"
         "- Durable work that must survive this session -> cronjob or "
-        "terminal(background=True, notify_on_complete=True); /stop, /new, or "
+        "terminal(background=True, notify=True); /stop, /new, or "
         "process exit discards running subagents.\n\n"
         "RULES:\n"
         "- Children know nothing of this conversation: pass everything needed "
@@ -4654,14 +5033,10 @@ def _build_top_level_description() -> str:
         "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
         "For external side effects (uploads, remote writes, publishing), "
         "require a verifiable handle (URL, ID, absolute path) and verify it "
-        "yourself — fetch the URL, stat the file, read back the content — "
-        "before telling the user the operation succeeded.\n"
-        "- Leaf children (the default) cannot call delegate_task, clarify, "
-        "memory, send_message, or cronjob; orchestrators regain only "
-        "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
-        "Results are returned as an array, one entry per task."
+        "yourself before telling the user the operation succeeded.\n"
+        + restrictions_rule +
+        "- Children inherit the parent model unless pinned via "
+        "delegation.provider / delegation.model in config.yaml."
     )
 
 
@@ -4672,47 +5047,31 @@ def _build_tasks_param_description() -> str:
     except Exception:
         max_children = _DEFAULT_MAX_CONCURRENT_CHILDREN
     return (
-        f"Batch mode: tasks to run in parallel (up to {max_children} for this "
-        f"user, set via delegation.max_concurrent_children). Each gets "
-        "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        f"The task(s), up to {max_children} in parallel for this user (set "
+        "via delegation.max_concurrent_children). Each entry spawns one "
+        "subagent with isolated context and terminal session; a single task "
+        "is a one-entry array. Required when spawning."
     )
 
 
 def _build_role_param_description() -> str:
-    """Compose the 'role' parameter description with current spawn-depth limit."""
+    """Legacy helper — the `role` param is no longer advertised.
+
+    Delegation capability is depth-derived (see the role-resolution block in
+    _build_child_agent): a child may itself delegate iff
+    delegation.orchestrator_enabled and its depth < max_spawn_depth. The
+    handler still accepts role for wire compat (old transcripts, kanban
+    dispatcher) but ignores it. Kept because external callers import this
+    symbol; returns the depth story for any such use.
+    """
     try:
         max_depth = _get_max_spawn_depth()
     except Exception:
         max_depth = MAX_DEPTH
-    try:
-        orchestrator_on = _get_orchestrator_enabled()
-    except Exception:
-        orchestrator_on = True
-
-    if max_depth >= 2 and orchestrator_on:
-        nesting_note = (
-            f"Nesting IS enabled for this user (max_spawn_depth={max_depth}): "
-            f"orchestrator children can themselves delegate up to {max_depth - 1} "
-            "more level(s) deep."
-        )
-    elif max_depth >= 2 and not orchestrator_on:
-        nesting_note = (
-            "Nesting is currently disabled "
-            "(delegation.orchestrator_enabled=false); 'orchestrator' is "
-            "silently forced to 'leaf'."
-        )
-    else:
-        nesting_note = (
-            f"Nesting is OFF for this user (max_spawn_depth={max_depth}); "
-            "'orchestrator' is silently forced to 'leaf'. Raise "
-            "delegation.max_spawn_depth in config.yaml to enable."
-        )
-
     return (
-        "Role of the child agent. 'leaf' (default) = focused "
-        "worker, cannot delegate further. 'orchestrator' = can "
-        f"use delegate_task to spawn its own workers. {nesting_note}"
+        "Legacy parameter, ignored: whether a child can delegate is derived "
+        f"from delegation config (max_spawn_depth={max_depth}), not declared "
+        "by the caller."
     )
 
 
@@ -4731,7 +5090,6 @@ def _build_dynamic_schema_overrides() -> dict:
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
-    overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
     return {
         "description": _build_top_level_description(),
@@ -4757,48 +5115,44 @@ DELEGATE_TASK_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "goal": {
-                "type": "string",
-                "description": (
-                    "What the subagent should accomplish. Be specific and "
-                    "self-contained -- the subagent knows nothing about your "
-                    "conversation history."
-                ),
-            },
-            "context": {
-                "type": "string",
-                "description": (
-                    "Background information the subagent needs: file paths, "
-                    "error messages, project structure, constraints. The more "
-                    "specific you are, the better the subagent performs."
-                ),
-            },
+            # NOTE: the handler also accepts the legacy single-goal shape —
+            # top-level `goal` (string), `context` (string), `output_schema`
+            # (object) — wrapped into a one-entry batch at dispatch. Legacy,
+            # unadvertised (old transcripts/callers only); tasks=[...] is the
+            # only advertised shape. Do not re-add these to the schema.
             "tasks": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "goal": {"type": "string", "description": "Task goal"},
+                        "goal": {
+                            "type": "string",
+                            "description": (
+                                "What this subagent should accomplish. Be "
+                                "specific and self-contained — it knows "
+                                "nothing about your conversation history."
+                            ),
+                        },
                         "context": {
                             "type": "string",
-                            "description": "Task-specific context",
-                        },
-                        "role": {
-                            "type": "string",
-                            "enum": ["leaf", "orchestrator"],
-                            "description": "Per-task role override. See top-level 'role' for semantics.",
+                            "description": (
+                                "Background THIS child needs: file paths, "
+                                "error messages, constraints. Each child "
+                                "sees only its own context — repeat shared "
+                                "background in every task that needs it."
+                            ),
                         },
                         "output_schema": {
                             "type": "object",
                             "description": (
-                                "Optional JSON Schema the subagent's final "
-                                "answer must validate against. The child is "
-                                "told the contract up front; the parent "
-                                "validates the final answer and allows one "
-                                "bounded correction retry. The result entry "
-                                "gains schema_valid (and schema_errors on "
-                                "final failure). Keep schemas forgiving: "
-                                "require only fields you will actually read."
+                                "Optional JSON Schema this child's final "
+                                "answer must validate against (told to the "
+                                "child up front; parent validates with one "
+                                "bounded correction retry; result gains "
+                                "schema_valid, plus schema_errors on "
+                                "failure). Keep it forgiving — require only "
+                                "fields you will read."
                             ),
                         },
                     },
@@ -4807,63 +5161,41 @@ DELEGATE_TASK_SCHEMA = {
                 # No maxItems — the runtime limit is configurable via
                 # delegation.max_concurrent_children (default 3) and
                 # enforced with a clear error in delegate_task().
+                # NOTE: the handler also accepts a per-task `role` — legacy,
+                # ignored: delegation capability is depth-derived, not
+                # caller-declared. Unadvertised on purpose; do not re-add.
                 "description": "(rebuilt at get_definitions() time)",
             },
-            "role": {
-                "type": "string",
-                "enum": ["leaf", "orchestrator"],
-                "description": "(rebuilt at get_definitions() time)",
-            },
-            "output_schema": {
-                "type": "object",
-                "description": (
-                    "Optional JSON Schema for the single-goal form — the "
-                    "subagent's final answer must validate against it "
-                    "(same semantics as tasks[].output_schema)."
-                ),
-            },
-            "background": {
-                "type": "boolean",
-                "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
-                ),
-            },
+            # NOTE: the handler also accepts `background` (bool) — DEPRECATED,
+            # ignored: top-level delegations always run in the background.
+            # Deliberately unadvertised (old transcripts/callers only); do not
+            # re-add to the schema.
             "action": {
                 "type": "string",
                 "enum": ["spawn", "list", "steer", "stop"],
                 "description": (
-                    "Default 'spawn' (omit for normal delegation). Live "
-                    "orchestration of running subagents: 'list' shows this "
-                    "conversation's live children (ids, goals, status, "
-                    "transcript paths); 'steer' queues course-correction text "
-                    "into one child (requires subagent_id + message) without "
-                    "stopping it; 'stop' ends one child early (requires "
-                    "subagent_id) — its partial result still returns as a "
-                    "completion message. Control actions return immediately; "
-                    "goal/tasks are ignored when action is not 'spawn'."
+                    "Default 'spawn'. Live control of running children: "
+                    "'list' = ids/goals/status/transcripts; 'steer' = queue "
+                    "course-correction text into one child (subagent_id + "
+                    "message) without stopping it; 'stop' = end one child "
+                    "early (subagent_id; partial result still returns). "
+                    "Control actions return immediately; goal/tasks are "
+                    "ignored unless spawning."
                 ),
             },
             "subagent_id": {
                 "type": "string",
                 "description": (
-                    "Target for action='steer'/'stop'. Ids are returned in the "
-                    "spawn dispatch response (subagent_ids) and by "
-                    "action='list'."
+                    "Target for action='steer'/'stop' (ids from the spawn "
+                    "response or action='list')."
                 ),
             },
             "message": {
                 "type": "string",
                 "description": (
-                    "For action='steer': the course correction. Be directive "
-                    "and specific — the child sees it appended to its next "
-                    "tool result mid-run (e.g. \"Stop exploring X; focus on Y "
-                    "and return early results\")."
+                    "For action='steer': the course correction, appended to "
+                    "the child's next tool result mid-run. Be directive and "
+                    "specific."
                 ),
             },
         },

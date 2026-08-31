@@ -25,11 +25,12 @@ Configuration in config.yaml::
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            reply_in_thread: true      # false = post replies flat to the channel timeline
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_REPLY_IN_THREAD, BUZZ_REPLY_TO_MODE
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -50,7 +51,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import current_secret_scope as _current_secret_scope
 from agent.secret_scope import get_secret as _scoped_get_secret
+from agent.secret_scope import is_multiplex_active as _is_multiplex_active
 
 
 def _get_scoped_secret(name, default=None):
@@ -65,12 +68,96 @@ def _get_scoped_secret(name, default=None):
     profile's own value, so fall back to it. Same pattern as the Slack
     ``SLACK_APP_TOKEN`` read (#59739) and
     ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+
+    The no-scope path has one more rung for the platform requirement gate:
+    ``check_requirements()`` runs at gateway startup BEFORE any per-profile
+    secret scope is installed, and ``get_secret`` without a scope simply
+    reads ``os.environ`` — so a Bitwarden-managed ``BUZZ_PRIVATE_KEY``
+    (only ``BWS_ACCESS_TOKEN`` in ``.env``) was invisible to the check and
+    Buzz was silently skipped (#95216). When no scope is active and the
+    process env has no value, consult a one-shot build of the profile's
+    secret mapping (``build_profile_secret_scope`` resolves external secret
+    sources) so externally managed credentials pass the gate. An ACTIVE
+    scope still shadows this rung entirely — it never runs under
+    multiplexing, so cross-profile isolation is unchanged.
     """
     try:
-        val = _scoped_get_secret(name, default)
+        val = _scoped_get_secret(name, None)
     except _UnscopedSecretError:
         val = os.getenv(name)
+    if val is None and _current_secret_scope() is None:
+        val = _unscoped_profile_secrets().get(name)
     return val if val is not None else default
+
+
+_UNSCOPED_PROFILE_SECRETS: Optional[Dict[str, str]] = None
+
+
+def _unscoped_profile_secrets() -> Dict[str, str]:
+    """One-shot build of the active profile's secret mapping.
+
+    Cached for the process: the build shells out to external secret
+    resolvers (Bitwarden via ``BWS_ACCESS_TOKEN``), and the requirement
+    gate / validate / is_connected probes all want the same snapshot. Any
+    failure degrades to an empty mapping — callers then simply report the
+    platform as not configured, which is the pre-fix behavior. The cache
+    is startup-gate-only: it pins whatever ``get_hermes_home()`` resolved
+    on first build, so it must not be reused off the startup path (where
+    a profile scope is always active and shadows it anyway).
+    """
+    global _UNSCOPED_PROFILE_SECRETS
+    if _UNSCOPED_PROFILE_SECRETS is None:
+        try:
+            from agent.secret_scope import build_profile_secret_scope
+            from hermes_constants import get_hermes_home
+
+            _UNSCOPED_PROFILE_SECRETS = dict(
+                build_profile_secret_scope(get_hermes_home())
+            )
+        except Exception:
+            logger.warning(
+                "Buzz requirement probe could not build the profile secret "
+                "scope; Bitwarden-managed credentials will not be visible "
+                "to the startup gate (#95216)",
+                exc_info=True,
+            )
+            _UNSCOPED_PROFILE_SECRETS = {}
+    return _UNSCOPED_PROFILE_SECRETS
+
+
+def _profile_scoped() -> bool:
+    """True when running inside a multiplexed secondary profile's scope.
+
+    Secondary-profile adapters are constructed, connected, and reloaded
+    inside ``_profile_runtime_scope`` (secret scope installed + multiplex
+    active) — the same discriminator as the Discord adapter's
+    ``_profile_scoped_config_load`` (#72348). The DEFAULT profile under
+    multiplexing runs unscoped: ``os.environ`` holds its own bridge output
+    there and keeps its legacy precedence.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        return bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        return False
+
+
+def _scoped_platform_setting(env_name, extra, key):
+    """Raw read of a non-secret Buzz setting, multiplex-profile-correct.
+
+    Inside a secondary profile scope ``os.environ`` holds the DEFAULT
+    profile's YAML-to-env bridge output (#98738), so the profile's
+    ``PlatformConfig.extra`` is authoritative and env is not consulted: a
+    missing key yields ``None`` and callers fail closed to their default
+    instead of silently borrowing the default profile's relay, channels, or
+    allowlist. Everywhere else — single-profile gateways, the default
+    profile under multiplexing — the legacy ``os.getenv`` read is returned
+    unchanged, so env-over-config precedence is preserved.
+    """
+    if _profile_scoped():
+        return (extra or {}).get(key)
+    return os.getenv(env_name)
 
 
 logger = logging.getLogger(__name__)
@@ -245,34 +332,84 @@ def _resolve_cli_path(configured: str = "") -> str:
     return str(fallback) if fallback.is_file() else ""
 
 
-def _resolve_private_key(extra: Optional[dict] = None) -> str:
-    """Resolve the Nostr private key: env first, then a credentials JSON.
-
-    NEVER log the return value.
-    """
-    key = _get_scoped_secret("BUZZ_PRIVATE_KEY", "").strip()
-    if key:
-        return key
-    configured = os.getenv("BUZZ_CREDENTIALS_FILE", "").strip() or (extra or {}).get("credentials_file", "")
+def _credentials_candidates(extra: Optional[dict] = None) -> List[Path]:
+    # Scope-aware read (#98738/#95216): inside a secondary profile scope the
+    # scope is authoritative (a miss falls to the profile's own config extra,
+    # never the default profile's os.environ); unscoped reads keep env
+    # precedence plus the external-secret rung.
+    configured = str(_get_scoped_secret("BUZZ_CREDENTIALS_FILE", "") or "").strip() or str(
+        (extra or {}).get("credentials_file", "") or ""
+    ).strip()
     if configured:
-        candidates = [Path(configured).expanduser()]
-    else:
-        try:
-            candidates = sorted(_DEFAULT_CREDENTIALS_DIR.glob("*credentials*.json"))
-        except OSError:
-            candidates = []
-    for path in candidates:
+        return [Path(configured).expanduser()]
+    if _is_multiplex_active():
+        return []
+    try:
+        return sorted(_DEFAULT_CREDENTIALS_DIR.glob("*credentials*.json"))
+    except OSError:
+        return []
+
+
+def _resolve_credentials_data(extra: Optional[dict] = None) -> dict:
+    """Load the first credential record containing a private key."""
+    for path in _credentials_candidates(extra):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         if not isinstance(data, dict):
             continue
-        for field in ("nsec", "private_key_hex", "private_key"):
-            value = data.get(field)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+        if any(isinstance(data.get(field), str) and data[field].strip() for field in ("nsec", "private_key_hex", "private_key")):
+            return data
+    return {}
+
+
+def _resolve_private_key(extra: Optional[dict] = None) -> str:
+    """Resolve the Nostr private key: scoped secret first, then credentials JSON.
+
+    NEVER log the return value.
+    """
+    key = str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip()
+    if key:
+        return key
+    data = _resolve_credentials_data(extra)
+    for field in ("nsec", "private_key_hex", "private_key"):
+        value = data.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return ""
+
+
+def _resolve_auth_tag(extra: Optional[dict] = None) -> str:
+    """Resolve and validate the optional NIP-OA owner-attestation tag."""
+    configured = str(_get_scoped_secret("BUZZ_AUTH_TAG", "") or "").strip()
+    if configured:
+        raw: Any = configured
+    else:
+        credentials_file = str(_get_scoped_secret("BUZZ_CREDENTIALS_FILE", "") or "").strip() or str(
+            (extra or {}).get("credentials_file", "") or ""
+        ).strip()
+        direct_key = str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip()
+        if direct_key and not credentials_file:
+            return ""
+        data = _resolve_credentials_data(extra)
+        if "auth_tag" not in data:
+            return ""
+        raw = data["auth_tag"]
+
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Buzz auth tag is not valid JSON") from exc
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 4
+        or raw[0] != "auth"
+        or not all(isinstance(part, str) for part in raw)
+    ):
+        raise ValueError("Buzz auth tag must be a four-string auth tag")
+    return json.dumps(raw, separators=(",", ":"))
 
 
 async def _exec_buzz(
@@ -281,6 +418,7 @@ async def _exec_buzz(
     *,
     relay_url: str,
     private_key: str,
+    auth_tag: str = "",
     input_text: Optional[str] = None,
     timeout: float = _CLI_TIMEOUT,
 ) -> Tuple[int, str, str]:
@@ -293,6 +431,9 @@ async def _exec_buzz(
     env = os.environ.copy()
     env["BUZZ_RELAY_URL"] = relay_url
     env["BUZZ_PRIVATE_KEY"] = private_key
+    env.pop("BUZZ_AUTH_TAG", None)
+    if auth_tag:
+        env["BUZZ_AUTH_TAG"] = auth_tag
     proc = await asyncio.create_subprocess_exec(
         cli_path,
         *args,
@@ -361,22 +502,30 @@ class BuzzAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", {}) or {}
         self._extra = extra
 
-        # Connection settings (env vars override config.yaml)
-        self.relay_url = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
+        # Connection settings (env vars override config.yaml; under a
+        # secondary multiplex profile scope the profile's extra wins and
+        # env — the default profile's bridge output — is not consulted)
+        _relay_raw = _scoped_platform_setting("BUZZ_RELAY_URL", extra, "relay_url")
+        self.relay_url = (_relay_raw or extra.get("relay_url", "")).strip()
+        _cli_raw = _scoped_platform_setting("BUZZ_CLI_PATH", extra, "cli_path")
         self.cli_path = _resolve_cli_path(
-            os.getenv("BUZZ_CLI_PATH", "").strip() or str(extra.get("cli_path", "") or "")
+            str(_cli_raw or "").strip() or str(extra.get("cli_path", "") or "")
         )
 
         # Channels to watch: env csv > extra list/csv; empty = all joined channels
-        raw_channels = os.getenv("BUZZ_CHANNELS") or extra.get("channels", [])
+        raw_channels = _scoped_platform_setting("BUZZ_CHANNELS", extra, "channels")
+        if raw_channels is None:
+            raw_channels = extra.get("channels", [])
         if isinstance(raw_channels, str):
             raw_channels = raw_channels.split(",")
         self.channels: List[str] = [c.strip() for c in raw_channels if isinstance(c, str) and c.strip()]
 
-        self.home_channel = (os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")).strip()
+        _home_raw = _scoped_platform_setting("BUZZ_HOME_CHANNEL", extra, "home_channel")
+        self.home_channel = (_home_raw or str(extra.get("home_channel", "") or "")).strip()
 
+        _pi_raw = _scoped_platform_setting("BUZZ_POLL_INTERVAL", extra, "poll_interval")
         try:
-            interval = float(os.getenv("BUZZ_POLL_INTERVAL") or extra.get("poll_interval", _DEFAULT_POLL_INTERVAL))
+            interval = float(_pi_raw or extra.get("poll_interval", _DEFAULT_POLL_INTERVAL))
         except (TypeError, ValueError):
             interval = _DEFAULT_POLL_INTERVAL
         self.poll_interval = max(_MIN_POLL_INTERVAL, interval)
@@ -385,24 +534,44 @@ class BuzzAdapter(BasePlatformAdapter):
         # Defaults to True (respond only when addressed). Set False to make the
         # agent respond to every message in a watched channel. DMs always
         # dispatch regardless. Env (BUZZ_REQUIRE_MENTION) overrides config.yaml.
-        _rm_raw = os.getenv("BUZZ_REQUIRE_MENTION")
+        _rm_raw = _scoped_platform_setting("BUZZ_REQUIRE_MENTION", extra, "require_mention")
         if _rm_raw is None:
             _rm_cfg = extra.get("require_mention", True)
         else:
             _rm_cfg = _rm_raw
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
 
+        # Reply anchoring: "first"/"all" thread the reply onto the parent event
+        # id, "off" posts every reply as a normal top-level channel message.
+        # Mirrors the Discord/Telegram adapters, which already honor this
+        # PlatformConfig field; without it Buzz threaded unconditionally.
+        # Env (BUZZ_REPLY_TO_MODE) overrides config.yaml.
+        _rtm = (os.getenv("BUZZ_REPLY_TO_MODE") or getattr(config, "reply_to_mode", "first")
+                or "first")
+        self._reply_to_mode: str = str(_rtm).strip().lower()
+        # Slack-convention alias: platforms.buzz.extra.reply_in_thread: false
+        # (the key users already know from Slack) opts out of threading the
+        # same way reply_to_mode: off does. Env (BUZZ_REPLY_IN_THREAD)
+        # overrides config.yaml. See #95842 / #75082.
+        _rit_raw = os.getenv("BUZZ_REPLY_IN_THREAD")
+        _rit = extra.get("reply_in_thread") if _rit_raw is None else _rit_raw
+        if _rit is not None and str(_rit).strip().lower() in ("false", "0", "no", "off"):
+            self._reply_to_mode = "off"
+
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
         # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
         # config.yaml.
+        _transport_raw = _scoped_platform_setting("BUZZ_TRANSPORT", extra, "transport")
         _transport = (
-            os.getenv("BUZZ_TRANSPORT") or str(extra.get("transport", "auto") or "auto")
+            _transport_raw or str(extra.get("transport", "auto") or "auto")
         ).strip().lower()
         self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
 
         # Auth: entries may be hex pubkeys or npubs; normalized to hex
-        raw_allowed = os.getenv("BUZZ_ALLOWED_USERS") or extra.get("allowed_users", [])
+        raw_allowed = _scoped_platform_setting("BUZZ_ALLOWED_USERS", extra, "allowed_users")
+        if raw_allowed is None:
+            raw_allowed = extra.get("allowed_users", [])
         if isinstance(raw_allowed, str):
             raw_allowed = raw_allowed.split(",")
         self._allowed_pubkeys: set = {
@@ -415,6 +584,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # never logged).  connect() re-resolves it to fail fast with a clear
         # error when it is missing.
         self._private_key: str = ""
+        self._auth_tag: str = ""
 
         # Identity — filled in by connect() from ``buzz users get``
         self._self_pubkey: str = ""
@@ -436,21 +606,38 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_meta: Dict[str, dict] = {}
         self._user_names: Dict[str, str] = {}
         self._poll_count = 0
+        # inbound event_id -> thread root event id, or None when that message
+        # was itself top-level.  Lets send() mirror the user's own threading
+        # instead of opening a new thread under every reply (see _thread_root).
+        self._thread_roots: "OrderedDict[str, Optional[str]]" = OrderedDict()
 
     @property
     def name(self) -> str:
         return "Buzz"
+
+    @staticmethod
+    def normalize_user_id(user_id: str) -> Optional[str]:
+        """Normalize a Buzz user reference (hex pubkey or npub) to hex.
+
+        Optional hook consumed by ``gateway/authz_mixin`` when matching the
+        profile allowlist carried in ``config.extra.allowed_users`` (#98738):
+        entries may be npubs while inbound ``user_id`` is always the hex
+        pubkey, so a plain string compare would deny listed users.
+        """
+        return _normalize_user_ref(user_id)
 
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
     async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
         if not self._private_key:
             self._private_key = _resolve_private_key(self._extra)
+            self._auth_tag = _resolve_auth_tag(self._extra)
         return await _exec_buzz(
             self.cli_path,
             args,
             relay_url=self.relay_url,
             private_key=self._private_key,
+            auth_tag=self._auth_tag,
             input_text=input_text,
         )
 
@@ -466,7 +653,13 @@ class BuzzAdapter(BasePlatformAdapter):
             logger.error("Buzz: buzz CLI binary not found (set BUZZ_CLI_PATH or put 'buzz' on PATH)")
             self._set_fatal_error("cli_missing", "buzz CLI binary not found", retryable=False)
             return False
-        self._private_key = _resolve_private_key(self._extra)
+        try:
+            self._private_key = _resolve_private_key(self._extra)
+            self._auth_tag = _resolve_auth_tag(self._extra)
+        except ValueError as exc:
+            logger.error("Buzz: invalid owner-auth configuration — %s", exc)
+            self._set_fatal_error("config_invalid", str(exc), retryable=False)
+            return False
         if not self._private_key:
             logger.error("Buzz: no private key (set BUZZ_PRIVATE_KEY or a credentials file)")
             self._set_fatal_error("config_missing", "BUZZ_PRIVATE_KEY must be set", retryable=False)
@@ -565,6 +758,8 @@ class BuzzAdapter(BasePlatformAdapter):
             transport_used,
             "" if transport_used == "websocket" else f", poll interval {self.poll_interval:.1f}s",
         )
+        # Plugin-registered native handlers (ctx.register_platform_handler).
+        self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
@@ -609,8 +804,15 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
-        if reply_target:
+        # Prefer the stable thread anchor from metadata.thread_id (Slack-style),
+        # then metadata.reply_to_message_id (gateway stream consumer /
+        # progress sends), then the explicit reply_to argument.  Without
+        # reply_to_message_id, interim commentary posts flat in the channel.
+        meta = metadata or {}
+        reply_target = self._resolve_reply_anchor(
+            meta.get("thread_id") or meta.get("reply_to_message_id") or reply_to
+        )
+        if reply_target and self._reply_to_mode != "off":
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
@@ -664,6 +866,81 @@ class BuzzAdapter(BasePlatformAdapter):
             return False
         return True
 
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit a previously sent message.
+
+        Implementing this is what lets the gateway stream a reply on Buzz: the
+        stream consumer sends a first partial message and then re-edits that one
+        message as tokens arrive.  Without it the adapter inherits the base
+        stub, which returns ``success=False``, and the whole answer is delivered
+        in one block when the turn finishes.
+
+        ``buzz-cli`` reports a NEW event id for the edit itself, but the edit
+        TARGET stays the original id, and the stream consumer holds a single
+        ``message_id`` across the whole stream.  So this returns the id it was
+        given, not the one the CLI reports; returning the CLI's id would make
+        every edit after the first address a message that was never sent.
+
+        ``finalize`` is a no-op here.  Buzz edits carry no lifecycle state, the
+        same as Telegram, Slack and Discord.
+        """
+        if not message_id:
+            return SendResult(success=False, error="Buzz edit needs a message id")
+        if not content:
+            return SendResult(success=False, error="Empty message")
+        args = ["messages", "edit", "--event", str(message_id), "--content", "-"]
+        code, out, err = await self._run_cli(args, input_text=content)
+        if code != 0:
+            return SendResult(
+                success=False,
+                error=_cli_error_message(err, code),
+                retryable=code == 2,
+            )
+        try:
+            data = json.loads(out or "{}")
+        except ValueError:
+            data = {}
+        edit_event_id = data.get("event_id")
+        if edit_event_id:
+            # The edit is itself an event on the relay and comes back on our own
+            # subscription; mark it seen so the de-dupe does not treat our own
+            # edit as inbound traffic.
+            self._mark_seen(str(chat_id), str(edit_event_id))
+        return SendResult(
+            success=bool(data.get("accepted", True)),
+            message_id=str(message_id),
+            raw_response=data,
+        )
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent message.
+
+        Used by the stream consumer's fresh-final cleanup path, which replaces a
+        long-lived preview with a completed reply rather than editing in place.
+        """
+        if not message_id:
+            return False
+        code, out, _err = await self._run_cli(
+            ["messages", "delete", "--event", str(message_id)]
+        )
+        if code != 0:
+            return False
+        try:
+            data = json.loads(out or "{}")
+        except ValueError:
+            return True
+        event_id = data.get("event_id")
+        if event_id:
+            self._mark_seen(str(chat_id), str(event_id))
+        return bool(data.get("accepted", True))
+
     async def send_image(
         self,
         chat_id: str,
@@ -681,8 +958,11 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            reply_target = self._resolve_reply_anchor(
+                (metadata or {}).get("thread_id") or reply_to
+            )
+            if reply_target and self._reply_to_mode != "off":
+                args += ["--reply-to", str(reply_target)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -770,11 +1050,26 @@ class BuzzAdapter(BasePlatformAdapter):
         message = json.loads(raw)
         if not isinstance(message, list) or len(message) < 2 or message[0] != "AUTH":
             raise ConnectionError("Buzz relay did not send a NIP-42 AUTH challenge")
+        # BUZZ_AUTH_TAG is per-identity NIP-OA owner attestation, so it must
+        # resolve through the profile secret scope (#98738): inside a scoped
+        # multiplex profile a missing tag fails closed to "" instead of
+        # attaching the default profile's tag from os.environ, while
+        # single-profile and unscoped default-profile reads keep the legacy
+        # env behavior. connect() populates ``self._auth_tag`` via
+        # ``_resolve_auth_tag`` (scope-aware read + credentials-file
+        # fallback, #79514); resolve lazily here as well so a re-auth on a
+        # bare adapter stays scope-correct.
+        auth_tag = getattr(self, "_auth_tag", "") or ""
+        if not auth_tag:
+            try:
+                auth_tag = _resolve_auth_tag(getattr(self, "_extra", None))
+            except ValueError:
+                auth_tag = ""
         event = build_auth_event(
             private_key=self._private_key,
             challenge=str(message[1]),
             relay_url=self._websocket_url(),
-            auth_tag_json=os.getenv("BUZZ_AUTH_TAG", ""),
+            auth_tag_json=auth_tag,
         )
         await websocket.send(json.dumps(["AUTH", event], separators=(",", ":")))
         while True:
@@ -1047,6 +1342,14 @@ class BuzzAdapter(BasePlatformAdapter):
         # open with "@Chip" even though no mention is required there, so the
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
+        # NIP-10 thread root for session scoping: replies inside a thread all
+        # share the root as their thread_id, so the gateway groups them into
+        # one thread session (marked "root" tag preferred, legacy fallback).
+        thread_id = self._extract_thread_root(event)
+
+        # Remember where this message sits in the thread graph so our reply
+        # can join the SAME thread rather than nesting a new one under it.
+        self._record_thread_root(event_id, event)
 
         await self._dispatch_message(
             text=dispatch_text,
@@ -1056,6 +1359,7 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            thread_id=thread_id,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
@@ -1210,6 +1514,76 @@ class BuzzAdapter(BasePlatformAdapter):
             state["seen"][event_id] = None
             self._trim_seen(state)
 
+    # ── Thread anchoring ──────────────────────────────────────────────────
+    #
+    # NIP-10 marked ``e`` tags: a reply carries ["e", <root>, "", "root"] plus
+    # ["e", <parent>, "", "reply"]; a message that STARTS a thread carries a
+    # single ["e", <parent>, "", "reply"] and no root marker.
+    #
+    # The gateway hands adapters the triggering message's own id as the reply
+    # anchor.  Anchoring to that id is correct for a top-level message (it
+    # opens the thread the user expects), but inside an existing thread it
+    # nests a fresh sub-thread under every single answer.  Buzz renders that
+    # as an endless ladder of one-message threads.
+    #
+    # Fix: remember each inbound message's thread ROOT.  When the trigger was
+    # already inside a thread, reply against that root so our answer lands in
+    # the same thread the user is typing in.  When it was top-level, keep the
+    # existing behaviour and anchor to the message itself.
+
+    _THREAD_ROOT_CACHE = 512
+
+    @staticmethod
+    def _extract_thread_root(event: dict) -> Optional[str]:
+        """Return the NIP-10 thread root of ``event``, or None if top-level."""
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return None
+        root = None
+        reply = None
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or len(tag) < 2:
+                continue
+            if str(tag[0]) != "e":
+                continue
+            marker = str(tag[3]).lower() if len(tag) > 3 else ""
+            if marker == "root":
+                root = str(tag[1])
+            elif marker == "reply":
+                reply = str(tag[1])
+            elif not marker and reply is None:
+                # Unmarked (deprecated positional) e-tag: treat as the parent.
+                reply = str(tag[1])
+        if root:
+            return root
+        # A lone "reply" e-tag means this message started a thread hanging off
+        # <reply>; that parent IS the thread root for anything that follows.
+        return reply
+
+    def _record_thread_root(self, event_id: str, event: dict) -> None:
+        """Cache the thread root for an inbound message id."""
+        if not event_id:
+            return
+        roots = getattr(self, "_thread_roots", None)
+        if roots is None:
+            roots = self._thread_roots = OrderedDict()
+        roots[event_id] = self._extract_thread_root(event)
+        roots.move_to_end(event_id)
+        while len(roots) > self._THREAD_ROOT_CACHE:
+            roots.popitem(last=False)
+
+    def _resolve_reply_anchor(self, anchor: Optional[str]) -> Optional[str]:
+        """Map a gateway reply anchor onto the right Buzz thread anchor.
+
+        Returns the thread root when the triggering message was already inside
+        a thread (so the reply joins it), otherwise the anchor unchanged (so a
+        reply to a top-level message opens one thread, as before).
+        """
+        if not anchor:
+            return anchor
+        roots = getattr(self, "_thread_roots", None) or {}
+        return roots.get(str(anchor)) or anchor
+
     async def _dispatch_message(
         self,
         text: str,
@@ -1219,6 +1593,7 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        thread_id: Optional[str] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1230,6 +1605,7 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
@@ -1254,17 +1630,62 @@ class BuzzAdapter(BasePlatformAdapter):
 # Plugin registration
 # ---------------------------------------------------------------------------
 
+def _profile_buzz_extra() -> dict:
+    """Read ``buzz.extra`` from the active profile's config.yaml (scoped path).
+
+    Only meaningful inside a secondary profile scope, where the hermes-home
+    override points at that profile's home. Used by ``check_requirements``
+    (which has no PlatformConfig argument) so the multiplex gate consults the
+    profile's own configuration instead of the process env. Best-effort: any
+    failure yields an empty mapping and the caller fails closed.
+    """
+    if not _profile_scoped():
+        return {}
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.config import read_user_config_raw
+
+        cfg = read_user_config_raw(Path(get_hermes_home()) / "config.yaml")
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    buzz = ((cfg.get("gateway") or {}).get("platforms") or {}).get("buzz")
+    if not isinstance(buzz, dict):
+        return {}
+    extra = buzz.get("extra", buzz)
+    return extra if isinstance(extra, dict) else {}
+
+
 def check_requirements() -> bool:
     """Check if Buzz is configured: a relay URL plus a resolvable key."""
-    if not os.getenv("BUZZ_RELAY_URL", "").strip():
+    if _profile_scoped():
+        # Multiplexed secondary profile (#98738): os.environ's BUZZ_* values
+        # are the default profile's bridge output and must not satisfy this
+        # gate for another profile. Consult the profile's own config.yaml
+        # (via the scoped home override) and its secret scope instead; an
+        # unconfigured profile fails closed.
+        extra = _profile_buzz_extra()
+        relay = str(extra.get("relay_url") or "").strip()
+        return bool(relay and _resolve_private_key(extra))
+    # Scope-aware read: the gate runs before per-profile scopes install, and
+    # BUZZ_RELAY_URL can be externally managed just like the key (#95216).
+    if not (_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip():
         return False
     return bool(_resolve_private_key())
 
 
 def validate_config(config) -> bool:
-    """Validate that the platform config has enough info to connect."""
+    """Validate that the platform config has enough information to connect."""
     extra = getattr(config, "extra", {}) or {}
-    relay = os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")
+    # Inside a secondary profile scope, extra is authoritative (#98738);
+    # unscoped, the env read gains the external-secret rung so a managed
+    # relay passes too (#95216).
+    if _profile_scoped():
+        relay = _scoped_platform_setting("BUZZ_RELAY_URL", extra, "relay_url")
+        relay = relay if relay is not None else extra.get("relay_url", "")
+    else:
+        relay = _get_scoped_secret("BUZZ_RELAY_URL", "") or extra.get("relay_url", "")
     return bool(relay and _resolve_private_key(extra))
 
 
@@ -1289,6 +1710,12 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     extra = buzz_cfg.get("extra", buzz_cfg) or {}
     if not isinstance(extra, dict):
         return None
+    # Under multiplex, a secondary profile's config loads inside its runtime
+    # scope; its values must NOT be written to the process-global env, where
+    # first-writer-wins would pin them for every other profile (issue #72348
+    # Telegram/Discord mirror, Buzz side of #98738). Its adapter reads the
+    # profile's PlatformConfig.extra directly instead.
+    _skip_env_bridge = _profile_scoped()
     _str_keys = {
         "relay_url": "BUZZ_RELAY_URL",
         "cli_path": "BUZZ_CLI_PATH",
@@ -1297,25 +1724,29 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     }
     for src, env in _str_keys.items():
         val = extra.get(src)
-        if val and not os.getenv(env):
+        if val and not _skip_env_bridge and not os.getenv(env):
             os.environ[env] = str(val)
     interval = extra.get("poll_interval")
-    if interval is not None and not os.getenv("BUZZ_POLL_INTERVAL"):
+    if interval is not None and not _skip_env_bridge and not os.getenv("BUZZ_POLL_INTERVAL"):
         os.environ["BUZZ_POLL_INTERVAL"] = str(interval)
     channels = extra.get("channels")
-    if channels is not None and not os.getenv("BUZZ_CHANNELS"):
+    if channels is not None and not _skip_env_bridge and not os.getenv("BUZZ_CHANNELS"):
         if isinstance(channels, (list, tuple)):
             channels = ",".join(str(c) for c in channels)
         os.environ["BUZZ_CHANNELS"] = str(channels)
     allowed = extra.get("allowed_users")
-    if allowed is not None and not os.getenv("BUZZ_ALLOWED_USERS"):
+    if allowed is not None and not _skip_env_bridge and not os.getenv("BUZZ_ALLOWED_USERS"):
         if isinstance(allowed, (list, tuple)):
             allowed = ",".join(str(a) for a in allowed)
         os.environ["BUZZ_ALLOWED_USERS"] = str(allowed)
-    if "allow_all_users" in extra and not os.getenv("BUZZ_ALLOW_ALL_USERS"):
+    if "allow_all_users" in extra and not _skip_env_bridge and not os.getenv("BUZZ_ALLOW_ALL_USERS"):
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
-    if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
+    if "require_mention" in extra and not _skip_env_bridge and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
+    if "reply_in_thread" in extra and not os.getenv("BUZZ_REPLY_IN_THREAD"):
+        os.environ["BUZZ_REPLY_IN_THREAD"] = str(extra["reply_in_thread"]).lower()
+    if "reply_to_mode" in extra and not os.getenv("BUZZ_REPLY_TO_MODE"):
+        os.environ["BUZZ_REPLY_TO_MODE"] = str(extra["reply_to_mode"]).lower()
     return None
 
 
@@ -1329,6 +1760,12 @@ def _env_enablement() -> Optional[dict]:
     The special ``home_channel`` key is handled by the core hook — it becomes
     a proper ``HomeChannel`` on the ``PlatformConfig``.
     """
+    if _profile_scoped():
+        # Secondary profile scope (#98738): the process env's BUZZ_* values
+        # are the default profile's configuration, not this profile's — env
+        # enablement must not fabricate a Buzz platform for a profile that
+        # did not configure one.
+        return None
     relay = os.getenv("BUZZ_RELAY_URL", "").strip()
     if not relay or not _resolve_private_key():
         return None
@@ -1372,27 +1809,50 @@ async def _standalone_send(
     fail with ``No live adapter for platform 'buzz'``.
     """
     extra = getattr(pconfig, "extra", {}) or {}
-    relay = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
+    _relay_raw = _scoped_platform_setting("BUZZ_RELAY_URL", extra, "relay_url")
+    relay = (_relay_raw or extra.get("relay_url", "")).strip()
     private_key = _resolve_private_key(extra)
+    _cli_raw = _scoped_platform_setting("BUZZ_CLI_PATH", extra, "cli_path")
+    try:
+        auth_tag = _resolve_auth_tag(extra)
+    except ValueError as exc:
+        return {"error": f"Buzz standalone send: {exc}"}
     cli_path = _resolve_cli_path(
-        os.getenv("BUZZ_CLI_PATH", "").strip() or str(extra.get("cli_path", "") or "")
+        str(_cli_raw or "").strip() or str(extra.get("cli_path", "") or "")
     )
     if not relay or not private_key:
         return {"error": "Buzz standalone send: BUZZ_RELAY_URL and BUZZ_PRIVATE_KEY must be configured"}
     if not cli_path:
         return {"error": "Buzz standalone send: buzz CLI binary not found"}
-    target = (chat_id or "").strip() or (os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")).strip()
+    _home_raw = _scoped_platform_setting("BUZZ_HOME_CHANNEL", extra, "home_channel")
+    target = (chat_id or "").strip() or (_home_raw or str(extra.get("home_channel", "") or "")).strip()
     if not target:
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
-    if thread_id:
+    # Same reply_to_mode / reply_in_thread gate as the live adapter, so
+    # out-of-process cron delivery (deliver=buzz) doesn't thread when the
+    # operator asked for flat channel replies.
+    _rtm = (os.getenv("BUZZ_REPLY_TO_MODE")
+            or getattr(pconfig, "reply_to_mode", "first") or "first")
+    _rtm = str(_rtm).strip().lower()
+    _rit = os.getenv("BUZZ_REPLY_IN_THREAD")
+    if _rit is None:
+        _rit = extra.get("reply_in_thread")
+    if _rit is not None and str(_rit).strip().lower() in ("false", "0", "no", "off"):
+        _rtm = "off"
+    if thread_id and _rtm != "off":
         args += ["--reply-to", str(thread_id)]
     for path in media_files or []:
         args += ["--file", str(path)]
     try:
         code, out, err = await _exec_buzz(
-            cli_path, args, relay_url=relay, private_key=private_key, input_text=message
+            cli_path,
+            args,
+            relay_url=relay,
+            private_key=private_key,
+            auth_tag=auth_tag,
+            input_text=message,
         )
     except asyncio.CancelledError:
         raise

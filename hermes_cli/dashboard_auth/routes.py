@@ -41,6 +41,7 @@ from hermes_cli.dashboard_auth.cookies import (
     clear_session_cookies,
     clear_sso_attempt_cookie,
     detect_https,
+    parse_pkce_payload,
     read_pkce_cookie,
     read_session_cookies,
     set_pkce_cookie,
@@ -447,9 +448,10 @@ async def auth_callback(
     # ``next`` segment is optional (only present when /auth/login was
     # given a next= query). All keys live in the same flat namespace;
     # ``next`` carries a URL-encoded path so it never contains ``;``.
-    parts = dict(
-        seg.split("=", 1) for seg in pkce_raw.split(";") if "=" in seg
-    )
+    # parse_pkce_payload URL-decodes the wire value (the setter encodes
+    # the whole payload so no raw ``;``/``"``/``\`` reaches the wire)
+    # before the ``;`` split.
+    parts = parse_pkce_payload(pkce_raw)
     provider_name = parts.get("provider", "")
     expected_state = parts.get("state", "")
     verifier = parts.get("verifier", "")
@@ -577,7 +579,7 @@ async def auth_callback(
         # Clear the PKCE cookie (its job is done) but set NO session cookies:
         # the desktop is not a browser session, it redeems the code for a
         # bearer token it stores itself.
-        clear_pkce_cookie(resp, prefix=_prefix(request))
+        clear_pkce_cookie(resp, use_https=detect_https(request), prefix=_prefix(request))
         clear_sso_attempt_cookie(resp, prefix=_prefix(request))
         return resp
 
@@ -598,7 +600,7 @@ async def auth_callback(
         prefix=_prefix(request),
         provider=session.provider,
     )
-    clear_pkce_cookie(resp, prefix=_prefix(request))
+    clear_pkce_cookie(resp, use_https=detect_https(request), prefix=_prefix(request))
     # Clear the one-shot auto-SSO loop-guard marker now that login succeeded,
     # so it never lingers to suppress a future silent attempt after logout.
     clear_sso_attempt_cookie(resp, prefix=_prefix(request))
@@ -760,9 +762,7 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
     cookie_provider = ""
     pkce_raw = read_pkce_cookie(request)
     if pkce_raw:
-        pkce_parts = dict(
-            seg.split("=", 1) for seg in pkce_raw.split(";") if "=" in seg
-        )
+        pkce_parts = parse_pkce_payload(pkce_raw)
         broker_state = pkce_parts.get("broker", "")
         cookie_provider = pkce_parts.get("provider", "")
     if broker_state and cookie_provider != body.provider:
@@ -854,7 +854,7 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
         # this window" page. No session cookies: the desktop is not a
         # browser session (mirrors the /auth/callback native branch).
         resp = JSONResponse({"ok": True, "next": loopback})
-        clear_pkce_cookie(resp, prefix=_prefix(request))
+        clear_pkce_cookie(resp, use_https=detect_https(request), prefix=_prefix(request))
         return resp
 
     expires_in = max(60, session.expires_at - int(time.time()))
@@ -899,7 +899,7 @@ async def auth_logout(request: Request):
     prefix = _prefix(request)
     resp = RedirectResponse(url=f"{prefix}/login", status_code=302)
     clear_session_cookies(resp, prefix=prefix)
-    clear_pkce_cookie(resp, prefix=prefix)
+    clear_pkce_cookie(resp, use_https=detect_https(request), prefix=prefix)
     return resp
 
 
