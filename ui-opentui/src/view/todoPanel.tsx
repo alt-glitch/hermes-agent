@@ -8,8 +8,8 @@
  *
  * Behaviour (locked design):
  *  - Header: counts only — "10 tasks · 1 done, 1 in progress, 8 open".
- *  - Rows (A1): in_progress first, then pending, capped at MAX_ROWS; completed
- *    and cancelled collapse into the header count + an overflow tail.
+ *  - Rows: active items in parent-before-child DFS order, capped at MAX_ROWS;
+ *    completed and cancelled collapse into the header count + overflow tail.
  *  - Overflow: "… +4 pending, 2 completed".
  *  - Auto-hide when there is no ACTIVE work (no pending/in_progress) — and the
  *    store auto-clears the snapshot once a session resets — so a finished plan
@@ -19,7 +19,7 @@
  */
 import { createMemo, For, Show } from 'solid-js'
 
-import type { TodoItem, TodoSnapshot } from '../logic/store.ts'
+import { todoTree, type TodoItem, type TodoSnapshot } from '../logic/store.ts'
 import { truncRight } from '../logic/truncate.ts'
 import { useDimensions } from './dimensions.tsx'
 import { useTheme } from './theme.tsx'
@@ -52,12 +52,12 @@ export function headerText(snap: TodoSnapshot): string {
   return `${c.total} task${c.total === 1 ? '' : 's'}${tail}`
 }
 
-/** Rows to show, A1 order: in_progress first, then pending; completed/cancelled
- *  are NOT shown as rows (they collapse to the header + overflow). */
-export function visibleRows(snap: TodoSnapshot): TodoItem[] {
-  const inProg = snap.todos.filter(t => t.status === 'in_progress')
-  const pending = snap.todos.filter(t => t.status === 'pending')
-  return [...inProg, ...pending].slice(0, MAX_ROWS)
+/** Active rows in parent-before-child DFS order. Completed/cancelled items are
+ * counted in the header/overflow but do not consume pinned panel rows. */
+export function visibleRows(snap: TodoSnapshot): Array<readonly [TodoItem, number]> {
+  return todoTree(snap.todos)
+    .filter(([todo]) => todo.status === 'in_progress' || todo.status === 'pending')
+    .slice(0, MAX_ROWS)
 }
 
 /** True when there is active work worth pinning (any pending/in_progress). */
@@ -66,7 +66,7 @@ export function hasActiveWork(snap: TodoSnapshot | undefined): snap is TodoSnaps
 }
 
 /** Overflow tail: "… +N open, M done" for the rows/states not shown above. */
-function overflowText(snap: TodoSnapshot, shownActive: number): string {
+export function overflowText(snap: TodoSnapshot, shownActive: number): string {
   const c = snap.counts
   const activeTotal = c.pending + c.in_progress
   const hiddenActive = Math.max(0, activeTotal - shownActive)
@@ -108,21 +108,25 @@ export function TodoPanel(props: { snapshot: TodoSnapshot | undefined }) {
             <text selectable={false}>
               <span style={{ fg: theme().color.label }}>{truncRight(headerText(snap()), budget())}</span>
             </text>
-            {/* active rows: in_progress (bold/accent) first, then pending */}
+            {/* active rows in DFS order, with nesting capped at four levels */}
             <For each={rows()}>
-              {item => (
-                <text selectable={false}>
-                  <span style={{ fg: colorFor(item.status) }}>{glyph(item.status)} </span>
-                  <span
-                    style={{
-                      fg: item.status === 'in_progress' ? theme().color.text : theme().color.muted,
-                      bold: item.status === 'in_progress'
-                    }}
-                  >
-                    {truncRight(item.content, budget() - 2)}
-                  </span>
-                </text>
-              )}
+              {([item, depth]) => {
+                const indent = ' '.repeat(Math.min(depth, 4) * 2)
+                return (
+                  <text selectable={false}>
+                    <span>{indent}</span>
+                    <span style={{ fg: colorFor(item.status) }}>{glyph(item.status)} </span>
+                    <span
+                      style={{
+                        fg: item.status === 'in_progress' ? theme().color.text : theme().color.muted,
+                        bold: item.status === 'in_progress'
+                      }}
+                    >
+                      {truncRight(item.content, Math.max(1, budget() - indent.length - 2))}
+                    </span>
+                  </text>
+                )
+              }}
             </For>
             {/* overflow tail — the rows/states not shown above */}
             <Show when={overflow()}>

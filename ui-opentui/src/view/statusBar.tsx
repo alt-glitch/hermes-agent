@@ -7,7 +7,7 @@
  *
  * Design rules (this pass):
  *   - Every segment is LABELED and terse (`ctx:`, `cost:`, `up:`, `cmp:`,
- *     `mcp:`; the profile name reads as itself) — self-describing, lowercase,
+ *     `mcp:`, cache hit, latency, and t/s; the profile name reads as itself) — self-describing, lowercase,
  *     no decoration.
  *   - No right-pinning, no flexGrow spacer, no two-line wide mode: segments
  *     flow left with generous ` │ ` separators; the cwd comes LAST and
@@ -84,6 +84,12 @@ export interface StatusSegments {
   /** Full `ctx: ███░░ 42% · 84k` read-out; false → compact `ctx: 42%`. */
   ctxDetail: boolean
   cost: boolean
+  /** Session prompt-cache hit ratio. */
+  cacheHit: boolean
+  /** Rolling API latency. */
+  latency: boolean
+  /** Rolling output tokens/second. */
+  tps: boolean
   /** Voice mode / REC / STT chrome (exact-f7 breakpoint). */
   voice: boolean
   /** Session uptime (`up: 23m`). */
@@ -108,8 +114,11 @@ export function statusSegments(cols: number): StatusSegments {
     voice: w >= 84,
     up: w >= 88,
     compressions: w >= 94,
+    cacheHit: w >= 96,
     sessions: w >= 100,
+    latency: w >= 104,
     profile: w >= 108,
+    tps: w >= 110,
     browser: w >= 112,
     bg: w >= 118,
     mcp: w >= 126
@@ -234,6 +243,10 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   const dims = useDimensions()
   const info = () => props.store.state.info
   const tick = useElapsedTick()
+  const fieldEnabled = (name: string): boolean => {
+    const fields = props.store.state.statusBarFields
+    return fields === null || fields.has(name)
+  }
 
   const ctxColorOf = (pct: number) => {
     const level = ctxLevel(pct)
@@ -299,8 +312,8 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   /** Plain text of the ctx segment (`ctx: ███░░ 42% · 84k` / `ctx: 42%`). */
   const ctxText = createMemo(() => {
     const p = pct()
-    if (p === undefined) return ''
-    if (!segs().ctxDetail) return `ctx: ${p}%`
+    if (p === undefined || (!fieldEnabled('context_detail') && !fieldEnabled('context_pct'))) return ''
+    if (!segs().ctxDetail || !fieldEnabled('context_detail')) return `ctx: ${p}%`
     const used = info().contextUsed
     return `ctx: ${ctxBar(p, barCells())} ${p}%${used !== undefined ? `${DOT_SEP}${fmtTokens(used)}` : ''}`
   })
@@ -311,14 +324,38 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   })
   const upText = createMemo(() => {
     const started = info().startedAt
-    if (!segs().up || !started || !model()) return ''
+    if (!segs().up || !fieldEnabled('duration') || !started || !model()) return ''
     tick() // re-derive once per second while shown
     return `up: ${fmtShortDuration(elapsedSeconds(started))}`
   })
   const cmpCount = () => info().compressions ?? 0
-  const cmpText = createMemo(() => (segs().compressions && cmpCount() > 0 ? `cmp: ${cmpCount()}` : ''))
+  const cmpText = createMemo(() =>
+    segs().compressions && fieldEnabled('compressions') && cmpCount() > 0 ? `cmp: ${cmpCount()}` : ''
+  )
+  const cacheHitText = createMemo(() => {
+    const value = info().cacheHitPct
+    return segs().cacheHit && fieldEnabled('cache_hit') && value !== undefined && Number.isFinite(value)
+      ? `◎ ${value}%`
+      : ''
+  })
+  const latencyText = createMemo(() => {
+    const value = info().avgLatencyS
+    return segs().latency && fieldEnabled('latency') && value !== undefined && Number.isFinite(value)
+      ? `◷ ${value.toFixed(1)}s`
+      : ''
+  })
+  const tpsText = createMemo(() => {
+    const value = info().avgTps
+    return segs().tps && fieldEnabled('tps') && value !== undefined && Number.isFinite(value)
+      ? `↑ ${Math.round(value)} t/s`
+      : ''
+  })
+  const cacheHitColor = () => {
+    const value = info().cacheHitPct ?? 0
+    return value >= 70 ? theme().color.statusGood : value >= 40 ? theme().color.statusWarn : theme().color.muted
+  }
   const voiceText = createMemo(() => {
-    if (!segs().voice) return ''
+    if (!segs().voice || !fieldEnabled('voice')) return ''
     const voice = props.store.state.voice
     if (voice.recording) return '● REC'
     if (voice.processing) return '◉ STT'
@@ -351,7 +388,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   // cleared on background.complete), mirroring Ink's bgTasks count.
   const bgText = createMemo(() => {
     const n = props.store.state.bgTasks.length
-    return segs().bg && n > 0 ? `bg: ${n}` : ''
+    return segs().bg && fieldEnabled('bg_tasks') && n > 0 ? `bg: ${n}` : ''
   })
   const sessionsText = createMemo(() => {
     const count = props.store.state.liveSessionCount
@@ -367,7 +404,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   )
   const agentsText = createMemo(() => {
     const n = activeSubagents().count
-    return segs().agents && n > 0 ? `⛓ ${n}` : ''
+    return segs().agents && fieldEnabled('bg_subagents') && n > 0 ? `⛓ ${n}` : ''
   })
   const spawnHud = createMemo(() =>
     props.subagentsVisible === false
@@ -397,7 +434,9 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   const focusText = createMemo(() => (props.store.state.focusView ? '◉ focus' : ''))
   const batteryText = createMemo(() => {
     const reading = props.store.state.batteryStatus
-    return props.store.state.batteryEnabled && reading?.available ? batteryLabel(reading) : ''
+    return fieldEnabled('battery') && props.store.state.batteryEnabled && reading?.available
+      ? batteryLabel(reading)
+      : ''
   })
   const batteryColor = () => {
     const reading = props.store.state.batteryStatus
@@ -419,6 +458,9 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
       costText(),
       upText(),
       cmpText(),
+      cacheHitText(),
+      latencyText(),
+      tpsText(),
       voiceText(),
       sessionsText(),
       profileText(),
@@ -431,7 +473,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     }
     return len
   })
-  const sessionTitle = () => info().title?.trim() ?? ''
+  const sessionTitle = () => (fieldEnabled('title') ? (info().title?.trim() ?? '') : '')
   const resumeHintText = createMemo(() => {
     const active = activeSubagents()
     // Only the registry-backed count can promise an automatic future resume;
@@ -528,7 +570,10 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
             <span style={{ fg: theme().color.border }}>{SEP}</span>
             <span style={{ fg: theme().color.muted }}>{'ctx: '}</span>
             {/* ctxText() truthy guarantees pct() is defined; `?? 0` only satisfies the type. */}
-            <Show when={segs().ctxDetail} fallback={<span style={{ fg: ctxColorOf(pct() ?? 0) }}>{`${pct()}%`}</span>}>
+            <Show
+              when={segs().ctxDetail && fieldEnabled('context_detail')}
+              fallback={<span style={{ fg: ctxColorOf(pct() ?? 0) }}>{`${pct()}%`}</span>}
+            >
               <span style={{ fg: ctxColorOf(pct() ?? 0) }}>{ctxBar(pct() ?? 0, barCells())}</span>
               <span style={{ fg: theme().color.statusFg }}>{` ${pct()}%`}</span>
               <Show when={info().contextUsed !== undefined}>
@@ -539,6 +584,9 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
           <Seg text={costText()} />
           <Seg text={upText()} />
           <Seg text={cmpText()} fg={cmpColorOf(cmpCount())} />
+          <Seg text={cacheHitText()} fg={cacheHitColor()} />
+          <Seg text={latencyText()} />
+          <Seg text={tpsText()} />
           <Seg text={voiceText()} fg={voiceColor()} />
           <Seg text={sessionsText()} fg={theme().color.accent} />
           {/* statusFg, not accent — persistent chrome spends no warm ink

@@ -9,7 +9,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 import { approvalChoices } from '../logic/approval.ts'
 import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { DEFAULT_THEME } from '../logic/theme.ts'
-import { createSessionStore, startupCatalogRetryDelay, type Message } from '../logic/store.ts'
+import { createSessionStore, startupCatalogRetryDelay, todoTree, type Message, type TodoItem } from '../logic/store.ts'
 import type { BillingBlockDecoded } from '../boundary/schema/GatewayEvent.ts'
 
 describe('session store — theming / dedup / hydrate (Phase 1)', () => {
@@ -1729,7 +1729,7 @@ describe('session store — rolling message cap (bounds the Yoga node high-water
 
 describe('session store — todo panel snapshot + draft + /new info reset', () => {
   const todoComplete = (
-    todos: Array<{ id: string; content: string; status: string }>,
+    todos: Array<{ id: string; parent?: string; content: string; status: string }>,
     summary?: Record<string, number>
   ) =>
     ({
@@ -1768,7 +1768,45 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     store.apply(todoComplete([{ id: '0', content: 'keep', status: 'pending' }]))
     expect(store.state.latestTodos?.todos).toHaveLength(1)
     store.apply(todoComplete([]))
-    expect(store.state.latestTodos?.todos).toEqual([{ content: 'keep', status: 'pending' }])
+    expect(store.state.latestTodos?.todos).toEqual([{ content: 'keep', id: '0', status: 'pending' }])
+  })
+
+  test('captures trimmed id/parent and degrades self-parenting to a root', () => {
+    const store = createSessionStore()
+    store.apply(
+      todoComplete([
+        { id: ' root ', content: ' parent ', status: 'pending' },
+        { id: ' child ', parent: ' root ', content: ' nested ', status: 'in_progress' },
+        { id: ' self ', parent: ' self ', content: ' flat ', status: 'pending' }
+      ])
+    )
+    expect(store.state.latestTodos?.todos).toEqual([
+      { content: 'parent', id: 'root', status: 'pending' },
+      { content: 'nested', id: 'child', parent: 'root', status: 'in_progress' },
+      { content: 'flat', id: 'self', status: 'pending' }
+    ])
+  })
+
+  test('todoTree renders nested children depth-first while dangling and cyclic parents stay depth 0', () => {
+    const todos: TodoItem[] = [
+      { content: 'root', id: 'root', status: 'pending' },
+      { content: 'child a', id: 'a', parent: 'root', status: 'pending' },
+      { content: 'grandchild', id: 'grand', parent: 'a', status: 'pending' },
+      { content: 'child b', id: 'b', parent: 'root', status: 'pending' },
+      { content: 'dangling', id: 'dangling', parent: 'missing', status: 'pending' },
+      { content: 'cycle a', id: 'cycle-a', parent: 'cycle-b', status: 'pending' },
+      { content: 'cycle b', id: 'cycle-b', parent: 'cycle-a', status: 'pending' }
+    ]
+
+    expect(todoTree(todos).map(([todo, depth]) => [todo.id, depth])).toEqual([
+      ['root', 0],
+      ['a', 1],
+      ['grand', 2],
+      ['b', 1],
+      ['dangling', 0],
+      ['cycle-a', 0],
+      ['cycle-b', 0]
+    ])
   })
 
   test('latestTodos clears on clearTranscript (/new starts a fresh plan)', () => {
@@ -1977,7 +2015,15 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     store.applyInfo({
       model: 'm',
       cwd: '/x',
-      usage: { context_used: 84000, context_percent: 42, cost_usd: 0.5, compressions: 2 }
+      usage: {
+        avg_latency_s: 1.25,
+        avg_tps: 42.4,
+        cache_hit_pct: 73,
+        context_used: 84000,
+        context_percent: 42,
+        cost_usd: 0.5,
+        compressions: 2
+      }
     } as never)
     expect(store.state.info.contextUsed).toBe(84000)
     store.clearTranscript()
@@ -1985,8 +2031,21 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     expect(store.state.info.contextPercent).toBeUndefined()
     expect(store.state.info.costUsd).toBeUndefined()
     expect(store.state.info.compressions).toBeUndefined()
+    expect(store.state.info.cacheHitPct).toBeUndefined()
+    expect(store.state.info.avgLatencyS).toBeUndefined()
+    expect(store.state.info.avgTps).toBeUndefined()
     expect(store.state.info.model).toBe('m')
     expect(store.state.info.cwd).toBe('/x')
+  })
+
+  test('resume snapshot reset also clears status telemetry', () => {
+    const store = createSessionStore()
+    store.applyInfo({ usage: { avg_latency_s: 1.25, avg_tps: 42.4, cache_hit_pct: 73 } } as never)
+    expect(store.state.info).toMatchObject({ avgLatencyS: 1.25, avgTps: 42.4, cacheHitPct: 73 })
+    store.commitSnapshot([])
+    expect(store.state.info.avgLatencyS).toBeUndefined()
+    expect(store.state.info.avgTps).toBeUndefined()
+    expect(store.state.info.cacheHitPct).toBeUndefined()
   })
 
   test('pending images survive same-session clear/recovery and reset on detach', () => {
@@ -2008,5 +2067,20 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
 
     store.detachSession()
     expect(store.state.pendingImages).toEqual([])
+  })
+})
+
+describe('session store — btw completion', () => {
+  test('renders the snapshot answer as the same persistent system-line result', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'btw.complete',
+      session_id: 'sid-1',
+      payload: { question: 'why did the plan change?', task_id: 'btw-7', text: 'Because the constraint changed.' }
+    })
+    expect(store.state.messages.at(-1)).toMatchObject({
+      role: 'system',
+      text: '[btw "why did the plan change?"] Because the constraint changed.'
+    })
   })
 })

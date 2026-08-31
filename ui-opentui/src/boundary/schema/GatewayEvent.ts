@@ -343,6 +343,11 @@ const BackgroundComplete = Schema.Struct({
   session_id: opt(Str),
   payload: Schema.Struct({ task_id: Str, text: Str })
 })
+const BtwComplete = Schema.Struct({
+  type: Schema.Literal('btw.complete'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ question: opt(Str), task_id: Str, text: Str })
+})
 const ReviewSummary = Schema.Struct({
   type: Schema.Literal('review.summary'),
   session_id: opt(Str),
@@ -442,6 +447,7 @@ const ChromeTransportEvents = Schema.Union([
   WakeDetected,
   BrowserProgress,
   BackgroundComplete,
+  BtwComplete,
   ReviewSummary,
   SubagentSpawnRequested,
   SubagentStart,

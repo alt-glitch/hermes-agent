@@ -66,7 +66,7 @@ import {
   replaceSession,
   resumeSession
 } from '../boundary/sessionLifecycle.ts'
-import { configSyncBlocked, createConfigSyncTracker } from '../logic/configSync.ts'
+import { configSyncBlocked, createConfigSyncTracker, normalizeStatusBarFields } from '../logic/configSync.ts'
 import { batteryEnabledFromConfig, createBatteryPoller } from '../logic/battery.ts'
 import { destructiveSlashConfirmFromConfig, skipDestructiveConfirm } from '../logic/approval.ts'
 import { compactFromConfig, detailsFromConfig, focusViewFromConfig, timestampsFromConfig } from '../logic/details.ts'
@@ -211,6 +211,14 @@ const PRE_ADMISSION_RETRY_WINDOW_MS = 30_000
 const QUIT_WINDOW_MS = 3_000
 const PENDING_STEER_LIMIT = 8
 const PENDING_STEER_MAX_CHARS = 4 * 1024 * 1024
+
+function statusBarFieldsFromConfig(config: Readonly<Record<string, unknown>>) {
+  const display = config.display
+  if (typeof display !== 'object' || display === null || Array.isArray(display)) return null
+  const statusBar = 'status_bar' in display ? display.status_bar : undefined
+  if (typeof statusBar !== 'object' || statusBar === null || Array.isArray(statusBar)) return null
+  return normalizeStatusBarFields('fields' in statusBar ? statusBar.fields : undefined)
+}
 
 interface PendingPrompt {
   readonly clientMessageId: string
@@ -432,6 +440,7 @@ const postSessionSetup = (
       store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedBusyConfig.config), batteryRevision)
       store.hydrateTimestamps(timestampsFromConfig(decodedBusyConfig.config), timestampsRevision)
       store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedBusyConfig.config))
+      store.setStatusBarFields(statusBarFieldsFromConfig(decodedBusyConfig.config))
       store.configureAgentsNudge(tuiAgentsNudgeConfigValue(decodedBusyConfig.config))
       store.setVoiceMode({
         recordKey: voiceRecordKeyFromConfig(decodedBusyConfig.config),
@@ -1131,6 +1140,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedConfig.config), batteryRevision)
               store.hydrateTimestamps(timestampsFromConfig(decodedConfig.config), timestampsRevision)
               store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedConfig.config))
+              store.setStatusBarFields(statusBarFieldsFromConfig(decodedConfig.config))
               store.setVoiceMode({
                 recordKey: voiceRecordKeyFromConfig(decodedConfig.config),
                 submitMode: voiceSubmitModeFromConfig(decodedConfig.config)
