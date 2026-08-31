@@ -129,6 +129,38 @@ describe('session store — correlated steer notices', () => {
   })
 })
 
+describe('session store — live correction ordering', () => {
+  test('keeps later assistant parts below the user correction that caused them', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'before correction' } })
+
+    store.pushCorrection('stop changing directories')
+    store.apply({ type: 'message.delta', payload: { text: 'after correction' } })
+    store.apply({ type: 'tool.start', payload: { tool_id: 't-after', name: 'read_file' } })
+
+    expect(store.state.messages).toHaveLength(1)
+    expect(store.state.messages[0]?.parts?.map(part => part.type)).toEqual(['text', 'correction', 'text', 'tool'])
+    expect(store.state.messages[0]?.parts?.map(part => ('text' in part ? part.text : part.name))).toEqual([
+      'before correction',
+      'stop changing directories',
+      'after correction',
+      'read_file'
+    ])
+  })
+
+  test('removes only a rejected optimistic correction part', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'still working' } })
+    const clientId = store.pushCorrection('never admitted')
+
+    expect(store.removeClientMessage(clientId)).toBe(true)
+    expect(store.state.messages[0]?.parts?.map(part => part.type)).toEqual(['text'])
+    expect(store.removeClientMessage(clientId)).toBe(false)
+  })
+})
+
 describe('session store — ordered parts (Phase 2b)', () => {
   test('interleaves text → tool → text as ordered parts in one assistant turn', () => {
     const store = createSessionStore()
