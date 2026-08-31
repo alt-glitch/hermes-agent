@@ -42,8 +42,20 @@ interface CloseWatchdog extends StartupWatchdog {
   readonly reason: string
 }
 
+interface HeartbeatAckWatchdog extends StartupWatchdog {
+  readonly id: string
+}
+
 const WS_CONNECTING = 0
 const WS_OPEN = 1
+
+// Browser-compatible WebSocket implementations do not expose acknowledged
+// protocol-level ping/pong frames. The gateway therefore advertises an
+// additive JSON-RPC heartbeat capability in gateway.ready. Only attach-mode
+// sockets that advertise it pay these timers; stdio and older gateways remain
+// unchanged.
+export const WS_HEARTBEAT_INTERVAL_MS = 15_000
+export const WS_HEARTBEAT_DEAD_MS = 45_000
 
 export function resolveGatewayAttachUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
   return env.HERMES_TUI_GATEWAY_URL?.trim() || undefined
@@ -233,6 +245,9 @@ export class RawGatewayClient {
   private processGeneration = 0
   private startupWatchdog: StartupWatchdog | undefined
   private closeWatchdog: CloseWatchdog | undefined
+  private heartbeatInterval: StartupWatchdog | undefined
+  private heartbeatAckWatchdog: HeartbeatAckWatchdog | undefined
+  private heartbeatSeq = 0
   private transportAccepting = false
   private readonly log: Log
   private readonly onEvent: (params: unknown) => void
@@ -266,6 +281,7 @@ export class RawGatewayClient {
     // when the new child arms its own timer.
     this.clearStartupWatchdog()
     this.clearCloseWatchdog()
+    this.clearHeartbeat()
     const generation = ++this.processGeneration
     this.attachUrl = requestedAttachUrl
     if (requestedAttachUrl) {
@@ -439,9 +455,61 @@ export class RawGatewayClient {
     }
   }
 
+  private startAttachedHeartbeat(generation: number, ws: WebSocket): void {
+    this.clearHeartbeat()
+    const handle = setInterval(() => {
+      if (
+        this.ws !== ws ||
+        this.processGeneration !== generation ||
+        ws.readyState !== WS_OPEN ||
+        this.heartbeatInterval?.generation !== generation ||
+        this.heartbeatAckWatchdog
+      ) {
+        return
+      }
+
+      const id = `h${++this.heartbeatSeq}`
+      const ackHandle = setTimeout(() => {
+        if (
+          this.ws !== ws ||
+          this.processGeneration !== generation ||
+          this.heartbeatAckWatchdog?.generation !== generation ||
+          this.heartbeatAckWatchdog.id !== id
+        ) {
+          return
+        }
+        this.finishAttachedGeneration(generation, 'gateway websocket heartbeat acknowledgement timed out')
+      }, WS_HEARTBEAT_DEAD_MS)
+      ackHandle.unref()
+      this.heartbeatAckWatchdog = { generation, id, handle: ackHandle }
+
+      try {
+        ws.send(JSON.stringify({ id, jsonrpc: '2.0', method: 'gateway.ping', params: {} }))
+      } catch {
+        this.finishAttachedGeneration(generation, 'gateway websocket heartbeat send failed')
+      }
+    }, WS_HEARTBEAT_INTERVAL_MS)
+    handle.unref()
+    this.heartbeatInterval = { generation, handle }
+  }
+
+  private clearHeartbeat(generation?: number): void {
+    const interval = this.heartbeatInterval
+    if (interval && (generation === undefined || interval.generation === generation)) {
+      clearInterval(interval.handle)
+      this.heartbeatInterval = undefined
+    }
+    const acknowledgement = this.heartbeatAckWatchdog
+    if (acknowledgement && (generation === undefined || acknowledgement.generation === generation)) {
+      clearTimeout(acknowledgement.handle)
+      this.heartbeatAckWatchdog = undefined
+    }
+  }
+
   private finishAttachedGeneration(generation: number, reason: string): boolean {
     if (this.processGeneration !== generation || !this.attachUrl) return false
     this.clearStartupWatchdog(generation)
+    this.clearHeartbeat(generation)
     this.transportAccepting = false
     const ws = this.ws
     this.ws = null
@@ -460,6 +528,7 @@ export class RawGatewayClient {
   }
 
   private closeSocket(): void {
+    this.clearHeartbeat()
     const ws = this.ws
     this.ws = null
     this.wsConnectPromise = null
@@ -769,6 +838,19 @@ export class RawGatewayClient {
     if (!msg || typeof msg !== 'object') return
     const frame = msg as { id?: unknown; method?: unknown; params?: unknown; result?: unknown; error?: unknown }
 
+    // Heartbeat responses are transport-owned and never enter the user RPC
+    // pending map. Matching the generation and opaque id prevents a stale pong
+    // from clearing a replacement socket's watchdog.
+    if (
+      typeof frame.id === 'string' &&
+      this.heartbeatAckWatchdog?.generation === generation &&
+      this.heartbeatAckWatchdog.id === frame.id
+    ) {
+      clearTimeout(this.heartbeatAckWatchdog.handle)
+      this.heartbeatAckWatchdog = undefined
+      return
+    }
+
     // Response: has an id matching a pending request.
     const pending = typeof frame.id === 'string' ? this.pending.get(frame.id) : undefined
     if (typeof frame.id === 'string' && pending) {
@@ -800,6 +882,16 @@ export class RawGatewayClient {
       if ('type' in frame.params && frame.params.type === 'gateway.ready') {
         this.clearStartupWatchdog(generation)
         this.pushTransportLog('[gateway] ready')
+        const payload = 'payload' in frame.params ? frame.params.payload : undefined
+        if (
+          payload &&
+          typeof payload === 'object' &&
+          'heartbeat' in payload &&
+          payload.heartbeat === true &&
+          this.ws?.readyState === WS_OPEN
+        ) {
+          this.startAttachedHeartbeat(generation, this.ws)
+        }
       }
       this.onEvent(frame.params)
       return

@@ -1,9 +1,18 @@
 import type { KeyEvent } from '@opentui/core'
 import { expect, test, vi } from 'vitest'
 
-import { redrawRenderer } from '../boundary/renderer.ts'
+import { redrawRenderer, shouldUseKittyKeyboard } from '../boundary/renderer.ts'
 import { isRedrawHotkey } from '../logic/hotkeys.ts'
 import { renderProbe } from './lib/render.ts'
+
+test.each([
+  [{ TERM_PROGRAM: 'ghostty' }, false],
+  [{ TERM: 'xterm-ghostty' }, false],
+  [{ TERM: 'xterm-kitty' }, true],
+  [{ TERM_PROGRAM: 'WezTerm' }, true]
+])('selects Kitty keyboard mode from terminal env %j', (env, expected) => {
+  expect(shouldUseKittyKeyboard(env)).toBe(expected)
+})
 
 test('redraw preserves later key bytes from the same stdin chunk and clears selection', async () => {
   const probe = await renderProbe(() => <text>ready</text>)
