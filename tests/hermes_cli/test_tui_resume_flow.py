@@ -478,22 +478,25 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "model": "gpt-test",
         "provider": "openai",
         "toolsets": None,
+        "skills": None,
         "usage_file": "usage.json",
     }
 
 
-def test_termux_fast_cli_launch_version_skips_update_check(monkeypatch, main_mod):
+def test_termux_fast_cli_launch_version_uses_current_update_contract(
+    monkeypatch, main_mod
+):
     captured = []
 
     monkeypatch.setenv("TERMUX_VERSION", "1")
     monkeypatch.delenv("HERMES_TUI", raising=False)
-    monkeypatch.setattr(sys, "argv", ["hermes", "version"])
+    monkeypatch.setattr(sys, "argv", ["hermes", "--version"])
     monkeypatch.setattr(
         main_mod, "_print_version_info", lambda *, check_updates: captured.append(check_updates)
     )
 
     assert main_mod._try_termux_fast_cli_launch() is True
-    assert captured == [False]
+    assert captured == [True]
 
 
 def test_termux_ultrafast_version_runs_before_heavy_startup(

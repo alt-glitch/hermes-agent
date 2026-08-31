@@ -1863,7 +1863,16 @@ class TestOneShotDispatchFencing:
             current_time[0] = t0 + timedelta(
                 seconds=jobs._oneshot_run_claim_ttl_seconds() + 1
             )
-            replacement["job"] = jobs.get_due_jobs()[0]
+            # The due scan now intentionally retires never-dispatched one-shots
+            # after their grace window instead of firing them late. Exercise
+            # replacement through the external-fire CAS, which remains the
+            # supported stale-claim takeover path this fencing test targets.
+            replacement["job"] = jobs.claim_job_for_fire(
+                job["id"],
+                claim_ttl_seconds=int(jobs._oneshot_run_claim_ttl_seconds()),
+                return_job=True,
+            )
+            assert isinstance(replacement["job"], dict)
             if raise_after_reclaim:
                 raise RuntimeError("runner A resumed with a failure")
             return True, "output", "externally visible result", None

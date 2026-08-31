@@ -509,7 +509,9 @@ def test_concurrent_first_turn_keeps_one_lease_through_transfer_and_release(
     from hermes_cli import active_sessions
 
     state_dir = tmp_path / "runtime"
-    monkeypatch.setattr(active_sessions, "_state_dir", lambda: state_dir)
+    monkeypatch.setattr(
+        active_sessions, "_state_dir", lambda registry_home=None: state_dir
+    )
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 2})
     session = {"session_key": "concurrent-first-turn", "source": "desktop"}
     barrier = threading.Barrier(2)
@@ -2239,6 +2241,7 @@ def test_dashboard_new_session_request_emits_on_bound_transport(
                 "type": "dashboard.new_session_requested",
                 "session_id": expected_session_id,
                 "payload": {"reason": expected_reason},
+                **({"seq": 1} if expected_session_id else {}),
             },
         }
     ]
@@ -2280,6 +2283,7 @@ def test_dashboard_new_session_request_uses_trimmed_session_transport(monkeypatc
         "type": "dashboard.new_session_requested",
         "session_id": "sid-multiplexed",
         "payload": {"reason": "idle_exit_hotkey"},
+        "seq": 1,
     }
 
 
