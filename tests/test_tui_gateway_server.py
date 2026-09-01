@@ -514,14 +514,31 @@ def test_concurrent_first_turn_keeps_one_lease_through_transfer_and_release(
     )
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 2})
     session = {"session_key": "concurrent-first-turn", "source": "desktop"}
-    barrier = threading.Barrier(2)
+    peer_entered_mutation = threading.Event()
     claimed = []
     claimed_lock = threading.Lock()
     real_claim = server._claim_active_session_slot
     server._sessions["live-sid"] = session
 
+    class _ObservedMutationLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._entries = 0
+
+        def __enter__(self):
+            self._lock.acquire()
+            self._entries += 1
+            if self._entries == 2:
+                peer_entered_mutation.set()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+
+    session["_mutation_lock"] = _ObservedMutationLock()
+
     def claim_together(*args, **kwargs):
-        barrier.wait(timeout=5)
+        assert peer_entered_mutation.wait(timeout=5)
         result = real_claim(*args, **kwargs)
         if result[0] is not None:
             with claimed_lock:
@@ -542,11 +559,12 @@ def test_concurrent_first_turn_keeps_one_lease_through_transfer_and_release(
             results = [future.result(timeout=5) for future in futures]
 
         assert results == [None, None]
-        assert len(claimed) == 2
+        assert len(claimed) == 1
         stored = session["active_session_lease"]
         snapshot = active_session_registry_snapshot()
         assert [entry["lease_id"] for entry in snapshot] == [stored.lease_id]
-        assert sum(lease.released for lease in claimed) == 1
+        assert claimed == [stored]
+        assert not stored.released
 
         assert server._transfer_active_session_slot(
             "live-sid", session, new_session_id="continued-session"
@@ -565,46 +583,148 @@ def test_concurrent_first_turn_keeps_one_lease_through_transfer_and_release(
         server._cfg_path = None
 
 
-def test_concurrent_first_turn_ignores_limit_after_peer_installs_lease(monkeypatch):
+def test_concurrent_first_turn_shares_refusal_and_retries_new_generation(monkeypatch):
     session = {"session_key": "concurrent-limit", "source": "desktop"}
     server._sessions["live-sid"] = session
     lease = Mock()
-    barrier = threading.Barrier(2)
-    lease_installed = threading.Event()
+    peer_entered_mutation = threading.Event()
     call_lock = threading.Lock()
     call_count = 0
+
+    class _ObservedMutationLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._entries = 0
+
+        def __enter__(self):
+            self._lock.acquire()
+            self._entries += 1
+            if self._entries == 2:
+                peer_entered_mutation.set()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+
+    session["_mutation_lock"] = _ObservedMutationLock()
 
     def coordinated_claim(*_args, **_kwargs):
         nonlocal call_count
         with call_lock:
             call_index = call_count
             call_count += 1
-        barrier.wait(timeout=5)
         if call_index == 0:
-            return lease, None
-        assert lease_installed.wait(timeout=5)
-        return None, "Hermes is at the active session limit (1/1)."
-
-    def ensure_and_signal():
-        result = server._ensure_active_session_slot("live-sid", session)
-        if session.get("active_session_lease") is lease:
-            lease_installed.set()
-        return result
+            assert peer_entered_mutation.wait(timeout=5)
+            return None, "Hermes is at the active session limit (1/1)."
+        return lease, None
 
     monkeypatch.setattr(server, "_claim_active_session_slot", coordinated_claim)
 
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(ensure_and_signal) for _ in range(2)]
+            futures = [
+                pool.submit(server._ensure_active_session_slot, "live-sid", session)
+                for _ in range(2)
+            ]
             results = [future.result(timeout=5) for future in futures]
 
-        assert results == [None, None]
+        assert results == [
+            "Hermes is at the active session limit (1/1).",
+            "Hermes is at the active session limit (1/1).",
+        ]
+        assert call_count == 1
+        assert "active_session_lease" not in session
+
+        assert server._ensure_active_session_slot("live-sid", session) is None
+        assert call_count == 2
         assert session["active_session_lease"] is lease
         server._release_active_session_slot(session)
     finally:
         if server._sessions.get("live-sid") is session:
             server._sessions.pop("live-sid", None)
     lease.release.assert_called_once_with()
+
+
+def test_concurrent_first_turn_never_retains_unregistered_lease(
+    monkeypatch, tmp_path
+):
+    """A stale registry observation cannot replace the durable winner."""
+
+    from hermes_cli import active_sessions
+
+    state_dir = tmp_path / "runtime"
+    monkeypatch.setattr(
+        active_sessions, "_state_dir", lambda registry_home=None: state_dir
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 2})
+    session = {"session_key": "registry-invariant", "source": "desktop"}
+    server._sessions["live-sid"] = session
+
+    real_claim = server._claim_active_session_slot
+    real_snapshot = active_sessions.active_session_registry_snapshot
+    first_claimed = threading.Event()
+    first_snapshotted = threading.Event()
+    peer_finished = threading.Event()
+    claim_lock = threading.Lock()
+    snapshot_lock = threading.Lock()
+    claim_count = 0
+    snapshot_count = 0
+
+    def coordinated_claim(*args, **kwargs):
+        nonlocal claim_count
+        with claim_lock:
+            claim_index = claim_count
+            claim_count += 1
+        if claim_index > 0:
+            assert first_snapshotted.wait(timeout=5)
+        result = real_claim(*args, **kwargs)
+        if claim_index == 0:
+            first_claimed.set()
+        return result
+
+    def stale_first_snapshot(*args, **kwargs):
+        nonlocal snapshot_count
+        captured = real_snapshot(*args, **kwargs)
+        with snapshot_lock:
+            snapshot_index = snapshot_count
+            snapshot_count += 1
+        if snapshot_index == 0:
+            first_snapshotted.set()
+            assert peer_finished.wait(timeout=5)
+        return captured
+
+    def peer_admission():
+        try:
+            return server._ensure_active_session_slot("live-sid", session)
+        finally:
+            peer_finished.set()
+
+    monkeypatch.setattr(server, "_claim_active_session_slot", coordinated_claim)
+    monkeypatch.setattr(
+        active_sessions, "active_session_registry_snapshot", stale_first_snapshot
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                server._ensure_active_session_slot, "live-sid", session
+            )
+            assert first_claimed.wait(timeout=5)
+            peer = pool.submit(peer_admission)
+            assert peer.result(timeout=5) is None
+            assert first.result(timeout=5) is None
+
+        stored = session["active_session_lease"]
+        registered_ids = {
+            entry["lease_id"] for entry in real_snapshot()
+        }
+        assert stored.lease_id in registered_ids
+        assert not stored.released
+        assert claim_count == 1
+    finally:
+        server._release_active_session_slot(session)
+        if server._sessions.get("live-sid") is session:
+            server._sessions.pop("live-sid", None)
 
 
 def test_prompt_submit_losing_lease_claim_to_close_is_rejected(monkeypatch):

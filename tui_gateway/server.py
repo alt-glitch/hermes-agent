@@ -749,52 +749,54 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     the invariant that anything holding a slot is something the user can see.
     """
     # Keep registry I/O outside the per-session mutation lock: claiming may
-    # block on the cross-process active-session file lock. The two locked
-    # checks make the in-memory ownership transition atomic while allowing
-    # unrelated lifecycle work to proceed.
+    # block on the cross-process active-session file lock. Elect one owner for
+    # each no-lease admission generation so same-session peers cannot replace
+    # each other's durable same-writer lease while the lock is released.
+    claim_owner = False
     with _session_mutation_lock(session):
         if not _session_registry_matches(sid, session) or session.get("_finalized"):
             return _SESSION_CLOSED_DURING_ADMISSION
         if session.get("active_session_lease") is not None:
             return None
-        claim_ready = session.get("_active_session_claim_ready")
-        if claim_ready is None:
-            claim_ready = threading.Event()
-            session["_active_session_claim_ready"] = claim_ready
-    lease, limit_message = _claim_active_session_slot(
-        str(session.get("session_key") or ""),
-        live_session_id=sid,
-        surface=_session_source(session),
-        profile_home=session.get("profile_home"),
-    )
-    result = limit_message
-    lease_is_registered = False
-    if limit_message is None and lease is not None:
-        lease_id = getattr(lease, "lease_id", None)
-        if not getattr(lease, "enabled", True) or not isinstance(lease_id, str):
-            # Disabled/legacy lease implementations have no durable registry
-            # identity to fence.  Their successful claim is authoritative at
-            # this boundary (and keeps the claim seam usable by embedders).
-            lease_is_registered = True
-        else:
-            try:
-                from hermes_cli.active_sessions import active_session_registry_snapshot
+        claim_state = session.get("_active_session_claim")
+        if claim_state is None:
+            claim_state = {
+                "event": threading.Event(),
+                "result": _SESSION_OWNERSHIP_UNAVAILABLE,
+            }
+            session["_active_session_claim"] = claim_state
+            claim_owner = True
 
-                lease_is_registered = any(
-                    entry.get("lease_id") == lease_id
-                    for entry in active_session_registry_snapshot(
-                        registry_home=session.get("profile_home")
-                    )
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to verify newly claimed active session lease",
-                    exc_info=True,
-                )
-                result = _SESSION_OWNERSHIP_UNAVAILABLE
+    if not claim_owner:
+        completed = claim_state["event"].wait(timeout=5.0)
+        with _session_mutation_lock(session):
+            if not _session_registry_matches(sid, session) or session.get("_finalized"):
+                return _SESSION_CLOSED_DURING_ADMISSION
+            if session.get("active_session_lease") is not None:
+                return None
+            if not completed:
+                return _SESSION_OWNERSHIP_UNAVAILABLE
+            peer_result = claim_state.get("result")
+            return (
+                peer_result
+                if peer_result is not None
+                else _SESSION_OWNERSHIP_UNAVAILABLE
+            )
 
-    stale_lease = None
-    wait_for_peer = False
+    lease = None
+    limit_message = None
+    claim_error = None
+    try:
+        lease, limit_message = _claim_active_session_slot(
+            str(session.get("session_key") or ""),
+            live_session_id=sid,
+            surface=_session_source(session),
+            profile_home=session.get("profile_home"),
+        )
+    except BaseException as exc:
+        claim_error = exc
+
+    result = limit_message or _SESSION_OWNERSHIP_UNAVAILABLE
     with _session_mutation_lock(session):
         if not _session_registry_matches(sid, session) or session.get("_finalized"):
             # Teardown detached/finalized this exact record while the
@@ -802,48 +804,24 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
             # a concurrent successful claimant: prompt.submit must stop here.
             result = _SESSION_CLOSED_DURING_ADMISSION
         elif session.get("active_session_lease") is not None:
-            # Upstream same-writer reacquisition replaces the registry entry.
-            # If this call owns that replacement, make the in-memory session
-            # retain it too; otherwise keep the peer's registered winner.
-            if limit_message is None and lease_is_registered:
-                stale_lease = session["active_session_lease"]
-                session["active_session_lease"] = lease
-                lease = None
+            # A lifecycle helper installed a lease while the elected claim was
+            # outside the lock. Keep that winner and release ours below.
             result = None
-        elif limit_message is None and lease_is_registered:
+        elif claim_error is None and limit_message is None and lease is not None:
             session["active_session_lease"] = lease
             lease = None  # ownership transferred to the session
             result = None
-        elif limit_message is None and result is None:
-            # Another same-writer claim has already replaced this lease in the
-            # registry but has not yet crossed the session mutation lock.
-            wait_for_peer = True
-        if not wait_for_peer:
-            claim_ready.set()
+        claim_state["result"] = result
+        if session.get("_active_session_claim") is claim_state:
+            session.pop("_active_session_claim", None)
+        claim_state["event"].set()
 
-    # A concurrent winner may have installed its lease after this thread
-    # claimed another slot. Never leave that redundant registry entry behind.
+    # Never leave a lease behind when teardown or another lifecycle path won
+    # while this generation's owner was outside the mutation lock.
     if lease is not None:
-        try:
-            lease.release()
-        except Exception:
-            logger.debug(
-                "Failed to release redundant active session slot", exc_info=True
-            )
-    if stale_lease is not None:
-        try:
-            stale_lease.release()
-        except Exception:
-            logger.debug("Failed to release superseded active session slot", exc_info=True)
-    if wait_for_peer:
-        claim_ready.wait(timeout=5.0)
-        with _session_mutation_lock(session):
-            if not _session_registry_matches(sid, session) or session.get("_finalized"):
-                result = _SESSION_CLOSED_DURING_ADMISSION
-            elif session.get("active_session_lease") is not None:
-                result = None
-            else:
-                result = _SESSION_OWNERSHIP_UNAVAILABLE
+        _release_active_session_lease(lease)
+    if claim_error is not None:
+        raise claim_error
     return result
 
 

@@ -533,3 +533,118 @@ class TestTickBatchAdvance:
         assert advance_calls == [[job["id"] for job in jobs]]
 
         sched._shutdown_parallel_pool()
+
+    def test_collection_failure_cancels_previously_gated_dispatch(
+        self, monkeypatch
+    ):
+        import cron.scheduler as sched
+
+        sched._running_job_ids.clear()
+        sched._running_futures.clear()
+        jobs = [
+            {
+                "id": "job-1",
+                "name": "submitted first",
+                "prompt": "must not run",
+                "schedule": "every 5m",
+                "enabled": True,
+                "next_run_at": "2020-01-01T00:00:00",
+                "deliver": "local",
+            },
+            {
+                "id": "job-2",
+                "name": "already running",
+                "prompt": "deduplicated",
+                "schedule": "every 5m",
+                "enabled": True,
+                "next_run_at": "2020-01-01T00:00:00",
+                "deliver": "local",
+            },
+        ]
+        sched._running_job_ids.add("job-2")
+        worker_started = threading.Event()
+        worker_finished = threading.Event()
+        release_calls = []
+        run_calls = []
+        finished_executions = []
+        real_release = sched.release_running_job
+
+        class _DaemonPool:
+            def submit(self, callback):
+                future = concurrent.futures.Future()
+
+                def run():
+                    worker_started.set()
+                    try:
+                        future.set_result(callback())
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                    finally:
+                        worker_finished.set()
+
+                threading.Thread(target=run, daemon=True).start()
+                return future
+
+        def record_release(job_id):
+            release_calls.append((job_id, threading.current_thread()))
+            real_release(job_id)
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(sched, "sweep_stale_inflight", lambda _jobs: None)
+        monkeypatch.setattr(sched, "_get_parallel_pool", lambda _workers: _DaemonPool())
+        monkeypatch.setattr(
+            sched,
+            "create_execution",
+            lambda job_id, source: {"id": f"exec-{job_id}"},
+        )
+        monkeypatch.setattr(
+            sched,
+            "advance_next_run",
+            lambda job_id: (_ for _ in ()).throw(
+                RuntimeError(f"cannot advance {job_id}")
+            ),
+        )
+        monkeypatch.setattr(
+            sched,
+            "advance_next_runs",
+            lambda _ids: (_ for _ in ()).throw(
+                AssertionError("batch advance must not run after collection fails")
+            ),
+        )
+        monkeypatch.setattr(
+            sched,
+            "run_one_job",
+            lambda job, **_kwargs: run_calls.append(job["id"]) or True,
+        )
+        monkeypatch.setattr(sched, "release_running_job", record_release)
+        monkeypatch.setattr(
+            sched,
+            "_finish_execution_best_effort",
+            lambda execution_id, **kwargs: finished_executions.append(
+                (execution_id, kwargs)
+            ),
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="cannot advance job-2"):
+                sched.tick(verbose=False)
+
+            assert worker_started.wait(timeout=1)
+            assert worker_finished.wait(timeout=1)
+            assert run_calls == []
+            assert "job-1" not in sched._running_job_ids
+            assert "job-2" in sched._running_job_ids
+            assert [job_id for job_id, _thread in release_calls] == ["job-1"]
+            assert release_calls[0][1] is not threading.current_thread()
+            assert finished_executions == [
+                (
+                    "exec-job-1",
+                    {
+                        "success": False,
+                        "error": "Schedule advance failed: cannot advance job-2",
+                    },
+                )
+            ]
+        finally:
+            sched._running_job_ids.clear()
+            sched._running_futures.clear()

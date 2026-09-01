@@ -8494,37 +8494,42 @@ def tick(
         # run_job's per-execution ContextVar/tool-session bindings and explicit
         # subprocess cwd, so they require no process-global serialization.
         _pending_dispatches: list[tuple] = []
-        if due_jobs:
-            pool = _get_parallel_pool(_max_workers)
-            for job in due_jobs:
-                pending = _submit_with_guard(job, pool)
-                if pending is None:
-                    continue
-                _pending_dispatches.append(pending)
+        try:
+            if due_jobs:
+                pool = _get_parallel_pool(_max_workers)
+                for job in due_jobs:
+                    pending = _submit_with_guard(job, pool)
+                    if pending is None:
+                        continue
+                    _pending_dispatches.append(pending)
 
-        if _pending_dispatches:
-            try:
+            if _pending_dispatches:
                 advance_next_runs(
                     [pending[1] for pending in _pending_dispatches]
                 )
-            except BaseException as advance_err:
-                for (
-                    _,
-                    job_id,
+        except BaseException as advance_err:
+            for pending in _pending_dispatches:
+                pending[4].set()
+            for pending in _pending_dispatches:
+                pending[3].set()
+            for (
+                _,
+                _job_id,
+                execution_id,
+                _start_gate,
+                _dispatch_cancelled,
+            ) in _pending_dispatches:
+                # The awakened worker owns release_running_job in its finally.
+                # Releasing here as well could erase a newer claim acquired
+                # after the cancelled worker wins its cleanup race.
+                _finish_execution_best_effort(
                     execution_id,
-                    start_gate,
-                    dispatch_cancelled,
-                ) in _pending_dispatches:
-                    release_running_job(job_id)
-                    dispatch_cancelled.set()
-                    start_gate.set()
-                    _finish_execution_best_effort(
-                        execution_id,
-                        success=False,
-                        error=f"Schedule advance failed: {advance_err}",
-                    )
-                raise
+                    success=False,
+                    error=f"Schedule advance failed: {advance_err}",
+                )
+            raise
 
+        if _pending_dispatches:
             for future, _, _, start_gate, _ in _pending_dispatches:
                 start_gate.set()
                 _all_futures.append(future)
