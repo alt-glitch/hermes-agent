@@ -217,7 +217,12 @@ def _(rid, params: dict) -> dict:
                 ):
                     return _ok(rid, {"sessions": []})
                 try:
-                    tip = db.resolve_resume_session_id(row["id"]) or row["id"]
+                    # A named-session registry lookup must resolve only a real
+                    # compression continuation.  The generic resume resolver
+                    # retains a legacy unmarked-child fallback for historical
+                    # sessions; using it here can redirect the canonical Bot
+                    # Chat to an unrelated normal child.
+                    tip = db.get_compression_tip(row["id"]) or row["id"]
                 except Exception:
                     tip = row["id"]
                 tip_row = (db.get_session(tip) or row) if tip != row["id"] else row
@@ -555,10 +560,18 @@ def _(rid, params: dict) -> dict:
         # here also re-anchors the fast path below so a still-live rotated session
         # is reused (by its new key) instead of rebuilding a duplicate agent on the
         # stale parent. Skipped for lazy watch windows, which intentionally attach
-        # to the exact child branch they were opened on.
+        # to the exact child branch they were opened on. Bot Chat is a named
+        # registry row — stay on a proven compression edge so an unmarked
+        # side chat cannot steal the open (the title-lookup / profiles.list
+        # contract). Other sessions keep the legacy unmarked-child walker.
         if found and not is_truthy_value(params.get("lazy", False)):
             try:
-                tip = db.resolve_resume_session_id(target)
+                from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+                if (found.get("title") or "").strip() == BOT_CHAT_TITLE:
+                    tip = db.get_compression_tip(target) or target
+                else:
+                    tip = db.resolve_resume_session_id(target)
             except Exception:
                 tip = target
             if tip and tip != target:
@@ -693,6 +706,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 lazy=True,
                 todo_state=_todo_state_from_history(history),
+                explicit_cwd=bool(profile_resume_cwd),
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -771,6 +785,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                explicit_cwd=bool(profile_resume_cwd),
             )
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
@@ -868,6 +883,7 @@ def _(rid, params: dict) -> dict:
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
                 todo_state=_todo_state_from_history(history),
+                explicit_cwd=bool(profile_resume_cwd),
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -961,6 +977,10 @@ def _(rid, params: dict) -> dict:
                     session_id=target,
                     session_db=db,
                     platform_override=source,
+                    context_cwd_is_launch_artifact=(
+                        source in _LAUNCH_CWD_NOT_A_WORKSPACE
+                        and not profile_resume_cwd
+                    ),
                     **stored_runtime_overrides,
                 )
             finally:
@@ -1010,6 +1030,7 @@ def _(rid, params: dict) -> dict:
                         cwd=profile_resume_cwd,
                         session_db=db,
                         source=source,
+                        explicit_cwd=bool(profile_resume_cwd),
                     )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
@@ -3325,6 +3346,9 @@ def _(rid, params: dict) -> dict:
                     session_id=new_key,
                     session_db=branch_db,
                     platform_override=source,
+                    context_cwd_is_launch_artifact=(
+                        _context_cwd_is_launch_artifact(session)
+                    ),
                 )
             finally:
                 _clear_session_context(tokens)
@@ -3338,6 +3362,7 @@ def _(rid, params: dict) -> dict:
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
+                explicit_cwd=bool(session.get("explicit_cwd")),
             )
             # Ownership TRANSFER — the branched session's agent holds this
             # handle for its whole life and closes it on teardown. Drop is
@@ -3407,6 +3432,13 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     _interrupt_session_turn(str(params.get("session_id") or ""), session)
+    # Retire the crash-recovery marker on a confirmed local Stop. Waiting for
+    # the run thread's finally leaves a window where a backend exit looks like
+    # a crash and session.resume auto-continues the turn the user just stopped.
+    # Extra key covers compression rotating session_key mid-turn.
+    with session["history_lock"]:
+        active_marker_key = str(session.pop("_active_turn_marker_key", "") or "")
+    _retire_turn_marker(session, active_marker_key)
     return _ok(rid, {"status": "interrupted"})
 
 

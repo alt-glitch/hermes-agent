@@ -274,21 +274,15 @@ class TestSyncMode:
         sched._shutdown_parallel_pool()
 
 
-class TestSequentialPool:
-    """Sequential (workdir) jobs use the persistent cron-seq pool.
+class TestWorkdirParallelPool:
+    """Task-scoped workdir jobs use the normal persistent parallel pool."""
 
-    Verifies the follow-up fix: env-mutating jobs no longer run inline
-    in the ticker thread, so a long workdir job can't starve the
-    schedule the same way the parallel path used to.
-    """
-
-    def test_sequential_job_does_not_block_ticker(self, tmp_path, monkeypatch):
+    def test_workdir_job_does_not_block_ticker(self, tmp_path, monkeypatch):
         """sync=False returns immediately even when a workdir job is slow."""
         import cron.scheduler as sched
 
         sched._parallel_pool = None
         sched._parallel_pool_max_workers = None
-        sched._sequential_pool = None
         sched._running_job_ids.clear()
 
         job = {
@@ -299,7 +293,7 @@ class TestSequentialPool:
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
-            "workdir": str(tmp_path),  # makes it sequential
+            "workdir": str(tmp_path),
         }
 
         barrier = threading.Barrier(2, timeout=5)
@@ -326,13 +320,12 @@ class TestSequentialPool:
         time.sleep(0.1)
         sched._shutdown_parallel_pool()
 
-    def test_sequential_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):
+    def test_workdir_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):
         """A workdir job already in _running_job_ids is skipped on next tick."""
         import cron.scheduler as sched
 
         sched._parallel_pool = None
         sched._parallel_pool_max_workers = None
-        sched._sequential_pool = None
         sched._running_job_ids.clear()
 
         job = {
@@ -378,9 +371,9 @@ class TestSequentialPool:
 
 
 class TestTickDurableDispatch:
-    """Each submitted job is ledgered and advanced before its start gate opens."""
+    """Submitted work cannot start before its ledger and schedule are durable."""
 
-    def test_tick_ledgers_then_advances_each_job_before_run(self, tmp_path, monkeypatch):
+    def test_tick_ledgers_then_batch_advances_before_run(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
         sched._parallel_pool = None
@@ -406,15 +399,20 @@ class TestTickDurableDispatch:
         )
         monkeypatch.setattr(
             sched,
-            "advance_next_run",
-            lambda job_id: events.append(("advance", job_id)),
+            "advance_next_runs",
+            lambda ids: events.append(("advance", tuple(ids))) or len(ids),
         )
         monkeypatch.setattr(
             sched,
-            "advance_next_runs",
-            lambda _ids: (_ for _ in ()).throw(
-                AssertionError("durable dispatch must advance after each submit")
+            "advance_next_run",
+            lambda _job_id: (_ for _ in ()).throw(
+                AssertionError("submitted jobs must use the post-ledger batch")
             ),
+        )
+        monkeypatch.setattr(
+            sched,
+            "claim_job_for_fire",
+            lambda job_id, **_kw: next(j for j in jobs if j["id"] == job_id),
         )
         monkeypatch.setattr(
             sched,
@@ -433,8 +431,64 @@ class TestTickDurableDispatch:
         n = sched.tick(verbose=False)
 
         assert n == 4
-        for job in jobs:
-            job_events = [kind for kind, job_id in events if job_id == job["id"]]
-            assert job_events == ["ledger", "advance", "run"]
+        batch_event = ("advance", tuple(job["id"] for job in jobs))
+        batch_index = events.index(batch_event)
+        assert all(
+            events.index(("ledger", job["id"])) < batch_index
+            for job in jobs
+        )
+        assert all(
+            batch_index < events.index(("run", job["id"]))
+            for job in jobs
+        )
+
+        sched._shutdown_parallel_pool()
+
+
+class TestTickBatchAdvance:
+    """Successfully submitted due jobs advance in one store operation."""
+
+    def test_tick_calls_advance_next_runs_once_with_all_submitted_ids(
+        self, tmp_path, monkeypatch
+    ):
+        import cron.scheduler as sched
+
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+        jobs = [
+            {
+                "id": f"job-{i}",
+                "name": f"Job {i}",
+                "prompt": "test",
+                "schedule": "every 5m",
+                "enabled": True,
+                "next_run_at": "2020-01-01T00:00:00",
+                "deliver": "local",
+            }
+            for i in range(4)
+        ]
+        advance_calls = []
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(
+            sched,
+            "create_execution",
+            lambda job_id, source: {"id": f"exec-{job_id}"},
+        )
+        monkeypatch.setattr(
+            sched,
+            "advance_next_runs",
+            lambda ids: advance_calls.append(list(ids)) or len(ids),
+        )
+        monkeypatch.setattr(
+            sched,
+            "claim_job_for_fire",
+            lambda job_id, **_kw: next(j for j in jobs if j["id"] == job_id),
+        )
+        monkeypatch.setattr(sched, "run_one_job", lambda *_a, **_kw: True)
+
+        assert sched.tick(verbose=False) == 4
+        assert advance_calls == [[job["id"] for job in jobs]]
 
         sched._shutdown_parallel_pool()

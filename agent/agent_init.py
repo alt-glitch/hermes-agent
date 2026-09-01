@@ -1347,8 +1347,8 @@ def init_agent(
             elif base_url_host_matches(effective_base, "portal.qwen.ai"):
                 client_kwargs["default_headers"] = _ra()._qwen_portal_headers()
             elif base_url_host_matches(effective_base, "chatgpt.com"):
-                from agent.auxiliary_client import _codex_cloudflare_headers
-                client_kwargs["default_headers"] = _codex_cloudflare_headers(
+                from agent.codex_headers import codex_cloudflare_headers
+                client_kwargs["default_headers"] = codex_cloudflare_headers(
                     api_key, base_url=effective_base,
                 )
             elif base_url_host_matches(effective_base, "x.ai"):
@@ -2777,6 +2777,34 @@ def init_agent(
         if not agent.quiet_mode:
             _ra().logger.info("Using context engine: %s", _selected_engine.name)
     else:
+        # Native Gemini output reservation (#57275 claim 4): when
+        # model.max_tokens is unset, the native generateContent adapter does
+        # NOT run uncapped — it sends maxOutputTokens=65,535
+        # (GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, see
+        # _effective_gemini_max_output_tokens). The compressor's threshold is
+        # pct×(window − max_tokens); passing None here meant it reserved 0
+        # while the wire reserved 65,535, so on a 128K window the trigger
+        # landed at ~96K against a real safe input budget of ~65K and the
+        # provider 400'd before compaction fired. Mirror the adapter's
+        # default so the reservation matches what is actually sent. The
+        # generic provider-default gap is #63839; this wires only the native
+        # Gemini path, where the default is a documented constant.
+        _compressor_max_tokens = agent.max_tokens
+        if _compressor_max_tokens is None:
+            try:
+                from agent.gemini_native_adapter import (
+                    GEMINI_DEFAULT_MAX_OUTPUT_TOKENS,
+                    is_native_gemini_base_url,
+                )
+                _gemini_provider = str(
+                    getattr(agent, "provider", "") or ""
+                ).strip().lower() in {
+                    "gemini", "google", "google-gemini", "google-ai-studio",
+                }
+                if _gemini_provider or is_native_gemini_base_url(agent.base_url):
+                    _compressor_max_tokens = GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
+            except Exception:
+                pass
         agent.context_compressor = ContextCompressor(
             model=agent.model,
             threshold_percent=compression_threshold,
@@ -2791,7 +2819,7 @@ def init_agent(
             provider=agent.provider,
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
-            max_tokens=agent.max_tokens,
+            max_tokens=_compressor_max_tokens,
             model_thresholds=compression_model_thresholds,
             threshold_tokens_cap=compression_threshold_tokens,
             proactive_prune_tokens=compression_proactive_prune_tokens,
@@ -3039,6 +3067,36 @@ def init_agent(
         _ra().logger.info(
             "Ollama num_ctx: will request %d tokens (model max from /api/show)",
             agent._ollama_num_ctx,
+        )
+    # ── Recalibrate the compressor to the served window (#57275 claim 3) ──
+    # The compressor was constructed ABOVE this block from the probed model
+    # window (GGUF metadata can advertise 256K+), but every request below
+    # runs at num_ctx. A config that sets only model.ollama_num_ctx (without
+    # model.context_length) previously left the compressor targeting the
+    # probed window while the server truncated/rejected at num_ctx — the
+    # compaction trigger could sit several times ABOVE the real served
+    # window and never fire. Clamp the compressor's window to the effective
+    # num_ctx so threshold math operates on the context the server actually
+    # serves. (Overlaps #60103's silent-clamp dead zone; this is the
+    # init-order half.)
+    _cc_window = getattr(agent.context_compressor, "context_length", 0) or 0
+    if (
+        agent._ollama_num_ctx
+        and agent._ollama_num_ctx > 0
+        and _cc_window
+        and agent._ollama_num_ctx < _cc_window
+    ):
+        _ra().logger.info(
+            "Compressor window clamped to Ollama num_ctx: %d -> %d",
+            _cc_window, agent._ollama_num_ctx,
+        )
+        agent.context_compressor.update_model(
+            model=agent.model,
+            context_length=agent._ollama_num_ctx,
+            base_url=agent.base_url,
+            api_key=getattr(agent, "api_key", ""),
+            provider=agent.provider,
+            api_mode=agent.api_mode,
         )
 
     # Codex gpt-5.x autoraise notice: show at most once per profile/config
