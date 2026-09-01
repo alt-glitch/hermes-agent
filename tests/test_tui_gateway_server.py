@@ -8151,13 +8151,83 @@ class _RecordingAgent:
         return {"final_response": "", "messages": []}
 
 
+@pytest.mark.parametrize("lifecycle", ["detach", "replace"])
+def test_run_prompt_submit_revalidates_record_after_blocked_ownership_claim(
+    monkeypatch, tmp_path, lifecycle
+):
+    """Synthesized turns must fence lifecycle changes at final admission."""
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+    dispatch_results = []
+    emitted = []
+    turns = []
+    sid = f"blocked-claim-{lifecycle}"
+    session = _session(
+        session_key=f"blocked-claim-{lifecycle}-key",
+        agent=_RecordingAgent(turns),
+        running=True,
+        inflight_turn={"status": "running"},
+        _active_client_submission_ids=["submission-1"],
+    )
+    replacement = _session(session_key="replacement-key")
+
+    def _blocked_admission(_sid, _session):
+        claim_entered.set()
+        assert release_claim.wait(timeout=5)
+        return None
+
+    monkeypatch.setattr(server, "_ensure_active_session_slot", _blocked_admission)
+    monkeypatch.setattr(
+        server, "_emit", lambda event, *_args, **_kwargs: emitted.append(event)
+    )
+    server._sessions[sid] = session
+    dispatch_thread = threading.Thread(
+        target=lambda: dispatch_results.append(
+            server._run_prompt_submit("rid", sid, session, "synthesized turn")
+        )
+    )
+
+    try:
+        dispatch_thread.start()
+        assert claim_entered.wait(timeout=5)
+        with server._sessions_lock:
+            if lifecycle == "detach":
+                server._sessions.pop(sid, None)
+                session["_sid"] = sid
+            else:
+                server._sessions[sid] = replacement
+        release_claim.set()
+        dispatch_thread.join(timeout=5)
+        run_thread = session.get("_run_thread")
+        if run_thread is not None:
+            run_thread.join(timeout=5)
+    finally:
+        release_claim.set()
+        dispatch_thread.join(timeout=5)
+        current = server._sessions.get(sid)
+        if current is session or current is replacement:
+            server._sessions.pop(sid, None)
+
+    assert not dispatch_thread.is_alive()
+    assert dispatch_results == [False]
+    assert "message.start" not in emitted
+    assert turns == []
+    assert session["running"] is False
+    assert session["_active_client_submission_ids"] == []
+    assert session.get("inflight_turn") is None
+
+
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     monkeypatch, tmp_path
 ):
-    """A close claimed during message.start must prevent the worker from running."""
+    """Close waits for the history start claim, then prevents a ghost worker."""
     _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
     emit_entered = threading.Event()
     release_emit = threading.Event()
+    admission_logged = threading.Event()
+    release_log = threading.Event()
+    close_finished = threading.Event()
     dispatch_results = []
     turns = []
     popped = []
@@ -8173,29 +8243,49 @@ def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
             emit_entered.set()
             assert release_emit.wait(timeout=2.0)
 
+    def _blocking_info(message, *_args, **_kwargs):
+        if str(message).startswith("tui prompt accepted"):
+            admission_logged.set()
+            assert release_log.wait(timeout=2.0)
+
     monkeypatch.setattr(server, "_emit", _blocking_emit)
+    monkeypatch.setattr(server.logger, "info", _blocking_info)
     server._sessions[sid] = session
     dispatch_thread = threading.Thread(
         target=lambda: dispatch_results.append(
             server._run_prompt_submit("rid", sid, session, "turn")
         )
     )
+    close_thread = threading.Thread(
+        target=lambda: (
+            popped.append(server._pop_session_by_id(sid)),
+            close_finished.set(),
+        )
+    )
 
     try:
         dispatch_thread.start()
         assert emit_entered.wait(timeout=1.0)
-        popped.append(server._pop_session_by_id(sid))
-        assert popped == [session]
+        close_thread.start()
+        assert not close_finished.wait(timeout=0.1)
         release_emit.set()
+        assert admission_logged.wait(timeout=1.0)
+        assert close_finished.wait(timeout=1.0)
+        release_log.set()
         dispatch_thread.join(timeout=2.0)
+        close_thread.join(timeout=2.0)
     finally:
         release_emit.set()
+        release_log.set()
         dispatch_thread.join(timeout=2.0)
+        close_thread.join(timeout=2.0)
         run_thread = session.get("_run_thread")
         if run_thread is not None and run_thread.is_alive():
             run_thread.join(timeout=2.0)
         server._sessions.pop(sid, None)
 
+    assert close_finished.is_set()
+    assert popped == [session]
     assert dispatch_results == [False]
     assert session["running"] is False
     assert turns == []

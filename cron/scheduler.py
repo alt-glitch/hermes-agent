@@ -829,9 +829,6 @@ def _is_cron_silence_response(text: str) -> bool:
 # ---------------------------------------------------------------------------
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
-# Workdir jobs retain a persistent single-worker lane so their shared runtime
-# state never overlaps across adjacent ticks while dispatch remains non-blocking.
-_sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _running_job_ids: set = set()
 _running_run_claim_tokens: dict[str, str] = {}
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
@@ -1531,27 +1528,13 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     return _parallel_pool
 
 
-def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
-    """Return (or create) the persistent single-thread workdir pool."""
-    global _sequential_pool
-    if _sequential_pool is None:
-        _sequential_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="cron-seq",
-        )
-    return _sequential_pool
-
-
 def _shutdown_parallel_pool() -> None:
-    """Shut down the persistent parallel and sequential pools."""
-    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
+    """Shut down the persistent parallel pool."""
+    global _parallel_pool, _parallel_pool_max_workers
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
         _parallel_pool_max_workers = None
-    if _sequential_pool is not None:
-        _sequential_pool.shutdown(wait=True, cancel_futures=False)
-        _sequential_pool = None
 
 
 
@@ -8360,16 +8343,6 @@ def tick(
                 verbose=verbose,
             )
 
-        # Fork contract: jobs with a workdir still pass through process-global
-        # terminal/runtime state, so serialize those jobs across ticks without
-        # blocking the ticker. Workdir-less jobs retain the parallel lane.
-        sequential_jobs = [
-            job for job in due_jobs if str(job.get("workdir") or "").strip()
-        ]
-        parallel_jobs = [
-            job for job in due_jobs if not str(job.get("workdir") or "").strip()
-        ]
-
         _results: list = []
         _all_futures: list = []
 
@@ -8517,30 +8490,13 @@ def tick(
                 dispatch_cancelled,
             )
 
-        # Sequential pass for env-mutating (workdir) jobs.
-        # Queued to a persistent single-thread pool so they run one at a time
-        # WITHOUT blocking the ticker thread — a long workdir job no
-        # longer starves the rest of the schedule (same fix as the parallel
-        # pass, just serialized).  The in-flight guard prevents a still-running
-        # job from being re-queued on the next tick.
+        # Every job uses the bounded parallel lane. Workdirs are isolated by
+        # run_job's per-execution ContextVar/tool-session bindings and explicit
+        # subprocess cwd, so they require no process-global serialization.
         _pending_dispatches: list[tuple] = []
-
-        if sequential_jobs:
-            seq_pool = _get_sequential_pool()
-            for job in sequential_jobs:
-                pending = _submit_with_guard(job, seq_pool)
-                if pending is None:
-                    continue
-                _pending_dispatches.append(pending)
-
-        # Parallel pass — persistent pool, non-blocking dispatch.
-        # Jobs that are already running (from a previous tick) are skipped.
-        # mark_job_run() updates next_run_at on completion, so the next tick
-        # after completion finds the job due again naturally.  No catch-up
-        # queue needed.
-        if parallel_jobs:
+        if due_jobs:
             pool = _get_parallel_pool(_max_workers)
-            for job in parallel_jobs:
+            for job in due_jobs:
                 pending = _submit_with_guard(job, pool)
                 if pending is None:
                     continue

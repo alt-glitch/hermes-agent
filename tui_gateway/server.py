@@ -16339,83 +16339,97 @@ def _run_prompt_submit(
         )
         with session["history_lock"]:
             session["running"] = False
+            session["_active_client_submission_ids"] = []
+            _clear_inflight_turn(session)
         _emit("error", sid, {"message": str(ownership_refusal)})
         return False
-    with session["history_lock"]:
-        if session.get("_closing"):
-            session["running"] = False
-            session["_active_client_submission_ids"] = []
-            _clear_inflight_turn(session)
+
+    # Final admission fence: the ownership claim above may block on durable
+    # registry I/O, so its successful return is not proof that ``sid`` still
+    # names this exact record. Serialize lifecycle mutation through the
+    # history-lock start claim/message.start commit. Global order is session
+    # mutation -> session registry -> history; close/replacement uses the same
+    # order, so it cannot detach the record between identity validation and
+    # publishing the accepted turn.
+    with _session_mutation_lock(session):
+        if (
+            not _session_registry_matches(sid, session)
+            or session.get("_finalized")
+        ):
+            with session["history_lock"]:
+                session["running"] = False
+                session["_active_client_submission_ids"] = []
+                _clear_inflight_turn(session)
             return False
-    agent = session.get("agent")
-    if agent is None:
+        agent = session.get("agent")
+        if agent is None:
+            with session["history_lock"]:
+                session["running"] = False
+                _emit_terminal_turn_error(
+                    sid,
+                    session,
+                    "session agent unavailable before turn start",
+                    client_submission_ids=client_submission_ids,
+                    history_lock_owned=True,
+                )
+            return False
         with session["history_lock"]:
-            session["running"] = False
-            _emit_terminal_turn_error(
-                sid,
-                session,
-                "session agent unavailable before turn start",
-                client_submission_ids=client_submission_ids,
-                history_lock_owned=True,
+            # Claim start atomically against session.interrupt. The start event
+            # is written while holding the same lock, so the interrupt response
+            # can never overtake it on the wire; clients flush start events
+            # before resolving a later interrupt response.
+            if (
+                session.get("_closing")
+                or session.get("_turn_cancel_requested")
+                or not session.get("running")
+            ):
+                session["_turn_cancel_requested"] = False
+                session["running"] = False
+                session["_active_client_submission_ids"] = []
+                _clear_inflight_turn(session)
+                return False
+            if (
+                queued_prompt_generation is not None
+                and int(session.get("_queued_prompt_generation", 0))
+                != queued_prompt_generation
+            ):
+                session["running"] = False
+                return False
+            session["_steer_admission_closed"] = False
+            history = list(session["history"])
+            history_version = int(session.get("history_version", 0))
+            if image_paths is None:
+                images = list(session.get("attached_images", []))
+                session["attached_images"] = []
+            else:
+                images = list(image_paths)
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new turn starts — replace it, never append onto it.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
+            if hasattr(agent, "clear_interrupt"):
+                try:
+                    _clear_agent_interrupt_for_turn(session, agent)
+                except Exception:
+                    pass
+            active_ids = list(session.get("_active_client_submission_ids") or [])
+            session["_active_client_submission_ids"] = list(
+                dict.fromkeys([*active_ids, *client_submission_ids])
             )
-        return False
-    with session["history_lock"]:
-        # Claim start atomically against session.interrupt. The start event is
-        # written while holding the same lock, so the interrupt response can
-        # never overtake it on the wire; clients flush start events before
-        # resolving a later interrupt response.
-        if (
-            session.get("_closing")
-            or session.get("_turn_cancel_requested")
-            or not session.get("running")
-        ):
-            session["_turn_cancel_requested"] = False
-            session["running"] = False
-            session["_active_client_submission_ids"] = []
-            _clear_inflight_turn(session)
-            return False
-        if (
-            queued_prompt_generation is not None
-            and int(session.get("_queued_prompt_generation", 0))
-            != queued_prompt_generation
-        ):
-            session["running"] = False
-            return False
-        session["_steer_admission_closed"] = False
-        history = list(session["history"])
-        history_version = int(session.get("history_version", 0))
-        if image_paths is None:
-            images = list(session.get("attached_images", []))
-            session["attached_images"] = []
-        else:
-            images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
-        if hasattr(agent, "clear_interrupt"):
-            try:
-                _clear_agent_interrupt_for_turn(session, agent)
-            except Exception:
-                pass
-        active_ids = list(session.get("_active_client_submission_ids") or [])
-        session["_active_client_submission_ids"] = list(
-            dict.fromkeys([*active_ids, *client_submission_ids])
-        )
-        turn_start_submission_ids = list(
-            session["_active_client_submission_ids"]
-        )
-        if turn_start_submission_ids:
-            _emit(
-                "message.start",
-                sid,
-                {"client_submission_ids": turn_start_submission_ids},
+            turn_start_submission_ids = list(
+                session["_active_client_submission_ids"]
             )
-        else:
-            # Preserve the shared Ink/desktop gateway call shape for legacy
-            # clients and tests; the wire frame is identical to payload=None.
-            _emit("message.start", sid)
+            if turn_start_submission_ids:
+                _emit(
+                    "message.start",
+                    sid,
+                    {"client_submission_ids": turn_start_submission_ids},
+                )
+            else:
+                # Preserve the shared Ink/desktop gateway call shape for legacy
+                # clients and tests; the wire frame is identical to payload=None.
+                _emit("message.start", sid)
 
     # Desktop/TUI observability (#86647): this is the ONE INFO record proving
     # a Desktop/TUI prompt was accepted by THIS process, and it ties together

@@ -277,6 +277,59 @@ class TestSyncMode:
 class TestWorkdirParallelPool:
     """Task-scoped workdir jobs use the normal persistent parallel pool."""
 
+    def test_workdir_jobs_share_bounded_parallel_lane(self, tmp_path, monkeypatch):
+        """Independent task-scoped workdirs can occupy parallel workers."""
+        import cron.scheduler as sched
+
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+        jobs = [
+            {
+                "id": f"workdir-{index}",
+                "name": f"workdir-{index}",
+                "prompt": "test",
+                "schedule": "every 5m",
+                "enabled": True,
+                "next_run_at": "2020-01-01T00:00:00",
+                "deliver": "local",
+                "workdir": str(tmp_path / str(index)),
+            }
+            for index in range(2)
+        ]
+        both_started = threading.Event()
+        release = threading.Event()
+        started = []
+        started_lock = threading.Lock()
+
+        def overlapping_run(job, **_kwargs):
+            with started_lock:
+                started.append(job["id"])
+                if len(started) == 2:
+                    both_started.set()
+            assert release.wait(timeout=5)
+            return True, "out", "resp", None
+
+        monkeypatch.delenv("HERMES_CRON_MAX_PARALLEL", raising=False)
+        monkeypatch.setattr(
+            sched, "load_config", lambda: {"cron": {"max_parallel_jobs": 2}}
+        )
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
+        monkeypatch.setattr(sched, "run_job", overlapping_run)
+        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        try:
+            assert sched.tick(verbose=False, sync=False) == 2
+            assert both_started.wait(timeout=1)
+        finally:
+            release.set()
+            sched._shutdown_parallel_pool()
+
+        assert set(started) == {"workdir-0", "workdir-1"}
+
     def test_workdir_job_does_not_block_ticker(self, tmp_path, monkeypatch):
         """sync=False returns immediately even when a workdir job is slow."""
         import cron.scheduler as sched
@@ -357,19 +410,6 @@ class TestWorkdirParallelPool:
         sched._running_job_ids.discard("guard-seq")
         sched._shutdown_parallel_pool()
 
-    def test_get_sequential_pool_is_persistent(self):
-        """_get_sequential_pool returns the same single-thread pool."""
-        import cron.scheduler as sched
-
-        sched._sequential_pool = None
-        pool1 = sched._get_sequential_pool()
-        pool2 = sched._get_sequential_pool()
-        assert pool1 is pool2
-
-        sched._shutdown_parallel_pool()
-        assert sched._sequential_pool is None
-
-
 class TestTickDurableDispatch:
     """Submitted work cannot start before its ledger and schedule are durable."""
 
@@ -386,6 +426,7 @@ class TestTickDurableDispatch:
              "next_run_at": "2020-01-01T00:00:00", "deliver": "local"}
             for i in range(4)
         ]
+        jobs[0]["workdir"] = str(tmp_path)
 
         events = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
