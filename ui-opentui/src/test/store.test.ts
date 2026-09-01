@@ -651,6 +651,86 @@ describe('session store — ordered parts (Phase 2b)', () => {
   })
 })
 
+describe('session store — idle/auto compaction status (upstream 3a542bbef4d1)', () => {
+  test('kind:compacting latches compacting, keeps the system note, and arms no restore timer', () => {
+    vi.useFakeTimers()
+    try {
+      const store = createSessionStore()
+      expect(store.state.compacting).toBe(false)
+      store.apply({ type: 'status.update', payload: { kind: 'compacting', text: 'Compacting context (idle)…' } })
+      expect(store.state.compacting).toBe(true)
+      expect(store.state.status).toBe('Compacting context (idle)…')
+      const system = store.state.messages.filter(message => message.role === 'system').map(message => message.text)
+      expect(system).toEqual(['Compacting context (idle)…'])
+      // No 4s restore window: the pause lasts as long as the gateway says.
+      vi.advanceTimersByTime(60_000)
+      expect(store.state.compacting).toBe(true)
+      expect(store.state.status).toBe('Compacting context (idle)…')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('the latch survives later status/thinking traffic (the view freezes the verb on it)', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'status.update', payload: { kind: 'compacting', text: 'Compacting context…' } })
+    store.apply({ type: 'thinking.delta', payload: { text: '(≖‿≖) pondering' } })
+    store.apply({ type: 'status.update', payload: { text: 'phase 2/3' } })
+    expect(store.state.compacting).toBe(true)
+  })
+
+  test('kind:compacted clears the latch and resumes normal terminal-status handling', () => {
+    vi.useFakeTimers()
+    try {
+      const store = createSessionStore()
+      store.apply({ type: 'status.update', payload: { kind: 'compacting', text: 'Compacting context…' } })
+      store.apply({ type: 'status.update', payload: { kind: 'compacted', text: '✓ context compacted' } })
+      expect(store.state.compacting).toBe(false)
+      expect(store.state.status).toBe('✓ context compacted')
+      vi.advanceTimersByTime(4_000)
+      expect(store.state.status).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('turn end and every session reset/transition path clears the latch (no cross-session bleed)', () => {
+    const latched = () => {
+      const store = createSessionStore()
+      store.apply({ type: 'status.update', payload: { kind: 'compacting', text: 'Compacting context…' } })
+      expect(store.state.compacting).toBe(true)
+      return store
+    }
+
+    const viaComplete = latched()
+    viaComplete.apply({ type: 'message.complete', payload: { text: 'done' } })
+    expect(viaComplete.state.compacting).toBe(false)
+
+    const viaError = latched()
+    viaError.apply({ type: 'error', payload: { message: 'boom' } })
+    expect(viaError.state.compacting).toBe(false)
+
+    const viaClear = latched()
+    viaClear.clearTranscript()
+    expect(viaClear.state.compacting).toBe(false)
+
+    const viaAdopt = latched()
+    viaAdopt.adoptFreshSession('next-session', {})
+    expect(viaAdopt.state.compacting).toBe(false)
+
+    const viaSnapshot = latched()
+    viaSnapshot.hydrate(() => [])
+    expect(viaSnapshot.state.compacting).toBe(false)
+
+    const viaGateway = latched()
+    viaGateway.apply({ type: 'gateway.exited' })
+    expect(viaGateway.state.compacting).toBe(false)
+    viaGateway.apply({ type: 'status.update', payload: { kind: 'compacting', text: 'Compacting context…' } })
+    viaGateway.apply({ type: 'gateway.ready' })
+    expect(viaGateway.state.compacting).toBe(false)
+  })
+})
+
 describe('session store — blocking prompts (Phase 3)', () => {
   test('approval.request sets an approval prompt; clearPrompt clears it', () => {
     const store = createSessionStore()

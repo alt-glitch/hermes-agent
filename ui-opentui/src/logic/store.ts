@@ -706,6 +706,13 @@ export interface StoreState {
   /** Transient busy indicator (the kaomoji face/verb from `thinking.delta`/`status.update`);
    *  shown above the composer WHILE a turn runs, cleared on `message.complete`. NOT transcript. */
   status: string | undefined
+  /** Context compaction in progress (idle/preflight/auto — `status.update
+   *  kind:'compacting'`, upstream 3a542bbef4d1). Session-scoped latch: keeps the
+   *  StatusLine spinner alive while `info.running` is false and freezes its verb
+   *  on "compacting" for the whole pause; cleared by `kind:'compacted'`, turn
+   *  end, gateway recovery/ready, and every session reset/transition so it can
+   *  never bleed across sessions. Distinct from `compact` (layout density). */
+  compacting: boolean
   /** Most recent background-activity notification (`notification.show`) — the OSC
    *  seam (terminalChrome) watches this to fire a desktop ping; the inline card
    *  lives in `messages`. Undefined until the first notification. */
@@ -1096,6 +1103,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     queuedPrompts: [],
     queueEditIndex: undefined,
     status: undefined,
+    compacting: false,
     // startedAt is set ONCE here (store creation ≈ session start) — the status
     // bar's session-duration segment ticks from it; wire patches never carry it.
     info: { startedAt: Date.now() },
@@ -1785,6 +1793,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     applied.clear()
     // A chrome notice must not survive a transcript reset (new session context).
     clearNoticeState()
+    // Nor may a compaction pause: the latch belongs to the discarded context.
+    setState('compacting', false)
     // A fresh session must not carry over prompts queued against the OLD turn —
     // they'd drain into the new session's first completion (cross-session bleed).
     clearQueue()
@@ -1879,6 +1889,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.pendingNotice = null
         draft.queuedPrompts = []
         draft.queueEditIndex = undefined
+        draft.compacting = false
         draft.info = info
         draft.hint = undefined
         draft.catalog = undefined
@@ -2391,6 +2402,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // Clear any transient status: on a recovery-respawn ready this drops the
         // lingering 'gateway recovering (attempt N)…' line; no-op on first connect.
         setState('status', undefined)
+        // A fresh/recovered gateway process cannot be mid-compaction.
+        setState('compacting', false)
         setSkin(event.payload?.skin)
         break
       case 'skin.changed':
@@ -2568,6 +2581,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         interimTextPartId = undefined
         clearStatusRestoreTimer()
         setState('status', undefined)
+        // A completed turn ends any compaction pause (the gateway compacts
+        // between turns) — mirrors the Ink turnController reset.
+        setState('compacting', false)
         // A terminal error frame can close a turn that never reached
         // message.start (agent-init failure — upstream run_after_agent_ready
         // now emits this frame instead of a bare `error` event). turnInFlight
@@ -2642,6 +2658,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
           lastStatusNote = text
           pushSystem(text)
         }
+        // Idle/auto compaction lifecycle (upstream 3a542bbef4d1 — #97239): every
+        // in-progress line latches `compacting` and deliberately arms NO restore
+        // timer — the pause lasts as long as the gateway says, and the StatusLine
+        // freezes its verb on "compacting" until the terminal edge below.
+        if (kind === 'compacting') {
+          setState('compacting', true)
+          break
+        }
+        // Terminal compaction edge: drop the latch, then resume the normal
+        // typed-status restore handling for the "compacted" line itself.
+        if (kind === 'compacted') setState('compacting', false)
         if (kind === 'goal') {
           setState(
             'status',
@@ -3179,6 +3206,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // "recovering…" wording now comes from the gateway.recovering case,
         // which fires only when a respawn is actually scheduled.
         setState('status', 'gateway exited')
+        // The dead child's compaction pause cannot complete — drop the latch so
+        // the idle spinner doesn't outlive the process that owned it.
+        setState('compacting', false)
         const reason = event.payload?.reason
         const base = 'gateway exited — recovering your session (any in-flight reply was lost)'
         pushSystem(reason ? `${base}: ${reason}` : base)
@@ -3228,6 +3258,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         const preStartFailure = state.info.running === true && !turnInFlight
         setState('info', prev => ({ ...prev, running: false }))
         setState('status', undefined)
+        // A terminal error is a turn end too — never leave the latch armed.
+        setState('compacting', false)
         if (preStartFailure) onTurnComplete?.()
         // A turn can end via error without message.complete — flush any held
         // notice here too, matching Ink recordError.
@@ -3387,6 +3419,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     // not inherit the prior session's plan. The resumed session re-emits its own
     // `todo` snapshot if it has one (mirrors clearTranscript's reset).
     setState('latestTodos', undefined)
+    // …and the compaction latch: a resumed session's pause (if any) re-announces
+    // itself via a fresh `status.update kind:'compacting'`.
+    setState('compacting', false)
     // `usage.active_subagents` belongs to the prior adopted session. The
     // resumed session's next info/complete payload re-establishes it.
     setState(
