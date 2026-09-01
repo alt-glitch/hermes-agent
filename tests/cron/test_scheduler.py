@@ -939,6 +939,9 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         class FakeFuture:
+            def done(self):
+                return True
+
             def result(self):
                 return {"final_response": "ok"}
 
@@ -1005,6 +1008,9 @@ class TestRunJobSessionPersistence:
                 self.interrupted = True
 
         class FakeFuture:
+            def done(self):
+                return True
+
             def result(self):
                 return {"final_response": "ok"}
 
@@ -1596,9 +1602,11 @@ class TestRunJobSkillBacked:
             register_credential_file("credentials/google_token.json")
             return json.dumps({"success": True, "content": "# google-workspace\nUse Google."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, *, task_id=None):
             from tools.credential_files import _get_registered
 
+            assert task_id is not None
+            assert task_id.startswith("cron:cred-env-job:")
             registered = _get_registered()
             assert registered, "credential files must be visible in worker thread"
             assert any("google_token.json" in v for v in registered.values())
@@ -1751,6 +1759,9 @@ class TestRunJobSkillBacked:
                 return {"final_response": "ok"}
 
         class FakeFuture:
+            def done(self):
+                return True
+
             def result(self):
                 return {"final_response": "ok"}
 
@@ -1860,8 +1871,13 @@ class TestOneShotDispatchFencing:
         replacement = {}
 
         def _run_then_resume(
-            job, *, defer_agent_teardown=None, extra_prompt=None
+            job,
+            *,
+            defer_agent_teardown=None,
+            extra_prompt=None,
+            execution_id=None,
         ):
+            assert execution_id
             current_time[0] = t0 + timedelta(
                 seconds=jobs._oneshot_run_claim_ttl_seconds() + 1
             )
