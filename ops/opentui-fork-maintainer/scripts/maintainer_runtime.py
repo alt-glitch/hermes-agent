@@ -2733,6 +2733,65 @@ def run_gate(
     return manifest
 
 
+def _validate_success_cleanup_worktree(
+    repo: Path,
+    *,
+    state_dir: Path,
+    evidence_dir: Path,
+    cwd: Path,
+    recorded_worktree: Path,
+) -> Path:
+    """Prove that success cleanup can only remove this run's worktree.
+
+    Current runs use a ``sync-*`` child of one of the managed worktree roots.
+    Early maintainer runs instead created ``integration`` directly beneath
+    their run evidence directory.  That legacy shape is safe only when the
+    evidence directory is itself one direct child of ``state/runs``; accepting
+    a same-named sibling elsewhere would turn crash recovery into an arbitrary
+    worktree deletion primitive.
+    """
+    resolved_repo = repo.resolve()
+    resolved_state = state_dir.resolve()
+    evidence_root = evidence_dir.resolve()
+    lexical_cwd = Path(os.path.abspath(cwd))
+    resolved_cwd = cwd.resolve()
+    recorded_cwd = recorded_worktree.resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    managed_roots = {
+        MAINTAINER_WORKTREE_ROOT.resolve(),
+        (resolved_state / "worktrees").resolve(),
+    }
+    is_scratch_worktree = resolved_cwd.is_relative_to(
+        temp_root
+    ) and resolved_cwd.name.startswith("opentui-maint-")
+    is_managed_worktree = (
+        resolved_cwd.parent in managed_roots and resolved_cwd.name.startswith("sync-")
+    )
+    runs_root = (resolved_state / "runs").resolve()
+    legacy_worktree = evidence_root / "integration"
+    is_legacy_run_worktree = (
+        evidence_root.parent == runs_root
+        and lexical_cwd == legacy_worktree
+        and resolved_cwd == legacy_worktree
+        and resolved_cwd.parent == evidence_root
+        and resolved_cwd.name == "integration"
+    )
+    if (
+        resolved_cwd != recorded_cwd
+        or lexical_cwd != resolved_cwd
+        or resolved_cwd == resolved_repo
+        or not (
+            is_scratch_worktree
+            or is_managed_worktree
+            or is_legacy_run_worktree
+        )
+    ):
+        raise ControlError("success cleanup path is not the proven maintainer worktree")
+    if _git_status(resolved_cwd, ["symbolic-ref", "-q", "HEAD"]) == 0:
+        raise ControlError("success cleanup refuses a branch-attached worktree")
+    return resolved_cwd
+
+
 def gate_and_ship(
     repo: Path,
     packet_path: Path,
@@ -2747,6 +2806,18 @@ def gate_and_ship(
     branch: str = BRANCH,
 ) -> dict[str, Any]:
     """Run every gate and immediately publish by remote CAS in one invocation."""
+    evidence_root = Path(os.path.abspath(manifest_path.parent))
+    # Refuse a path that finalization cannot safely remove before doing any
+    # expensive work or touching the remote.  Publication and cleanup are one
+    # transaction; an invalid eventual cleanup path must never wedge it after
+    # the irreversible push boundary.
+    _validate_success_cleanup_worktree(
+        repo,
+        state_dir=state_dir,
+        evidence_dir=evidence_root,
+        cwd=cwd,
+        recorded_worktree=cwd,
+    )
     run_binding = _derive_run_binding(state_dir, manifest_path.parent, token)
     if run_binding["captured_base"] != base_sha:
         raise ControlError("gate base does not match captured fork snapshot")
@@ -2866,27 +2937,13 @@ def finalize_success(
         _atomic_json(_journal_path(state_dir), journal)
     if journal["phase"] != "finalizing":
         raise ControlError("publication journal is not finalizable")
-    recorded_cwd = Path(journal["worktree"]).resolve()
-    resolved_cwd = cwd.resolve()
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    managed_roots = {
-        MAINTAINER_WORKTREE_ROOT.resolve(),
-        (state_dir / "worktrees").resolve(),
-    }
-    is_scratch_worktree = resolved_cwd.is_relative_to(
-        temp_root
-    ) and resolved_cwd.name.startswith("opentui-maint-")
-    is_managed_worktree = (
-        resolved_cwd.parent in managed_roots and resolved_cwd.name.startswith("sync-")
+    resolved_cwd = _validate_success_cleanup_worktree(
+        repo,
+        state_dir=state_dir,
+        evidence_dir=evidence_root,
+        cwd=cwd,
+        recorded_worktree=Path(journal["worktree"]),
     )
-    if (
-        resolved_cwd != recorded_cwd
-        or resolved_cwd == repo.resolve()
-        or not (is_scratch_worktree or is_managed_worktree)
-    ):
-        raise ControlError("success cleanup path is not the proven maintainer worktree")
-    if _git_status(resolved_cwd, ["symbolic-ref", "-q", "HEAD"]) == 0:
-        raise ControlError("success cleanup refuses a branch-attached worktree")
 
     claimed = evidence_root / "request.claimed.json"
     consumed = evidence_root / "request.consumed.json"

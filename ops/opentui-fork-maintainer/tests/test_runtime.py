@@ -27,7 +27,7 @@ def git(repo: Path, *args: str) -> str:
 
 
 def make_repo(
-    tmp_path: Path, *, worktree_name: str = "gate-worktree"
+    tmp_path: Path, *, worktree_name: str = "opentui-maint-gate-worktree"
 ) -> tuple[Path, Path, str, str, Path]:
     remote = tmp_path / "remote.git"
     repo = tmp_path / "repo"
@@ -1667,13 +1667,45 @@ def test_finalize_success_consumes_request_and_removes_proven_worktree(
     )
 
 
-def test_finalize_success_rejects_arbitrary_detached_worktree(
+def test_gate_and_ship_rejects_arbitrary_cleanup_path_before_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
     state = tmp_path / "state"
+    evidence = state / "runs" / "test-run"
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="state/runs/test-run/integration-sibling"
+    )
     write_live_lease(state)
-    evidence = tmp_path / "evidence"
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    with pytest.raises(runtime.ControlError, match="proven maintainer worktree"):
+        runtime.gate_and_ship(
+            repo,
+            packet,
+            manifest_path,
+            state_dir=state,
+            cwd=gate_worktree,
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+        )
+    assert remote_sha(repo) == base
+    assert not (state / "publish-journal.json").exists()
+    assert gate_worktree.exists()
+
+
+def test_reconcile_finalizes_legacy_run_bound_integration_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "test-run"
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path,
+        worktree_name="state/runs/test-run/integration",
+    )
+    write_live_lease(state)
     claim_backport(state, evidence, base, candidate)
     packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
     install_success_mocks(monkeypatch)
@@ -1688,15 +1720,58 @@ def test_finalize_success_rejects_arbitrary_detached_worktree(
         candidate_sha=candidate,
         token="test-token",
     )
+    journal_path = state / "publish-journal.json"
+    journal = json.loads(journal_path.read_text())
+    journal.update({"phase": "finalizing", "finalizing_unix": 1})
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease.update({"expires_unix": 1, "max_expires_unix": 1})
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    result = runtime.reconcile_run(
+        state,
+        evidence,
+        token="test-token",
+        allow_expired=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["candidate_sha"] == candidate
+    assert remote_sha(repo) == candidate
+    assert not gate_worktree.exists()
+    assert not lease_path.exists()
+    assert not (state / "run-request.inflight.json").exists()
+    assert (evidence / "request.consumed.json").exists()
+
+
+def test_gate_and_ship_rejects_legacy_integration_symlink_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "test-run"
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    write_live_lease(state)
+    claim_backport(state, evidence, base, candidate)
+    escaped_cwd = evidence / "integration"
+    escaped_cwd.symlink_to(gate_worktree, target_is_directory=True)
+    packet, _ = make_gate_packet(evidence, escaped_cwd, base, candidate)
+    install_success_mocks(monkeypatch)
+
     with pytest.raises(runtime.ControlError, match="proven maintainer worktree"):
-        runtime.finalize_success(
+        runtime.gate_and_ship(
             repo,
-            manifest_path,
+            packet,
+            evidence / "gate.json",
             state_dir=state,
-            evidence_dir=evidence,
-            cwd=gate_worktree,
+            cwd=escaped_cwd,
+            base_sha=base,
+            candidate_sha=candidate,
             token="test-token",
         )
+
+    assert remote_sha(repo) == base
+    assert not (state / "publish-journal.json").exists()
     assert gate_worktree.exists()
 
 
