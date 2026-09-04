@@ -5,7 +5,7 @@ Versioned source for the Hermes cron that keeps `sid/opentui` aligned with
 `/home/daimon/projects/opentui-fork-maintainer/state`.
 
 The production sync runs at 09:00 and 21:00 local time with Hermes Agent as
-the parent (`openai/gpt-5.6-sol`, medium reasoning). It may delegate bounded
+the parent (`openai/gpt-5.6-sol`, per-job medium reasoning). It may delegate bounded
 implementation work to Codex or Claude, but the parent owns integration,
 evidence, and the final ship decision. At most two workers run concurrently.
 

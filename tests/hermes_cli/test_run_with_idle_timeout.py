@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.main import _run_with_idle_timeout
+from hermes_cli.main_web_build import _run_with_idle_timeout
 
 
 def test_streams_output_and_returns_zero_on_success(tmp_path):

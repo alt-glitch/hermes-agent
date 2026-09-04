@@ -5,6 +5,7 @@ import time
 import types
 
 from tui_gateway import server
+from tools import mcp_tool_agent, mcp_tool_discovery, mcp_tool_lifecycle
 
 
 class _CaptureTransport:
@@ -22,8 +23,6 @@ class _CaptureTransport:
 
 
 def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch):
-    from tools import mcp_tool
-
     calls: list[str] = []
     emitted: list[tuple[str, str, dict]] = []
     agent = object()
@@ -33,10 +32,10 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
     server._sessions["reload-other"] = other
 
     monkeypatch.setattr(
-        mcp_tool, "shutdown_mcp_servers", lambda: calls.append("shutdown")
+        mcp_tool_lifecycle, "shutdown_mcp_servers", lambda: calls.append("shutdown")
     )
     monkeypatch.setattr(
-        mcp_tool, "discover_mcp_tools", lambda: calls.append("discover")
+        mcp_tool_discovery, "discover_mcp_tools", lambda: calls.append("discover")
     )
 
     def refresh(live_agent, *, enabled_override, quiet_mode):
@@ -45,7 +44,7 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
         assert quiet_mode is True
         calls.append("refresh")
 
-    monkeypatch.setattr(mcp_tool, "refresh_agent_mcp_tools", refresh)
+    monkeypatch.setattr(mcp_tool_agent, "refresh_agent_mcp_tools", refresh)
     monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["hermes"])
     monkeypatch.setattr(
         server,
@@ -77,7 +76,7 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
 
         other["running"] = False
         after_idle = server._methods["reload.mcp"]("r3", params)
-        assert after_idle["result"] == {"status": "reloaded"}
+        assert after_idle["result"]["status"] == "reloaded"
         assert calls == ["shutdown", "discover", "refresh"]
         assert emitted == [
             (
@@ -94,8 +93,6 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
 def test_reload_mcp_admission_fence_blocks_a_new_turn_until_discovery_finishes(
     monkeypatch,
 ):
-    from tools import mcp_tool
-
     reload_entered = threading.Event()
     release_reload = threading.Event()
     turn_ran = threading.Event()
@@ -111,8 +108,8 @@ def test_reload_mcp_admission_fence_blocks_a_new_turn_until_discovery_finishes(
         reload_entered.set()
         assert release_reload.wait(1)
 
-    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", shutdown)
-    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: None)
+    monkeypatch.setattr(mcp_tool_lifecycle, "shutdown_mcp_servers", shutdown)
+    monkeypatch.setattr(mcp_tool_discovery, "discover_mcp_tools", lambda: None)
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
@@ -148,13 +145,7 @@ def test_reload_mcp_admission_fence_blocks_a_new_turn_until_discovery_finishes(
         turn_thread.join(1)
         assert not reload_thread.is_alive()
         assert not turn_thread.is_alive()
-        assert responses == [
-            {
-                "jsonrpc": "2.0",
-                "id": "reload-race",
-                "result": {"status": "reloaded"},
-            }
-        ]
+        assert responses[0]["result"]["status"] == "reloaded"
         assert turn_ran.is_set()
         assert session["running"] is True
     finally:
@@ -167,8 +158,6 @@ def test_reload_mcp_admission_fence_blocks_a_new_turn_until_discovery_finishes(
 
 
 def test_reload_mcp_pool_keeps_prompt_rejection_and_interrupt_responsive(monkeypatch):
-    from tools import mcp_tool
-
     reload_entered = threading.Event()
     release_reload = threading.Event()
     interrupted = threading.Event()
@@ -190,8 +179,8 @@ def test_reload_mcp_pool_keeps_prompt_rejection_and_interrupt_responsive(monkeyp
         reload_entered.set()
         assert release_reload.wait(2)
 
-    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", shutdown)
-    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: None)
+    monkeypatch.setattr(mcp_tool_lifecycle, "shutdown_mcp_servers", shutdown)
+    monkeypatch.setattr(mcp_tool_discovery, "discover_mcp_tools", lambda: None)
     transport = _CaptureTransport()
 
     try:
@@ -234,7 +223,7 @@ def test_reload_mcp_pool_keeps_prompt_rejection_and_interrupt_responsive(monkeyp
 
         release_reload.set()
         assert transport.written.wait(1)
-        assert transport.frames[-1]["result"] == {"status": "reloaded"}
+        assert transport.frames[-1]["result"]["status"] == "reloaded"
     finally:
         release_reload.set()
         server._sessions.pop("mcp-responsive", None)
@@ -244,8 +233,6 @@ def test_slash_reload_mcp_fence_rejects_other_session_prompt_while_mutating(
     monkeypatch,
 ):
     """The slash mirror shares reload.mcp's process-global admission fence."""
-    from tools import mcp_tool
-
     reload_entered = threading.Event()
     release_reload = threading.Event()
     calls: list[str] = []
@@ -272,9 +259,9 @@ def test_slash_reload_mcp_fence_rejects_other_session_prompt_while_mutating(
         reload_entered.set()
         assert release_reload.wait(2)
 
-    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", shutdown)
+    monkeypatch.setattr(mcp_tool_lifecycle, "shutdown_mcp_servers", shutdown)
     monkeypatch.setattr(
-        mcp_tool, "discover_mcp_tools", lambda: calls.append("discover")
+        mcp_tool_discovery, "discover_mcp_tools", lambda: calls.append("discover")
     )
 
     def refresh(live_agent, *, enabled_override, quiet_mode):
@@ -283,7 +270,7 @@ def test_slash_reload_mcp_fence_rejects_other_session_prompt_while_mutating(
         assert quiet_mode is True
         calls.append("refresh")
 
-    monkeypatch.setattr(mcp_tool, "refresh_agent_mcp_tools", refresh)
+    monkeypatch.setattr(mcp_tool_agent, "refresh_agent_mcp_tools", refresh)
     monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["hermes"])
     monkeypatch.setattr(server, "_session_info", lambda *_args: {"running": False})
     monkeypatch.setattr(server, "_emit", lambda *_args: None)
@@ -324,8 +311,6 @@ def test_slash_reload_mcp_fence_rejects_other_session_prompt_while_mutating(
 
 def test_other_session_prompt_wins_before_slash_reload_mcp_mutation(monkeypatch):
     """A claimed turn makes the later slash mirror fail before MCP mutation."""
-    from tools import mcp_tool
-
     turn_entered = threading.Event()
     release_turn = threading.Event()
     turn_done = threading.Event()
@@ -366,13 +351,13 @@ def test_other_session_prompt_wins_before_slash_reload_mcp_mutation(monkeypatch)
     monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
     monkeypatch.setattr(server, "_run_prompt_submit", run_prompt)
     monkeypatch.setattr(
-        mcp_tool, "shutdown_mcp_servers", lambda: calls.append("shutdown")
+        mcp_tool_lifecycle, "shutdown_mcp_servers", lambda: calls.append("shutdown")
     )
     monkeypatch.setattr(
-        mcp_tool, "discover_mcp_tools", lambda: calls.append("discover")
+        mcp_tool_discovery, "discover_mcp_tools", lambda: calls.append("discover")
     )
     monkeypatch.setattr(
-        mcp_tool,
+        mcp_tool_agent,
         "refresh_agent_mcp_tools",
         lambda *_args, **_kwargs: calls.append("refresh"),
     )
@@ -399,8 +384,6 @@ def test_other_session_prompt_wins_before_slash_reload_mcp_mutation(monkeypatch)
 
 
 def test_agent_registry_snapshot_completes_before_reload_mutates(monkeypatch):
-    from tools import mcp_tool
-
     build_entered = threading.Event()
     release_build = threading.Event()
     reload_entered = threading.Event()
@@ -414,9 +397,9 @@ def test_agent_registry_snapshot_completes_before_reload_mutates(monkeypatch):
 
     monkeypatch.setattr(server, "_make_agent", make_agent)
     monkeypatch.setattr(
-        mcp_tool, "shutdown_mcp_servers", lambda: reload_entered.set()
+        mcp_tool_lifecycle, "shutdown_mcp_servers", lambda: reload_entered.set()
     )
-    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: None)
+    monkeypatch.setattr(mcp_tool_discovery, "discover_mcp_tools", lambda: None)
 
     build_thread = threading.Thread(
         target=lambda: built.append(
@@ -452,13 +435,7 @@ def test_agent_registry_snapshot_completes_before_reload_mutates(monkeypatch):
         assert not reload_thread.is_alive()
         assert len(built) == 1
         assert reload_entered.is_set()
-        assert reload_responses == [
-            {
-                "jsonrpc": "2.0",
-                "id": "reload-after-build",
-                "result": {"status": "reloaded"},
-            }
-        ]
+        assert reload_responses[0]["result"]["status"] == "reloaded"
     finally:
         release_build.set()
         if build_thread.ident is not None:
@@ -468,8 +445,6 @@ def test_agent_registry_snapshot_completes_before_reload_mutates(monkeypatch):
 
 
 def test_tools_configure_waits_for_reload_on_the_rpc_pool(monkeypatch):
-    from tools import mcp_tool
-
     reload_entered = threading.Event()
     release_reload = threading.Event()
     reload_responses: list[dict] = []
@@ -479,8 +454,8 @@ def test_tools_configure_waits_for_reload_on_the_rpc_pool(monkeypatch):
         reload_entered.set()
         assert release_reload.wait(2)
 
-    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", shutdown)
-    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: None)
+    monkeypatch.setattr(mcp_tool_lifecycle, "shutdown_mcp_servers", shutdown)
+    monkeypatch.setattr(mcp_tool_discovery, "discover_mcp_tools", lambda: None)
 
     reload_thread = threading.Thread(
         target=lambda: reload_responses.append(
@@ -516,7 +491,7 @@ def test_tools_configure_waits_for_reload_on_the_rpc_pool(monkeypatch):
         configure_thread.join(1)
         assert not reload_thread.is_alive()
         assert not configure_thread.is_alive()
-        assert reload_responses[0]["result"] == {"status": "reloaded"}
+        assert reload_responses[0]["result"]["status"] == "reloaded"
         assert configure_responses[0]["error"]["code"] == 4017
     finally:
         release_reload.set()

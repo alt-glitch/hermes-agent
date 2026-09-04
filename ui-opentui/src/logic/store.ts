@@ -2906,7 +2906,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
             for (const message of draft.messages) {
               const oldParts = message.parts
               if (!oldParts || message === assistant) continue
-              for (let index = 0; index < oldParts.length && retained + header.length > MOA_STORE_TEXT_LIMIT;) {
+              for (let index = 0; index < oldParts.length && retained + header.length > MOA_STORE_TEXT_LIMIT; ) {
                 const part = oldParts[index]
                 if (part?.type === 'moa') {
                   retained -= part.text.length

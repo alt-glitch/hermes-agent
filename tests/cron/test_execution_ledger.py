@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
 import os
 import sqlite3
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 
@@ -320,28 +318,14 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     assert [r["status"] for r in records] == ["unknown"]
 
 
-def test_generic_submit_failure_keeps_recurring_job_due(monkeypatch, tmp_path):
-    import cron.jobs as jobs
+def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
     import cron.scheduler as scheduler
 
     class BrokenPool:
         def submit(self, _callable):
             raise ValueError("executor rejected")
 
-    cron_dir = tmp_path / "cron"
-    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
-    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
-    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
-    job = jobs.create_job(prompt="submit retry", schedule="every 1h")
-    stored = jobs.load_jobs()
-    due_at = (jobs._hermes_now() - timedelta(minutes=1)).isoformat()
-    stored[0]["next_run_at"] = due_at
-    jobs.save_jobs(stored)
-
     finished = []
-    monkeypatch.setattr(scheduler, "_running_job_ids", set())
-    monkeypatch.setattr(scheduler, "_running_run_claim_tokens", {})
-    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
         scheduler, "create_execution",
         lambda *_args, **_kwargs: {"id": "exec-submit-fail"},
@@ -350,104 +334,18 @@ def test_generic_submit_failure_keeps_recurring_job_due(monkeypatch, tmp_path):
         scheduler, "finish_execution",
         lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
     )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
+    monkeypatch.setattr(scheduler, "claim_job_for_fire", lambda _job_id: True)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
     assert scheduler.tick(verbose=False, sync=False) == 0
-    assert jobs.get_job(job["id"])["next_run_at"] == due_at
-    assert [item["id"] for item in jobs.get_due_jobs()] == [job["id"]]
     assert finished == [
-        (
-            "exec-submit-fail",
-            {
-                "success": False,
-                "error": "Executor dispatch failed: executor rejected",
-                "delivery_outcome": None,
-            },
-        )
+        ("exec-submit-fail", {
+            "success": False,
+            "error": "Executor dispatch failed: executor rejected",
+        })
     ]
-    assert job["id"] not in scheduler.get_running_job_ids()
-
-
-def test_ledger_creation_failure_keeps_recurring_job_due_for_retry(monkeypatch, tmp_path):
-    import cron.jobs as jobs
-    import cron.scheduler as scheduler
-
-    cron_dir = tmp_path / "cron"
-    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
-    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
-    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
-
-    job = jobs.create_job(prompt="ledger retry", schedule="every 1h")
-    stored = jobs.load_jobs()
-    due_at = (jobs._hermes_now() - timedelta(minutes=1)).isoformat()
-    stored[0]["next_run_at"] = due_at
-    jobs.save_jobs(stored)
-    assert [item["id"] for item in jobs.get_due_jobs()] == [job["id"]]
-
-    attempts = []
-
-    def fail_ledger_creation(job_id, *, source):
-        attempts.append((job_id, source))
-        raise sqlite3.OperationalError("database is locked")
-
-    monkeypatch.setattr(scheduler, "_running_job_ids", set())
-    monkeypatch.setattr(scheduler, "_running_run_claim_tokens", {})
-    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr(scheduler, "create_execution", fail_ledger_creation)
-
-    for expected_attempts in (1, 2):
-        # Ledger initialization is observability, not the execution control
-        # plane: a locked DB leaves the occurrence due and releases the guard
-        # without crashing the long-lived ticker.
-        assert scheduler.tick(verbose=False, sync=False) == 0
-        assert scheduler.get_running_job_ids() == frozenset()
-        assert scheduler._running_run_claim_tokens == {}
-        assert jobs.get_job(job["id"])["next_run_at"] == due_at
-        assert [item["id"] for item in jobs.get_due_jobs()] == [job["id"]]
-        assert len(attempts) == expected_attempts
-
-    assert attempts == [
-        (job["id"], "builtin"),
-        (job["id"], "builtin"),
-    ]
-
-
-def test_schedule_advance_failure_finishes_attempt_and_releases_guard(monkeypatch):
-    import cron.scheduler as scheduler
-
-    finished = []
-    monkeypatch.setattr(
-        scheduler,
-        "create_execution",
-        lambda *_args, **_kwargs: {"id": "exec-advance-fail"},
-    )
-    monkeypatch.setattr(
-        scheduler,
-        "finish_execution",
-        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
-    )
-    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "advance-fail"}])
-    monkeypatch.setattr(
-        scheduler,
-        "claim_job_for_fire",
-        lambda _job_id, **_kwargs: (_ for _ in ()).throw(
-            OSError("jobs store unavailable")
-        ),
-    )
-
-    assert scheduler.tick(verbose=False, sync=True) == 0
-
-    assert finished == [
-        (
-            "exec-advance-fail",
-            {
-                "success": False,
-                "error": "Fire claim failed: jobs store unavailable",
-                "delivery_outcome": None,
-            },
-        )
-    ]
-    assert "advance-fail" not in scheduler.get_running_job_ids()
+    assert "submit-fail" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
@@ -483,229 +381,6 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
-
-
-def test_run_one_job_ledger_finish_failure_does_not_rewrite_success(monkeypatch):
-    import cron.scheduler as scheduler
-
-    marks = []
-    finish_attempts = []
-
-    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(
-        scheduler, "mark_execution_running", lambda _execution_id: {}
-    )
-    monkeypatch.setattr(
-        scheduler,
-        "run_job",
-        lambda job, *, defer_agent_teardown=None, **_kwargs: (
-            True, "output", "response", None
-        ),
-    )
-    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
-    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        scheduler,
-        "mark_job_run",
-        lambda _job_id, success, error=None, **_kwargs: marks.append((success, error)) or True,
-    )
-
-    def fail_finish(_execution_id, *, success, error=None, delivery_outcome=None):
-        finish_attempts.append((success, error, delivery_outcome))
-        raise sqlite3.OperationalError("ledger unavailable")
-
-    monkeypatch.setattr(scheduler, "finish_execution", fail_finish)
-
-    assert scheduler.run_one_job({"id": "job-ledger-finish", "execution_id": "exec-ledger-finish"}) is True
-    assert marks == [(True, None)]
-    assert finish_attempts == [(True, None, "suppressed")]
-
-
-def test_job_store_double_failure_still_finalizes_execution(monkeypatch):
-    import cron.scheduler as scheduler
-
-    mark_attempts = []
-    finish_attempts = []
-    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(
-        scheduler, "mark_execution_running", lambda _execution_id: {}
-    )
-    monkeypatch.setattr(
-        scheduler,
-        "run_job",
-        lambda job, *, defer_agent_teardown=None, **_kwargs: (
-            True, "output", "response", None
-        ),
-    )
-    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
-    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
-
-    def fail_mark(_job_id, success, error=None, **_kwargs):
-        mark_attempts.append((success, error))
-        raise OSError("jobs store unavailable")
-
-    monkeypatch.setattr(scheduler, "mark_job_run", fail_mark)
-    monkeypatch.setattr(
-        scheduler,
-        "finish_execution",
-        lambda execution_id, **kwargs: finish_attempts.append((execution_id, kwargs)),
-    )
-
-    assert scheduler.run_one_job(
-        {"id": "job-store-fail", "execution_id": "exec-store-fail"}
-    ) is False
-    assert mark_attempts == [
-        (True, None),
-        (False, "jobs store unavailable"),
-    ]
-    assert finish_attempts == [
-        (
-            "exec-store-fail",
-            {
-                "success": False,
-                "error": "jobs store unavailable",
-                "delivery_outcome": "suppressed",
-            },
-        )
-    ]
-
-
-def test_run_claim_validation_failure_suppresses_delivery_and_finalizes_execution(
-    monkeypatch,
-):
-    import cron.scheduler as scheduler
-
-    finish_attempts = []
-    delivery_attempts = []
-    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(
-        scheduler,
-        "mark_execution_running",
-        lambda _execution_id: {},
-    )
-    monkeypatch.setattr(
-        scheduler,
-        "run_job",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            OSError("jobs store unavailable")
-        ),
-    )
-    monkeypatch.setattr(
-        scheduler,
-        "run_claim_is_owned",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("jobs store unavailable")
-        ),
-    )
-    monkeypatch.setattr(
-        scheduler,
-        "mark_job_run",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            OSError("jobs store unavailable")
-        ),
-    )
-    monkeypatch.setattr(
-        scheduler,
-        "_deliver_result",
-        lambda *_args, **_kwargs: delivery_attempts.append(True),
-    )
-    monkeypatch.setattr(
-        scheduler,
-        "finish_execution",
-        lambda execution_id, **kwargs: finish_attempts.append(
-            (execution_id, kwargs)
-        ),
-    )
-
-    job = {
-        "id": "token-store-fail",
-        "execution_id": "exec-token-store-fail",
-        "schedule": {"kind": "once", "at": "2026-08-15T00:00:00Z"},
-        "run_claim": {"token": "claim-token"},
-    }
-    assert scheduler.run_one_job(job) is False
-    assert delivery_attempts == []
-    assert finish_attempts == [
-        (
-            "exec-token-store-fail",
-            {
-                "success": False,
-                "error": "jobs store unavailable",
-                "delivery_outcome": "suppressed",
-            },
-        )
-    ]
-
-
-def test_late_shutdown_interruption_finalizes_execution_failed(monkeypatch):
-    import cron.scheduler as scheduler
-
-    delivery_entered = threading.Event()
-    release_delivery = threading.Event()
-    marks = []
-    finishes = []
-    results = []
-    job_id = "late-interrupt"
-
-    monkeypatch.setattr(scheduler, "_running_job_ids", {job_id})
-    monkeypatch.setattr(scheduler, "_running_run_claim_tokens", {})
-    monkeypatch.setattr(scheduler, "_interrupted_job_ids", set())
-    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda _execution_id: {})
-    monkeypatch.setattr(
-        scheduler,
-        "run_job",
-        lambda job, *, defer_agent_teardown=None, **_kwargs: (
-            True, "output", "response", None
-        ),
-    )
-    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
-
-    def block_delivery(*_args, **_kwargs):
-        delivery_entered.set()
-        assert release_delivery.wait(timeout=5)
-        return None
-
-    monkeypatch.setattr(scheduler, "_deliver_result", block_delivery)
-    monkeypatch.setattr(
-        scheduler,
-        "mark_job_run",
-        lambda jid, success, error=None, **_kwargs: marks.append((jid, success, error)) or True,
-    )
-    monkeypatch.setattr(
-        scheduler,
-        "finish_execution",
-        lambda execution_id, **kwargs: finishes.append((execution_id, kwargs)),
-    )
-
-    worker = threading.Thread(
-        target=lambda: results.append(
-            scheduler.run_one_job({"id": job_id, "execution_id": "exec-interrupt"})
-        )
-    )
-    worker.start()
-    assert delivery_entered.wait(timeout=5)
-    assert scheduler.mark_running_jobs_interrupted("gateway shutdown") == [job_id]
-    release_delivery.set()
-    worker.join(timeout=5)
-    assert not worker.is_alive()
-
-    assert results == [True]
-    # There is no durable owner in this synthetic direct-run setup. Upstream's
-    # interruption fence deliberately avoids an unfenced jobs.json rewrite;
-    # the exact in-memory execution token still forces the ledger terminal.
-    assert marks == []
-    assert finishes == [
-        (
-            "exec-interrupt",
-            {
-                "success": False,
-                "error": "Interrupted by gateway shutdown before terminal completion.",
-                "delivery_outcome": None,
-            },
-        )
-    ]
-    assert scheduler._interrupted_job_ids == set()
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):

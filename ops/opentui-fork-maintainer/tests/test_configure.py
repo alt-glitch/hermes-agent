@@ -183,6 +183,7 @@ def test_cron_update_pins_runtime_and_resource_contract() -> None:
     assert update["schedule"] == "0 9,21 * * *"
     assert update["provider"] == "nous"
     assert update["model"] == "openai/gpt-5.6-sol"
+    assert update["reasoning_effort"] == "medium"
     assert update["inactivity_timeout_seconds"] == 18_000
     assert update["enabled_toolsets"] == [
         "terminal",
@@ -218,13 +219,10 @@ def test_real_update_cannot_create_a_missing_maintainer_job(tmp_path: Path) -> N
         assert list_jobs(include_disabled=True) == []
 
 
-def test_medium_reasoning_is_required_because_job_has_no_effort_field(
-    tmp_path: Path,
-) -> None:
+def test_cron_reasoning_pin_does_not_depend_on_global_agent_effort(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     _write_config(config_path, "high")
-    with pytest.raises(configure.ConfigurationError, match="must be 'medium'"):
-        configure.require_medium_reasoning(config_path)
+    assert configure.cron_update(Path("/runtime"), tmp_path)["reasoning_effort"] == "medium"
 
 
 def test_configure_video_preserves_existing_yaml_and_pins_openrouter(
@@ -365,9 +363,10 @@ def test_apply_uses_supported_cron_api_after_deploy(
     # Exercise the scheduler's real containment boundary: the deployed cron
     # path must be accepted from HERMES_HOME/scripts rather than merely persist.
     from cron import scheduler
+    from cron.scheduler_script import _run_job_script
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: hermes_home)
-    accepted, output = scheduler._run_job_script(calls[1]["script"])
+    accepted, output = _run_job_script(calls[1]["script"])
     assert accepted is True
     assert output == "ok"
 
@@ -671,6 +670,7 @@ def test_deployed_bootstrap_and_fixed_script_output_are_scanner_safe(
     tmp_path: Path, monkeypatch
 ) -> None:
     from cron import scheduler
+    from cron.scheduler_prompt import _scan_assembled_cron_prompt
     import tools.skill_usage as skill_usage
 
     runtime = tmp_path / "runtime"
@@ -690,7 +690,7 @@ def test_deployed_bootstrap_and_fixed_script_output_are_scanner_safe(
         prerun_script=(True, script_output),
     )
     assert assembled is not None
-    cleaned = scheduler._scan_assembled_cron_prompt(
+    cleaned = _scan_assembled_cron_prompt(
         assembled,
         configure.cron_update(runtime, tmp_path / "hermes"),
         has_skills=True,

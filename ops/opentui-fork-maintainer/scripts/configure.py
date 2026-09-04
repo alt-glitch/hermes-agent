@@ -37,6 +37,7 @@ JOB_NAME = "opentui-fork-sync"
 SCHEDULE = "0 9,21 * * *"
 MODEL = "openai/gpt-5.6-sol"
 PROVIDER = "nous"
+REASONING_EFFORT = "medium"
 VIDEO_PROVIDER = "openrouter"
 VIDEO_MODEL = "google/gemini-3.5-flash"
 INACTIVITY_TIMEOUT_SECONDS = 18_000
@@ -104,6 +105,7 @@ def cron_update(
         "skills": list(SKILLS),
         "model": MODEL,
         "provider": PROVIDER,
+        "reasoning_effort": REASONING_EFFORT,
         "base_url": "",
         "inactivity_timeout_seconds": INACTIVITY_TIMEOUT_SECONDS,
         # The supported cron API resolves relative scripts below
@@ -124,18 +126,6 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigurationError(f"config root is not a mapping: {path}")
     return value
-
-
-def require_medium_reasoning(config_path: Path) -> None:
-    """Cron has no per-job effort field, so the global value is load-bearing."""
-    config = _read_yaml(config_path)
-    agent = config.get("agent")
-    effort = agent.get("reasoning_effort") if isinstance(agent, dict) else None
-    if str(effort or "").strip().lower() != "medium":
-        raise ConfigurationError(
-            "agent.reasoning_effort must be 'medium'; cron jobs do not expose "
-            "a per-job reasoning field"
-        )
 
 
 def validate_sources(source_home: Path = SOURCE_HOME) -> None:
@@ -647,7 +637,6 @@ def apply_configuration(
     )
     config_path = hermes_home / "config.yaml"
     validate_sources(source_home)
-    require_medium_reasoning(config_path)
     if cron_call is None:
         from cron.jobs import cron_store_transaction, get_job
         from tools.cronjob_tools import cronjob
@@ -845,7 +834,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.backport:
             raise ConfigurationError("--backport requires --apply")
         validate_sources(SOURCE_HOME)
-        require_medium_reasoning(args.hermes_home / "config.yaml")
         print(
             json.dumps(
                 {"apply": False, "cron": plan, "video_model": VIDEO_MODEL}, indent=2

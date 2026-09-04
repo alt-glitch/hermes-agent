@@ -18,9 +18,6 @@ The bugs, as reproduced before the fix:
    the service ("linear") missed tools whose own name omits it.
 4. (docstring-only) the substring fallback documented a zero-IDF case
    that cannot occur with the Lucene IDF variant.
-5. A ``check_fn`` verdict flip (credential appears, daemon starts) never
-   invalidated the ``get_tool_definitions`` memo — the stale tool list
-   survived until an unrelated registry mutation.
 """
 
 import json
@@ -31,7 +28,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent.tool_dispatch_helpers import _plan_tool_batch_segments
-from tools.tool_search import _short_desc, build_catalog, search_catalog
+from tools.tool_search import build_catalog, search_catalog
+from tools.tool_search_catalog import _short_desc
 
 
 def _tc(name, arguments="{}", call_id=None):
@@ -300,12 +298,14 @@ class TestSourceNameIndexing:
                 _td("mcp__catalogsource__native_action", "Perform a native action."),
                 _td("plugin_action", "Perform a plugin action."),
             ])
-            from tools.tool_search import _stem
-
-            # The index stems every token (ns-730), so the label appears as its stem.
+            # Compare in token space: the tokenizer may stem (e.g.
+            # "catalogsource" -> "catalogsourc"), and the contract is that
+            # the label lands in the document exactly once either way.
+            from tools.tool_search_catalog import _tokenize
+            label_token = _tokenize(source_label)[0]
             tokens_by_name = {entry.name: entry._tokens for entry in catalog}
-            assert tokens_by_name[names[0]].count(_stem(source_label)) == 1
-            assert tokens_by_name[names[1]].count(_stem(source_label)) == 1
+            assert tokens_by_name[names[0]].count(label_token) == 1
+            assert tokens_by_name[names[1]].count(label_token) == 1
         finally:
             for name in names:
                 registry.deregister(name)
@@ -329,7 +329,6 @@ class TestSourceNameIndexing:
         finally:
             for n in names:
                 registry.deregister(n)
-
 
 class TestCheckFnFlipBustsToolDefsMemo:
     """Fix 5: an availability flip propagates without a registry mutation."""

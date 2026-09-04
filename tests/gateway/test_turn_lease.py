@@ -142,8 +142,6 @@ def test_timeout_fails_closed_instead_of_authorizing_an_unserialized_turn():
         assert registry.release(successor) is True
 
     _run(scenario())
-
-
 @pytest.mark.asyncio
 async def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
     monkeypatch, tmp_path
