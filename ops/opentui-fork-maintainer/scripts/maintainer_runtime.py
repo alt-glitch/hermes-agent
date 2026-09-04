@@ -1033,6 +1033,53 @@ def _remote_sha(repo: Path, remote: str, branch: str) -> str:
     return parts[0]
 
 
+def _remote_contains_candidate(
+    repo: Path,
+    remote: str,
+    branch: str,
+    candidate_sha: str,
+) -> tuple[str, bool]:
+    """Return a stable remote tip and whether it descends from candidate.
+
+    A later maintainer run may legitimately advance the branch after this run's
+    guarded push but before its finalization is recovered. Equality is
+    therefore sufficient but not necessary proof that the candidate was
+    published. Fetch only the advertised tip object, without updating
+    FETCH_HEAD or a tracking ref, then require the remote to remain at that
+    exact tip while proving ancestry. Rewinds, unrelated tips, and concurrent
+    remote movement remain fail-closed.
+    """
+    current_remote = _remote_sha(repo, remote, branch)
+    if current_remote == candidate_sha:
+        return current_remote, True
+    resolved_candidate = _git(repo, ["rev-parse", f"{candidate_sha}^{{commit}}"])
+    if resolved_candidate != candidate_sha:
+        raise ControlError("published candidate does not resolve exactly")
+    _git(
+        repo,
+        [
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            remote,
+            current_remote,
+        ],
+    )
+    resolved_remote = _git(repo, ["rev-parse", f"{current_remote}^{{commit}}"])
+    if resolved_remote != current_remote:
+        raise ControlError("remote tip does not resolve exactly")
+    contains_candidate = (
+        _git_status(
+            repo,
+            ["merge-base", "--is-ancestor", candidate_sha, current_remote],
+        )
+        == 0
+    )
+    if _remote_sha(repo, remote, branch) != current_remote:
+        raise ControlError("remote branch changed during publication reconciliation")
+    return current_remote, contains_candidate
+
+
 def _journal_path(state_dir: Path) -> Path:
     return state_dir / "publish-journal.json"
 
@@ -2795,11 +2842,14 @@ def finalize_success(
                     "manifest_evidence_status",
                     "intact",
                 ),
+                "remote_head_sha": result.get("remote_head_sha", candidate_sha),
             },
         )
         return result
-    current_remote = _remote_sha(repo, remote, branch)
-    if current_remote != candidate_sha:
+    current_remote, contains_candidate = _remote_contains_candidate(
+        repo, remote, branch, candidate_sha
+    )
+    if not contains_candidate:
         raise ControlError("remote branch does not match the published candidate")
     if journal["phase"] == "prepared":
         journal = {
@@ -2889,6 +2939,7 @@ def finalize_success(
         "worktree_removed": worktree_removed,
         "upstream_sha": upstream_sha,
         "manifest_evidence_status": manifest_evidence_status,
+        "remote_head_sha": current_remote,
     }
     if isinstance(upstream_sha, str):
         _atomic_text(state_dir / "last_synced_upstream.sha", upstream_sha + "\n")
@@ -2917,6 +2968,7 @@ def finalize_success(
             "upstream_sha": upstream_sha,
             "published": True,
             "manifest_evidence_status": manifest_evidence_status,
+            "remote_head_sha": current_remote,
         },
     )
     return result
@@ -2959,8 +3011,13 @@ def finalize_failure(
         if journal["phase"] == "finalized":
             raise ControlError("a finalized publication cannot be recorded as failed")
         repo = Path(journal["repo"])
-        remote_sha = _remote_sha(repo, journal["remote"], journal["branch"])
-        if remote_sha == journal["candidate_sha"]:
+        remote_sha, contains_candidate = _remote_contains_candidate(
+            repo,
+            journal["remote"],
+            journal["branch"],
+            journal["candidate_sha"],
+        )
+        if contains_candidate:
             if journal["phase"] == "prepared":
                 journal = {
                     **journal,
@@ -2978,6 +3035,7 @@ def finalize_failure(
                     "published": True,
                     "needs_finalization": True,
                     "candidate_sha": journal["candidate_sha"],
+                    "remote_head_sha": remote_sha,
                     "request_recovered": False,
                 },
             )
@@ -3127,14 +3185,20 @@ def reconcile_run(
         and journal is not None
     ):
         repo = Path(journal["repo"])
-        remote_sha = _remote_sha(repo, journal["remote"], journal["branch"])
-        if remote_sha == journal["candidate_sha"]:
+        remote_sha, contains_candidate = _remote_contains_candidate(
+            repo,
+            journal["remote"],
+            journal["branch"],
+            journal["candidate_sha"],
+        )
+        if contains_candidate:
             # The journal was written from a validated manifest before the
-            # guarded push. Once the remote equals that exact candidate, the
-            # publication is an irreversible fact and cleanup no longer needs
-            # the manifest's current bytes. Keep the recorded hash unchanged
-            # and label the recovery below; this must never become a path that
-            # validates or publishes a new candidate from mutable evidence.
+            # guarded push. Once the stable remote tip equals or descends from
+            # that candidate, publication is an irreversible fact and cleanup
+            # no longer needs the manifest's current bytes. Keep the recorded
+            # hash unchanged and label the recovery below; this must never
+            # become a path that validates or publishes a new candidate from
+            # mutable evidence.
             recover_published_manifest = not _publish_journal_manifest_is_intact(
                 journal
             )

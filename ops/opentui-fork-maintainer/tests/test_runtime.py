@@ -1995,6 +1995,141 @@ def test_reconcile_finalizes_exact_published_candidate_after_manifest_changes(
     assert remote_sha(repo) == next_candidate
 
 
+def test_reconcile_finalizes_published_candidate_after_remote_advances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed_root = tmp_path / "managed-worktrees"
+    monkeypatch.setattr(runtime, "MAINTAINER_WORKTREE_ROOT", managed_root)
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="managed-worktrees/sync-descendant-recovery"
+    )
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = state / "runs" / "test-run"
+    evidence.mkdir(parents=True)
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    journal_path = state / "publish-journal.json"
+    journal = json.loads(journal_path.read_text())
+    journal.update({"phase": "finalizing", "finalizing_unix": 1})
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    (repo / "file").write_text("later maintainer\n", encoding="utf-8")
+    git(repo, "commit", "-am", "later maintainer")
+    descendant = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "origin", f"{descendant}:refs/heads/sid/opentui")
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease.update({"expires_unix": 1, "max_expires_unix": 1})
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    result = runtime.reconcile_run(
+        state, evidence, token="test-token", allow_expired=True
+    )
+
+    assert result["status"] == "success"
+    assert result["candidate_sha"] == candidate
+    assert result["remote_head_sha"] == descendant
+    assert remote_sha(repo) == descendant
+    assert not gate_worktree.exists()
+    assert not lease_path.exists()
+    assert not (state / "run-request.inflight.json").exists()
+    assert (evidence / "request.consumed.json").exists()
+    outcome = json.loads((state / "last-run.json").read_text())
+    assert outcome["published"] is True
+    assert outcome["remote_head_sha"] == descendant
+
+
+def test_finalize_failure_recognizes_published_candidate_under_remote_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        evidence / "gate.json",
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    (repo / "file").write_text("later maintainer\n", encoding="utf-8")
+    git(repo, "commit", "-am", "later maintainer")
+    descendant = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "origin", f"{descendant}:refs/heads/sid/opentui")
+
+    outcome = runtime.finalize_failure(
+        state,
+        evidence,
+        stage="finalization",
+        reason_code="finalization-failed",
+    )
+
+    assert outcome["published"] is True
+    assert outcome["needs_finalization"] is True
+    assert outcome["candidate_sha"] == candidate
+    assert outcome["remote_head_sha"] == descendant
+    assert (state / "run-request.inflight.json").exists()
+    assert not (state / "run-request.json").exists()
+
+
+def test_reconcile_rejects_unrelated_remote_tip_after_candidate_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    tree = git(repo, "rev-parse", f"{base}^{{tree}}")
+    unrelated = git(repo, "commit-tree", tree, "-m", "unrelated tip")
+    git(repo, "push", "--force", "origin", f"{unrelated}:refs/heads/sid/opentui")
+
+    with pytest.raises(
+        runtime.ControlError,
+        match="publication outcome is indeterminate; request preserved",
+    ):
+        runtime.reconcile_run(state, evidence, token="test-token")
+
+    assert remote_sha(repo) == unrelated
+    assert gate_worktree.exists()
+    assert (state / "run.lease.json").exists()
+    assert (state / "run-request.inflight.json").exists()
+    assert not (evidence / "success-finalization.json").exists()
+
+
 def test_changed_manifest_cannot_finalize_without_exact_remote_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

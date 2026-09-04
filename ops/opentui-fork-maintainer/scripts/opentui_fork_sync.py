@@ -225,28 +225,89 @@ def _invoke_reconcile(
 
 
 def _reconcile_stale_lease(now: int | None = None) -> bool:
-    """Close one expired structured run before the next claim attempt."""
+    """Serialize and close one expired run before the next claim attempt."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with (STATE_DIR / "stale-reconciliation.lock").open(
+        "a+", encoding="utf-8"
+    ) as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            return _reconcile_stale_lease_locked(now)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _reconcile_stale_lease_locked(now: int | None = None) -> bool:
     now = int(time.time()) if now is None else now
     with _lease_lock():
         current = _read_lease_raw(STATE_DIR / "run.lease.json")
     if current is None:
         return True
     value = current[1]
-    try:
-        expires = int(value.get("expires_unix", 0))
-    except (TypeError, ValueError):
-        return True
-    if expires > now:
-        return True
     token = value.get("token")
     run_id = value.get("run_id")
     evidence = value.get("evidence_dir")
-    if not all(isinstance(item, str) and item for item in (token, run_id, evidence)):
+    has_run_identity = all(
+        isinstance(item, str) and item for item in (token, run_id, evidence)
+    )
+    try:
+        expires = int(value.get("expires_unix", 0))
+    except (TypeError, ValueError):
+        if has_run_identity:
+            _record_stale_reconciliation_failure(
+                str(run_id),
+                reason_code="invalid-lease-expiry",
+                returncode=None,
+            )
+            return False
         return True
+    if expires > now:
+        return True
+    if not has_run_identity:
+        return True
+    assert isinstance(token, str)
+    assert isinstance(run_id, str)
+    assert isinstance(evidence, str)
     evidence_dir = Path(evidence)
     if evidence_dir.name != run_id:
         return False
-    return _invoke_reconcile(token, evidence_dir, allow_expired=True).returncode == 0
+    try:
+        result = _invoke_reconcile(token, evidence_dir, allow_expired=True)
+    except (OSError, subprocess.SubprocessError):
+        if _stale_reconciliation_completed_by_peer(token, run_id, evidence_dir):
+            return True
+        _record_stale_reconciliation_failure(
+            run_id,
+            reason_code="reconcile-invocation-failed",
+            returncode=None,
+        )
+        return False
+    if result.returncode != 0:
+        if _stale_reconciliation_completed_by_peer(token, run_id, evidence_dir):
+            return True
+        _record_stale_reconciliation_failure(
+            run_id,
+            reason_code="reconcile-exited-nonzero",
+            returncode=result.returncode,
+        )
+        return False
+    return True
+
+
+def _stale_reconciliation_completed_by_peer(
+    token: str, run_id: str, evidence_dir: Path
+) -> bool:
+    """Accept a losing reconciler only after the peer durably closed this run."""
+    lease_path = STATE_DIR / "run.lease.json"
+    with _lease_lock():
+        current = _read_lease_raw(lease_path)
+        if current is None:
+            # Missing proves release; unreadable-but-present cannot prove that
+            # the original owner disappeared and must remain fail-closed.
+            original_token_disappeared = not lease_path.exists()
+        else:
+            original_token_disappeared = current[1].get("token") != token
+    return original_token_disappeared and _durable_outcome_bound(run_id, evidence_dir)
 
 
 def _release_lease(token: str) -> bool:
@@ -411,6 +472,69 @@ def _queue_reconciliation_failure(run_id: str) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _record_stale_reconciliation_failure(
+    run_id: str,
+    *,
+    reason_code: str,
+    returncode: int | None,
+) -> None:
+    """Persist and queue one sanitized alert for a wedged stale run.
+
+    Runtime stderr can contain repository-controlled content or credentials, so
+    this recovery boundary records only an allowlisted reason and bounded
+    process status. Keeping the record in shared state also prevents every
+    twelve-hour tick from appending a duplicate alert for the same wedged run.
+    """
+    if reason_code not in {
+        "reconcile-exited-nonzero",
+        "reconcile-invocation-failed",
+        "invalid-lease-expiry",
+    }:
+        raise ValueError("invalid stale reconciliation failure reason")
+    safe_run_id = "".join(
+        character if character.isalnum() or character in "._-" else "?"
+        for character in run_id[:80]
+    ) or "unknown"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with (STATE_DIR / "stale-reconciliation-failure.lock").open(
+        "a+", encoding="utf-8"
+    ) as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            path = STATE_DIR / "stale-reconciliation-failure.json"
+            prior: dict[str, Any] = {}
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    prior = value
+            except (OSError, json.JSONDecodeError):
+                pass
+            already_queued = (
+                prior.get("run_id") == safe_run_id
+                and prior.get("reason_code") == reason_code
+                and prior.get("notification_queued") is True
+            )
+            failure = {
+                "schema_version": 1,
+                "recorded_unix": int(time.time()),
+                "run_id": safe_run_id,
+                "reason_code": reason_code,
+                "returncode": returncode if isinstance(returncode, int) else None,
+                "notification_queued": already_queued,
+            }
+            _write_text_atomic(path, json.dumps(failure, sort_keys=True) + "\n")
+            if already_queued:
+                return
+            try:
+                _queue_reconciliation_failure(safe_run_id)
+            except OSError:
+                return
+            failure["notification_queued"] = True
+            _write_text_atomic(path, json.dumps(failure, sort_keys=True) + "\n")
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _durable_outcome_bound(run_id: str, evidence_dir: Path) -> bool:
     outcome_path = evidence_dir / "run-outcome.json"
     durable_path = STATE_DIR / "last-run.json"
@@ -561,7 +685,21 @@ def _safe_summary(
 
 
 def main() -> int:
-    _reconcile_stale_lease()
+    if not _reconcile_stale_lease():
+        print(
+            json.dumps(
+                {
+                    "status": "stale_reconciliation_failed",
+                    "ingest_file": str(INGEST_FILE),
+                    "gap": 0,
+                    "needs_port_count": 0,
+                    "probe_failures": _read_failure_count(),
+                    "run_token": None,
+                    "wakeAgent": False,
+                }
+            )
+        )
+        return 2
     run_token = _claim_lease()
     if run_token is None:
         print(

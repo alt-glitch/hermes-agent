@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -567,6 +568,229 @@ def test_expired_structured_lease_is_reconciled_before_replacement(
     assert sync._reconcile_stale_lease(now=100) is True
     assert calls == [("old-token", evidence, {"allow_expired": True})]
     assert sync._claim_lease(now=100) is not None
+
+
+def test_failed_stale_reconciliation_is_durable_notified_and_fails_closed(
+    tmp_path, monkeypatch, capsys
+):
+    sync = load("sync_stale_failure", "scripts/opentui_fork_sync.py")
+    state = tmp_path / "state"
+    evidence = state / "runs" / "run-old"
+    evidence.mkdir(parents=True)
+    lease_path = state / "run.lease.json"
+    lease_path.write_text(
+        json.dumps(
+            {
+                "token": "secret-token",
+                "run_id": "run-old",
+                "evidence_dir": str(evidence),
+                "expires_unix": 1,
+                "max_expires_unix": 1,
+            }
+        )
+    )
+    monkeypatch.setattr(sync, "STATE_DIR", state)
+    monkeypatch.setattr(sync, "INGEST_FILE", state / "ingest.latest.json")
+    monkeypatch.setattr(
+        sync,
+        "_invoke_reconcile",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=7,
+            stdout="repository-controlled output",
+            stderr="secret-token must not persist",
+        ),
+    )
+    queued = []
+    monkeypatch.setattr(sync, "_queue_reconciliation_failure", queued.append)
+
+    assert sync.main() == 2
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "stale_reconciliation_failed"
+    assert response["wakeAgent"] is False
+    assert response["run_token"] is None
+    assert lease_path.exists()
+    failure_text = (state / "stale-reconciliation-failure.json").read_text()
+    failure = json.loads(failure_text)
+    assert failure == {
+        "notification_queued": True,
+        "reason_code": "reconcile-exited-nonzero",
+        "recorded_unix": failure["recorded_unix"],
+        "returncode": 7,
+        "run_id": "run-old",
+        "schema_version": 1,
+    }
+    assert "secret-token" not in failure_text
+    assert "repository-controlled" not in failure_text
+    assert queued == ["run-old"]
+
+    # A later tick stays visibly failed but does not spam a duplicate alert.
+    assert sync.main() == 2
+    assert queued == ["run-old"]
+
+
+def test_stale_reconcile_loser_accepts_peer_durable_completion(
+    tmp_path, monkeypatch
+):
+    sync = load("sync_stale_peer", "scripts/opentui_fork_sync.py")
+    state = tmp_path / "state"
+    evidence = state / "runs" / "run-old"
+    evidence.mkdir(parents=True)
+    lease_path = state / "run.lease.json"
+    lease_path.write_text(
+        json.dumps(
+            {
+                "token": "old-token",
+                "run_id": "run-old",
+                "evidence_dir": str(evidence),
+                "expires_unix": 1,
+                "max_expires_unix": 1,
+            }
+        )
+    )
+    monkeypatch.setattr(sync, "STATE_DIR", state)
+
+    def peer_wins(*_args, **_kwargs):
+        outcome_path = evidence / "run-outcome.json"
+        outcome_path.write_text(json.dumps({"status": "success"}))
+        (state / "last-run.json").write_text(
+            json.dumps(
+                {
+                    "status": "success",
+                    "evidence_path": str(outcome_path),
+                    "evidence_sha256": sync.hashlib.sha256(
+                        outcome_path.read_bytes()
+                    ).hexdigest(),
+                }
+            )
+        )
+        lease_path.unlink()
+        return SimpleNamespace(returncode=1, stdout="", stderr="lost race")
+
+    monkeypatch.setattr(sync, "_invoke_reconcile", peer_wins)
+    queued = []
+    monkeypatch.setattr(sync, "_queue_reconciliation_failure", queued.append)
+
+    assert sync._reconcile_stale_lease(now=100) is True
+    assert queued == []
+    assert not (state / "stale-reconciliation-failure.json").exists()
+
+
+def test_peer_completion_requires_original_lease_to_be_provably_gone(
+    tmp_path, monkeypatch
+):
+    sync = load("sync_stale_peer_lease_proof", "scripts/opentui_fork_sync.py")
+    state = tmp_path / "state"
+    evidence = state / "runs" / "run-old"
+    evidence.mkdir(parents=True)
+    monkeypatch.setattr(sync, "STATE_DIR", state)
+    outcome_path = evidence / "run-outcome.json"
+    outcome_path.write_text(json.dumps({"status": "success"}))
+    (state / "last-run.json").write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "evidence_path": str(outcome_path),
+                "evidence_sha256": sync.hashlib.sha256(
+                    outcome_path.read_bytes()
+                ).hexdigest(),
+            }
+        )
+    )
+    (state / "run.lease.json").write_text("{unreadable but still present")
+
+    assert not sync._stale_reconciliation_completed_by_peer(
+        "old-token", "run-old", evidence
+    )
+
+
+def test_malformed_structured_lease_expiry_is_visible_and_never_replaced(
+    tmp_path, monkeypatch, capsys
+):
+    sync = load("sync_stale_bad_expiry", "scripts/opentui_fork_sync.py")
+    state = tmp_path / "state"
+    evidence = state / "runs" / "run-old"
+    evidence.mkdir(parents=True)
+    lease_path = state / "run.lease.json"
+    lease_path.write_text(
+        json.dumps(
+            {
+                "token": "old-token",
+                "run_id": "run-old",
+                "evidence_dir": str(evidence),
+                "expires_unix": "not-a-timestamp",
+                "max_expires_unix": 1,
+            }
+        )
+    )
+    monkeypatch.setattr(sync, "STATE_DIR", state)
+    monkeypatch.setattr(sync, "INGEST_FILE", state / "ingest.latest.json")
+    monkeypatch.setattr(
+        sync,
+        "_claim_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("malformed lease must not be replaced")
+        ),
+    )
+    queued = []
+    monkeypatch.setattr(sync, "_queue_reconciliation_failure", queued.append)
+
+    assert sync.main() == 2
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "stale_reconciliation_failed"
+    assert response["wakeAgent"] is False
+    assert lease_path.exists()
+    failure = json.loads(
+        (state / "stale-reconciliation-failure.json").read_text()
+    )
+    assert failure["reason_code"] == "invalid-lease-expiry"
+    assert failure["returncode"] is None
+    assert queued == ["run-old"]
+
+
+def test_stale_reconciliation_alert_deduplication_is_atomic(
+    tmp_path, monkeypatch
+):
+    sync = load("sync_stale_alert_atomic", "scripts/opentui_fork_sync.py")
+    state = tmp_path / "state"
+    monkeypatch.setattr(sync, "STATE_DIR", state)
+    entered = threading.Event()
+    release = threading.Event()
+    queued = []
+    errors = []
+
+    def queue(run_id):
+        queued.append(run_id)
+        entered.set()
+        assert release.wait(timeout=2)
+
+    def record():
+        try:
+            sync._record_stale_reconciliation_failure(
+                "run-old",
+                reason_code="reconcile-exited-nonzero",
+                returncode=7,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(sync, "_queue_reconciliation_failure", queue)
+    first = threading.Thread(target=record)
+    second = threading.Thread(target=record)
+    first.start()
+    assert entered.wait(timeout=2)
+    second.start()
+    time.sleep(0.05)
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert errors == []
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert queued == ["run-old"]
+    assert json.loads(
+        (state / "stale-reconciliation-failure.json").read_text()
+    )["notification_queued"] is True
 
 
 def test_watchdog_absolute_deadline_fences_stale_running_row(tmp_path, monkeypatch):
