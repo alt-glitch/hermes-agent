@@ -229,6 +229,39 @@ def write_live_lease(
     )
 
 
+def write_publish_journal(
+    state_dir: Path,
+    evidence_dir: Path,
+    *,
+    phase: str,
+    prepared_unix: int = 100,
+) -> Path:
+    path = state_dir / "publish-journal.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "phase": phase,
+                "repo": str(state_dir / "repo"),
+                "remote": "origin",
+                "branch": "sid/opentui",
+                "base_sha": "a" * 40,
+                "candidate_sha": "b" * 40,
+                "manifest_path": str(evidence_dir / "gate.json"),
+                "manifest_sha256": "c" * 64,
+                "evidence_dir": str(evidence_dir),
+                "worktree": str(evidence_dir / "integration"),
+                "upstream_sha": "d" * 40,
+                "run_binding": {},
+                "prepared_unix": prepared_unix,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def claim_backport(state: Path, evidence: Path, base: str, upstream: str) -> None:
     (state / "run-request.json").write_text(
         json.dumps({"mode": "backport", "commits": ["abcdef1"]}),
@@ -1450,6 +1483,96 @@ def test_atomic_gate_and_ship_is_only_publish_cli(
     for removed in ("ship", "run-gate"):
         with pytest.raises(SystemExit):
             runtime._parser().parse_args([removed])
+
+
+@pytest.mark.parametrize("phase", ["finalized", "aborted"])
+def test_old_terminal_journal_does_not_cap_fresh_lease(
+    tmp_path: Path, phase: str
+) -> None:
+    state = tmp_path / "state"
+    old_evidence = state / "runs" / "old-run"
+    fresh_evidence = state / "runs" / "fresh-run"
+    write_live_lease(state, expires_unix=5_000)
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease["evidence_dir"] = str(fresh_evidence)
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+    journal_path = write_publish_journal(
+        state,
+        old_evidence,
+        phase=phase,
+        prepared_unix=100,
+    )
+    journal_before = journal_path.read_bytes()
+
+    runtime.renew_lease(
+        state,
+        "test-token",
+        now=1_000,
+        ttl_seconds=600,
+    )
+
+    renewed = json.loads(lease_path.read_text())
+    assert renewed["expires_unix"] == 1_600
+    assert journal_path.read_bytes() == journal_before
+
+
+@pytest.mark.parametrize("phase", ["prepared", "published", "finalizing"])
+def test_mismatched_nonterminal_journal_refuses_lease_without_mutation(
+    tmp_path: Path, phase: str
+) -> None:
+    state = tmp_path / "state"
+    old_evidence = state / "runs" / "old-run"
+    fresh_evidence = state / "runs" / "fresh-run"
+    write_live_lease(state, expires_unix=5_000)
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease["evidence_dir"] = str(fresh_evidence)
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+    write_publish_journal(state, old_evidence, phase=phase)
+    lease_before = lease_path.read_bytes()
+    journal_before = (state / "publish-journal.json").read_bytes()
+
+    with pytest.raises(
+        runtime.ControlError,
+        match="nonterminal publication journal belongs to another run",
+    ):
+        runtime.renew_lease(
+            state,
+            "test-token",
+            now=1_000,
+            ttl_seconds=600,
+        )
+
+    assert lease_path.read_bytes() == lease_before
+    assert (state / "publish-journal.json").read_bytes() == journal_before
+
+
+def test_same_run_finalized_journal_keeps_fixed_post_publish_deadline(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "same-run"
+    write_live_lease(state, expires_unix=5_000)
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease["evidence_dir"] = str(evidence)
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+    write_publish_journal(state, evidence, phase="finalized", prepared_unix=100)
+
+    runtime.renew_lease(
+        state,
+        "test-token",
+        now=950,
+        ttl_seconds=4_000,
+    )
+    lease = json.loads(lease_path.read_text())
+    assert lease["expires_unix"] == 1_000
+    lease["expires_unix"] = 1_100
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    with pytest.raises(runtime.ControlError, match="fixed deadline"):
+        runtime.renew_lease(state, "test-token", now=1_000)
 
 
 def test_gate_cli_completes_publish_finalization_and_release(

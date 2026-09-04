@@ -612,12 +612,35 @@ def renew_lease(
         journal = _load_publish_journal(
             state_dir, require_manifest_evidence=False
         )
-        if journal is not None and journal["phase"] in {
+        post_publish_phases = {
             "prepared",
             "published",
             "finalizing",
             "finalized",
-        }:
+        }
+        if journal is not None:
+            journal_evidence = journal.get("evidence_dir")
+            lease_evidence = value.get("evidence_dir")
+            same_run = (
+                isinstance(journal_evidence, str)
+                and bool(journal_evidence)
+                and isinstance(lease_evidence, str)
+                and bool(lease_evidence)
+                and journal_evidence == lease_evidence
+            )
+            if not same_run:
+                if journal["phase"] in {"finalized", "aborted"}:
+                    # Terminal evidence is immutable history. A later run may
+                    # renew normally without deleting or rewriting it.
+                    journal = None
+                else:
+                    # An unfinished publication owned by another run must be
+                    # reconciled before this lease can move forward.
+                    raise ControlError(
+                        "nonterminal publication journal belongs to another run"
+                    )
+        post_publish = journal is not None and journal["phase"] in post_publish_phases
+        if post_publish:
             ttl_seconds = min(ttl_seconds, POST_PUBLISH_LEASE_TTL_SECONDS)
         try:
             max_expires = int(value.get("max_expires_unix", 0))
@@ -626,12 +649,7 @@ def renew_lease(
         if max_expires <= now:
             raise ControlError("run lease reached its absolute deadline")
         expires = min(now + ttl_seconds, max_expires)
-        if journal is not None and journal["phase"] in {
-            "prepared",
-            "published",
-            "finalizing",
-            "finalized",
-        }:
+        if post_publish:
             post_publish_deadline = (
                 int(journal["prepared_unix"]) + POST_PUBLISH_LEASE_TTL_SECONDS
             )
