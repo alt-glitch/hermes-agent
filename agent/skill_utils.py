@@ -434,6 +434,15 @@ def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
+# Skills that must stay available regardless of configuration. The
+# `hermes-agent` skill is the agent's own operating manual — it drives
+# configuring, extending, and troubleshooting Hermes itself, and the system
+# prompt unconditionally points at it. Disabling it leaves the agent unable
+# to help with Hermes, so disable requests for these names are ignored
+# everywhere the disabled list is consulted.
+ESSENTIAL_SKILLS: frozenset = frozenset({"hermes-agent"})
+
+
 def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     """Read disabled skill names from config.yaml.
 
@@ -468,8 +477,10 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
             resolved_platform
         )
         if platform_disabled is not None:
-            return global_disabled | _normalize_string_set(platform_disabled)
-    return global_disabled
+            return (
+                global_disabled | _normalize_string_set(platform_disabled)
+            ) - ESSENTIAL_SKILLS
+    return global_disabled - ESSENTIAL_SKILLS
 
 
 def parse_config_string_list(value) -> List[str]:
@@ -1007,6 +1018,13 @@ def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
         "requires_toolsets": hermes.get("requires_toolsets", []),
         "fallback_for_tools": hermes.get("fallback_for_tools", []),
         "requires_tools": hermes.get("requires_tools", []),
+        # Gateway-channel gate (maintainer-directed, skills-index slim):
+        # list of session platforms (e.g. ["msteams"]) the skill is FOR.
+        # Unlike top-level ``platforms:`` (host OS), this hides the skill
+        # from the index on every other channel — the teams-meeting
+        # pipeline has no business in a desktop or telegram session's
+        # index. Empty/absent = visible everywhere (backward compat).
+        "session_platforms": hermes.get("session_platforms", []),
     }
 
 

@@ -5,8 +5,26 @@ import {
   configSyncBlocked,
   createConfigSyncTracker,
   mcpLoadedRevision,
-  mcpReloadSucceeded
+  mcpReloadSucceeded,
+  normalizeStatusBarFields
 } from '../logic/configSync.ts'
+
+describe('status bar field normalization', () => {
+  test('missing, malformed, empty, and wholly blank values use the default field set', () => {
+    expect(normalizeStatusBarFields(undefined)).toBeNull()
+    expect(normalizeStatusBarFields('cache_hit')).toBeNull()
+    expect(normalizeStatusBarFields([])).toBeNull()
+    expect(normalizeStatusBarFields(['', '   '])).toBeNull()
+  })
+
+  test('normalizes like Ink and retains unknown names harmlessly', () => {
+    expect([...normalizeStatusBarFields([' Cache_Hit ', 'LATENCY', 'future_field'])!]).toEqual([
+      'cache_hit',
+      'latency',
+      'future_field'
+    ])
+  })
+})
 
 describe('revision-aware live config synchronization', () => {
   test('decodes the revision-bearing poll and reload acknowledgement contracts', () => {

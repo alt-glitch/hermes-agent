@@ -123,8 +123,8 @@ def _budget_for_agent(agent) -> BudgetConfig:
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
 _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
-# Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
-# guard does not preempt a slow-but-valid summarization attempt.
+# Generous ceiling for slow-but-valid tool work (large page fetches, slow
+# remote backends) so the batch guard does not preempt a legitimate attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
 # Upper bound a concurrent worker will wait at the start-order gate for all
 # earlier-ordered tools to advance before proceeding out of order. Long enough
@@ -154,6 +154,12 @@ def _authorization_gate_lock_timeout() -> float:
     try:
         from tools.approval import human_wait_ceiling
 
+        # human_wait_ceiling is platform-safety-capped (agent/deadline.py
+        # MAX_SAFE_TIMEOUT_S): a huge approvals.timeout can no longer overflow
+        # Lock.acquire's time_t on macOS (#83220). Deliberately NOT min()'d
+        # with _AUTHORIZATION_GATE_LOCK_TIMEOUT_S — the gate must never give
+        # up while a legitimate approval prompt is still answerable (#79719),
+        # so a configured approvals.timeout above 360s must extend the gate.
         return human_wait_ceiling()
     except Exception:
         return _AUTHORIZATION_GATE_LOCK_TIMEOUT_S
@@ -2273,14 +2279,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
-        elif function_name == "read_preview":
+        elif function_name == "desktop_preview":
             def _execute(next_args: dict) -> Any:
-                from tools.read_preview_tool import read_preview_tool as _read_preview_tool
-                return _read_preview_tool(
-                    start=next_args.get("start"),
-                    count=next_args.get("count"),
-                    callback=getattr(agent, "read_preview_callback", None),
-                )
+                if (next_args.get("action") or "").strip() == "read":
+                    from tools.read_preview_tool import read_preview_tool as _read_preview_tool
+                    return _read_preview_tool(
+                        start=next_args.get("start"),
+                        count=next_args.get("count"),
+                        callback=getattr(agent, "read_preview_callback", None),
+                    )
+                from tools.preview_tool import _handle_preview
+                return _handle_preview(next_args)
             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
@@ -2293,7 +2302,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('read_preview', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('desktop_preview', function_args, tool_duration, result=function_result)}")
         elif function_name == "drive_preview":
             def _execute(next_args: dict) -> Any:
                 from tools.drive_preview_tool import drive_preview_tool as _drive_preview_tool

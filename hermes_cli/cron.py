@@ -6,9 +6,10 @@ pause/resume/run/remove, status, and tick.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -77,9 +78,31 @@ def _builtin_gateway_liveness() -> Optional[bool]:
     try:
         if _active_cron_provider_name() != "builtin":
             return True  # external provider fires jobs without the gateway
-        from hermes_cli.gateway import find_gateway_pids
+        # The gateway runtime lock is held for exactly the gateway's lifetime, so it
+        # is a more reliable "is the ticker's process alive" signal than PID scanning
+        # — and inside the gateway process it short-circuits to True, so the in-gateway
+        # cron tool never emits a false "gateway not running" (find_gateway_pids can
+        # transiently miss the gateway just after a restart).
+        try:
+            from gateway.status import is_gateway_runtime_lock_active
 
-        return bool(find_gateway_pids())
+            if is_gateway_runtime_lock_active():
+                return True
+        except Exception:
+            # A crashing lock probe is "unknown", not "dead" — let the pid
+            # scan below still decide instead of collapsing the whole
+            # tri-state to None.
+            pass
+        from hermes_cli.gateway import (
+            find_gateway_pids,
+            named_profile_served_by_running_multiplexer,
+        )
+
+        if find_gateway_pids():
+            return True
+        # Satellite profile: no local gateway.pid, but the default multiplexer
+        # ticks this profile's cron store (#97120).
+        return named_profile_served_by_running_multiplexer()
     except Exception:
         return None
 
@@ -230,9 +253,19 @@ def cron_list(show_all: bool = False):
 
 def cron_tick():
     """Run due jobs once and exit."""
-    from cron.scheduler import tick
+    from cron.scheduler import CronTickYielded, tick
     try:
         tick(verbose=True)
+    except CronTickYielded as exc:
+        # Not expected on this surface (a one-shot CLI process has no boot
+        # fingerprint, so the yield gate is inert) — but if a future caller
+        # records one, report cleanly instead of a traceback.
+        print(color(f"✗ {exc}", Colors.YELLOW))
+        print(
+            "  A fresher gateway process owns the runtime lock and will fire "
+            "due jobs; this stale process yielded its tick."
+        )
+        return 1
     except OSError as exc:
         # tick() now propagates real lock-acquisition failures (EMFILE,
         # EACCES on open, ...) instead of swallowing them as contention
@@ -260,6 +293,104 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
         )
         if record.get("error"):
             print(f"    {record['error']}")
+
+
+_INCIDENT_STATE_COLORS = {
+    "detected": Colors.RED,
+    "alerted": Colors.YELLOW,
+    "closed": Colors.GREEN,
+}
+
+
+def cron_incidents(args) -> int:
+    """List or acknowledge durable cron failure incidents.
+
+    ``hermes cron incidents [--state <s>]`` lists incidents (the stored error
+    is redacted and truncated at write time, safe for terminal display);
+    ``hermes cron incidents ack <id>`` closes one so its failure ping stays
+    silent until the error signature changes.
+    """
+    from cron.incidents import ack_incident, list_incidents
+
+    action = getattr(args, "incident_action", "list")
+    if action == "ack":
+        incident_id = getattr(args, "incident_id", None)
+        if not incident_id:
+            print(
+                color(
+                    "✗ Incident ID required: hermes cron incidents ack <incident_id>",
+                    Colors.RED,
+                )
+            )
+            return 1
+        if ack_incident(incident_id):
+            print(
+                color(
+                    f"✓ Incident {incident_id} acknowledged (closed).",
+                    Colors.GREEN,
+                )
+            )
+        else:
+            print(
+                color(
+                    f"Incident {incident_id} not found or already closed.",
+                    Colors.YELLOW,
+                )
+            )
+        return 0
+
+    state = getattr(args, "state", None)
+    incidents = list_incidents(state=state)
+    if not incidents:
+        print(color("No cron failure incidents recorded.", Colors.DIM))
+        if state:
+            print(color(f"  (filtered by state '{state}')", Colors.DIM))
+        return 0
+
+    print()
+    print(
+        color(
+            "┌─────────────────────────────────────────────────────────────────────────┐",
+            Colors.CYAN,
+        )
+    )
+    print(
+        color(
+            "│                         Cron Failure Incidents                          │",
+            Colors.CYAN,
+        )
+    )
+    print(
+        color(
+            "└─────────────────────────────────────────────────────────────────────────┘",
+            Colors.CYAN,
+        )
+    )
+    print()
+    for inc in incidents:
+        state_display = color(
+            inc["state"], _INCIDENT_STATE_COLORS.get(inc["state"], Colors.DIM)
+        )
+        print(f"  {color(inc['id'], Colors.YELLOW)}  {state_display}")
+        print(f"    Job:        {inc['job_id']}")
+        print(f"    Type:       {inc.get('failure_type', 'unknown')}")
+        print(f"    First seen: {inc.get('first_seen_at', '?')}")
+        print(f"    Last seen:  {inc.get('last_seen_at', '?')}")
+        error_text = re.sub(r"\s+", " ", inc.get("error") or "").strip()
+        if len(error_text) > 160:
+            error_text = error_text[:157].rstrip() + "..."
+        print(f"    Error:      {error_text}")
+        if inc.get("output_file"):
+            print(f"    Output:     {inc['output_file']}")
+        print()
+    print(
+        color(
+            f"  {len(incidents)} incident(s)  |  ack one with: "
+            "hermes cron incidents ack <id>",
+            Colors.DIM,
+        )
+    )
+    return 0
 
 
 def cron_status():
@@ -294,7 +425,24 @@ def cron_status():
         return
 
     pids = find_gateway_pids()
-    if pids:
+    gateway_alive_via_lock = False
+    if not pids:
+        # Same false-alarm class the cronjob tool fixed (#95947): the pid scan
+        # can transiently miss a live gateway (just after a restart) while the
+        # runtime lock — held for exactly the gateway's lifetime — proves the
+        # ticker's process is alive. Only declare "not running" when both the
+        # scan AND the lock say so.
+        try:
+            from gateway.status import get_running_pid, is_gateway_runtime_lock_active
+
+            if is_gateway_runtime_lock_active():
+                gateway_alive_via_lock = True
+                lock_pid = get_running_pid()
+                if lock_pid:
+                    pids = [lock_pid]
+        except Exception:
+            pass
+    if pids or gateway_alive_via_lock:
         # The gateway PROCESS is alive — but the cron ticker THREAD inside it
         # can die silently, or stay alive while every tick fails. Check both
         # the liveness heartbeat and the last-successful-tick marker so we
@@ -315,16 +463,32 @@ def cron_status():
         hb_age = get_ticker_heartbeat_age()
         ok_age = get_ticker_success_age()
 
-        if hb_age is not None and hb_age > STALE_AFTER:
+        if hb_age is None:
+            # No heartbeat file means the ticker thread has never started.
+            # This can occur when:
+            # - Gateway is running but not in a profile with cron enabled,
+            # - Gateway was started moments ago (heartbeat is written after startup),
+            # - Or a configuration issue is blocking the ticker from starting at all.
+            print(color(
+                "⚠ Gateway is running but the cron ticker has not reported a heartbeat.",
+                Colors.YELLOW,
+            ))
+            if pids:
+                print(f"  PID: {', '.join(map(str, pids))}")
+            print("  Cron jobs will NOT fire until the ticker writes its first heartbeat.")
+            print("  If the gateway just started, wait ~60s and re-run `hermes cron status`.")
+            print("  If heartbeat never appears, restart: hermes gateway restart")
+        elif hb_age > STALE_AFTER:
             # No heartbeat at all → the ticker thread is gone.
             print(color(
                 "⚠ Gateway is running but the cron ticker looks STALLED — "
                 f"no heartbeat for {int(hb_age)}s (expected every ~60s).",
                 Colors.YELLOW,
             ))
-            print(f"  PID: {', '.join(map(str, pids))}")
+            if pids:
+                print(f"  PID: {', '.join(map(str, pids))}")
             print("  Cron jobs may NOT be firing. Restart: hermes gateway restart")
-        elif hb_age is not None and ok_age is not None and ok_age > STALE_AFTER:
+        elif ok_age is not None and ok_age > STALE_AFTER:
             # Loop is alive (fresh heartbeat) but no tick has SUCCEEDED in a
             # long time → ticks are failing every iteration.
             print(color(
@@ -332,7 +496,8 @@ def cron_status():
                 f"succeeded in {int(ok_age)}s — ticks may be failing.",
                 Colors.YELLOW,
             ))
-            print(f"  PID: {', '.join(map(str, pids))}")
+            if pids:
+                print(f"  PID: {', '.join(map(str, pids))}")
             last_error = get_ticker_last_error()
             if last_error:
                 # Show WHY ticks fail — e.g. a root-rewritten jobs.json
@@ -360,7 +525,8 @@ def cron_status():
             print("  Check the gateway log for 'Cron tick error'.")
         else:
             print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
-            print(f"  PID: {', '.join(map(str, pids))}")
+            if pids:
+                print(f"  PID: {', '.join(map(str, pids))}")
             if hb_age is not None:
                 print(f"  Ticker heartbeat: {int(hb_age)}s ago")
     else:
@@ -388,6 +554,131 @@ def _print_active_jobs_summary(jobs) -> None:
             print(f"  Next run: {min(next_runs)}")
     else:
         print("  No active jobs")
+
+
+def _scripts_dir_for_cron() -> Path:
+    """Return the scripts directory used by cron jobs.
+
+    Prefer ``cron.jobs.CRON_DIR.parent`` over a fresh ``get_hermes_home()`` call
+    so tests and profile-aware callers that monkeypatch cron storage inspect the
+    same Hermes home the jobs were loaded from.
+    """
+    from cron.jobs import CRON_DIR
+
+    return CRON_DIR.parent / "scripts"
+
+
+def _script_health_issue(script: str) -> Optional[str]:
+    """Return a human-readable script issue, or ``None`` when the path is OK."""
+    scripts_dir = _scripts_dir_for_cron().resolve()
+    raw = Path(script).expanduser()
+    path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+
+    try:
+        path.relative_to(scripts_dir)
+    except ValueError:
+        return f"script resolves outside HERMES_HOME/scripts: {script!r}"
+
+    if not path.exists():
+        return f"script not found: {path}"
+    if not path.is_file():
+        return f"script path is not a file: {path}"
+    return None
+
+
+# Grace period before an overdue ``next_run_at`` is reported. The ticker runs
+# once a minute and a busy tick can push dispatch a few minutes late; only a
+# next_run_at parked well in the past means the job is silently not firing
+# (ticker dead, gateway down, or a wedged fire-claim).
+_OVERDUE_GRACE_SECONDS = 15 * 60
+
+
+def _next_run_overdue_issue(next_run: str) -> Optional[str]:
+    """Return an issue string when ``next_run_at`` is parked in the past."""
+    from datetime import datetime, timezone
+
+    try:
+        dt = datetime.fromisoformat(next_run.replace("Z", "+00:00"))
+    except ValueError:
+        return f"next_run_at is not a valid timestamp: {next_run!r}"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    overdue_s = (datetime.now(timezone.utc) - dt).total_seconds()
+    if overdue_s > _OVERDUE_GRACE_SECONDS:
+        hours = overdue_s / 3600
+        if hours >= 1:
+            return f"next_run_at is {hours:.1f}h overdue — job is not firing (is the scheduler running?)"
+        return f"next_run_at is {overdue_s / 60:.0f}m overdue — job is not firing (is the scheduler running?)"
+    return None
+
+
+def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
+    issues: List[str] = []
+
+    last_status = str(job.get("last_status") or "").strip().lower()
+    if last_status and last_status != "ok":
+        err = str(job.get("last_error") or "unknown error").strip()
+        issues.append(f"last run failed: {err}")
+
+    delivery_err = str(job.get("last_delivery_error") or "").strip()
+    if delivery_err:
+        issues.append(f"last delivery failed: {delivery_err}")
+
+    if job.get("enabled", True) and job.get("state") not in {"paused", "completed"}:
+        next_run = str(job.get("next_run_at") or "").strip()
+        if not next_run:
+            issues.append("active job has no next_run_at")
+        else:
+            overdue = _next_run_overdue_issue(next_run)
+            if overdue:
+                issues.append(overdue)
+
+    script = str(job.get("script") or "").strip()
+    if job.get("no_agent") and not script:
+        issues.append("no-agent job has no script")
+    if script:
+        script_issue = _script_health_issue(script)
+        if script_issue:
+            issues.append(script_issue)
+
+    workdir = str(job.get("workdir") or "").strip()
+    if workdir and not Path(workdir).expanduser().exists():
+        issues.append(f"workdir not found: {workdir}")
+
+    return issues
+
+
+def cron_doctor() -> int:
+    """Run read-only cron health checks and return a shell-friendly status."""
+    from cron.jobs import list_jobs
+
+    jobs = list_jobs(include_disabled=False)
+    findings: List[tuple[Dict[str, Any], List[str]]] = []
+    for job in jobs:
+        issues = _cron_doctor_issues_for_job(job)
+        if issues:
+            findings.append((job, issues))
+
+    if not findings:
+        print(color("✓ Cron doctor found no issues", Colors.GREEN))
+        if jobs:
+            print(color(f"  Checked {len(jobs)} active job(s).", Colors.DIM))
+        else:
+            print(color("  No active jobs configured.", Colors.DIM))
+        return 0
+
+    issue_count = sum(len(issues) for _, issues in findings)
+    print(color(f"Cron doctor found {issue_count} issue(s) across {len(findings)} job(s):", Colors.YELLOW))
+    print()
+    for job, issues in findings:
+        job_id = job.get("id", "?")
+        name = job.get("name", "(unnamed)")
+        print(f"  {color(job_id, Colors.YELLOW)} {name}")
+        for issue in issues:
+            print(f"    - {issue}")
+    print()
+    print(color("Next: fix the listed job config, then run `hermes cron doctor` again.", Colors.DIM))
+    return 1
 
 
 def cron_create(args):
@@ -687,12 +978,18 @@ def cron_command(args):
         cron_status()
         return 0
 
+    if subcmd == "doctor":
+        return cron_doctor()
+
     if subcmd == "tick":
         return cron_tick()
 
     if subcmd in {"runs", "history"}:
         cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
         return 0
+
+    if subcmd == "incidents":
+        return cron_incidents(args)
 
     if subcmd == "notepad":
         return cron_notepad(args)
@@ -716,5 +1013,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
     sys.exit(1)

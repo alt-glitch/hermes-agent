@@ -10,12 +10,18 @@
  * This keeps those transient indicators OUT of the transcript. Renders nothing
  * when both are idle.
  *
+ * Idle/auto compaction (upstream 3a542bbef4d1 — #97239): while the store's
+ * `compacting` latch is set the spinner stays visible even though
+ * `info.running` is false, and the verb FREEZES on "compacting" — later
+ * status/thinking traffic updates the system note, not the visible verb — so a
+ * between-turns compaction pause never reads as a hung or vanished session.
+ *
  * ARCHITECTURE (per the skins-spec adversarial gate): the animation is a BOUNDED
- * `setInterval` ARMED only while `info.running` and CLEARED on stop/cleanup —
- * NOT a `setFrameCallback` (the lone permanent frame callback is the windowing
- * poll; a second per-frame timer would fight it and defeat idle-GC). The tick
- * rate is ~10fps, far below a render-loop cadence, and the timer never runs while
- * idle, so it adds zero idle cost.
+ * `setInterval` ARMED only while `info.running` or `compacting` and CLEARED on
+ * stop/cleanup — NOT a `setFrameCallback` (the lone permanent frame callback is
+ * the windowing poll; a second per-frame timer would fight it and defeat
+ * idle-GC). The tick rate is ~10fps, far below a render-loop cadence, and the
+ * timer never runs while idle, so it adds zero idle cost.
  */
 import { createEffect, createSignal, onCleanup, Show } from 'solid-js'
 
@@ -28,13 +34,15 @@ const TICK_MS = 100 // ~10fps — well below the render loop; never runs while i
 
 export function StatusLine(props: { store: SessionStore }) {
   const theme = useTheme()
-  const verb = () => props.store.state.status
-  const running = () => props.store.state.info.running === true && props.store.state.hint === undefined
+  const compacting = () => props.store.state.compacting
+  // Frozen verb for the whole compaction pause; the raw status text otherwise.
+  const verb = () => (compacting() ? 'compacting' : props.store.state.status)
+  const busy = () => (props.store.state.info.running === true || compacting()) && props.store.state.hint === undefined
 
-  // Animation frame counter — only advances while a turn runs.
+  // Animation frame counter — only advances while a turn runs (or compaction).
   const [frame, setFrame] = createSignal(0)
   createEffect(() => {
-    if (!running()) return // disarmed when idle — no timer, no cost.
+    if (!busy()) return // disarmed when idle — no timer, no cost.
     const id = setInterval(() => setFrame(f => f + 1), TICK_MS)
     onCleanup(() => clearInterval(id))
   })
@@ -62,12 +70,12 @@ export function StatusLine(props: { store: SessionStore }) {
 
   const hintText = () => props.store.state.hint
   // Three display states, in priority order:
-  //   running → animated face (+ verb if present), accent
-  //   hint    → the hint text, warn
-  //   idle    → nothing
+  //   busy (running or compacting) → animated face (+ verb if present), accent
+  //   hint                         → the hint text, warn
+  //   idle                         → nothing
   return (
     <Show
-      when={running()}
+      when={busy()}
       fallback={
         <Show when={hintText()}>
           {text => (

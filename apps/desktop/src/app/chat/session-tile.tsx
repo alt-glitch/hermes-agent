@@ -165,7 +165,13 @@ function TileChat({
     [ownerRoute, requestGateway]
   )
 
-  const { selectModel } = useModelControls({ queryClient, requestGateway: requestTileGateway })
+  const { selectModel } = useModelControls({
+    cacheOwnerConnectionId: ownerRoute?.connectionId || undefined,
+    cacheProfile: ownerRoute?.targetProfile || ownerRoute?.profile || undefined,
+    queryClient,
+    requestGateway: requestTileGateway
+  })
+
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const cwd = useStore(view.$cwd)
   const gatewayOpen = useStore($gatewayState) === 'open'
@@ -232,13 +238,21 @@ function TileChat({
     () =>
       gatewayOpen ? (
         <ModelMenuPanel
-          gateway={gateway || undefined}
           onSelectModel={selectModel}
-          profile={ownerRoute?.profile || activeGatewayProfile}
+          ownerConnectionId={ownerRoute?.connectionId || undefined}
+          profile={ownerRoute?.targetProfile || ownerRoute?.profile || activeGatewayProfile}
           requestGateway={requestTileGateway}
         />
       ) : null,
-    [activeGatewayProfile, gateway, gatewayOpen, ownerRoute?.profile, requestTileGateway, selectModel]
+    [
+      activeGatewayProfile,
+      gatewayOpen,
+      ownerRoute?.connectionId,
+      ownerRoute?.profile,
+      ownerRoute?.targetProfile,
+      requestTileGateway,
+      selectModel
+    ]
   )
 
   return (
@@ -247,6 +261,8 @@ function TileChat({
         <ChatView
           gateway={gateway}
           modelMenuContent={modelMenuContent}
+          modelOptionsOwnerConnectionId={ownerRoute?.connectionId || undefined}
+          modelOptionsProfile={ownerRoute?.targetProfile || ownerRoute?.profile || activeGatewayProfile}
           onAddContextRef={addContextRefAttachment}
           onAddUrl={onAddUrl}
           onAttachDroppedItems={composer.attachDroppedItems}
@@ -269,6 +285,7 @@ function TileChat({
           onThreadMessagesChange={actions.handleThreadMessagesChange}
           onToggleSelectedPin={noop}
           onTranscribeAudio={tileTranscribeAudio}
+          requestModelOptionsForOwner={requestTileGateway}
         />
       </ComposerScopeProvider>
     </SessionViewProvider>
@@ -647,8 +664,6 @@ export function WorkspaceTabMenu({ children }: { children: React.ReactElement })
  *  `$sessions`). Tiles dock against main on the chosen edge, flex width. */
 export const watchSessionTiles = paneMirror<SessionTile>({
   source: $sessionTiles,
-  workspaceMode: tile => tile.workspaceMode ?? 'sessions',
-  workspaceOwnerKey: tile => tile.workspaceOwnerKey,
   // $projectTree: a tile whose session is older than the recents page resolves
   // its title through the tree, which loads after the tiles register. (The tab's
   // status dot subscribes to color/state itself, so it needs no `also` entry.)

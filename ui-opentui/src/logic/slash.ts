@@ -573,8 +573,9 @@ const resumeCmd: ClientHandler = async (arg, ctx) => {
 
 /**
  * Flatten `model.options` into grouped picker rows (Epic 7; v2.1 availability):
- * group = the provider's display ("lab") name, haystacks = slug + lab name (so
- * `oai`/`copilot`/`anthropic` fuzzy-match the whole group), value = the FULL
+ * group = the provider's display ("lab") name, haystacks = slug + lab name +
+ * picker-only model aliases (so `oai`/`copilot`/`anthropic`, `kimi`, and
+ * `ox alpha` find the expected rows), value = the FULL
  * switch arg `<model> --provider <slug>` so picking a model under a different
  * provider actually switches provider+model (the gateway's
  * `_apply_model_switch` parses `--provider` via parse_model_flags). The current
@@ -587,6 +588,17 @@ const resumeCmd: ClientHandler = async (arg, ctx) => {
  * `unavailable` hint row each (`no API key — set <ENV_VAR>`): hidden by
  * default, revealed dimmed + non-selectable by the picker's Ctrl+U toggle.
  */
+const MODEL_SEARCH_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  k3: ['kimi-k3', 'kimi'],
+  'x-preview-f-free': ['ox-alpha', 'ox']
+}
+
+/** Extra picker-only search tokens. The wire id remains the row label/value,
+ * preserving exact-id ranking and the provider request contract. */
+export function modelSearchAliases(model: string): readonly string[] {
+  return MODEL_SEARCH_ALIASES[model.trim().toLowerCase()] ?? []
+}
+
 export function mapModelOptions(opts: unknown): PickerItem[] {
   if (!opts || typeof opts !== 'object') return []
   const providers = (opts as { providers?: unknown }).providers
@@ -616,7 +628,9 @@ export function mapModelOptions(opts: unknown): PickerItem[] {
       const item: PickerItem = {
         description: `${providerName}${Number.isFinite(count) && count > 0 ? ` · ${count} use${count === 1 ? '' : 's'}` : ''}`,
         group,
-        haystacks: [provider, providerName, readStr(row, 'base_url') ?? ''].filter(Boolean),
+        haystacks: [provider, providerName, readStr(row, 'base_url') ?? '', ...modelSearchAliases(model)].filter(
+          Boolean
+        ),
         label: model,
         value: `${model} --provider ${provider}`
       }
@@ -660,7 +674,7 @@ export function mapModelOptions(opts: unknown): PickerItem[] {
       // then the slug comparison, then "no provider known at all").
       if (m === current && (rowCurrent || currentProvider === slug || !currentProvider)) item.current = true
       if (lab) item.group = lab
-      const haystacks = [slug, lab].filter(Boolean)
+      const haystacks = [slug, lab, ...modelSearchAliases(m)].filter(Boolean)
       if (haystacks.length) item.haystacks = haystacks
       items.push(item)
     }
@@ -2118,7 +2132,7 @@ const subscriptionCmd: ClientHandler = async (_arg, ctx, flight) => {
   }
 }
 
-/** `/bg <prompt>` (aliases /background, /btw) — launch a background PROMPT via
+/** `/bg <prompt>` (alias /background) — launch a background PROMPT via
  *  `prompt.background` (Ink parity): echo "bg <id> started" and track the task so
  *  the `bg: N` badge counts it until `background.complete` clears it. NOT the OS
  *  process panel (that's /processes). */
@@ -2139,6 +2153,25 @@ const backgroundCmd: ClientHandler = async (arg, ctx) => {
     }
   } catch (error) {
     ctx.pushSystem(`/bg: ${error instanceof Error ? error.message : 'failed'}`)
+  }
+}
+
+/** `/btw <question>` — ask against a read-only snapshot of this conversation.
+ * The auxiliary answer arrives asynchronously as `btw.complete`; unlike /bg,
+ * this never enters the background-prompt task counter. */
+const btwCmd: ClientHandler = async (arg, ctx) => {
+  const text = arg.trim()
+  if (!text) {
+    ctx.pushSystem('/btw <question> — ask about this conversation')
+    return
+  }
+  try {
+    const response = await ctx.request('prompt.btw', { session_id: ctx.sessionId(), text })
+    const taskId = readStr(response, 'task_id')
+    if (taskId) ctx.pushSystem(`btw ${taskId} — answering from a conversation snapshot`)
+    else ctx.pushSystem('/btw: no task id returned')
+  } catch (error) {
+    ctx.pushSystem(`/btw: ${error instanceof Error ? error.message : 'failed'}`)
   }
 }
 
@@ -2919,7 +2952,7 @@ const CLIENT: Record<string, ClientHandler> = {
   upgrade: subscriptionCmd,
   browser: browserCmd,
   busy: busyCmd,
-  btw: backgroundCmd,
+  btw: btwCmd,
   clear: freshSessionCmd(false),
   density: densityCmd,
   compress: compressCmd,

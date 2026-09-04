@@ -37,6 +37,7 @@ import {
   type SlashContext
 } from '../logic/slash.ts'
 import { normalizeSlashSearchQuery, scoreSlashMenuItem } from '../logic/slashFuzzy.ts'
+import { fuzzyFilter } from '../logic/fuzzy.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
 import { isWakeUserDisabled, setWakeUserDisabled } from '../logic/wake.ts'
 import type { ConfirmRequest, Message, PickerItem } from '../logic/store.ts'
@@ -553,6 +554,7 @@ interface Probe {
   compressionKeys: string[]
   submitAccept: { value: boolean }
   browserStates: Array<{ connected: boolean; url?: string }>
+  bgTasks: string[]
 }
 
 function makeCtx(request: (method: string, params: Record<string, unknown>) => Promise<unknown>): Probe {
@@ -607,6 +609,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const compressionKeys: string[] = []
   const submitAccept = { value: true }
   const browserStates: Probe['browserStates'] = []
+  const bgTasks: string[] = []
   const ctx: SlashContext = {
     guardBusySessionSwitch: () => busy.value,
     newSession: (message, title) => newSessions.push([message, title]),
@@ -718,7 +721,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     openBackgroundPanel: () => {},
     openBilling: overlay => billed.push(overlay),
     openSubscription: overlay => subscribed.push(overlay),
-    addBgTask: () => {},
+    addBgTask: id => bgTasks.push(id),
     openPager: (title, text) => paged.push({ text, title }),
     openPicker: p => pickers.push(p),
     openSessionPicker: tab => sessionPickers.push(tab),
@@ -768,6 +771,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     reasoningFullFlag,
     busyMode,
     browserStates,
+    bgTasks,
     queued,
     queueAccept,
     prefills,
@@ -797,6 +801,35 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     system
   }
 }
+
+describe('/btw snapshot question parity', () => {
+  test('/btw calls prompt.btw and never enters the background task counter', async () => {
+    const p = makeCtx(async method => (method === 'prompt.btw' ? { task_id: 'btw-7' } : {}))
+
+    await dispatchSlash('/btw why did the plan change?', p.ctx)
+
+    expect(p.calls).toEqual([
+      { method: 'prompt.btw', params: { session_id: 'sid-1', text: 'why did the plan change?' } }
+    ])
+    expect(p.bgTasks).toEqual([])
+    expect(p.system).toEqual(['btw btw-7 — answering from a conversation snapshot'])
+  })
+
+  test('/bg and /background remain prompt.background aliases and track returned tasks', async () => {
+    let next = 0
+    const p = makeCtx(async method => (method === 'prompt.background' ? { task_id: `bg-${String(++next)}` } : {}))
+
+    await dispatchSlash('/bg first', p.ctx)
+    await dispatchSlash('/background second', p.ctx)
+
+    expect(p.calls).toEqual([
+      { method: 'prompt.background', params: { session_id: 'sid-1', text: 'first' } },
+      { method: 'prompt.background', params: { session_id: 'sid-1', text: 'second' } }
+    ])
+    expect(p.bgTasks).toEqual(['bg-1', 'bg-2'])
+    expect(p.system).toEqual(['bg bg-1 started', 'bg bg-2 started'])
+  })
+})
 
 describe('voice command parity', () => {
   test('status decodes the direct toggle response and renders exact mode requirements', async () => {
@@ -1851,6 +1884,33 @@ describe('dispatchSlash — client commands', () => {
       value: 'qwen3.5:27b --provider local-ollama'
     })
     expect(buildModelTabs(items)).toEqual(['Recent', 'Most used', 'Local Ollama'])
+  })
+
+  test('picker-only aliases find x-preview-f-free and k3 without changing ids or exact-id ranking', () => {
+    const items = mapModelOptions({
+      model: 'other',
+      provider: 'nous',
+      providers: [
+        {
+          authenticated: true,
+          models: ['x-preview-f-free', 'x-preview-f', 'k3', 'kimi-k2'],
+          name: 'Nous Research',
+          slug: 'nous'
+        }
+      ]
+    })
+    const rank = (query: string) =>
+      fuzzyFilter(query, items, item => [
+        { text: item.label, weight: 2 },
+        ...(item.haystacks ?? []).map(text => ({ text }))
+      ]).map(item => item.label)
+
+    expect(rank('ox')[0]).toBe('x-preview-f-free')
+    expect(rank('ox alpha')[0]).toBe('x-preview-f-free')
+    expect(rank('kimi')[0]).toBe('k3')
+    expect(rank('x-preview-f-free')[0]).toBe('x-preview-f-free')
+    expect(items.find(item => item.label === 'x-preview-f-free')?.value).toBe('x-preview-f-free --provider nous')
+    expect(items.find(item => item.label === 'k3')?.value).toBe('k3 --provider nous')
   })
 
   test('/model registers the provider-tab seam (buildModelTabs); /skills clears it back to stripless', async () => {

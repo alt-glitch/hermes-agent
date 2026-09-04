@@ -9,6 +9,20 @@
 
 export type ConfigSyncKind = 'baseline' | 'change'
 
+/** `display.status_bar.fields` visibility filter. `null` means the user has
+ * not supplied a usable filter, so the status bar renders its default set. */
+export type StatusBarFields = ReadonlySet<string> | null
+
+/** Ink-compatible `display.status_bar.fields` normalization. A non-empty list
+ * filters named segments; missing, empty, or wholly blank/malformed input uses
+ * defaults. Unknown names survive harmlessly because the renderer only checks
+ * the names it understands. */
+export function normalizeStatusBarFields(raw: unknown): StatusBarFields {
+  if (!Array.isArray(raw) || raw.length === 0) return null
+  const cleaned = raw.map(value => String(value).trim().toLowerCase()).filter(Boolean)
+  return cleaned.length > 0 ? new Set(cleaned) : null
+}
+
 export interface ConfigSyncPlan {
   readonly kind: ConfigSyncKind
   readonly mcpRev: string

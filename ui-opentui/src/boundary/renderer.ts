@@ -65,6 +65,16 @@ export interface RendererOptions {
   readonly ignoreSigint?: boolean
 }
 
+/** Ghostty supports the Kitty keyboard protocol, but its disambiguate-mode
+ * implementation currently strips Alt from Backspace. Match Hermes' existing
+ * terminal detection paths and leave OpenTUI on legacy input there; Kitty and
+ * WezTerm keep the richer protocol. */
+export function shouldUseKittyKeyboard(env: NodeJS.ProcessEnv = process.env): boolean {
+  const termProgram = (env.TERM_PROGRAM ?? '').trim()
+  const term = (env.TERM ?? '').trim().toLowerCase()
+  return termProgram !== 'ghostty' && term !== 'xterm-ghostty'
+}
+
 /**
  * Acquire a CliRenderer inside the current scope and register its release.
  * Returns the renderer plus a Deferred that resolves when the renderer is
@@ -104,7 +114,7 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
           exitSignals: options.ignoreSigint
             ? ['SIGTERM', 'SIGQUIT', 'SIGHUP']
             : ['SIGINT', 'SIGTERM', 'SIGQUIT', 'SIGHUP'],
-          useKittyKeyboard: {},
+          useKittyKeyboard: shouldUseKittyKeyboard() ? {} : null,
           useMouse: options.mouse
         })
         guardRendererErrorHandlers(created, preexisting)

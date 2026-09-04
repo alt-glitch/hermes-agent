@@ -20,9 +20,49 @@ import { ThemeProvider } from '../view/theme.tsx'
 import { toolNameStyle } from '../view/toolPart.tsx'
 import { BashToolBody, commandFitsHeader, commandOf } from '../view/tools/bashTool.tsx'
 import { diffOutputPlan, FileToolBody } from '../view/tools/fileTool.tsx'
+import { todoRenderer, todosOf } from '../view/tools/todoTool.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
 type Store = ReturnType<typeof createSessionStore>
+
+describe('todo tool nested rendering', () => {
+  const part: ToolPartState = {
+    args: {},
+    id: 'todo-1',
+    name: 'todo',
+    result: {
+      todos: [
+        { content: 'root', id: 'root', status: 'pending' },
+        { content: 'child', id: 'child', parent: 'root', status: 'in_progress' },
+        { content: 'grandchild', id: 'grand', parent: 'child', status: 'pending' },
+        { content: 'dangling', id: 'dangling', parent: 'missing', status: 'pending' },
+        { content: 'cycle a', id: 'cycle-a', parent: 'cycle-b', status: 'pending' },
+        { content: 'cycle b', id: 'cycle-b', parent: 'cycle-a', status: 'pending' }
+      ]
+    },
+    state: 'complete',
+    type: 'tool'
+  }
+
+  test('captures parent ids and emits DFS indentation while dangling/cyclic items stay flat', () => {
+    expect(todosOf(part).map(todo => [todo.id, todo.parent])).toEqual([
+      ['root', undefined],
+      ['child', 'root'],
+      ['grand', 'child'],
+      ['dangling', 'missing'],
+      ['cycle-a', 'cycle-b'],
+      ['cycle-b', 'cycle-a']
+    ])
+    expect(todoRenderer.lines?.(part)).toEqual([
+      '☐ root',
+      '  ▣ child',
+      '    ☐ grandchild',
+      '☐ dangling',
+      '☐ cycle a',
+      '☐ cycle b'
+    ])
+  })
+})
 
 /** Seed a settled assistant turn containing exactly the given tool call. */
 function seedTool(store: Store, start: Record<string, unknown>, complete: Record<string, unknown>) {

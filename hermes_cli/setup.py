@@ -102,7 +102,7 @@ _DEFAULT_PROVIDER_MODELS = {
         "google/gemini-3-flash-preview", "google/gemini-3.1-flash-lite-preview",
         "google/gemini-2.5-pro", "google/gemini-2.5-flash",
     ],
-    "zai": ["glm-5.2", "glm-5.1", "glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
+    "zai": ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
     "kimi-coding": ["kimi-k3", "kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
     "kimi-coding-cn": ["kimi-k3", "kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
     "stepfun": ["step-3.5-flash", "step-3.5-flash-2603"],
@@ -112,8 +112,8 @@ _DEFAULT_PROVIDER_MODELS = {
     "ai-gateway": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5", "google/gemini-3-flash"],
     "kilocode": ["anthropic/claude-sonnet-5", "anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview", "google/gemini-3-flash-preview"],
     "opencode-zen": ["x-preview-f-free", "gpt-5.6-sol", "gpt-5.4", "gpt-5.3-codex", "claude-opus-5", "claude-sonnet-5", "gemini-3.7-flash", "glm-5.2", "kimi-k3", "minimax-m3"],
-    "opencode-free": ["x-preview-f-free", "hy3-free", "laguna-s-2.1-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free", "muse-spark-1.2-contributor-free"],
-    "opencode-go": ["kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "gpt-5.6-luna", "grok-4.5", "glm-5.3", "glm-5.2", "mimo-v2.5-pro", "mimo-v2.5", "minimax-m3", "minimax-m2.7", "qwen3.8-max", "qwen3.7-max", "deepseek-v4-pro", "hy3"],
+    "opencode-free": ["deepseek-v4-flash-free", "hy3-free", "mimo-v2.5-free", "laguna-s-2.1-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free", "muse-spark-1.2-contributor-free"],
+    "opencode-go": ["kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "gpt-5.6-luna", "grok-4.5", "glm-5.3", "glm-5.3-flash", "glm-5.2", "mimo-v2.5-pro", "mimo-v2.5", "minimax-m3", "minimax-m2.7", "qwen3.8-max", "qwen3.7-max", "deepseek-v4-pro", "hy3"],
     "huggingface": [
         "Qwen/Qwen3.5-397B-A17B", "Qwen/Qwen3-235B-A22B-Thinking-2507",
         "Qwen/Qwen3-Coder-480B-A35B-Instruct", "deepseek-ai/DeepSeek-R1-0528",
@@ -513,7 +513,7 @@ def _print_setup_summary(config: dict, hermes_home):
         tool_status.append(("Vision (image analysis)", False, "run 'hermes setup' to configure"))
 
 
-    # Web tools (Exa, Parallel, Firecrawl, or Tavily)
+    # Web tools (Exa, Parallel, Firecrawl, or Keenable)
     if subscription_features.web.managed_by_nous:
         tool_status.append(("Web Search & Extract (Nous subscription)", True, None))
     elif subscription_features.web.available:
@@ -522,7 +522,7 @@ def _print_setup_summary(config: dict, hermes_home):
             label = f"Web Search & Extract ({subscription_features.web.current_provider})"
         tool_status.append((label, True, None))
     else:
-        tool_status.append(("Web Search & Extract", False, "EXA_API_KEY, PARALLEL_API_KEY, FIRECRAWL_API_KEY/FIRECRAWL_API_URL, TAVILY_API_KEY, or SEARXNG_URL"))
+        tool_status.append(("Web Search & Extract", False, "EXA_API_KEY, PARALLEL_API_KEY, FIRECRAWL_API_KEY/FIRECRAWL_API_URL, KEENABLE_API_KEY, or SEARXNG_URL"))
 
     # Browser tools (local Chromium, Camofox, Browserbase, Browser Use, or Firecrawl)
     browser_provider = subscription_features.browser.current_provider
@@ -1429,6 +1429,26 @@ def setup_terminal_backend(config: dict):
         backend_to_idx["singularity"] = next_idx
         next_idx += 1
 
+    # Plugin-registered terminal backends (standalone plugin repos installed
+    # under ~/.hermes/plugins/). Fail-soft: a broken plugin must not take the
+    # setup wizard down.
+    plugin_backend_names = []
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()  # idempotent — plugin state may not be loaded yet
+        from agent.terminal_env_registry import list_providers
+
+        for _provider in list_providers():
+            _pname = _provider.name.strip().lower()
+            terminal_choices.append(f"{_provider.display_name} - {_provider.description}")
+            idx_to_backend[next_idx] = _pname
+            backend_to_idx[_pname] = next_idx
+            plugin_backend_names.append(_pname)
+            next_idx += 1
+    except Exception:
+        pass
+
     # Add keep current option
     keep_current_idx = next_idx
     terminal_choices.append(f"Keep current ({current_backend})")
@@ -1669,6 +1689,18 @@ def setup_terminal_backend(config: dict):
                     print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
 
         _prompt_vercel_sandbox_settings(config)
+
+    elif selected_backend in plugin_backend_names:
+        try:
+            from agent.terminal_env_registry import get_provider
+
+            _provider = get_provider(selected_backend)
+            print_success(f"Terminal backend: {_provider.display_name}")
+            for _line in _provider.setup_instructions():
+                print_info(_line)
+            _provider.post_setup()
+        except Exception as exc:
+            print_warning(f"Backend plugin setup hook failed: {exc}")
 
     elif selected_backend == "ssh":
         print_success("Terminal backend: SSH")
@@ -3393,28 +3425,64 @@ def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool):
     print_info("  Configure all settings:    hermes setup")
     if gateway_choice != 0:
         print_info("  Connect Telegram/Discord:  hermes setup gateway")
+    _print_macos_fda_tip()
     print()
 
     _print_setup_summary(config, hermes_home)
 
 
+def _print_macos_fda_tip() -> None:
+    """One-time macOS onboarding tip: a single Full Disk Access grant kills
+    every per-folder permission prompt, permanently (issue #52010 follow-up).
+
+    Uses the same prompt-free probe as doctor's check_macos_full_disk_access
+    (the TCC db dir is FDA-gated but probing it never triggers a dialog).
+    Silent on non-macOS and when FDA is already granted or indeterminate.
+    """
+    if sys.platform != "darwin":
+        return
+    tcc_dir = Path.home() / "Library" / "Application Support" / "com.apple.TCC"
+    try:
+        os.listdir(tcc_dir)
+        return  # already granted — nothing to teach
+    except PermissionError:
+        pass
+    except OSError:
+        return  # indeterminate — don't nag
+    print()
+    print_info("  macOS tip: silence ALL folder permission prompts with one switch —")
+    print_info("  System Settings → Privacy & Security → Full Disk Access → enable")
+    print_info("  your terminal (and Hermes.app if you use Desktop), or run:")
+    print_info("    open \"x-apple.systempreferences:com.apple.preference"
+               ".security?Privacy_AllFiles\"")
+    print_info("  The grant is permanent — it survives every Hermes update.")
+
+
 def _blank_slate_minimal_toolsets(config: dict):
     """Write the minimal toolset state for a Blank Slate install.
 
-    Only ``file`` and ``terminal`` are enabled. Two layers enforce this:
+    Only ``file``, ``terminal``, ``vision``, and ``skills`` are enabled.
+    Vision is part of
+    the core surface: ``read_file`` cannot read images and its own description
+    points at ``vision_analyze``, so an agent without it can't see screenshots
+    or image files at all. Skills stay on because the essential
+    ``hermes-agent`` skill (the agent's operating manual for driving,
+    configuring, and troubleshooting Hermes) is always seeded — without
+    ``skill_view`` it would be unloadable. Two layers enforce the selection:
 
-    1. ``platform_toolsets["cli"] = ["file", "terminal"]`` — an explicit list of
+    1. ``platform_toolsets["cli"] = ["file", "skills", "terminal", "vision"]``
+       — an explicit list of
        configurable keys, which the resolver treats as authoritative
        (``has_explicit_config``) so default toolsets aren't re-expanded.
     2. ``agent.disabled_toolsets`` — a global hard-suppression list (applied last
        in ``_get_platform_tools``, overriding every other path including the
        non-configurable platform-toolset recovery that would otherwise re-add
-       toolsets like ``kanban``). We list every known toolset except the two we
+       toolsets like ``kanban``). We list every known toolset except the ones we
        keep, guaranteeing a true blank slate regardless of platform/recovery
        quirks. The user re-enables any of them later via ``hermes tools`` (which
        rewrites ``platform_toolsets``) or by editing ``agent.disabled_toolsets``.
     """
-    keep = {"file", "terminal"}
+    keep = {"file", "terminal", "vision", "skills"}
     config.setdefault("platform_toolsets", {})["cli"] = sorted(keep)
 
     try:
@@ -3491,9 +3559,11 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
     print_info("to run an agent, then you choose whether to stop there or walk")
     print_info("through enabling more — opting in to exactly what you want.")
     print_info("")
-    print_info("Forced on: Provider & Model, File Operations, Terminal.")
-    print_info("Everything else (web, browser, code exec, vision, memory,")
-    print_info("delegation, cron, skills, plugins, MCP, …) starts disabled.")
+    print_info("Forced on: Provider & Model, File Operations, Terminal, Vision, Skills.")
+    print_info("Everything else (web, browser, code exec, memory,")
+    print_info("delegation, cron, plugins, MCP, …) starts disabled. The")
+    print_info("essential `hermes-agent` skill is always kept so the agent")
+    print_info("can help you drive and configure Hermes itself.")
     print()
 
     # ── Step 1: Provider & Model (REQUIRED — the agent cannot run without it) ──
@@ -3511,7 +3581,7 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
     save_config(config)
     print()
     print_success("Minimal baseline applied:")
-    print_info("  Toolsets: file, terminal (everything else off)")
+    print_info("  Toolsets: file, terminal, vision, skills (everything else off)")
     print_info("  Compression, memory, checkpoints, smart routing: off")
 
     # ── The fork: stop here, or walk through enabling things ──
@@ -3529,10 +3599,12 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
     if path == 0:
         save_config(config)
         # Blank Slate means no bundled skills; record the opt-out so future
-        # `hermes update` runs don't re-inject them.
+        # `hermes update` runs don't re-inject them. Essential skills (the
+        # `hermes-agent` operating manual) are still seeded by the sync.
         try:
-            from tools.skills_sync import set_bundled_skills_opt_out
+            from tools.skills_sync import set_bundled_skills_opt_out, sync_skills
             set_bundled_skills_opt_out(True)
+            sync_skills(quiet=True)
         except Exception as exc:
             logger.debug("blank-slate skill opt-out error: %s", exc)
         print()
@@ -3573,7 +3645,11 @@ def _blank_slate_walkthrough(config: dict, hermes_home):
             print_success(f"Seeded {copied} bundled skills.")
         else:
             set_bundled_skills_opt_out(True)
-            print_info("No skills seeded. A .no-bundled-skills marker keeps future")
+            # Essential skills (the `hermes-agent` operating manual) are
+            # still seeded even for an opted-out profile.
+            sync_skills(quiet=True)
+            print_info("No skills seeded (except the essential `hermes-agent`")
+            print_info("skill). A .no-bundled-skills marker keeps future")
             print_info("`hermes update` runs from re-injecting them. Opt back in any")
             print_info("time with `hermes skills opt-in --sync`.")
     except Exception as exc:

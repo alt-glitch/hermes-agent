@@ -960,7 +960,7 @@ abandons its own. Instead, create a reconciliation card assigned to a **third,
 neutral profile** with **both** conflicted cards linked as parents: the parent
 links carry both sides' completion summaries into the reconciler's context, so
 it receives both diffs *and* both intents. The bundled
-[`merge-reconciler` skill](https://github.com/NousResearch/hermes-agent/blob/main/skills/autonomous-ai-agents/merge-reconciler/SKILL.md)
+[`agent-merge-conflict-arbiter` optional skill](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/autonomous-ai-agents/agent-merge-conflict-arbiter/SKILL.md)
 gives that worker the full procedure: classify each conflicted hunk, resolve
 impartially, verify, and hand back a summary naming every decision.
 
@@ -984,7 +984,7 @@ path** should create a dedicated refactor/decomposition card for that file
 **before** queuing more work that touches it — splitting the magnet file is
 cheaper than reconciling every future collision it would cause. For conflicts
 that have *already* happened, use the reconciliation-card pattern above with
-the `merge-reconciler` skill; hotspot flagging is the upstream fix that keeps
+the `agent-merge-conflict-arbiter` optional skill; hotspot flagging is the upstream fix that keeps
 the reconciler from becoming a standing lane.
 
 ## Multi-tenant usage
@@ -1034,6 +1034,8 @@ A subscription removes itself automatically once the task reaches `done` or `arc
 | `wake` | no | yes | You only want the agent to act on the event, with no separate ping. |
 
 A "wake" forges a synthetic inbound message to the destination gateway agent so it takes a normal turn (reads the comment + result, reasons, replies) instead of getting a one-line passive notification. It only fires when the notifier runs inside a live gateway process; otherwise a `notify+wake` subscription still delivers its passive message, while a `wake`-only subscription does nothing in that process.
+
+**Which events wake.** The ones that hand a decision back to the origin: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `review_requested` (a worker finished the implementation and handed off via `kanban_request_review`) and `block_loop_detected` (the task was routed to `triage` after repeated blocks). `status`, `archived` and `unblocked` are delivered but never wake — they are bookkeeping transitions, not decisions. When a `completed` or `review_requested` event carries a summary, that handoff rides the wake turn, so the woken agent sees what the worker actually did.
 
 `--chat-type` (`dm` | `group` | `channel` | `thread`) records the originating chat's type so a woken turn resolves the operator's **real** session: `build_session_key` keys groups, channels, and threads differently from DMs, so an inaccurate `chat_type` would route the wake into a separate, context-less session. The `/kanban` auto-subscribe and slash-command paths capture this automatically — you only set it by hand when subscribing a chat from a script or cron. Omit it to leave an existing subscription unchanged (new subscriptions default to `dm`).
 

@@ -111,16 +111,19 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("deepseek/deepseek-v4-flash-0731",        "dated snapshot of v4-flash"),
     # Qwen
     ("qwen/qwen3.8-max",                       ""),
+    ("qwen/qwen3.8-flash",                     ""),
     # MoonshotAI
     ("moonshotai/kimi-k3",                     "recommended"),
     # MiniMax
     ("minimax/minimax-m3",                     ""),
     # Z-AI
     ("z-ai/glm-5.3",                           ""),
+    ("z-ai/glm-5.3-flash",                     ""),
     ("z-ai/glm-5.2",                           "default"),
     # Xiaomi
     ("xiaomi/mimo-v2.5-pro",                   ""),
     # Tencent
+    ("tencent/hy4-preview",                    ""),
     ("tencent/hy3",                            ""),
     # StepFun
     ("stepfun/step-3.7-flash",                 ""),
@@ -133,8 +136,9 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # OpenRouter routers
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
     # Free tier
-    ("stealth/ox-alpha",                       "free"),  # "Ox Alpha" stealth reasoning model — 1M ctx
-    ("openrouter/elephant-alpha",              "free"),
+    ("thinkingmachines/inkling:free",          "free"),
+    ("thinkingmachines/inkling-small:free",    "free"),
+    ("minimax/minimax-m3:free",                "free"),
     ("z-ai/glm-5.2:free",                      "free"),
     ("poolside/laguna-s-2.1:free",             "free"),
     ("poolside/laguna-xs-2.1:free",            "free"),
@@ -289,16 +293,19 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek/deepseek-v4-flash-0731",
         # Qwen
         "qwen/qwen3.8-max",
+        "qwen/qwen3.8-flash",
         # MoonshotAI
         "moonshotai/kimi-k3",
         # MiniMax
         "minimax/minimax-m3",
         # Z-AI
         "z-ai/glm-5.3",
+        "z-ai/glm-5.3-flash",
         "z-ai/glm-5.2",
         # Xiaomi
         "xiaomi/mimo-v2.5-pro",
         # Tencent
+        "tencent/hy4-preview",
         "tencent/hy3",
         # StepFun
         "stepfun/step-3.7-flash",
@@ -306,11 +313,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nvidia/nemotron-3-super-120b-a12b",
         # Sakana
         "sakana/fugu-ultra",
-        # Stealth — "Ox Alpha" reasoning model, free ($0/$0 on the portal),
-        # 1M ctx / 131K max output. Same model as OpenCode Zen's
-        # x-preview-f-free; metadata entries live under the bare "ox-alpha"
-        # slug (model_metadata.py / reasoning_timeouts.py).
-        "stealth/ox-alpha",
     ],
     # Native OpenAI Chat Completions (api.openai.com). Used by /model counts and
     # provider_model_ids fallback when /v1/models is unavailable.
@@ -374,6 +376,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "zai": [
         "glm-5.3",
+        "glm-5.3-flash",
         "glm-5.2",
         "glm-5.1",
         "glm-5",
@@ -475,6 +478,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "mimo-v2-flash",
     ],
     "tencent-tokenhub": [
+        "hy4-preview",
+        "hy3",
+        "hy3-preview",
+    ],
+    "tencent-tokenplan": [
+        "hy4-preview",
+        "hy3",
         "hy3-preview",
     ],
     "arcee": [
@@ -545,6 +555,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimax-m2.7",
         "minimax-m2.5",
         "glm-5.3",
+        "glm-5.3-flash",
         "glm-5.2",
         "glm-5.1",
         "glm-5",
@@ -562,16 +573,21 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nemotron-3.5-lightning-free",
         "muse-spark-1.2-contributor-free",
     ],
-    # OpenCode free tier — keyless (no OpenCode account needed). Synced
-    # against live GET /zen/v1/models + anonymous probes (2026-08-21);
-    # deepseek-v4-flash-free delisted (promo ended, now 401s).
-    # big-pickle + mimo-v2.5-free delisted (UA-gated: the relay 429s
-    # FreeUsageLimitError for every client except User-Agent
-    # "opencode/latest"; we send honest Hermes attribution and don't
-    # impersonate other clients — verified 2026-08-21).
+    # OpenCode free tier — keyless (no OpenCode account needed). This is the
+    # OFFLINE FLOOR only: provider_model_ids("opencode-free") revalidates live
+    # against GET /zen/v1/models (keyless) and filters to the anonymous free
+    # tier, so a relay-delisted model stops appearing in the picker and a
+    # newly-live one becomes selectable without a release. This floor keeps the
+    # picker populated when the relay is unreachable. Note: this floor may lag
+    # the live relay — that is intentional; the live revalidation is the
+    # source of truth when reachable. Known-delisted models are REMOVED from
+    # the floor (x-preview-f-free delisted 2026-08-26 — offline fallback must
+    # not offer a model that 401s). deepseek-v4-flash-free and mimo-v2.5-free
+    # are back on the live list.
     "opencode-free": [
-        "x-preview-f-free",  # "Ox Alpha" stealth model — free, 1M ctx, ZDR
+        "deepseek-v4-flash-free",
         "hy3-free",
+        "mimo-v2.5-free",
         "laguna-s-2.1-free",
         "nemotron-3-ultra-free",
         "nemotron-3.5-lightning-free",
@@ -587,6 +603,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-5.6-luna",
         "grok-4.5",
         "glm-5.3",
+        "glm-5.3-flash",
         "glm-5.2",
         "glm-5.1",
         "glm-5",
@@ -624,16 +641,41 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # to https://dashscope-intl.aliyuncs.com/compatible-mode/v1 (OpenAI-compat)
     # or https://dashscope-intl.aliyuncs.com/apps/anthropic (Anthropic-compat).
     "alibaba": [
+        # Qwen 千问系列 (DashScope / Qwen Cloud)
+        "qwen3.8-max",
         "qwen3.7-max",
         "qwen3.7-plus",
         "qwen3.6-plus",
+        "qwen3.6-flash",
         "kimi-k2.5",
         "qwen3.5-plus",
         "qwen3-coder-plus",
         "qwen3-coder-next",
-        # Third-party models available on coding-intl
+        # Third-party models available on coding-intl / DashScope
+        "glm-5.2",
         "glm-5",
         "glm-4.7",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash-0731",
+        "MiniMax-M2.5",
+    ],
+    # Alibaba DashScope (China) — same platform as alibaba, domestic endpoint
+    # (dashscope.aliyuncs.com); same catalog as the international tier.
+    "alibaba-cn": [
+        "qwen3.8-max",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+        "qwen3.6-flash",
+        "kimi-k2.5",
+        "qwen3.5-plus",
+        "qwen3-coder-plus",
+        "qwen3-coder-next",
+        "glm-5.2",
+        "glm-5",
+        "glm-4.7",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash-0731",
         "MiniMax-M2.5",
     ],
     # Alibaba Coding Plan — same platform as alibaba (DashScope coding-intl),
@@ -649,6 +691,57 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "glm-5",
         "glm-4.7",
         "MiniMax-M2.5",
+    ],
+    # Alibaba Coding Plan (China) — domestic coding endpoint
+    # (coding.dashscope.aliyuncs.com); same catalog as the international tier.
+    "alibaba-coding-plan-cn": [
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+        "qwen3.5-plus",
+        "qwen3-max-2026-01-23",
+        "qwen3-coder-plus",
+        "qwen3-coder-next",
+        "kimi-k2.5",
+        "glm-5",
+        "glm-4.7",
+        "MiniMax-M2.5",
+    ],
+    # Alibaba Token Plan (Personal Edition) — dedicated token-plan endpoint
+    # (token-plan.ap-southeast-1.maas.aliyuncs.com), key tier `sk-sp-...`.
+    # Catalog verified against a live Token Plan subscription (2026-08-03).
+    "alibaba-token-plan": [
+        "qwen3.8-max-preview",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+        "qwen3.6-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "deepseek-v3.2",
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "kimi-k2.5",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-5",
+    ],
+    # Alibaba Token Plan (China) — domestic token-plan endpoint
+    # (token-plan.cn-beijing.maas.aliyuncs.com); same catalog as intl.
+    "alibaba-token-plan-cn": [
+        "qwen3.8-max-preview",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+        "qwen3.6-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "deepseek-v3.2",
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "kimi-k2.5",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-5",
     ],
     # Curated HF model list — only agentic models that map to OpenRouter defaults.
     "huggingface": [
@@ -1224,7 +1317,8 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("alibaba",        "Qwen Cloud",               "Qwen Cloud / DashScope (Qwen + multi-provider)"),
     ProviderEntry("xai-oauth",      "xAI Grok OAuth (SuperGrok / Premium+)", "xAI Grok OAuth (SuperGrok / Premium+ subscription)"),
     ProviderEntry("xiaomi",         "Xiaomi MiMo",              "Xiaomi MiMo (MiMo-V2.5 and V2 models: pro, omni, flash)"),
-    ProviderEntry("tencent-tokenhub", "Tencent TokenHub",       "Tencent TokenHub (Hy3 Preview via tokenhub.tencentmaas.com)"),
+    ProviderEntry("tencent-tokenhub", "Tencent TokenHub",       "Tencent TokenHub (Hy4 preview via tokenhub.tencentmaas.com)"),
+    ProviderEntry("tencent-tokenplan", "Tencent TokenPlan",     "Tencent TokenPlan (Hy4 preview via api.lkeap.cloud.tencent.com, Anthropic Messages)"),
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
@@ -1304,9 +1398,10 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
     "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
     "openai":   ("OpenAI",          "ChatGPT/Codex subscription or direct OpenAI API", ["openai-codex", "openai-api"]),
-    "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
+    "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan, Token Plan & Qwen CLI OAuth", ["alibaba", "alibaba-cn", "alibaba-coding-plan", "alibaba-coding-plan-cn", "alibaba-token-plan", "alibaba-token-plan-cn", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go, Go subscription, or free tier", ["opencode-zen", "opencode-go", "opencode-free"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
+    "tencent":  ("Tencent Hy",      "Hy4 / Hy3 via TokenHub & TokenPlan", ["tencent-tokenhub", "tencent-tokenplan"]),
 }
 
 # Reverse index: member slug -> group_id. Built once at import.
@@ -1413,6 +1508,11 @@ _PROVIDER_ALIASES = {
     "actual-computer": "actual",
     "actualcomputer": "actual",
     "aci": "actual",
+    "nebius": "nebius-token-factory",
+    "nebius-tokenfactory": "nebius-token-factory",
+    "nebius-tf": "nebius-token-factory",
+    "token-factory": "nebius-token-factory",
+    "tokenfactory": "nebius-token-factory",
     "minimax-china": "minimax-cn",
     "minimax_cn": "minimax-cn",
     "minimax-portal": "minimax-oauth",
@@ -1449,6 +1549,8 @@ _PROVIDER_ALIASES = {
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
     "tencentmaas": "tencent-tokenhub",
+    "tokenplan": "tencent-tokenplan",
+    "tencent-lkeap": "tencent-tokenplan",
     "aws": "bedrock",
     "aws-bedrock": "bedrock",
     "amazon-bedrock": "bedrock",
@@ -3325,6 +3427,30 @@ _AGGREGATOR_PROVIDERS = frozenset(
     {"nous", "openrouter", "ai-gateway", "copilot", "kilocode"}
 )
 
+# OpenRouter request-time routing variants (docs: guides/routing/model-variants).
+# These suffixes are per-request routing modifiers valid on ANY model id —
+# ":nitro" sorts the endpoint pool by throughput and admits priority-tier
+# endpoints, ":floor" sorts by price and admits flex-tier endpoints, ":exacto"
+# applies quality-first provider sorting, ":online" attaches the web plugin.
+# They are never separate catalog entries: /models lists only the base id.
+# NOT in this set: ":free", ":batch", ":thinking", ":extended" — those ARE
+# distinct catalog SKUs that appear in /models when they exist, so absence
+# from the listing is authoritative for them and the direct-membership check
+# above handles the valid ones.
+_OPENROUTER_VARIANT_SUFFIXES = frozenset({"nitro", "floor", "exacto", "online"})
+
+
+def _openrouter_variant_base(model_id: str) -> Optional[str]:
+    """Return the base model id when ``model_id`` carries a recognized
+    OpenRouter routing-variant suffix (e.g. ``x-ai/grok-4:nitro`` →
+    ``x-ai/grok-4``), else ``None``."""
+    base, sep, suffix = (model_id or "").rpartition(":")
+    if not sep or not base:
+        return None
+    if suffix.lower() in _OPENROUTER_VARIANT_SUFFIXES:
+        return base
+    return None
+
 # Subscription/OAuth providers whose catalogs RE-EXPOSE other vendors' models
 # would be listed here (tried only as a last resort for bare short-alias
 # resolution, after every native-vendor catalog, so they never hijack an alias
@@ -4071,12 +4197,18 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         except Exception:
             pass
 
-    # OpenCode Free: curated keyless list only. models.dev's cost.input==0
-    # filter lags reality (deepseek-v4-flash-free stayed "free" there after
-    # its promo ended and the relay began 401ing keyless requests), so the
-    # curated list — synced against anonymous live probes — is authoritative.
+    # OpenCode Free: keyless live catalog, revalidated against the Zen relay
+    # every TTL. models.dev's cost.input==0 filter lags reality
+    # (deepseek-v4-flash-free stayed "free" there after its promo ended and the
+    # relay began 401ing keyless requests), so we filter the live /zen/v1/models
+    # dump to the anonymous-servable `*-free` tier ourselves and fall back to
+    # the curated _PROVIDER_MODELS floor only when the live fetch fails or is
+    # empty. This is what keeps a relay-delisted model (e.g. x-preview-f-free)
+    # from lingering in the picker until a release re-syncs the snapshot.
     if normalized == "opencode-free":
-        return list(_PROVIDER_MODELS.get(normalized, []))
+        return _fetch_opencode_free_models(
+            force_refresh=force_refresh
+        ) or list(_PROVIDER_MODELS.get(normalized, []))
 
     # ── Profile-based generic live fetch (all simple api-key providers) ──
     # Handles any provider registered in providers/ with auth_type="api_key".
@@ -4167,6 +4299,12 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 #     to a live fetch — the picker keeps working.
 
 _PROVIDER_MODELS_CACHE_TTL = 3600  # 1h
+# Providers whose catalog is served with NO credential and therefore gets a
+# stable (constant) credential fingerprint in the disk cache. The opencode-free
+# catalog is anonymous — its freshness comes from TTL revalidation, not from
+# user-rotatable credentials — so folding in unrelated auth.json mtimes would
+# only needlessly bust the SWR cache.
+_KEYLESS_STABLE_CACHE_PROVIDERS = frozenset({"opencode-free"})
 # Stale-while-revalidate window: an expired-but-same-credentials entry is
 # served IMMEDIATELY (picker opens stay instant) while a background daemon
 # thread re-fetches the live catalog and rewrites the disk cache for the
@@ -4266,6 +4404,14 @@ def _credential_fingerprint(provider: str) -> str:
     import os as _os
 
     parts: list[str] = []
+
+    # Keyless providers have no credential to fingerprint: the catalog is
+    # served anonymously, so nothing the user rotates (env vars, auth files,
+    # base URLs) should invalidate the cached entry. A stable fingerprint keeps
+    # the SWR disk cache alive across unrelated re-auths and only busts on TTL
+    # expiry — matching how the live catalog genuinely changes.
+    if (provider or "").strip().lower() in _KEYLESS_STABLE_CACHE_PROVIDERS:
+        return "keyless:" + (provider or "").strip().lower()
 
     # Env vars from PROVIDER_REGISTRY for this slug
     try:
@@ -5418,6 +5564,20 @@ _OPENCODE_ZEN_FREE_BASE_URL = "https://opencode.ai/zen/v1"
 # (big-pickle is OpenCode's rotating free stealth slot.)
 _OPENCODE_KEYLESS_EXTRA_SLUGS = frozenset({"big-pickle"})
 
+# Models whose slug carries ``-free`` but are NOT anonymous-servable: they are
+# KEYED (Go-subscription) models and must be excluded from the keyless free
+# catalog even though the suffix looks free. ox-alpha-free is the Go relay's
+# subscription twin of the Zen keyless Ox Alpha (verified 2026-08-21).
+_OPENCODE_FREE_KEYED_SUFFIX_MODELS = frozenset({"ox-alpha-free"})
+
+# In-process memo for _fetch_opencode_free_models(): (fetched_at, ids-or-None).
+# Direct provider_model_ids("opencode-free") callers (model validation, healing)
+# can run several times per resolution — without this each would block on a
+# network round-trip. Failures are memoized too (negative caching) so an
+# unreachable relay doesn't stall every validation for `timeout` seconds.
+_opencode_free_live_memo: Optional[tuple[float, Optional[list[str]]]] = None
+_OPENCODE_FREE_LIVE_MEMO_TTL = 300.0  # 5 min; SWR disk cache handles the rest
+
 
 def is_opencode_zen_free_model(model_id: Optional[str]) -> bool:
     """True when ``model_id`` is an OpenCode Zen free-tier slug.
@@ -5454,6 +5614,95 @@ def opencode_zen_free_headers() -> dict:
     }
 
 
+def _fetch_opencode_free_models(
+    timeout: float = 8.0, *, force_refresh: bool = False
+) -> Optional[list[str]]:
+    """Fetch the live keyless OpenCode Free catalog from the Zen relay.
+
+    GETs ``{_OPENCODE_ZEN_FREE_BASE_URL}/models`` ANONYMOUSLY (the free tier
+    rejects any unrecognized Authorization bearer with 401) and filters the
+    dump to the anonymous-servable ``*-free`` tier. Returns ``None`` on any
+    network/auth/parse failure so callers fall back to the curated
+    ``_PROVIDER_MODELS["opencode-free"]`` floor; an empty filtered result is
+    treated as a failure for the same reason (a relay with zero free models is
+    not worth trusting over the floor).
+
+    A short in-process memo (``_OPENCODE_FREE_LIVE_MEMO_TTL``) keeps direct
+    ``provider_model_ids("opencode-free")`` callers — model validation runs
+    it several times per resolution — from issuing one blocking network
+    round-trip each. The picker's cross-process freshness still comes from
+    the SWR disk cache one layer up; ``force_refresh=True`` (the SWR refresh
+    path) bypasses and repopulates the memo.
+
+    The Zen ``/models`` dump also lists paid/subscription IDs (e.g. Go
+    ``ox-alpha-free`` is KEYED despite the suffix), so a bare ``*-free`` suffix
+    filter is not safe on its own — this mirrors the existing
+    ``opencode_zen_free_runtime`` contract, which uses membership in the
+    verified keyless catalog as the routing criterion.
+    """
+    import urllib.request
+
+    from hermes_cli.urllib_security import open_credentialed_url
+
+    now = time.time()
+    if not force_refresh:
+        memo = _opencode_free_live_memo
+        if memo is not None and now - memo[0] < _OPENCODE_FREE_LIVE_MEMO_TTL:
+            return list(memo[1]) if memo[1] else None
+
+    url = f"{_OPENCODE_ZEN_FREE_BASE_URL.rstrip('/')}/models"
+    req = urllib.request.Request(url)
+    req.add_header("Accept", "application/json")
+    for k, v in opencode_zen_free_headers().items():
+        if k.lower() != "authorization":  # never send a bearer keylessly
+            req.add_header(k, v)
+    try:
+        with open_credentialed_url(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        items = data if isinstance(data, list) else data.get("data", [])
+    except Exception:
+        _set_opencode_free_live_memo(None)
+        return None
+    ids = [m["id"] for m in items if isinstance(m, dict) and isinstance(m.get("id"), str)]
+    # Filter to the anonymous-servable free tier. The Zen dump can contain
+    # keyed/Go IDs; only the verified free set belongs in the keyless picker.
+    live_free = [
+        mid
+        for mid in ids
+        if mid.lower().endswith("-free")
+        and mid.lower() not in _OPENCODE_FREE_KEYED_SUFFIX_MODELS
+    ]
+    result = live_free if live_free else None
+    _set_opencode_free_live_memo(result)
+    return result
+
+
+def _set_opencode_free_live_memo(ids: Optional[list[str]]) -> None:
+    global _opencode_free_live_memo
+    _opencode_free_live_memo = (time.time(), list(ids) if ids else None)
+
+
+def _opencode_free_known_model_slugs() -> set[str]:
+    """Lowercased keyless free-tier slugs known right now — WITHOUT network I/O.
+
+    Union of the static ``_PROVIDER_MODELS["opencode-free"]`` floor, the
+    in-process live memo, and the SWR disk-cache entry. Used by the
+    ``opencode_zen_free_runtime`` healing path, which runs during model
+    resolution and must never block on a live fetch. Union (not replacement)
+    so a stale cache can only widen healing, never silently disable it.
+    """
+    known = {m.lower() for m in _PROVIDER_MODELS.get("opencode-free", [])}
+    memo = _opencode_free_live_memo
+    if memo is not None and memo[1]:
+        known.update(m.lower() for m in memo[1])
+    try:
+        entry = _load_provider_models_cache().get("opencode-free") or {}
+        known.update(str(m).lower() for m in entry.get("models", []) or [])
+    except Exception:
+        pass
+    return known
+
+
 def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str]) -> Optional[dict]:
     """Keyless runtime entry for an OpenCode Zen free-tier model, or None.
 
@@ -5471,13 +5720,16 @@ def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str
     stopped being a reliable keyless signal when ``ox-alpha-free`` appeared
     on the Go relay as a KEYED subscription model (2026-08-21) — suffix-based
     healing would have routed it to a Zen relay that doesn't serve it.
+    Membership means the union of the cached LIVE keyless catalog (in-process
+    memo / SWR disk cache — never a blocking fetch on this hot path) and the
+    static floor, so a newly-live free model heals without a release.
     """
     family = opencode_provider_family(provider_id)
     if family is None:
         return None
     if family != "opencode-free":
         bare = normalize_opencode_model_id(provider_id, model_id).strip().lower()
-        if bare not in {m.lower() for m in _PROVIDER_MODELS.get("opencode-free", [])}:
+        if bare not in _opencode_free_known_model_slugs():
             return None
     normalized = normalize_opencode_model_id(provider_id, model_id)
     api_mode = opencode_model_api_mode("opencode-zen", normalized)
@@ -6356,6 +6608,47 @@ def validate_requested_model(
             "message": "Model names cannot contain spaces.",
         }
 
+    # OpenRouter presets are account-scoped configurations, so direct
+    # ``@preset/<slug>`` references never appear in the public /v1/models
+    # listing. Combined ``<model>@preset/<slug>`` references are also valid;
+    # validate their base model normally and preserve the preset suffix if a
+    # close match is auto-corrected. OpenRouter validates the preset slug when
+    # the inference request is made.
+    preset_suffix = ""
+
+    def _with_preset_suffix(model_id: str) -> str:
+        """Re-attach a preserved ``@preset/<slug>`` suffix after auto-correction."""
+        return f"{model_id}{preset_suffix}"
+
+    if normalized == "openrouter":
+        marker = "@preset/"
+        if marker in requested:
+            if requested.count(marker) != 1:
+                preset_slug = ""
+                preset_base = requested
+            else:
+                preset_base, preset_slug = requested.split(marker, 1)
+            if re.fullmatch(r"[A-Za-z0-9._~-]+", preset_slug) is None:
+                return {
+                    "accepted": False,
+                    "persist": False,
+                    "recognized": False,
+                    "message": (
+                        "OpenRouter preset slugs must be non-empty URL-safe "
+                        "identifiers using only letters, digits, '.', '_', "
+                        "'~', or '-'."
+                    ),
+                }
+            preset_suffix = f"{marker}{preset_slug}"
+            if not preset_base:
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": False,
+                    "message": None,
+                }
+            requested_for_lookup = preset_base
+
     if normalized == "lmstudio":
         from hermes_cli.auth import AuthError
         # Use probe_lmstudio_models so we can distinguish None (unreachable
@@ -6812,6 +7105,24 @@ def validate_requested_model(
                 "recognized": True,
                 "message": None,
             }
+        # OpenRouter routing variants (":nitro", ":floor", ...) are request-time
+        # modifiers, not catalog entries — /models lists only the base id.
+        # Validate the BASE against the listing but preserve the suffixed id,
+        # and do this BEFORE fuzzy auto-correction: get_close_matches would
+        # otherwise "correct" `model:nitro` → `model` and silently strip the
+        # user's routing opt-in.
+        _variant_base = (
+            _openrouter_variant_base(requested_for_lookup)
+            if normalized == "openrouter"
+            else None
+        )
+        if _variant_base is not None and _variant_base in set(api_models):
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
         else:
             # API responded but model is not listed.  Accept anyway —
             # the user may have access to models not shown in the public
@@ -6821,15 +7132,18 @@ def validate_requested_model(
             # Auto-correct if the top match is very similar (e.g. typo)
             auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
             if auto:
+                corrected = _with_preset_suffix(auto[0])
                 return {
                     "accepted": True,
                     "persist": True,
                     "recognized": True,
-                    "corrected_model": auto[0],
-                    "message": f"Auto-corrected `{requested}` → `{auto[0]}`",
+                    "corrected_model": corrected,
+                    "message": f"Auto-corrected `{requested}` → `{corrected}`",
                 }
 
-            suggestions = get_close_matches(requested, api_models, n=3, cutoff=0.5)
+            suggestions = get_close_matches(
+                requested_for_lookup, api_models, n=3, cutoff=0.5
+            )
             suggestion_text = ""
             if suggestions:
                 suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
@@ -6853,7 +7167,8 @@ def validate_requested_model(
 
                 _openai_listing_is_authoritative = is_official_openai_host(base_url)
             if not _openai_listing_is_authoritative and _model_in_provider_catalog(
-                requested_for_lookup.lower(), _provider_keys(normalized)
+                (_variant_base or requested_for_lookup).lower(),
+                _provider_keys(normalized),
             ):
                 return {
                     "accepted": True,
@@ -6864,6 +7179,41 @@ def validate_requested_model(
                         f"but exists in the curated catalog — accepted."
                     ),
                 }
+
+            # Nous provider: also check the Portal's live
+            # /api/nous/recommended-models feed. That feed can list a model
+            # (e.g. a newly-promoted free/paid recommendation) before it's
+            # been added to the hardcoded _PROVIDER_MODELS["nous"] curated
+            # list or the docs-hosted catalog manifest has been rebuilt.
+            # `hermes chat` already accepts these models via
+            # union_with_portal_free/paid_recommendations() at model-list
+            # build time; this mirrors that same source of truth for the
+            # per-message /model validation path (messaging platform
+            # pickers, /model command), which previously only checked the
+            # curated catalog and rejected valid Portal-recommended models.
+            if normalized == "nous":
+                try:
+                    portal_payload = fetch_nous_recommended_models(
+                        _resolve_nous_portal_url()
+                    )
+                    portal_model_names = {
+                        name.lower()
+                        for tier in ("freeRecommendedModels", "paidRecommendedModels")
+                        for entry in (portal_payload.get(tier) or [])
+                        if (name := _extract_model_name(entry))
+                    }
+                except Exception:
+                    portal_model_names = set()
+                if requested_for_lookup.lower() in portal_model_names:
+                    return {
+                        "accepted": True,
+                        "persist": True,
+                        "recognized": True,
+                        "message": (
+                            f"Note: `{requested}` was not found in the live /v1/models "
+                            f"listing but is a current Nous Portal recommendation — accepted."
+                        ),
+                    }
 
         return {
             "accepted": False,
@@ -6936,18 +7286,36 @@ def validate_requested_model(
                 "recognized": True,
                 "message": None,
             }
+        # OpenRouter routing-variant suffixes: validate the base id against
+        # the catalog, keep the suffixed id (same rule as the live-listing
+        # path above — variants never appear as catalog entries).
+        if normalized == "openrouter":
+            _cat_variant_base = _openrouter_variant_base(requested_for_lookup)
+            if (
+                _cat_variant_base is not None
+                and _cat_variant_base.lower() in catalog_lower
+            ):
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "message": None,
+                }
         catalog_lower_list = list(catalog_lower.keys())
         auto = get_close_matches(
             requested_for_lookup.lower(), catalog_lower_list, n=1, cutoff=0.9
         )
         if auto:
             corrected = catalog_lower[auto[0]]
+            corrected_with_suffix = _with_preset_suffix(corrected)
             return {
                 "accepted": True,
                 "persist": True,
                 "recognized": True,
-                "corrected_model": corrected,
-                "message": f"Auto-corrected `{requested}` → `{corrected}`",
+                "corrected_model": corrected_with_suffix,
+                "message": (
+                    f"Auto-corrected `{requested}` → `{corrected_with_suffix}`"
+                ),
             }
         suggestions = get_close_matches(
             requested_for_lookup.lower(), catalog_lower_list, n=3, cutoff=0.5

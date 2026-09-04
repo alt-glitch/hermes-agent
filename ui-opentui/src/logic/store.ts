@@ -31,6 +31,7 @@ import {
   type SessionInfoPatchDecoded
 } from '../boundary/schema/SessionInfo.ts'
 import type { DetailsMode, DetailsSection, DetailsSections } from './details.ts'
+import type { StatusBarFields } from './configSync.ts'
 import type { BatteryInfo } from './battery.ts'
 import type { VoiceSubmitMode } from './voiceSubmit.ts'
 import {
@@ -475,10 +476,51 @@ function mergeSubagentPayload(subagent: SubagentInfo, payload: SpawnTreeSubagent
 /** Todo task states (mirrors tools/todo_tool.py). */
 export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled'
 
-/** One todo item (content + state); list ORDER is priority — never re-sort. */
+/** One todo item. List order is stable within each DFS sibling group. */
 export interface TodoItem {
   content: string
+  id: string
+  /** Optional id of another item — renders this as a nested subtask. */
+  parent?: string
   status: TodoStatus
+}
+
+/** DFS order for a possibly nested todo list. Parents precede children;
+ * dangling/self/cyclic parents degrade to depth 0 so no item disappears. */
+export function todoTree(todos: readonly TodoItem[]): Array<readonly [TodoItem, number]> {
+  const ids = new Set(todos.map(todo => todo.id))
+  const children = new Map<string, TodoItem[]>()
+  const roots: TodoItem[] = []
+
+  for (const todo of todos) {
+    if (todo.parent && ids.has(todo.parent) && todo.parent !== todo.id) {
+      const siblings = children.get(todo.parent) ?? []
+      siblings.push(todo)
+      children.set(todo.parent, siblings)
+    } else {
+      roots.push(todo)
+    }
+  }
+
+  const rows: Array<readonly [TodoItem, number]> = []
+  const seen = new Set<string>()
+  const walk = (todo: TodoItem, depth: number): void => {
+    if (seen.has(todo.id)) return
+    seen.add(todo.id)
+    rows.push([todo, depth])
+    for (const child of children.get(todo.id) ?? []) walk(child, depth + 1)
+  }
+
+  for (const root of roots) walk(root, 0)
+  // A parent cycle has no root. Keep every cycle member (and anything chained
+  // from it) visible as a flat root rather than inventing a misleading depth.
+  for (const todo of todos) {
+    if (!seen.has(todo.id)) {
+      seen.add(todo.id)
+      rows.push([todo, 0])
+    }
+  }
+  return rows
 }
 
 /** Counts by state for the panel header + status-bar chip. */
@@ -522,6 +564,12 @@ export interface SessionInfo {
   /** Registry-backed background delegation count. Presence is authoritative,
    *  including zero; local live rows are only a compatibility fallback. */
   activeSubagents?: number
+  /** Session prompt-cache hit ratio (`cache_read / prompt`, percent). */
+  cacheHitPct?: number
+  /** Rolling mean API latency over recent calls, in seconds. */
+  avgLatencyS?: number
+  /** Rolling output throughput over recent calls, in tokens/second. */
+  avgTps?: number
   /** Commits behind the remote (`update_behind`) — null/absent until the async
    *  update check resolves; >0 drives the transient update notice in the bar. */
   updateBehind?: number
@@ -658,6 +706,13 @@ export interface StoreState {
   /** Transient busy indicator (the kaomoji face/verb from `thinking.delta`/`status.update`);
    *  shown above the composer WHILE a turn runs, cleared on `message.complete`. NOT transcript. */
   status: string | undefined
+  /** Context compaction in progress (idle/preflight/auto — `status.update
+   *  kind:'compacting'`, upstream 3a542bbef4d1). Session-scoped latch: keeps the
+   *  StatusLine spinner alive while `info.running` is false and freezes its verb
+   *  on "compacting" for the whole pause; cleared by `kind:'compacted'`, turn
+   *  end, gateway recovery/ready, and every session reset/transition so it can
+   *  never bleed across sessions. Distinct from `compact` (layout density). */
+  compacting: boolean
   /** Most recent background-activity notification (`notification.show`) — the OSC
    *  seam (terminalChrome) watches this to fire a desktop ping; the inline card
    *  lives in `messages`. Undefined until the first notification. */
@@ -740,6 +795,9 @@ export interface StoreState {
   batteryEnabled: boolean
   /** Latest host reading. Cleared immediately when the indicator is disabled. */
   batteryStatus: BatteryInfo | null
+  /** Persisted `display.status_bar.fields` filter. Config-owned, so it survives
+   * session resets; null means the default field set. */
+  statusBarFields: StatusBarFields
 }
 
 export interface VoiceState {
@@ -773,6 +831,12 @@ function readOptNum(payload: { readonly [k: string]: unknown }, key: string): nu
   return typeof v === 'number' ? v : undefined
 }
 
+/** Status telemetry must never render NaN/Infinity from a malformed provider. */
+function readFiniteNum(payload: { readonly [k: string]: unknown } | undefined, key: string): number | undefined {
+  const value = payload?.[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
 /** Render a raw tool `result` for display: strings as-is, anything else pretty
  *  JSON — both then go through the same envelope-strip pipeline as result_text. */
 function stringifyResult(v: unknown): string | undefined {
@@ -796,7 +860,20 @@ function stringifyResult(v: unknown): string | undefined {
 function readInfoPatch(payload: object): Partial<SessionInfo> {
   const decoded = decodeSessionInfoPatch(payload)
   if (Option.isNone(decoded)) return {}
-  return infoPatchFrom(decoded.value)
+  const patch = infoPatchFrom(decoded.value)
+  const raw = payload as { readonly [k: string]: unknown }
+  const usageValue = raw['usage']
+  const usage =
+    usageValue && typeof usageValue === 'object' && !Array.isArray(usageValue)
+      ? (usageValue as { readonly [k: string]: unknown })
+      : undefined
+  const cacheHitPct = readFiniteNum(usage, 'cache_hit_pct') ?? readFiniteNum(raw, 'cache_hit_pct')
+  if (cacheHitPct !== undefined) patch.cacheHitPct = cacheHitPct
+  const avgLatencyS = readFiniteNum(usage, 'avg_latency_s') ?? readFiniteNum(raw, 'avg_latency_s')
+  if (avgLatencyS !== undefined) patch.avgLatencyS = avgLatencyS
+  const avgTps = readFiniteNum(usage, 'avg_tps') ?? readFiniteNum(raw, 'avg_tps')
+  if (avgTps !== undefined) patch.avgTps = avgTps
+  return patch
 }
 
 /** Build the SessionInfo patch from a decoded session.info payload. */
@@ -870,8 +947,17 @@ export function todoSnapshotFrom(result: unknown, args: unknown): TodoSnapshot |
   for (const t of rawList) {
     if (!t || typeof t !== 'object') continue
     const o = t as Record<string, unknown>
-    const content = typeof o['content'] === 'string' ? o['content'] : ''
-    if (content) todos.push({ content, status: normalizeTodoStatus(o['status']) })
+    const content = typeof o['content'] === 'string' ? o['content'].trim() : ''
+    const id = typeof o['id'] === 'string' ? o['id'].trim() : ''
+    const parent = typeof o['parent'] === 'string' ? o['parent'].trim() : ''
+    if (id && content) {
+      todos.push({
+        content,
+        id,
+        status: normalizeTodoStatus(o['status']),
+        ...(parent && parent !== id ? { parent } : {})
+      })
+    }
   }
   if (todos.length === 0) return undefined
   const counts: TodoCounts = { total: todos.length, completed: 0, in_progress: 0, pending: 0, cancelled: 0 }
@@ -1017,6 +1103,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     queuedPrompts: [],
     queueEditIndex: undefined,
     status: undefined,
+    compacting: false,
     // startedAt is set ONCE here (store creation ≈ session start) — the status
     // bar's session-duration segment ticks from it; wire patches never carry it.
     info: { startedAt: Date.now() },
@@ -1036,7 +1123,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     reasoningFull: false,
     busyInputMode: DEFAULT_BUSY_INPUT_MODE,
     batteryEnabled: false,
-    batteryStatus: null
+    batteryStatus: null,
+    statusBarFields: null
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
@@ -1705,6 +1793,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     applied.clear()
     // A chrome notice must not survive a transcript reset (new session context).
     clearNoticeState()
+    // Nor may a compaction pause: the latch belongs to the discarded context.
+    setState('compacting', false)
     // A fresh session must not carry over prompts queued against the OLD turn —
     // they'd drain into the new session's first completion (cross-session bleed).
     clearQueue()
@@ -1727,6 +1817,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         delete info.costUsd
         delete info.compressions
         delete info.activeSubagents
+        delete info.cacheHitPct
+        delete info.avgLatencyS
+        delete info.avgTps
       })
     )
   }
@@ -1796,6 +1889,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.pendingNotice = null
         draft.queuedPrompts = []
         draft.queueEditIndex = undefined
+        draft.compacting = false
         draft.info = info
         draft.hint = undefined
         draft.catalog = undefined
@@ -2210,6 +2304,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('destructiveSlashConfirm', on)
   }
 
+  /** Hydrate the config-owned status-field filter. Unlike usage telemetry this
+   * deliberately survives clear/new/resume session boundaries. */
+  function setStatusBarFields(fields: StatusBarFields): void {
+    setState('statusBarFields', fields)
+  }
+
   /** /reasoning full|clamp — set the expand-all-thinking display flag. */
   function setReasoningFull(on: boolean): void {
     setState('reasoningFull', on)
@@ -2302,6 +2402,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // Clear any transient status: on a recovery-respawn ready this drops the
         // lingering 'gateway recovering (attempt N)…' line; no-op on first connect.
         setState('status', undefined)
+        // A fresh/recovered gateway process cannot be mid-compaction.
+        setState('compacting', false)
         setSkin(event.payload?.skin)
         break
       case 'skin.changed':
@@ -2479,6 +2581,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         interimTextPartId = undefined
         clearStatusRestoreTimer()
         setState('status', undefined)
+        // A completed turn ends any compaction pause (the gateway compacts
+        // between turns) — mirrors the Ink turnController reset.
+        setState('compacting', false)
         // A terminal error frame can close a turn that never reached
         // message.start (agent-init failure — upstream run_after_agent_ready
         // now emits this frame instead of a bare `error` event). turnInFlight
@@ -2553,6 +2658,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
           lastStatusNote = text
           pushSystem(text)
         }
+        // Idle/auto compaction lifecycle (upstream 3a542bbef4d1 — #97239): every
+        // in-progress line latches `compacting` and deliberately arms NO restore
+        // timer — the pause lasts as long as the gateway says, and the StatusLine
+        // freezes its verb on "compacting" until the terminal edge below.
+        if (kind === 'compacting') {
+          setState('compacting', true)
+          break
+        }
+        // Terminal compaction edge: drop the latch, then resume the normal
+        // typed-status restore handling for the "compacted" line itself.
+        if (kind === 'compacted') setState('compacting', false)
         if (kind === 'goal') {
           setState(
             'status',
@@ -2607,6 +2723,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
           level: 'info',
           text: `bg ${event.payload.task_id} → ${event.payload.text}`
         })
+        break
+      }
+      case 'btw.complete': {
+        const question = event.payload.question?.trim()
+        pushSystem(`[btw${question ? ` "${question}"` : ''}] ${event.payload.text}`)
         break
       }
       // The self-improvement background review finished and emitted a persistent
@@ -3085,6 +3206,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // "recovering…" wording now comes from the gateway.recovering case,
         // which fires only when a respawn is actually scheduled.
         setState('status', 'gateway exited')
+        // The dead child's compaction pause cannot complete — drop the latch so
+        // the idle spinner doesn't outlive the process that owned it.
+        setState('compacting', false)
         const reason = event.payload?.reason
         const base = 'gateway exited — recovering your session (any in-flight reply was lost)'
         pushSystem(reason ? `${base}: ${reason}` : base)
@@ -3134,6 +3258,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         const preStartFailure = state.info.running === true && !turnInFlight
         setState('info', prev => ({ ...prev, running: false }))
         setState('status', undefined)
+        // A terminal error is a turn end too — never leave the latch armed.
+        setState('compacting', false)
         if (preStartFailure) onTurnComplete?.()
         // A turn can end via error without message.complete — flush any held
         // notice here too, matching Ink recordError.
@@ -3293,12 +3419,18 @@ export function createSessionStore(options?: SessionStoreOptions) {
     // not inherit the prior session's plan. The resumed session re-emits its own
     // `todo` snapshot if it has one (mirrors clearTranscript's reset).
     setState('latestTodos', undefined)
+    // …and the compaction latch: a resumed session's pause (if any) re-announces
+    // itself via a fresh `status.update kind:'compacting'`.
+    setState('compacting', false)
     // `usage.active_subagents` belongs to the prior adopted session. The
     // resumed session's next info/complete payload re-establishes it.
     setState(
       'info',
       produce(info => {
         delete info.activeSubagents
+        delete info.cacheHitPct
+        delete info.avgLatencyS
+        delete info.avgTps
       })
     )
     // Slice to the cap BEFORE the first setState, not after. Yoga (WASM) layout
@@ -3557,6 +3689,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     hydrateTimestamps,
     getTimestampsRevision,
     setDestructiveSlashConfirm,
+    setStatusBarFields,
     setReasoningFull,
     setBusyInputMode,
     hydrateBusyInputMode,

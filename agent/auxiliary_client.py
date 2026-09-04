@@ -62,6 +62,13 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent.codex_headers import (
+    CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
+    apply_required_codex_headers as _apply_required_codex_headers,
+    codex_cloudflare_headers as _codex_cloudflare_headers,
+    is_official_codex_base_url as _is_official_codex_base_url,
+)
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -195,7 +202,7 @@ def _resolve_aux_verify(base_url: Optional[str]) -> Any:
     """Resolve httpx ``verify`` for an auxiliary-client base_url.
 
     Mirrors the main client's TLS resolution so auxiliary calls (compression,
-    vision, web_extract, title generation, etc.) honor per-provider
+    vision, title generation, etc.) honor per-provider
     ``ssl_ca_cert`` / ``ssl_verify`` config and the ``HERMES_CA_BUNDLE`` /
     ``SSL_CERT_FILE`` env conventions. Best-effort: any failure falls back to
     the httpx/certifi default (``True``).
@@ -437,12 +444,14 @@ class _AuxiliaryCancellationDecision:
 # deadline punishes SLOW summary models exactly as hard as HUNG ones: a
 # reasoning model happily streaming a large summary is killed mid-generation.
 # This thread-local hook lets the host observe liveness instead: the wire
-# consumers below tick it on every streamed token/SSE event, and the host
+# consumers below tick it only for non-empty streamed payloads, and the host
 # extends its deadline while tokens are moving (see gateway/run.py session
 # hygiene + CompressionCommitFence.touch_progress). Thread-local matches the
 # call topology — the aux call and its stream consumption run synchronously
 # on the thread that installed the hook.
 _aux_progress = threading.local()
+_aux_dispatch = threading.local()
+_aux_provider_response = threading.local()
 
 
 def _notify_aux_progress() -> None:
@@ -456,8 +465,115 @@ def _notify_aux_progress() -> None:
         logger.debug("aux progress hook failed", exc_info=True)
 
 
+def _notify_aux_dispatch() -> None:
+    """Record an actual provider dispatch without claiming response progress."""
+    hook = getattr(_aux_dispatch, "hook", None)
+    if hook is not None:
+        try:
+            hook()
+        except Exception:
+            logger.debug("aux dispatch hook failed", exc_info=True)
+
+
+def _notify_aux_timing_response() -> None:
+    """Record a provider response/chunk WITHOUT claiming forward progress.
+
+    Same timing slot as :func:`_notify_aux_provider_response`, minus the
+    forward-progress chain: used for content-free frames (keepalives,
+    lifecycle events, typed-but-empty deltas) that must still count toward
+    ``time_to_first_progress_ms`` telemetry but must not reset a compression
+    inactivity fence.
+    """
+    hook = getattr(_aux_provider_response, "hook", None)
+    if hook is not None:
+        try:
+            hook()
+        except Exception:
+            logger.debug("aux provider response hook failed", exc_info=True)
+
+
+def _notify_aux_provider_response() -> None:
+    """Record a provider response/chunk, then preserve the liveness signal."""
+    _notify_aux_timing_response()
+    _notify_aux_progress()
+
+
 def _aux_progress_active() -> bool:
     return getattr(_aux_progress, "hook", None) is not None
+
+
+def _event_field(event: Any, name: str) -> Any:
+    if isinstance(event, dict):
+        return event.get(name)
+    return getattr(event, name, None)
+
+
+def _anthropic_event_has_content(event: Any) -> bool:
+    """Whether an Anthropic stream event carries a non-empty payload."""
+    event_type = _event_field(event, "type")
+    if event_type == "content_block_delta":
+        delta = _event_field(event, "delta")
+        return any(
+            bool(_event_field(delta, field))
+            for field in ("text", "thinking", "partial_json", "signature", "citation")
+        )
+    if event_type == "content_block_start":
+        block = _event_field(event, "content_block")
+        return _event_field(block, "type") == "tool_use" and any(
+            bool(_event_field(block, field)) for field in ("id", "name")
+        )
+    return False
+
+
+_CODEX_PROGRESS_DELTA_TYPES = frozenset(
+    {
+        "response.output_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.text.delta",
+        "response.audio.delta",
+        "response.function_call_arguments.delta",
+        "response.reasoning_text.delta",
+    }
+)
+
+
+# Progress-aware auxiliary stream deadlines (Aug 2026, masoria report):
+# a dead stream fails fast at the no-progress window (first token AND
+# between tokens), a live stream re-arms per substantive event and is
+# bounded only by _aux_stream_total_ceiling() (shared with the streamed
+# chat.completions path).
+_AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS = 60.0
+
+
+def _codex_event_has_content(event: Any) -> bool:
+    """Whether a Codex Responses event carries a non-empty payload."""
+    event_type = _event_field(event, "type")
+    if event_type in _CODEX_PROGRESS_DELTA_TYPES:
+        return bool(_event_field(event, "delta"))
+    if event_type == "response.output_item.added":
+        item = _event_field(event, "item")
+        return "function_call" in str(_event_field(item, "type") or "") and any(
+            bool(_event_field(item, field))
+            for field in ("id", "call_id", "name", "arguments")
+        )
+    return False
+
+
+@contextlib.contextmanager
+def _aux_thread_local_hook(local: threading.local, hook):
+    """Install one thread-local hook callback and restore its prior value.
+
+    ``hook=None`` (or any non-callable) is a no-op passthrough so callers can
+    wire it unconditionally. Re-entrant-safe: restores the previous hook on
+    exit. Shared by the forward-progress hook and the content-free timing
+    hooks — one save/restore implementation, three thread-local slots.
+    """
+    previous = getattr(local, "hook", None)
+    local.hook = hook if callable(hook) else previous
+    try:
+        yield
+    finally:
+        local.hook = previous
 
 
 @contextlib.contextmanager
@@ -467,12 +583,12 @@ def aux_progress_hook(hook):
     ``hook=None`` is a no-op passthrough so callers can wire it
     unconditionally. Re-entrant-safe: restores the previous hook on exit.
     """
-    prev = getattr(_aux_progress, "hook", None)
-    _aux_progress.hook = hook if callable(hook) else prev
-    try:
+    with _aux_thread_local_hook(_aux_progress, hook):
         yield
-    finally:
-        _aux_progress.hook = prev
+
+
+# Back-compat alias — the timing hooks were introduced with this name.
+_aux_timing_hook = _aux_thread_local_hook
 
 
 def _run_protected_sync_provider_call(
@@ -506,14 +622,24 @@ def _run_protected_sync_provider_call(
         raise AuxiliaryExplicitCancellation()
 
     progress_hook = getattr(_aux_progress, "hook", None)
+    # Timing hooks ride along with the progress hook: _create_with_progress
+    # fires _notify_aux_dispatch/_notify_aux_provider_response from whichever
+    # thread runs the provider callback, so an owner-thread-only install would
+    # silently drop provider_dispatch_ms / time_to_first_progress_ms whenever
+    # the protected daemon path is taken.
+    dispatch_hook = getattr(_aux_dispatch, "hook", None)
+    provider_response_hook = getattr(_aux_provider_response, "hook", None)
     provider_context = contextvars.copy_context()
     done = threading.Event()
     outcome: dict[str, Any] = {}
 
     def _provider_worker() -> None:
         try:
-            with aux_progress_hook(progress_hook), aux_interrupt_protection(
-                cancel_check=cancel_check
+            with (
+                aux_progress_hook(progress_hook),
+                _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
+                _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
+                aux_interrupt_protection(cancel_check=cancel_check),
             ):
                 outcome["result"] = callback(kwargs)
         except BaseException as exc:
@@ -599,6 +725,8 @@ _PROVIDER_ALIASES = {
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
     "tencentmaas": "tencent-tokenhub",
+    "tokenplan": "tencent-tokenplan",
+    "tencent-lkeap": "tencent-tokenplan",
 }
 
 
@@ -969,7 +1097,8 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "opencode-go": "glm-5",
     "kilocode": "google/gemini-3.6-flash",
     "ollama-cloud": "nemotron-3-nano:30b",
-    "tencent-tokenhub": "hy3-preview",
+    "tencent-tokenhub": "hy4-preview",
+    "tencent-tokenplan": "hy4-preview",
     # NB: no "deepinfra" entry — its aux model lives on the ProviderProfile
     # (plugins/model-providers/deepinfra: default_aux_model), which
     # _get_aux_model_for_provider() reads first. Duplicating it here would be
@@ -1212,89 +1341,10 @@ _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 
-# Codex OAuth endpoint used when a caller explicitly requests
-# provider="openai-codex".  There is deliberately no hardcoded default
-# model: the set of models OpenAI accepts on this endpoint for
-# ChatGPT-account auth is an undocumented, shifting allow-list, and
-# pinning one here has drifted silently twice (gpt-5.3-codex → gpt-5.2-codex
-# → gpt-5.4 over 6 weeks in early 2026).  Callers must pass the model
-# they want explicitly (from config.yaml model.model, auxiliary.<task>.model,
-# or the user's active Codex model selection).
-_CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-
-
-def _is_official_codex_base_url(base_url: str) -> bool:
-    """Identify OpenAI's Codex endpoint without matching custom proxies."""
-    try:
-        parsed = urlparse(base_url)
-        path = parsed.path.rstrip("/")
-        return (
-            parsed.scheme == "https"
-            and parsed.hostname == "chatgpt.com"
-            and parsed.port in (None, 443)
-            and (path == "/backend-api/codex" or path.startswith("/backend-api/codex/"))
-        )
-    except (TypeError, ValueError):
-        return False
-
-
-def _codex_cloudflare_headers(
-    access_token: str, *, base_url: str = _CODEX_AUX_BASE_URL,
-) -> Dict[str, str]:
-    """Identity and account headers for chatgpt.com/backend-api/codex.
-
-    OpenAI requires third-party harnesses to identify themselves. Requests to
-    the official endpoint always send Hermes' originator and version. Custom
-    endpoints retain the existing compatibility identity. In either case,
-    preserve ``ChatGPT-Account-ID`` from the OAuth JWT's
-    ``chatgpt_account_id`` claim.
-
-    Malformed tokens are tolerated — we drop the account-ID header rather than
-    raise, so a bad token still surfaces as an auth error (401) instead of a
-    crash at client construction.
-    """
-    headers = {
-        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
-        "originator": "codex_cli_rs",
-    }
-    if _is_official_codex_base_url(base_url):
-        from hermes_cli import __version__
-
-        headers.update({
-            "User-Agent": f"HermesAgent/{__version__}",
-            "originator": "hermes-agent",
-        })
-    if not isinstance(access_token, str) or not access_token.strip():
-        return headers
-    try:
-        import base64
-        parts = access_token.split(".")
-        if len(parts) < 2:
-            return headers
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
-        acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
-        if isinstance(acct_id, str) and acct_id:
-            headers["ChatGPT-Account-ID"] = acct_id
-    except Exception:
-        pass
-    return headers
-
-
-def _apply_required_codex_headers(
-    client_kwargs: Dict[str, Any], *, access_token: str, base_url: str,
-) -> None:
-    """Keep required Codex identity after user/provider header overrides."""
-    if not _is_official_codex_base_url(base_url):
-        return
-    required = _codex_cloudflare_headers(access_token, base_url=base_url)
-    required_names = {name.lower() for name in required}
-    existing = client_kwargs.get("default_headers") or {}
-    client_kwargs["default_headers"] = {
-        **{name: value for name, value in existing.items()
-           if str(name).lower() not in required_names},
-        **required,
-    }
+# Codex helpers live in a small leaf module so fresh client builders never
+# request newly added exports from a stale, long-lived auxiliary router. The
+# private aliases above preserve the established import surface for plugins and
+# tests while new production consumers import the leaf directly.
 
 
 # Hosts that expose BOTH an Anthropic-style ``…/anthropic`` path and a sibling
@@ -1606,6 +1656,25 @@ class _CodexCompletionsAdapter:
         # same behavior as the main agent's Codex transport.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
+            # Fast mode / Priority Processing is a top-level Responses field.
+            # Auxiliary callers express provider controls through
+            # auxiliary.<task>.extra_body, so project service_tier here just as
+            # the main Codex transport projects request_overrides. xAI's
+            # Responses endpoint rejects this field; keep the same xAI-only
+            # guard as agent/transports/codex.py.
+            service_tier = extra_body.get("service_tier")
+            client_base_url = str(getattr(self._client, "base_url", "") or "")
+            is_xai_responses = (
+                base_url_host_matches(client_base_url, "x.ai")
+                or base_url_host_matches(client_base_url, "api.x.ai")
+            )
+            if (
+                isinstance(service_tier, str)
+                and service_tier.strip()
+                and not is_xai_responses
+            ):
+                resp_kwargs["service_tier"] = service_tier.strip()
+
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
@@ -1735,9 +1804,42 @@ class _CodexCompletionsAdapter:
         tool_calls_raw: List[Any] = []
         usage = None
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
-        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
+        # Progress-aware stream deadlines (supersedes the old single absolute
+        # kill at ``total_timeout``). Three regimes:
+        #   1. First token: the stream must produce its first substantive
+        #      payload within ``no_progress_timeout`` (60s default) or we
+        #      fail fast and let the caller's normal retry/fallback chain
+        #      run — a dead (or keepalive-only zombie) Codex stream no
+        #      longer holds the full 300s compression budget before falling
+        #      back (masoria report, Aug 2026: 3 stacked 300s waits ->
+        #      20+ min stuck on "Summarizing").
+        #   2. Streaming: every substantive event re-arms the deadline by
+        #      ``no_progress_timeout`` — a live stream is never killed by an
+        #      absolute total, so a long reasoning summary that is actually
+        #      producing tokens completes instead of timing out at 300s and
+        #      falling back (#54915's original complaint, fixed properly).
+        #      Keepalive/lifecycle frames do NOT re-arm, mirroring the
+        #      commit-fence progress gating (#96707).
+        #   3. Hard ceiling: an absolute backstop from
+        #      ``_aux_stream_total_ceiling`` (max(600s, 4x configured
+        #      timeout) — the same bound the streamed chat.completions path
+        #      uses) so a pathological one-token-per-59s drip still
+        #      terminates.
+        _start_monotonic = time.monotonic()
+        no_progress_timeout = _AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS
+        if total_timeout is not None:
+            no_progress_timeout = min(no_progress_timeout, float(total_timeout))
+        hard_deadline = _start_monotonic + _aux_stream_total_ceiling(total_timeout)
+        deadline_lock = threading.Lock()
+        progress_deadline = [_start_monotonic + no_progress_timeout]
+        saw_content = threading.Event()
         timed_out = threading.Event()
-        timeout_timer: Optional[threading.Timer] = None
+        # Set only when the timeout WON the attempt (not when the owner
+        # hard-cancelled first): tells the owning thread's ``finally`` that
+        # the shared client's FDs still need a real close (#29507).
+        timeout_release_pending = threading.Event()
+        stream_finished = threading.Event()
+        timeout_timer: List[Optional[threading.Timer]] = [None]
         # A protected provider call may outlive its owning compression attempt:
         # the owner returns promptly on hard cancellation while this adapter is
         # still blocked in the SDK stream on its isolated worker. Timer threads
@@ -1748,9 +1850,38 @@ class _CodexCompletionsAdapter:
         )
         attempt_stream_lock = threading.Lock()
         attempt_stream: List[Any] = []
+        # The thread driving this request owns its transport's file
+        # descriptors — see the FD-ownership note in _close_client_on_timeout.
+        owner_tid = threading.get_ident()
+
+        def _effective_deadline() -> float:
+            with deadline_lock:
+                return min(hard_deadline, progress_deadline[0])
+
+        def _record_stream_progress() -> None:
+            # A substantive payload re-arms the no-progress window. The hard
+            # ceiling is never extended.
+            with deadline_lock:
+                progress_deadline[0] = time.monotonic() + no_progress_timeout
 
         def _timeout_message() -> str:
-            return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
+            elapsed = time.monotonic() - _start_monotonic
+            if time.monotonic() >= hard_deadline:
+                return (
+                    "Codex auxiliary Responses stream exceeded "
+                    f"{hard_deadline - _start_monotonic:.1f}s hard ceiling"
+                )
+            if not saw_content.is_set():
+                return (
+                    "Codex auxiliary Responses stream produced no output "
+                    f"within {float(no_progress_timeout):.1f}s "
+                    f"(no-progress timeout, {elapsed:.1f}s elapsed)"
+                )
+            return (
+                "Codex auxiliary Responses stream stalled: no new output "
+                f"for {float(no_progress_timeout):.1f}s "
+                f"({elapsed:.1f}s elapsed)"
+            )
 
         def _close_client_on_timeout() -> None:
             begin_timeout_cleanup = getattr(
@@ -1785,12 +1916,58 @@ class _CodexCompletionsAdapter:
                             exc_info=True,
                         )
                 return
-            close = getattr(self._client, "close", None)
-            if callable(close):
+            # FD-ownership contract (#29507 / #67142 / #70773): only the
+            # thread driving the request may RELEASE this client's file
+            # descriptors. This callback has two callers — ``_check_cancelled``
+            # on the owning thread, and the daemon watchdog ``threading.Timer``,
+            # which is a stranger thread. From a stranger thread we may only
+            # ``shutdown()`` the pooled sockets: ``close()`` releases the raw
+            # TLS fd while the owner's OpenSSL BIO still caches that integer,
+            # the kernel recycles it into the next ``open()`` in this process
+            # (a SessionDB / kanban.db handle), and the owner's unwinding TLS
+            # flush writes an application-data record into that database file.
+            # ``shutdown()`` from any thread is FD-safe; ``close()`` is not.
+            # The owning thread performs the real close in the ``finally``
+            # below, which is where the FD release belongs.
+            timeout_release_pending.set()
+            if threading.get_ident() == owner_tid:
+                close = getattr(self._client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+            else:
                 try:
-                    close()
+                    from agent.agent_runtime_helpers import force_close_tcp_sockets
+
+                    shutdown_count = force_close_tcp_sockets(self._client)
+                    logger.info(
+                        "Codex auxiliary client aborted (timeout, tcp_force_closed=%d, "
+                        "deferred_close=stranger_thread)",
+                        shutdown_count,
+                    )
                 except Exception:
-                    logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+                    logger.debug("Codex auxiliary: client abort during timeout failed", exc_info=True)
+                # Socket shutdown wakes a reader blocked on a REAL transport,
+                # but the owner may be blocked inside the SDK's event stream
+                # (or a test double with no sockets). Closing the attempt-
+                # owned stream is the same attempt-scoped wake the hard-cancel
+                # branch above performs from this Timer thread — it releases
+                # the owner without touching the shared client's FDs; the
+                # owner then does the real close in its ``finally``.
+                with attempt_stream_lock:
+                    stream = attempt_stream[0] if attempt_stream else None
+                close_stream = getattr(stream, "close", None)
+                if callable(close_stream):
+                    try:
+                        close_stream()
+                    except Exception:
+                        logger.debug(
+                            "Codex auxiliary: attempt stream close during "
+                            "stranger-thread timeout failed",
+                            exc_info=True,
+                        )
             # The cached auxiliary client wraps this same ``self._client``
             # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
             # this instance).  After we close the httpx transport above, the
@@ -1803,7 +1980,7 @@ class _CodexCompletionsAdapter:
                 logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
-            if deadline is not None and time.monotonic() >= deadline:
+            if total_timeout is not None and time.monotonic() >= _effective_deadline():
                 if not timed_out.is_set():
                     _close_client_on_timeout()
                 raise TimeoutError(_timeout_message())
@@ -1825,11 +2002,30 @@ class _CodexCompletionsAdapter:
                 # new failure mode for auxiliary calls.
                 pass
 
+        def _watchdog_fire() -> None:
+            # Re-armable watchdog: if progress moved the deadline forward
+            # since this timer was scheduled, reschedule instead of killing
+            # a live stream. Only kill when the effective deadline (progress
+            # window or hard ceiling, whichever is sooner) has truly passed.
+            remaining = _effective_deadline() - time.monotonic()
+            if remaining > 0:
+                if timed_out.is_set() or stream_finished.is_set():
+                    return
+                t = threading.Timer(remaining, _watchdog_fire)
+                t.daemon = True
+                timeout_timer[0] = t
+                t.start()
+                return
+            _close_client_on_timeout()
+
         try:
             if total_timeout:
-                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
-                timeout_timer.daemon = True
-                timeout_timer.start()
+                timeout_timer[0] = threading.Timer(
+                    max(_effective_deadline() - time.monotonic(), 0.0),
+                    _watchdog_fire,
+                )
+                timeout_timer[0].daemon = True
+                timeout_timer[0].start()
             _check_cancelled()
 
             # Event-driven Responses streaming via the low-level
@@ -1856,10 +2052,21 @@ class _CodexCompletionsAdapter:
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
-                # Each SSE event is also forward progress for hosts watching
-                # a progress hook (gateway session hygiene): a reasoning
-                # model streaming a long summary must not look hung.
-                _notify_aux_progress()
+                # Provider response timing (TTFP telemetry) records every
+                # frame; forward progress for hosts watching liveness (the
+                # compression commit fence) counts only substantive
+                # payloads — lifecycle and keepalive events must not reset
+                # the compression idle clock.
+                # The transport no-progress window likewise re-arms only on
+                # substantive payloads: a zombie stream that drips SSE
+                # keepalives but never produces output dies at the same 60s
+                # window as a fully dead connection.
+                if _codex_event_has_content(_event):
+                    _record_stream_progress()
+                    saw_content.set()
+                    _notify_aux_provider_response()
+                else:
+                    _notify_aux_timing_response()
                 _check_cancelled()
 
             event_stream = self._client.responses.create(**stream_kwargs)
@@ -1951,8 +2158,26 @@ class _CodexCompletionsAdapter:
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
         finally:
-            if timeout_timer is not None:
-                timeout_timer.cancel()
+            stream_finished.set()
+            _t = timeout_timer[0]
+            if _t is not None:
+                _t.cancel()
+            # A stranger-thread timeout only shut the sockets down; the FDs
+            # are still open and this — the owning thread, now unwound — is
+            # the one context that may release them (#29507). Gated on
+            # timeout_release_pending, NOT timed_out: in the hard-cancel
+            # branch (timeout_won=False) the shared client must stay usable
+            # for other sessions.
+            if timeout_release_pending.is_set():
+                close = getattr(self._client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.debug(
+                            "Codex auxiliary: owner-thread close after timeout failed",
+                            exc_info=True,
+                        )
 
         content = "".join(text_parts).strip() or None
 
@@ -2213,13 +2438,22 @@ class _AnthropicCompletionsAdapter:
         response = create_anthropic_message(
             self._client,
             anthropic_kwargs,
-            # Tick the aux forward-progress hook per streamed event so hosts
-            # watching liveness (gateway session hygiene) don't kill a
-            # slow-but-generating summary model. No-op when no hook is
-            # installed (None keeps the fast get_final_message path).
+            # Per streamed event: record provider-response timing always, but
+            # tick the forward-progress hook (hosts watching liveness —
+            # gateway session hygiene / the compression commit fence) only
+            # for substantive payloads, so keepalive pings cannot hold a
+            # stalled summary open. No-op when no hook is installed (None
+            # keeps the fast get_final_message path).
             on_stream_event=(
-                (lambda _event: _notify_aux_progress())
-                if _aux_progress_active() else None
+                (
+                    lambda event: (
+                        _notify_aux_provider_response()
+                        if _anthropic_event_has_content(event)
+                        else _notify_aux_timing_response()
+                    )
+                )
+                if _aux_progress_active()
+                else None
             ),
         )
         _transport = get_transport("anthropic_messages")
@@ -2343,7 +2577,7 @@ class _BedrockCompletionsAdapter:
                 "stream); caller downgrades to non-streaming.",
                 model,
             )
-        return call_converse(
+        response = call_converse(
             region=self._region,
             model=model,
             messages=messages,
@@ -2361,6 +2595,11 @@ class _BedrockCompletionsAdapter:
             top_p=kwargs.get("top_p"),
             stop_sequences=stop,
         )
+        # Converse is a complete-response API in this shim. Mark provider
+        # progress only after the response returns so TTFP reflects real
+        # Bedrock latency rather than dispatch/setup activity.
+        _notify_aux_provider_response()
+        return response
 
 
 class _BedrockChatShim:
@@ -2943,7 +3182,6 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
             "auxiliary.free_only.",
             or_model,
         )
-        _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
     if not _is_free_model(or_model):
         _warn_paid_lane_once(or_model)
@@ -2969,8 +3207,15 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
                    default_headers=build_or_headers()), or_model
 
 
-def _describe_openrouter_unavailable() -> str:
-    """Return a more precise OpenRouter auth failure reason for logs."""
+def _describe_openrouter_unavailable(model: str = None) -> str:
+    """Return the policy or credential reason OpenRouter was unavailable."""
+    free_only, cfg_model = _aux_openrouter_settings()
+    or_model = model or cfg_model
+    if free_only and not _is_free_model(or_model):
+        return (
+            f"auxiliary.free_only rejected non-free model {or_model!r}; "
+            "the request was skipped before provider availability checks"
+        )
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
         if entry is None:
@@ -4996,7 +5241,7 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
         if normalized == "anthropic":
-            from agent.anthropic_adapter import read_claude_code_credentials, _refresh_oauth_token, resolve_anthropic_token
+            from agent.anthropic_credentials import read_claude_code_credentials, _refresh_oauth_token, resolve_anthropic_token
 
             creds = read_claude_code_credentials()
             token = _refresh_oauth_token(creds) if isinstance(creds, dict) and creds.get("refreshToken") else None
@@ -5094,6 +5339,18 @@ def _fallback_chain_entry(task: Optional[str], fb_label: str) -> Optional[Dict[s
     return entry if isinstance(entry, dict) else None
 
 
+def _coerce_positive_timeout(raw: Any) -> Optional[float]:
+    """Coerce a config ``timeout`` value to a positive float, or None.
+
+    Rejects bools (``True``/``False`` are ``int`` subclasses in Python) and
+    non-positive values. Shared by the aux client's fallback timeout resolver
+    and the compression stall-fallback route resolver (#78981).
+    """
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(raw)
+    return None
+
+
 def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[float]:
     """Resolve a per-entry ``timeout`` for a configured fallback candidate.
 
@@ -5112,9 +5369,7 @@ def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[floa
     """
     entry = _fallback_chain_entry(task, fb_label)
     raw = entry.get("timeout") if entry else None
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
-        return float(raw)
-    return None
+    return _coerce_positive_timeout(raw)
 
 
 def _fallback_provider_from_label(label: str) -> str:
@@ -5267,6 +5522,19 @@ def _call_fallback_candidate_sync(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
+    fallback_entry = _fallback_chain_entry(task, fb_label) or {}
+    fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
+        task,
+        actual_provider=destination.provider,
+        actual_model=destination.model,
+        requested_provider=fallback_entry.get("provider"),
+        requested_model=fallback_entry.get("model"),
+        route_config=fallback_entry,
+        leak_guard_config=task_config,
+        max_tokens=max_tokens,
+        extra_body=effective_extra_body,
+    )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5274,10 +5542,14 @@ def _call_fallback_candidate_sync(
     )
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
-        temperature=temperature, max_tokens=max_tokens,
+        temperature=temperature, max_tokens=fallback_max_tokens,
         tools=fallback_tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, reasoning_config=reasoning_config,
+        extra_body=fallback_extra_body, reasoning_config=reasoning_config,
         base_url=destination.base_url, task=task)
+    if fallback_max_tokens is not None and max_tokens is None:
+        fb_kwargs.update(
+            auxiliary_max_tokens_param(fallback_max_tokens, model=destination.model)
+        )
     try:
         return _validate_llm_response(
             _relay_sync_completion(
@@ -5285,6 +5557,14 @@ def _call_fallback_candidate_sync(
                 fb_kwargs,
                 provider=destination.provider,
                 api_mode=destination.api_mode,
+                create=lambda request: _create_with_progress(
+                    fb_client,
+                    request,
+                    task,
+                    force_stream=_provider_requires_stream(
+                        destination.provider, destination.base_url
+                    ),
+                ),
             ),
             task,
         )
@@ -5314,15 +5594,32 @@ def _call_fallback_candidate_sync(
                     tools,
                     destination=retry_destination,
                 )
+                retry_max_tokens, retry_extra_body = _compression_fast_lane_controls(
+                    task,
+                    actual_provider=retry_destination.provider,
+                    actual_model=retry_destination.model,
+                    requested_provider=fallback_entry.get("provider"),
+                    requested_model=fallback_entry.get("model"),
+                    route_config=fallback_entry,
+                    leak_guard_config=task_config,
+                    max_tokens=max_tokens,
+                    extra_body=effective_extra_body,
+                )
                 retry_kwargs = _build_call_kwargs(
                     retry_destination.provider,
                     retry_destination.model,
                     retry_messages,
-                    temperature=temperature, max_tokens=max_tokens,
+                    temperature=temperature, max_tokens=retry_max_tokens,
                     tools=retry_tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
+                    extra_body=retry_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=retry_destination.base_url, task=task)
+                if retry_max_tokens is not None and max_tokens is None:
+                    retry_kwargs.update(
+                        auxiliary_max_tokens_param(
+                            retry_max_tokens, model=retry_destination.model
+                        )
+                    )
                 try:
                     return _validate_llm_response(
                         _relay_sync_completion(
@@ -5330,6 +5627,15 @@ def _call_fallback_candidate_sync(
                             retry_kwargs,
                             provider=retry_destination.provider,
                             api_mode=retry_destination.api_mode,
+                            create=lambda request: _create_with_progress(
+                                retry_client,
+                                request,
+                                task,
+                                force_stream=_provider_requires_stream(
+                                    retry_destination.provider,
+                                    retry_destination.base_url,
+                                ),
+                            ),
                         ),
                         task,
                     )
@@ -5614,7 +5920,7 @@ def _task_minimum_context_length(task: Optional[str]) -> Optional[int]:
     Only ``compression`` carries an explicit minimum today (the same
     ``MINIMUM_CONTEXT_LENGTH`` (64K) floor that
     ``check_compression_model_feasibility`` already enforces at startup).
-    Other tasks (``vision``, ``title_generation``, ``web_extract``,
+    Other tasks (``vision``, ``title_generation``,
     ``skills_hub``, ``mcp``, ``session_search``) return ``None`` — they
     have no per-task context floor and the runtime chain must remain
     permissive for them.
@@ -6489,11 +6795,14 @@ def resolve_provider_client(
 
     # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
+        client, default = _try_openrouter(
+            explicit_api_key=explicit_api_key,
+            model=model,
+        )
         if client is None:
             logger.warning(
                 "resolve_provider_client: openrouter requested but %s",
-                _describe_openrouter_unavailable(),
+                _describe_openrouter_unavailable(model=model),
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
@@ -7182,11 +7491,11 @@ def get_text_auxiliary_client(
     """Return (client, default_model_slug) for text-only auxiliary tasks.
 
     Args:
-        task: Optional task name ("compression", "web_extract") to check
+        task: Optional task name ("compression", "skills_hub") to check
               for a task-specific provider override.
 
     Callers may override the returned model via config.yaml
-    (e.g. auxiliary.compression.model, auxiliary.web_extract.model).
+    (e.g. auxiliary.compression.model, auxiliary.skills_hub.model).
     """
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
@@ -8340,6 +8649,126 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     return task_config
 
 
+class CompressionFastLane(NamedTuple):
+    """Explicit, non-reasoning compression route safe for a bounded summary."""
+
+    certified_non_reasoning: bool
+    max_tokens: Optional[int]
+    reasoning_config: Optional[Dict[str, Any]]
+
+
+def _fast_lane_config_fields(
+    config: Dict[str, Any],
+) -> tuple[str, str, bool, Optional[int]]:
+    """Extract the fast-lane certification fields from one task config.
+
+    Returns ``(provider, model, non_reasoning, cap)``:
+
+    - ``provider``/``model``: normalized (stripped; provider lowercased).
+    - ``non_reasoning``: True only when ``reasoning_effort`` EXPLICITLY
+      disables thinking. Delegates to ``parse_reasoning_effort`` so every
+      spelling users can write in config.yaml (``none``, ``false``,
+      ``disabled``, YAML boolean ``false``) certifies identically —
+      ``_get_task_extra_body`` already uses the same parser to disable
+      reasoning, and the two predicates must not disagree. Empty/unset
+      (provider default) is NOT non-reasoning.
+    - ``cap``: positive int from ``max_output_tokens``, else None.
+      Booleans are config drift, never a cap (``int(True) == 1``).
+    """
+    from hermes_constants import parse_reasoning_effort
+
+    provider = str(config.get("provider") or "").strip().lower()
+    model = str(config.get("model") or "").strip()
+    parsed_effort = parse_reasoning_effort(config.get("reasoning_effort"))
+    non_reasoning = parsed_effort is not None and parsed_effort.get("enabled") is False
+    raw_cap = config.get("max_output_tokens")
+    try:
+        cap = 0 if isinstance(raw_cap, bool) else int(raw_cap or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    return provider, model, non_reasoning, (cap if cap > 0 else None)
+
+
+def resolve_compression_fast_lane(
+    actual_provider: str,
+    actual_model: Optional[str],
+    *,
+    requested_provider: Optional[str] = None,
+    requested_model: Optional[str] = None,
+    route_config: Optional[Dict[str, Any]] = None,
+) -> CompressionFastLane:
+    """Certify the opt-in fast lane against one already-resolved route.
+
+    A cap is safe only when the operator has selected a concrete auxiliary
+    provider/model, explicitly certified it as non-reasoning, and that exact
+    route is the one Hermes will call. A requested model covers a compressor
+    summary-model override. Auto/inherited and drifted routes stay uncapped.
+    """
+    config = (
+        route_config
+        if route_config is not None
+        else _get_auxiliary_task_config("compression")
+    )
+    cfg_provider, cfg_model, non_reasoning, cap = _fast_lane_config_fields(config)
+    provider = str(requested_provider or "").strip().lower() or cfg_provider
+    model = str(requested_model or "").strip() or cfg_model
+    explicit_route = provider not in {"", "auto"} and model.lower() not in {"", "auto"}
+    provider_matches = _normalize_aux_provider(
+        _fallback_provider_from_label(str(actual_provider or ""))
+    ) == _normalize_aux_provider(provider)
+    model_matches = str(actual_model or "").strip().lower() == model.lower()
+    certified = explicit_route and provider_matches and model_matches and non_reasoning
+    if not certified:
+        return CompressionFastLane(False, None, None)
+    return CompressionFastLane(
+        True,
+        cap,
+        {"enabled": False, "effort": "none"},
+    )
+
+
+def _compression_config_claims_fast_lane(config: Dict[str, Any]) -> bool:
+    """Whether task config declares fast-only controls that cannot leak."""
+    provider, model, non_reasoning, cap = _fast_lane_config_fields(config)
+    return (
+        provider not in {"", "auto"}
+        and model.lower() not in {"", "auto"}
+        and non_reasoning
+        and cap is not None
+    )
+
+
+def _compression_fast_lane_controls(
+    task: str | None,
+    *,
+    actual_provider: str,
+    actual_model: str | None,
+    requested_provider: str | None,
+    requested_model: str | None,
+    route_config: Dict[str, Any],
+    leak_guard_config: Dict[str, Any],
+    max_tokens: int | None,
+    extra_body: Dict[str, Any],
+) -> tuple[int | None, Dict[str, Any]]:
+    """Apply the certified compression controls to one resolved route."""
+    if task != "compression" or max_tokens is not None:
+        return max_tokens, extra_body
+    body = dict(extra_body)
+    lane = resolve_compression_fast_lane(
+        actual_provider,
+        actual_model,
+        requested_provider=requested_provider,
+        requested_model=requested_model,
+        route_config=route_config,
+    )
+    if lane.reasoning_config is not None:
+        if "reasoning" not in body:
+            body["reasoning"] = lane.reasoning_config
+    elif _compression_config_claims_fast_lane(leak_guard_config):
+        body.pop("reasoning", None)
+    return lane.max_tokens, body
+
+
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
     if not task:
@@ -8707,12 +9136,23 @@ def _build_call_kwargs(
             from hermes_cli.providers import nous_api_mode
 
             _nous_on_messages = nous_api_mode(model) == "anthropic_messages"
+        # OpenRouter budgets credit against the requested output cap; when the
+        # param is omitted it assumes the model's FULL output window (e.g.
+        # 65,536), so low-credit accounts 402 ("can only afford N") even
+        # though the actual summary would cost far less. Preserving the
+        # caller's cap keeps the request affordable (#41035, PR #41055 by
+        # @liuhao1024).
+        _is_openrouter = (
+            _provider_norm == "openrouter"
+            or base_url_host_matches(_effective_base, "openrouter.ai")
+        )
         if (
             _is_anthropic_compat_endpoint(provider, _effective_base)
             or _nous_on_messages
             or _is_nvidia_nim
             or _is_moa
             or _is_gemini_native
+            or _is_openrouter
         ):
             # Use auxiliary_max_tokens_param() so models that require
             # max_completion_tokens (GPT-5 family, Copilot) get the right
@@ -9094,7 +9534,94 @@ def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
     return False
 
 
+_AFFORDABLE_TOKENS_RE = re.compile(
+    r"can only afford\s+([0-9][0-9,]*)", re.IGNORECASE
+)
+
+# Below this, the affordable budget can't fit a useful auxiliary output
+# (summaries, titles, vision descriptions) — treat as genuine exhaustion.
+_AFFORDABLE_RETRY_FLOOR_TOKENS = 512
+# Headroom under the provider's stated budget so token-count rounding on
+# their side can't 402 the retry (same margin PR #49785 used).
+_AFFORDABLE_RETRY_MARGIN_TOKENS = 64
+
+
+def _affordable_max_tokens_from_error(exc: Exception) -> Optional[int]:
+    """Extract the affordable output budget from a credit-limited 402.
+
+    OpenRouter's insufficient-credit rejection states the budget explicitly:
+    ``402 - This request requires more credits, or fewer max_tokens. You
+    requested up to 65536 tokens, but can only afford 7117.`` The account
+    HAS usable credit — the request just asked for (or defaulted to) an
+    output cap larger than the balance covers. Returns the retryable cap
+    (affordable minus a safety margin), or ``None`` when the error carries
+    no affordable count or the budget is too small to be useful.
+    """
+    if not _is_payment_error(exc):
+        return None
+    match = _AFFORDABLE_TOKENS_RE.search(str(exc))
+    if not match:
+        return None
+    try:
+        affordable = int(match.group(1).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    capped = affordable - _AFFORDABLE_RETRY_MARGIN_TOKENS
+    if capped < _AFFORDABLE_RETRY_FLOOR_TOKENS:
+        return None
+    return capped
+
+
 def _create_with_progress(
+    client: Any,
+    kwargs: Dict[str, Any],
+    task: Optional[str] = None,
+    *,
+    force_stream: bool = False,
+) -> Any:
+    """Credit-aware wrapper over :func:`_create_with_progress_once`.
+
+    A 402 that names an affordable output budget ("can only afford N
+    tokens") is NOT terminal billing exhaustion — the account can pay for
+    the call at a lower ``max_tokens``. Retry ONCE with the provider-stated
+    cap (masoria debug bundle, Aug 2026: compression fell back to
+    OpenRouter, which defaulted the omitted cap to the model's full 65,536
+    window and 402'd three times in a row on an account that could afford
+    7,117 tokens — plenty for a summary). Only lowers, never raises, an
+    existing cap; anything else re-raises for the normal recovery chains.
+    """
+    try:
+        return _create_with_progress_once(
+            client, kwargs, task, force_stream=force_stream,
+        )
+    except Exception as exc:
+        affordable = _affordable_max_tokens_from_error(exc)
+        if affordable is None:
+            raise
+        existing_cap = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
+        if isinstance(existing_cap, (int, float)) and 0 < existing_cap <= affordable:
+            # The request was already within the stated budget — the error
+            # is something else (e.g. prompt-side cost). Don't spin.
+            raise
+        retry_kwargs = dict(kwargs)
+        retry_kwargs.pop("max_tokens", None)
+        retry_kwargs.pop("max_completion_tokens", None)
+        retry_kwargs.update(
+            auxiliary_max_tokens_param(
+                affordable, model=str(kwargs.get("model") or "") or None,
+            )
+        )
+        logger.info(
+            "Auxiliary %s: credit-limited 402 (affordable=%d tokens); "
+            "retrying once with a clamped output cap instead of failing: %s",
+            task or "call", affordable, exc,
+        )
+        return _create_with_progress_once(
+            client, retry_kwargs, task, force_stream=force_stream,
+        )
+
+
+def _create_with_progress_once(
     client: Any,
     kwargs: Dict[str, Any],
     task: Optional[str] = None,
@@ -9108,18 +9635,22 @@ def _create_with_progress(
     neither trigger applies (every existing caller/task) or when the client's
     wire adapter streams internally. With a hook + a chunk-capable client,
     the request is sent with ``stream=True`` and aggregated, ticking the hook
-    per chunk — so the configured ``timeout`` acts per stream read (idle)
-    rather than as a total budget, and outer liveness watchdogs see tokens
-    moving. ``force_stream=True`` (stream-only providers such as Tencent
+    only for substantive chunks. The configured ``timeout`` acts per stream
+    read (idle) rather than as a total budget, and outer liveness watchdogs see
+    tokens moving. ``force_stream=True`` (stream-only providers such as Tencent
     Copilot — credit @kudi88, PR #60686) takes the same streamed path even
     without a hook. Providers that reject the streamed request fall back to
     the plain non-streaming call — except under ``force_stream``, where a
     stream-only provider rejects the plain call by definition, so the
     original error is surfaced to the normal recovery chains instead.
     """
-    _notify_aux_progress()  # request dispatched counts as progress
+    _notify_aux_dispatch()
+    _notify_aux_progress()  # Preserve the watchdog's historical dispatch tick.
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
-        return client.chat.completions.create(**kwargs)
+        response = client.chat.completions.create(**kwargs)
+        if not _client_streams_internally(client):
+            _notify_aux_provider_response()
+        return response
 
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
     stream_kwargs = dict(kwargs)
@@ -9148,12 +9679,17 @@ def _create_with_progress(
             "Auxiliary %s: streamed request failed (%s); retrying "
             "non-streaming", task or "call", exc,
         )
-        return client.chat.completions.create(**kwargs)
+        _notify_aux_dispatch()
+        response = client.chat.completions.create(**kwargs)
+        _notify_aux_provider_response()
+        return response
 
     # Some shims (MoA virtual provider under quiet mode, defensive adapters)
-    # return a complete response even when stream=True was requested.
+    # return a complete response even when stream=True was requested. A
+    # complete response object carries the full summary payload, so it counts
+    # as provider response progress (TTFP) and forward progress alike.
     if hasattr(chunks, "choices"):
-        _notify_aux_progress()
+        _notify_aux_provider_response()
         return chunks
     return _aggregate_chat_stream(
         chunks, model=str(kwargs.get("model") or ""), total_ceiling=total_ceiling,
@@ -9168,7 +9704,8 @@ def _aggregate_chat_stream(
 ) -> Any:
     """Consume a chat.completions chunk stream into a complete response.
 
-    Ticks the thread-local aux progress hook on every chunk. Raises
+    Ticks the thread-local aux progress hook only for non-empty content,
+    reasoning, or tool-call fragments. Raises
     TimeoutError when *total_ceiling* seconds elapse before the stream
     finishes — phrased with "timed out" so existing timeout classification
     (``_is_timeout_error``) treats it exactly like a request timeout.
@@ -9202,6 +9739,7 @@ class _ChatStreamAccumulator:
         self._total_ceiling = total_ceiling
         self.content_parts: List[str] = []
         self.reasoning_parts: List[str] = []
+        self.reasoning_details: List[Any] = []
         self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
         self.finish_reason = None
         self.usage = None
@@ -9209,7 +9747,11 @@ class _ChatStreamAccumulator:
         self.resp_model = model or ""
 
     def feed(self, chunk: Any) -> None:
-        _notify_aux_progress()
+        # Every provider frame records transport-level timing (TTFP
+        # telemetry, first-frame-wins); only a substantive payload below
+        # ticks the forward-progress hook that keeps compression alive.
+        _notify_aux_timing_response()
+        made_progress = False
         if (
             self._total_ceiling is not None
             and (time.monotonic() - self._started) >= self._total_ceiling
@@ -9234,25 +9776,53 @@ class _ChatStreamAccumulator:
         piece = getattr(delta, "content", None)
         if piece:
             self.content_parts.append(piece)
+            made_progress = True
         reasoning_piece = (
             getattr(delta, "reasoning", None)
             or getattr(delta, "reasoning_content", None)
         )
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
+            made_progress = True
+        # OpenRouter-compatible reasoning models may stream their entire
+        # thinking phase through ``reasoning_details`` instead of
+        # ``reasoning`` / ``reasoning_content``.  Treat only details carrying
+        # actual text as forward progress: structural/signed envelopes must
+        # not keep an otherwise stalled compression alive indefinitely.
+        reasoning_details = getattr(delta, "reasoning_details", None)
+        if reasoning_details is None:
+            model_extra = getattr(delta, "model_extra", None)
+            if isinstance(model_extra, dict):
+                reasoning_details = model_extra.get("reasoning_details")
+        if isinstance(reasoning_details, list):
+            for detail in reasoning_details:
+                self.reasoning_details.append(detail)
+                if isinstance(detail, dict) and any(
+                    isinstance(detail.get(field), str) and detail[field]
+                    for field in ("summary", "thinking", "content", "text")
+                ):
+                    made_progress = True
         for tc in (getattr(delta, "tool_calls", None) or []):
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(
                 idx, {"id": "", "name": "", "arguments": []}
             )
+            tool_fragment = False
             if getattr(tc, "id", None):
                 acc["id"] = tc.id
+                tool_fragment = True
             fn = getattr(tc, "function", None)
             if fn is not None:
                 if getattr(fn, "name", None):
                     acc["name"] = fn.name
+                    tool_fragment = True
                 if getattr(fn, "arguments", None):
                     acc["arguments"].append(fn.arguments)
+                    tool_fragment = True
+            made_progress = made_progress or tool_fragment
+
+        if made_progress:
+            _notify_aux_progress()
 
     def finish(self) -> Any:
         tool_calls = None
@@ -9273,6 +9843,7 @@ class _ChatStreamAccumulator:
             content="".join(self.content_parts),
             tool_calls=tool_calls,
             reasoning="".join(self.reasoning_parts) or None,
+            reasoning_details=self.reasoning_details or None,
         )
         choice = SimpleNamespace(
             index=0,
@@ -9361,38 +9932,72 @@ def call_llm(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
         semaphore.acquire()
-    try:
-        response = _call_llm_impl(
-            task=task,
-            provider=provider,
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            main_runtime=main_runtime,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            timeout=timeout,
-            extra_body=extra_body,
-            reasoning_config=reasoning_config,
-            extra_headers=extra_headers,
-            api_mode=api_mode,
-            stream=stream,
-            stream_options=stream_options,
-            route_info=route_info,
+    request_started_at = time.monotonic()
+    if latency_info is not None:
+        latency_info["queue_wait_ms"] = max(
+            0, int((request_started_at - queue_started_at) * 1000)
         )
+    prior_progress_hook = getattr(_aux_progress, "hook", None)
+
+    def _timed_response() -> None:
+        if latency_info is not None and "time_to_first_progress_ms" not in latency_info:
+            latency_info["time_to_first_progress_ms"] = max(
+                0, int((time.monotonic() - request_started_at) * 1000)
+            )
+
+    def _timed_dispatch() -> None:
+        if latency_info is not None and "provider_dispatch_ms" not in latency_info:
+            latency_info["provider_dispatch_ms"] = max(
+                0, int((time.monotonic() - request_started_at) * 1000)
+            )
+
+    try:
+        with (
+            aux_progress_hook(
+                prior_progress_hook
+                if callable(prior_progress_hook)
+                else ((lambda: None) if latency_info is not None else None)
+            ),
+            _aux_timing_hook(_aux_dispatch, _timed_dispatch),
+            _aux_timing_hook(_aux_provider_response, _timed_response),
+        ):
+            response = _call_llm_impl(
+                task=task,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                main_runtime=main_runtime,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=timeout,
+                extra_body=extra_body,
+                reasoning_config=reasoning_config,
+                extra_headers=extra_headers,
+                api_mode=api_mode,
+                stream=stream,
+                stream_options=stream_options,
+                route_info=route_info,
+            )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
             semaphore = None
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         return response
     finally:
+        if latency_info is not None:
+            latency_info["summary_generation_ms"] = max(
+                0, int((time.monotonic() - request_started_at) * 1000)
+            )
         if semaphore is not None:
             semaphore.release()
 
@@ -9439,7 +10044,7 @@ def _call_llm_impl(
     handles auth, request formatting, and model-specific arg adjustments.
 
     Args:
-        task: Auxiliary task name ("compression", "vision", "web_extract",
+        task: Auxiliary task name ("compression", "vision",
               "session_search", "skills_hub", "mcp", "title_generation").
               Reads provider:model from config/env. Ignored if provider is set.
         provider: Explicit provider override.
@@ -9565,6 +10170,20 @@ def _call_llm_impl(
 
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
+    compression_config = (
+        _get_auxiliary_task_config("compression") if task == "compression" else {}
+    )
+    fast_compression_cap, effective_extra_body = _compression_fast_lane_controls(
+        task,
+        actual_provider=request_provider,
+        actual_model=final_model,
+        requested_provider=provider,
+        requested_model=model,
+        route_config=compression_config,
+        leak_guard_config=compression_config,
+        max_tokens=max_tokens,
+        extra_body=effective_extra_body,
+    )
     _set_relay_auxiliary_route(
         request_provider,
         final_model,
@@ -9590,6 +10209,16 @@ def _call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
+    if fast_compression_cap is not None and max_tokens is None:
+        # Normal auxiliary calls intentionally omit a cap on most
+        # OpenAI-compatible/local providers.  This is the narrow exception:
+        # the configured compression route is concrete and certified
+        # non-reasoning, so a bounded summary request is intentional.
+        # ``max_tokens is None`` restricts the forced param to caps the
+        # certified lane itself produced — an explicit caller max_tokens is
+        # passed through untouched and keeps _build_call_kwargs's
+        # provider-quirk handling (same guard as the fallback path).
+        kwargs.update(auxiliary_max_tokens_param(fast_compression_cap, model=final_model))
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
 
@@ -9676,12 +10305,20 @@ def _call_llm_impl(
             # fall straight through to provider/model fallback; fast blips (a
             # streaming-close or a 5xx) still retry, since those are cheap.
             if task == "compression" and _is_timeout_error(transient_err):
-                logger.info(
-                    "Auxiliary compression: timeout on the critical path; "
-                    "skipping same-provider retry and falling back: %s",
-                    transient_err,
-                )
-                raise
+                # A fast first-token fail (dead stream detected within the
+                # 60s no-progress window, zero output seen) is cheap — take
+                # the normal same-provider retry chain first; the provider
+                # is often fine and only that one stream was stillborn. A
+                # mid-stream stall or hard-ceiling timeout skips straight to
+                # fallback, because re-running a multi-minute summary on the
+                # same provider doubles the user-visible stall (#54465).
+                if "no-progress timeout" not in str(transient_err):
+                    logger.info(
+                        "Auxiliary compression: timeout on the critical path; "
+                        "skipping same-provider retry and falling back: %s",
+                        transient_err,
+                    )
+                    raise
             _max_transient_retries = _transient_retry_count()
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):
@@ -10177,7 +10814,38 @@ def _call_llm_impl(
         raise
 
 
-def extract_content_or_reasoning(response) -> str:
+def _coerce_llm_message(response):
+    """Pull a message (dict, object, or str) out of a response-or-message value.
+
+    Compression and some OpenAI-compatible proxies hand us a dict-shaped
+    response or a bare message; vision/oneshot callers pass a ChatCompletion
+    object. MagicMock ``reasoning_*`` attrs are not strings — callers that
+    want the empty-content failure path rely on that.
+    """
+    if response is None or isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        if "choices" not in response:
+            return response
+        choices = response.get("choices") or []
+        if not choices:
+            return None
+        first = choices[0]
+        return first.get("message") if isinstance(first, dict) else getattr(first, "message", None)
+    choices = getattr(response, "choices", None)
+    if not choices:
+        return response
+    first = choices[0]
+    return first.get("message") if isinstance(first, dict) else getattr(first, "message", None)
+
+
+def _message_field(msg, name):
+    if isinstance(msg, dict):
+        return msg.get(name)
+    return getattr(msg, name, None)
+
+
+def extract_content_or_reasoning(response, *, max_reasoning_chars: int | None = None) -> str:
     """Extract content from an LLM response, falling back to reasoning fields.
 
     Mirrors the main agent loop's behavior when a reasoning model (DeepSeek-R1,
@@ -10190,12 +10858,24 @@ def extract_content_or_reasoning(response) -> str:
          structured reasoning fields (DeepSeek, Moonshot, NovitaAI, etc.).
       3. ``message.reasoning_details`` — OpenRouter unified array format.
 
+    Accepts a full response or a bare message (dict or object). When
+    ``max_reasoning_chars`` is set, a reasoning-field fallback is truncated
+    so an unbounded chain-of-thought cannot become the compaction summary.
+
     Returns the best available text, or ``""`` if nothing found.
     """
     import re
 
-    msg = response.choices[0].message
-    content = (msg.content or "").strip()
+    msg = _coerce_llm_message(response)
+    if msg is None:
+        return ""
+    if isinstance(msg, str):
+        return msg.strip()
+
+    raw = _message_field(msg, "content")
+    if not isinstance(raw, str):
+        raw = str(raw) if raw else ""
+    content = raw.strip()
 
     if content:
         # Strip inline think/reasoning blocks (mirrors _strip_think_blocks)
@@ -10211,11 +10891,11 @@ def extract_content_or_reasoning(response) -> str:
     # Content is empty or reasoning-only — try structured reasoning fields
     reasoning_parts: list[str] = []
     for field in ("reasoning", "reasoning_content"):
-        val = getattr(msg, field, None)
+        val = _message_field(msg, field)
         if val and isinstance(val, str) and val.strip() and val not in reasoning_parts:
             reasoning_parts.append(val.strip())
 
-    details = getattr(msg, "reasoning_details", None)
+    details = _message_field(msg, "reasoning_details")
     if details and isinstance(details, list):
         for detail in details:
             if isinstance(detail, dict):
@@ -10227,10 +10907,18 @@ def extract_content_or_reasoning(response) -> str:
                 if summary and summary not in reasoning_parts:
                     reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
 
-    if reasoning_parts:
-        return "\n\n".join(reasoning_parts)
+    if not reasoning_parts:
+        return ""
 
-    return ""
+    text = "\n\n".join(reasoning_parts)
+    if max_reasoning_chars is not None and len(text) > max_reasoning_chars:
+        logger.warning(
+            "fell back to reasoning fields (%d chars); truncating to %d",
+            len(text),
+            max_reasoning_chars,
+        )
+        return text[:max_reasoning_chars]
+    return text
 
 
 @_relay_auxiliary_call_async

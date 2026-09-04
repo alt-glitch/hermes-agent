@@ -968,6 +968,8 @@ class PhotonAdapter(BasePlatformAdapter):
             "[photon] connected — sidecar on %s:%d, streaming inbound over gRPC",
             self._sidecar_bind, self._sidecar_port,
         )
+        # Plugin-registered native handlers (ctx.register_platform_handler).
+        self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
@@ -1290,6 +1292,15 @@ class PhotonAdapter(BasePlatformAdapter):
             )
 
         ctype = content.get("type")
+        if ctype in {"read", "read_receipt"}:
+            # Read receipts are presence signals, not a user turn. The sidecar
+            # only forwards receipts for messages we sent, so logging the
+            # target is enough for observability without waking the agent.
+            logger.debug(
+                "[photon] outbound message read: %s",
+                content.get("targetMessageId") or "unknown",
+            )
+            return
         if ctype == "reaction":
             # Route only tapbacks on messages WE sent — those are implicitly
             # addressed to the bot (feishu precedent: synthetic text event).

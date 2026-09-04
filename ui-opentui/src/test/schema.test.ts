@@ -41,6 +41,18 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
+  test('decodes btw snapshot completion with its question and answer', () => {
+    const ev = decode({
+      type: 'btw.complete',
+      session_id: 's1',
+      payload: { question: 'why?', task_id: 'btw-1', text: 'because' }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'btw.complete') {
+      expect(ev.value.payload).toEqual({ question: 'why?', task_id: 'btw-1', text: 'because' })
+    }
+  })
+
   test('preserves correlated prompt lifecycle ids', () => {
     for (const wire of [
       { type: 'message.start', payload: { client_submission_ids: ['send-1'] } },

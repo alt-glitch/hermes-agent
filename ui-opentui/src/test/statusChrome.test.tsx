@@ -17,6 +17,7 @@ import { describe, expect, test } from 'vitest'
 
 import { decodeSessionInfoPatch } from '../boundary/schema/SessionInfo.ts'
 import { applyDelegationState, createDelegationState } from '../logic/agentStatus.ts'
+import { normalizeStatusBarFields } from '../logic/configSync.ts'
 import { createSessionStore, type SessionStore, type SubagentInfo } from '../logic/store.ts'
 import {
   cmpLevel,
@@ -121,6 +122,21 @@ describe('store.applyInfo — chrome merge', () => {
     store.applyInfo({ model: 'opus' })
     expect(store.state.info.startedAt).toBe(seeded)
   })
+
+  test('captures only present finite cache/latency/tps telemetry', () => {
+    const store = createSessionStore()
+    store.applyInfo({ usage: { avg_latency_s: 1.25, avg_tps: 48.6, cache_hit_pct: 73 } } as never)
+    expect(store.state.info).toMatchObject({ avgLatencyS: 1.25, avgTps: 48.6, cacheHitPct: 73 })
+
+    store.applyInfo({ usage: { avg_latency_s: Number.NaN, avg_tps: Number.POSITIVE_INFINITY } } as never)
+    expect(store.state.info).toMatchObject({ avgLatencyS: 1.25, avgTps: 48.6, cacheHitPct: 73 })
+
+    const malformed = createSessionStore()
+    malformed.applyInfo({ usage: { avg_latency_s: Number.NaN, avg_tps: Number.NEGATIVE_INFINITY } } as never)
+    expect(malformed.state.info.avgLatencyS).toBeUndefined()
+    expect(malformed.state.info.avgTps).toBeUndefined()
+    expect(malformed.state.info.cacheHitPct).toBeUndefined()
+  })
 })
 
 // ── 3. pure logic ────────────────────────────────────────────────────────
@@ -138,6 +154,9 @@ describe('statusSegments — progressive disclosure table (chrome v3 order)', ()
       agents: true,
       ctxDetail: true,
       cost: true,
+      cacheHit: true,
+      latency: true,
+      tps: true,
       voice: true,
       up: true,
       compressions: true,
@@ -149,12 +168,15 @@ describe('statusSegments — progressive disclosure table (chrome v3 order)', ()
     })
   })
 
-  test('segments drop whole in reverse priority as width shrinks: mcp → bg → profile → cmp → up → cost → ctx detail', () => {
+  test('segments drop whole in reverse priority, including telemetry ladder thresholds', () => {
     // each row: [width, expected visible flags]
     const table: Array<[number, Partial<ReturnType<typeof statusSegments>>]> = [
       [125, { mcp: false, bg: true }], // mcp drops first
       [117, { mcp: false, bg: false, profile: true }], // then bg
       [107, { profile: false, compressions: true }], // then profile
+      [109, { tps: false, profile: true }],
+      [103, { latency: false, sessions: true }],
+      [95, { cacheHit: false, compressions: true }],
       [111, { browser: false, profile: true }], // browser drops before profile
       [99, { sessions: false, compressions: true }], // then live-session count
       [93, { compressions: false, up: true }], // then cmp
@@ -435,6 +457,56 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     expect([...positions].sort((a, b) => a - b)).toEqual(positions)
     // …and no other row carries chrome: the bar never restacks to two lines.
     expect(rows.filter(r => r.includes('│')).length).toBe(1)
+  })
+
+  test('cache hit, latency, and throughput appear only when finite and past their drop thresholds', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.applyInfo({ model: 'm', usage: { avg_latency_s: 1.25, avg_tps: 48.6, cache_hit_pct: 73 } } as never)
+
+    const cases = [
+      { width: 95, absent: ['◎', '◷', 't/s'], present: [] },
+      { width: 96, absent: ['◷', 't/s'], present: ['◎ 73%'] },
+      { width: 103, absent: ['◷', 't/s'], present: ['◎ 73%'] },
+      { width: 104, absent: ['t/s'], present: ['◎ 73%', '◷ 1.3s'] },
+      { width: 109, absent: ['t/s'], present: ['◎ 73%', '◷ 1.3s'] },
+      { width: 110, absent: [], present: ['◎ 73%', '◷ 1.3s', '↑ 49 t/s'] }
+    ]
+    for (const { absent, present, width } of cases) {
+      const frame = await captureFrame(bar(store), { width, height: 3 })
+      const rows = frame.split('\n').filter(row => row.trim())
+      expect(rows, `width ${String(width)}`).toHaveLength(1)
+      for (const text of present) expect(rows[0], `width ${String(width)}`).toContain(text)
+      for (const text of absent) expect(rows[0], `width ${String(width)}`).not.toContain(text)
+    }
+  })
+
+  test('display.status_bar.fields filters known telemetry names while unknown names are harmless', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.applyInfo({ model: 'm', usage: { avg_latency_s: 1.25, avg_tps: 48.6, cache_hit_pct: 73 } } as never)
+    store.setStatusBarFields(normalizeStatusBarFields([' TPS ', 'future_field']))
+
+    const frame = await captureFrame(bar(store), { width: 140, height: 3 })
+    expect(frame).toContain('↑ 49 t/s')
+    expect(frame).not.toContain('◎ 73%')
+    expect(frame).not.toContain('◷ 1.3s')
+  })
+
+  test('telemetry width sweep stays on one physical row and never emits partial values', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.applyInfo({ model: 'm', usage: { avg_latency_s: 1.25, avg_tps: 48.6, cache_hit_pct: 73 } } as never)
+
+    for (const width of [20, 40, 60, 80, 95, 96, 103, 104, 109, 110, 120, 160, 220]) {
+      const frame = await captureFrame(bar(store), { width, height: 3 })
+      const rows = frame.split('\n').filter(row => row.trim())
+      expect(rows, `width ${String(width)}`).toHaveLength(1)
+      const row = rows[0] ?? ''
+      expect(row.includes('◎'), `cache width ${String(width)}`).toBe(row.includes('◎ 73%'))
+      expect(row.includes('◷'), `latency width ${String(width)}`).toBe(row.includes('◷ 1.3s'))
+      expect(row.includes('t/s'), `tps width ${String(width)}`).toBe(row.includes('↑ 49 t/s'))
+    }
   })
 
   test('the MCP segment reports enabled servers while retaining the connected fallback', async () => {

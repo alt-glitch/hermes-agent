@@ -2,16 +2,24 @@ import { atom, computed } from 'nanostores'
 
 import { translateNow } from '@/i18n'
 import { stableArray } from '@/lib/stable-array'
-import type { TodoItem, TodoStatus } from '@/lib/todos'
+import { type TodoItem, type TodoStatus, todoTree } from '@/lib/todos'
 
 import { $gateway } from './gateway'
 import { $goalsBySession, type GoalStatus } from './goals'
 import { dispatchNativeNotification } from './native-notifications'
 import { notifyError } from './notifications'
+import { isSessionGone, isSessionGoneForBackgroundPolling, markSessionGone, noteRuntimeAlive } from './runtime-gone'
 import { $sessions, lineageAliases } from './session'
 import { $sessionStates } from './session-states'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 import { $todosBySession } from './todos'
+
+export {
+  isSessionGone,
+  isSessionGoneForBackgroundPolling,
+  markSessionGone,
+  resetBackgroundPollingGuard
+} from './runtime-gone'
 
 /** Composer status stack feed — merged todos, subagents, background per session. */
 export type StatusItemState = 'done' | 'failed' | 'running'
@@ -22,6 +30,8 @@ export interface ComposerStatusItem {
   exitCode?: number
   /** subagent: active tool label shown on the right. */
   currentTool?: string
+  /** todo: nesting depth (0 = top-level) for indented subtask rows. */
+  depth?: number
   /** goal: active | paused | waiting | done. */
   goalStatus?: GoalStatus
   id: string
@@ -145,7 +155,8 @@ const subToItem = (s: SubagentProgress): ComposerStatusItem => ({
   type: 'subagent'
 })
 
-const todoToItem = (t: TodoItem): ComposerStatusItem => ({
+const todoToItem = (t: TodoItem, depth: number): ComposerStatusItem => ({
+  depth,
   id: `todo:${t.id}`,
   state: t.status === 'in_progress' ? 'running' : 'done',
   title: t.content,
@@ -182,6 +193,7 @@ const sameStatusItem = (a: ComposerStatusItem, b: ComposerStatusItem) =>
   a.currentTool === b.currentTool &&
   a.goalStatus === b.goalStatus &&
   a.todoStatus === b.todoStatus &&
+  a.depth === b.depth &&
   a.sessionId === b.sessionId
 
 const stabilizeItems = (prev: ComposerStatusItem[] | undefined, next: ComposerStatusItem[]): ComposerStatusItem[] => {
@@ -208,7 +220,10 @@ export const $statusItemsBySession = computed(
     }
 
     for (const [sid, list] of Object.entries(todos)) {
-      push(sid, list.map(todoToItem))
+      push(
+        sid,
+        todoTree(list).map(([t, depth]) => todoToItem(t, depth))
+      )
     }
 
     for (const [sid, goal] of Object.entries(goals)) {
@@ -381,7 +396,7 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
 export async function refreshBackgroundProcesses(sid: string): Promise<void> {
   const gateway = $gateway.get()
 
-  if (!sid || !gateway) {
+  if (!sid || !gateway || isSessionGone(sid)) {
     return
   }
 
@@ -389,7 +404,18 @@ export async function refreshBackgroundProcesses(sid: string): Promise<void> {
     const result = await gateway.request<{ processes?: GatewayProcessEntry[] }>('process.list', { session_id: sid })
 
     reconcileBackgroundProcesses(sid, result?.processes ?? [])
-  } catch {
+    // The binding answered, so it is healthy: refund the stored session's
+    // recovery budget (a heal that stuck must not count against the next one).
+    noteRuntimeAlive(sid)
+  } catch (error) {
+    // A gone session never comes back under this runtime id: stop polling it,
+    // or the 5s timer hammers the gateway with 4001s for the window's lifetime.
+    if (isSessionGoneForBackgroundPolling(error)) {
+      markSessionGone(sid)
+
+      return
+    }
+
     // Transient socket loss — the next trigger (event or poll) retries.
   }
 }

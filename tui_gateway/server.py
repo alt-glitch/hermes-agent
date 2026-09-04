@@ -410,6 +410,16 @@ _current_runtime_session_record: contextvars.ContextVar[dict | None] = (
     contextvars.ContextVar("hermes_gateway_runtime_session_record", default=None)
 )
 
+# JSON-RPC method being dispatched on this thread/task. Purely diagnostic: the
+# 4001 "session not found" warning below is the only signal a stale-runtime
+# retry loop leaves behind, and without the method name it cannot say WHICH
+# client poll is looping (a 5s `process.list` poll produced 18,614 rejections
+# against one id before the caller could be identified). Never used for
+# authorization — the method string is client-supplied.
+_current_rpc_method: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hermes_gateway_rpc_method", default=""
+)
+
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
 # of corrupting the JSON protocol.
@@ -651,12 +661,27 @@ def _notify_session_boundary(
         pass
 
 
+_SESSION_OWNERSHIP_UNAVAILABLE = (
+    "Hermes could not safely reserve this session. Try again."
+)
+
+_AUTOMATIC_SESSION_END_REASONS = frozenset({
+    "ws_orphan_reap",
+    "ws_disconnect",
+    "idle_timeout",
+    "lru_evict",
+    "tui_shutdown",
+})
+
+
 def _claim_active_session_slot(
     session_key: str,
     *,
     live_session_id: str,
     surface: str = "tui",
+    profile_home: str | Path | None = None,
 ) -> tuple[Any, str | None]:
+    track_liveness = str(surface or "").strip().lower() == "desktop"
     try:
         from hermes_cli.active_sessions import try_acquire_active_session
 
@@ -665,10 +690,17 @@ def _claim_active_session_slot(
             surface=surface,
             config=_load_cfg(),
             metadata={"live_session_id": live_session_id},
+            registry_home=profile_home,
+            track_liveness=track_liveness,
         )
     except Exception as exc:
         logger.warning("Failed to claim active session slot: %s", exc)
-        return None, None
+        # Fail CLOSED regardless of surface: per-session exclusivity is a
+        # correctness guarantee (see PER_SESSION_EXCLUSIVE_SUBMIT), and a
+        # claim that errors out has NOT proven the session is unowned.
+        # Proceeding without a lease here is the silent double-writer hole
+        # flagged in the #94595 review (blocker 2).
+        return (None, _SESSION_OWNERSHIP_UNAVAILABLE)
 
 
 _SESSION_CLOSED_DURING_ADMISSION = (
@@ -717,20 +749,54 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     the invariant that anything holding a slot is something the user can see.
     """
     # Keep registry I/O outside the per-session mutation lock: claiming may
-    # block on the cross-process active-session file lock. The two locked
-    # checks make the in-memory ownership transition atomic while allowing
-    # unrelated lifecycle work to proceed.
+    # block on the cross-process active-session file lock. Elect one owner for
+    # each no-lease admission generation so same-session peers cannot replace
+    # each other's durable same-writer lease while the lock is released.
+    claim_owner = False
     with _session_mutation_lock(session):
         if not _session_registry_matches(sid, session) or session.get("_finalized"):
             return _SESSION_CLOSED_DURING_ADMISSION
         if session.get("active_session_lease") is not None:
             return None
-    lease, limit_message = _claim_active_session_slot(
-        str(session.get("session_key") or ""),
-        live_session_id=sid,
-        surface=_session_source(session),
-    )
-    result = limit_message
+        claim_state = session.get("_active_session_claim")
+        if claim_state is None:
+            claim_state = {
+                "event": threading.Event(),
+                "result": _SESSION_OWNERSHIP_UNAVAILABLE,
+            }
+            session["_active_session_claim"] = claim_state
+            claim_owner = True
+
+    if not claim_owner:
+        completed = claim_state["event"].wait(timeout=5.0)
+        with _session_mutation_lock(session):
+            if not _session_registry_matches(sid, session) or session.get("_finalized"):
+                return _SESSION_CLOSED_DURING_ADMISSION
+            if session.get("active_session_lease") is not None:
+                return None
+            if not completed:
+                return _SESSION_OWNERSHIP_UNAVAILABLE
+            peer_result = claim_state.get("result")
+            return (
+                peer_result
+                if peer_result is not None
+                else _SESSION_OWNERSHIP_UNAVAILABLE
+            )
+
+    lease = None
+    limit_message = None
+    claim_error = None
+    try:
+        lease, limit_message = _claim_active_session_slot(
+            str(session.get("session_key") or ""),
+            live_session_id=sid,
+            surface=_session_source(session),
+            profile_home=session.get("profile_home"),
+        )
+    except BaseException as exc:
+        claim_error = exc
+
+    result = limit_message or _SESSION_OWNERSHIP_UNAVAILABLE
     with _session_mutation_lock(session):
         if not _session_registry_matches(sid, session) or session.get("_finalized"):
             # Teardown detached/finalized this exact record while the
@@ -738,36 +804,110 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
             # a concurrent successful claimant: prompt.submit must stop here.
             result = _SESSION_CLOSED_DURING_ADMISSION
         elif session.get("active_session_lease") is not None:
-            # A concurrent first submission installed the lease. Its result
-            # wins over a stale cap error from this redundant attempt.
+            # A lifecycle helper installed a lease while the elected claim was
+            # outside the lock. Keep that winner and release ours below.
             result = None
-        elif limit_message is None:
+        elif claim_error is None and limit_message is None and lease is not None:
             session["active_session_lease"] = lease
             lease = None  # ownership transferred to the session
             result = None
+        claim_state["result"] = result
+        if session.get("_active_session_claim") is claim_state:
+            session.pop("_active_session_claim", None)
+        claim_state["event"].set()
 
-    # A concurrent winner may have installed its lease after this thread
-    # claimed another slot. Never leave that redundant registry entry behind.
+    # Never leave a lease behind when teardown or another lifecycle path won
+    # while this generation's owner was outside the mutation lock.
     if lease is not None:
-        try:
-            lease.release()
-        except Exception:
-            logger.debug(
-                "Failed to release redundant active session slot", exc_info=True
-            )
+        _release_active_session_lease(lease)
+    if claim_error is not None:
+        raise claim_error
     return result
 
 
-def _release_active_session_slot(session: dict | None) -> None:
-    if not session:
-        return
-    lease = session.pop("active_session_lease", None)
+def _release_active_session_lease(lease) -> bool:
     if lease is None:
+        return True
+    attempts = 3 if getattr(lease, "track_liveness", False) else 1
+    for attempt in range(attempts):
+        try:
+            lease.release()
+            break
+        except Exception:
+            if attempt + 1 >= attempts:
+                logger.warning("Failed to release active session slot", exc_info=True)
+                return False
+            time.sleep(0.05 * (attempt + 1))
+    released = getattr(lease, "released", True)
+    enabled = getattr(lease, "enabled", True)
+    return bool(released or not enabled)
+
+
+def _release_active_session_slot(session: dict | None) -> bool:
+    if not session:
+        return True
+    lease = session.get("active_session_lease")
+    if _release_active_session_lease(lease):
+        if session.get("active_session_lease") is lease:
+            session.pop("active_session_lease", None)
+        return True
+    return False
+
+
+@contextlib.contextmanager
+def _other_runtime_lease_guard(session_id: str, session: dict):
+    """Release this runtime and lock sibling ownership through the DB write."""
+    lease = session.get("active_session_lease")
+    try:
+        from hermes_cli.active_sessions import (
+            active_session_liveness_guard,
+            release_active_session_liveness_guard,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to load active session ownership guard; preserving session %s: %s",
+            session_id,
+            exc,
+        )
+        yield True
+        return
+
+    last_error: Exception | None = None
+    stack = contextlib.ExitStack()
+    for attempt in range(3):
+        try:
+            if lease is not None and getattr(lease, "enabled", False):
+                guard = release_active_session_liveness_guard(lease, session_id)
+            else:
+                guard = active_session_liveness_guard(
+                    session_id, registry_home=session.get("profile_home")
+                )
+            active = stack.enter_context(guard)
+            break
+        except Exception as exc:
+            stack.close()
+            stack = contextlib.ExitStack()
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+    else:
+        logger.warning(
+            "Failed to inspect active session leases; preserving session %s: %s",
+            session_id,
+            last_error,
+        )
+        yield True
         return
     try:
-        lease.release()
-    except Exception:
-        logger.debug("Failed to release active session slot", exc_info=True)
+        yield active
+    finally:
+        stack.close()
+        if (
+            lease is not None
+            and getattr(lease, "released", False)
+            and session.get("active_session_lease") is lease
+        ):
+            session.pop("active_session_lease", None)
 
 
 def _transfer_active_session_slot(
@@ -793,6 +933,9 @@ def _transfer_active_session_slot(
     except Exception:
         logger.debug("Failed to transfer active session slot", exc_info=True)
 
+    if getattr(lease, "track_liveness", False):
+        return False
+
     # Fallback: the in-place transfer could not move the lease (entry pruned /
     # pid-check transiently failed). Reserve the new slot BEFORE releasing the
     # old one, so a concurrent gateway at the session cap cannot grab the freed
@@ -802,6 +945,7 @@ def _transfer_active_session_slot(
         new_session_id,
         live_session_id=sid,
         surface=_session_source(session),
+        profile_home=session.get("profile_home"),
     )
     if new_lease is not None:
         old_lease = session.pop("active_session_lease", None)
@@ -876,7 +1020,14 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if history_ready is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
         history_ready.set()
-    _release_active_session_slot(session)
+    _desktop_automatic_cleanup = bool(
+        end_reason in _AUTOMATIC_SESSION_END_REASONS
+        and _session_source(session).strip().lower() == "desktop"
+    )
+    # Automatic Desktop cleanup removes its lease inside the lock-held lifecycle
+    # guard below. Explicit close and non-Desktop paths keep force/end semantics.
+    if not _desktop_automatic_cleanup:
+        _release_active_session_slot(session)
     # A close is terminal for every already-accepted input owned by this
     # record. Drain the complete queue (head + image-bearing tail), fence any
     # claimed drain by advancing its generation, and correlate one terminal
@@ -974,27 +1125,42 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # Use session_id (from agent.session_id) not session_key — after compression,
     # session_key may be stale (the ended parent) while session_id is the live
     # continuation. Fix for #20001.
-    _tui_owns_lifecycle = True
-    if session_id:
-        try:
-            # End the row in the *session's* profile state.db (app-global
-            # remote mode), not the launch profile's shared handle.
-            with _session_db(session) as db:
-                if db is not None:
-                    # Don't end gateway-originated sessions — the gateway owns
-                    # their lifecycle.  The TUI is a viewer, not the owner.
-                    # Ending a gateway session in state.db triggers a Groundhog
-                    # Day routing loop: the gateway's #54878 self-heal detects
-                    # the stale entry, recovers to the parent session, context
-                    # compression splits back to the reaped child, and the cycle
-                    # repeats on every inbound message.  (#60609)
-                    row = db.get_session(session_id)
-                    source = (row or {}).get("source", "")
-                    _tui_owns_lifecycle = not _is_gateway_owned_source(source)
-                    if _tui_owns_lifecycle:
-                        db.end_session(session_id, end_reason)
-        except Exception:
-            pass
+    if _desktop_automatic_cleanup and not session_id:
+        _release_active_session_slot(session)
+    _lifecycle_guard = (
+        _other_runtime_lease_guard(session_id, session)
+        if _desktop_automatic_cleanup and session_id
+        else contextlib.nullcontext(False)
+    )
+    with _lifecycle_guard as _other_runtime_owns_lifecycle:
+        _tui_owns_lifecycle = not _other_runtime_owns_lifecycle
+        if _other_runtime_owns_lifecycle:
+            logger.info(
+                "Preserving session %s during %s: another backend owns an active lease",
+                session_id,
+                end_reason,
+            )
+        if session_id:
+            try:
+                # End the row in the *session's* profile state.db (app-global
+                # remote mode), not the launch profile's shared handle.
+                with _session_db(session) as db:
+                    if db is not None:
+                        # Don't end gateway-originated sessions — the gateway owns
+                        # their lifecycle.  The TUI is a viewer, not the owner.
+                        # Ending a gateway session in state.db triggers a Groundhog
+                        # Day routing loop: the gateway's #54878 self-heal detects
+                        # the stale entry, recovers to the parent session, context
+                        # compression splits back to the reaped child, and the cycle
+                        # repeats on every inbound message.  (#60609)
+                        row = db.get_session(session_id)
+                        source = (row or {}).get("source", "")
+                        if _is_gateway_owned_source(source):
+                            _tui_owns_lifecycle = False
+                        elif _tui_owns_lifecycle:
+                            db.end_session(session_id, end_reason)
+            except Exception:
+                pass
 
     # A session's in-flight async delegations end WITH the session (#55578):
     # once nobody owns the return address, a still-running background subagent
@@ -1258,7 +1424,16 @@ def _interrupt_session_turn(
     run_thread_alive = False
 
     if use_compute_host:
-        if should_interrupt:
+        # The host owns the live turn. Parent `running` is only a mirror and
+        # can lag behind a blocked interactive tool (a clarify parked on its
+        # Event keeps the host turn alive after the parent flag went stale),
+        # so let the host decide whether there is work to interrupt.
+        # Gate on `_compute_host_active` too: `_session_uses_compute_host`
+        # is also true for lazy sessions that never ran a hosted turn, and
+        # `HostSupervisor.interrupt()` calls `start()` — forwarding
+        # unconditionally would spawn a compute-host child just to deliver
+        # an interrupt no session ever submitted work to.
+        if should_interrupt or session.get("_compute_host_active"):
             _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
     else:
         run_thread = session.get("_run_thread")
@@ -1508,9 +1683,8 @@ def _close_sessions_for_transport(
     transport, *, end_reason: str = "ws_disconnect"
 ) -> tuple[int, int]:
     """On transport disconnect, reap the sessions that opted into
-    close_on_disconnect (sidecar/dashboard) immediately via the unified
-    ``_close_session_by_id`` path, and re-point the rest back to stdio so later
-    emits don't hit a dead socket.
+    close_on_disconnect (sidecar/dashboard) immediately and re-point the rest
+    at the detached transport so later emits don't hit a dead socket.
 
     Non-flagged detached sessions are handed to the grace-windowed WS-orphan
     reaper (``_schedule_ws_orphan_reap``): a quick reconnect / session.resume
@@ -1525,47 +1699,57 @@ def _close_sessions_for_transport(
     reaped = 0
     detached = 0
     for sid, session in owned:
-        if session.get("close_on_disconnect"):
-            _close_session_by_id(sid, end_reason=end_reason)
-            reaped += 1
-        else:
-            # Point detached sessions at the drop sentinel (NOT real stdio) so
-            # _ws_session_is_orphaned recognizes them and the grace-reap can
-            # actually fire; a standalone `hermes --tui` keeps real _stdio.
-            # UNLESS another window still shows the session: multi-window
-            # pop-outs all register as viewers, so on disconnect re-bind the
-            # session to the most recent surviving viewer instead of
-            # stranding the original window on the sentinel (#83716).
-            viewers = session.get("viewers")
-            if viewers:
-                viewers.pop(transport, None)
-            # Revalidate under the sessions lock before stomping (#77129):
-            # between the owned-sessions snapshot above and this write, a
-            # concurrent session.resume can rebind the session to a NEW live
-            # transport. Stomping it back onto the drop sentinel here would
-            # knock an attached client into detached state and arm an orphan
-            # reap against a session that has a live owner. If the transport
-            # already moved on to a different live transport, this disconnect
-            # has nothing left to tear down — skip the park AND the reap.
+        claimed_for_teardown = None
+        should_schedule_reap = False
+        # A session.resume fast-path rebinds its live session while holding
+        # _session_resume_lock. Take that lock before re-checking the snapshot
+        # so a reconnect cannot move the transport between this check and the
+        # close/detach ownership claim. Keep the slow teardown below both locks.
+        with _session_resume_lock:
             with _sessions_lock:
-                current = session.get("transport")
-                if (
-                    current is not transport
-                    and current is not None
-                    and not _transport_is_dead(current)
-                ):
+                current = _sessions.get(sid)
+                if current is not session:
                     continue
-                remaining = [
-                    (ts, v)
-                    for v, ts in (viewers or {}).items()
-                    if v is not transport and not _transport_is_dead(v)
-                ]
-                if remaining:
-                    remaining.sort(key=lambda kv: kv[0])
-                    session["transport"] = remaining[-1][1]
+                if current.get("transport") is not transport:
+                    # The reconnect owns this session now. Drop only the old
+                    # viewer registration; it must not affect the new owner.
+                    viewers = current.get("viewers")
+                    if viewers:
+                        viewers.pop(transport, None)
                     continue
-                session["transport"] = _detached_ws_transport
-                session.pop("_client_gone_interrupt_requested", None)
+                if current.get("close_on_disconnect"):
+                    claimed_for_teardown = _pop_session_by_id(sid)
+                else:
+                    # Point detached sessions at the drop sentinel (NOT real
+                    # stdio) so _ws_session_is_orphaned recognizes them and
+                    # the grace-reap can actually fire; a standalone
+                    # `hermes --tui` keeps real _stdio. UNLESS another window
+                    # still shows the session: multi-window pop-outs all
+                    # register as viewers, so on disconnect re-bind the
+                    # session to the most recent surviving viewer instead of
+                    # stranding the original window on the sentinel (#83716).
+                    viewers = current.get("viewers")
+                    if viewers:
+                        viewers.pop(transport, None)
+                    remaining = [
+                        (ts, viewer_transport)
+                        for viewer_transport, ts in (viewers or {}).items()
+                        if (
+                            viewer_transport is not transport
+                            and not _transport_is_dead(viewer_transport)
+                        )
+                    ]
+                    if remaining:
+                        remaining.sort(key=lambda item: item[0])
+                        current["transport"] = remaining[-1][1]
+                    else:
+                        current["transport"] = _detached_ws_transport
+                        current.pop("_client_gone_interrupt_requested", None)
+                        should_schedule_reap = True
+        if claimed_for_teardown is not None:
+            if _teardown_popped_session(claimed_for_teardown, end_reason=end_reason):
+                reaped += 1
+        elif should_schedule_reap:
             detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
@@ -1575,6 +1759,15 @@ def _close_sessions_for_transport(
 
 
 def _shutdown_sessions() -> None:
+    # Durable-first (#94724 item 2): persist every session's un-flushed
+    # transcript within a bounded budget BEFORE the slow per-session
+    # teardown below (plugin hooks, memory commit, delegation interrupts,
+    # agent.close). A supervisor that SIGKILLs a slow shutdown mid-way can
+    # then no longer lose the transcripts — the flush already landed.
+    try:
+        _flush_sessions_before_exit()
+    except Exception:
+        pass
     try:
         _release_gateway_wake_owner()
     except Exception:
@@ -1594,6 +1787,176 @@ except (TypeError, ValueError):
     _SESSION_TTL_S = float(6 * 3600)
 _SESSION_TTL_S = max(0.0, _SESSION_TTL_S)
 _REAPER_SCAN_S = 300.0
+
+
+# ── Flush-on-kill + periodic incremental flush (#94724 item 2) ───────────
+# A `hermes serve` killed mid-update used to lose every un-flushed in-memory
+# session: the next RPC failed with "session-scoped RPC rejected: not in
+# memory (detached/reaped runtime)" and NO store held the transcript. #95576
+# made serves survive *future* updates; this closes the kill path itself:
+#   (a) SIGTERM/SIGINT run a bounded, best-effort flush of in-memory session
+#       transcripts to state.db BEFORE the normal shutdown path, chained to
+#       whatever handler was installed before (uvicorn's included);
+#   (b) the idle-reaper scan piggybacks a periodic incremental flush so even
+#       a SIGKILL loses at most one flush interval.
+try:
+    _EXIT_FLUSH_BUDGET_S = float(
+        os.environ.get("HERMES_TUI_EXIT_FLUSH_BUDGET_S") or 5.0
+    )
+except (TypeError, ValueError):
+    _EXIT_FLUSH_BUDGET_S = 5.0
+_EXIT_FLUSH_BUDGET_S = max(0.0, _EXIT_FLUSH_BUDGET_S)
+
+try:
+    _INCREMENTAL_FLUSH_INTERVAL_S = float(
+        os.environ.get("HERMES_TUI_SESSION_FLUSH_INTERVAL_S") or _REAPER_SCAN_S
+    )
+except (TypeError, ValueError):
+    _INCREMENTAL_FLUSH_INTERVAL_S = _REAPER_SCAN_S
+_INCREMENTAL_FLUSH_INTERVAL_S = max(0.0, _INCREMENTAL_FLUSH_INTERVAL_S)
+
+
+def _flush_session_messages(session: dict | None) -> bool:
+    """Best-effort durable flush of one session's in-memory transcript.
+
+    Rides ``agent._persist_session`` — the same marker-deduped persist
+    contract ``_finalize_session`` uses (#13121) — so repeated calls only
+    write genuinely-unflushed messages and never duplicate durable rows.
+    """
+    if not session:
+        return False
+    agent = session.get("agent")
+    if agent is None or not hasattr(agent, "_persist_session"):
+        return False
+    snapshot = getattr(agent, "_session_messages", None)
+    if not snapshot:
+        return False
+    try:
+        agent._persist_session(snapshot)
+        return True
+    except Exception:
+        logger.debug("incremental session flush failed", exc_info=True)
+        return False
+
+
+def _flush_dirty_sessions(now: float | None = None) -> int:
+    """Periodic incremental flush, driven by the idle-reaper scan.
+
+    Skips ``running`` sessions: the turn thread owns mid-turn persistence
+    (it already flushes at every persist point) and
+    ``_drop_trailing_empty_response_scaffolding`` mutates the live message
+    list, so racing an in-flight turn from the reaper thread is never safe.
+    Idle/detached sessions — precisely the ones a kill strands — are flushed
+    at most once per ``_INCREMENTAL_FLUSH_INTERVAL_S``. ``now`` is injectable
+    for tests (monotonic clock).
+    """
+    if _INCREMENTAL_FLUSH_INTERVAL_S <= 0:
+        return 0
+    if now is None:
+        now = time.monotonic()
+    with _sessions_lock:
+        sessions = list(_sessions.values())
+    flushed = 0
+    for session in sessions:
+        if not isinstance(session, dict) or session.get("running"):
+            continue
+        last = float(session.get("_last_incremental_flush") or 0.0)
+        if last and (now - last) < _INCREMENTAL_FLUSH_INTERVAL_S:
+            continue
+        if _flush_session_messages(session):
+            flushed += 1
+        session["_last_incremental_flush"] = now
+    return flushed
+
+
+def _flush_sessions_before_exit(budget_s: float | None = None) -> int:
+    """Bounded flush of ALL in-memory sessions on the way out.
+
+    Runs on a daemon worker joined with the budget so a hung SQLite write
+    can never block exit longer than ``HERMES_TUI_EXIT_FLUSH_BUDGET_S``
+    (default 5s). Running sessions are included — the process is dying, so
+    a best-effort partial transcript beats guaranteed loss.
+    """
+    budget = _EXIT_FLUSH_BUDGET_S if budget_s is None else max(0.0, budget_s)
+    if budget <= 0:
+        return 0
+    result = {"flushed": 0}
+
+    def _run() -> None:
+        deadline = time.monotonic() + budget
+        with _sessions_lock:
+            sessions = list(_sessions.values())
+        for session in sessions:
+            if time.monotonic() >= deadline:
+                break
+            if _flush_session_messages(session):
+                result["flushed"] += 1
+
+    worker = threading.Thread(target=_run, daemon=True, name="hermes-exit-flush")
+    worker.start()
+    worker.join(budget)
+    return result["flushed"]
+
+
+_exit_flush_prev_handlers: dict[int, Any] = {}
+_exit_flush_handlers_installed = False
+
+
+def _handle_exit_flush_signal(signum, frame) -> None:
+    """Flush in-memory sessions, then hand off to the prior handler.
+
+    Chaining preserves the pre-existing signal story (uvicorn's graceful
+    shutdown, a supervisor's handler, or the default terminate disposition)
+    — this handler only *prepends* a bounded durable flush.
+    """
+    try:
+        _flush_sessions_before_exit()
+    except Exception:
+        pass
+    import signal as _signal
+
+    prev = _exit_flush_prev_handlers.get(signum)
+    if callable(prev):
+        prev(signum, frame)
+        return
+    if prev is _signal.SIG_IGN:
+        return
+    # Default disposition: restore it and re-raise so the process still dies
+    # with the correct signal (exit status visible to supervisors).
+    try:
+        _signal.signal(signum, _signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    except Exception:
+        raise SystemExit(128 + int(signum)) from None
+
+
+def install_exit_flush_signal_handlers() -> bool:
+    """Install chaining SIGTERM/SIGINT flush handlers (main thread only).
+
+    Called by ``hermes serve`` / dashboard startup before uvicorn takes over
+    signals: uvicorn's ``capture_signals()`` saves these as the "original"
+    handlers and restores + re-raises into them after its graceful shutdown,
+    so the flush also covers terminations outside uvicorn's serve window.
+    Idempotent; returns False off the main thread or when installation fails.
+    """
+    global _exit_flush_handlers_installed
+    if _exit_flush_handlers_installed:
+        return True
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    import signal as _signal
+
+    installed = False
+    for signum in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            prev = _signal.getsignal(signum)
+            _signal.signal(signum, _handle_exit_flush_signal)
+            _exit_flush_prev_handlers[signum] = prev
+            installed = True
+        except (ValueError, OSError, RuntimeError):
+            continue
+    _exit_flush_handlers_installed = installed
+    return installed
 
 
 def _transport_is_dead(transport) -> bool:
@@ -1625,6 +1988,13 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
 
 def _reap_idle_sessions() -> None:
     now = time.time()
+    # Piggyback the periodic incremental flush on the existing reaper tick
+    # (#94724 item 2) — no new timer subsystem. Even a SIGKILL then loses at
+    # most one flush interval of un-persisted messages.
+    try:
+        _flush_dirty_sessions()
+    except Exception:
+        logger.debug("periodic incremental session flush failed", exc_info=True)
     with _sessions_lock:
         victims = [sid for sid, s in _sessions.items() if _session_is_evictable(sid, s, now)]
     for sid in victims:
@@ -1820,6 +2190,13 @@ def _sweep_orphaned_session_rows() -> list[str]:
     process still holds in memory (e.g. a ``session.resume`` during the
     startup grace window) are excluded so the sweep never races a
     mid-reconnect client.
+
+    Cross-backend liveness (#94895): when one ``state.db`` is shared by
+    N serve / gateway processes, each registered a heartbeat row in
+    ``gateway_heartbeats``. The sweep refuses to close a row that any
+    live backend (heartbeat refreshed within ``2 * TTL``) could
+    plausibly own — see ``SessionDB.sweep_orphaned_sessions`` for the
+    exact predicate.
     """
     db = _get_db()
     if db is None:
@@ -1840,6 +2217,138 @@ def _sweep_orphaned_session_rows() -> list[str]:
             ", ".join(swept),
         )
     return swept
+
+
+# ── Cross-backend heartbeat (#94895) ───────────────────────────────────
+# Each serve / gateway process registers a heartbeat row in
+# ``gateway_heartbeats`` so the startup orphan sweep can tell "row owned
+# by a live but idle backend" from "row truly orphaned".  Without this,
+# the first process to restart in a multi-backend topology reaped every
+# inactive row — including those held by the other N−1 still-running
+# processes (the #94895 reporter saw 473 sessions disappear in one shot).
+#
+# Refresh cadence: every HEARTBEAT_REFRESH_S (default 60s — much shorter
+# than the default 6h session TTL so a refresh always lands inside the
+# staleness window).  The heartbeat is removed at process exit so a
+# graceful shutdown doesn't leave a stale row behind.  A crashed process
+# leaves its row until the heartbeat ages out of the staleness window,
+# at which point the sweep treats it as dead.
+
+_HEARTBEAT_REFRESH_S = float(
+    os.environ.get("HERMES_GATEWAY_HEARTBEAT_REFRESH_S") or 60.0
+)
+_HEARTBEAT_REFRESH_S = max(0.0, _HEARTBEAT_REFRESH_S)
+
+_heartbeat_refresher_started = False
+_heartbeat_refresher_lock = threading.Lock()
+
+
+def _backend_id_for_this_process() -> str:
+    """Stable identity for this process's heartbeat row (#94895).
+
+    Includes pid AND a startup-time nonce so a PID-reuse respawn cannot
+    inherit the dead predecessor's heartbeat and protect truly orphaned
+    sessions.  The pid is kept for human readability in diagnostics.
+    """
+    nonce = getattr(_backend_id_for_this_process, "_nonce", None)
+    if nonce is None:
+        import secrets as _secrets
+
+        nonce = _secrets.token_hex(4)
+        try:
+            setattr(_backend_id_for_this_process, "_nonce", nonce)
+        except AttributeError:  # pragma: no cover - defensive
+            pass
+    return f"{_current_profile_name()}@{os.uname().nodename if hasattr(os, 'uname') else 'host'}:{os.getpid()}:{nonce}"
+
+
+def _refresh_backend_heartbeat() -> None:
+    """Refresh this backend's heartbeat row (#94895). No-op when DB unavailable."""
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        db.register_backend_heartbeat(
+            backend_id=_backend_id_for_this_process(),
+            pid=os.getpid(),
+            started_at=_gateway_started_at(),
+            profile=_current_profile_name(),
+            host=(os.uname().nodename if hasattr(os, "uname") else "host"),
+        )
+    except Exception:
+        logger.debug("backend heartbeat refresh failed", exc_info=True)
+
+
+def _gateway_started_at() -> float:
+    """Wall-clock time when this process started. Module-import time is
+    a good-enough proxy: the heartbeat refresher runs after the gateway
+    is fully wired up.
+    """
+    started = getattr(_gateway_started_at, "_t", None)
+    if started is None:
+        started = time.time()
+        try:
+            setattr(_gateway_started_at, "_t", started)
+        except AttributeError:  # pragma: no cover
+            pass
+    return started
+
+
+def _heartbeat_refresher_loop(stop_event: threading.Event) -> None:
+    """Background loop that refreshes the heartbeat on a fixed cadence."""
+    while not stop_event.is_set():
+        try:
+            _refresh_backend_heartbeat()
+        except Exception:
+            logger.debug("heartbeat refresh loop iteration failed", exc_info=True)
+        stop_event.wait(_HEARTBEAT_REFRESH_S)
+
+
+def _start_backend_heartbeat_refresher() -> None:
+    """Register this backend and start the refresher thread (#94895).
+
+    Called once per process from both gateway entry points.  The first
+    refresh writes the row immediately so even a very fast crash leaves
+    a fresh-enough row that other backends can see.  Repeat calls are
+    no-ops.  The refresher thread is only spawned when
+    ``_HEARTBEAT_REFRESH_S > 0`` — a refresh interval of zero means
+    "register the row once, never refresh" (the row ages out naturally
+    after the heartbeat staleness window).
+    """
+    global _heartbeat_refresher_started
+    with _heartbeat_refresher_lock:
+        if _heartbeat_refresher_started:
+            return
+        _heartbeat_refresher_started = True
+    # Write a row synchronously so the sweep run later in this same
+    # process can see ourselves in the heartbeat table too.  Without
+    # this, exclude_ids would have to cover every local session — a
+    # regression in the strict-ownership case the heartbeat exists to fix.
+    try:
+        _refresh_backend_heartbeat()
+    except Exception:
+        logger.debug("initial backend heartbeat write failed", exc_info=True)
+    if _HEARTBEAT_REFRESH_S <= 0:
+        return
+    stop_event = threading.Event()
+
+    def _atexit_clear():
+        stop_event.set()
+        try:
+            db = _get_db()
+            if db is not None:
+                db.clear_backend_heartbeat(_backend_id_for_this_process())
+        except Exception:
+            pass
+
+    atexit.register(_atexit_clear)
+    thread = threading.Thread(
+        target=_heartbeat_refresher_loop,
+        args=(stop_event,),
+        name="hermes-gateway-heartbeat",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _schedule_startup_orphan_sweep() -> None:
@@ -1964,6 +2473,29 @@ def _transfer_db_to_agent(agent, db) -> bool:
         return True
     except Exception:
         return False
+
+
+def _open_profile_session_db(profile_home):
+    """Open a DEDICATED handle on ``profile_home``'s ``state.db`` — FAIL CLOSED.
+
+    A named-profile agent whose profile store cannot be opened must surface a
+    clear error and never get built against the launch ``state.db``: a silent
+    fallback bleeds the session's rows and messages into the wrong profile's
+    store exactly when the profile store is briefly unopenable (locked,
+    unreadable, mid-restore), and the named profile then looks blank. Callers
+    let the raised error abort the agent build (deferred builds route it to
+    the build's ``agent_error`` path) instead of swallowing it back onto the
+    launch handle.
+    """
+    from hermes_state import SessionDB
+
+    db_path = Path(profile_home) / "state.db"
+    try:
+        return SessionDB(db_path=db_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"profile session store unavailable: {db_path}: {exc}"
+        ) from exc
 
 
 @contextlib.contextmanager
@@ -2143,12 +2675,24 @@ def write_json(obj: dict) -> bool:
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
        behaviour and keeping tests that monkey-patch ``_real_stdout`` green.
+
+    Every routed event frame is stamped with a per-session monotonic
+    ``seq`` and recorded in the bounded replay ring (tui_gateway.event_replay)
+    so a WS client can resume losslessly after a reconnect via
+    ``session.events.since``.
     """
     if obj.get("method") == "event":
-        sid = ((obj.get("params") or {}).get("session_id")) or ""
+        params = obj.get("params")
+        sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
+            from tui_gateway.event_replay import _stamp_event
+
+            _stamp_event(obj)
             return t.write(obj)
 
+    from tui_gateway.event_replay import _stamp_event
+
+    _stamp_event(obj)
     return (current_transport() or _stdio_transport).write(obj)
 
 
@@ -2243,7 +2787,7 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
             from tui_gateway.host_supervisor import HostSupervisor
 
             _compute_host_supervisor = HostSupervisor(
-                rpc_sink=write_json,
+                rpc_sink=_relay_compute_host_rpc,
                 heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
                 respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
             )
@@ -2278,6 +2822,7 @@ def _compute_host_turn_frame(
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
         "cwd": _session_cwd(session),
+        "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(session),
         "profile_home": session.get("profile_home") or "",
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
@@ -2291,6 +2836,87 @@ def _compute_host_turn_frame(
 def _metadata_mirror(session: dict | None) -> dict:
     mirror = (session or {}).get("_metadata_mirror")
     return mirror if isinstance(mirror, dict) else {}
+
+
+def _relay_compute_host_rpc(message: dict) -> bool:
+    """Relay host events while retaining the clarify snapshot needed on resume."""
+    params = message.get("params") if isinstance(message, dict) else None
+    if isinstance(params, dict) and params.get("type") == "clarify.request":
+        sid = str(params.get("session_id") or "")
+        payload = params.get("payload")
+        session = _sessions.get(sid)
+        if session is not None and isinstance(payload, dict) and payload.get("request_id"):
+            with session.get("history_lock", threading.Lock()):
+                session["_compute_host_pending_clarify"] = dict(payload)
+    elif isinstance(params, dict) and params.get("type") == "clarify.expire":
+        sid = str(params.get("session_id") or "")
+        payload = params.get("payload")
+        session = _sessions.get(sid)
+        request_id = payload.get("request_id") if isinstance(payload, dict) else None
+        if session is not None and request_id:
+            with session.get("history_lock", threading.Lock()):
+                pending = session.get("_compute_host_pending_clarify")
+                if isinstance(pending, dict) and pending.get("request_id") == request_id:
+                    session.pop("_compute_host_pending_clarify", None)
+    return write_json(message)
+
+
+def _compute_host_clarify_session(request_id: str) -> tuple[str, dict] | None:
+    """Find the parent mirror for one host-owned clarify request."""
+    if not request_id:
+        return None
+    for sid, session in list(_sessions.items()):
+        with session.get("history_lock", threading.Lock()):
+            pending = session.get("_compute_host_pending_clarify")
+            if isinstance(pending, dict) and pending.get("request_id") == request_id:
+                return sid, session
+    return None
+
+
+def _update_compute_host_clarify_snapshot(sid: str, session: dict, params: dict, result: dict) -> None:
+    """Keep reconnect snapshots accurate while a batch clarify is answered."""
+    request_id = str(params.get("request_id") or "")
+    with session.get("history_lock", threading.Lock()):
+        pending = session.get("_compute_host_pending_clarify")
+        if not isinstance(pending, dict) or pending.get("request_id") != request_id:
+            return
+        if result.get("status") == "expired" or not result.get("remaining") and not params.get("question_id"):
+            session.pop("_compute_host_pending_clarify", None)
+            return
+        question_id = str(params.get("question_id") or "")
+        if question_id and isinstance(result.get("remaining"), list):
+            answers = dict(pending.get("answers") or {})
+            answers[question_id] = str(params.get("answer") or "")
+            pending["answers"] = answers
+            if not result["remaining"]:
+                session.pop("_compute_host_pending_clarify", None)
+
+
+def _respond_compute_host_clarify(rid: str, params: dict) -> dict | None:
+    """Proxy a clarify answer into the process that owns its pending Event."""
+    located = _compute_host_clarify_session(str(params.get("request_id") or ""))
+    if located is None:
+        return None
+    sid, session = located
+    if not _session_uses_compute_host(session):
+        return None
+    try:
+        ack = _get_compute_host_supervisor().respond(sid, params)
+    except Exception as exc:
+        return _err(rid, 5019, f"compute-host clarify response failed: {exc}")
+    if ack.get("type") == "respond.error":
+        return _err(rid, 5019, str(ack.get("message") or "compute-host clarify response failed"))
+    response = ack.get("response")
+    if not isinstance(response, dict):
+        return _err(rid, 5019, "compute-host clarify response returned an invalid response")
+    if "error" in response:
+        error = response["error"] if isinstance(response["error"], dict) else {}
+        return _err(rid, int(error.get("code") or 5000), str(error.get("message") or "clarify response failed"))
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return _err(rid, 5019, "compute-host clarify response returned an invalid result")
+    _update_compute_host_clarify_snapshot(sid, session, params, result)
+    return _ok(rid, result)
 
 
 def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
@@ -2342,6 +2968,7 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session["running"] = False
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
+        session.pop("_compute_host_pending_clarify", None)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
@@ -2461,6 +3088,12 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
                 if batch is not None and batch["answers"]:
                     snapshot["answers"] = dict(batch["answers"])
                 return snapshot
+    session = _sessions.get(sid)
+    if session is not None:
+        with session.get("history_lock", threading.Lock()):
+            pending = session.get("_compute_host_pending_clarify")
+            if isinstance(pending, dict):
+                return dict(pending)
     return None
 
 
@@ -2493,12 +3126,12 @@ def _status_update(sid: str, kind: str, text: str | None = None):
         return
     out_kind = kind if text is not None else "status"
     # Auto-compaction reaches us as a generic "lifecycle" status. Re-tag it so
-    # drivers (desktop app) can show an explicit "Summarizing…" indicator —
-    # otherwise a mid-turn compaction looks like the transcript reset itself.
+    # drivers (TUI / desktop) can show an explicit summarizing indicator —
+    # otherwise idle/preflight compaction looks like a hung turn (#97239).
     if out_kind == "lifecycle":
-        from agent.conversation_compression import COMPACTION_STATUS_MARKER
+        from agent.conversation_compression import is_compaction_progress_status
 
-        if COMPACTION_STATUS_MARKER in body:
+        if is_compaction_progress_status(body):
             out_kind = "compacting"
     _emit("status.update", sid, {"kind": out_kind, "text": body})
 
@@ -2631,7 +3264,11 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    return fn(rid, params)
+    token = _current_rpc_method.set(method)
+    try:
+        return fn(rid, params)
+    finally:
+        _current_rpc_method.reset(token)
 
 
 def _current_session_steer_authority(
@@ -2940,17 +3577,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
                 except Exception:
                     pass
-                try:
-                    from hermes_state import SessionDB
-
-                    # DEDICATED handle — ours until _transfer_db_to_agent hands
-                    # it to the built agent in the finally below. Every path
-                    # that leaves this build without that transfer (the except
-                    # below, and a session reaped mid-build) must close it.
-                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
-                    owns_db = True
-                except Exception:
-                    session_db = None
+                # DEDICATED handle — ours until _transfer_db_to_agent hands
+                # it to the built agent in the finally below. Every path
+                # that leaves this build without that transfer (the except
+                # below, and a session reaped mid-build) must close it.
+                # FAIL CLOSED on open failure: the raise routes to the
+                # ``except`` below (clear agent_error, no agent turn) instead
+                # of silently binding _make_agent's launch-DB default and
+                # bleeding this session into the wrong profile's state.db.
+                session_db = _open_profile_session_db(profile_home)
+                owns_db = True
 
             try:
                 from tui_gateway.entry import ensure_mcp_discovery_started
@@ -2963,12 +3599,21 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw = {"session_db": session_db}
+                kw = {
+                    "session_db": session_db,
+                    "context_cwd_is_launch_artifact": (
+                        _context_cwd_is_launch_artifact(current)
+                    ),
+                }
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
                 resume_overrides = current.get("resume_runtime_overrides")
-                if isinstance(resume_overrides, dict) and resume_overrides:
+                if (
+                    isinstance(resume_overrides, dict)
+                    and resume_overrides
+                    and _overrides_have_routable_provider(resume_overrides)
+                ):
                     # Cold deferred resume: restore the full persisted runtime
                     # identity (model/provider/base_url/api_mode/reasoning/tier)
                     # exactly as the eager resume path's _stored_session_runtime_
@@ -2976,9 +3621,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     # provider and fail with "No LLM provider configured".
                     kw.update(resume_overrides)
                 else:
-                    # Model/effort/fast the desktop picked for a brand-new chat
-                    # ride in as per-session overrides so the first build uses
-                    # them directly (no global config, no build-then-switch).
+                    # No stored runtime, or the stored provider no longer
+                    # resolves (renamed/removed since the row was written) —
+                    # never let that sink agent init with "Unknown provider".
+                    # Fall back to the model/effort/fast the desktop picked
+                    # for THIS session, else the configured default.
                     if override := current.get("model_override"):
                         kw["model_override"] = override
                     if (reasoning := current.get("create_reasoning_override")) is not None:
@@ -3001,6 +3648,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # pending_title applied post-first-message (see cli.exec handler).
             if _install_deferred_agent_runtime(current, agent):
                 _persist_live_session_runtime(current)
+            _session_todo_state(current)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -3133,8 +3781,9 @@ def _sess_nowait(params, rid):
     # report is diagnosable as "request arrived and was rejected" instead of
     # "request never arrived" (see #90428).
     logger.warning(
-        "session-scoped RPC rejected: session_id=%r not in memory "
+        "session-scoped RPC rejected: method=%s session_id=%r not in memory "
         "(detached/reaped runtime; client should resume the stored session), rid=%r",
+        _current_rpc_method.get() or "?",
         sid,
         rid,
     )
@@ -3303,6 +3952,15 @@ def _session_cwd(session: dict | None) -> str:
 # a workspace the user picked. Everything else is terminal-started: the process
 # runs in a directory the user deliberately cd'd into.
 _LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
+
+
+def _context_cwd_is_launch_artifact(session: dict | None) -> bool:
+    """Whether the session cwd came from app launch rather than user intent."""
+    return bool(
+        session
+        and not session.get("explicit_cwd")
+        and _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE
+    )
 
 
 def _persisted_session_cwd(session: dict) -> str | None:
@@ -3525,13 +4183,17 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
-def _ensure_session_db_row(session: dict) -> None:
+def _ensure_session_db_row(session: dict) -> bool:
     """Idempotently persist the session's DB row on first real activity.
 
     Called from prompt.submit so a row only exists once the user actually sends
     a message — abandoned drafts never leave an empty "Untitled" session behind.
     Uses INSERT OR IGNORE under the hood, so re-calls (and the AIAgent's own
     lazy create) are no-ops.
+    Returns False only when the store is unavailable (no openable state.db);
+    prompt.submit turns that into an RPC error so a send fails loudly with a
+    toast instead of streaming into a store that will never save it (#98924).
+    Every other outcome — no key, best-effort attempt, success — is True.
 
     A cwd the user *chose* is always persisted. When they made no explicit
     choice the launch directory stands in, and whether that is meaningful
@@ -3561,13 +4223,18 @@ def _ensure_session_db_row(session: dict) -> None:
             db = SessionDB(db_path=Path(profile_home) / "state.db")
         except Exception:
             logger.debug("failed to open profile db for session row", exc_info=True)
-            return
+            return False
         close_db = True
     else:
         db = _get_db()
         close_db = False
     if db is None:
-        return
+        # Fail loud ONLY when the store actually failed to open (#98924):
+        # _db_error records the SessionDB open exception. A None db with no
+        # recorded error means "no store in this context" (degraded harness,
+        # store deliberately absent) — that keeps the pinned best-effort
+        # contract and stays True.
+        return _db_error is None
     # The session's own model/effort/fast pick — the composer override shipped on
     # session.create, or a restored /model switch — must own the row's model +
     # model_config. The agent isn't built yet at first prompt.submit, so derive
@@ -3627,6 +4294,23 @@ def _ensure_session_db_row(session: dict) -> None:
     parent_session_id = session.get("parent_session_id") or None
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
+    # Bot-Mode room plumbing sessions are per-member scratch conversations
+    # inside a group chat: their runtime must ALWAYS follow the member profile's
+    # CURRENT config, never the provider that was pinned when the row was first
+    # written. Persist that contract explicitly so resume can distinguish room
+    # plumbing from a normal user chat (whose stored model/provider must be
+    # restored verbatim). See _stored_session_runtime_overrides.
+    if session.get("room_plumbing"):
+        model_config["room_plumbing"] = True
+    # Bot-Mode canonical chats (the ONE forever DM per bot) and room plumbing
+    # sessions are plugin-owned scratch conversations: their runtime must ALWAYS
+    # follow the member profile's CURRENT config, never the model/provider that
+    # was pinned when the row was first written. Persist that contract explicitly
+    # so resume can distinguish them from a normal user chat (whose stored
+    # model/provider must be restored verbatim). See
+    # _stored_session_runtime_overrides.
+    if session.get("follow_profile_config"):
+        model_config["follow_profile_config"] = True
     try:
         db.create_session(
             key,
@@ -3636,9 +4320,15 @@ def _ensure_session_db_row(session: dict) -> None:
             parent_session_id=parent_session_id,
             cwd=_persisted_session_cwd(session),
             # Self-describing rows: aggregators that merge multiple profile DBs
-            # into one list can't rely on which file a row came from alone. NULL
-            # means the launch/default profile (matches run_agent's convention).
-            profile_name=Path(profile_home).name if profile_home else None,
+            # into one list can't rely on which file a row came from alone.
+            # Stamp the launch profile explicitly instead of leaving NULL —
+            # NULL is exactly what the #94724 legacy-owner backfill exists to
+            # repair, and rows minted AFTER that one-shot backfill ran stayed
+            # NULL forever: profile-keyed matching then drops them from the
+            # sidebar and deep links can't resolve them (#99222).
+            profile_name=(
+                Path(profile_home).name if profile_home else _current_profile_name()
+            ),
         )
         # A session can be born hidden (session.create hidden=true, or a
         # session.set_hidden that arrived before the row existed): apply the
@@ -3663,6 +4353,7 @@ def _ensure_session_db_row(session: dict) -> None:
                 db.close()
             except Exception:
                 pass
+    return True
 
 
 def _persist_branch_seed(session: dict) -> None:
@@ -4152,7 +4843,9 @@ def _save_cfg(cfg: dict):
 
     from utils import atomic_roundtrip_yaml_save
 
-    path = _hermes_home / "config.yaml"
+    override = get_hermes_home_override()
+    home = Path(override) if isinstance(override, str) and override else _hermes_home
+    path = Path(home) / "config.yaml"
     # Comment-, ordering-, and Unicode-preserving full-state write.
     # Replaces the previous `yaml.safe_dump(cfg, f)` (and later
     # `atomic_config_write`, which is not comment-preserving) which clobbered
@@ -4957,6 +5650,30 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
 from hermes_state import _BARE_BILLING_PROVIDERS
 
 
+def _overrides_have_routable_provider(overrides: dict) -> bool:
+    """Whether persisted runtime overrides still name a routable provider.
+
+    A session row written under a provider that has since been renamed or
+    removed would otherwise fail agent init with "Unknown provider".
+    Empty provider counts as NOT routable here, so the caller falls back
+    to the model the user picked for this session / the configured
+    default instead of restoring a provider-less snapshot override.
+    """
+    provider = str(overrides.get("provider_override") or "").strip()
+    if not provider:
+        provider = str(
+            (overrides.get("model_override") or {}).get("provider") or ""
+        ).strip()
+    if not provider:
+        return False
+    try:
+        from hermes_cli.runtime_provider import is_routable_provider
+
+        return is_routable_provider(provider)
+    except Exception:
+        return False
+
+
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
     """Return runtime fields persisted with a stored session.
 
@@ -4967,6 +5684,74 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     ``billing_provider``, and richer runtime knobs in JSON ``model_config``.
     """
     if not row:
+        return {}
+
+    # Bot-Mode room plumbing sessions (hidden, titled "Group: <name>") are
+    # per-member scratch conversations inside a group chat. They must always
+    # rebuild from the member profile's CURRENT config: restoring the stored
+    # model/provider pin from an old row is what left room bots stuck on
+    # Nous (or any earlier provider) long after the profile was switched —
+    # every room message then failed with "out of Nous credits" while the
+    # same bots worked fine in DMs. 1:1 chats keep the stored-runtime
+    # restore (opening an older chat must show the model it actually used);
+    # only the room plumbing is exempt.
+    #
+    # The primary signal is the EXPLICIT ``room_plumbing`` contract persisted
+    # by session.create/room consumers (desktop Bot Mode) — a deliberate
+    # marker, not a presentation heuristic. The hidden + "Group:" title
+    # shape is kept as a legacy fallback so rows created by older desktop
+    # builds (which never sent the marker) still behave correctly until the
+    # client catches up.
+    raw_plumbing = row.get("model_config")
+    if isinstance(raw_plumbing, dict):
+        _plumbing_marker = raw_plumbing.get("room_plumbing")
+    elif isinstance(raw_plumbing, str) and raw_plumbing.strip():
+        try:
+            _plumbing_marker = json.loads(raw_plumbing).get("room_plumbing")
+        except Exception:
+            _plumbing_marker = None
+    else:
+        _plumbing_marker = None
+    if _plumbing_marker:
+        return {}
+    _row_title = str(row.get("title") or "").strip()
+    _row_hidden = row.get("hidden")
+    if _row_hidden and _row_title.startswith("Group:"):
+        return {}
+
+    # Bot-Mode canonical chats (the ONE forever DM per bot) and room plumbing
+    # sessions are plugin-owned scratch conversations. They must always rebuild
+    # from the member profile's CURRENT config: restoring the stored
+    # model/provider pin from an old row is what left bot DMs stuck on a stale
+    # provider (e.g. "out of Nous credits" after the profile was switched to
+    # ollama-cloud) while the same bot worked fine in rooms. 1:1 user chats
+    # keep the stored-runtime restore (opening an older chat must show the
+    # model it actually used); only the plugin-owned bot sessions are exempt.
+    #
+    # The primary signal is the EXPLICIT ``follow_profile_config`` contract
+    # persisted by session.create consumers (desktop Bot Mode) — a deliberate
+    # marker, not a presentation heuristic.
+    raw_follow = row.get("model_config")
+    if isinstance(raw_follow, dict):
+        _follow_marker = raw_follow.get("follow_profile_config")
+    elif isinstance(raw_follow, str) and raw_follow.strip():
+        try:
+            _follow_marker = json.loads(raw_follow).get("follow_profile_config")
+        except Exception:
+            _follow_marker = None
+    else:
+        _follow_marker = None
+    if _follow_marker:
+        return {}
+    # Legacy backfill: canonical Bot Chats created BEFORE the
+    # follow_profile_config contract existed carry no marker, yet they are
+    # still the plugin-owned forever-DM. The plugin's own identity rule is
+    # "the profile's session titled exactly 'Bot Chat'" (UNIQUE(title) makes
+    # that an exact registry, and pre-policy rows may be visible OR hidden),
+    # so mirror that rule here. Without this, every Bot Chat that already
+    # exists in the field stays pinned to its stale stored provider until
+    # the user deletes it — the exact live-report shape (#89497 / #94818).
+    if _row_title == "Bot Chat":
         return {}
 
     raw_config = row.get("model_config")
@@ -5000,30 +5785,46 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
 
-    # Heal a bare ``"custom"`` provider stored by an older build (or any leak
-    # site that bypassed _runtime_model_config's normalization). Bare custom is
-    # the resolved billing class, not a routable identity — restoring it as the
-    # session's provider override routes the resume to the OpenRouter default
-    # URL with no api_key, surfacing as "No LLM provider configured". Recover
-    # the durable ``custom:<name>`` menu key from the stored base_url, then
-    # from the entry that serves the stored model, falling back to the
-    # configured provider when the row has neither (the recurring Desktop/TUI
-    # regression vector). If none names a real entry,
-    # drop the bare provider entirely so resume falls back to the configured
-    # default rather than the broken OpenRouter route.
-    if provider.strip().lower() == "custom":
-        healed = None
+    # Heal a stale/expired provider name persisted by an older build — not
+    # just the bare ``"custom"`` billing class. A renamed or removed custom
+    # provider (e.g. ``oldone`` -> ``newone``) stored in the session row
+    # would otherwise fail agent init with "Unknown provider '<name>'".
+    # Recover the durable ``custom:<name>`` menu key from the stored
+    # base_url, then from the entry that serves the stored model, falling
+    # back to the configured provider when the row has neither. When
+    # nothing names a real entry, drop the provider entirely so resume
+    # falls back to the configured default rather than the broken route.
+    if provider:
+        routable = False
         try:
-            from hermes_cli.runtime_provider import canonical_custom_identity
+            from hermes_cli.runtime_provider import is_routable_provider
 
-            healed = canonical_custom_identity(
-                base_url=base_url or None, model=model or None
-            )
+            routable = is_routable_provider(provider)
         except Exception:
-            logger.debug(
-                "custom provider identity recovery failed", exc_info=True
-            )
-        provider = healed or ("" if not base_url else provider)
+            routable = False
+        if not routable:
+            healed = None
+            try:
+                from hermes_cli.runtime_provider import canonical_custom_identity
+
+                healed = canonical_custom_identity(
+                    base_url=base_url or None, model=model or None
+                )
+            except Exception:
+                logger.debug(
+                    "custom provider identity recovery failed", exc_info=True
+                )
+            if healed:
+                logger.info(
+                    "healed stale session provider %r to %r", provider, healed
+                )
+                provider = healed
+                # The healed identity owns a registered endpoint; drop the
+                # snapshot's base_url so it can't override the registry URL
+                # (e.g. a stale direct endpoint behind a renamed proxy).
+                base_url = ""
+            else:
+                provider = ""
 
     if model:
         # Use the same dict-shaped override that live /model switches use so a
@@ -5052,6 +5853,20 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
 
 
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+    """Merge the agent's CURRENT runtime identity onto an existing config.
+
+    ``existing`` is the row's previously-persisted ``model_config`` JSON (may
+    be absent on first write). The returned dict must mirror the agent's live
+    state: falsy agent attributes DELETE the corresponding key rather than
+    merely omit the write, so a stale value from an earlier session state can
+    never survive into the merged config. Keeping stale values here is what
+    desynced the ``sessions.model`` column (fresh) from ``model_config``
+    (stale provider/endpoint): ``_persist_live_session_runtime`` writes the
+    model column separately, and on resume ``_stored_session_runtime_overrides``
+    reads provider/endpoint from this JSON — so a stale provider would silently
+    route the resumed chat to the wrong endpoint while the model column claimed
+    the new one.
+    """
     config = dict(existing or {})
     model = str(getattr(agent, "model", "") or "").strip()
     provider = str(getattr(agent, "provider", "") or "").strip()
@@ -5062,6 +5877,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
 
     if model:
         config["model"] = model
+    else:
+        config.pop("model", None)
     if provider:
         if provider.strip().lower() == "custom":
             # ``agent.provider`` is the RESOLVED provider, and for any named
@@ -5092,6 +5909,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
                     "custom provider identity lookup failed", exc_info=True
                 )
         config["provider"] = provider
+    else:
+        config.pop("provider", None)
     if base_url:
         config["base_url"] = base_url
     else:
@@ -5173,6 +5992,16 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     home_token = (
         set_hermes_home_override(profile_home) if profile_home else None
     )
+    # Bind the session context too. This function runs on the RPC dispatcher
+    # thread (model.switch, config.set model). On that thread the _SESSION_CWD
+    # contextvar is not set, so resolve_agent_cwd() falls back to the process
+    # TERMINAL_CWD, which the desktop pins to the home directory. The rebuilt
+    # prompt then records the wrong working directory and persists it. Later
+    # turns restore the stored bytes without change, because the turn
+    # prologue rebuilds only when _cached_system_prompt is None.
+    session_tokens = _set_session_context(
+        session_key, cwd=_session_cwd(session)
+    )
     try:
         prompt = agent._build_system_prompt(None)
         agent._cached_system_prompt = prompt
@@ -5184,6 +6013,7 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
             exc_info=True,
         )
     finally:
+        _clear_session_context(session_tokens)
         if home_token is not None:
             reset_hermes_home_override(home_token)
 
@@ -5300,6 +6130,34 @@ def _write_config_key(key_path: str, value):
 
 _STATUSBAR_MODES = frozenset({"off", "top", "bottom"})
 _APPROVAL_MODES = frozenset({"manual", "smart", "off"})
+
+# Appearance switches the desktop renderer owns but the AGENT has to see: each
+# one gates a tool's `check_fn`, so the toggle has to reach the config of
+# whichever gateway the app is actually talking to — local, SSH, URL, or cloud.
+#
+# `config.set` matches an explicit key list and answers 4002 for anything else,
+# so a renderer mirroring a key that is not listed here writes nothing at all.
+# That is not hypothetical: the reactions toggle shipped mirroring
+# `display.message_reactions`, every write was rejected into a swallowed
+# `.catch()`, and `react_to_message` therefore stayed dark no matter what the
+# user picked. Adding a mirrored switch to the renderer means adding it here.
+_DISPLAY_TOGGLE_KEYS = frozenset(
+    {
+        "display.message_reactions",
+        "display.in_app_tips",
+        "display.in_app_tours",
+    }
+)
+_BOOL_WORDS = {
+    "1": True,
+    "on": True,
+    "true": True,
+    "yes": True,
+    "0": False,
+    "off": False,
+    "false": False,
+    "no": False,
+}
 
 
 def _load_approval_mode() -> str:
@@ -5729,7 +6587,57 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             api_key=snapshot.get("api_key", ""),
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
+            capabilities=snapshot.get("capabilities"),
         )
+
+
+@contextlib.contextmanager
+def _session_profile_runtime_scope(session: dict):
+    """Bind model resolution to the session's profile config and secrets."""
+    profile_home = session.get("profile_home")
+    if not profile_home:
+        yield
+        return
+    home_token = set_hermes_home_override(profile_home)
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def _restart_completed_failed_agent_build(
+    sid: str, session: dict, failed_ready: threading.Event | None
+) -> bool:
+    """Replace one completed failed build generation and start its retry."""
+    if failed_ready is None:
+        return False
+    build_lock = session.setdefault("agent_build_lock", threading.Lock())
+    with build_lock:
+        if (
+            session.get("agent") is not None
+            or session.get("agent_error") is None
+            or session.get("agent_ready") is not failed_ready
+            or not failed_ready.is_set()
+        ):
+            return False
+        model_override = session.get("model_override")
+        resume_overrides = session.get("resume_runtime_overrides")
+        if isinstance(model_override, dict) and isinstance(resume_overrides, dict):
+            resume_overrides = dict(resume_overrides)
+            resume_overrides["model_override"] = model_override
+            if provider := model_override.get("provider"):
+                resume_overrides["provider_override"] = provider
+            else:
+                resume_overrides.pop("provider_override", None)
+            session["resume_runtime_overrides"] = resume_overrides
+        session["agent_error"] = None
+        session["agent_ready"] = threading.Event()
+        session.pop("agent_build_started", None)
+        session.pop("_agent_build_thread", None)
+    _start_agent_build(sid, session)
+    return True
 
 
 def _apply_model_switch(
@@ -5881,6 +6789,9 @@ def _apply_model_switch(
             confirm_msg = warning.message
             if result.warning_message:
                 confirm_msg = f"{confirm_msg}\n\n{result.warning_message}"
+            # Same contract as the deferred branch below: confirm_message is
+            # canonical, warning is the pre-confirm-era alias. Identical by
+            # design, not by accident.
             return {
                 "value": result.new_model,
                 "warning": confirm_msg,
@@ -5896,6 +6807,7 @@ def _apply_model_switch(
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
+                capabilities=getattr(result, "runtime_capabilities", None),
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -6083,6 +6995,358 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
             "error",
             sid,
             {"message": f"Could not switch to configured model {model}: {e}"},
+        )
+
+
+def _pending_switch_selection_warning(model: str, provider: str) -> str | None:
+    """Selection-guard message for a model queued mid-turn, or ``None``.
+
+    Runs BEFORE the pick is stashed, while the client still has a live response
+    it can turn into a confirm prompt. Only pre-resolution inputs exist here --
+    the model id the user picked and any explicit ``--provider`` -- which is
+    exactly what the data-policy guard keys on. Guards that can only decide
+    once base_url / api_key / model_info have settled still get their chance in
+    ``_apply_model_switch``; the cost guard returns ``None`` when pricing is
+    unknown, so an early call can only under-fire, never over-fire.
+
+    A misbehaving guard must never break the pick, so exceptions are swallowed
+    and treated as "no warning" -- the apply-time check remains the backstop.
+    """
+    if not model:
+        return None
+    try:
+        from hermes_cli.model_selection_guards import combined_selection_warning
+
+        warning = combined_selection_warning(model, provider=provider or None)
+    except Exception:
+        return None
+
+    return warning.message if warning is not None else None
+
+
+def _tui_compression_config_signature(cfg: dict | None) -> tuple:
+    """Stable snapshot of compression/context keys that must apply next turn.
+
+    Reuses the messaging-gateway cache-busting extract so Desktop/TUI and
+    messaging stay on the same key set. Adds ``idle_compact_after_seconds``
+    and ``tail_mode``, which affect live TUI sessions but are not in the
+    gateway tuple today.
+    """
+    from gateway.run import GatewayRunner
+
+    keys = GatewayRunner._extract_cache_busting_config(cfg)
+    picked = {
+        key: value
+        for key, value in keys.items()
+        if key.startswith("compression.") or key == "model.context_length"
+    }
+    compression = cfg.get("compression") if isinstance(cfg, dict) and isinstance(cfg.get("compression"), dict) else {}
+    for extra in ("idle_compact_after_seconds", "tail_mode"):
+        picked[f"compression.{extra}"] = compression.get(extra)
+    return tuple(sorted(picked.items()))
+
+
+def _compressor_ctor_default(name: str, fallback: Any) -> Any:
+    """Read a normalized default from ContextCompressor's REAL signature.
+
+    Unset restoration must go through the same derivation the construction
+    path uses (#94724 review finding on #95980) — pulling the default off
+    ``ContextCompressor.__init__`` itself instead of hardcoding copies keeps
+    the two from drifting.
+    """
+    try:
+        import inspect
+
+        from agent.context_compressor import ContextCompressor
+
+        default = inspect.signature(ContextCompressor.__init__).parameters[
+            name
+        ].default
+        if default is inspect.Parameter.empty:
+            return fallback
+        return default
+    except Exception:
+        return fallback
+
+
+def _derived_default_threshold_percent(agent: Any, compression: dict) -> float:
+    """Default compaction threshold when ``compression.threshold`` is unset.
+
+    Mirrors agent_init exactly: the ctor's global default, then the per-model
+    resolution (Codex gpt-5.4/5.5 + spark autoraise, Arcee Trinity, etc.)
+    via the SAME ``_resolve_compression_threshold`` helper — so removing the
+    key restores the model-derived value, not a bare constant.
+    """
+    try:
+        pct = float(_compressor_ctor_default("threshold_percent", 0.50))
+    except (TypeError, ValueError):
+        pct = 0.50
+    try:
+        from agent.agent_init import _resolve_compression_threshold
+        from agent.auxiliary_client import (
+            _compression_threshold_for_model,
+            _is_codex_gpt54_or_gpt55,
+            _is_codex_spark,
+        )
+
+        model = getattr(agent, "model", "") or ""
+        provider = getattr(agent, "provider", "") or ""
+        autoraise_enabled = str(
+            compression.get("codex_gpt55_autoraise", True)
+        ).lower() in {"true", "1", "yes"}
+        model_cthresh = _compression_threshold_for_model(
+            model,
+            provider,
+            allow_codex_gpt55_autoraise=autoraise_enabled,
+        )
+        pct, _notice = _resolve_compression_threshold(
+            pct,
+            model_cthresh,
+            model=model,
+            is_codex_autoraise=(
+                _is_codex_gpt54_or_gpt55(model, provider)
+                or _is_codex_spark(model, provider)
+            ),
+        )
+    except Exception:
+        pass
+    return pct
+
+
+def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
+    """Update a live session's compressor from current config.yaml.
+
+    Preserves the agent object, session identity, history, and callbacks.
+    Recomputes the trigger from the ratio-based threshold and then applies
+    ``compression.threshold_tokens`` so raising, lowering, or clearing the
+    cap all take effect on the next preflight.
+
+    Every adopted key has UNSET semantics (#94724 review finding on the
+    merged #95980): removing a key from config.yaml restores the normalized
+    default — or the model-derived value — on the next turn, through the
+    same derivation the construction path uses (ContextCompressor ctor
+    defaults read off its real signature, the Codex threshold autoraise via
+    ``_resolve_compression_threshold``, context-length re-inference via the
+    deferred ``get_model_context_length`` resolution). The old behavior
+    acted only on PRESENT keys, leaving stale values active forever.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    compression_raw = cfg.get("compression")
+    compression = compression_raw if isinstance(compression_raw, dict) else {}
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+
+    enabled_raw = compression.get("enabled", True)
+    if isinstance(enabled_raw, bool):
+        agent.compression_enabled = enabled_raw
+    else:
+        agent.compression_enabled = str(enabled_raw).lower() in {"true", "1", "yes"}
+
+    agent.codex_responses_native_compaction = is_truthy_value(
+        compression.get("codex_responses_native", False)
+    )
+    native_threshold_raw = compression.get(
+        "codex_responses_compact_threshold", 200_000
+    )
+    try:
+        if isinstance(native_threshold_raw, bool):
+            raise ValueError
+        native_threshold = int(native_threshold_raw)
+        if native_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid compression.codex_responses_compact_threshold=%r; "
+            "using 200000.",
+            native_threshold_raw,
+        )
+        native_threshold = 200_000
+    agent.codex_responses_compact_threshold = native_threshold
+
+    # Absence restores the agent_init/config default (0 = disabled).
+    idle_raw = compression.get("idle_compact_after_seconds", 0)
+    try:
+        agent.compression_idle_compact_after_seconds = max(0, int(idle_raw or 0))
+    except (TypeError, ValueError):
+        pass
+
+    cc = getattr(agent, "context_compressor", None)
+    if cc is None:
+        return
+
+    # tail_mode: ctor normalization — unknown/absent values land on "lean",
+    # matching agent_init's default and the compressor's own fallback.
+    default_tail = str(_compressor_ctor_default("tail_mode", "lean"))
+    mode = str(compression.get("tail_mode", default_tail) or default_tail)
+    mode = mode.strip().lower()
+    cc.tail_mode = mode if mode in ("legacy", "lean") else default_tail
+
+    def _assign_int(key: str, attr: str, default: int, min_value: int = 0) -> None:
+        raw = compression.get(key, default)
+        try:
+            value = default if raw is None else int(raw)
+        except (TypeError, ValueError):
+            return
+        setattr(cc, attr, max(min_value, value))
+
+    _assign_int(
+        "proactive_prune_tokens",
+        "proactive_prune_tokens",
+        int(_compressor_ctor_default("proactive_prune_tokens", 0)),
+    )
+    _assign_int(
+        "proactive_prune_min_result_chars",
+        "proactive_prune_min_result_chars",
+        int(_compressor_ctor_default("proactive_prune_min_result_chars", 8000)),
+    )
+    _assign_int(
+        "proactive_prune_min_reclaim_tokens",
+        "proactive_prune_min_reclaim_tokens",
+        int(_compressor_ctor_default("proactive_prune_min_reclaim_tokens", 4096)),
+    )
+    _assign_int(
+        "protect_last_n",
+        "protect_last_n",
+        int(_compressor_ctor_default("protect_last_n", 20)),
+    )
+    _assign_int(
+        "min_tail_user_messages",
+        "min_tail_user_messages",
+        int(_compressor_ctor_default("min_tail_user_messages", 1)),
+        min_value=1,
+    )
+
+    try:
+        ratio_raw = compression.get(
+            "target_ratio", _compressor_ctor_default("summary_target_ratio", 0.20)
+        )
+        cc.summary_target_ratio = max(0.10, min(float(ratio_raw), 0.80))
+    except (TypeError, ValueError):
+        pass
+
+    raw_thresholds = compression.get("model_thresholds")
+    if isinstance(raw_thresholds, dict):
+        cc.model_thresholds = {
+            str(k): float(v)
+            for k, v in raw_thresholds.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+    else:
+        # Absent (or invalid shape — agent_init treats both as empty):
+        # stale per-model overrides must stop steering the live threshold.
+        cc.model_thresholds = {}
+
+    # threshold: present value wins; absence derives the default through
+    # the same agent_init resolution (global default + per-model autoraise).
+    pct: float | None = None
+    if "threshold" in compression:
+        try:
+            pct = float(compression["threshold"])
+        except (TypeError, ValueError):
+            pct = None
+    if pct is None:
+        pct = _derived_default_threshold_percent(agent, compression)
+    try:
+        cc._config_threshold_percent = pct
+        cc._configured_threshold_percent = pct
+        base = pct
+        model_thresholds = getattr(cc, "model_thresholds", None) or {}
+        if model_thresholds:
+            from agent.context_compressor import resolve_model_threshold
+
+            base = resolve_model_threshold(
+                getattr(agent, "model", "") or "",
+                model_thresholds,
+                pct,
+            )
+        cc._base_threshold_percent = base
+        if hasattr(cc, "_effective_threshold_percent"):
+            try:
+                cc.threshold_percent = cc._effective_threshold_percent(
+                    cc.context_length, base
+                )
+            except Exception:
+                cc.threshold_percent = pct
+        else:
+            cc.threshold_percent = pct
+    except (TypeError, ValueError):
+        pass
+
+    raw_ctx = model_cfg.get("context_length")
+    if raw_ctx is not None:
+        try:
+            new_ctx = int(raw_ctx)
+        except (TypeError, ValueError):
+            new_ctx = 0
+        if new_ctx > 0:
+            cc._config_context_length = new_ctx
+            try:
+                cc.context_length = new_ctx
+            except Exception:
+                pass
+    elif getattr(cc, "_config_context_length", None) is not None:
+        # model.context_length removed: drop the config override and force
+        # re-inference from model metadata on next access — the same
+        # deferred get_model_context_length resolution agent construction
+        # uses (#32221). The re-resolve also re-applies the small-context
+        # threshold floor for the genuinely re-inferred window.
+        cc._config_context_length = None
+        cc._resolved_context_length = None
+
+    coerce_cap = getattr(cc, "_coerce_threshold_tokens_cap", None)
+    if callable(coerce_cap):
+        cc.threshold_tokens_cap = coerce_cap(compression.get("threshold_tokens"))
+    elif "threshold_tokens" in compression:
+        try:
+            cap = int(compression.get("threshold_tokens"))
+            cc.threshold_tokens_cap = cap if cap > 0 else None
+        except (TypeError, ValueError):
+            cc.threshold_tokens_cap = None
+    else:
+        cc.threshold_tokens_cap = None
+
+    # Invalidate cached trigger so the next preflight re-derives from the
+    # current percent/window and then applies the (possibly new) cap.
+    if hasattr(cc, "_threshold_tokens"):
+        cc._threshold_tokens = None
+        if hasattr(cc, "_tail_token_budget"):
+            cc._tail_token_budget = None
+    elif hasattr(cc, "_apply_threshold_tokens_cap"):
+        compute = getattr(cc, "_compute_threshold_tokens", None)
+        if callable(compute):
+            cc.threshold_tokens = compute(
+                getattr(cc, "context_length", 0) or 0,
+                getattr(cc, "threshold_percent", 0.5),
+                getattr(cc, "max_tokens", None),
+            )
+        cc._apply_threshold_tokens_cap()
+    else:
+        cap = getattr(cc, "threshold_tokens_cap", None)
+        current = getattr(cc, "threshold_tokens", None)
+        if cap and current:
+            cc.threshold_tokens = min(int(current), int(cap))
+
+
+def _sync_agent_compression_with_config(sid: str, session: dict) -> None:
+    """Adopt compression.* / model.context_length edits at turn start.
+
+    Messaging gateways already rebuild a cached agent when these keys change.
+    Desktop/TUI only synced the model; the live compressor kept the threshold
+    captured at agent creation (#95151).
+    """
+    agent = session.get("agent")
+    if agent is None:
+        return
+    cfg = _load_cfg() or {}
+    signature = _tui_compression_config_signature(cfg)
+    seen = session.get("config_compression_seen")
+    session["config_compression_seen"] = signature
+    if signature == seen:
+        return
+    try:
+        _apply_live_compression_config(agent, cfg)
+    except Exception as e:
+        logger.warning(
+            "Could not apply live compression config for %s: %s", sid, e
         )
 
 
@@ -6399,6 +7663,39 @@ def _get_usage(agent) -> dict:
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+    # Cache-hit ratio + rolling latency/throughput for the TUI status bar.
+    # Mirrors the classic CLI bar (cli.py _get_status_bar_snapshot / PR #98250):
+    #   hit = session_cache_read_tokens / session_prompt_tokens
+    #   (CanonicalUsage.prompt_tokens = input + cache_read + cache_write)
+    # latency/tps read the deque(maxlen=10) history maintained per API call in
+    # agent/conversation_loop.py. Values are omitted (not fabricated) when no
+    # data exists — e.g. Codex app-server reports no latency, and a session
+    # with zero cache reads shows no hit% rather than an alarming 0.
+    try:
+        _prompt_total = int(getattr(agent, "session_prompt_tokens", 0) or 0)
+        _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
+        if _prompt_total > 0 and _cache_read > 0:
+            usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
+    except Exception:
+        pass
+    try:
+        _lhist = list(getattr(agent, "_api_latency_history", []) or [])
+        _ohist = list(getattr(agent, "_api_output_history", []) or [])
+        _n = min(len(_lhist), len(_ohist))
+        if _n:
+            _lhist = _lhist[-_n:]
+            _ohist = _ohist[-_n:]
+            _avg_lat = sum(_lhist) / _n
+            _total_lat = sum(_lhist)
+            _avg_vel = (sum(_ohist) / _total_lat) if _total_lat > 0 else None
+            # Guard NaN/negative/absurd values from odd provider timings.
+            if _avg_lat == _avg_lat and 0 < _avg_lat < 1e6:
+                usage["avg_latency_s"] = round(float(_avg_lat), 1)
+            if _avg_vel is not None and _avg_vel == _avg_vel and 0 < _avg_vel < 1e6:
+                usage["avg_tps"] = round(float(_avg_vel), 1)
+    except Exception:
+        # A status-bar readout must never break usage reporting.
+        pass
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
     # bar's ⛓ indicator; sourced from the same async_delegation registry.
@@ -6894,6 +8191,101 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
     return f"{text}{suffix}" if text else None
 
 
+def _normalize_todo_state(value: object) -> dict | None:
+    """Return a client-safe full todo snapshot or ``None`` when malformed."""
+    if not isinstance(value, dict) or not isinstance(value.get("todos"), list):
+        return None
+    try:
+        revision = max(0, int(value.get("revision") or 0))
+    except (TypeError, ValueError):
+        return None
+    todos = list(value["todos"])
+    # Unused TodoStore snapshot() is {todos: [], revision: 0}. Attaching
+    # that on resume stamps a client watermark and blocks unversioned
+    # tool.start merges. An empty list at revision >= 1 is a real clear.
+    if not todos and revision == 0:
+        return None
+    return {"todos": todos, "revision": revision}
+
+
+def _session_todo_state(session: dict) -> dict | None:
+    """Return the newest live/cached todo snapshot for a runtime session."""
+    cached = _normalize_todo_state(session.get("todo_state"))
+    live = None
+    agent = session.get("agent")
+    store = getattr(agent, "_todo_store", None)
+    snapshot = getattr(store, "snapshot", None)
+    if callable(snapshot):
+        try:
+            live = _normalize_todo_state(snapshot())
+        except Exception:
+            logger.debug("failed to read live todo state", exc_info=True)
+
+    if live is not None and (
+        cached is None or live["revision"] >= cached["revision"]
+    ):
+        cached = live
+    if cached is not None:
+        session["todo_state"] = cached
+    return cached
+
+
+def _attach_todo_state(payload: dict, session: dict) -> dict:
+    """Attach the authoritative todo snapshot to a session response."""
+    state = _session_todo_state(session)
+    if state is not None:
+        payload["todo_state"] = state
+    return payload
+
+
+def _todo_state_from_history(history) -> dict | None:
+    """Derive the latest todo snapshot from an already-loaded transcript.
+
+    Used by resume paths that answer before an AIAgent (and its live
+    TodoStore) exists. The canonical todo tool results already persist in
+    conversation history as ordinary tool messages, so the latest one paired
+    with an assistant ``todo`` tool call IS the durable snapshot — no side
+    table and no extra transcript read (each resume path passes the history
+    it already loaded).
+    """
+    if not isinstance(history, list) or not history:
+        return None
+    try:
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS
+
+        todo_call_ids: set[str] = set()
+        for msg in history:
+            if not isinstance(msg, dict):
+                continue
+            for call in msg.get("tool_calls") or []:
+                if (call.get("function") or {}).get("name") == "todo":
+                    cid = call.get("id")
+                    if cid:
+                        todo_call_ids.add(cid)
+        if not todo_call_ids:
+            return None
+        for msg in reversed(history):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            if msg.get("tool_call_id") not in todo_call_ids:
+                continue
+            content = msg.get("content", "")
+            if (
+                not isinstance(content, str)
+                or len(content) > MAX_TODO_RESULT_CHARS
+                or '"todos"' not in content
+            ):
+                continue
+            try:
+                return _normalize_todo_state(json.loads(content))
+            except Exception:
+                continue
+        return None
+    except Exception:
+        logger.debug("failed to derive todo state from history", exc_info=True)
+        return None
+
+
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
     session = _sessions.get(sid)
     if session is not None:
@@ -6975,13 +8367,15 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
+    todo_state = None
     if name == "todo":
-        try:
-            data = json.loads(result)
-            if isinstance(data, dict) and isinstance(data.get("todos"), list):
-                payload["todos"] = data.get("todos")
-        except Exception:
-            pass
+        todo_state = _normalize_todo_state(payload.get("result"))
+        if todo_state is not None:
+            payload.update(todo_state)
+            if session is not None:
+                cached = _normalize_todo_state(session.get("todo_state"))
+                if cached is None or todo_state["revision"] >= cached["revision"]:
+                    session["todo_state"] = todo_state
     try:
         from agent.display import render_edit_diff_with_delta
 
@@ -7026,8 +8420,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         or payload.get("inline_diff")
         or payload.get("diff_unified")
         or _tool_lifecycle_required_for_ui(name)
+        or name == "todo"
     ):
         _emit("tool.complete", sid, payload)
+    # Task state is application data, not optional tool-progress chrome. A
+    # dedicated full-snapshot event lets every client reconcile immediately
+    # without interpreting provider text or partial merge arguments.
+    if todo_state is not None:
+        _emit("todo.updated", sid, todo_state)
 
 
 def _on_tool_progress(
@@ -7825,6 +9225,9 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            context_cwd_is_launch_artifact=(
+                _context_cwd_is_launch_artifact(session)
+            ),
         )
     finally:
         _clear_session_context(tokens)
@@ -7996,6 +9399,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    context_cwd_is_launch_artifact: bool | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -8179,6 +9583,15 @@ def _make_agent(
     # that says fast while sending normal requests.
     if getattr(agent, "service_tier", None) == "priority":
         _apply_service_tier_override(agent, "priority")
+    if context_cwd_is_launch_artifact is None:
+        with _sessions_lock:
+            context_session = _sessions.get(sid)
+        context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(
+            context_session
+        )
+    agent._context_cwd_is_launch_artifact = bool(
+        context_cwd_is_launch_artifact
+    )
     return agent
 
 
@@ -8199,6 +9612,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    explicit_cwd: bool = False,
 ):
     now = time.time()
     with _sessions_lock:
@@ -8215,6 +9629,7 @@ def _init_session(
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
+            "explicit_cwd": bool(explicit_cwd),
             "cols": cols,
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
@@ -8234,17 +9649,27 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        _session_todo_state(_sessions[sid])
     _init_owns_db = False
     if session_db is not None:
         db = session_db
     elif profile_home:
         try:
-            from hermes_state import SessionDB
-
-            db = SessionDB(db_path=Path(profile_home) / "state.db")
+            db = _open_profile_session_db(profile_home)
             _init_owns_db = True
         except Exception:
-            db = _get_db()
+            # FAIL CLOSED — same class as the deferred-build bind: a
+            # named-profile session must never read/write the launch
+            # ``state.db``. Skip the cwd hydration/persist (the row lands on
+            # the agent's own lazy-create once the store recovers) rather
+            # than writing this session's row into the wrong profile's store.
+            logger.warning(
+                "profile session store unavailable for %s — skipping cwd "
+                "hydration instead of touching the launch state.db",
+                profile_home,
+                exc_info=True,
+            )
+            db = None
     else:
         db = _get_db()
     try:
@@ -9170,6 +10595,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     same _run_prompt_submit machinery as every other synthesized turn — so
     the client that just resumed streams it live.
     """
+    # Hosted room turns are recovered by their durable task/lease state
+    # machine. Generic session auto-continue would bypass its execution
+    # generation and can duplicate work after a process restart.
+    if session.get("source") == "bot_room":
+        return None
+
     home = _session_home(session)
     marker = read_turn_marker(home, session_key)
     if marker is None:
@@ -9216,6 +10647,23 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 return
             session["running"] = True
             session["last_active"] = time.time()
+        # Ownership admission BEFORE message.start: the interrupted-turn
+        # marker this continuation is recovering may have been written by a
+        # sibling backend that is still alive and mid-turn (#94778 — two
+        # backends share one HERMES_HOME; B resumes S while A runs it and
+        # sees A's fresh marker). Running the continuation anyway would be
+        # the double-writer this fence exists to prevent. Leave the marker:
+        # once the owner finishes or dies, a later resume retries.
+        if _ensure_active_session_slot(sid, session) is not None:
+            logger.info(
+                "auto-continue for %s refused: session has another live owner",
+                session_key,
+            )
+            with session["history_lock"]:
+                session["running"] = False
+                session["_auto_continue_scheduled"] = False
+            return
+        with session["history_lock"]:
             # Hand this turn its own marker inputs (read back by
             # _run_prompt_submit): count the attempt so a crash during the
             # continuation trips the breaker, and re-record the ORIGINAL
@@ -9906,10 +11354,11 @@ def _emit_terminal_turn_error(
     sid: str,
     session: dict,
     error: Any,
-    error_surface: Optional[dict] = None,
     *,
+    error_surface: Optional[dict] = None,
     client_submission_ids: list[str] | None = None,
     history_lock_owned: bool = False,
+    retire_marker: bool = True,
 ) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
@@ -9974,7 +11423,8 @@ def _emit_terminal_turn_error(
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
-    _retire_turn_marker(session)
+    if retire_marker:
+        _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
 
@@ -10565,6 +12015,8 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    todo_state: dict | None = None,
+    explicit_cwd: bool = False,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -10581,7 +12033,7 @@ def _deferred_session_record(
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {},
-        "explicit_cwd": False,
+        "explicit_cwd": bool(explicit_cwd),
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,
@@ -10601,6 +12053,7 @@ def _deferred_session_record(
         "source": source,
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
+        "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
     }
     if display_history is not None:
@@ -11239,6 +12692,11 @@ def _schedule_resume_hydration(
                 )
                 session["resume_hydrating"] = False
                 session["resume_message_count"] = len(display_history)
+            # Deferred resumes answered before the transcript existed; cache
+            # the derived todo snapshot now so later payload attaches carry it.
+            todo_state = _todo_state_from_history(history)
+            if todo_state is not None and session.get("todo_state") is None:
+                session["todo_state"] = todo_state
             session["resume_history_ready"].set()
             _emit(
                 "session.resume_progress",
@@ -11584,7 +13042,7 @@ def _live_session_payload(
         payload["pending_approval"] = approval
     if clarify := _pending_clarify_request_payload(sid):
         payload["pending_clarify"] = clarify
-    return payload
+    return _attach_todo_state(payload, session)
 
 
 @method("session.active_list")
@@ -13224,25 +14682,10 @@ def _(rid, params: dict) -> dict:
         return err
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
-        if session.get("running"):
-            try:
-                _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
-            except Exception as exc:
-                return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
-        with session["history_lock"]:
-            session["_turn_cancel_requested"] = True
-            session["queued_prompt"] = None
-            session.pop("queued_prompts", None)
-            session["_queued_prompt_generation"] = int(
-                session.get("_queued_prompt_generation", 0)
-            ) + 1
-        _clear_pending(sid)
         try:
-            from tools.approval import resolve_gateway_approval
-
-            resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
-        except Exception:
-            pass
+            _interrupt_session_turn(sid, session, request_id=f"interrupt-{rid}")
+        except Exception as exc:
+            return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
     session, err = _sess(params, rid)
     if err:
@@ -14850,6 +16293,7 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     loop_claim_id: str = "",
+    terminal_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> bool:
     client_submission_ids = list(client_submission_ids or [])
     if session.get("_closing") or _session_is_detached(sid, session):
@@ -14858,75 +16302,112 @@ def _run_prompt_submit(
             session["_active_client_submission_ids"] = []
             _clear_inflight_turn(session)
         return False
-    agent = session.get("agent")
-    if agent is None:
+
+    # Ownership admission at the ONE chokepoint every fresh turn source must
+    # cross. prompt.submit already claims the slot in its RPC handler (so this
+    # is a no-op re-check there), but crash auto-continue, wake-ups and other
+    # synthesized turns call _run_prompt_submit directly — the exact bypass
+    # that let a second backend run a duplicate turn in #94778. When the
+    # session already holds its lease this is a cheap dict check.
+    if (ownership_refusal := _ensure_active_session_slot(sid, session)) is not None:
+        logger.info(
+            "Refusing turn for session %s at _run_prompt_submit: %s",
+            session.get("session_key") or sid,
+            getattr(ownership_refusal, "reason", None) or "refused",
+        )
         with session["history_lock"]:
-            session["running"] = False
-            _emit_terminal_turn_error(
-                sid,
-                session,
-                "session agent unavailable before turn start",
-                client_submission_ids=client_submission_ids,
-                history_lock_owned=True,
-            )
-        return False
-    with session["history_lock"]:
-        # Claim start atomically against session.interrupt. The start event is
-        # written while holding the same lock, so the interrupt response can
-        # never overtake it on the wire; clients flush start events before
-        # resolving a later interrupt response.
-        if (
-            session.get("_closing")
-            or session.get("_turn_cancel_requested")
-            or not session.get("running")
-        ):
-            session["_turn_cancel_requested"] = False
             session["running"] = False
             session["_active_client_submission_ids"] = []
             _clear_inflight_turn(session)
-            return False
+        _emit("error", sid, {"message": str(ownership_refusal)})
+        return False
+
+    # Final admission fence: the ownership claim above may block on durable
+    # registry I/O, so its successful return is not proof that ``sid`` still
+    # names this exact record. Serialize lifecycle mutation through the
+    # history-lock start claim/message.start commit. Global order is session
+    # mutation -> session registry -> history; close/replacement uses the same
+    # order, so it cannot detach the record between identity validation and
+    # publishing the accepted turn.
+    with _session_mutation_lock(session):
         if (
-            queued_prompt_generation is not None
-            and int(session.get("_queued_prompt_generation", 0))
-            != queued_prompt_generation
+            not _session_registry_matches(sid, session)
+            or session.get("_finalized")
         ):
-            session["running"] = False
+            with session["history_lock"]:
+                session["running"] = False
+                session["_active_client_submission_ids"] = []
+                _clear_inflight_turn(session)
             return False
-        session["_steer_admission_closed"] = False
-        history = list(session["history"])
-        history_version = int(session.get("history_version", 0))
-        if image_paths is None:
-            images = list(session.get("attached_images", []))
-            session["attached_images"] = []
-        else:
-            images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
-        if hasattr(agent, "clear_interrupt"):
-            try:
-                _clear_agent_interrupt_for_turn(session, agent)
-            except Exception:
-                pass
-        active_ids = list(session.get("_active_client_submission_ids") or [])
-        session["_active_client_submission_ids"] = list(
-            dict.fromkeys([*active_ids, *client_submission_ids])
-        )
-        turn_start_submission_ids = list(
-            session["_active_client_submission_ids"]
-        )
-        if turn_start_submission_ids:
-            _emit(
-                "message.start",
-                sid,
-                {"client_submission_ids": turn_start_submission_ids},
+        agent = session.get("agent")
+        if agent is None:
+            with session["history_lock"]:
+                session["running"] = False
+                _emit_terminal_turn_error(
+                    sid,
+                    session,
+                    "session agent unavailable before turn start",
+                    client_submission_ids=client_submission_ids,
+                    history_lock_owned=True,
+                )
+            return False
+        with session["history_lock"]:
+            # Claim start atomically against session.interrupt. The start event
+            # is written while holding the same lock, so the interrupt response
+            # can never overtake it on the wire; clients flush start events
+            # before resolving a later interrupt response.
+            if (
+                session.get("_closing")
+                or session.get("_turn_cancel_requested")
+                or not session.get("running")
+            ):
+                session["_turn_cancel_requested"] = False
+                session["running"] = False
+                session["_active_client_submission_ids"] = []
+                _clear_inflight_turn(session)
+                return False
+            if (
+                queued_prompt_generation is not None
+                and int(session.get("_queued_prompt_generation", 0))
+                != queued_prompt_generation
+            ):
+                session["running"] = False
+                return False
+            session["_steer_admission_closed"] = False
+            history = list(session["history"])
+            history_version = int(session.get("history_version", 0))
+            if image_paths is None:
+                images = list(session.get("attached_images", []))
+                session["attached_images"] = []
+            else:
+                images = list(image_paths)
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new turn starts — replace it, never append onto it.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
+            if hasattr(agent, "clear_interrupt"):
+                try:
+                    _clear_agent_interrupt_for_turn(session, agent)
+                except Exception:
+                    pass
+            active_ids = list(session.get("_active_client_submission_ids") or [])
+            session["_active_client_submission_ids"] = list(
+                dict.fromkeys([*active_ids, *client_submission_ids])
             )
-        else:
-            # Preserve the shared Ink/desktop gateway call shape for legacy
-            # clients and tests; the wire frame is identical to payload=None.
-            _emit("message.start", sid)
+            turn_start_submission_ids = list(
+                session["_active_client_submission_ids"]
+            )
+            if turn_start_submission_ids:
+                _emit(
+                    "message.start",
+                    sid,
+                    {"client_submission_ids": turn_start_submission_ids},
+                )
+            else:
+                # Preserve the shared Ink/desktop gateway call shape for legacy
+                # clients and tests; the wire frame is identical to payload=None.
+                _emit("message.start", sid)
 
     # Desktop/TUI observability (#86647): this is the ONE INFO record proving
     # a Desktop/TUI prompt was accepted by THIS process, and it ties together
@@ -14949,6 +16430,8 @@ def _run_prompt_submit(
     )
 
     def run():
+        terminal_receipt_attempted = False
+        terminal_receipt_committed = terminal_callback is None
         # The conversation runs on a fresh thread, so ContextVars from the RPC
         # dispatcher do not follow automatically. Rebind the exact transport
         # stored on this session generation before any tool can commission a
@@ -14982,7 +16465,17 @@ def _run_prompt_submit(
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
         marker_text = session.pop("_auto_continue_prompt", None) or text
         if isinstance(marker_text, str) and marker_text.strip():
+            # Publish the original key before the disk write so an interrupt
+            # racing startup can retire it even if compression rotates the
+            # session key later. The post-write cancel check closes the inverse
+            # race where Stop lands first and therefore clears no file yet.
+            with session["history_lock"]:
+                session["_active_turn_marker_key"] = marker_key
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
+            with session["history_lock"]:
+                marker_cancelled = bool(session.get("_turn_cancel_requested"))
+            if marker_cancelled:
+                clear_turn_marker(marker_home, marker_key)
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -15019,6 +16512,7 @@ def _run_prompt_submit(
                 # config sync so an explicit pick wins over a config.yaml change.
                 _apply_pending_model_switch(sid, session)
                 _sync_agent_model_with_config(sid, session)
+                _sync_agent_compression_with_config(sid, session)
             # Bot Chat capability sync — adopt Settings→Capabilities edits
             # (skills/toolsets/MCP/SOUL) into the eternal bot session before
             # the turn runs. No-op for every other session shape.
@@ -15598,7 +17092,26 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
-            _retire_turn_marker(session, marker_key)
+            if terminal_callback is not None:
+                terminal_receipt_attempted = True
+                terminal_callback(
+                    {
+                        "status": (
+                            "cancelled"
+                            if status == "interrupted"
+                            else "failed" if status == "error" else "settled"
+                        ),
+                        "text": raw if isinstance(raw, str) else str(raw),
+                        **(
+                            {"error": str(result.get("error") or raw)}
+                            if status == "error" and isinstance(result, dict)
+                            else {}
+                        ),
+                    }
+                )
+                terminal_receipt_committed = True
+            if terminal_receipt_committed:
+                _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -15838,6 +17351,15 @@ def _run_prompt_submit(
                     "failed to restore agent history after turn error",
                     exc_info=True,
                 )
+            if terminal_callback is not None and not terminal_receipt_attempted:
+                terminal_receipt_attempted = True
+                try:
+                    terminal_callback(
+                        {"status": "failed", "text": "", "error": str(e)}
+                    )
+                    terminal_receipt_committed = True
+                except Exception:
+                    logger.exception("hosted room terminal receipt commit failed")
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
@@ -15847,6 +17369,7 @@ def _run_prompt_submit(
                     session,
                     e,
                     client_submission_ids=failed_submission_ids,
+                    retire_marker=terminal_receipt_committed,
                 )
                 turn_error_retained = True
             except Exception as emit_exc:
@@ -15954,7 +17477,12 @@ def _run_prompt_submit(
             )
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
-            _retire_turn_marker(session, marker_key)
+            if terminal_receipt_committed:
+                _retire_turn_marker(session, marker_key)
+                with session["history_lock"]:
+                    if session.get("_active_turn_marker_key") == marker_key:
+                        session.pop("_active_turn_marker_key", None)
+                    session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
 
@@ -16379,6 +17907,7 @@ def _respond(rid, params, key, *, allow_expired=False):
 # opt/model-resolution-core PR touches its body; move it to methods_config.py
 # in a follow-up once that PR lands.
 @method("config.set")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))
@@ -16406,19 +17935,57 @@ def _(rid, params: dict) -> dict:
                         pending_model = parsed.model_input
                     except Exception:
                         pending_model = str(value)
+                    pending_provider = (
+                        getattr(parsed, "explicit_provider", "") or ""
+                    ).strip()
+                    confirmed = bool(params.get("confirm_expensive_model", False))
+                    # Run the selection guards HERE, not only at apply time.
+                    # This branch used to answer confirm_required=False without
+                    # consulting them, so a client that implements the confirm
+                    # round-trip was told no consent was needed. It stashed the
+                    # pick, and _apply_pending_model_switch -- which calls the
+                    # guards with the stashed (unconfirmed) flag -- dropped the
+                    # switch at the next turn start. The model reverted with no
+                    # confirm ever offered, because the one moment a round-trip
+                    # was possible had already passed.
+                    if not confirmed:
+                        pending_warning = _pending_switch_selection_warning(
+                            pending_model, pending_provider
+                        )
+                        if pending_warning is not None:
+                            # Nothing is stashed: an unconfirmed guarded pick
+                            # leaves the session exactly as it was, and the
+                            # client re-sends with confirm_expensive_model to
+                            # queue it for real.
+                            return _ok(
+                                rid,
+                                {
+                                    "key": key,
+                                    "value": pending_model,
+                                    # `confirm_message` is the field to read.
+                                    # `warning` carries the same text only so
+                                    # clients written before the confirm
+                                    # round-trip existed still show something;
+                                    # `_apply_pending_model_switch` already
+                                    # prefers confirm_message and falls back to
+                                    # warning. Keep them identical or drop
+                                    # `warning` -- do not let them diverge.
+                                    "warning": pending_warning,
+                                    "confirm_required": True,
+                                    "confirm_message": pending_warning,
+                                    "scope": "session",
+                                    "deferred": False,
+                                },
+                            )
                     session["pending_model_switch"] = {
                         "raw": value,
-                        "confirm_expensive_model": bool(
-                            params.get("confirm_expensive_model", False)
-                        ),
+                        "confirm_expensive_model": confirmed,
                         # The resolved model/provider the next turn will run on.
                         # _session_info reports these while the switch is pending
                         # so the end-of-turn settle keeps showing the user's pick
                         # instead of blipping back to the still-live old model.
                         "display_model": pending_model,
-                        "display_provider": (
-                            getattr(parsed, "explicit_provider", "") or ""
-                        ).strip(),
+                        "display_provider": pending_provider,
                     }
                     return _ok(
                         rid,
@@ -16434,7 +18001,33 @@ def _(rid, params: dict) -> dict:
                     )
                 parsed_flags = parse_model_switch_args(value)
                 explicit_provider = parsed_flags.explicit_provider
-                if session.get("agent") is None and not explicit_provider.strip():
+                failed_agent_init = (
+                    session.get("agent") is None
+                    and session.get("agent_error") is not None
+                )
+                failed_ready = session.get("agent_ready") if failed_agent_init else None
+                if failed_agent_init:
+                    if failed_ready is None:
+                        return _err(
+                            rid,
+                            5032,
+                            session.get("agent_error")
+                            or "agent initialization failed",
+                        )
+                    if not failed_ready.wait(timeout=30.0):
+                        return _err(rid, 5032, "agent initialization timed out")
+                failed_agent_init = (
+                    failed_agent_init
+                    and session.get("agent") is None
+                    and session.get("agent_error") is not None
+                    and session.get("agent_ready") is failed_ready
+                    and failed_ready.is_set()
+                )
+                if (
+                    session.get("agent") is None
+                    and not explicit_provider.strip()
+                    and not failed_agent_init
+                ):
                     session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)
                     init_err = _wait_agent(session, rid)
@@ -16442,15 +18035,27 @@ def _(rid, params: dict) -> dict:
                         return init_err
                     if session.get("agent") is None:
                         return _err(rid, 5032, "agent initialization failed")
-                result = _apply_model_switch(
-                    params.get("session_id", ""),
-                    session,
-                    value,
-                    confirm_expensive_model=bool(
-                        params.get("confirm_expensive_model", False)
-                    ),
-                    parsed_flags=parsed_flags,
-                )
+                with _session_profile_runtime_scope(session):
+                    result = _apply_model_switch(
+                        params.get("session_id", ""),
+                        session,
+                        value,
+                        confirm_expensive_model=bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        parsed_flags=parsed_flags,
+                    )
+                if failed_agent_init and not result.get("confirm_required"):
+                    _restart_completed_failed_agent_build(
+                        params.get("session_id", ""), session, failed_ready
+                    )
+                    init_err = _wait_agent(session, rid)
+                    if init_err:
+                        return init_err
+                    if session.get("agent") is None:
+                        return _err(rid, 5032, "agent initialization failed")
+                    with _session_profile_runtime_scope(session):
+                        _persist_live_session_runtime(session)
             else:
                 result = _apply_model_switch(
                     "",
@@ -17117,6 +18722,13 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, resp)
         except Exception as e:
             return _err(rid, 5001, str(e))
+
+    if key in _DISPLAY_TOGGLE_KEYS:
+        on = _BOOL_WORDS.get(str(value).strip().lower())
+        if on is None:
+            return _err(rid, 4002, f"{key} takes true or false")
+        _write_config_key(key, on)
+        return _ok(rid, {"key": key, "value": on})
 
     return _err(rid, 4002, f"unknown config key: {key}")
 
@@ -20382,6 +21994,25 @@ def _persist_wake_enabled(enabled: bool) -> bool:
     except Exception as e:
         logger.warning("wake: failed to persist wake_word.enabled=%s: %s", enabled, e)
         return False
+
+
+@method("gateway.capabilities")
+def _(rid, params: dict) -> dict:
+    """What guarantees THIS BUILD enforces, for a client that must not assume.
+
+    An automated client cannot tell a gateway that fences concurrent writers to
+    one session from one that silently allows them -- both accept the same calls
+    and both answer prompt.submit the same way. It only finds out by corrupting a
+    conversation. So the guarantee is advertised, and a client that does not see
+    it advertised is expected to withhold rather than hope.
+
+    Sourced from the module that performs the enforcement, never from config: a
+    capability an operator can switch on without also having the mechanism is
+    worse than no capability at all, because it is believed.
+    """
+    from hermes_cli.active_sessions import PER_SESSION_EXCLUSIVE_SUBMIT
+
+    return _ok(rid, {"per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT)})
 
 
 @method("ping")

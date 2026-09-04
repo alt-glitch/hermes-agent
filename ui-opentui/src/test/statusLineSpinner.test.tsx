@@ -44,4 +44,67 @@ describe('StatusLine — spinner timer lifecycle (no permanent timer)', () => {
     // flipping running false disposes the prior effect-run → clearInterval fires
     expect(clearSpy.mock.calls.length).toBeGreaterThan(clearedBefore)
   })
+
+  test('idle compaction arms the interval and freezes the verb on "compacting"; compacted disarms', async () => {
+    const setSpy = vi.spyOn(globalThis, 'setInterval')
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval')
+    const store = createSessionStore()
+
+    probe = await renderProbe(() => (
+      <ThemeProvider theme={() => store.state.theme}>
+        <StatusLine store={store} />
+      </ThemeProvider>
+    ))
+
+    const armedAtIdle = setSpy.mock.calls.length
+
+    // Idle compaction: no turn is running, yet the spinner must be visible.
+    store.apply({ type: 'status.update', payload: { kind: 'compacting', text: 'Compacting context (idle)…' } })
+    await probe.settle()
+    expect(store.state.info.running).not.toBe(true)
+    expect(setSpy.mock.calls.length).toBeGreaterThan(armedAtIdle) // timer armed while idle-compacting
+    expect(probe.frame()).toContain('compacting') // the frozen verb…
+    expect(probe.frame()).not.toContain('Compacting context') // …not the raw lifecycle text
+
+    // Later transient traffic must not unfreeze the verb.
+    store.apply({ type: 'thinking.delta', payload: { text: 'pondering deeply' } })
+    await probe.settle()
+    expect(probe.frame()).toContain('compacting')
+    expect(probe.frame()).not.toContain('pondering deeply')
+
+    // A hint still occludes the spinner while the latch is set.
+    store.setHint('Ctrl+C again to quit')
+    await probe.settle()
+    expect(probe.frame()).toContain('Ctrl+C again to quit')
+    expect(probe.frame()).not.toContain('compacting')
+    store.setHint(undefined)
+    await probe.settle()
+    expect(probe.frame()).toContain('compacting')
+
+    const clearedBefore = clearSpy.mock.calls.length
+    store.apply({ type: 'status.update', payload: { kind: 'compacted', text: '✓ context compacted' } })
+    await probe.settle()
+    // dropping the latch disposes the effect-run → clearInterval fires
+    expect(clearSpy.mock.calls.length).toBeGreaterThan(clearedBefore)
+    expect(probe.frame()).not.toContain('compacting')
+  })
+
+  test('unmount mid-compaction clears the interval (cleanup/disarm)', async () => {
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval')
+    const store = createSessionStore()
+
+    probe = await renderProbe(() => (
+      <ThemeProvider theme={() => store.state.theme}>
+        <StatusLine store={store} />
+      </ThemeProvider>
+    ))
+
+    store.apply({ type: 'status.update', payload: { kind: 'compacting', text: 'Compacting context (idle)…' } })
+    await probe.settle()
+
+    const clearedBefore = clearSpy.mock.calls.length
+    probe.destroy()
+    probe = undefined
+    expect(clearSpy.mock.calls.length).toBeGreaterThan(clearedBefore)
+  })
 })

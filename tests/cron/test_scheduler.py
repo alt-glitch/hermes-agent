@@ -214,6 +214,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1001",
             "thread_id": "17585",
+            "_resolved_from": "origin",
         }
 
 
@@ -258,6 +259,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1003724596514",
             "thread_id": "17",
+            "_resolved_from": "explicit",
         }
 
 
@@ -274,6 +276,7 @@ class TestResolveDeliveryTarget:
             "platform": "whatsapp",
             "chat_id": "12345678901234@lid",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
 
@@ -289,6 +292,7 @@ class TestResolveDeliveryTarget:
             "platform": "whatsapp",
             "chat_id": "12345@lid",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
     def test_unresolved_target_still_delivered_as_written(self):
@@ -307,6 +311,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "ops-room",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
 
@@ -934,6 +939,9 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         class FakeFuture:
+            def done(self):
+                return True
+
             def result(self):
                 return {"final_response": "ok"}
 
@@ -1000,6 +1008,9 @@ class TestRunJobSessionPersistence:
                 self.interrupted = True
 
         class FakeFuture:
+            def done(self):
+                return True
+
             def result(self):
                 return {"final_response": "ok"}
 
@@ -1531,9 +1542,11 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, *, task_id=None):
             from tools.env_passthrough import get_all_passthrough
 
+            assert isinstance(task_id, str)
+            assert task_id.startswith("cron:skill-env-job:")
             assert "NOTION_API_KEY" in get_all_passthrough()
             return {"final_response": "ok"}
 
@@ -1589,9 +1602,11 @@ class TestRunJobSkillBacked:
             register_credential_file("credentials/google_token.json")
             return json.dumps({"success": True, "content": "# google-workspace\nUse Google."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, *, task_id=None):
             from tools.credential_files import _get_registered
 
+            assert task_id is not None
+            assert task_id.startswith("cron:cred-env-job:")
             registered = _get_registered()
             assert registered, "credential files must be visible in worker thread"
             assert any("google_token.json" in v for v in registered.values())
@@ -1744,6 +1759,9 @@ class TestRunJobSkillBacked:
                 return {"final_response": "ok"}
 
         class FakeFuture:
+            def done(self):
+                return True
+
             def result(self):
                 return {"final_response": "ok"}
 
@@ -1853,12 +1871,26 @@ class TestOneShotDispatchFencing:
         replacement = {}
 
         def _run_then_resume(
-            job, *, defer_agent_teardown=None, extra_prompt=None
+            job,
+            *,
+            defer_agent_teardown=None,
+            extra_prompt=None,
+            execution_id=None,
         ):
+            assert execution_id
             current_time[0] = t0 + timedelta(
                 seconds=jobs._oneshot_run_claim_ttl_seconds() + 1
             )
-            replacement["job"] = jobs.get_due_jobs()[0]
+            # The due scan now intentionally retires never-dispatched one-shots
+            # after their grace window instead of firing them late. Exercise
+            # replacement through the external-fire CAS, which remains the
+            # supported stale-claim takeover path this fencing test targets.
+            replacement["job"] = jobs.claim_job_for_fire(
+                job["id"],
+                claim_ttl_seconds=int(jobs._oneshot_run_claim_ttl_seconds()),
+                return_job=True,
+            )
+            assert isinstance(replacement["job"], dict)
             if raise_after_reclaim:
                 raise RuntimeError("runner A resumed with a failure")
             return True, "output", "externally visible result", None

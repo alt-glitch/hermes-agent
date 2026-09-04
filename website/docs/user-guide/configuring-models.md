@@ -167,7 +167,7 @@ When `fallback_chain` is absent, `auto` uses the top-level `fallback_providers` 
 
 ## Per-provider request options
 
-Provider entries (`providers.<name>` in the `providers:` dict, or items in the legacy `custom_providers` list) accept two knobs that shape how Hermes talks to the endpoint:
+Provider entries (`providers.<name>` in the `providers:` dict, or items in the legacy `custom_providers` list) accept knobs that shape how Hermes talks to the endpoint:
 
 **`extra_headers`** — a mapping of extra HTTP headers attached to every LLM request routed to that provider's base URL. They are applied last, after URL/profile defaults and user header overrides, so they survive credential swaps and client rebuilds. Useful for Cloudflare Access service tokens, proxy auth, or custom bearer schemes:
 
@@ -196,6 +196,16 @@ providers:
 ```
 
 With discovery off, the model picker (`hermes model`, `/model`) shows the configured list instead of a live probe.
+
+**`openai_native_compaction`** — set this capability to `true` only for an OpenAI-compatible endpoint that you trust with conversation content. Native compaction sends its payload to that provider's configured `base_url`:
+
+```yaml
+providers:
+  trusted-proxy:
+    api: https://llm.internal.example.com/v1
+    capabilities:
+      openai_native_compaction: true
+```
 
 For a gateway that resolves a bare model alias only after receiving the
 request, opt the alias into prompt-cache markers with the per-model
@@ -290,6 +300,26 @@ model_aliases:
     model: grok-4
     provider: x-ai
 ```
+
+An alias that points at its own endpoint can also carry that endpoint's
+credential, with either `api_key` (a literal, or a `"${VAR}"` reference) or
+`key_env` (the name of an environment variable). If both are set, `api_key`
+wins:
+
+```yaml
+model_aliases:
+  theta:
+    model: theta-1
+    provider: custom
+    base_url: "https://theta.example.com/v1"
+    key_env: THETA_API_KEY        # or: api_key: "${THETA_API_KEY}"
+```
+
+When an alias sets neither, the key is resolved from the alias **host** —
+`OLLAMA_API_KEY` for an `ollama.com` endpoint, `DEEPSEEK_API_KEY` for
+`api.deepseek.com`, and so on. It is never inherited from whichever provider
+happened to be active before the switch, so switching to an alias cannot send
+one provider's secret to another provider's host.
 
 **Short string form (`model.aliases.<name>: provider/model`)** — convenient from the shell because `hermes config set` writes scalars and now also parses inline list/mapping literals, though this short alias form still can't carry a custom `base_url`:
 

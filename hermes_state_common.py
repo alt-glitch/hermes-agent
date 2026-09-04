@@ -224,6 +224,32 @@ _RECOVERABLE_END_REASONS = (
 )
 _RECOVERABLE_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RECOVERABLE_END_REASONS)
 
+# End reasons written by AUTOMATIC infrastructure cleanup (server shutdown,
+# orphan reapers, idle/LRU eviction) rather than by a deliberate conversation
+# boundary (compression, session_reset, session_switch, explicit user close).
+# An automatic stamp records "some runtime went away", NOT "this conversation
+# ended" — so a writer that can prove the conversation is still live (e.g. an
+# active compression rotation holding the lease, #88197) may treat the stamp
+# as stale and clear it. Superset of the recoverable set: those are already
+# resumable accidents; the extra TUI reasons are the same accident class but
+# were historically only known to tui_gateway's _AUTOMATIC_SESSION_END_REASONS.
+_AUTOMATIC_END_REASONS = frozenset(_RECOVERABLE_END_REASONS) | {
+    "tui_shutdown",
+    "ws_disconnect",
+    "idle_timeout",
+    "lru_evict",
+}
+
+
+def is_automatic_end_reason(reason) -> bool:
+    """True when *reason* is an automatic-cleanup end stamp (see above).
+
+    Single owner of the "accidental vs deliberate end" predicate — every
+    compression-liveness site must call this instead of re-implementing the
+    reason taxonomy (#88197, never-patch-predicates).
+    """
+    return isinstance(reason, str) and reason in _AUTOMATIC_END_REASONS
+
 
 def _legacy_reset_child_sql(alias: str, reasons_sql: str) -> str:
     """Pre-marker reset-continuation heuristic.
@@ -446,6 +472,7 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_message_items TEXT,
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
+    _compressed_summary INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
@@ -491,6 +518,23 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
 CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     session_key TEXT PRIMARY KEY,
     failure_streak INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-backend liveness heartbeat (#94895). Each serve / tui_gateway process
+-- registers a row at startup and refreshes ``last_heartbeat`` periodically.
+-- The startup orphan sweep (sessions.startup_orphan_reap) consults this
+-- table to avoid reaping rows whose owning backend is still alive but
+-- just idle (multi-backend state.db shared by isolated serve processes).
+-- A backend whose ``last_heartbeat`` is older than the heartbeat staleness
+-- window is treated as dead; rows without ANY matching heartbeat fall back
+-- to the original staleness predicate so legacy deployments keep working.
+CREATE TABLE IF NOT EXISTS gateway_heartbeats (
+    backend_id TEXT PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    started_at REAL NOT NULL,
+    last_heartbeat REAL NOT NULL,
+    profile TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS compression_locks (

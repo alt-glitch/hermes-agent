@@ -93,9 +93,15 @@ interface ModelCatalogMenuProps {
   /** Rows appended under the catalog (Refresh Models, Edit Models, …). */
   footer?: ReactNode
   gateway?: HermesGateway
+  /** Owner-routed RPC for catalog reads. Preferred over `gateway.request` so
+   *  a tile's menu queries the session owner's backend, not chrome's. */
+  request?: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   /** Render the virtual `moa` provider's presets as a selectable section.
    *  Off for override surfaces, where a MoA preset isn't a worker model. */
   includeMoa?: boolean
+  /** Registry source owning this catalog. Profile/session names are not unique
+   * across sources, so this participates in the React Query cache key. */
+  ownerConnectionId?: string
   profile?: string
   /** Session whose catalog to fetch. A live session's catalog can differ from
    *  the profile-global one, and the app invalidates the SESSION-scoped query
@@ -121,7 +127,9 @@ export function ModelCatalogMenu({
   footer,
   gateway,
   includeMoa = false,
+  ownerConnectionId,
   profile = 'default',
+  request,
   sessionId = null
 }: ModelCatalogMenuProps) {
   const { t } = useI18n()
@@ -137,11 +145,11 @@ export function ModelCatalogMenu({
   const visibleModels = useStore($visibleModels)
 
   const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, sessionId),
+    queryKey: modelOptionsQueryKey(profile, sessionId, ownerConnectionId),
     // Gateway-first even with no session: a connected (possibly remote)
     // gateway owns the model catalog, including virtual providers the local
     // REST fallback can't know about (#53817).
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, sessionId })
+    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, profile, request, sessionId })
   })
 
   const loading = modelOptions.isPending && !modelOptions.data
