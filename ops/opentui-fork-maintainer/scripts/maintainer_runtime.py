@@ -75,7 +75,9 @@ SHARED_VENV_PYTEST_PREFIX = [
     "-m",
     "pytest",
 ]
+VIDEO_PROVIDER = "nous"
 VIDEO_MODEL = "google/gemini-3.5-flash"
+VIDEO_BASE_URL = "https://inference-api.nousresearch.com/v1"
 VIDEO_TAIL_MS = 3_000
 TERMCTRL_READY_HOLD_SECONDS = 1.5
 TERMCTRL_MIN_ACTION_TIMELINE_MS = 1_000
@@ -2296,48 +2298,109 @@ def run_adversarial_review(
     }
 
 
-def _canonical_openrouter(value: Any) -> bool:
-    return str(value).rstrip("/") == "https://openrouter.ai/api/v1"
+def _canonical_nous(value: Any) -> bool:
+    return str(value).rstrip("/") == VIDEO_BASE_URL
 
 
 def _invoke_video_analyze_in_process(video_path: Path) -> str:
     try:
-        from agent.auxiliary_client import (
-            _resolve_task_provider_model,
-            resolve_vision_provider_client,
-        )
-        from tools.vision_tools import video_analyze_tool
+        from agent import auxiliary_client
+        from tools import vision_tools
     except ImportError as exc:
         raise ControlError("video_analyze callable is unavailable") from exc
-    provider, model, base_url, api_key, _api_mode = _resolve_task_provider_model(
-        "vision", model=VIDEO_MODEL
-    )
-    if (
-        provider != "openrouter"
-        or model != VIDEO_MODEL
-        or (base_url is not None and not _canonical_openrouter(base_url))
-    ):
-        raise ControlError(
-            "video_analyze is not configured for canonical OpenRouter Gemini 3.5 Flash"
+    vision_tools._load_auxiliary_client()
+    delegated_call = vision_tools.async_call_llm
+    if not callable(delegated_call):
+        raise ControlError("video_analyze auxiliary callable is unavailable")
+    effective_provider, client, final_model = (
+        auxiliary_client.resolve_vision_provider_client(
+            provider=VIDEO_PROVIDER,
+            model=VIDEO_MODEL,
+            base_url=VIDEO_BASE_URL,
+            api_key=None,
+            async_mode=True,
         )
-    effective_provider, client, final_model = resolve_vision_provider_client(
-        provider=provider,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        async_mode=True,
     )
     if (
         client is None
-        or effective_provider != "openrouter"
+        or effective_provider != VIDEO_PROVIDER
         or final_model != VIDEO_MODEL
-        or not _canonical_openrouter(getattr(client, "base_url", None))
+        or not _canonical_nous(getattr(client, "base_url", None))
     ):
-        raise ControlError("the canonical OpenRouter Gemini video route is unavailable")
-    raw = asyncio.run(video_analyze_tool(str(video_path), VIDEO_PROMPT, VIDEO_MODEL))
-    if not _canonical_openrouter(getattr(client, "base_url", None)):
-        raise ControlError("video analysis client route changed during verification")
-    return raw
+        raise ControlError("the canonical Nous Gemini video route is unavailable")
+
+    async def pinned_video_call(**kwargs: Any) -> Any:
+        route_info: dict[str, str] = {}
+        pinned = {
+            **kwargs,
+            "provider": VIDEO_PROVIDER,
+            "model": VIDEO_MODEL,
+            "base_url": VIDEO_BASE_URL,
+            "api_key": None,
+            "route_info": route_info,
+        }
+        response = await delegated_call(**pinned)
+        if route_info != {"provider": VIDEO_PROVIDER, "model": VIDEO_MODEL}:
+            raise ControlError("video analysis escaped the pinned Nous route")
+        return response
+
+    def no_provider_recovery(*_args: Any, **_kwargs: Any):
+        # A successful primary call never enters this generator. On failure,
+        # return the sentinel immediately so the original error is surfaced;
+        # model healing and cross-provider fallback would invalidate the gate.
+        if False:  # pragma: no cover - makes this a generator without yielding
+            yield None
+        return auxiliary_client._RERAISE_ORIGINAL
+
+    delegated_resolver = auxiliary_client._resolve_call_client
+
+    def pinned_call_resolver(task: str | None, *args: Any, **kwargs: Any):
+        """Pin and verify the concrete client used by ``async_call_llm``.
+
+        The preflight above proves the configured route is available, but the
+        auxiliary client resolves again for the actual request and may consult
+        a credential pool or cache. Guard that second seam so a custom Nous
+        endpoint cannot pass preflight and then receive the acceptance video.
+        """
+        if task != "vision":
+            raise ControlError("video analysis attempted a non-vision route")
+        pinned = {
+            **kwargs,
+            "provider": VIDEO_PROVIDER,
+            "model": VIDEO_MODEL,
+            "base_url": VIDEO_BASE_URL,
+            "api_key": None,
+            "resolved_provider": VIDEO_PROVIDER,
+            "resolved_model": VIDEO_MODEL,
+            "resolved_base_url": VIDEO_BASE_URL,
+            "resolved_api_key": None,
+        }
+        route = delegated_resolver(task, *args, **pinned)
+        if (
+            route.resolved_provider != VIDEO_PROVIDER
+            or route.effective_provider != VIDEO_PROVIDER
+            or route.final_model != VIDEO_MODEL
+            or not _canonical_nous(getattr(route.client, "base_url", None))
+        ):
+            raise ControlError("video analysis escaped the canonical Nous route")
+        return route
+
+    original_call = vision_tools.async_call_llm
+    original_recovery = auxiliary_client._start_recovery_ladder
+    original_resolver = auxiliary_client._resolve_call_client
+    vision_tools.async_call_llm = pinned_video_call
+    auxiliary_client._start_recovery_ladder = no_provider_recovery
+    auxiliary_client._resolve_call_client = pinned_call_resolver
+    try:
+        return asyncio.run(
+            vision_tools.video_analyze_tool(
+                str(video_path), VIDEO_PROMPT, VIDEO_MODEL
+            )
+        )
+    finally:
+        vision_tools.async_call_llm = original_call
+        auxiliary_client._start_recovery_ladder = original_recovery
+        auxiliary_client._resolve_call_client = original_resolver
 
 
 def _invoke_video_analyze(video_path: Path) -> str:
@@ -2433,7 +2496,7 @@ def verify_video_request(
     evidence_root: Path,
     termctrl_evidence: dict[str, Any],
 ) -> dict[str, Any]:
-    if value != {"provider": "openrouter", "model": VIDEO_MODEL}:
+    if value != {"provider": VIDEO_PROVIDER, "model": VIDEO_MODEL}:
         raise ControlError("video analysis used the wrong provider or model")
     video_path = _verified_file(
         termctrl_evidence, "video_path", "video_sha256", evidence_root
@@ -2456,8 +2519,9 @@ def verify_video_request(
     if not analysis.rstrip().endswith("VERDICT: PASS"):
         raise ControlError("video_analyze did not return a passing verdict")
     return {
-        "provider": "openrouter",
+        "provider": VIDEO_PROVIDER,
         "model": VIDEO_MODEL,
+        "base_url": VIDEO_BASE_URL,
         "video_path": str(video_path),
         "video_sha256": _file_sha256(video_path),
         "raw_output_path": str(raw_path),
@@ -2475,7 +2539,7 @@ def _validate_gate_packet_item(gate_id: str, item: Any) -> None:
     if gate_id == "video-analysis":
         if not isinstance(item, dict) or set(item) != {"id", "request"}:
             raise ControlError("video gate must contain an inline route request")
-        if item["request"] != {"provider": "openrouter", "model": VIDEO_MODEL}:
+        if item["request"] != {"provider": VIDEO_PROVIDER, "model": VIDEO_MODEL}:
             raise ControlError("video analysis used the wrong provider or model")
         return
     if gate_id == "adversarial-review":

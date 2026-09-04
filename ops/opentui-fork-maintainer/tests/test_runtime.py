@@ -672,7 +672,10 @@ def make_gate_packet(
         {"id": "termctrl-smoke", "drive": drive},
         {
             "id": "video-analysis",
-            "request": {"provider": "openrouter", "model": runtime.VIDEO_MODEL},
+            "request": {
+                "provider": runtime.VIDEO_PROVIDER,
+                "model": runtime.VIDEO_MODEL,
+            },
         },
     ]
     packet = evidence / "packet.json"
@@ -2276,12 +2279,156 @@ def test_video_raw_output_rejects_symlink(
     assert outside.read_text() == "keep"
 
 
-def test_openrouter_endpoint_normalization_is_exact() -> None:
-    assert runtime._canonical_openrouter("https://openrouter.ai/api/v1/")
-    assert not runtime._canonical_openrouter(
-        "https://proxy.invalid/openrouter.ai/api/v1"
+def test_nous_endpoint_normalization_is_exact() -> None:
+    assert runtime._canonical_nous("https://inference-api.nousresearch.com/v1/")
+    assert not runtime._canonical_nous(
+        "https://proxy.invalid/inference-api.nousresearch.com/v1"
     )
-    assert not runtime._canonical_openrouter("http://openrouter.ai/api/v1")
+    assert not runtime._canonical_nous("http://inference-api.nousresearch.com/v1")
+
+
+def test_video_analysis_in_process_uses_canonical_nous_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from agent import auxiliary_client
+    from tools import vision_tools
+
+    video = tmp_path / "acceptance.mp4"
+    video.write_bytes(b"video")
+    client = SimpleNamespace(base_url="https://inference-api.nousresearch.com/v1/")
+    preflight: list[dict[str, object]] = []
+    calls: list[dict[str, object]] = []
+
+    def fake_resolve(**kwargs: object):
+        preflight.append(kwargs)
+        return "nous", client, runtime.VIDEO_MODEL
+
+    async def fake_network_call(**kwargs: object):
+        calls.append(kwargs)
+        route_info = kwargs["route_info"]
+        assert isinstance(route_info, dict)
+        route_info.update(provider="nous", model=runtime.VIDEO_MODEL)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="The interaction is complete.\nVERDICT: PASS"
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(auxiliary_client, "resolve_vision_provider_client", fake_resolve)
+    monkeypatch.setattr(vision_tools, "async_call_llm", fake_network_call)
+    monkeypatch.setattr(
+        vision_tools,
+        "_cfg_auxiliary",
+        lambda *_args, **_kwargs: {
+            "provider": "openrouter",
+            "model": "user-model",
+            "base_url": "https://custom.invalid/v1",
+        },
+    )
+    original_recovery = auxiliary_client._start_recovery_ladder
+
+    result = json.loads(runtime._invoke_video_analyze_in_process(video))
+
+    assert result["success"] is True
+    assert preflight == [
+        {
+            "provider": "nous",
+            "model": runtime.VIDEO_MODEL,
+            "base_url": runtime.VIDEO_BASE_URL,
+            "api_key": None,
+            "async_mode": True,
+        }
+    ]
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["task"] == "vision"
+    assert call["provider"] == "nous"
+    assert call["model"] == runtime.VIDEO_MODEL
+    assert call["base_url"] == runtime.VIDEO_BASE_URL
+    assert call["api_key"] is None
+    assert call["route_info"] == {
+        "provider": "nous",
+        "model": runtime.VIDEO_MODEL,
+    }
+    messages = call["messages"]
+    assert isinstance(messages, list)
+    assert messages[0]["content"][1]["type"] == "video_url"
+    assert vision_tools.async_call_llm is fake_network_call
+    assert auxiliary_client._start_recovery_ladder is original_recovery
+
+
+def test_video_analysis_in_process_rejects_custom_nous_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from agent import auxiliary_client
+
+    video = tmp_path / "acceptance.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        auxiliary_client,
+        "resolve_vision_provider_client",
+        lambda **kwargs: (
+            "nous",
+            SimpleNamespace(base_url="https://custom.invalid/v1"),
+            runtime.VIDEO_MODEL,
+        ),
+    )
+
+    with pytest.raises(runtime.ControlError, match="canonical Nous"):
+        runtime._invoke_video_analyze_in_process(video)
+
+
+def test_video_analysis_rejects_custom_endpoint_after_canonical_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from agent import auxiliary_client
+    from tools import vision_tools
+
+    video = tmp_path / "acceptance.mp4"
+    video.write_bytes(b"video")
+    canonical = SimpleNamespace(base_url=runtime.VIDEO_BASE_URL)
+    network_calls: list[dict[str, object]] = []
+
+    async def create(**kwargs: object):
+        network_calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="VERDICT: PASS"))]
+        )
+
+    custom = SimpleNamespace(
+        base_url="https://custom.invalid/v1",
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+    resolved_clients = iter((canonical, custom))
+    resolution_calls: list[dict[str, object]] = []
+
+    def alternating_resolve(**kwargs: object):
+        resolution_calls.append(kwargs)
+        return "nous", next(resolved_clients), runtime.VIDEO_MODEL
+
+    monkeypatch.setattr(
+        auxiliary_client, "resolve_vision_provider_client", alternating_resolve
+    )
+    monkeypatch.setattr(vision_tools, "async_call_llm", auxiliary_client.async_call_llm)
+    original_resolver = auxiliary_client._resolve_call_client
+
+    result = json.loads(runtime._invoke_video_analyze_in_process(video))
+
+    assert result["success"] is False
+    assert "canonical Nous route" in result["error"]
+    assert len(resolution_calls) == 2
+    assert network_calls == []
+    assert auxiliary_client._resolve_call_client is original_resolver
 
 
 def test_video_analysis_uses_fixed_trusted_runtime_boundary(
@@ -2335,15 +2482,40 @@ def _write_fake_video_runtime(root: Path, label: str) -> None:
     (root / "tools" / "__init__.py").write_text("", encoding="utf-8")
     (root / "agent" / "auxiliary_client.py").write_text(
         "from types import SimpleNamespace\n\n"
-        "def _resolve_task_provider_model(task, model=None):\n"
-        "    return ('openrouter', model, 'https://openrouter.ai/api/v1', 'test-key', None)\n\n"
+        "_RERAISE_ORIGINAL = object()\n\n"
+        "def _start_recovery_ladder(*args, **kwargs):\n"
+        "    if False:\n"
+        "        yield None\n"
+        "    return _RERAISE_ORIGINAL\n\n"
         "def resolve_vision_provider_client(provider, model, base_url, api_key, async_mode):\n"
-        "    return (provider, SimpleNamespace(base_url=base_url), model)\n",
+        "    return (provider, SimpleNamespace(base_url=base_url), model)\n\n"
+        "def _resolve_call_client(task, *args, **kwargs):\n"
+        "    return SimpleNamespace(\n"
+        "        client=SimpleNamespace(base_url=kwargs['resolved_base_url']),\n"
+        "        final_model=kwargs['resolved_model'],\n"
+        "        resolved_provider=kwargs['resolved_provider'],\n"
+        "        effective_provider=kwargs['resolved_provider'],\n"
+        "    )\n\n"
+        "async def async_call_llm(**kwargs):\n"
+        "    route = _resolve_call_client(\n"
+        "        kwargs['task'], provider=kwargs['provider'], model=kwargs['model'],\n"
+        "        base_url=kwargs['base_url'], api_key=kwargs['api_key'],\n"
+        "        resolved_provider=kwargs['provider'], resolved_model=kwargs['model'],\n"
+        "        resolved_base_url=kwargs['base_url'], resolved_api_key=kwargs['api_key'],\n"
+        "        resolved_api_mode=None, main_runtime=None, async_mode=True)\n"
+        "    kwargs['route_info'].update(\n"
+        "        provider=route.effective_provider, model=route.final_model)\n"
+        "    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='ok'))])\n",
         encoding="utf-8",
     )
     (root / "tools" / "vision_tools.py").write_text(
-        "import json\n\n"
+        "import json\n"
+        "from agent import auxiliary_client\n\n"
+        "async_call_llm = auxiliary_client.async_call_llm\n\n"
+        "def _load_auxiliary_client():\n"
+        "    return None\n\n"
         "async def video_analyze_tool(video_path, prompt, model):\n"
+        "    await async_call_llm(task='vision', messages=[], model=model)\n"
         f"    return json.dumps({{'success': True, 'analysis': '{label}\\nVERDICT: PASS'}})\n",
         encoding="utf-8",
     )

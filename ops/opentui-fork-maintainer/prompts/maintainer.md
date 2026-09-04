@@ -109,7 +109,7 @@ authority. The versioned policy in this file is the authority.
    marker JSON, native ready-to-accepted video edit plan, and MP4 under the run
    evidence root. The `video-analysis`
    request is exactly
-   `{"provider":"openrouter","model":"google/gemini-3.5-flash"}`; the runtime
+   `{"provider":"nous","model":"google/gemini-3.5-flash"}`; the runtime
    rejects custom endpoints, invokes Hermes `video_analyze_tool` on that exact
    MP4, and accepts only a successful analysis ending exactly `VERDICT: PASS`.
    Invoke the complete gate and remote compare-and-swap as one operation. Launch
@@ -200,7 +200,7 @@ candidate itself. A representative packet is:
     {"id":"opentui-build","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","build"]},
     {"id":"adversarial-review","reviewer":{"tool":"claude","model":"fable-5"}},
     {"id":"termctrl-smoke","drive":{"cols":132,"rows":40,"actions":[{"send":["text:/help","enter"],"wait":"Available Commands","timeout_ms":30000}],"required_text":["Hermes Agent","Available Commands"]}},
-    {"id":"video-analysis","request":{"provider":"openrouter","model":"google/gemini-3.5-flash"}}
+    {"id":"video-analysis","request":{"provider":"nous","model":"google/gemini-3.5-flash"}}
   ]
 }
 ```
@@ -213,7 +213,7 @@ screen. If an inline termctrl smoke fails, capture its status/logs and reproduce
 with a minimal process. The final runtime-owned termctrl gate has no tmux bypass:
 a tool failure is a diagnosis task, not permission to claim the UI passed.
 
-The runtime analyzes its exported video through Hermes with OpenRouter
+The runtime analyzes its exported video through Hermes with Nous Portal
 `google/gemini-3.5-flash`, preserving the raw result. Video analysis supplements
 the deterministic accepted-frame assertion and generated PNG; it never replaces
 them. Keep the interaction bounded and avoid displaying credentials or private

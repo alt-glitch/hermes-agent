@@ -225,36 +225,6 @@ def test_cron_reasoning_pin_does_not_depend_on_global_agent_effort(tmp_path: Pat
     assert configure.cron_update(Path("/runtime"), tmp_path)["reasoning_effort"] == "medium"
 
 
-def test_configure_video_preserves_existing_yaml_and_pins_openrouter(
-    tmp_path: Path,
-) -> None:
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        "# keep me\n"
-        "agent:\n"
-        "  reasoning_effort: medium\n"
-        "auxiliary:\n"
-        "  vision:\n"
-        "    base_url: http://127.0.0.1:11434/v1\n"
-        "    api_key: should-not-survive\n",
-        encoding="utf-8",
-    )
-
-    configure.configure_video(config_path)
-
-    text = config_path.read_text(encoding="utf-8")
-    parsed = YAML(typ="safe").load(text)
-    assert "# keep me" in text
-    assert parsed["agent"]["reasoning_effort"] == "medium"
-    assert parsed["auxiliary"]["vision"]["provider"] == "openrouter"
-    assert parsed["auxiliary"]["vision"]["base_url"] == ""
-    assert parsed["auxiliary"]["vision"]["api_key"] == ""
-    assert parsed["auxiliary"]["video"] == {
-        "provider": "openrouter",
-        "model": "google/gemini-3.5-flash",
-    }
-
-
 def test_queue_backport_writes_strict_one_shot_request(tmp_path: Path) -> None:
     path = configure.queue_backport(tmp_path, ["ABCDEF1", "abcdef1", "1234567890ab"])
     assert json.loads(path.read_text()) == {
@@ -308,7 +278,24 @@ def test_apply_uses_supported_cron_api_after_deploy(
     (source / "scripts/sync_probe.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/maintainer_runtime.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/worktree.sh").write_text("#!/usr/bin/env bash\n")
-    _write_config(hermes_home / "config.yaml")
+    config_path = hermes_home / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "# user-owned auxiliary settings\n"
+        "agent:\n"
+        "  reasoning_effort: medium\n"
+        "auxiliary:\n"
+        "  vision:\n"
+        "    provider: custom\n"
+        "    model: local-vision\n"
+        "    base_url: http://127.0.0.1:11434/v1\n"
+        "    api_key: user-secret\n"
+        "  video:\n"
+        "    provider: openrouter\n"
+        "    model: user-video-model\n",
+        encoding="utf-8",
+    )
+    config_before = config_path.read_bytes()
 
     skill_sources = {}
     for name in configure.MAINTAINER_SKILL_SOURCES:
@@ -359,6 +346,7 @@ def test_apply_uses_supported_cron_api_after_deploy(
     assert (hermes_home / "scripts/opentui_fork_sync.py").is_file()
     assert (runtime / "scripts/sync_probe.py").is_file()
     assert (runtime / "scripts/worktree.sh").is_file()
+    assert config_path.read_bytes() == config_before
 
     # Exercise the scheduler's real containment boundary: the deployed cron
     # path must be accepted from HERMES_HOME/scripts rather than merely persist.
@@ -540,6 +528,7 @@ def test_policy_requires_real_fanout_evidence_and_green_ship_gate() -> None:
     assert "opus-4.8" in policy
     assert "Never use Haiku" in policy
     assert "video_analyze_tool" in policy
+    assert '{"provider":"nous","model":"google/gemini-3.5-flash"}' in policy
     assert "google/gemini-3.5-flash" in policy
     assert "termctrl-smoke" in policy
     assert "`drive` object" in policy

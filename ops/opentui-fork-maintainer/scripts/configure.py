@@ -2,9 +2,10 @@
 """Install and configure the production OpenTUI fork-maintainer cron.
 
 The default mode is a read-only plan. ``--apply`` deploys versioned assets,
-installs the three maintainer-specific skills, pins the existing cron through
-Hermes' supported cronjob API, and configures the auxiliary video model. It
-never reads or writes credential files.
+installs the three maintainer-specific skills, and pins the existing cron
+through Hermes' supported cronjob API. The deployed runtime pins its own video
+verifier route without changing the user's auxiliary settings or credential
+files.
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ SCHEDULE = "0 9,21 * * *"
 MODEL = "openai/gpt-5.6-sol"
 PROVIDER = "nous"
 REASONING_EFFORT = "medium"
-VIDEO_PROVIDER = "openrouter"
 VIDEO_MODEL = "google/gemini-3.5-flash"
 INACTIVITY_TIMEOUT_SECONDS = 18_000
 CRON_ENTRYPOINT_NAME = "opentui_fork_sync.py"
@@ -195,19 +195,6 @@ def require_installed_skills(hermes_home: Path) -> None:
         raise ConfigurationError(
             "required Hermes skill(s) are not installed: " + ", ".join(missing)
         )
-
-
-def configure_video(config_path: Path) -> None:
-    from utils import atomic_roundtrip_yaml_update
-
-    atomic_roundtrip_yaml_update(config_path, "auxiliary.vision.provider", VIDEO_PROVIDER)
-    # A stale per-task endpoint takes precedence over the named provider in
-    # auxiliary routing. Clear both endpoint axes so the OpenRouter provider
-    # resolves its canonical URL and credential source.
-    atomic_roundtrip_yaml_update(config_path, "auxiliary.vision.base_url", "")
-    atomic_roundtrip_yaml_update(config_path, "auxiliary.vision.api_key", "")
-    atomic_roundtrip_yaml_update(config_path, "auxiliary.video.provider", VIDEO_PROVIDER)
-    atomic_roundtrip_yaml_update(config_path, "auxiliary.video.model", VIDEO_MODEL)
 
 
 @contextmanager
@@ -635,7 +622,6 @@ def apply_configuration(
     normalized_backports = (
         _normalize_backports(backport_commits) if backport_commits else None
     )
-    config_path = hermes_home / "config.yaml"
     validate_sources(source_home)
     if cron_call is None:
         from cron.jobs import cron_store_transaction, get_job
@@ -662,7 +648,6 @@ def apply_configuration(
         hermes_home / "skills/software-development" / name
         for name in MAINTAINER_SKILL_SOURCES
     )
-    targets.append(config_path)
     request = runtime_home / "state/run-request.json"
     if normalized_backports:
         targets.append(request)
@@ -701,7 +686,7 @@ def apply_configuration(
                     _pause_cron_for_deployment(cron_call, cron_read_call)
                     with rollback_paths(targets):
                         # Stage and snapshot the one-shot request before touching
-                        # live assets/config. A catchable failure restores it.
+                        # live assets. A catchable failure restores it.
                         if normalized_backports:
                             _write_backport_request(request, normalized_backports)
                         deploy_assets(source_home, runtime_home)
@@ -711,8 +696,6 @@ def apply_configuration(
                         )
                         install_maintainer_skills(hermes_home)
                         require_installed_skills(hermes_home)
-                        configure_video(config_path)
-
                         intended_update = cron_update(runtime_home, hermes_home)
                         result = _cron_call_required(
                             cron_call,
