@@ -39,6 +39,7 @@ MODEL = "openai/gpt-5.6-sol"
 PROVIDER = "nous"
 VIDEO_PROVIDER = "openrouter"
 VIDEO_MODEL = "google/gemini-3.5-flash"
+INACTIVITY_TIMEOUT_SECONDS = 18_000
 CRON_ENTRYPOINT_NAME = "opentui_fork_sync.py"
 DEPLOYMENT_JOURNAL_NAME = "deployment.inflight.json"
 WORKDIR = Path("/home/daimon/side-quests/hermes-agent")
@@ -104,6 +105,7 @@ def cron_update(
         "model": MODEL,
         "provider": PROVIDER,
         "base_url": "",
+        "inactivity_timeout_seconds": INACTIVITY_TIMEOUT_SECONDS,
         # The supported cron API resolves relative scripts below
         # HERMES_HOME/scripts and rejects absolute paths at its boundary.
         "script": CRON_ENTRYPOINT_NAME,

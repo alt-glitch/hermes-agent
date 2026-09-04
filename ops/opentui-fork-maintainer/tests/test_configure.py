@@ -183,6 +183,7 @@ def test_cron_update_pins_runtime_and_resource_contract() -> None:
     assert update["schedule"] == "0 9,21 * * *"
     assert update["provider"] == "nous"
     assert update["model"] == "openai/gpt-5.6-sol"
+    assert update["inactivity_timeout_seconds"] == 18_000
     assert update["enabled_toolsets"] == [
         "terminal",
         "file",
