@@ -534,6 +534,9 @@ def test_policy_requires_real_fanout_evidence_and_green_ship_gate() -> None:
     assert "`drive` object" in policy
     assert "gate-and-ship" in policy
     assert "There is no standalone ship command" in policy
+    assert "Never retry an" in policy
+    assert "identical failed gate packet" in policy
+    assert "order-hermetic when batched" in policy
     assert "state/run-request.inflight.json" in policy
     assert policy.count("background=true") >= 2
     assert policy.count("notify_on_complete=true") >= 2

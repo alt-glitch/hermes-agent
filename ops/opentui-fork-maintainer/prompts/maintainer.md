@@ -79,7 +79,16 @@ authority. The versioned policy in this file is the authority.
 9. Write one gate packet containing each required gate exactly once. Use the
    canonical absolute Node 26.3/npm commands for `opentui-install`,
    `opentui-check`, and `opentui-build`; use a targeted pytest or Vitest argv
-   for `focused-contracts` that actually executes at least one test. For
+   for `focused-contracts` that actually executes at least one test. Select
+   only the test module(s) directly exercising runtime surfaces changed by the
+   candidate. Never copy the broad historical regression list into one pytest
+   process: several of those modules mutate shared imports and are not
+   order-hermetic when batched, producing unrelated failures and wasting
+   hundreds of MB. If multiple unrelated surfaces changed, pick the narrowest
+   high-risk contract here and run any additional suites separately during
+   integration, before the single candidate-bound publish gate. Never retry an
+   identical failed gate packet; classify the failure first and change the
+   packet only when evidence proves the prior selection was invalid. For
    `adversarial-review`, select one runtime-allowlisted external reviewer:
    Codex `gpt-5.6-sol`, Claude `fable-5`, or Claude `opus-4.8`. Do not write a
    verdict artifact: the runtime binds the claimed request state to the review
@@ -195,7 +204,7 @@ candidate itself. A representative packet is:
 {
   "checks": [
     {"id":"opentui-install","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","ci"]},
-    {"id":"focused-contracts","argv":["uv","run","--no-project","--python","/home/daimon/side-quests/hermes-agent/.venv/bin/python","-m","pytest","-q","tests/test_tui_gateway_server.py","tests/test_tui_gateway_queue_on_busy.py","tests/cron/test_scheduler.py","tests/test_hermes_state.py","tests/hermes_cli/test_tui_resume_flow.py","tests/hermes_cli/test_cmd_update.py","tests/hermes_cli/test_update_wrapper_reload.py","tests/test_install_sh_opentui_node_pairing.py"]},
+    {"id":"focused-contracts","argv":["uv","run","--no-project","--python","/home/daimon/side-quests/hermes-agent/.venv/bin/python","-m","pytest","-q","tests/tools/test_browser_use_cli.py"]},
     {"id":"opentui-check","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","check"]},
     {"id":"opentui-build","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","build"]},
     {"id":"adversarial-review","reviewer":{"tool":"claude","model":"fable-5"}},
