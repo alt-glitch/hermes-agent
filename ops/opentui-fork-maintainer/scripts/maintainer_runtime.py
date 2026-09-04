@@ -60,6 +60,15 @@ MAINTAINER_WORKTREE_ROOT = Path(
 )
 FORK_SOURCE_ROOT = Path("/home/daimon/side-quests/hermes-agent")
 FORK_VENV_PYTHON = FORK_SOURCE_ROOT / ".venv/bin/python"
+# Candidate construction and focused tests intentionally use the source
+# checkout above. The video verdict is different: it is part of the trusted
+# control plane and must execute against the last installed/published Hermes
+# runtime, never whichever mutable developer checkout happens to live at
+# ``FORK_SOURCE_ROOT``. Keeping these roots separate also prevents an old
+# source checkout from silently breaking the verifier after the managed
+# installation has already advanced.
+TRUSTED_HERMES_ROOT = Path("/home/daimon/.hermes/hermes-agent")
+TRUSTED_HERMES_PYTHON = TRUSTED_HERMES_ROOT / "venv/bin/python"
 CONTROLLED_PATH = f"{NODE26_DIR}:/usr/local/bin:/usr/bin:/bin"
 CANONICAL_CODE_GATES = {
     "opentui-install": [str(NPM26), "--prefix", "ui-opentui", "ci"],
@@ -2422,19 +2431,19 @@ def _invoke_video_analyze_in_process(video_path: Path) -> str:
 
 
 def _invoke_video_analyze(video_path: Path) -> str:
-    """Run Hermes video analysis through the dependency-complete fork venv.
+    """Run Hermes video analysis through the managed published installation.
 
     The control-plane script itself is a PEP 723 isolated program and therefore
     cannot import Hermes' optional inference dependencies. Keep that isolation:
-    launch the fixed fork interpreter in isolated mode, load this trusted runtime
-    by exact path, and import the verdict-producing Hermes code only from the
-    trusted deployed fork. The candidate contributes the hashed MP4, never judge code.
+    launch the managed-install interpreter in isolated mode, load this trusted
+    runtime by exact path, and import the verdict-producing Hermes code only from
+    the installed fork. The candidate contributes the hashed MP4, never judge code.
     """
     video_path = Path(os.path.abspath(video_path))
-    trusted_root = Path(os.path.abspath(FORK_SOURCE_ROOT))
+    trusted_root = Path(os.path.abspath(TRUSTED_HERMES_ROOT))
     runtime_path = Path(__file__).resolve()
-    if not FORK_VENV_PYTHON.is_file():
-        raise ControlError("dependency-complete fork Python is unavailable")
+    if not TRUSTED_HERMES_PYTHON.is_file():
+        raise ControlError("trusted installed Hermes Python is unavailable")
     if not trusted_root.is_dir() or trusted_root.is_symlink():
         raise ControlError(
             "trusted video analysis source root is unavailable or unsafe"
@@ -2466,13 +2475,13 @@ print("HERMES_VIDEO_RESULT_B64=" + encoded)
         "PYTHONPATH": str(trusted_root),
         "PYTHONSAFEPATH": "1",
         "HERMES_PYTHON_SRC_ROOT": str(trusted_root),
-        "HERMES_PYTHON": str(FORK_VENV_PYTHON),
+        "HERMES_PYTHON": str(TRUSTED_HERMES_PYTHON),
         "HERMES_CWD": str(trusted_root),
         "TERMINAL_CWD": str(trusted_root),
     }
     env.pop("PYTHONHOME", None)
     argv = [
-        str(FORK_VENV_PYTHON),
+        str(TRUSTED_HERMES_PYTHON),
         "-I",
         "-c",
         helper,

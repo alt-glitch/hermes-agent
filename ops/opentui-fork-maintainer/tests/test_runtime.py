@@ -2575,8 +2575,8 @@ def test_video_analysis_uses_fixed_trusted_runtime_boundary(
         calls.append((argv, kwargs))
         return subprocess.CompletedProcess(argv, 0, framed, b"diagnostic")
 
-    monkeypatch.setattr(runtime, "FORK_SOURCE_ROOT", trusted)
-    monkeypatch.setattr(runtime, "FORK_VENV_PYTHON", python)
+    monkeypatch.setattr(runtime, "TRUSTED_HERMES_ROOT", trusted)
+    monkeypatch.setattr(runtime, "TRUSTED_HERMES_PYTHON", python)
     monkeypatch.setattr(runtime.subprocess, "run", fake_run)
 
     assert runtime._invoke_video_analyze(video) == expected
@@ -2596,6 +2596,15 @@ def test_video_analysis_uses_fixed_trusted_runtime_boundary(
     assert env["HERMES_CWD"] == str(trusted)
     assert env["TERMINAL_CWD"] == str(trusted)
     assert "PYTHONHOME" not in env
+
+
+def test_video_analysis_default_runtime_is_managed_install() -> None:
+    assert runtime.TRUSTED_HERMES_ROOT == Path.home() / ".hermes/hermes-agent"
+    assert runtime.TRUSTED_HERMES_ROOT != runtime.FORK_SOURCE_ROOT
+    assert (
+        runtime.TRUSTED_HERMES_PYTHON
+        == runtime.TRUSTED_HERMES_ROOT / "venv/bin/python"
+    )
 
 
 def _write_fake_video_runtime(root: Path, label: str) -> None:
@@ -2653,8 +2662,8 @@ def test_video_analysis_real_isolated_process_ignores_malicious_candidate_path(
     _write_fake_video_runtime(malicious, "malicious")
     video = tmp_path / "acceptance.mp4"
     video.write_bytes(b"video")
-    monkeypatch.setattr(runtime, "FORK_SOURCE_ROOT", trusted)
-    monkeypatch.setattr(runtime, "FORK_VENV_PYTHON", Path(sys.executable))
+    monkeypatch.setattr(runtime, "TRUSTED_HERMES_ROOT", trusted)
+    monkeypatch.setattr(runtime, "TRUSTED_HERMES_PYTHON", Path(sys.executable))
     monkeypatch.setenv("PYTHONPATH", str(malicious))
     monkeypatch.chdir(malicious)
 
@@ -2671,7 +2680,10 @@ def test_video_analysis_rejects_missing_result_frame(
     python.write_text("")
     video = tmp_path / "acceptance.mp4"
     video.write_bytes(b"video")
-    monkeypatch.setattr(runtime, "FORK_VENV_PYTHON", python)
+    trusted = tmp_path / "trusted-fork"
+    trusted.mkdir()
+    monkeypatch.setattr(runtime, "TRUSTED_HERMES_ROOT", trusted)
+    monkeypatch.setattr(runtime, "TRUSTED_HERMES_PYTHON", python)
     monkeypatch.setattr(
         runtime.subprocess,
         "run",
