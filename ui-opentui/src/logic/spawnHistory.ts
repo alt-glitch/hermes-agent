@@ -100,6 +100,7 @@ const FIELD_ALIASES = new Map<string, string>([
   ['apiCalls', 'api_calls'],
   ['childSessionId', 'child_session_id'],
   ['costUsd', 'cost_usd'],
+  ['delegationId', 'delegation_id'],
   ['durationSeconds', 'duration_seconds'],
   ['filesRead', 'files_read'],
   ['filesWritten', 'files_written'],

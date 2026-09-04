@@ -14,6 +14,7 @@ import { describe, expect, test } from 'vitest'
 
 import { installTerminalChrome, type TerminalChromeSeam } from '../boundary/termChrome.ts'
 import { createSessionStore } from '../logic/store.ts'
+import { bellOnPromptFromConfig } from '../logic/details.ts'
 import {
   notifyEnabled,
   promptNotification,
@@ -57,14 +58,15 @@ describe('sanitizeOscText — escape-splice safety', () => {
 describe('installTerminalChrome — native triggerNotification transport', () => {
   /** A minimal fake renderer matching the RendererSeam the boundary casts to.
    *  Records triggerNotification calls and lets a test fire focus/blur. */
-  function fakeRenderer() {
+  function fakeRenderer(isTTY = false) {
     const calls: Array<{ message: string; title: string | undefined }> = []
+    const writes: string[] = []
     let focusCb: (() => void) | undefined
     let blurCb: (() => void) | undefined
     const renderer = {
       isDestroyed: false,
       setTerminalTitle: () => {},
-      writeOut: () => {},
+      writeOut: (chunk: string) => writes.push(chunk),
       triggerNotification: (message: string, title?: string) => {
         calls.push({ message, title })
         return true
@@ -82,7 +84,8 @@ describe('installTerminalChrome — native triggerNotification transport', () =>
       fireBlur: () => blurCb?.(),
       fireFocus: () => focusCb?.(),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      seam: installTerminalChrome(renderer as any)
+      seam: installTerminalChrome(renderer as any, { isTTY }),
+      writes
     }
   }
 
@@ -120,6 +123,18 @@ describe('installTerminalChrome — native triggerNotification transport', () =>
     seam.notify({ title: 'Hermes', body: 'b' })
     expect(calls).toEqual([{ message: 'b', title: 'Hermes' }])
   })
+
+  test('bell writes BEL through the renderer only for an interactive stdout', () => {
+    const interactive = fakeRenderer(true)
+    interactive.writes.length = 0 // discard title-stack setup
+    interactive.seam.bell()
+    expect(interactive.writes).toEqual([BEL])
+
+    const piped = fakeRenderer(false)
+    piped.writes.length = 0
+    piped.seam.bell()
+    expect(piped.writes).toEqual([])
+  })
 })
 
 describe('promptNotification + env gate', () => {
@@ -139,6 +154,14 @@ describe('promptNotification + env gate', () => {
     expect(notifyEnabled({ HERMES_TUI_NOTIFY: 'false' })).toBe(false)
     expect(notifyEnabled({ HERMES_TUI_NOTIFY: 'off' })).toBe(false)
   })
+
+  test('display.bell_on_prompt is boolean-true-only and defaults off', () => {
+    expect(bellOnPromptFromConfig({ display: { bell_on_prompt: true } })).toBe(true)
+    expect(bellOnPromptFromConfig({ display: { bell_on_prompt: false } })).toBe(false)
+    expect(bellOnPromptFromConfig({ display: { bell_on_prompt: 'true' } })).toBe(false)
+    expect(bellOnPromptFromConfig({})).toBe(false)
+    expect(bellOnPromptFromConfig(undefined)).toBe(false)
+  })
 })
 
 describe('<TerminalChrome> wiring — store edges drive the seam', () => {
@@ -146,15 +169,17 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
     const store = createSessionStore()
     const titles: Array<string | undefined> = []
     const notifications: string[] = []
+    const bells: string[] = []
     const seam: TerminalChromeSeam = {
-      setTitle: t => titles.push(t),
-      notify: n => notifications.push(n.body ?? n.title)
+      bell: () => void bells.push(BEL),
+      notify: n => notifications.push(n.body ?? n.title),
+      setTitle: t => titles.push(t)
     }
     const dispose = createRoot(d => {
       TerminalChrome({ chrome: seam, store })
       return d
     })
-    return { dispose, notifications, store, titles }
+    return { bells, dispose, notifications, store, titles }
   }
 
   test('sets the generic title immediately, then tracks session.info title', () => {
@@ -197,6 +222,31 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
       // clearing the prompt does not notify again
       store.clearPrompt()
       expect(notifications).toEqual(['needs an answer to continue'])
+    } finally {
+      dispose()
+    }
+  })
+
+  test('enabled prompt bell rings exactly once for each newly opened blocker', () => {
+    const { bells, dispose, store } = mount()
+    try {
+      store.setBellOnPrompt(true)
+      store.apply({
+        type: 'clarify.request',
+        payload: { choices: null, question: 'first?', request_id: 'r1' }
+      })
+      expect(bells).toEqual([BEL])
+
+      // Unrelated reactive work while the same prompt remains open cannot ring again.
+      store.apply({ type: 'session.info', payload: { title: 'still blocked' } })
+      expect(bells).toEqual([BEL])
+
+      store.clearPrompt()
+      store.apply({
+        type: 'secret.request',
+        payload: { env_var: 'TOKEN', prompt: 'token?', request_id: 'r2' }
+      })
+      expect(bells).toEqual([BEL, BEL])
     } finally {
       dispose()
     }

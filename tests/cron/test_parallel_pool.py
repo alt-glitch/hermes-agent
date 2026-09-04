@@ -187,7 +187,7 @@ class TestRunningJobGuard:
             if job_id == "healthy-job"
             else None,
         )
-        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: {})
         monkeypatch.setattr(sched, "heartbeat_fire_claim", lambda *_a, **_kw: True)
 
         n = sched.tick(verbose=False)
@@ -466,7 +466,7 @@ class TestTickDurableDispatch:
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: {})
         monkeypatch.setattr(sched, "finish_execution", lambda *_a, **_kw: None)
 
         n = sched.tick(verbose=False)

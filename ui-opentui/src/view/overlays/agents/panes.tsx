@@ -12,6 +12,7 @@ import {
   type SubagentAggregate,
   type SubagentNode
 } from '../../../logic/subagentTree.ts'
+import { delegationTaskPrefix } from '../../../logic/delegationLabels.ts'
 import type { Theme } from '../../../logic/theme.ts'
 import { truncRight } from '../../../logic/truncate.ts'
 import { useTheme } from '../../theme.tsx'
@@ -75,6 +76,9 @@ export function AgentListRow(props: {
     return bucket >= 2 ? palette[bucket] : undefined
   })
   const line = createMemo(() => props.node.item.tools?.at(-1) ?? props.node.item.lastTool)
+  const taskPrefix = createMemo(() =>
+    delegationTaskPrefix(props.node.item.delegationId, props.node.item.index, props.node.item.taskCount)
+  )
   const toolShort = createMemo(() => {
     const value = line()
     if (!value) return ''
@@ -102,7 +106,7 @@ export function AgentListRow(props: {
       <Show when={heat()}>{color => <span style={{ fg: color() }}>▍</span>}</Show>
       <span style={{ fg: props.active ? theme().color.accent : visual().color }}>{visual().glyph} </span>
       <span style={{ fg: props.active ? theme().color.accent : theme().color.text }}>
-        {truncRight(props.node.item.goal || 'subagent', goalBudget())}
+        {truncRight(`${taskPrefix()}${props.node.item.goal || 'subagent'}`, goalBudget())}
       </span>
       <span style={{ fg: props.active ? theme().color.accent : theme().color.muted }}>
         {tools()}

@@ -36,7 +36,8 @@ JOB_ID = "c57fe4db4d43"
 JOB_NAME = "opentui-fork-sync"
 SCHEDULE = "0 9,21 * * *"
 MODEL = "openai/gpt-5.6-sol"
-PROVIDER = "openrouter"
+PROVIDER = "nous"
+VIDEO_PROVIDER = "openrouter"
 VIDEO_MODEL = "google/gemini-3.5-flash"
 CRON_ENTRYPOINT_NAME = "opentui_fork_sync.py"
 DEPLOYMENT_JOURNAL_NAME = "deployment.inflight.json"
@@ -207,13 +208,13 @@ def require_installed_skills(hermes_home: Path) -> None:
 def configure_video(config_path: Path) -> None:
     from utils import atomic_roundtrip_yaml_update
 
-    atomic_roundtrip_yaml_update(config_path, "auxiliary.vision.provider", PROVIDER)
+    atomic_roundtrip_yaml_update(config_path, "auxiliary.vision.provider", VIDEO_PROVIDER)
     # A stale per-task endpoint takes precedence over the named provider in
     # auxiliary routing. Clear both endpoint axes so the OpenRouter provider
     # resolves its canonical URL and credential source.
     atomic_roundtrip_yaml_update(config_path, "auxiliary.vision.base_url", "")
     atomic_roundtrip_yaml_update(config_path, "auxiliary.vision.api_key", "")
-    atomic_roundtrip_yaml_update(config_path, "auxiliary.video.provider", PROVIDER)
+    atomic_roundtrip_yaml_update(config_path, "auxiliary.video.provider", VIDEO_PROVIDER)
     atomic_roundtrip_yaml_update(config_path, "auxiliary.video.model", VIDEO_MODEL)
 
 

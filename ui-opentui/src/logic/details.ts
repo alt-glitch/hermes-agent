@@ -51,6 +51,7 @@ export interface DetailsConfig {
 }
 
 const DetailsDisplayConfigSchema = Schema.Struct({
+  bell_on_prompt: Schema.optionalKey(Schema.Unknown),
   details_mode: Schema.optionalKey(Schema.Unknown),
   focus_view: Schema.optionalKey(Schema.Unknown),
   timestamps: Schema.optionalKey(Schema.Unknown),
@@ -72,6 +73,13 @@ export function compactFromConfig(config: unknown): boolean {
 export function focusViewFromConfig(config: unknown): boolean {
   const decoded = decodeDetailsRootConfig(config)
   return Option.isSome(decoded) && Boolean(decoded.value.display?.focus_view)
+}
+
+/** Decode Ink's opt-in audible alert for a newly opened blocking prompt.
+ * Boolean-true-only avoids treating malformed string values as enabled. */
+export function bellOnPromptFromConfig(config: unknown): boolean {
+  const decoded = decodeDetailsRootConfig(config)
+  return Option.isSome(decoded) && decoded.value.display?.bell_on_prompt === true
 }
 
 /** Decode the persisted `display.timestamps` flag from `config.get full`

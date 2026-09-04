@@ -60,6 +60,11 @@ describe('session-store replacement boundary', () => {
       title: 'Old title',
       usage: { compressions: 3, context_percent: 50, context_used: 100, cost_usd: 1.25 }
     })
+    store.apply({
+      type: 'todo.updated',
+      session_id: 'old-live',
+      payload: { revision: 8, todos: [{ id: 'old', content: 'old plan', status: 'pending' }] }
+    })
 
     const before = Date.now()
     store.adoptFreshSession('new-live', { cwd: '/new', model: 'new-model' })
@@ -77,6 +82,7 @@ describe('session-store replacement boundary', () => {
     expect(store.state.sessionId).toBe('new-live')
     expect(store.state.resumeId).toBe('new-live')
     expect(store.state.messages).toEqual([])
+    expect(store.state.latestTodos).toBeUndefined()
     expect(store.state.composerDraft).toBe('')
     expect(store.state.queuedPrompts).toEqual([])
     expect(store.state.pager).toBeUndefined()

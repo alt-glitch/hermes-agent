@@ -1007,6 +1007,16 @@ def _(rid, params: dict) -> dict:
             # Store unavailable: failing the RPC is the only user-visible
             # signal — same principle as the disk-full path above (#98924).
             # _db_error carries the SessionDB open failure for the toast.
+            # Admission has already marked this session running and created an
+            # in-flight snapshot. Roll the whole pending-input lifecycle back
+            # before returning the synchronous error; otherwise every later
+            # submit is misclassified as a busy/queued turn even after storage
+            # recovers.
+            # _try_mcp_turn_admission still owns history_lock here.
+            session["running"] = False
+            session["last_active"] = time.time()
+            _settle_pending_input_ids_locked(session, client_submission_ids)
+            _clear_inflight_turn(session)
             return _err(
                 rid,
                 5072,
@@ -1036,7 +1046,18 @@ def _(rid, params: dict) -> dict:
             5071,
             f"session storage could not be written: {exc}",
         )
-    _start_agent_build(sid, session)
+    # A completed FAILED build must not wedge the session: the error frame
+    # says retryable, so a new send (or the error card's Retry) rebuilds the
+    # agent with fresh provider resolution instead of replaying the cached
+    # failure forever. Before this, only a model switch reset the failed
+    # generation — a session that failed once (local server off) kept
+    # erroring after the server came back, while new sessions worked. Falls
+    # through to the normal build when there is no completed failure to
+    # clear.
+    if not _restart_completed_failed_agent_build(
+        sid, session, session.get("agent_ready")
+    ):
+        _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:
         # Patient wait (#63078): the user's message is already the accepted

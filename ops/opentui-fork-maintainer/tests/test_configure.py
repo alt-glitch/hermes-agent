@@ -181,7 +181,7 @@ def test_cron_update_pins_runtime_and_resource_contract() -> None:
     assert update["action"] == "update"
     assert update["job_id"] == "c57fe4db4d43"
     assert update["schedule"] == "0 9,21 * * *"
-    assert update["provider"] == "openrouter"
+    assert update["provider"] == "nous"
     assert update["model"] == "openai/gpt-5.6-sol"
     assert update["enabled_toolsets"] == [
         "terminal",

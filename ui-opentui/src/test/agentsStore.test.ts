@@ -23,6 +23,7 @@ describe('Agents gateway schemas', () => {
       type: 'subagent.complete',
       session_id: 'sid-1',
       payload: {
+        delegation_id: 'deleg_batch_a',
         api_calls: 4,
         child_session_id: 'child-1',
         cost_usd: 0.25,
@@ -57,6 +58,7 @@ describe('Agents gateway schemas', () => {
       expect(decoded.value.payload).toMatchObject({
         api_calls: 4,
         child_session_id: 'child-1',
+        delegation_id: 'deleg_batch_a',
         cost_usd: 0.25,
         duration_seconds: 8.5,
         subagent_id: 'a1',
@@ -89,6 +91,7 @@ describe('Agents live reducer', () => {
         child_session_id: 'child-1',
         cost_usd: 0.25,
         depth: 2,
+        delegation_id: 'deleg_batch_a',
         duration_seconds: 8.5,
         files_read: ['a.ts'],
         files_written: ['b.ts'],
@@ -117,6 +120,7 @@ describe('Agents live reducer', () => {
     expect(store.state.subagents[0]).toEqual(
       expect.objectContaining({
         apiCalls: 4,
+        delegationId: 'deleg_batch_a',
         childSessionId: 'child-1',
         costUsd: 0.25,
         depth: 2,

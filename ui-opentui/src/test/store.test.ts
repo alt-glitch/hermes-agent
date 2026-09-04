@@ -1810,20 +1810,22 @@ describe('session store — rolling message cap (bounds the Yoga node high-water
 describe('session store — todo panel snapshot + draft + /new info reset', () => {
   const todoComplete = (
     todos: Array<{ id: string; parent?: string; content: string; status: string }>,
-    summary?: Record<string, number>
+    summary?: Record<string, number>,
+    name = 'todo',
+    revision = 0
   ) =>
     ({
       type: 'tool.complete',
       payload: {
         tool_id: 't1',
-        name: 'todo',
+        name,
         args: { todos },
-        result: { todos, ...(summary ? { summary } : {}) },
+        result: { todos, revision, ...(summary ? { summary } : {}) },
         duration_s: 0
       }
     }) as never
 
-  test('captures latestTodos from a todo tool.complete (result.todos)', () => {
+  test('captures latestTodos from a todo_list tool.complete (result.todos)', () => {
     const store = createSessionStore()
     store.apply(
       todoComplete(
@@ -1832,7 +1834,9 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
           { id: '1', content: 'b', status: 'in_progress' },
           { id: '2', content: 'c', status: 'pending' }
         ],
-        { completed: 1, in_progress: 1, pending: 1, cancelled: 0 }
+        { completed: 1, in_progress: 1, pending: 1, cancelled: 0 },
+        'todo_list',
+        2
       )
     )
     const snap = store.state.latestTodos
@@ -1841,14 +1845,38 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     // list order is preserved (priority) — never re-sorted
     expect(snap?.todos.map(t => t.content)).toEqual(['a', 'b', 'c'])
     expect(snap?.counts).toEqual({ total: 3, completed: 1, in_progress: 1, pending: 1, cancelled: 0 })
+    expect(snap?.revision).toBe(2)
   })
 
-  test('a malformed/empty todo call does not clobber a good prior snapshot', () => {
+  test('authoritative revisions reject stale state and accept a nonzero empty clear', () => {
     const store = createSessionStore()
-    store.apply(todoComplete([{ id: '0', content: 'keep', status: 'pending' }]))
-    expect(store.state.latestTodos?.todos).toHaveLength(1)
-    store.apply(todoComplete([]))
-    expect(store.state.latestTodos?.todos).toEqual([{ content: 'keep', id: '0', status: 'pending' }])
+    store.apply({
+      type: 'todo.updated',
+      session_id: 's1',
+      payload: { revision: 2, todos: [{ id: '0', content: 'keep', status: 'pending' }] }
+    })
+    store.apply({
+      type: 'todo.updated',
+      session_id: 's1',
+      payload: { revision: 1, todos: [{ id: 'stale', content: 'stale', status: 'completed' }] }
+    })
+    expect(store.state.latestTodos?.revision).toBe(2)
+    expect(store.state.latestTodos?.todos.map(todo => todo.id)).toEqual(['0'])
+
+    store.apply({ type: 'todo.updated', session_id: 's1', payload: { revision: 3, todos: [] } })
+    expect(store.state.latestTodos).toEqual({
+      revision: 3,
+      todos: [],
+      counts: { total: 0, completed: 0, in_progress: 0, pending: 0, cancelled: 0 }
+    })
+    store.apply(todoComplete([{ id: 'stale', content: 'stale', status: 'pending' }], undefined, 'todo_list', 2))
+    expect(store.state.latestTodos?.todos).toEqual([])
+  })
+
+  test('revision-zero empty state remains the legacy uninitialized sentinel', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'todo.updated', payload: { revision: 0, todos: [] } })
+    expect(store.state.latestTodos).toBeUndefined()
   })
 
   test('captures trimmed id/parent and degrades self-parenting to a root', () => {

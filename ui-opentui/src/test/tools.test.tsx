@@ -20,6 +20,7 @@ import { ThemeProvider } from '../view/theme.tsx'
 import { toolNameStyle } from '../view/toolPart.tsx'
 import { BashToolBody, commandFitsHeader, commandOf } from '../view/tools/bashTool.tsx'
 import { diffOutputPlan, FileToolBody } from '../view/tools/fileTool.tsx'
+import { glyphFor, rendererFor } from '../view/tools/registry.tsx'
 import { todoRenderer, todosOf } from '../view/tools/todoTool.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
@@ -61,6 +62,11 @@ describe('todo tool nested rendering', () => {
       '☐ cycle a',
       '☐ cycle b'
     ])
+  })
+
+  test('todo_list resolves to the todo renderer and glyph', () => {
+    expect(rendererFor('todo_list')).toBe(todoRenderer)
+    expect(glyphFor('todo_list')).toBe('☰')
   })
 })
 

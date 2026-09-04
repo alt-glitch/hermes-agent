@@ -486,8 +486,13 @@ describe('parseSlash', () => {
     expect(parseSlash('/HELP')).toEqual({ name: 'help', arg: '' })
     expect(parseSlash('/model   anthropic/claude\tfast')).toEqual({
       name: 'model',
-      arg: 'anthropic/claude fast'
+      arg: 'anthropic/claude\tfast'
     })
+    expect(parseSlash('/queue first line\n  second line\n\tthird line')).toEqual({
+      name: 'queue',
+      arg: 'first line\n  second line\n\tthird line'
+    })
+    expect(parseSlash('/goal ship   it')).toEqual({ name: 'goal', arg: 'ship   it' })
     // Ink does not silently reinterpret whitespace immediately after `/` as a
     // local command name; preserve that distinction for the server fallback.
     expect(parseSlash('/ help')).toEqual({ name: '', arg: 'help' })

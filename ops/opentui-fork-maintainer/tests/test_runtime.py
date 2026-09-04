@@ -1903,6 +1903,141 @@ def test_finalize_success_retries_after_cleanup_before_outcome(
     assert not (state / "run.lease.json").exists()
 
 
+def test_reconcile_finalizes_exact_published_candidate_after_manifest_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="opentui-maint-changed-manifest"
+    )
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = state / "runs" / "test-run"
+    evidence.mkdir(parents=True)
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    journal_path = state / "publish-journal.json"
+    journal = json.loads(journal_path.read_text())
+    journal.update({"phase": "finalizing", "finalizing_unix": 1})
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    manifest_path.write_text('{"changed": true}\n', encoding="utf-8")
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease.update({"expires_unix": 1, "max_expires_unix": 1})
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    with pytest.raises(
+        runtime.ControlError, match="publish journal manifest evidence changed"
+    ):
+        runtime._load_publish_journal(state)
+
+    result = runtime.reconcile_run(
+        state, evidence, token="test-token", allow_expired=True
+    )
+
+    assert result["status"] == "success"
+    assert result["candidate_sha"] == candidate
+    assert result["manifest_evidence_status"] == "changed-after-publication"
+    assert remote_sha(repo) == candidate
+    assert not gate_worktree.exists()
+    assert not (state / "run.lease.json").exists()
+    assert not (state / "run-request.inflight.json").exists()
+    assert (evidence / "request.consumed.json").exists()
+    finalized = runtime._load_publish_journal(
+        state, require_manifest_evidence=False
+    )
+    assert finalized is not None
+    assert finalized["phase"] == "finalized"
+    assert finalized["manifest_sha256"] != runtime._file_sha256(manifest_path)
+    assert finalized["manifest_evidence_status"] == "changed-after-publication"
+    outcome = json.loads((state / "last-run.json").read_text())
+    assert outcome["published"] is True
+    assert outcome["manifest_evidence_status"] == "changed-after-publication"
+
+    # The stale manifest remains untrusted, but its terminal journal cannot
+    # prevent a separately gated, newer candidate from publishing.
+    (repo / "file").write_text("next candidate\n", encoding="utf-8")
+    git(repo, "commit", "-am", "next candidate")
+    next_candidate = git(repo, "rev-parse", "HEAD")
+    next_worktree = tmp_path / "opentui-maint-next-candidate"
+    git(repo, "worktree", "add", "--detach", str(next_worktree), next_candidate)
+    write_live_lease(state)
+    next_evidence = tmp_path / "next-evidence"
+    claim_backport(state, next_evidence, candidate, next_candidate)
+    next_packet, _ = make_gate_packet(
+        next_evidence,
+        next_worktree,
+        candidate,
+        next_candidate,
+    )
+    install_success_mocks(monkeypatch)
+    runtime.gate_and_ship(
+        repo,
+        next_packet,
+        next_evidence / "gate.json",
+        state_dir=state,
+        cwd=next_worktree,
+        base_sha=candidate,
+        candidate_sha=next_candidate,
+        token="test-token",
+    )
+    assert remote_sha(repo) == next_candidate
+
+
+def test_changed_manifest_cannot_finalize_without_exact_remote_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="opentui-maint-remote-mismatch"
+    )
+    state = tmp_path / "state"
+    write_live_lease(state)
+    evidence = tmp_path / "evidence"
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    journal_path = state / "publish-journal.json"
+    journal = json.loads(journal_path.read_text())
+    journal.update({"phase": "finalizing", "finalizing_unix": 1})
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    manifest_path.write_text('{"changed": true}\n', encoding="utf-8")
+    git(repo, "push", "--force", "origin", f"{base}:refs/heads/sid/opentui")
+
+    with pytest.raises(
+        runtime.ControlError,
+        match="publication outcome is indeterminate; request preserved",
+    ):
+        runtime.reconcile_run(state, evidence, token="test-token")
+
+    assert remote_sha(repo) == base
+    assert gate_worktree.exists()
+    assert (state / "run.lease.json").exists()
+    assert (state / "run-request.inflight.json").exists()
+    assert not (evidence / "success-finalization.json").exists()
+
+
 def test_video_raw_output_rejects_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

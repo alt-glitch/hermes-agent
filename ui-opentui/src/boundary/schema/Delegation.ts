@@ -44,6 +44,7 @@ export const SpawnTreeSubagentSchema = Schema.StructWithRest(
     api_calls: opt(NonNegativeInt),
     child_session_id: opt(Str),
     cost_usd: opt(Num),
+    delegation_id: opt(Str),
     depth: opt(NonNegativeInt),
     duration_seconds: opt(Num),
     files_read: opt(Schema.Array(Str)),
@@ -81,6 +82,7 @@ export type SpawnTreeSubagent = typeof SpawnTreeSubagentSchema.Type
 /** Exact projection returned by `list_active_subagents()`. */
 export const ActiveDelegationSubagentSchema = Schema.StructWithRest(
   Schema.Struct({
+    delegation_id: opt(Str),
     depth: NonNegativeInt,
     goal: Str,
     last_tool: opt(Str),

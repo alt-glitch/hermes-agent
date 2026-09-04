@@ -1,6 +1,8 @@
 /** Effect 4 decode boundaries for the unified live-session orchestrator RPCs. */
 import { Option, Schema } from 'effect'
 
+import { TodoStateSchema } from './TodoState.ts'
+
 const Str = Schema.String
 const Num = Schema.Number
 const Bool = Schema.Boolean
@@ -63,7 +65,8 @@ export const LiveSessionSnapshotSchema = Schema.StructWithRest(
     session_id: Str,
     session_key: opt(Str),
     started_at: opt(Num),
-    status: opt(LiveSessionStatusSchema)
+    status: opt(LiveSessionStatusSchema),
+    todo_state: opt(TodoStateSchema)
   }),
   [UnknownFields]
 )

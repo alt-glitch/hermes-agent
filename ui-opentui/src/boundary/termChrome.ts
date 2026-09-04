@@ -38,6 +38,7 @@ import {
   windowTitleFor
 } from '../logic/termChrome.ts'
 import { getLog } from './log.ts'
+const BEL = '\u0007'
 
 /** What the view layer needs from the chrome seam (DI-friendly for tests). */
 export interface TerminalChromeSeam {
@@ -45,6 +46,8 @@ export interface TerminalChromeSeam {
   readonly setTitle: (sessionTitle: string | undefined) => void
   /** Announce "waiting on you" to the hosting terminal (no-op while focused). */
   readonly notify: (notification: TermNotification) => void
+  /** Ring the terminal bell; no-op when stdout is not interactive. */
+  readonly bell: () => void
 }
 
 /** The renderer surface the seam writes through (runtime-verified shapes). */
@@ -60,7 +63,10 @@ interface RendererSeam {
 
 /** Install the chrome seam on a live renderer. Idempotent per renderer use —
  *  the entry calls it once, right next to the render bridge. */
-export function installTerminalChrome(renderer: CliRenderer): TerminalChromeSeam {
+export function installTerminalChrome(
+  renderer: CliRenderer,
+  output: Pick<NodeJS.WriteStream, 'isTTY'> = process.stdout
+): TerminalChromeSeam {
   const seam = renderer as unknown as RendererSeam
   const notificationsOn = notifyEnabled()
 
@@ -84,6 +90,9 @@ export function installTerminalChrome(renderer: CliRenderer): TerminalChromeSeam
 
   let lastTitle = ''
   return {
+    bell: () => {
+      if (output.isTTY) writeRaw(seam, BEL)
+    },
     setTitle: sessionTitle => {
       const title = windowTitleFor(sessionTitle)
       if (title === lastTitle) return

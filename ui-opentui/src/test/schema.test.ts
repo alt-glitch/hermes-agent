@@ -20,6 +20,31 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
+  test('decodes authoritative todo.updated state and rejects invalid revisions', () => {
+    const event = decode({
+      type: 'todo.updated',
+      session_id: 's1',
+      payload: {
+        revision: 7,
+        todos: [{ id: 'a', content: 'ship it', status: 'in_progress' }],
+        future_field: true
+      }
+    })
+    expect(Option.isSome(event)).toBe(true)
+    if (Option.isSome(event) && event.value.type === 'todo.updated') {
+      expect(event.value.payload.revision).toBe(7)
+      expect(event.value.payload.todos).toHaveLength(1)
+      expect(event.value.payload['future_field']).toBe(true)
+    }
+
+    expect(
+      Option.isNone(decode({ type: 'todo.updated', payload: { revision: -1, todos: [] }, session_id: 's1' }))
+    ).toBe(true)
+    expect(
+      Option.isNone(decode({ type: 'todo.updated', payload: { revision: 1.5, todos: [] }, session_id: 's1' }))
+    ).toBe(true)
+  })
+
   test('decodes interim assistant and previewed completion events', () => {
     const interim = decode({
       type: 'message.interim',

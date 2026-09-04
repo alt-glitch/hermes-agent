@@ -318,19 +318,25 @@ describe('/verbose', () => {
 describe('/fast, /yolo, /reload-mcp', () => {
   test('fast validates, reads status, and sets explicit modes', async () => {
     const p = makeCtx(async (method, params) => ({
-      value: method === 'config.get' ? 'normal' : params.value === 'on' ? 'fast' : 'normal'
+      value: method === 'config.get' ? 'normal' : params.value === 'on' ? 'fast' : params.value
     }))
     await dispatchSlash('/fast', p.ctx)
     await dispatchSlash('/fast on', p.ctx)
+    await dispatchSlash('/fast auto', p.ctx)
+    await dispatchSlash('/fast cold', p.ctx)
     await dispatchSlash('/fast turbo', p.ctx)
     expect(p.calls).toEqual([
       { method: 'config.get', params: { key: 'fast', session_id: 'sid-1' } },
-      { method: 'config.set', params: { key: 'fast', session_id: 'sid-1', value: 'on' } }
+      { method: 'config.set', params: { key: 'fast', session_id: 'sid-1', value: 'on' } },
+      { method: 'config.set', params: { key: 'fast', session_id: 'sid-1', value: 'auto' } },
+      { method: 'config.set', params: { key: 'fast', session_id: 'sid-1', value: 'cold' } }
     ])
     expect(p.system).toEqual([
       'fast mode: normal',
       'fast mode: fast',
-      'usage: /fast [normal|fast|status|on|off|toggle]'
+      'fast mode: auto',
+      'fast mode: cold',
+      'usage: /fast [normal|fast|auto|cold|status|on|off|toggle]'
     ])
   })
 

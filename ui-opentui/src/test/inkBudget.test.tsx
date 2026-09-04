@@ -21,7 +21,7 @@ import { DARK_THEME, fromSkin, LIGHT_THEME } from '../logic/theme.ts'
 import { App } from '../view/App.tsx'
 import { bodyColor, glyphColor, lastTextId, turnSpacing } from '../view/messageLine.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
-import { DEFAULT_TOOL_GLYPH, glyphFor, TOOL_GLYPHS } from '../view/tools/registry.tsx'
+import { DEFAULT_TOOL_GLYPH, glyphFor, rendererFor, TOOL_GLYPHS } from '../view/tools/registry.tsx'
 import { renderProbe } from './lib/render.ts'
 
 // ── 1. theme: neutral muted + bg token ───────────────────────────────────
@@ -82,12 +82,14 @@ describe('tool glyph vocabulary (registry) — identity survives the collapsed v
       patch: '◆',
       process: '$',
       read_file: '◇',
+      process_manage: '$',
       search_files: '○',
       skill_manage: '▲',
       skill_view: '▲',
       terminal: '$',
       todo: '☰',
       web_extract: '●',
+      todo_list: '☰',
       web_search: '●',
       write_file: '◆'
     })
@@ -96,6 +98,8 @@ describe('tool glyph vocabulary (registry) — identity survives the collapsed v
   test('MCP/unknown tools fall back to ◦', () => {
     expect(glyphFor('mcp_railway_deploy')).toBe(DEFAULT_TOOL_GLYPH)
     expect(glyphFor('totally_new_tool')).toBe('◦')
+    expect(glyphFor('process_manage')).toBe('$')
+    expect(rendererFor('process_manage')).toBe(rendererFor('process'))
     expect(glyphFor('terminal')).toBe('$')
   })
 

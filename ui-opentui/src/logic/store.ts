@@ -17,6 +17,7 @@ import { createStore, produce } from 'solid-js/store'
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
 import type { BillingOverlayState, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { CommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
+import type { TodoState } from '../boundary/schema/TodoState.ts'
 import { decodeSessionActiveListResponse, type ActiveItem } from '../boundary/schema/SessionOrchestratorResponses.ts'
 import {
   decodeDelegationPauseResponse,
@@ -319,6 +320,7 @@ export interface SubagentInfo {
   apiCalls?: number
   childSessionId?: string
   costUsd?: number
+  delegationId?: string
   depth: number
   durationSeconds?: number
   filesRead?: string[]
@@ -435,6 +437,7 @@ function mergeSubagentPayload(subagent: SubagentInfo, payload: SpawnTreeSubagent
   if (payload.api_calls !== undefined) subagent.apiCalls = payload.api_calls
   if (payload.child_session_id !== undefined) subagent.childSessionId = payload.child_session_id
   if (payload.cost_usd !== undefined) subagent.costUsd = payload.cost_usd
+  if (payload.delegation_id !== undefined) subagent.delegationId = payload.delegation_id
   if (payload.depth !== undefined) subagent.depth = payload.depth
   if (payload.duration_seconds !== undefined) subagent.durationSeconds = payload.duration_seconds
   if (payload.files_read !== undefined) subagent.filesRead = [...payload.files_read]
@@ -536,6 +539,7 @@ export interface TodoCounts {
 export interface TodoSnapshot {
   todos: TodoItem[]
   counts: TodoCounts
+  revision: number
 }
 
 export interface SessionInfo {
@@ -783,6 +787,9 @@ export interface StoreState {
    *  alias/override at the confirm seam. Config-scoped — survives session
    *  resets; a transient config poll failure preserves the last policy. */
   destructiveSlashConfirm: boolean
+  /** Persisted `display.bell_on_prompt`; rings once when a blocking prompt
+   * opens in an interactive terminal. Config-owned across session resets. */
+  bellOnPrompt: boolean
   /** /reasoning full — expand ALL thinking ("Thinking"/"Thought") sections to show
    *  their full body, independently of the global /details mode. Defaults OFF;
    *  bare `/reasoning` syncs it from the persisted `display.reasoning_full` (via
@@ -935,14 +942,13 @@ function normalizeTodoStatus(s: unknown): TodoStatus {
   return 'pending'
 }
 
-/** Parse a TodoSnapshot from a `todo` tool.complete payload — result.todos
- *  first, else args.todos. Returns undefined when there's no usable list (so a
- *  malformed call never clobbers a good prior snapshot). */
-export function todoSnapshotFrom(result: unknown, args: unknown): TodoSnapshot | undefined {
-  const fromObj = (o: unknown): unknown =>
-    o && typeof o === 'object' && !Array.isArray(o) ? (o as Record<string, unknown>)['todos'] : undefined
-  const rawList = fromObj(result) ?? fromObj(args)
+function todoSnapshotFromRecord(value: unknown): TodoSnapshot | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const rawList = record['todos']
   if (!Array.isArray(rawList)) return undefined
+  const rawRevision = record['revision']
+  const revision = Number.isInteger(rawRevision) && (rawRevision as number) >= 0 ? (rawRevision as number) : 0
   const todos: TodoItem[] = []
   for (const t of rawList) {
     if (!t || typeof t !== 'object') continue
@@ -959,10 +965,37 @@ export function todoSnapshotFrom(result: unknown, args: unknown): TodoSnapshot |
       })
     }
   }
-  if (todos.length === 0) return undefined
+  // A non-empty wire list containing no valid rows is malformed, not a clear.
+  // Empty authoritative states are meaningful only after the first revision;
+  // revision zero is the legacy/uninitialized sentinel used by old sessions.
+  if ((rawList.length > 0 && todos.length === 0) || (rawList.length === 0 && revision === 0)) return undefined
   const counts: TodoCounts = { total: todos.length, completed: 0, in_progress: 0, pending: 0, cancelled: 0 }
   for (const t of todos) counts[t.status]++
-  return { todos, counts }
+  return { todos, counts, revision }
+}
+
+/** Parse the authoritative state emitted by `todo.updated` and session RPCs. */
+export function todoSnapshotFromState(value: unknown): TodoSnapshot | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const revision = (value as Record<string, unknown>)['revision']
+  if (!Number.isInteger(revision) || (revision as number) < 0) return undefined
+  return todoSnapshotFromRecord(value)
+}
+
+/**
+ * Compatibility path for `todo`/`todo_list` tool.complete frames. Current
+ * gateways include `{todos, revision}` in result; older gateways only include
+ * todos and therefore retain revision zero ordering semantics.
+ */
+export function todoSnapshotFrom(result: unknown, args: unknown): TodoSnapshot | undefined {
+  const hasTodos = (value: unknown): value is Record<string, unknown> =>
+    Boolean(
+      value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      Array.isArray((value as Record<string, unknown>)['todos'])
+    )
+  return todoSnapshotFromRecord(hasTodos(result) ? result : hasTodos(args) ? args : undefined)
 }
 
 /** Build the typed Catalog from a decoded startup.catalog result (item 9). An
@@ -1118,6 +1151,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     details: 'collapsed',
     detailsCommandOverride: false,
     detailsSections: {},
+    bellOnPrompt: false,
     timestamps: false,
     destructiveSlashConfirm: true,
     reasoningFull: false,
@@ -1837,7 +1871,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     snapshot: Message[] = [],
     resumeId: string | undefined = sessionId,
     turnRunning = false,
-    startedAtMs: number = Date.now()
+    startedAtMs: number = Date.now(),
+    rawTodoState?: TodoState
   ): void {
     clearStatusRestoreTimer()
     lastStatusNote = ''
@@ -1851,6 +1886,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     agentsTurnArchived = true
     const info: SessionInfo = { startedAt: startedAtMs, ...(rawInfo ? readInfoPatch(rawInfo) : {}) }
     const capped = snapshot.length > MESSAGE_CAP ? snapshot.slice(-MESSAGE_CAP) : snapshot
+    const latestTodos = todoSnapshotFromState(rawTodoState)
 
     setState(
       produce(draft => {
@@ -1860,7 +1896,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.composerDraft = ''
         draft.pendingImages = []
         draft.composerClearVersion += 1
-        draft.latestTodos = undefined
+        draft.latestTodos = latestTodos
         draft.pager = undefined
         draft.sessionPicker = undefined
         draft.picker = undefined
@@ -1909,9 +1945,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function adoptFreshSession(
     sessionId: string,
     rawInfo?: { readonly [k: string]: unknown },
-    resumeId: string = sessionId
+    resumeId: string = sessionId,
+    rawTodoState?: TodoState
   ): void {
-    resetSessionOwnedState(sessionId, rawInfo, [], resumeId)
+    resetSessionOwnedState(sessionId, rawInfo, [], resumeId, false, Date.now(), rawTodoState)
   }
 
   /**
@@ -1926,10 +1963,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
     acceptEvent: (event: GatewayEvent) => boolean,
     resumeId: string = sessionId,
     turnRunning = false,
-    startedAtMs: number = Date.now()
+    startedAtMs: number = Date.now(),
+    rawTodoState?: TodoState
   ): void {
     const pending = buffering ?? []
-    resetSessionOwnedState(sessionId, rawInfo, snapshot, resumeId, turnRunning, startedAtMs)
+    resetSessionOwnedState(sessionId, rawInfo, snapshot, resumeId, turnRunning, startedAtMs, rawTodoState)
     for (const event of pending) if (acceptEvent(event)) applyNow(event)
   }
 
@@ -2300,6 +2338,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
    *  this on a successfully decoded `config.get full`, so a transient config
    *  failure preserves the last known policy instead of silently re-enabling
    *  or disabling the safety gate. */
+
+  function setBellOnPrompt(on: boolean): void {
+    setState('bellOnPrompt', on)
+  }
   function setDestructiveSlashConfirm(on: boolean): void {
     setState('destructiveSlashConfirm', on)
   }
@@ -2386,6 +2428,23 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('completionEnd', undefined)
   }
 
+  /** Commit one todo snapshot without allowing stale/duplicate revisions to win. */
+  function commitTodoSnapshot(snapshot: TodoSnapshot | undefined): boolean {
+    if (!snapshot) return false
+    const current = state.latestTodos
+    if (current) {
+      if (snapshot.revision < current.revision) return false
+      if (snapshot.revision > 0 && snapshot.revision === current.revision) return false
+    }
+    setState('latestTodos', snapshot)
+    return true
+  }
+
+  /** Apply a typed authoritative todo state from a live event/session snapshot. */
+  function applyTodoState(value: unknown): boolean {
+    return commitTodoSnapshot(todoSnapshotFromState(value))
+  }
+
   /** Reduce a decoded gateway event into the store. The sole boundary->Solid sink. */
   function apply(event: GatewayEvent): void {
     if (buffering) {
@@ -2411,6 +2470,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       case 'session.info':
         applyInfo(event.payload)
+        break
+      case 'todo.updated':
+        applyTodoState(event.payload)
         break
       case 'session.title': {
         // Live auto-title push (upstream f726090d489d) — fires the moment the
@@ -2784,7 +2846,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
             for (const message of draft.messages) {
               const oldParts = message.parts
               if (!oldParts || message === assistant) continue
-              for (let index = 0; index < oldParts.length && retained + header.length > MOA_STORE_TEXT_LIMIT; ) {
+              for (let index = 0; index < oldParts.length && retained + header.length > MOA_STORE_TEXT_LIMIT;) {
                 const part = oldParts[index]
                 if (part?.type === 'moa') {
                   retained -= part.text.length
@@ -3004,14 +3066,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
             }
           })
         )
-        // Todo panel (live tracker): capture the latest todo snapshot from EVERY
-        // `todo` tool.complete, REGARDLESS of HERMES_TUI_TOOL_OUTPUTS (the pinned
+        // Todo panel compatibility: capture both the legacy `todo` and current
+        // `todo_list` tool.complete, REGARDLESS of HERMES_TUI_TOOL_OUTPUTS (the pinned
         // panel is not a tool body). Set OUTSIDE the produce() above — it's a
         // separate top-level slice, not part of the message tree. Keeps list
         // order (= priority); never re-sorts.
-        if (name === 'todo') {
+        if (name === 'todo' || name === 'todo_list') {
           const snap = todoSnapshotFrom(event.payload['result'], event.payload['args'])
-          if (snap) setState('latestTodos', snap)
+          commitTodoSnapshot(snap)
         }
         // Abandoned batch clarify: the clarify tool settling while its batch
         // prompt is STILL open proves the server-side deadline fired (an
@@ -3687,6 +3749,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     getDetailsRevision,
     setTimestamps,
     hydrateTimestamps,
+    setBellOnPrompt,
     getTimestampsRevision,
     setDestructiveSlashConfirm,
     setStatusBarFields,

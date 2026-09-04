@@ -18,14 +18,16 @@ import {
   StyledText,
   TextRenderable,
   type CliRenderer,
+  type MarkdownCodeBlockRenderer,
   type Renderable,
   type TextChunk
 } from '@opentui/core'
 import type { Span } from 'grok-mermaid'
-import type { Tokens } from 'marked'
 
 import { mermaidFenceIsClosed, renderMermaidTerminal, type MermaidDiagram } from '../../logic/mermaid.ts'
 import type { Theme } from '../../logic/theme.ts'
+
+type CodeBlockToken = Parameters<MarkdownCodeBlockRenderer>[0]
 
 /** Context handed to a fence plugin — everything the view used to close over. */
 export interface CodeBlockContext {
@@ -37,7 +39,7 @@ export interface CodeBlockContext {
   readonly defaultRender: () => Renderable | null
 }
 
-export type CodeBlockPlugin = (token: Tokens.Code, context: CodeBlockContext) => Renderable | null
+export type CodeBlockPlugin = (token: CodeBlockToken, context: CodeBlockContext) => Renderable | null
 
 const FALLBACK = RGBA.fromHex('#E6EDF3')
 const HEX6 = /^#[0-9a-fA-F]{6}$/

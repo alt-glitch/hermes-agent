@@ -214,6 +214,40 @@ def _resolve_ws_orphan_reap_grace() -> float:
 
 
 _WS_ORPHAN_REAP_GRACE_S = _resolve_ws_orphan_reap_grace()
+
+
+def _resolve_ws_orphan_activity_stale() -> float:
+    """Resolve the detached-turn activity staleness threshold (seconds).
+
+    A detached RUNNING turn is only interrupted by the WS-orphan reaper once
+    its activity clock has been idle at least this long (#98028/#100325);
+    while the turn keeps producing (API waits, stream tokens, tool
+    heartbeats all stamp the clock) it runs to completion detached.
+    Config-driven via ``dashboard.ws_orphan_activity_stale_s``; the
+    ``HERMES_TUI_WS_ORPHAN_ACTIVITY_STALE_S`` env var is an internal
+    override. Defaults to 600s, matching the turn-liveness watchdog's idle
+    bound (``agent.turn_liveness.timeout_s``) so "wedged" means the same
+    thing on both paths. ``0`` disables the gate (pre-#98028 behavior:
+    interrupt at grace regardless of activity).
+    """
+    raw = os.environ.get("HERMES_TUI_WS_ORPHAN_ACTIVITY_STALE_S")
+    if raw is None or not str(raw).strip():
+        try:
+            from hermes_cli.config import load_config
+
+            raw = (load_config().get("dashboard") or {}).get(
+                "ws_orphan_activity_stale_s"
+            )
+        except Exception:
+            raw = None
+    try:
+        stale = float(raw) if raw is not None else 600.0
+    except (ValueError, TypeError):
+        stale = 600.0
+    return max(0.0, stale)
+
+
+_WS_ORPHAN_ACTIVITY_STALE_S = _resolve_ws_orphan_activity_stale()
 _WS_ORPHAN_INTERRUPT_REAP_POLL_S = 1.0
 # Total budget for the interrupt-then-reap poll chain. If an interrupted turn
 # never settles (agent thread hung in a syscall, supervisor lost), each 1s poll
@@ -854,6 +888,17 @@ def _release_active_session_slot(session: dict | None) -> bool:
     return False
 
 
+def _own_live_lease_ids(*, exclude=None) -> set[str]:
+    """Snapshot leases still backed by this process's live session records."""
+    with _sessions_lock:
+        return {
+            str(lease.lease_id)
+            for session in _sessions.values()
+            if (lease := session.get("active_session_lease")) is not None
+            and lease is not exclude
+        }
+
+
 @contextlib.contextmanager
 def _other_runtime_lease_guard(session_id: str, session: dict):
     """Release this runtime and lock sibling ownership through the DB write."""
@@ -874,13 +919,20 @@ def _other_runtime_lease_guard(session_id: str, session: dict):
 
     last_error: Exception | None = None
     stack = contextlib.ExitStack()
+    own_live_lease_ids = _own_live_lease_ids(exclude=lease)
     for attempt in range(3):
         try:
             if lease is not None and getattr(lease, "enabled", False):
-                guard = release_active_session_liveness_guard(lease, session_id)
+                guard = release_active_session_liveness_guard(
+                    lease,
+                    session_id,
+                    own_live_lease_ids=own_live_lease_ids,
+                )
             else:
                 guard = active_session_liveness_guard(
-                    session_id, registry_home=session.get("profile_home")
+                    session_id,
+                    registry_home=session.get("profile_home"),
+                    own_live_lease_ids=own_live_lease_ids,
                 )
             active = stack.enter_context(guard)
             break
@@ -1571,6 +1623,34 @@ def _cancel_ws_orphan_reap(sid: str) -> None:
             pass
 
 
+def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
+    """Whether a detached RUNNING turn's activity clock is still fresh.
+
+    Reuses the agent's existing activity summary (``_touch_activity`` is
+    stamped by API waits, stream tokens, and tool heartbeats — the same
+    clock the turn-liveness watchdog samples; see agent/turn_liveness.py).
+    Fresh means the WS-orphan reaper must NOT interrupt the turn yet
+    (#98028/#100325): deliberate client absence (closed laptop, backgrounded
+    mobile app, desktop update/relaunch) keeps healthy work running detached.
+
+    Conservative fallbacks preserve the wedged-turn safety net: a disabled
+    threshold (<= 0), a missing/opaque agent, an unreadable summary, or a
+    never-stamped clock all report NOT fresh, i.e. eligible for the
+    interrupt-at-grace path exactly as before.
+    """
+    if _WS_ORPHAN_ACTIVITY_STALE_S <= 0:
+        return False
+    agent = session.get("agent")
+    summary_fn = getattr(agent, "get_activity_summary", None)
+    if not callable(summary_fn):
+        return False
+    try:
+        elapsed = summary_fn().get("seconds_since_activity")
+        return elapsed is not None and float(elapsed) < _WS_ORPHAN_ACTIVITY_STALE_S
+    except Exception:
+        return False
+
+
 def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
     """After a grace window, reap session ``sid`` iff it's still orphaned.
 
@@ -1607,30 +1687,47 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
             if _session_has_active_delegations(sid, current):
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif current.get("running"):
-                # Mid-turn detached sessions must never drop the single
-                # Timer (#85578): after the reconnect grace the turn is
-                # interrupted once, then the reap keeps polling until the
-                # normal turn-finalization path settles.
-                polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
-                current["_client_gone_interrupt_polls"] = polls
-                if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
-                    # The interrupted turn never settled inside the budget —
-                    # force-reap rather than parking the session + a timer
-                    # chain forever. Loud by design: this only fires when a
-                    # turn is genuinely stuck past interrupt.
-                    logger.error(
-                        "client_gone sid=%s: turn did not settle after %d "
-                        "interrupt polls (%.0fs) — force-reaping detached "
-                        "session",
-                        sid, polls - 1,
-                        (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
+                if not current.get(
+                    "_client_gone_interrupt_requested"
+                ) and _ws_orphan_turn_activity_is_fresh(current):
+                    # Client-absent but actively producing (#98028/#100325):
+                    # the turn keeps running detached (the sentinel transport
+                    # already buffers emits) and the reaper re-checks each
+                    # grace interval. Only a turn whose activity clock has
+                    # gone stale — genuinely wedged, the case the interrupt
+                    # was added for — falls through to the interrupt below.
+                    logger.debug(
+                        "client_gone sid=%s action=defer (turn activity "
+                        "fresh; stale threshold %.0fs)",
+                        sid,
+                        _WS_ORPHAN_ACTIVITY_STALE_S,
                     )
-                    session = _pop_session_by_id(sid)
+                    reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
                 else:
-                    if not current.get("_client_gone_interrupt_requested"):
-                        current["_client_gone_interrupt_requested"] = True
-                        interrupt_session = current
-                    reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
+                    # Mid-turn detached sessions must never drop the single
+                    # Timer (#85578): after the reconnect grace the turn is
+                    # interrupted once, then the reap keeps polling until the
+                    # normal turn-finalization path settles.
+                    polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
+                    current["_client_gone_interrupt_polls"] = polls
+                    if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
+                        # The interrupted turn never settled inside the budget
+                        # — force-reap rather than parking the session + a
+                        # timer chain forever. Loud by design: this only fires
+                        # when a turn is genuinely stuck past interrupt.
+                        logger.error(
+                            "client_gone sid=%s: turn did not settle after %d "
+                            "interrupt polls (%.0fs) — force-reaping detached "
+                            "session",
+                            sid, polls - 1,
+                            (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
+                        )
+                        session = _pop_session_by_id(sid)
+                    else:
+                        if not current.get("_client_gone_interrupt_requested"):
+                            current["_client_gone_interrupt_requested"] = True
+                            interrupt_session = current
+                        reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
             else:
                 session = _pop_session_by_id(sid)
 
@@ -2029,12 +2126,7 @@ def _reclaim_orphaned_leases() -> None:
     try:
         from hermes_cli.active_sessions import release_orphaned_leases
 
-        with _sessions_lock:
-            live = {
-                lease.lease_id
-                for session in _sessions.values()
-                if (lease := session.get("active_session_lease")) is not None
-            }
+        live = _own_live_lease_ids()
         if dropped := release_orphaned_leases(live):
             logger.info("Reclaimed %d orphaned active-session lease(s)", dropped)
     except Exception:
@@ -2394,10 +2486,10 @@ _start_idle_reaper()
 def _get_db():
     global _db, _db_error
     if _db is None:
-        from hermes_state import SessionDB
+        from hermes_state import get_shared_session_db
 
         try:
-            _db = SessionDB()
+            _db = get_shared_session_db()
             _db_error = None
         except Exception as exc:
             _db_error = str(exc)
@@ -2423,9 +2515,9 @@ def _db_for_profile(profile: str | None = None):
     if profile_home is None:
         return _get_db(), False
     try:
-        from hermes_state import SessionDB
+        from hermes_state import get_shared_session_db
 
-        return SessionDB(db_path=Path(profile_home) / "state.db"), True
+        return get_shared_session_db(Path(profile_home) / "state.db"), True
     except Exception as exc:
         logger.warning(
             "TUI profile session store unavailable for %s: %s",
@@ -2487,11 +2579,11 @@ def _open_profile_session_db(profile_home):
     the build's ``agent_error`` path) instead of swallowing it back onto the
     launch handle.
     """
-    from hermes_state import SessionDB
+    from hermes_state import get_shared_session_db
 
     db_path = Path(profile_home) / "state.db"
     try:
-        return SessionDB(db_path=db_path)
+        return get_shared_session_db(db_path)
     except Exception as exc:
         raise RuntimeError(
             f"profile session store unavailable: {db_path}: {exc}"
@@ -2556,7 +2648,18 @@ def _profile_home(profile: str | None) -> Path | None:
     # Already the launch profile? No override needed.
     if home.resolve() == Path(_hermes_home).resolve():
         return None
-    return home if (home / "state.db").exists() or home.exists() else None
+    if (home / "state.db").exists() or home.exists():
+        # Remember every sibling home this backend was asked to serve so the
+        # change watcher stats its store too (#99333 class).
+        _served_profile_homes.add(home)
+        return home
+    return None
+
+
+# Profile homes served by this process besides the launch home — the only
+# extra stores the sessions watcher must probe. Empty on single-profile
+# installs, so their watcher stays byte-identical (two stats per tick).
+_served_profile_homes: set[Path] = set()
 
 
 def _profile_scoped(handler):
@@ -2755,6 +2858,11 @@ def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
 
 _compute_host_supervisor = None
 _compute_host_supervisor_lock = threading.Lock()
+# Hard cap on how long session.compress blocks its RPC waiting for the compute
+# host (#97948). Must stay below the desktop's SESSION_COMPRESS_TIMEOUT_MS
+# (660s) so the client receives the `pending` answer instead of its own
+# timeout error; the late-ack path covers anything slower.
+_COMPUTE_HOST_COMPRESS_WAIT_CAP_SECS = 630.0
 
 
 def _inside_compute_host_child() -> bool:
@@ -3030,6 +3138,7 @@ def _send_compute_host_control(
     payload: dict | None = None,
     wait: bool = True,
     timeout: float = 30.0,
+    on_late_ack=None,
 ) -> dict:
     frame = dict(payload or {})
     frame.setdefault("type", "control")
@@ -3040,7 +3149,66 @@ def _send_compute_host_control(
         payload=frame,
         wait=wait,
         timeout=timeout,
+        on_late_ack=on_late_ack,
     )
+
+
+def _compute_host_compress_wait_seconds(cfg: dict | None = None) -> float:
+    """RPC wait budget for a compute-host compress control (#97948).
+
+    Manual compression legitimately runs up to the configured
+    ``compression.context_total_ceiling_seconds`` (default 600s), so a fixed
+    120s waiter reported a false timeout while the host kept working. Follow
+    the ceiling with a little slack, but cap the blocking wait so it stays
+    below the desktop's own RPC timeout; anything longer is adopted through
+    the late-ack path instead of failing.
+    """
+    from agent.conversation_compression import resolve_context_compression_timeouts
+
+    try:
+        compression_cfg = (cfg if cfg is not None else _load_cfg()).get("compression", {})
+    except Exception:
+        compression_cfg = {}
+    _idle, ceiling = resolve_context_compression_timeouts(
+        compression_cfg if isinstance(compression_cfg, dict) else {}
+    )
+    return float(min(max(ceiling + 30.0, 120.0), _COMPUTE_HOST_COMPRESS_WAIT_CAP_SECS))
+
+
+def _announce_compute_host_compress_done(sid: str, session: dict, ack: dict) -> None:
+    """Mirror a compute-host compress ack and push the client-visible edges.
+
+    Emits the same ``session.info`` the in-process /compress path does plus
+    the ``compacted`` status edge, so a client whose own RPC wait already
+    expired still learns the transcript changed.
+    """
+    _apply_compute_host_metadata_mirror(session, ack)
+    try:
+        info = _session_info(session.get("agent"), session)
+    except TypeError:
+        info = _session_info(session.get("agent"))
+    _emit("session.info", sid, info)
+    _status_update(sid, "compacted", "✓ Context compression complete")
+
+
+def _adopt_late_compute_host_compress_ack(sid: str, session: dict, ack: dict, *, route_name: str) -> None:
+    """Adopt a compute-host compress ack that arrived after its RPC waiter gave up.
+
+    The RPC already answered ``status: pending``; this is the only place the
+    rotated session_key / history_version / session_info mirror can land, and
+    the only signal the client gets that the transcript changed. A late
+    ``control.error`` surfaces through the existing ``error`` event path.
+    """
+    with _sessions_lock:
+        live = _sessions.get(sid)
+    if live is not session:
+        return
+    if not isinstance(ack, dict) or ack.get("type") in {"control.error", "error"}:
+        message = str((ack or {}).get("message") or f"compute-host {route_name} failed")
+        _emit("error", sid, {"message": f"compression failed: {message}"})
+        _status_update(sid, "ready")
+        return
+    _announce_compute_host_compress_done(sid, session, ack)
 
 
 def _approval_request_payload(data: dict | None) -> dict:
@@ -3363,22 +3531,27 @@ def _install_deferred_agent_runtime(session: dict, agent) -> bool:
 
 
 def _apply_service_tier_override(agent, pinned_tier: str) -> None:
-    """Apply a session's fast/normal pin to an already-constructed agent.
+    """Apply a session tier pin to an already-constructed agent.
 
     Deferred construction snapshots its kwargs before the comparatively slow
     agent build. A concurrent fast-mode change may therefore change the session
     pin while construction is in flight. Reconcile both the public tier and
     provider request overrides before publishing the agent.
     """
-    fast = pinned_tier == "priority"
-    agent.service_tier = "priority" if fast else None
+    tier = pinned_tier or None
+    fast = tier == "priority"
+    agent.service_tier = tier
     request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
     request_overrides.pop("service_tier", None)
     request_overrides.pop("speed", None)
     if fast:
         from hermes_cli.models import resolve_fast_mode_overrides
 
-        resolved = resolve_fast_mode_overrides(getattr(agent, "model", None))
+        resolved = resolve_fast_mode_overrides(
+            getattr(agent, "model", None),
+            provider=getattr(agent, "provider", None),
+            base_url=getattr(agent, "base_url", None),
+        )
         if isinstance(resolved, dict):
             request_overrides.update(resolved)
     agent.request_overrides = request_overrides
@@ -3551,6 +3724,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         secret_token = None
+        build_terminal_token = None
         session_db = None
         owns_db = False
         profile_home = current.get("profile_home")
@@ -3577,6 +3751,21 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
                 except Exception:
                     pass
+                # Bind the profile's COMPLETE terminal policy for the agent
+                # build (fail-closed: malformed policy → refusal scope) so
+                # _make_agent's terminal probing / cwd hints resolve the
+                # routed profile, never the launch process (#98581 class).
+                try:
+                    from tools.terminal_scope import (
+                        install_profile_terminal_scope,
+                        reset_terminal_scope,
+                    )
+
+                    build_terminal_token = install_profile_terminal_scope(
+                        Path(profile_home)
+                    )
+                except Exception:
+                    build_terminal_token = None
                 # DEDICATED handle — ours until _transfer_db_to_agent hands
                 # it to the built agent in the finally below. Every path
                 # that leaves this build without that transfer (the except
@@ -3727,6 +3916,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     from agent.secret_scope import reset_secret_scope
 
                     reset_secret_scope(secret_token)
+                except Exception:
+                    pass
+            if build_terminal_token is not None:
+                try:
+                    from tools.terminal_scope import reset_terminal_scope
+
+                    reset_terminal_scope(build_terminal_token)
                 except Exception:
                     pass
             # _attach_worker already closed the worker if this session was
@@ -4220,7 +4416,8 @@ def _ensure_session_db_row(session: dict) -> bool:
         from hermes_state import SessionDB
 
         try:
-            db = SessionDB(db_path=Path(profile_home) / "state.db")
+            from hermes_state import get_shared_session_db
+            db = get_shared_session_db(Path(profile_home) / "state.db")
         except Exception:
             logger.debug("failed to open profile db for session row", exc_info=True)
             return False
@@ -4350,7 +4547,8 @@ def _ensure_session_db_row(session: dict) -> bool:
     finally:
         if close_db:
             try:
-                db.close()
+                from hermes_state import release_or_close
+                release_or_close(db)
             except Exception:
                 pass
     return True
@@ -4436,7 +4634,8 @@ def _session_db(session: dict):
         from hermes_state import SessionDB
 
         try:
-            db, close_db = SessionDB(db_path=Path(profile_home) / "state.db"), True
+            from hermes_state import get_shared_session_db
+            db, close_db = get_shared_session_db(Path(profile_home) / "state.db"), True
         except Exception:
             logger.debug("failed to open profile db for session", exc_info=True)
     else:
@@ -4446,7 +4645,8 @@ def _session_db(session: dict):
     finally:
         if close_db and db is not None:
             with contextlib.suppress(Exception):
-                db.close()
+                from hermes_state import release_or_close
+                release_or_close(db)
 
 
 def _rewind_active_session_history(
@@ -5325,15 +5525,17 @@ def _sessions_sig():
     """Newest mtime across state.db and its WAL — the cross-process change
     signal. Messaging-gateway turns and cron runs are written by OTHER
     processes that never touch this gateway's transports; the shared SQLite
-    file is the one thing they all move (#58671)."""
-    home = _watcher_home()
+    file is the one thing they all move (#58671). A backend serving several
+    profiles owns one store per profile, so every served sibling home is
+    probed too — otherwise a routed profile's Bot Chat never refreshes."""
     sig = None
-    for name in ("state.db", "state.db-wal"):
-        try:
-            mtime = (home / name).stat().st_mtime_ns
-        except OSError:
-            continue
-        sig = mtime if sig is None else max(sig, mtime)
+    for root in (_watcher_home(), *_served_profile_homes):
+        for name in ("state.db", "state.db-wal"):
+            try:
+                mtime = (root / name).stat().st_mtime_ns
+            except OSError:
+                continue
+            sig = mtime if sig is None else max(sig, mtime)
     return sig
 
 
@@ -6258,6 +6460,8 @@ def _load_service_tier() -> str | None:
         return None
     if raw in {"fast", "priority", "on"}:
         return "priority"
+    if raw in {"auto", "cold"}:
+        return raw
     return None
 
 
@@ -6600,9 +6804,20 @@ def _session_profile_runtime_scope(session: dict):
         return
     home_token = set_hermes_home_override(profile_home)
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    # Same authoritative terminal policy the gateway binds per turn (#68559):
+    # a docker-configured dashboard profile must never resolve the launch
+    # process's pinned env. Failure → refusal scope (fail closed).
+    from tools.terminal_scope import (
+        install_profile_terminal_scope as _install_term_scope,
+    )
+
+    terminal_token = _install_term_scope(Path(profile_home))
     try:
         yield
     finally:
+        from tools.terminal_scope import reset_terminal_scope
+
+        reset_terminal_scope(terminal_token)
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
 
@@ -8258,7 +8473,7 @@ def _todo_state_from_history(history) -> dict | None:
             if not isinstance(msg, dict):
                 continue
             for call in msg.get("tool_calls") or []:
-                if (call.get("function") or {}).get("name") == "todo":
+                if (call.get("function") or {}).get("name") in ("todo_list", "todo"):
                     cid = call.get("id")
                     if cid:
                         todo_call_ids.add(cid)
@@ -8368,7 +8583,7 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     if summary:
         payload["summary"] = summary
     todo_state = None
-    if name == "todo":
+    if name in ("todo_list", "todo"):  # legacy alias: pre-rename replays
         todo_state = _normalize_todo_state(payload.get("result"))
         if todo_state is not None:
             payload.update(todo_state)
@@ -8420,7 +8635,7 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         or payload.get("inline_diff")
         or payload.get("diff_unified")
         or _tool_lifecycle_required_for_ui(name)
-        or name == "todo"
+        or name in ("todo_list", "todo")
     ):
         _emit("tool.complete", sid, payload)
     # Task state is application data, not optional tool-progress chrome. A
@@ -8533,6 +8748,8 @@ def _on_tool_progress(
             payload["parent_id"] = str(_kwargs["parent_id"])
         if _kwargs.get("child_session_id"):
             payload["child_session_id"] = str(_kwargs["child_session_id"])
+        if _kwargs.get("delegation_id"):
+            payload["delegation_id"] = str(_kwargs["delegation_id"])
         if _kwargs.get("depth") is not None:
             payload["depth"] = int(_kwargs["depth"])
         if _kwargs.get("model"):
@@ -10513,6 +10730,128 @@ def _fail_inflight_turn(
     session["inflight_turn"] = turn
 
 
+_TURN_FAILURE_DETAIL_LIMIT = 240
+# Shortest run of the submitted prompt that counts as the provider quoting it
+# back. Long enough that shared boilerplate ("Invalid request for model ") does
+# not trip it, short enough to catch a quoted sentence.
+_TURN_PROMPT_ECHO_WINDOW = 24
+# Ceiling on the prompt we shingle. An @-expanded prompt can carry a whole
+# file; the failure path must stay cheap.
+_TURN_PROMPT_ECHO_MAX_PROMPT = 65536
+
+
+def _strip_prompt_echo(message: str, prompt: Any) -> str:
+    """Blank runs of the submitted prompt that ``message`` quotes back.
+
+    Secret redaction and prompt omission are different contracts, and only the
+    first one is pattern-based. A provider 4xx that echoes the request carries
+    ordinary private prose -- a paragraph about a person, a pasted file from an
+    ``@`` reference -- that matches no credential pattern and would otherwise
+    reach the log intact. This closes that path directly: anything the message
+    shares with the prompt for ``_TURN_PROMPT_ECHO_WINDOW`` characters or more
+    becomes ``<prompt>``.
+
+    Shingle-set matching, not a diff: cost is linear in both strings, which
+    matters because this runs on every failed turn and an ``@`` reference can
+    make the prompt arbitrarily long. The JSON-escaped form of the prompt is
+    shingled too, since a provider that hands back its own request body often
+    hands it back escaped.
+
+    Verbatim echo is what this stops. A paraphrase, a re-encoding (base64, a
+    different unicode normalization) or a summary of the prompt would survive,
+    so this is a floor and not a proof; the guarantee it does give is that the
+    prompt cannot reach the record by being quoted.
+    """
+    if not message or not prompt:
+        return message
+    needle = " ".join(str(prompt).split())[:_TURN_PROMPT_ECHO_MAX_PROMPT]
+    window = _TURN_PROMPT_ECHO_WINDOW
+    if len(needle) < window or len(message) < window:
+        return message
+    shingles = {needle[i:i + window] for i in range(len(needle) - window + 1)}
+    try:
+        escaped = json.dumps(needle)[1:-1]
+    except Exception:
+        escaped = ""
+    if escaped and escaped != needle:
+        shingles.update(
+            escaped[i:i + window] for i in range(len(escaped) - window + 1)
+        )
+    out: list[str] = []
+    i = 0
+    n = len(message)
+    while i <= n - window:
+        if message[i:i + window] in shingles:
+            j = i + window
+            while j < n and message[j - window + 1:j + 1] in shingles:
+                j += 1
+            out.append("<prompt>")
+            i = j
+        else:
+            out.append(message[i])
+            i += 1
+    out.append(message[i:])
+    return "".join(out)
+
+
+def _turn_failure_detail(error: Any, reason: Any = None, prompt: Any = None) -> str:
+    """Render why a turn failed, for the ``tui turn finished`` bookend.
+
+    Returns ``""`` when there is nothing to say, otherwise a fragment that
+    already carries its own leading space, so the caller can append it to the
+    record unconditionally.
+
+    #86865 added the bookend to trace compression rotations, so it logs
+    identities and a coarse ``status`` and deliberately logs no content.
+    #89117 is what the missing cause costs: a report consisting of two lines
+    reading ``status=error error_retained=True duration=0.9s`` with no way to
+    tell a provider 4xx from a budget wall from a crashed finalizer. The
+    returned-error path -- the one a 0.9 s failure almost always takes --
+    emits no other log line at all; only the exception path prints to stderr,
+    which is why the quiet failures are the ones that get filed.
+
+    Content discipline follows #86865's, and it takes two separate steps
+    because it is two separate contracts. ``redact_sensitive_text`` removes
+    credentials, which are pattern-shaped. It does nothing about a 4xx body
+    that quotes the request back, because ordinary private prose is not
+    pattern-shaped -- so ``_strip_prompt_echo`` removes that separately, using
+    the submitted ``prompt`` itself as the thing to look for. The invariant the
+    two of them keep is: this record may gain failure classification and
+    provider detail, and may not newly persist the user's own content.
+
+    ``prompt`` is optional so the helper stays callable from a path that has no
+    prompt in scope, but the turn paths always pass it; without it, only the
+    secret contract is enforced.
+    """
+    reason_text = str(reason or "").strip()
+    message = str(error or "").strip()
+    if isinstance(error, BaseException):
+        message = message or type(error).__name__
+    if not message and not reason_text:
+        return ""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        message = redact_sensitive_text(message, force=True)
+    except Exception:
+        # A redactor that cannot run must not be able to leak the raw
+        # message into the log by failing open.
+        message = "<unredactable>"
+    message = " ".join(message.split())
+    # After the collapse, so both sides are compared in the same shape, and
+    # before the truncation, so a quote that starts inside the kept prefix
+    # cannot survive by being cut mid-run.
+    message = _strip_prompt_echo(message, prompt)
+    if len(message) > _TURN_FAILURE_DETAIL_LIMIT:
+        message = message[:_TURN_FAILURE_DETAIL_LIMIT] + "\u2026"
+    out = ""
+    if reason_text:
+        out += " failure_reason=%s" % " ".join(reason_text.split())
+    if message:
+        out += " cause=%r" % message
+    return out
+
+
 # ── Auto-continue: resume a turn killed by a process/machine death ────
 #
 # A turn that concludes — success, handled error, interrupt — clears its
@@ -12069,14 +12408,32 @@ def _deferred_session_record(
     return record
 
 
+_ANY_PROFILE = object()  # default: match a live session regardless of profile
+
+
+def _live_profile_matches(session: dict, profile_home) -> bool:
+    """True when ``session`` belongs to ``profile_home`` (None = launch profile).
+
+    A record with no profile_home is the launch profile. _ANY_PROFILE disables
+    the check for callers that have no profile scope.
+    """
+    if profile_home is _ANY_PROFILE:
+        return True
+    want = str(profile_home) if profile_home else None
+    return (session.get("profile_home") or None) == want
+
+
 def _claim_or_reuse_live(
     sid: str, session_key: str, record: dict, lease
 ) -> tuple[str, dict] | None:
     """Register ``record`` as the live session for ``session_key`` under the
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
+    # A stored id can exist in multiple profiles. Reuse only the runtime from
+    # the profile resolved for this resume.
+    profile_home = record.get("profile_home")
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key(session_key, profile_home)
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -12094,7 +12451,7 @@ def _claim_or_reuse_live(
         # those quietly so the reap doesn't later broadcast session.reclaimed
         # for a session the client just re-resumed (auto-re-resume storm).
         _cancel_ws_orphan_reap(sid)
-        stale = _claim_parked_runtimes(session_key, keep_sid=sid)
+        stale = _claim_parked_runtimes(session_key, keep_sid=sid, profile_home=profile_home)
     # Slow finalization work stays OUTSIDE _session_resume_lock (see
     # _pop_session_by_id) — the stale records are already claimed above.
     _finalize_superseded_runtimes(stale)
@@ -12102,7 +12459,7 @@ def _claim_or_reuse_live(
 
 
 def _claim_parked_runtimes(
-    session_key: str, *, keep_sid: str
+    session_key: str, *, keep_sid: str, profile_home=_ANY_PROFILE
 ) -> list[tuple[str, dict]]:
     """Claim sentinel-parked stale runtimes of ``session_key`` for supersession.
 
@@ -12121,6 +12478,7 @@ def _claim_parked_runtimes(
             if old_sid != keep_sid
             and not old.get("_finalized")
             and _session_lookup_key(old, fallback=old_sid) == session_key
+            and _live_profile_matches(old, profile_home)
             and old.get("transport") is _detached_ws_transport
         ]
     for old_sid, _old in candidates:
@@ -12835,11 +13193,19 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+def _find_live_session_by_key(
+    session_key: str, profile_home=_ANY_PROFILE
+) -> tuple[str, dict] | None:
+    # Stored session ids are timestamp-based and can legitimately exist in more
+    # than one profile's store, so a bare-id match can hand profile B's resume
+    # profile A's live runtime (#100029). Profile-aware callers pass the home
+    # they resolved; the match must then be on (profile_home, session_key).
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
             continue
-        if _session_lookup_key(session, fallback=sid) == session_key:
+        if _session_lookup_key(session, fallback=sid) == session_key and _live_profile_matches(
+            session, profile_home
+        ):
             return sid, session
     return None
 
@@ -12937,7 +13303,16 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
     key = session.get("session_key")
     if db is not None and key:
         try:
-            display = db.get_messages_as_conversation(key, include_ancestors=True, include_row_ids=True)
+            display = db.get_messages_as_conversation(
+                key,
+                include_ancestors=True,
+                include_row_ids=True,
+                # Display read: a compacted session's archived turns are still
+                # the user's conversation. Without them a warm switch repainted
+                # the chat as just the summary + tail while the REST transcript
+                # showed everything (#92080).
+                include_compacted=True,
+            )
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:
             logger.debug("live display projection read failed", exc_info=True)
@@ -14219,13 +14594,33 @@ def _(rid, params: dict) -> dict:
         sid = str(params.get("session_id") or "")
         focus_topic = str(params.get("focus_topic", "") or "").strip()
         command = "/compress" + (f" {focus_topic}" if focus_topic else "")
+        _late_session = session
+
+        def _on_late_ack(late: dict, _sid=sid) -> None:
+            _adopt_late_compute_host_compress_ack(
+                _sid, _late_session, late, route_name="session.compress"
+            )
+
         try:
             ack = _send_compute_host_control(
                 sid,
                 route_name="session.compress",
                 command=command,
                 wait=True,
-                timeout=120.0,
+                timeout=_compute_host_compress_wait_seconds(),
+                on_late_ack=_on_late_ack,
+            )
+        except queue.Empty:
+            return _ok(
+                rid,
+                {
+                    "status": "pending",
+                    "turn_isolation": True,
+                    "message": (
+                        "compression still running in the background; "
+                        "the transcript will refresh when it finishes"
+                    ),
+                },
             )
         except Exception as exc:
             return _err(rid, 5019, f"compute-host compress failed: {exc}")
@@ -14599,9 +14994,9 @@ def _(rid, params: dict) -> dict:
         # recreate the cross-profile split one turn later.
         parent_home = session.get("profile_home")
         if parent_home:
-            from hermes_state import SessionDB
+            from hermes_state import get_shared_session_db
 
-            branch_db = SessionDB(db_path=Path(parent_home) / "state.db")
+            branch_db = get_shared_session_db(Path(parent_home) / "state.db")
             branch_owns_db = True
         home_token = (
             set_hermes_home_override(parent_home) if parent_home else None
@@ -18086,17 +18481,18 @@ def _(rid, params: dict) -> dict:
             # Pre-build session with a pinned tier (desktop draft pick or an
             # earlier session-scoped toggle) — report/toggle from the pin, not
             # the global default.
-            current_fast = session["create_service_tier_override"] == "priority"
+            current_tier = session["create_service_tier_override"] or None
         elif agent is not None:
-            current_fast = getattr(agent, "service_tier", None) == "priority"
+            current_tier = getattr(agent, "service_tier", None)
         else:
-            current_fast = _load_service_tier() == "priority"
+            current_tier = _load_service_tier()
+        current_fast = current_tier == "priority"
+        display_tier = {"priority": "fast", None: "normal"}.get(
+            current_tier, current_tier
+        )
 
         if raw in {"status"}:
-            return _ok(
-                rid,
-                {"key": key, "value": "fast" if current_fast else "normal"},
-            )
+            return _ok(rid, {"key": key, "value": display_tier})
 
         if raw in {"", "toggle"}:
             nv = "normal" if current_fast else "fast"
@@ -18104,6 +18500,8 @@ def _(rid, params: dict) -> dict:
             nv = "fast"
         elif raw in {"normal", "off"}:
             nv = "normal"
+        elif raw in {"auto", "cold"}:
+            nv = raw
         else:
             return _err(rid, 4002, f"unknown fast mode: {value}")
 
@@ -18129,7 +18527,11 @@ def _(rid, params: dict) -> dict:
                     4002,
                     "fast mode is not available without a selected model",
                 )
-            overrides = resolve_fast_mode_overrides(target_model)
+            overrides = resolve_fast_mode_overrides(
+                target_model,
+                provider=getattr(agent, "provider", None) if agent is not None else None,
+                base_url=getattr(agent, "base_url", None) if agent is not None else None,
+            )
             if overrides is None:
                 return _err(
                     rid,
@@ -18146,7 +18548,7 @@ def _(rid, params: dict) -> dict:
             # build ("switch one session, switches everywhere"). Pin the
             # create override so lazily-built sessions and rebuilds (/new,
             # deferred resume) keep the choice; "" pins normal explicitly.
-            pinned_tier = "priority" if nv == "fast" else ""
+            pinned_tier = {"fast": "priority", "normal": ""}.get(nv, nv)
             runtime_lock = session.setdefault(
                 "runtime_override_lock", threading.Lock()
             )
@@ -18166,7 +18568,8 @@ def _(rid, params: dict) -> dict:
             _write_config_key("agent.service_tier", nv)
         if agent is not None:
             if session is None:
-                _apply_service_tier_override(agent, "priority" if nv == "fast" else "")
+                pinned_tier = {"fast": "priority", "normal": ""}.get(nv, nv)
+                _apply_service_tier_override(agent, pinned_tier)
             _persist_live_session_runtime(session)
             _emit(
                 "session.info",
@@ -19492,16 +19895,20 @@ def _(rid, params: dict) -> dict:
         # pre-build session keeps its pin in create_service_tier_override.
         session = _sessions.get(params.get("session_id", ""))
         tier = None
+        has_session_tier = False
         if session is not None:
             if session.get("create_service_tier_override") is not None:
-                tier = session["create_service_tier_override"]
+                tier = session["create_service_tier_override"] or None
+                has_session_tier = True
             else:
                 agent = session.get("agent")
                 if agent is not None:
                     tier = getattr(agent, "service_tier", None)
-        if tier is None:
+                    has_session_tier = True
+        if not has_session_tier:
             tier = _load_service_tier()
-        return _ok(rid, {"value": "fast" if tier == "priority" else "normal"})
+        display_tier = {"priority": "fast", None: "normal"}.get(tier, tier)
+        return _ok(rid, {"value": display_tier})
     if key == "busy":
         return _ok(rid, {"value": _load_busy_input_mode()})
     if key in {"approval_mode", "approvals.mode"}:
@@ -21251,12 +21658,30 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     _MUTATES_WHILE_RUNNING = {"model", "personality", "prompt", "compress"}
     if _session_uses_compute_host(session) and name in _MUTATES_WHILE_RUNNING:
         route_name = f"slash.{name}"
+
+        def _on_late_ack(late: dict) -> None:
+            _adopt_late_compute_host_compress_ack(
+                sid, session, late, route_name=route_name
+            )
+
         try:
+            control_kwargs: dict[str, Any] = {}
+            if name == "compress":
+                control_kwargs = {
+                    "timeout": _compute_host_compress_wait_seconds(),
+                    "on_late_ack": _on_late_ack,
+                }
             ack = _send_compute_host_control(
                 sid,
                 route_name=route_name,
                 command=command,
                 wait=True,
+                **control_kwargs,
+            )
+        except queue.Empty:
+            return (
+                "compression still running in the background; "
+                "the transcript will refresh when it finishes"
             )
         except Exception as exc:
             return f"compute-host {route_name} failed: {exc}"

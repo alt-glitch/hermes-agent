@@ -3,7 +3,13 @@ import { Cause, Effect, Exit } from 'effect'
 
 import { GatewayError } from '../boundary/errors.ts'
 import type { GatewayServiceShape } from '../boundary/gateway/GatewayService.ts'
-import { branchSession, replaceSession, resumeSession, SessionProtocolError } from '../boundary/sessionLifecycle.ts'
+import {
+  activateSession,
+  branchSession,
+  replaceSession,
+  resumeSession,
+  SessionProtocolError
+} from '../boundary/sessionLifecycle.ts'
 import { createSessionStore } from '../logic/store.ts'
 
 interface FakeGateway {
@@ -43,7 +49,11 @@ describe('replaceSession', () => {
         return Effect.succeed({
           info: { model: 'new-model' },
           session_id: 'new-live',
-          stored_session_id: 'persisted-new'
+          stored_session_id: 'persisted-new',
+          todo_state: {
+            revision: 1,
+            todos: [{ id: 'new', content: 'new plan', status: 'pending' }]
+          }
         })
       }
       return Effect.succeed(undefined)
@@ -61,7 +71,11 @@ describe('replaceSession', () => {
         kind: 'created',
         sessionId: 'new-live',
         resumeId: 'persisted-new',
-        info: { model: 'new-model' }
+        info: { model: 'new-model' },
+        todoState: {
+          revision: 1,
+          todos: [{ id: 'new', content: 'new plan', status: 'pending' }]
+        }
       })
       assert.deepStrictEqual(fake.calls.at(-1), {
         method: 'session.create',
@@ -282,7 +296,11 @@ describe('resumeSession', () => {
               info: { model: 'resumed-model' },
               messages: [{ role: 'user', text: 'saved question' }],
               resumed: 'persisted-key',
-              session_id: 'new-live'
+              session_id: 'new-live',
+              todo_state: {
+                revision: 4,
+                todos: [{ id: 'resume', content: 'resumed plan', status: 'in_progress' }]
+              }
             } as A
           }
           return { closed: true } as A
@@ -306,6 +324,8 @@ describe('resumeSession', () => {
       assert.strictEqual(freshPart?.type, 'text')
       assert.strictEqual(freshPart?.type === 'text' ? freshPart.text : undefined, 'fresh')
       assert.notInclude(JSON.stringify(store.state.messages), 'stale')
+      assert.strictEqual(store.state.latestTodos?.revision, 4)
+      assert.strictEqual(store.state.latestTodos?.todos[0]?.content, 'resumed plan')
     })
   })
 
@@ -429,6 +449,37 @@ describe('resumeSession', () => {
       assert.isTrue(Exit.isFailure(exit))
       store.apply({ type: 'message.start', session_id: 'old-live' })
       assert.strictEqual(store.state.messages.length, 1)
+    })
+  })
+})
+
+describe('activateSession', () => {
+  it.effect('atomically replaces prior todo state with the target live snapshot', () => {
+    const store = createSessionStore()
+    store.adoptFreshSession('old-live', undefined, 'old-key', {
+      revision: 9,
+      todos: [{ id: 'old', content: 'old plan', status: 'pending' }]
+    })
+    const fake = fakeGateway(
+      method =>
+        method === 'session.activate'
+          ? Effect.succeed({
+              messages: [],
+              session_id: 'target-live',
+              session_key: 'target-key',
+              todo_state: {
+                revision: 2,
+                todos: [{ id: 'target', content: 'target plan', status: 'in_progress' }]
+              }
+            })
+          : Effect.die('unexpected RPC'),
+      'old-live'
+    )
+    return Effect.gen(function* () {
+      yield* activateSession(fake.service, store, { targetSessionId: 'target-live' })
+      assert.strictEqual(store.state.sessionId, 'target-live')
+      assert.strictEqual(store.state.latestTodos?.revision, 2)
+      assert.strictEqual(store.state.latestTodos?.todos[0]?.content, 'target plan')
     })
   })
 })

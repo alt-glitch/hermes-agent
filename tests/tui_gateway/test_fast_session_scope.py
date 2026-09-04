@@ -125,7 +125,34 @@ class TestConfigSetFastSessionScope:
                     return_value=FAST_OVERRIDES,
                 ) as resolve:
             _set({"key": "fast", "session_id": "s4", "value": "fast"})
-        resolve.assert_called_once_with("session-model")
+        resolve.assert_called_once_with(
+            "session-model", provider=None, base_url=None
+        )
+
+    def test_auto_and_cold_are_session_scoped_tier_pins(self) -> None:
+        session = {
+            "session_key": "k4-window",
+            "agent": _agent(service_tier=None),
+        }
+        with patch.dict(server._sessions, {"s4-window": session}, clear=False), \
+                patch.object(server, "_write_config_key") as write_key:
+            auto = _set(
+                {"key": "fast", "session_id": "s4-window", "value": "auto"}
+            )
+            assert auto["result"]["value"] == "auto"
+            assert session["create_service_tier_override"] == "auto"
+            assert session["agent"].service_tier == "auto"
+
+            status = _set(
+                {"key": "fast", "session_id": "s4-window", "value": "status"}
+            )
+            assert status["result"]["value"] == "auto"
+
+            cold = _set(
+                {"key": "fast", "session_id": "s4-window", "value": "cold"}
+            )
+            assert cold["result"]["value"] == "cold"
+            assert session["agent"].service_tier == "cold"
 
     def test_toggle_flips_prebuild_pin(self) -> None:
         """An empty value toggles from the session's pin, not the global."""

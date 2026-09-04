@@ -15,6 +15,7 @@
 import { Schema } from 'effect'
 
 import { SpawnTreeSubagentSchema } from './Delegation.ts'
+import { TodoStateSchema } from './TodoState.ts'
 
 const Str = Schema.String
 const opt = Schema.optionalKey
@@ -220,6 +221,11 @@ const ToolGenerating = Schema.Struct({
   type: Schema.Literal('tool.generating'),
   session_id: opt(Str),
   payload: Schema.Struct({ name: opt(Str) })
+})
+const TodoUpdated = Schema.Struct({
+  type: Schema.Literal('todo.updated'),
+  session_id: opt(Str),
+  payload: TodoStateSchema
 })
 
 // blocking prompts (deadlock-critical — Phase 3 renders these)
@@ -430,6 +436,7 @@ const SessionTurnEvents = Schema.Union([
   ToolComplete,
   ToolProgress,
   ToolGenerating,
+  TodoUpdated,
   ClarifyRequest,
   ApprovalRequest,
   SudoRequest,

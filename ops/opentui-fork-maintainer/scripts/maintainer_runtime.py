@@ -42,6 +42,7 @@ REQUIRED_GATES = frozenset(
     }
 )
 SHA_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
+SHA256_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
 SHORT_SHA_RE = __import__("re").compile(r"^[0-9a-fA-F]{7,40}$")
 GATE_SCHEMA_VERSION = 3
 LEASE_TTL_SECONDS = 11 * 60 * 60
@@ -606,7 +607,9 @@ def renew_lease(
     with _lease_lock(state_dir):
         value = _lease_value(state_dir)
         _validate_lease_value(value, token, now)
-        journal = _load_publish_journal(state_dir)
+        journal = _load_publish_journal(
+            state_dir, require_manifest_evidence=False
+        )
         if journal is not None and journal["phase"] in {
             "prepared",
             "published",
@@ -1034,7 +1037,14 @@ def _journal_path(state_dir: Path) -> Path:
     return state_dir / "publish-journal.json"
 
 
-def _load_publish_journal(state_dir: Path) -> dict[str, Any] | None:
+def _publish_journal_manifest_is_intact(value: dict[str, Any]) -> bool:
+    manifest = Path(str(value["manifest_path"]))
+    return manifest.is_file() and _file_sha256(manifest) == value["manifest_sha256"]
+
+
+def _load_publish_journal(
+    state_dir: Path, *, require_manifest_evidence: bool = True
+) -> dict[str, Any] | None:
     path = _journal_path(state_dir)
     if not path.exists():
         return None
@@ -1064,12 +1074,12 @@ def _load_publish_journal(state_dir: Path) -> dict[str, Any] | None:
         or value.get("schema_version") != 1
         or value.get("phase")
         not in {"prepared", "published", "finalizing", "finalized", "aborted"}
+        or not SHA256_RE.fullmatch(str(value.get("manifest_sha256", "")))
         or not SHA_RE.fullmatch(str(value.get("base_sha", "")))
         or not SHA_RE.fullmatch(str(value.get("candidate_sha", "")))
     ):
         raise ControlError("publish journal has an invalid shape")
-    manifest = Path(str(value["manifest_path"]))
-    if not manifest.is_file() or _file_sha256(manifest) != value["manifest_sha256"]:
+    if require_manifest_evidence and not _publish_journal_manifest_is_intact(value):
         raise ControlError("publish journal manifest evidence changed")
     return value
 
@@ -1139,8 +1149,12 @@ def ship_candidate(
             "run_binding": manifest["run_binding"],
             "prepared_unix": int(time.time()),
         }
-        prior = _load_publish_journal(state_dir)
+        prior = _load_publish_journal(
+            state_dir, require_manifest_evidence=False
+        )
         if prior is not None and prior["phase"] not in {"finalized", "aborted"}:
+            if not _publish_journal_manifest_is_intact(prior):
+                raise ControlError("publish journal manifest evidence changed")
             if _publication_identity(prior) != _publication_identity(prepared):
                 raise ControlError("another publication requires finalization first")
             prepared = prior
@@ -2725,6 +2739,7 @@ def finalize_success(
     token: str,
     remote: str = REMOTE,
     branch: str = BRANCH,
+    _recover_published_manifest: bool = False,
 ) -> dict[str, Any]:
     """Consume any claimed request and remove a proven shipped worktree.
 
@@ -2732,13 +2747,20 @@ def finalize_success(
     makes the remaining success cleanup deterministic and candidate-bound so a
     parent cannot consume a failed request or remove an arbitrary checkout.
     """
-    evidence_root = Path(os.path.abspath(manifest_path.parent))
-    if Path(os.path.abspath(evidence_dir)) != evidence_root:
+    evidence_root = Path(os.path.abspath(evidence_dir))
+    manifest_path = Path(os.path.abspath(manifest_path))
+    if manifest_path.parent != evidence_root:
         raise ControlError("success evidence must match the gate manifest directory")
     manifest_path = _evidence_path(
-        str(manifest_path), evidence_root, label="success gate manifest"
+        str(manifest_path),
+        evidence_root,
+        label="success gate manifest",
+        must_exist=not _recover_published_manifest,
     )
-    journal = _load_publish_journal(state_dir)
+    journal = _load_publish_journal(
+        state_dir,
+        require_manifest_evidence=not _recover_published_manifest,
+    )
     if journal is None:
         raise ControlError("success finalization requires a publication journal")
     if (
@@ -2769,6 +2791,10 @@ def finalize_success(
                 "candidate_sha": journal["candidate_sha"],
                 "upstream_sha": upstream_sha,
                 "published": True,
+                "manifest_evidence_status": result.get(
+                    "manifest_evidence_status",
+                    "intact",
+                ),
             },
         )
         return result
@@ -2849,6 +2875,11 @@ def finalize_success(
         _git(repo, ["worktree", "remove", str(resolved_cwd)])
         worktree_removed = str(resolved_cwd)
     upstream_sha = journal["upstream_sha"]
+    manifest_evidence_status = (
+        "intact"
+        if _publish_journal_manifest_is_intact(journal)
+        else "changed-after-publication"
+    )
     result = {
         "schema_version": 1,
         "candidate_sha": candidate_sha,
@@ -2857,13 +2888,19 @@ def finalize_success(
         "request_consumed": request_consumed,
         "worktree_removed": worktree_removed,
         "upstream_sha": upstream_sha,
+        "manifest_evidence_status": manifest_evidence_status,
     }
     if isinstance(upstream_sha, str):
         _atomic_text(state_dir / "last_synced_upstream.sha", upstream_sha + "\n")
     _atomic_json(evidence_root / "success-finalization.json", result)
     _atomic_json(
         _journal_path(state_dir),
-        {**journal, "phase": "finalized", "finalized_unix": int(time.time())},
+        {
+            **journal,
+            "phase": "finalized",
+            "finalized_unix": int(time.time()),
+            "manifest_evidence_status": manifest_evidence_status,
+        },
     )
     # The terminal outcome is the final durable commit. Reconciliation can
     # reconstruct it from the finalized journal and success evidence after a
@@ -2879,6 +2916,7 @@ def finalize_success(
             "candidate_sha": candidate_sha,
             "upstream_sha": upstream_sha,
             "published": True,
+            "manifest_evidence_status": manifest_evidence_status,
         },
     )
     return result
@@ -2910,7 +2948,9 @@ def finalize_failure(
     if stage not in allowed_stages or reason_code not in allowed_reasons:
         raise ControlError("failure outcome is not an allowlisted stage/reason")
     evidence_root = Path(os.path.abspath(evidence_dir))
-    journal = _load_publish_journal(state_dir)
+    journal = _load_publish_journal(
+        state_dir, require_manifest_evidence=False
+    )
     journal_matches = (
         journal is not None
         and Path(journal["evidence_dir"]).resolve() == evidence_root.resolve()
@@ -3005,7 +3045,9 @@ def _bound_terminal_outcome(state_dir: Path, evidence_dir: Path) -> dict[str, An
     ):
         raise ControlError("run outcome is not bound to durable state")
     if outcome.get("status") == "success":
-        journal = _load_publish_journal(state_dir)
+        journal = _load_publish_journal(
+            state_dir, require_manifest_evidence=False
+        )
         final_path = evidence_root / "success-finalization.json"
         if (
             journal is None
@@ -3062,7 +3104,9 @@ def reconcile_run(
         validate_lease(state_dir, token)
 
     outcome_path = evidence_root / "run-outcome.json"
-    journal = _load_publish_journal(state_dir)
+    journal = _load_publish_journal(
+        state_dir, require_manifest_evidence=False
+    )
     journal_matches = (
         journal is not None
         and Path(journal["evidence_dir"]).resolve() == evidence_root.resolve()
@@ -3085,6 +3129,15 @@ def reconcile_run(
         repo = Path(journal["repo"])
         remote_sha = _remote_sha(repo, journal["remote"], journal["branch"])
         if remote_sha == journal["candidate_sha"]:
+            # The journal was written from a validated manifest before the
+            # guarded push. Once the remote equals that exact candidate, the
+            # publication is an irreversible fact and cleanup no longer needs
+            # the manifest's current bytes. Keep the recorded hash unchanged
+            # and label the recovery below; this must never become a path that
+            # validates or publishes a new candidate from mutable evidence.
+            recover_published_manifest = not _publish_journal_manifest_is_intact(
+                journal
+            )
             result = finalize_success(
                 repo,
                 Path(journal["manifest_path"]),
@@ -3094,6 +3147,7 @@ def reconcile_run(
                 token=token,
                 remote=journal["remote"],
                 branch=journal["branch"],
+                _recover_published_manifest=recover_published_manifest,
             )
             release_lease(state_dir, token)
             return {"status": "success", **result}

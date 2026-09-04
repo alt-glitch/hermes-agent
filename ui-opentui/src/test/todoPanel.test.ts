@@ -7,6 +7,7 @@ describe('todo panel nested row contract', () => {
   test('keeps DFS indentation while counts and overflow remain based on the whole snapshot', () => {
     const snapshot: TodoSnapshot = {
       counts: { cancelled: 1, completed: 2, in_progress: 1, pending: 7, total: 11 },
+      revision: 1,
       todos: [
         { content: 'root', id: 'root', status: 'in_progress' },
         { content: 'child', id: 'child', parent: 'root', status: 'pending' },

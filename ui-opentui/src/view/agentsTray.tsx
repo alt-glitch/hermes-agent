@@ -25,6 +25,7 @@ import { RenderableEvents, type BoxRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, Show } from 'solid-js'
 
+import { delegationTaskPrefix } from '../logic/delegationLabels.ts'
 import type { SubagentInfo } from '../logic/store.ts'
 import { isRunning, normalizeSubagentStatus } from '../logic/subagentTree.ts'
 import { elapsedSeconds, useElapsedTick } from './elapsed.ts'
@@ -195,7 +196,9 @@ function CompactTrayRows(props: { agents: SubagentInfo[] }) {
             <text selectable={false} wrapMode="none">
               <span style={{ fg: statusColor(status(), theme) }}>{status() === 'queued' ? '○ ' : '● '}</span>
               <span style={{ fg: theme().color.muted }}>{`${truncate(shortModel(sa.model), 24)}  `}</span>
-              <span style={{ fg: theme().color.label }}>{truncate(sa.goal || sa.id, 72)}</span>
+              <span style={{ fg: theme().color.label }}>
+                {truncate(`${delegationTaskPrefix(sa.delegationId, sa.index, sa.taskCount)}${sa.goal || sa.id}`, 72)}
+              </span>
             </text>
           )
         }}
@@ -239,7 +242,7 @@ function TrayRows(props: { agents: SubagentInfo[]; selected: number; firstSeen: 
                 </span>
                 <span style={{ fg: statusColor(status(), theme) }}>{`● ${status()}`}</span>
                 <span style={{ fg: active() ? theme().color.text : theme().color.label }}>{`  ${truncate(
-                  sa.goal || sa.id,
+                  `${delegationTaskPrefix(sa.delegationId, sa.index, sa.taskCount)}${sa.goal || sa.id}`,
                   72
                 )}`}</span>
                 <span style={{ fg: theme().color.muted }}>{`  · ${fmtElapsed(secs())}`}</span>

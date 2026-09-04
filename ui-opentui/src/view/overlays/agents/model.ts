@@ -41,6 +41,7 @@ export interface DashboardOutputEntry {
  */
 export interface DashboardAgent extends SubagentTreeItem {
   readonly apiCalls?: number
+  readonly delegationId?: string
   readonly goal: string
   readonly iteration?: number
   readonly lastTool?: string
@@ -50,6 +51,7 @@ export interface DashboardAgent extends SubagentTreeItem {
   readonly reasoningTokens?: number
   readonly startedAt?: number
   readonly summary?: string
+  readonly taskCount?: number
   readonly thinking?: readonly string[]
   readonly thought?: string
   readonly toolsets?: readonly string[]
@@ -163,6 +165,7 @@ export function dashboardAgentFromRecord(value: unknown, position = 0): Dashboar
   const thought = readString(row, 'thought')
   const index = readNumber(row, 'task_index', 'index')
   const costUsd = readNumber(row, 'cost_usd', 'costUsd')
+  const delegationId = readString(row, 'delegation_id', 'delegationId')
   const durationSeconds = readNumber(row, 'duration_seconds', 'durationSeconds')
   const inputTokens = readNumber(row, 'input_tokens', 'inputTokens')
   const outputTokens = readNumber(row, 'output_tokens', 'outputTokens')
@@ -172,6 +175,7 @@ export function dashboardAgentFromRecord(value: unknown, position = 0): Dashboar
   const iteration = readNumber(row, 'iteration_count', 'iteration')
   const lastTool = readString(row, 'last_tool', 'lastTool', 'tool_name')
   const startedAt = epochMs(readNumber(row, 'started_at', 'startedAt'))
+  const taskCount = readNumber(row, 'task_count', 'taskCount')
   const filesRead = readStrings(row, 'files_read', 'filesRead')
   const filesWritten = readStrings(row, 'files_written', 'filesWritten')
   const notes = readStrings(row, 'notes')
@@ -190,6 +194,7 @@ export function dashboardAgentFromRecord(value: unknown, position = 0): Dashboar
     status: normalizeSubagentStatus(row['status'], 'completed'),
     ...(apiCalls === undefined ? {} : { apiCalls }),
     ...(costUsd === undefined ? {} : { costUsd }),
+    ...(delegationId === undefined ? {} : { delegationId }),
     ...(durationSeconds === undefined ? {} : { durationSeconds }),
     ...(filesRead === undefined ? {} : { filesRead }),
     ...(filesWritten === undefined ? {} : { filesWritten }),
@@ -205,6 +210,7 @@ export function dashboardAgentFromRecord(value: unknown, position = 0): Dashboar
     ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
     ...(startedAt === undefined ? {} : { startedAt }),
     ...(summary === undefined ? {} : { summary }),
+    ...(taskCount === undefined ? {} : { taskCount }),
     ...(thinking === undefined ? {} : { thinking }),
     ...(thought === undefined ? {} : { thought }),
     ...(toolCount === undefined ? {} : { toolCount }),

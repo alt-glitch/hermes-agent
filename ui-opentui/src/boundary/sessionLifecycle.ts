@@ -16,6 +16,7 @@ import {
   decodeSessionResumeResponse,
   type LiveSessionSnapshot
 } from './schema/SessionOrchestratorResponses.ts'
+import { TodoStateSchema, type TodoState } from './schema/TodoState.ts'
 import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { mapResumeHistory } from '../logic/resume.ts'
 import type { Message, SessionStore } from '../logic/store.ts'
@@ -25,7 +26,8 @@ const SetupStatusResponseSchema = Schema.Struct({ provider_configured: Schema.op
 const SessionCreateResponseSchema = Schema.Struct({
   session_id: Schema.String,
   stored_session_id: Schema.optionalKey(Schema.String),
-  info: Schema.optionalKey(InfoRecord)
+  info: Schema.optionalKey(InfoRecord),
+  todo_state: Schema.optionalKey(TodoStateSchema)
 })
 
 const decodeSetupStatus = Schema.decodeUnknownOption(SetupStatusResponseSchema)
@@ -47,6 +49,7 @@ export interface CreatedSession {
   readonly sessionId: string
   readonly resumeId: string
   readonly info?: Readonly<Record<string, unknown>>
+  readonly todoState?: TodoState
 }
 
 export type ReplaceSessionResult =
@@ -56,6 +59,7 @@ export type ReplaceSessionResult =
       readonly sessionId: string
       readonly resumeId: string
       readonly info?: Readonly<Record<string, unknown>>
+      readonly todoState?: TodoState
     }
 
 export class SessionProtocolError extends Data.TaggedError('SessionProtocolError')<{
@@ -90,7 +94,8 @@ export const createSession = Effect.fn('SessionLifecycle.create')(function* (
   return {
     sessionId,
     resumeId: created.stored_session_id?.trim() || sessionId,
-    ...(created.info ? { info: created.info } : {})
+    ...(created.info ? { info: created.info } : {}),
+    ...(created.todo_state ? { todoState: created.todo_state } : {})
   } satisfies CreatedSession
 })
 
@@ -119,7 +124,8 @@ export const replaceSession = Effect.fn('SessionLifecycle.replace')(function* (
     kind: 'created',
     sessionId: created.sessionId,
     resumeId: created.resumeId,
-    ...(created.info ? { info: created.info } : {})
+    ...(created.info ? { info: created.info } : {}),
+    ...(created.todoState ? { todoState: created.todoState } : {})
   } as const
 })
 
@@ -250,7 +256,8 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
       event => eventBelongsToSession(event, liveSessionId),
       resumedId,
       liveSnapshotRunning(response),
-      liveSnapshotStartedAtMs(response)
+      liveSnapshotStartedAtMs(response),
+      response.todo_state
     )
     for (const text of preservedQueue) store.enqueuePrompt(text)
     for (const image of preservedImages) store.restorePendingImage(image)
@@ -319,7 +326,8 @@ export const activateSession = Effect.fn('SessionLifecycle.activate')(function* 
       event => eventBelongsToSession(event, liveSessionId),
       resumeId,
       liveSnapshotRunning(response),
-      liveSnapshotStartedAtMs(response)
+      liveSnapshotStartedAtMs(response),
+      response.todo_state
     )
     committed = true
     return {

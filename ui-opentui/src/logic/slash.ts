@@ -112,12 +112,19 @@ export interface AgentsSlashControl {
   readonly loadSnapshot: (response: unknown, path: string) => SpawnSnapshot | null
 }
 
+// Only the separator between the command name and its argument is whitespace
+// the parser owns. Everything after it is the user's text and survives
+// verbatim: splitting the whole line on `\s+` and rejoining with a space
+// flattened every pasted diff, log, or PR thread into one run-on line before
+// the command ever saw it.
+const SLASH_PARTS_RE = /^(\S*)\s*([\s\S]*)$/
+
 /** Parse `/name rest…` → {name, arg}; null if not a slash command. */
 export function parseSlash(input: string): ParsedSlash | null {
   if (!input.startsWith('/')) return null
-  const [name = '', ...rest] = input.slice(1).split(/\s+/)
-  if (!name && rest.length === 0) return null
-  return { arg: rest.join(' '), name: name.toLowerCase() }
+  const [, name = '', arg = ''] = SLASH_PARTS_RE.exec(input.slice(1)) ?? []
+  if (!name && !arg) return null
+  return { arg, name: name.toLowerCase() }
 }
 
 /** How a submitted composer line is routed (F9 + slash ladder): a `!cmd` runs a
@@ -1647,8 +1654,8 @@ const petCmd: ClientHandler = async (arg, ctx, flight) => {
 
 const fastCmd: ClientHandler = async (arg, ctx, flight) => {
   const mode = arg.trim().toLowerCase()
-  if (!['', 'status', 'normal', 'fast', 'on', 'off', 'toggle'].includes(mode)) {
-    ctx.pushSystem('usage: /fast [normal|fast|status|on|off|toggle]')
+  if (!['', 'status', 'normal', 'fast', 'auto', 'cold', 'on', 'off', 'toggle'].includes(mode)) {
+    ctx.pushSystem('usage: /fast [normal|fast|auto|cold|status|on|off|toggle]')
     return
   }
   const sid = ctx.sessionId()
@@ -1665,7 +1672,8 @@ const fastCmd: ClientHandler = async (arg, ctx, flight) => {
   )
   if (!currentSessionIs(ctx, sid, flight)) return
   if (!response) return ctx.pushSystem('error: invalid response: fast mode')
-  ctx.pushSystem(`fast mode: ${response.value === 'fast' ? 'fast' : 'normal'}`)
+  const value = ['fast', 'auto', 'cold'].includes(response.value) ? response.value : 'normal'
+  ctx.pushSystem(`fast mode: ${value}`)
 }
 
 const yoloCmd: ClientHandler = async (_arg, ctx, flight) => {

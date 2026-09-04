@@ -69,11 +69,13 @@ export const TOOL_GLYPHS: Record<string, string> = {
   patch: '◆',
   process: '$',
   read_file: '◇',
+  process_manage: '$',
   search_files: '○',
   skill_manage: '▲',
   skill_view: '▲',
   terminal: '$',
   todo: '☰',
+  todo_list: '☰',
   web_extract: '●',
   web_search: '●',
   write_file: '◆'
@@ -100,6 +102,7 @@ const TOOLS: Record<string, ToolRenderer> = {
   // full output (+ the command echo only when the header truncated it, item 3;
   // execute_code's code arg is Tree-sitter highlighted, item 7).
   execute_code: bashRenderer,
+  process_manage: bashRenderer,
   process: bashRenderer,
   terminal: bashRenderer,
   // file-edit tools (Epic 2.3): collapsed = cwd-relative path + `+N −M`;
@@ -118,6 +121,7 @@ const TOOLS: Record<string, ToolRenderer> = {
   // todo (panel-primary): collapsed = "N tasks · …" summary; expanded = clean
   // checklist. The LIVE list is the pinned TodoPanel above the composer.
   todo: todoRenderer,
+  todo_list: todoRenderer,
   write_file: fileRenderer
 }
 

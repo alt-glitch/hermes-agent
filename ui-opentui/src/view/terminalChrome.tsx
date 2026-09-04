@@ -41,7 +41,10 @@ export function TerminalChrome(props: { store: Store; chrome?: TerminalChromeSea
     on(
       () => props.store.state.prompt,
       (prompt, previous) => {
-        if (prompt && !previous) chrome.notify(promptNotification(prompt.kind))
+        if (prompt && !previous) {
+          chrome.notify(promptNotification(prompt.kind))
+          if (props.store.state.bellOnPrompt) chrome.bell()
+        }
       },
       { defer: true }
     )

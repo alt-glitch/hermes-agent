@@ -69,7 +69,13 @@ import {
 import { configSyncBlocked, createConfigSyncTracker, normalizeStatusBarFields } from '../logic/configSync.ts'
 import { batteryEnabledFromConfig, createBatteryPoller } from '../logic/battery.ts'
 import { destructiveSlashConfirmFromConfig, skipDestructiveConfirm } from '../logic/approval.ts'
-import { compactFromConfig, detailsFromConfig, focusViewFromConfig, timestampsFromConfig } from '../logic/details.ts'
+import {
+  bellOnPromptFromConfig,
+  compactFromConfig,
+  detailsFromConfig,
+  focusViewFromConfig,
+  timestampsFromConfig
+} from '../logic/details.ts'
 import {
   createDelegationStatusRefresher,
   createSpawnTreeSaveDrainer,
@@ -440,6 +446,7 @@ const postSessionSetup = (
       store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedBusyConfig.config), batteryRevision)
       store.hydrateTimestamps(timestampsFromConfig(decodedBusyConfig.config), timestampsRevision)
       store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedBusyConfig.config))
+      store.setBellOnPrompt(bellOnPromptFromConfig(decodedBusyConfig.config))
       store.setStatusBarFields(statusBarFieldsFromConfig(decodedBusyConfig.config))
       store.configureAgentsNudge(tuiAgentsNudgeConfigValue(decodedBusyConfig.config))
       store.setVoiceMode({
@@ -503,10 +510,8 @@ const createFreshSession = (
       // launch dir is meaningless; see _ensure_session_db_row.)
       cwd: launchCwd()
     })
-    if (created.info) store.applyInfo(created.info)
+    store.adoptFreshSession(created.sessionId, created.info, created.resumeId, created.todoState)
     writeActiveSession(created.resumeId) // persisted id for launcher/recovery (#5)
-    store.setSessionId(created.sessionId)
-    store.setResumeId(created.resumeId)
     getLog().info('bootstrap', 'session created', { resumeId: created.resumeId, sid: created.sessionId })
     yield* postSessionSetup(gateway, store, created.sessionId, input.initialPrompt, input.initialImage, submitInitial)
   })
@@ -1140,6 +1145,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedConfig.config), batteryRevision)
               store.hydrateTimestamps(timestampsFromConfig(decodedConfig.config), timestampsRevision)
               store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedConfig.config))
+              store.setBellOnPrompt(bellOnPromptFromConfig(decodedConfig.config))
               store.setStatusBarFields(statusBarFieldsFromConfig(decodedConfig.config))
               store.setVoiceMode({
                 recordKey: voiceRecordKeyFromConfig(decodedConfig.config),
@@ -2292,7 +2298,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             }
 
             const draft = store.state.composerDraft
-            store.adoptFreshSession(result.sessionId, result.info, result.resumeId)
+            store.adoptFreshSession(result.sessionId, result.info, result.resumeId, result.todoState)
             if (draft) {
               pasteStore.retainOnly(draft)
               store.replaceComposerDraft(draft)
@@ -2411,7 +2417,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               cwd: launchCwd()
             })
           )
-          store.adoptFreshSession(created.sessionId, created.info, created.resumeId)
+          store.adoptFreshSession(created.sessionId, created.info, created.resumeId, created.todoState)
           pasteStore.clear()
           writeActiveSession(created.resumeId)
           stableSessionOwnerId = created.resumeId
