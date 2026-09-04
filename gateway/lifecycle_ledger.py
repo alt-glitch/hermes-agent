@@ -24,6 +24,15 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+# An integrity probe runs only after an unclean exit, but it still shares the
+# gateway startup thread.  Large stores must not hold startup (and therefore
+# the cron ticker) indefinitely.  SQLite's progress handler bounds VM work
+# without spawning a second connection or abandoning a query in a worker.
+STATE_DB_INTEGRITY_TIMEOUT_SECONDS = 30.0
+STATE_DB_INTEGRITY_PROGRESS_STEPS = 1_000
+STATE_DB_INTEGRITY_TIMED_OUT = "inconclusive: timed out"
+
+
 def _process_hermes_home() -> Path:
     """HERMES_HOME for process-level identity files (ignore task overrides)."""
     from hermes_constants import get_hermes_home
@@ -164,21 +173,52 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]
     return evidence
 
 
-def check_state_db_integrity(home: Optional[Path] = None) -> str:
-    """``"ok"``, ``"absent"``, or the first ``quick_check`` complaint.  Never raises.
+def check_state_db_integrity(
+    home: Optional[Path] = None,
+    *,
+    timeout_seconds: float = STATE_DB_INTEGRITY_TIMEOUT_SECONDS,
+) -> str:
+    """Return the bounded ``quick_check`` verdict; never raise.
+
+    Results are ``"ok"``, ``"absent"``,
+    :data:`STATE_DB_INTEGRITY_TIMED_OUT` when the startup-safe deadline expires,
+    or the first integrity/check failure.  A timeout is deliberately
+    inconclusive rather than evidence of corruption.
 
     Only after an unclean death — SIGKILL mid-WAL-checkpoint can leave half-written
-    b-tree pages.  ``quick_check(1)`` stops at the first problem (~2s on a healthy
-    500MB store): cheap once per unclean boot, too costly every boot.  Opened
-    normally: a WAL store needs its -shm sidecar for read-only, and the PRAGMA writes nothing.
+    b-tree pages. ``quick_check(1)`` stops at the first problem, while the SQLite
+    progress callback prevents a very large store from blocking gateway startup
+    forever. Opened normally: a WAL store needs its -shm sidecar for read-only,
+    and the PRAGMA writes nothing.
     """
     path = _home_path(home, "state.db")
     if not path.exists():
         return "absent"
+    timed_out = False
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+
+    def _stop_after_deadline() -> int:
+        nonlocal timed_out
+        if time.monotonic() >= deadline:
+            timed_out = True
+            return 1
+        return 0
+
     try:
         with closing(sqlite3.connect(str(path))) as conn:
-            row = conn.execute("PRAGMA quick_check(1)").fetchone()
+            conn.set_progress_handler(
+                _stop_after_deadline,
+                STATE_DB_INTEGRITY_PROGRESS_STEPS,
+            )
+            try:
+                row = conn.execute("PRAGMA quick_check(1)").fetchone()
+            finally:
+                # Do not leave a callback capturing startup state installed if
+                # this connection's lifetime ever expands beyond this helper.
+                conn.set_progress_handler(None, 0)
     except Exception as exc:
+        if timed_out:
+            return STATE_DB_INTEGRITY_TIMED_OUT
         return f"check-failed: {exc}"
     return "check-failed: no result" if not row or row[0] is None else str(row[0])
 
@@ -187,7 +227,15 @@ def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None
     """Integrity-check the store, persist the exit-diag record, log at WARNING."""
     # The death may have torn the store; this is the only moment we know to look.
     verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
-    if verdict not in ("ok", "absent"):
+    if verdict == STATE_DB_INTEGRITY_TIMED_OUT:
+        path = _home_path(home, "state.db")
+        logger.warning(
+            "state.db integrity check was inconclusive after timing out at startup; gateway startup "
+            "will continue. For a complete offline check, stop the gateway and run "
+            "`sqlite3 \"%s\" 'PRAGMA quick_check;'`.",
+            path,
+        )
+    elif verdict not in ("ok", "absent"):
         logger.error(
             "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
             "missing until it is repaired. Run `hermes doctor`.",

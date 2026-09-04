@@ -14,10 +14,13 @@ The check is gated on the unclean exit precisely because it costs ~2s on a
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
+import gateway.lifecycle_ledger as ledger
 from gateway.lifecycle_ledger import (
+    STATE_DB_INTEGRITY_TIMED_OUT,
     check_state_db_integrity,
     get_lifecycle_sentinel_path,
     record_startup,
@@ -83,6 +86,40 @@ def test_checker_tolerates_a_missing_store(tmp_path: Path) -> None:
     assert check_state_db_integrity(home=tmp_path) == "absent"
 
 
+def test_checker_timeout_is_inconclusive_and_cleans_up_callback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "state.db").touch()
+
+    class TimeoutConnection:
+        def __init__(self) -> None:
+            self.progress_calls = []
+            self.closed = False
+
+        def set_progress_handler(self, callback, steps: int) -> None:
+            self.progress_calls.append((callback, steps))
+
+        def execute(self, sql: str):
+            assert sql == "PRAGMA quick_check(1)"
+            callback, _ = self.progress_calls[-1]
+            assert callback() == 1
+            raise sqlite3.OperationalError("interrupted")
+
+        def close(self) -> None:
+            self.closed = True
+
+    conn = TimeoutConnection()
+    monotonic = iter((100.0, 131.0))
+    monkeypatch.setattr(ledger.sqlite3, "connect", lambda _path: conn)
+    monkeypatch.setattr(ledger.time, "monotonic", lambda: next(monotonic))
+
+    verdict = check_state_db_integrity(home=tmp_path, timeout_seconds=30.0)
+
+    assert verdict == STATE_DB_INTEGRITY_TIMED_OUT
+    assert conn.progress_calls[-1] == (None, 0)
+    assert conn.closed is True
+
+
 # ── wiring into the unclean-exit path ───────────────────────────────────────
 
 
@@ -106,6 +143,34 @@ def test_unclean_exit_on_a_healthy_store_records_ok(tmp_path: Path) -> None:
 
     assert evidence is not None
     assert evidence["state_db_integrity"] == "ok"
+
+
+def test_unclean_timeout_warns_without_reporting_corruption_and_reclaims_sentinel(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    _write_sentinel(tmp_path)
+    monkeypatch.setattr(
+        ledger,
+        "check_state_db_integrity",
+        lambda **_kwargs: STATE_DB_INTEGRITY_TIMED_OUT,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gateway.lifecycle_ledger"):
+        evidence = record_startup(home=tmp_path)
+
+    assert evidence is not None
+    assert evidence["state_db_integrity"] == STATE_DB_INTEGRITY_TIMED_OUT
+    record = _exit_diag_records(tmp_path)[0]
+    assert record["state_db_integrity"] == STATE_DB_INTEGRITY_TIMED_OUT
+    sentinel = json.loads(get_lifecycle_sentinel_path(tmp_path).read_text())
+    assert sentinel["phase"] == "running"
+    assert sentinel["pid"] != _DEAD_PID
+    assert "complete offline check" in caplog.text
+    assert "gateway startup will continue" in caplog.text
+    assert not any(
+        item.levelno >= logging.ERROR and "FAILED integrity" in item.message
+        for item in caplog.records
+    )
 
 
 def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch) -> None:
