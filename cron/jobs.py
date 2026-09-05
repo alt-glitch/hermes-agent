@@ -2583,10 +2583,12 @@ def clear_run_claim(
     return _with_job(job_id, apply, False)
 
 
-def advance_next_runs(job_ids) -> int:
+def advance_next_runs(job_ids, *, write_receipts: Optional[Dict[str, tuple[Optional[str], Dict[str, Any]]]] = None) -> int:
     """Batch form of :func:`advance_next_run`: one load + at most one save for the whole due set;
     one-shot/unknown ids are skipped. Returns the count advanced. Persisted once at the end, so a
-    crash mid-batch re-fires the whole set on restart rather than a prefix (sub-10ms window)."""
+    crash mid-batch re-fires the whole set on restart rather than a prefix (sub-10ms window).
+    Optional write receipts capture (previous due time, proposed record) before save, allowing
+    a caller to compare-and-compensate even when persistence succeeds but then raises."""
     ids = set(job_ids)
     if not ids:
         return 0
@@ -2603,7 +2605,10 @@ def advance_next_runs(job_ids) -> int:
                 continue
             new_next = compute_next_run(job["schedule"], now)
             if new_next and new_next != job.get("next_run_at"):
+                previous_next = job.get("next_run_at")
                 job["next_run_at"] = new_next
+                if write_receipts is not None:
+                    write_receipts[job["id"]] = (previous_next, copy.deepcopy(job))
                 advanced += 1
         if advanced:
             save_jobs(jobs)

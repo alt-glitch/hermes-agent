@@ -441,7 +441,7 @@ class TestTickDurableDispatch:
         monkeypatch.setattr(
             sched,
             "advance_next_runs",
-            lambda ids: events.append(("advance", tuple(ids))) or len(ids),
+            lambda ids, **_kw: events.append(("advance", tuple(ids))) or len(ids),
         )
         monkeypatch.setattr(
             sched,
@@ -520,7 +520,7 @@ class TestTickBatchAdvance:
         monkeypatch.setattr(
             sched,
             "advance_next_runs",
-            lambda ids: advance_calls.append(list(ids)) or len(ids),
+            lambda ids, **_kw: advance_calls.append(list(ids)) or len(ids),
         )
         monkeypatch.setattr(
             sched,
@@ -607,7 +607,7 @@ class TestTickBatchAdvance:
         monkeypatch.setattr(
             sched,
             "advance_next_runs",
-            lambda _ids: (_ for _ in ()).throw(
+            lambda _ids, **_kw: (_ for _ in ()).throw(
                 AssertionError("batch advance must not run after collection fails")
             ),
         )

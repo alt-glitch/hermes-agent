@@ -482,7 +482,8 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 from cron.jobs import (
     CronStoreLockTimeout,
     _ensure_cron_dir, advance_next_run, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
-    clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
+    clear_run_claim, cron_store_transaction, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim,
+    load_jobs, mark_job_run, save_jobs,
     run_claim_is_owned,
     save_job_output, use_cron_store, resolve_cron_inactivity_timeout_seconds)
 from cron.executions import (
@@ -594,6 +595,12 @@ class _GatedDispatch:
     profile_home: Path
     run_token: Optional[str]
     execution_id: Optional[str] = None
+    schedule_advance: Optional[tuple[Optional[str], dict]] = None
+
+
+_SCHEDULE_OCCURRENCE_FIELDS = (
+    "schedule", "next_run_at", "last_run_at", "repeat", "run_claim", "fire_claim", "dispatch_claim", "enabled", "state",
+)
 
 
 # Removed under _running_lock immediately before entering the worker callable.
@@ -884,10 +891,25 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
     return [s[0] for s in stale]
 
 
+def _restore_cancelled_schedule(job_id: str, pending: _GatedDispatch) -> None:
+    # Wait for any in-progress batch advance to publish its write receipt.
+    # Only undo that occurrence's schedule write, never a new owner or user re-arm.
+    with cron_store_transaction():
+        if pending.schedule_advance is not None:
+            original_next, expected = pending.schedule_advance
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") == job_id and all(job.get(key) == value for key, value in expected.items()):
+                    job["next_run_at"] = original_next
+                    save_jobs(jobs)
+                    break
+
+
 def _finish_cancelled_dispatch(job_id: str, pending: _GatedDispatch, reason: str) -> None:
     """Close a proven-unstarted dispatch before waking its cancelled worker."""
     try:
         with use_cron_store(pending.profile_home):
+            _restore_cancelled_schedule(job_id, pending)
             if pending.run_token:
                 try:
                     clear_run_claim(job_id, expected_token=pending.run_token)
@@ -3876,6 +3898,36 @@ def _sweep_mcp_orphans_when_all_done(futures: list) -> None:
         _f.add_done_callback(_on_done)
 
 
+def _advance_gated_dispatches(pending_dispatches: list) -> None:
+    # The jobs lock also fences cancellation compensation. Never hold _running_lock
+    # over store I/O: jobs-store readers can call get_running_job_ids themselves.
+    with cron_store_transaction():
+        with _running_lock:
+            active = {
+                job_id: pending for _, job_id, _, _, cancelled in pending_dispatches
+                if (pending := _gated_dispatches.get(job_id)) is not None
+                and pending.cancelled is cancelled and not cancelled.is_set()
+            }
+        if not active:
+            return
+        receipts = {}
+        try:
+            advance_next_runs(list(active), write_receipts=receipts)
+        except BaseException:
+            for pending in active.values():
+                pending.cancelled.set()
+            raise
+        finally:
+            # Receipts exist before the write, even if a successful replace then raises.
+            for job_id, (original_next, proposed) in receipts.items():
+                active[job_id].schedule_advance = (
+                    original_next, {key: proposed.get(key) for key in _SCHEDULE_OCCURRENCE_FIELDS},
+                )
+            for job_id, pending in active.items():
+                if pending.cancelled.is_set():
+                    _restore_cancelled_schedule(job_id, pending)
+
+
 def tick(
     verbose: bool = True, adapters=None, loop=None, sync: bool = True, *, can_dispatch=None):
     """Check and run all due jobs. File-locked so only one tick runs at a time (gateway ticker vs
@@ -3953,7 +4005,7 @@ def tick(
                 if pending is not None:
                     pending_dispatches.append(pending)
             if pending_dispatches:
-                advance_next_runs([pending[1] for pending in pending_dispatches])
+                _advance_gated_dispatches(pending_dispatches)
         except BaseException as advance_err:
             for pending in pending_dispatches:
                 pending[4].set()
