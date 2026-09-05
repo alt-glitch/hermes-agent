@@ -195,7 +195,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
     const controls = replayMode()
       ? ' · controls locked'
       : ` · x kill · X subtree · p ${delegation().paused ? 'resume' : 'pause'}`
-    const full = `↑↓ scroll · PgUp/PgDn · G/L live · Esc/← back · r thinking · t tools${controls} · q close`
+    const full = `↑↓ scroll · PgUp/PgDn · G/L live · Esc/← back · r reasoning · a activity · t tools${controls} · q close`
     const compact = `↑↓ scroll · L live · Esc back · q close`
     const tiny = `Esc back · L live · q close`
     const available = Math.max(8, dims().width - 4)

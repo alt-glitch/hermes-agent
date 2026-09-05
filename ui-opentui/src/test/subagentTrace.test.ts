@@ -101,6 +101,14 @@ describe('agent message retention and completion', () => {
     expect(b.trace?.at(-1)?.text).toBe('Legacy result')
   })
 
+  test('empty failure completion never fabricates an assistant reply', () => {
+    const store = createSessionStore()
+    const agent = start(store)
+    store.apply({ type: 'subagent.complete', payload: { subagent_id: 'a', status: 'failed' } })
+    expect(agent.status).toBe('failed')
+    expect(agent.trace?.some(entry => entry.kind === 'summary' || entry.kind === 'reply')).toBe(false)
+  })
+
   test('a huge reply stays bounded after repeated appends, with explicit loss and stable identity', () => {
     const store = createSessionStore()
     const agent = start(store)
@@ -129,6 +137,7 @@ describe('agent message retention and completion', () => {
     text(store, '😀' + 'x'.repeat(SUBAGENT_TRACE_TEXT_LIMIT - 1))
     expect(agent.trace?.at(-1)?.text.isWellFormed()).toBe(true)
     expect(agent.trace?.at(-1)?.text.length).toBeLessThanOrEqual(SUBAGENT_TRACE_TEXT_LIMIT)
+    expect(agent.trace).toHaveLength(1)
     store.apply({
       type: 'subagent.complete',
       payload: { subagent_id: 'a', summary: '😀' + 'y'.repeat(SUBAGENT_SUMMARY_LIMIT - 1) }

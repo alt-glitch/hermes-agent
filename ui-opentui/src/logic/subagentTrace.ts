@@ -46,6 +46,10 @@ export function trimSubagentTrace(agent: SubagentInfo): void {
       entry.text = retainedTail(entry.text, remaining)
       entry.truncated = true
       agent.traceTruncated = true
+      const dropped = index + (entry.text.length === 0 ? 1 : 0)
+      agent.traceDropped = (agent.traceDropped ?? 0) + dropped
+      trace.splice(0, dropped)
+      break
     }
     remaining -= entry.text.length
   }

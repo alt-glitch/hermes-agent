@@ -3271,7 +3271,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
               sa.endedAt ??= Date.now()
               const summary = event.payload.summary || text || sa.summary
               if (summary) sa.summary = summary
-              finishSubagentTrace(sa, summary || 'done')
+              if (summary?.trim()) finishSubagentTrace(sa, summary)
             }
             // Coalesce adjacent deltas of the same channel without flattening
             // reasoning, messages and tools into one body.
