@@ -150,7 +150,7 @@ def _fallback_api_mode(provider: str, base_url: str, model: str = "") -> str:
 def _resolve_plain_custom_api_mode(model_cfg: Dict[str, Any], base_url: str) -> str:
     """api_mode for legacy/plain ``provider: custom`` endpoints — conservative by default: only
     direct OpenAI/xAI/Meta URLs imply Responses; named custom providers opt in via ``api_mode``."""
-    configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+    configured_mode = _configured_api_mode("custom", model_cfg)
     detected_mode = _detect_api_mode_for_url(base_url)
     if configured_mode == "codex_responses" and detected_mode != "codex_responses":
         logger.info("Ignoring persisted custom api_mode=codex_responses for non-OpenAI endpoint %s", base_url or "(unknown)")
@@ -423,7 +423,7 @@ from hermes_cli.runtime_provider_backends import (  # noqa: E402,F401
 # OpenAI-compatible provider is never honoured for it (it would 404 on /chat/completions).
 _POOL_ENTRY_SIMPLE_MODES: Dict[str, tuple] = {
     "openai-codex": ("codex_responses", DEFAULT_CODEX_BASE_URL), "xai-oauth": ("codex_responses", DEFAULT_XAI_OAUTH_BASE_URL),
-    "qwen-oauth": ("chat_completions", DEFAULT_QWEN_BASE_URL), "openrouter": ("chat_completions", OPENROUTER_BASE_URL),
+    "qwen-oauth": ("chat_completions", DEFAULT_QWEN_BASE_URL),
     "minimax-oauth": ("anthropic_messages", lambda: getattr(PROVIDER_REGISTRY.get("minimax-oauth"), "inference_base_url", "")),
     "xai": ("codex_responses", ""),
 }
@@ -431,6 +431,8 @@ _POOL_ENTRY_SIMPLE_MODES: Dict[str, tuple] = {
 
 def _pool_entry_mode_and_url(provider, entry, model_cfg, effective_model, base_url) -> tuple:
     """(api_mode, base_url) for a pool entry of ``provider``."""
+    if provider == "openrouter":
+        return _configured_api_mode(provider, model_cfg) or "chat_completions", base_url or OPENROUTER_BASE_URL
     if provider in _POOL_ENTRY_SIMPLE_MODES:
         api_mode, default_url = _POOL_ENTRY_SIMPLE_MODES[provider]
         return api_mode, base_url or (default_url() if callable(default_url) else default_url)

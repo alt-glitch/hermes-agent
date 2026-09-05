@@ -13,6 +13,7 @@ export default tseslint.config(
       ".bench/**",
       ".demo/**",
       ".repos/**",
+      "tools/oxlint/anti-slop/**",
       "*.frame.txt",
       "*.ansi",
     ],

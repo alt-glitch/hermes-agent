@@ -31,7 +31,7 @@ import { readClipboardText, writeClipboard } from '../boundary/clipboard.ts'
 import { launchHermesCommand } from '../boundary/externalCli.ts'
 import { openInEditor } from '../boundary/externalInput.ts'
 import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../boundary/terminalSetup.ts'
-import { GatewayService, type GatewayServiceShape } from '../boundary/gateway/GatewayService.ts'
+import { GatewayService, type GatewayTransport } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
 import { promptResponseAcknowledged, type PromptResponseMethod } from '../boundary/promptResponses.ts'
@@ -293,7 +293,7 @@ const writeActiveSession = (sid: string | undefined) => {
 }
 
 const resumeInto = (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   store: SessionStore,
   sid: string,
   cols: number,
@@ -333,7 +333,7 @@ const resumeInto = (
  * the authoritative agent build is pending. The loop is session-fenced and
  * detached so a slow build never holds the input transition lock. */
 const scheduleStartupCatalogRetry = (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   store: SessionStore,
   sid: string,
   initial: Catalog,
@@ -367,7 +367,7 @@ const scheduleStartupCatalogRetry = (
  * background work: awaiting it here holds the session-transition input lock.
  */
 const postSessionSetup = (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   store: SessionStore,
   sid: string,
   initialPrompt?: string,
@@ -490,7 +490,7 @@ const postSessionSetup = (
  *  also the boot-picker's Esc fallback — closing the picker without a pick
  *  must still leave a usable session behind). */
 const createFreshSession = (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   store: SessionStore,
   input: TuiInput,
   submitInitial?: (text: string) => boolean
@@ -527,7 +527,7 @@ const createFreshSession = (
  * swallowed — a bootstrap hiccup must never tear down the rendered UI.
  */
 const bootstrapSession = (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   store: SessionStore,
   input: TuiInput,
   submitInitial?: (text: string) => boolean

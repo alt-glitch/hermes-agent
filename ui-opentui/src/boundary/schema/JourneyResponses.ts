@@ -1,9 +1,20 @@
-import { Option, Schema } from 'effect'
+import { Effect, Option, Schema } from 'effect'
 
 const Str = Schema.String
 const Num = Schema.Number
 const opt = Schema.optionalKey
 const UnknownFields = Schema.Record(Str, Schema.Unknown)
+// learning_graph_render.py emits [text, style, alpha, hex?]. Shorter runs remain
+// valid, matching the previous view contract and the renderer fixtures.
+const JourneyRunSchema = Schema.Tuple([Str, opt(Str), opt(Schema.Finite), opt(Schema.NullOr(Str))])
+const JourneyFrameSchema = Schema.Struct({ grid: opt(Schema.Array(Schema.Array(JourneyRunSchema))) })
+const JourneyLegendItemSchema = Schema.Struct({ color: opt(Str), glyph: Str, label: Str, style: opt(Str) })
+// Charts are supplemental: one malformed visual section must not hide the
+// validated learning list or prevent viewing/editing its nodes.
+const VisualFrames = Schema.Array(JourneyFrameSchema).pipe(Schema.catchDecoding(() => Effect.succeed(Option.some([]))))
+const VisualLegend = Schema.Array(JourneyLegendItemSchema).pipe(
+  Schema.catchDecoding(() => Effect.succeed(Option.some([])))
+)
 const JourneyNodeSchema = Schema.StructWithRest(
   Schema.Struct({
     body: opt(Str),
@@ -29,17 +40,15 @@ const JourneyBucketSchema = Schema.StructWithRest(
   }),
   [UnknownFields]
 )
-export const JourneyFramesSchema = Schema.StructWithRest(
-  Schema.Struct({
-    axis: Schema.Struct({ end: Str, start: Str }),
-    buckets: opt(Schema.Array(JourneyBucketSchema)),
-    count: Num,
-    frames: Schema.Array(Schema.Unknown),
-    legend: Schema.Array(Schema.Unknown),
-    summary: Schema.Array(Str)
-  }),
-  [UnknownFields]
-)
+export const JourneyFramesSchema = Schema.Struct({
+  axis: Schema.Struct({ end: Str, start: Str }),
+  buckets: opt(Schema.Array(JourneyBucketSchema)),
+  categories: opt(VisualLegend),
+  count: Num,
+  frames: VisualFrames,
+  legend: VisualLegend,
+  summary: Schema.Array(Str)
+})
 export const JourneyDetailSchema = Schema.StructWithRest(
   Schema.Struct({
     content: opt(Str),
@@ -53,6 +62,7 @@ export const JourneyMutationSchema = Schema.StructWithRest(Schema.Struct({ messa
   UnknownFields
 ])
 export type JourneyFrames = typeof JourneyFramesSchema.Type
+export type JourneyRun = typeof JourneyRunSchema.Type
 export type JourneyDetail = typeof JourneyDetailSchema.Type
 export type JourneyMutation = typeof JourneyMutationSchema.Type
 const frames = Schema.decodeUnknownOption(JourneyFramesSchema)

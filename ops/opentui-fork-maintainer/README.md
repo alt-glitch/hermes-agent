@@ -1,67 +1,110 @@
 # OpenTUI fork maintainer
 
-Versioned source for the Hermes cron that keeps `sid/opentui` aligned with
-`upstream/main`. Runtime state remains in
-`/home/daimon/projects/opentui-fork-maintainer/state`.
+Versioned engineering workflow for keeping `alt-glitch/hermes-agent: sid/opentui`
+aligned with canonical `NousResearch/hermes-agent: main`. The parent classifies
+actual diffs, integrates in an owned worktree, verifies behavior and publishes
+only a candidate whose exact evidence passes the runtime gates.
 
-The production sync runs at 09:00 and 21:00 local time with Hermes Agent as
-the parent (`openai/gpt-5.6-sol`, per-job medium reasoning). It may delegate bounded
-implementation work to Codex or Claude, but the parent owns integration,
-evidence, and the final ship decision. At most two workers run concurrently.
+## Runtime ownership
 
-Preview the pinned cron/configuration plan with
-`uv run --project /home/daimon/side-quests/hermes-agent /home/daimon/side-quests/hermes-agent/ops/opentui-fork-maintainer/scripts/configure.py`.
-Deploy the versioned policy, wrapper, classifier, worktree helper, required
-skills, video routing, and cron fields with the same command plus `--apply`. The runnable cron
-entrypoint is copied into `~/.hermes/scripts/` to satisfy the scheduler's
-containment boundary; its versioned runtime dependencies and state remain under
-`/home/daimon/projects/opentui-fork-maintainer/`. To exercise the same production workflow
-against a bounded real commit, add `--backport <upstream-sha>`; the
-request is one-shot, refuses to overwrite an unconsumed request, and is
-resumed from its in-flight marker after an interrupted run. Long worker and
-publish operations run as Hermes-managed background processes with completion
-notification and an explicit process wait.
+| Resource | Owner |
+| --- | --- |
+| Parent model | `openai/gpt-6-astra`, OpenRouter Responses, medium reasoning |
+| Profile | `~/.hermes/profiles/opentui-maintainer` |
+| Credential provisioning | Only `OPENROUTER_API_KEY` from the explicitly selected demo profile |
+| Compression | 300,000-token cap; effective trigger is the lower of cap and ratio limit |
+| Skills | One compact auto-injected `opentui-maintainer`; selected supporting skills on demand |
+| Scheduling | Profile-local cron, 09:00 and 21:00 local time, dedicated cron-only gateway |
+| Runtime/state | `/home/daimon/projects/opentui-fork-maintainer/` |
+| Visual judge | Gemini through OpenRouter, using the isolated profile's credential |
 
-Each run is bound to one captured fork base and canonical upstream commit in a
-hashed `run-context.json`. Its renewable lease has an absolute eleven-hour
-deadline, so a crashed run cannot overlap the next twelve-hour tick forever. A
-watchdog and the next-run reconciler converge interrupted publication journals
-to a truthful terminal outcome. Manual backport requests remain queued until a
-successful publish or an explicit, durable failure recovery.
-The post-publish lease deadline is fixed at preparation time and cannot slide
-through renewal; an expired structured run is reconciled before a later tick
-may replace its lease.
+Profiles do not inherit personal MCPs, memories or conversations. The parent
+profile owns its own sessions and credential. The user explicitly approved
+sending sanitized test recordings to Gemini through OpenRouter on 2026-09-05.
+Only maintainer-owned synthetic test captures are eligible; inherited startup
+prompts, images and session overrides must be cleared before capture. Runtime
+constants validate the exact judge route and reject cross-provider fallback.
 
-Deployment is crash-safe: configuration records a durable recovery journal and
-pauses the existing cron under Hermes' cron-store transaction before replacing
-any live asset. The job is resumed only after all assets and persisted cron
-fields verify. If the deploy process is killed, the paused job cannot execute a
-mixed version; rerunning `configure.py --apply` converges the deployment from
-the journal and resumes the job. Catchable failures still roll back both local
-files and the original cron state. The cron stores the supported relative script
-name `opentui_fork_sync.py`; Hermes resolves it inside `~/.hermes/scripts/`.
+## Provision and migrate
 
-The maintainer is deliberately an engineering workflow, not a merge bot. It
-classifies the upstream delta, delegates bounded implementation and review work,
-integrates the results in an isolated worktree, and advances
-`origin/sid/opentui` only through one atomic `gate-and-ship` operation. That
-operation installs from the committed OpenTUI lockfile, runs focused and full
-gates, invokes an external Codex/Claude reviewer on the exact diff, launches the
-candidate under termctrl, analyzes the generated recording with Gemini 3.5
-Flash through canonical OpenRouter, and performs a remote compare-and-swap. It
-never changes the local daily-driver ref, index, or worktree.
+Use the managed Hermes Python with `uv`. Inspect the printed plan before apply.
+The supplied development-skill ZIP is installed as a complete reference library;
+its upstream-specific identity and release rules do not override fork policy.
 
-Run evidence lives at `state/runs/<run-id>/`; `state/last-run.json` is the
-durable terminal summary and `state/last_synced_upstream.sha` is advanced only
-after the remote compare-and-swap succeeds. The notification drain is also
-versioned here. It fails closed when cron delivery state cannot be read and
-requeues messages whose previous delivery failed instead of silently dropping
-them.
+```bash
+hermes profile create opentui-maintainer --no-skills --no-alias
+uv run --no-project --python /home/daimon/.hermes/hermes-agent/venv/bin/python \
+  ops/opentui-fork-maintainer/scripts/provision_profile.py \
+  --dev-skill /absolute/extracted/hermes-agent-dev --apply --refresh-skills
+uv run --no-project --python /home/daimon/.hermes/hermes-agent/venv/bin/python \
+  ops/opentui-fork-maintainer/scripts/configure.py --apply --create-paused \
+  --hermes-home /home/daimon/.hermes/profiles/opentui-maintainer
+```
 
-Use `hermes cron list` for the schedule and last result. For a specific run,
-inspect `state/last-run.json`, its referenced evidence directory, and the
-corresponding cron execution record; do not infer success from a worker summary
-or a still-running terminal process.
+Create the profile only once. Skill refresh stages replacements before replacing
+them and preserves backups outside skill discovery. Provisioning is not a
+whole-profile transaction: keep the job paused while changing its environment.
+The job ID is generated and saved in `state/job-identity.json`; subsequent
+deployments use `--job-id <that-id>`, not another `--create-paused`.
 
-See `prompts/maintainer.md` for the operational contract and
-`tests/` for the cron-ingest security and configuration contracts.
+Pause the legacy default-profile job `c57fe4db4d43` and confirm its current run
+has finished **before deploying shared runtime assets**, not merely before
+resuming the replacement. Creation leaves the new job **paused**. Verify route/tool execution, compression,
+skill loading, candidate source selection and the profile's scheduler before
+resuming it. Never run two active schedules against the same runtime state.
+Use supported profile-scoped `hermes cron pause/resume/run` commands, not raw edits
+to the jobs database. Preserve historical default-profile reports.
+
+Existing multiplex gateways discover profile homes at startup. Creating a profile
+does not prove it has a ticker. Install/start a dedicated profile gateway with
+`hermes -p opentui-maintainer gateway install` and verify its status; a gateway
+with no messaging platforms is intentionally allowed to execute cron jobs.
+Do not restart the user's other gateways to test the maintainer.
+
+Configuration deployment retains the existing pause/journal/verify/rollback
+protocol. Recovery journals are bound to both profile home and job ID. Relative
+entrypoint scripts remain inside that profile's `scripts/` directory, as required
+by the scheduler. An interrupted deployment must be reconciled before resuming.
+
+## Verification and publication
+
+Each wake binds one run token, execution ID, fork base and upstream SHA in
+`run-context.json`. No-op/up-to-date scanner ticks need not invoke a model.
+The absolute eleven-hour lease fits inside the twelve-hour cadence; healthy work
+is not killed at 600 seconds. Worker packets are bounded to four hours and at
+most two concurrent workers. Background long calls and observe their exit status.
+
+The complete gate installs the committed lockfile, runs focused contracts and
+the full OpenTUI check/build, obtains independent review, drives the candidate
+with termctrl, and analyzes its actual recording. The PR stage publishes the
+verified candidate branch and sanitized Preview evidence before the existing
+target compare-and-swap. The target update remains the only publication boundary;
+do not bypass it with `gh pr merge` or worker pushes. A startup/help Preview is
+not proof of a different feature interaction. Use the `before-and-after` skill
+for real matched comparisons and verify uploaded attachment URLs.
+
+Publishing and finalization are separate journaled phases. If the remote accepted
+the candidate before a local failure, reconcile that candidate rather than push
+again. The runtime removes only its proven clean detached integration worktree;
+the user's daily-driver branch, index and working files are untouched.
+
+## Inspect a run
+
+Use `hermes -p opentui-maintainer cron list`, `cron status` and `cron runs` for
+schedule/execution state. Then inspect `state/last-run.json` and its referenced
+`state/runs/<run-id>/` evidence. A scheduler success, model summary or live worker
+does not prove a push. Require a passing manifest, publication journal, terminal
+outcome and matching remote SHA. Reports include PR URL, exact range, behavior,
+actual tests/visual proof and any concrete blocker.
+
+Refresh research only when needed with `scripts/prepare_references.py --refresh`.
+It owns ignored `.repos/` clones, refuses dirty/mismatched checkouts and prints
+exact SHAs. Reference refresh never changes runtime dependencies. Anti-slop is
+available as `npm --prefix ui-opentui run lint:anti-slop`; it currently reports
+unresolved findings separately from the established passing check gate. See
+`ui-opentui/tools/oxlint/README.md` for the measured migration, not a claim of zero
+slop. Failure lessons live with the compact maintainer skill.
+
+See `prompts/maintainer.md` for the control-plane protocol and `tests/` for its
+failure-path contracts. `docs/handoffs/opentui-maintainer-dashboard.md` describes
+a future read-only dashboard; no dashboard is deployed by this workflow.

@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import runpy
 import signal
 import subprocess
 import sys
@@ -84,9 +85,10 @@ SHARED_VENV_PYTEST_PREFIX = [
     "-m",
     "pytest",
 ]
-VIDEO_PROVIDER = "nous"
+SYNTHETIC_PROFILE = Path("/home/daimon/.hermes/profiles/opentui-maintainer")
+VIDEO_PROVIDER = "openrouter"
 VIDEO_MODEL = "google/gemini-3.5-flash"
-VIDEO_BASE_URL = "https://inference-api.nousresearch.com/v1"
+VIDEO_BASE_URL = "https://openrouter.ai/api/v1"
 VIDEO_TAIL_MS = 3_000
 TERMCTRL_READY_HOLD_SECONDS = 1.5
 TERMCTRL_MIN_ACTION_TIMELINE_MS = 1_000
@@ -1223,6 +1225,7 @@ def ship_candidate(
             "worktree": manifest["worktree_proof"]["worktree"],
             "upstream_sha": manifest["review_proof"].get("upstream_sha"),
             "run_binding": manifest["run_binding"],
+            "pr_evidence": manifest.get("pr_evidence"),
             "prepared_unix": int(time.time()),
         }
         prior = _load_publish_journal(
@@ -1575,6 +1578,69 @@ def _wait_for_hydrated_session(
     raise ControlError("OpenTUI did not finish session hydration before smoke actions")
 
 
+def _synthetic_base_environment() -> dict[str, str]:
+    """Use the curated profile, never inherited prompts, gateways, or credentials."""
+    if SYNTHETIC_PROFILE.resolve() != SYNTHETIC_PROFILE:
+        raise ControlError("synthetic profile must be a canonical directory")
+    if (SYNTHETIC_PROFILE / ".op.env").exists():
+        raise ControlError("synthetic profile has an unsupported dotenv source")
+    dotenv = SYNTHETIC_PROFILE / ".env"
+    if dotenv.is_symlink():
+        raise ControlError("synthetic profile dotenv must not be a symlink")
+    if dotenv.exists():
+        lines = [line.strip() for line in dotenv.read_text(encoding="utf-8").splitlines()]
+        assignments = [line for line in lines if line and not line.startswith("#")]
+        if len(assignments) > 1 or any(
+            not line.startswith("OPENROUTER_API_KEY=") for line in assignments
+        ):
+            raise ControlError("synthetic profile dotenv contains unsupported inputs")
+    return {
+        "HOME": "/home/daimon",
+        "LANG": "C.UTF-8",
+        "TERM": "xterm-256color",
+        "COLORTERM": "truecolor",
+        "PATH": CONTROLLED_PATH,
+        "HERMES_HOME": str(SYNTHETIC_PROFILE),
+        "HERMES_PROFILE": "opentui-maintainer",
+    }
+
+
+def _synthetic_capture_environment(candidate: Path) -> dict[str, str]:
+    for name in (".env", ".op.env"):
+        if (candidate / name).exists() or (candidate / name).is_symlink():
+            raise ControlError("synthetic capture refuses candidate dotenv inputs")
+    return {
+        **_synthetic_base_environment(),
+        "PYTHONPATH": str(candidate),
+        "HERMES_PYTHON": str(FORK_VENV_PYTHON),
+        "HERMES_PYTHON_SRC_ROOT": str(candidate),
+        "HERMES_TUI_ENGINE": "opentui",
+        "HERMES_CWD": str(candidate),
+        "TERMINAL_CWD": str(candidate),
+    }
+
+
+def _synthetic_scope() -> dict[str, Any]:
+    return {
+        "profile": str(SYNTHETIC_PROFILE),
+        "flow": "synthetic-startup-help",
+        "personal_history": False,
+        "environment": "allowlist-v1",
+    }
+
+
+def _synthetic_capture_scope(
+    env: dict[str, str], actions: list[dict[str, Any]], candidate: Path
+) -> dict[str, Any] | None:
+    if (
+        env == _synthetic_capture_environment(candidate)
+        and len(actions) == 1
+        and actions[0]["send"] == ["text:/help", "enter"]
+    ):
+        return _synthetic_scope()
+    return None
+
+
 def verify_termctrl_drive(
     value: Any, evidence_root: Path, candidate: Path
 ) -> dict[str, Any]:
@@ -1600,16 +1666,7 @@ def verify_termctrl_drive(
     session = f"maintainer-{os.getpid()}-{time.time_ns()}"
     if not FORK_VENV_PYTHON.is_file():
         raise ControlError("the fork dependency-complete Python runtime is unavailable")
-    child_env = {
-        **os.environ,
-        "PATH": CONTROLLED_PATH,
-        "PYTHONPATH": str(candidate),
-        "HERMES_PYTHON": str(FORK_VENV_PYTHON),
-        "HERMES_PYTHON_SRC_ROOT": str(candidate),
-        "HERMES_TUI_ENGINE": "opentui",
-        "HERMES_CWD": str(candidate),
-    }
-    child_env.pop("PYTHONHOME", None)
+    child_env = _synthetic_capture_environment(candidate)
     launch = [
         "start",
         session,
@@ -1731,6 +1788,7 @@ def verify_termctrl_drive(
             raise ControlError(f"termctrl did not regenerate {output.name}")
     return {
         "launch_argv": launch,
+        "publication_scope": _synthetic_capture_scope(child_env, actions, candidate),
         "recording_path": str(recording),
         "recording_sha256": _file_sha256(recording),
         "markers_path": str(marker_path),
@@ -2325,7 +2383,7 @@ def run_adversarial_review(
     }
 
 
-def _canonical_nous(value: Any) -> bool:
+def _canonical_video_endpoint(value: Any) -> bool:
     return str(value).rstrip("/") == VIDEO_BASE_URL
 
 
@@ -2352,9 +2410,9 @@ def _invoke_video_analyze_in_process(video_path: Path) -> str:
         client is None
         or effective_provider != VIDEO_PROVIDER
         or final_model != VIDEO_MODEL
-        or not _canonical_nous(getattr(client, "base_url", None))
+        or not _canonical_video_endpoint(getattr(client, "base_url", None))
     ):
-        raise ControlError("the canonical Nous Gemini video route is unavailable")
+        raise ControlError("the canonical OpenRouter Gemini video route is unavailable")
 
     async def pinned_video_call(**kwargs: Any) -> Any:
         route_info: dict[str, str] = {}
@@ -2368,7 +2426,7 @@ def _invoke_video_analyze_in_process(video_path: Path) -> str:
         }
         response = await delegated_call(**pinned)
         if route_info != {"provider": VIDEO_PROVIDER, "model": VIDEO_MODEL}:
-            raise ControlError("video analysis escaped the pinned Nous route")
+            raise ControlError("video analysis escaped the pinned OpenRouter route")
         return response
 
     def no_provider_recovery(*_args: Any, **_kwargs: Any):
@@ -2386,7 +2444,7 @@ def _invoke_video_analyze_in_process(video_path: Path) -> str:
 
         The preflight above proves the configured route is available, but the
         auxiliary client resolves again for the actual request and may consult
-        a credential pool or cache. Guard that second seam so a custom Nous
+        a credential pool or cache. Guard that second seam so a custom provider
         endpoint cannot pass preflight and then receive the acceptance video.
         """
         if task != "vision":
@@ -2407,9 +2465,9 @@ def _invoke_video_analyze_in_process(video_path: Path) -> str:
             route.resolved_provider != VIDEO_PROVIDER
             or route.effective_provider != VIDEO_PROVIDER
             or route.final_model != VIDEO_MODEL
-            or not _canonical_nous(getattr(route.client, "base_url", None))
+            or not _canonical_video_endpoint(getattr(route.client, "base_url", None))
         ):
-            raise ControlError("video analysis escaped the canonical Nous route")
+            raise ControlError("video analysis escaped the canonical OpenRouter route")
         return route
 
     original_call = vision_tools.async_call_llm
@@ -2438,6 +2496,8 @@ def _invoke_video_analyze(video_path: Path) -> str:
     launch the managed-install interpreter in isolated mode, load this trusted
     runtime by exact path, and import the verdict-producing Hermes code only from
     the installed fork. The candidate contributes the hashed MP4, never judge code.
+    The approved OpenRouter route uses only the isolated maintainer profile's key;
+    no default-profile credentials, agent instance, or session history are loaded.
     """
     video_path = Path(os.path.abspath(video_path))
     trusted_root = Path(os.path.abspath(TRUSTED_HERMES_ROOT))
@@ -2460,6 +2520,8 @@ runtime_path = pathlib.Path(sys.argv[1])
 trusted_root = pathlib.Path(sys.argv[2])
 video_path = pathlib.Path(sys.argv[3])
 sys.path.insert(0, str(trusted_root))
+from hermes_cli.env_loader import load_hermes_dotenv
+load_hermes_dotenv(project_env=None, load_external_secrets=False)
 spec = importlib.util.spec_from_file_location("_hermes_maintainer_runtime", runtime_path)
 if spec is None or spec.loader is None:
     raise RuntimeError("could not load trusted maintainer runtime")
@@ -2470,7 +2532,7 @@ encoded = base64.b64encode(raw.encode("utf-8")).decode("ascii")
 print("HERMES_VIDEO_RESULT_B64=" + encoded)
 """
     env = {
-        **os.environ,
+        **_synthetic_base_environment(),
         # -I ignores this for the primary interpreter; descendants inherit it.
         "PYTHONPATH": str(trusted_root),
         "PYTHONSAFEPATH": "1",
@@ -2525,6 +2587,8 @@ def verify_video_request(
 ) -> dict[str, Any]:
     if value != {"provider": VIDEO_PROVIDER, "model": VIDEO_MODEL}:
         raise ControlError("video analysis used the wrong provider or model")
+    if termctrl_evidence.get("publication_scope") != _synthetic_scope():
+        raise ControlError("video upload requires a sanitized synthetic capture")
     video_path = _verified_file(
         termctrl_evidence, "video_path", "video_sha256", evidence_root
     )
@@ -2883,6 +2947,19 @@ def _validate_success_cleanup_worktree(
     return resolved_cwd
 
 
+def _publish_pr_evidence(
+    repo: Path, evidence_root: Path, manifest: dict[str, Any], remote: str
+) -> dict[str, Any]:
+    # Load only the installed sibling control-plane module, never candidate code.
+    publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
+    try:
+        return publisher["publish_preview"](
+            repo, evidence_root, manifest, node=NODE26, remote=remote
+        )
+    except (RuntimeError, ValueError, KeyError, OSError) as exc:
+        raise ControlError(f"PR evidence publication refused: {exc}") from exc
+
+
 def gate_and_ship(
     repo: Path,
     packet_path: Path,
@@ -2925,6 +3002,13 @@ def gate_and_ship(
     failed = [item["id"] for item in result["checks"] if item["status"] != "passed"]
     if failed:
         raise ControlError("candidate gates failed: " + ", ".join(failed))
+    validate_gate_manifest(
+        repo, manifest_path, base_sha=base_sha, candidate_sha=candidate_sha,
+        token=token, branch=branch,
+    )
+    proof = _publish_pr_evidence(repo, evidence_root, result, remote)
+    result["pr_evidence"] = proof
+    _atomic_json(manifest_path, result)
     ship_candidate(
         repo,
         manifest_path,

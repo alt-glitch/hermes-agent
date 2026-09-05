@@ -5,6 +5,7 @@ import {
   flattenTree,
   normalizeSubagentStatus,
   type SubagentNode,
+  type SubagentStatus,
   type SubagentTreeItem
 } from '../../../logic/subagentTree.ts'
 
@@ -59,7 +60,7 @@ export interface DashboardAgent extends SubagentTreeItem {
   readonly trace?: readonly TraceEntry[]
 }
 
-const STATUS_RANK: Readonly<Record<string, number>> = {
+const STATUS_RANK: Readonly<Record<SubagentStatus, number>> = {
   error: 0,
   failed: 0,
   interrupted: 1,
@@ -230,7 +231,7 @@ export function snapshotDashboardAgents(snapshot: SpawnSnapshot): readonly Dashb
 }
 
 function statusRank(status: string): number {
-  return STATUS_RANK[normalizeSubagentStatus(status)] ?? STATUS_RANK['error'] ?? 0
+  return STATUS_RANK[normalizeSubagentStatus(status)]
 }
 
 const SORT_COMPARATORS: Readonly<

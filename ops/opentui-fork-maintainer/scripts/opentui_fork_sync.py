@@ -33,8 +33,6 @@ PROBE = PROJECT_HOME / "scripts" / "sync_probe.py"
 INGEST_FILE = STATE_DIR / "ingest.latest.json"
 FAIL_COUNT_FILE = STATE_DIR / "consecutive_probe_failures"
 LEASE_TTL_SECONDS = 11 * 60 * 60
-CRON_JOB_ID = os.environ.get("OPENTUI_MAINTAINER_CRON_JOB_ID", "c57fe4db4d43")
-CRON_EXECUTIONS_DB = Path.home() / ".hermes" / "cron" / "executions.db"
 RUNTIME = PROJECT_HOME / "scripts" / "maintainer_runtime.py"
 WATCHDOG_POLL_SECONDS = 15
 WATCHDOG_GRACE_SECONDS = 5 * 60
@@ -423,16 +421,40 @@ def _bind_run_context(token: str, context: dict[str, Any]) -> None:
         _write_text_atomic(STATE_DIR / "run.lease.json", json.dumps(value) + "\n")
 
 
+def _cron_identity() -> tuple[str, Path]:
+    identity_path = STATE_DIR / "job-identity.json"
+    inherited_home = os.environ.get("HERMES_HOME")
+    inherited_job = os.environ.get("OPENTUI_MAINTAINER_CRON_JOB_ID")
+    if identity_path.exists():
+        try:
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            job_id = identity["job_id"]
+            home = Path(identity["hermes_home"])
+            if not isinstance(job_id, str) or not job_id or not home.is_absolute():
+                raise ValueError("invalid identity fields")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError("invalid maintainer cron identity") from exc
+        if inherited_home and Path(inherited_home).expanduser().resolve() != home.resolve():
+            raise RuntimeError("maintainer cron profile differs from deployed identity")
+        if inherited_job and inherited_job != job_id:
+            raise RuntimeError("maintainer cron job differs from deployed identity")
+        return job_id, home.resolve()
+    # Compatibility for pre-migration deployments without an identity manifest.
+    home = Path(inherited_home).expanduser() if inherited_home else Path.home() / ".hermes"
+    return inherited_job or "c57fe4db4d43", home.resolve()
+
+
 def _current_execution_id() -> str | None:
+    job_id, home = _cron_identity()
     try:
-        with sqlite3.connect(CRON_EXECUTIONS_DB, timeout=5) as conn:
+        with sqlite3.connect((home / "cron/executions.db").as_uri() + "?mode=ro", uri=True, timeout=5) as conn:
             row = conn.execute(
                 """
                 SELECT id FROM executions
                 WHERE job_id=? AND status='running'
                 ORDER BY started_at DESC LIMIT 1
                 """,
-                (CRON_JOB_ID,),
+                (job_id,),
             ).fetchone()
     except (OSError, sqlite3.Error):
         return None
@@ -442,11 +464,12 @@ def _current_execution_id() -> str | None:
 def _execution_state(execution_id: str, acquired_unix: int) -> tuple[str, str | None]:
     if execution_id.startswith("legacy:"):
         return "untracked", None
+    job_id, home = _cron_identity()
     try:
-        with sqlite3.connect(CRON_EXECUTIONS_DB, timeout=5) as conn:
+        with sqlite3.connect((home / "cron/executions.db").as_uri() + "?mode=ro", uri=True, timeout=5) as conn:
             row = conn.execute(
                 "SELECT status FROM executions WHERE id=? AND job_id=?",
-                (execution_id, CRON_JOB_ID),
+                (execution_id, job_id),
             ).fetchone()
     except (OSError, sqlite3.Error):
         return "error", None
@@ -811,6 +834,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--check-identity"]:
+        job_id, home = _cron_identity()
+        print(json.dumps({"job_id": job_id, "hermes_home": str(home),
+                          "execution_id": _current_execution_id()}))
+        sys.exit(0)
     if len(sys.argv) == 5 and sys.argv[1] == "--reconcile-watch":
         sys.exit(
             _watch_execution(

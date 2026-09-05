@@ -245,6 +245,14 @@ describe('subagent status normalization', () => {
     expect(normalizeTerminalStatus('mystery', 'timeout')).toBe('timeout')
   })
 
+  test.each(['__proto__', 'constructor', 'toString', {}, null, 1])(
+    'does not interpret an unknown value as a known status: %j',
+    value => {
+      expect(normalizeSubagentStatus(value, 'queued')).toBe('queued')
+      expect(normalizeTerminalStatus(value, 'failed')).toBe('failed')
+    }
+  )
+
   test('recognizes terminal aliases without treating live aliases as terminal', () => {
     for (const status of ['completed', 'complete', 'failed', 'error', 'interrupted', 'timeout', 'cancelled']) {
       expect(isTerminalStatus(status)).toBe(true)

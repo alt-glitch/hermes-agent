@@ -9,11 +9,11 @@
  */
 import { Effect, Layer } from 'effect'
 
-import { GatewayService, type GatewayServiceShape } from '../boundary/gateway/GatewayService.ts'
+import { GatewayService, type GatewayTransport } from '../boundary/gateway/GatewayService.ts'
 import type { GatewayEvent } from '../boundary/schema/GatewayEvent.ts'
 
 export interface FakeGatewayController {
-  readonly service: GatewayServiceShape
+  readonly service: GatewayTransport
   /** Emit a decoded event to all subscribers (drives the store in tests). */
   readonly emit: (event: GatewayEvent) => void
   /** Recorded (method, params) pairs from `request` calls. */
@@ -25,7 +25,7 @@ export function makeFakeGateway(initialSessionId = 'fake-session'): FakeGatewayC
   const handlers = new Set<(event: GatewayEvent) => void>()
   const calls: Array<{ method: string; params: unknown }> = []
 
-  const service: GatewayServiceShape = {
+  const service: GatewayTransport = {
     subscribe: handler =>
       Effect.sync(() => {
         handlers.add(handler)

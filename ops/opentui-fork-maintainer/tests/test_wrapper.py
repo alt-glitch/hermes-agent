@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
@@ -20,6 +21,34 @@ SPEC.loader.exec_module(wrapper)
 
 BASE_SHA = "a" * 40
 UPSTREAM_SHA = "b" * 40
+
+
+def test_execution_identity_uses_migrated_profile_ledger(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    database = profile / "cron/executions.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE executions (id TEXT, job_id TEXT, status TEXT, started_at TEXT)")
+        conn.executemany("INSERT INTO executions VALUES (?, ?, ?, ?)", [
+            ("target-execution", "new-job", "running", "2026-09-05"),
+            ("other-execution", "other-job", "running", "2026-09-06"),
+        ])
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "job-identity.json").write_text(json.dumps({"hermes_home": str(profile), "job_id": "new-job"}))
+    monkeypatch.setattr(wrapper, "STATE_DIR", state)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.delenv("OPENTUI_MAINTAINER_CRON_JOB_ID", raising=False)
+    assert wrapper._current_execution_id() == "target-execution"
+    assert wrapper._execution_state("target-execution", 0) == ("ok", "running")
+    assert wrapper._execution_state("other-execution", 0) == ("missing", None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "wrong-profile"))
+    with pytest.raises(RuntimeError, match="profile"):
+        wrapper._current_execution_id()
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("OPENTUI_MAINTAINER_CRON_JOB_ID", "wrong-job")
+    with pytest.raises(RuntimeError, match="job"):
+        wrapper._current_execution_id()
 
 
 def _run_with_payload(

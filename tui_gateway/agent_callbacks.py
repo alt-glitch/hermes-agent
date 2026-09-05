@@ -249,6 +249,12 @@ def _load_fallback_model():
     return get_fallback_chain(_load_cfg())
 
 
+def _disabled_toolsets_from_config(cfg: dict) -> list[str]:
+    from agent.skill_utils import parse_config_string_list
+    return [name.strip() for name in parse_config_string_list(
+        (cfg.get("agent") or {}).get("disabled_toolsets")) if name.strip()]
+
+
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
 
@@ -270,6 +276,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
                              "provider_data_collection", "openrouter_min_coding_score")},
         "model": g("model") or _resolve_model(), "max_iterations": _cfg_max_turns(cfg, 25),
         "enabled_toolsets": g("enabled_toolsets") or _load_enabled_toolsets("tui"),
+        "disabled_toolsets": list(g("disabled_toolsets") or []),
         "quiet_mode": True, "verbose_logging": False,
         "provider_require_parameters": g("provider_require_parameters", False), "session_id": task_id,
         "reasoning_config": g("reasoning_config") or _load_reasoning_config(str(g("model", "") or "")),

@@ -851,12 +851,6 @@ function readOptNum(payload: { readonly [k: string]: unknown }, key: string): nu
   return typeof v === 'number' ? v : undefined
 }
 
-/** Status telemetry must never render NaN/Infinity from a malformed provider. */
-function readFiniteNum(payload: { readonly [k: string]: unknown } | undefined, key: string): number | undefined {
-  const value = payload?.[key]
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
-}
-
 /** Render a raw tool `result` for display: strings as-is, anything else pretty
  *  JSON — both then go through the same envelope-strip pipeline as result_text. */
 function stringifyResult(v: unknown): string | undefined {
@@ -880,25 +874,18 @@ function stringifyResult(v: unknown): string | undefined {
 function readInfoPatch(payload: object): Partial<SessionInfo> {
   const decoded = decodeSessionInfoPatch(payload)
   if (Option.isNone(decoded)) return {}
-  const patch = infoPatchFrom(decoded.value)
-  const raw = payload as { readonly [k: string]: unknown }
-  const usageValue = raw['usage']
-  const usage =
-    usageValue && typeof usageValue === 'object' && !Array.isArray(usageValue)
-      ? (usageValue as { readonly [k: string]: unknown })
-      : undefined
-  const cacheHitPct = readFiniteNum(usage, 'cache_hit_pct') ?? readFiniteNum(raw, 'cache_hit_pct')
-  if (cacheHitPct !== undefined) patch.cacheHitPct = cacheHitPct
-  const avgLatencyS = readFiniteNum(usage, 'avg_latency_s') ?? readFiniteNum(raw, 'avg_latency_s')
-  if (avgLatencyS !== undefined) patch.avgLatencyS = avgLatencyS
-  const avgTps = readFiniteNum(usage, 'avg_tps') ?? readFiniteNum(raw, 'avg_tps')
-  if (avgTps !== undefined) patch.avgTps = avgTps
-  return patch
+  return infoPatchFrom(decoded.value)
 }
 
 /** Build the SessionInfo patch from a decoded session.info payload. */
 function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   const patch: Partial<SessionInfo> = {}
+  const cacheHitPct = d.usage?.cache_hit_pct ?? d.cache_hit_pct
+  if (cacheHitPct !== undefined) patch.cacheHitPct = cacheHitPct
+  const avgLatencyS = d.usage?.avg_latency_s ?? d.avg_latency_s
+  if (avgLatencyS !== undefined) patch.avgLatencyS = avgLatencyS
+  const avgTps = d.usage?.avg_tps ?? d.avg_tps
+  if (avgTps !== undefined) patch.avgTps = avgTps
   if (d.model) patch.model = d.model
   if (d.reasoning_effort) patch.effort = d.reasoning_effort
   if (d.fast !== undefined) patch.fast = d.fast

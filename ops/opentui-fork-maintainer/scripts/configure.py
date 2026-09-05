@@ -2,7 +2,7 @@
 """Install and configure the production OpenTUI fork-maintainer cron.
 
 The default mode is a read-only plan. ``--apply`` deploys versioned assets,
-installs the three maintainer-specific skills, and pins the existing cron
+installs maintainer reference skills, and pins the selected profile's cron
 through Hermes' supported cronjob API. The deployed runtime pins its own video
 verifier route without changing the user's auxiliary settings or credential
 files.
@@ -17,10 +17,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, ContextManager
@@ -36,8 +37,8 @@ if str(REPO_ROOT) not in sys.path:
 JOB_ID = "c57fe4db4d43"
 JOB_NAME = "opentui-fork-sync"
 SCHEDULE = "0 9,21 * * *"
-MODEL = "openai/gpt-5.6-sol"
-PROVIDER = "nous"
+MODEL = "openai/gpt-6-astra"
+PROVIDER = "openrouter"
 REASONING_EFFORT = "medium"
 VIDEO_MODEL = "google/gemini-3.5-flash"
 INACTIVITY_TIMEOUT_SECONDS = 18_000
@@ -45,27 +46,20 @@ CRON_ENTRYPOINT_NAME = "opentui_fork_sync.py"
 DEPLOYMENT_JOURNAL_NAME = "deployment.inflight.json"
 WORKDIR = Path("/home/daimon/side-quests/hermes-agent")
 RUNTIME_HOME = Path("/home/daimon/projects/opentui-fork-maintainer")
+LEGACY_HERMES_HOME = Path.home() / ".hermes"
 SOURCE_HOME = Path(__file__).resolve().parents[1]
 
-SKILLS = [
-    "codex",
-    "claude-code",
-    "adversarial-review-loop",
-    "terminal-control",
-    "opentui-tui-engineering",
-    "tmux-pane-screenshot",
-]
+SKILLS = ["opentui-maintainer"]
 TOOLSETS = ["terminal", "file", "skills", "delegation", "video", "todo", "no_mcp"]
 MAINTAINER_SKILL_SOURCES = {
-    "terminal-control": Path.home() / ".agents/skills/terminal-control",
-    "opentui-tui-engineering": Path.home() / ".agents/skills/opentui-tui-engineering",
-    "tmux-pane-screenshot": Path.home() / ".agents/skills/tmux-pane-screenshot",
+    "opentui-maintainer": SOURCE_HOME / "skills/opentui-maintainer",
 }
 RUNTIME_ASSETS = (
     Path("prompts/maintainer.md"),
     Path("scripts/opentui_fork_sync.py"),
     Path("scripts/sync_probe.py"),
     Path("scripts/maintainer_runtime.py"),
+    Path("scripts/pr_publication.py"),
     Path("scripts/worktree.sh"),
 )
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
@@ -93,13 +87,15 @@ def bootstrap_prompt(runtime_home: Path = RUNTIME_HOME) -> str:
 def cron_update(
     runtime_home: Path = RUNTIME_HOME,
     hermes_home: Path = Path.home() / ".hermes",
+    *, job_id: str = JOB_ID,
 ) -> dict[str, Any]:
     """Single source of truth for the supported cronjob update call."""
     return {
         "action": "update",
-        "job_id": JOB_ID,
+        "job_id": job_id,
         "prompt": bootstrap_prompt(runtime_home),
         "schedule": SCHEDULE,
+        "repeat": 0,
         "name": JOB_NAME,
         "deliver": "local",
         "skills": list(SKILLS),
@@ -332,9 +328,10 @@ def queue_backport(runtime_home: Path, commits: list[str]) -> Path:
 def _cron_restore_update(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "action": "update",
-        "job_id": JOB_ID,
+        "job_id": snapshot.get("id") or snapshot.get("job_id") or JOB_ID,
         "prompt": str(snapshot.get("prompt") or ""),
         "schedule": str(snapshot.get("schedule_display") or ""),
+        "repeat": (snapshot.get("repeat") or {}).get("times") or 0,
         "name": str(snapshot.get("name") or JOB_NAME),
         "deliver": str(snapshot.get("deliver") or "local"),
         "skills": list(snapshot.get("skills") or []),
@@ -345,6 +342,8 @@ def _cron_restore_update(snapshot: dict[str, Any]) -> dict[str, Any]:
         "enabled_toolsets": list(snapshot.get("enabled_toolsets") or []),
         "workdir": str(snapshot.get("workdir") or ""),
         "no_agent": bool(snapshot.get("no_agent", False)),
+        "reasoning_effort": snapshot.get("reasoning_effort"),
+        "inactivity_timeout_seconds": snapshot.get("inactivity_timeout_seconds"),
     }
 
 
@@ -354,12 +353,15 @@ def _deployment_journal_path(runtime_home: Path) -> Path:
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     """Durably replace a small recovery record before live mutation starts."""
+    _atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_name, path)
@@ -375,7 +377,22 @@ def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
             pass
 
 
-def _load_deployment_journal(runtime_home: Path) -> dict[str, Any] | None:
+def _install_cron_entrypoint(path: Path, runtime_home: Path, hermes_home: Path, job_id: str) -> None:
+    bindings = {
+        "HERMES_HOME": str(hermes_home.expanduser().resolve()),
+        "OPENTUI_MAINTAINER_HOME": str(runtime_home.expanduser().resolve()),
+        "OPENTUI_MAINTAINER_CRON_JOB_ID": job_id,
+    }
+    runtime_script = runtime_home.resolve() / "scripts" / CRON_ENTRYPOINT_NAME
+    _atomic_write_text(path, "#!/usr/bin/env python3\nimport os\nimport runpy\n"
+                       f"os.environ.update({bindings!r})\n"
+                       f"runpy.run_path({str(runtime_script)!r}, run_name='__main__')\n")
+
+
+def _load_deployment_journal(
+    runtime_home: Path, *, job_id: str = JOB_ID,
+    hermes_home: Path = Path.home() / ".hermes",
+) -> dict[str, Any] | None:
     path = _deployment_journal_path(runtime_home)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -388,17 +405,23 @@ def _load_deployment_journal(runtime_home: Path) -> dict[str, Any] | None:
     if not isinstance(value, dict) or value.get("version") != 1:
         raise ConfigurationError(f"invalid deployment recovery journal: {path}")
     snapshot = value.get("cron_snapshot")
-    if value.get("job_id") != JOB_ID or not isinstance(snapshot, dict):
+    if (value.get("job_id") != job_id or not isinstance(snapshot, dict)
+            or (snapshot.get("id") or snapshot.get("job_id")) != job_id
+            or value.get("hermes_home") != str(hermes_home.expanduser().resolve())):
         raise ConfigurationError(f"invalid deployment recovery journal: {path}")
     return value
 
 
-def _write_deployment_journal(runtime_home: Path, snapshot: dict[str, Any]) -> None:
+def _write_deployment_journal(
+    runtime_home: Path, snapshot: dict[str, Any], *,
+    hermes_home: Path = Path.home() / ".hermes",
+) -> None:
     _atomic_write_json(
         _deployment_journal_path(runtime_home),
         {
             "version": 1,
-            "job_id": JOB_ID,
+            "job_id": snapshot.get("id") or snapshot.get("job_id") or JOB_ID,
+            "hermes_home": str(hermes_home.expanduser().resolve()),
             "phase": "pause-required",
             "cron_snapshot": snapshot,
         },
@@ -430,19 +453,20 @@ def _cron_call_required(
 def _pause_cron_for_deployment(
     cron_call: Callable[..., str],
     cron_read_call: Callable[[str], dict[str, Any] | None],
+    job_id: str = JOB_ID,
 ) -> None:
-    current = copy.deepcopy(cron_read_call(JOB_ID))
+    current = copy.deepcopy(cron_read_call(job_id))
     if not isinstance(current, dict):
-        raise ConfigurationError(f"maintainer cron job {JOB_ID!r} does not exist")
+        raise ConfigurationError(f"maintainer cron job {job_id!r} does not exist")
     if current.get("state") != "paused":
         _cron_call_required(
             cron_call,
             "cron pause before deployment failed",
             action="pause",
-            job_id=JOB_ID,
+            job_id=job_id,
             reason="OpenTUI maintainer deployment in progress",
         )
-    paused = copy.deepcopy(cron_read_call(JOB_ID))
+    paused = copy.deepcopy(cron_read_call(job_id))
     if not isinstance(paused, dict) or paused.get("state") != "paused":
         raise ConfigurationError("cron pause was not durably persisted")
 
@@ -457,13 +481,13 @@ def _restore_cron_job(cron_call: Callable[..., str], snapshot: dict[str, Any]) -
         transition = json.loads(
             cron_call(
                 action="pause",
-                job_id=JOB_ID,
+                job_id=restore["job_id"],
                 reason=str(snapshot.get("paused_reason") or "restored paused state"),
             )
         )
         action = "pause"
     else:
-        transition = json.loads(cron_call(action="resume", job_id=JOB_ID))
+        transition = json.loads(cron_call(action="resume", job_id=restore["job_id"]))
         action = "resume"
     if transition.get("success") is not True:
         raise ConfigurationError(f"cron {action} rollback failed: {transition}")
@@ -526,6 +550,11 @@ def _cron_persistence_mismatches(
     actual_id = _normalized_text(persisted.get("id") or persisted.get("job_id"))
     comparisons: dict[str, tuple[Any, Any]] = {
         "job_id": (actual_id, expected_id),
+        "repeat": (
+            (persisted.get("repeat") or {}).get("times") if isinstance(persisted.get("repeat"), dict)
+            else persisted.get("repeat") or None,
+            intended.get("repeat") or None,
+        ),
         "schedule": (
             _normalized_schedule(persisted),
             " ".join(str(intended.get("schedule") or "").split()) or None,
@@ -594,7 +623,7 @@ def _compensate_cron_update_if_owned(
 ) -> None:
     """Restore only when the cron still contains our write or its old snapshot."""
     try:
-        current = copy.deepcopy(cron_read_call(JOB_ID))
+        current = copy.deepcopy(cron_read_call(intended["job_id"]))
     except Exception as exc:
         raise ConfigurationError(
             "cron state could not be reread; refusing an unsafe rollback"
@@ -608,11 +637,113 @@ def _compensate_cron_update_if_owned(
     _restore_cron_job(cron_call, snapshot)
 
 
+@contextmanager
+def _cron_profile_scope(hermes_home: Path):
+    from cron.jobs import use_cron_store
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    token = set_hermes_home_override(hermes_home.expanduser().resolve())
+    try:
+        with use_cron_store(hermes_home):
+            yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _require_previous_owner_paused(runtime_home: Path, hermes_home: Path, job_id: str | None) -> None:
+    """Preflight other owners; operators must not resume them during cutover.
+
+    Do not hold a cross-profile cron transaction across deployment: cron's
+    nesting counter is thread-global, which would skip the target store lock.
+    The caller holds the shared runtime lease lock across this check and deploy.
+    """
+    from cron.jobs import cron_store_transaction, get_job
+
+    owners: set[tuple[Path, str]] = set()
+    identity_path = runtime_home / "state/job-identity.json"
+    if identity_path.exists():
+        try:
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            home, prior_id = Path(identity["hermes_home"]), identity["job_id"]
+            if not home.is_absolute() or not isinstance(prior_id, str) or not prior_id:
+                raise ValueError("invalid identity fields")
+            owners.add((home.resolve(), prior_id))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise ConfigurationError("invalid previous runtime owner identity") from exc
+    if runtime_home.resolve() == RUNTIME_HOME.resolve():
+        owners.add((LEGACY_HERMES_HOME.resolve(), JOB_ID))
+    for home, prior_id in sorted(owners):
+        if home == hermes_home.resolve() and (job_id is None or prior_id == job_id):
+            continue
+        with _cron_profile_scope(home), cron_store_transaction():
+            previous = get_job(prior_id)
+            if previous and previous.get("enabled") is not False:
+                raise ConfigurationError(
+                    f"pause prior maintainer {prior_id} in {home} before deploying the shared runtime")
+            if previous and (previous.get("run_claim") or previous.get("fire_claim")):
+                raise ConfigurationError("previous maintainer still has an execution claim; wait for quiescence")
+            database = home / "cron/executions.db"
+            if database.is_file():
+                try:
+                    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=5)) as conn:
+                        active = conn.execute(
+                            "SELECT 1 FROM executions WHERE job_id=? AND status IN ('claimed','running') LIMIT 1",
+                            (prior_id,),
+                        ).fetchone()
+                except sqlite3.Error as exc:
+                    raise ConfigurationError("cannot verify previous maintainer execution quiescence") from exc
+                if active:
+                    raise ConfigurationError("previous maintainer still has an active execution; wait for quiescence")
+
+
+def create_paused_configuration(
+    *, source_home: Path, runtime_home: Path, hermes_home: Path,
+) -> dict[str, Any]:
+    """Bootstrap a separate profile without scheduling work before verification.
+
+    The initial far-future schedule is inert even if this process dies between
+    creation and pause. Re-run deployment with its returned job ID after a failure;
+    duplicate creation is refused. Pause the former profile's job BEFORE deploying
+    shared runtime assets and leave it paused throughout cutover. It is never modified here.
+    """
+    from cron.jobs import cron_store_transaction, get_job, list_jobs
+    from tools.cronjob_tools import cronjob
+
+    validate_sources(source_home)
+    with _cron_profile_scope(hermes_home), _maintenance_quiescence_lock(runtime_home):
+        _require_previous_owner_paused(runtime_home, hermes_home, None)
+        with cron_store_transaction():
+            existing = [job for job in list_jobs(include_disabled=True) if job.get("name") == JOB_NAME]
+            if existing:
+                raise ConfigurationError(
+                    f"maintainer already exists in this profile; use --job-id {existing[0]['id']}")
+            if _deployment_journal_path(runtime_home).exists():
+                raise ConfigurationError("recover the existing deployment journal before creating another job")
+            seed = cron_update(runtime_home, hermes_home)
+            seed.pop("job_id")
+            seed.update(action="create", schedule="2099-01-01T00:00:00+00:00", skills=[], script="")
+            created = _cron_call_required(cronjob, "cron creation failed", **seed)
+            job_id = created.get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                raise ConfigurationError("cron creation omitted its job ID; inspect the profile's cron list")
+            try:
+                _pause_cron_for_deployment(cronjob, get_job, job_id)
+            except BaseException:
+                _cron_call_required(cronjob, "failed bootstrap cleanup", action="remove", job_id=job_id)
+                raise
+            _atomic_write_json(runtime_home / "state/job-identity.json", {
+                "job_id": job_id, "hermes_home": str(hermes_home.expanduser().resolve()),
+            })
+    return apply_configuration(source_home=source_home, runtime_home=runtime_home,
+                               hermes_home=hermes_home, job_id=job_id)
+
+
 def apply_configuration(
     *,
     source_home: Path,
     runtime_home: Path,
     hermes_home: Path,
+    job_id: str = JOB_ID,
     cron_call: Callable[..., str] | None = None,
     cron_snapshot_call: Callable[[str], dict[str, Any] | None] | None = None,
     cron_read_call: Callable[[str], dict[str, Any] | None] | None = None,
@@ -644,6 +775,8 @@ def apply_configuration(
     targets = [runtime_home / relative for relative in RUNTIME_ASSETS]
     cron_entrypoint = hermes_home / "scripts" / CRON_ENTRYPOINT_NAME
     targets.append(cron_entrypoint)
+    identity_path = runtime_home / "state/job-identity.json"
+    targets.append(identity_path)
     targets.extend(
         hermes_home / "skills/software-development" / name
         for name in MAINTAINER_SKILL_SOURCES
@@ -654,7 +787,8 @@ def apply_configuration(
     request_guard = (
         _request_lock(runtime_home) if normalized_backports else nullcontext()
     )
-    with _maintenance_quiescence_lock(runtime_home):
+    with _cron_profile_scope(hermes_home), _maintenance_quiescence_lock(runtime_home):
+        _require_previous_owner_paused(runtime_home, hermes_home, job_id)
         with request_guard:
             if normalized_backports:
                 _assert_no_active_request(runtime_home)
@@ -664,46 +798,46 @@ def apply_configuration(
             # The cron-store lock excludes scheduler claims and operator mutations
             # across pause, local replacement, verification, and final resume.
             with cron_guard:
-                journal = _load_deployment_journal(runtime_home)
+                journal = _load_deployment_journal(runtime_home, job_id=job_id, hermes_home=hermes_home)
                 recovering = journal is not None
                 if journal is not None:
                     cron_snapshot = copy.deepcopy(journal["cron_snapshot"])
                 else:
                     cron_snapshot = copy.deepcopy(
-                        cron_snapshot_call(JOB_ID)
+                        cron_snapshot_call(job_id)
                         if cron_snapshot_call is not None
-                        else cron_read_call(JOB_ID)
+                        else cron_read_call(job_id)
                     )
                     if not isinstance(cron_snapshot, dict):
                         raise ConfigurationError(
-                            f"maintainer cron job {JOB_ID!r} does not exist"
+                            f"maintainer cron job {job_id!r} does not exist"
                         )
                     # A hard process death after this write is recoverable: the
                     # next apply pauses the job and converges every local asset.
-                    _write_deployment_journal(runtime_home, cron_snapshot)
+                    _write_deployment_journal(runtime_home, cron_snapshot, hermes_home=hermes_home)
 
                 try:
-                    _pause_cron_for_deployment(cron_call, cron_read_call)
+                    _pause_cron_for_deployment(cron_call, cron_read_call, job_id)
                     with rollback_paths(targets):
                         # Stage and snapshot the one-shot request before touching
                         # live assets. A catchable failure restores it.
                         if normalized_backports:
                             _write_backport_request(request, normalized_backports)
                         deploy_assets(source_home, runtime_home)
-                        _copy_atomic(
-                            source_home / "scripts" / CRON_ENTRYPOINT_NAME,
-                            cron_entrypoint,
-                        )
+                        _atomic_write_json(identity_path, {
+                            "job_id": job_id, "hermes_home": str(hermes_home.expanduser().resolve()),
+                        })
+                        _install_cron_entrypoint(cron_entrypoint, runtime_home, hermes_home, job_id)
                         install_maintainer_skills(hermes_home)
                         require_installed_skills(hermes_home)
-                        intended_update = cron_update(runtime_home, hermes_home)
+                        intended_update = cron_update(runtime_home, hermes_home, job_id=job_id)
                         result = _cron_call_required(
                             cron_call,
                             "cron update failed",
                             **intended_update,
                         )
                         _require_persisted_cron_job(
-                            copy.deepcopy(cron_read_call(JOB_ID)), intended_update
+                            copy.deepcopy(cron_read_call(job_id)), intended_update
                         )
                         if not (
                             cron_snapshot.get("state") == "paused"
@@ -713,9 +847,9 @@ def apply_configuration(
                                 cron_call,
                                 "cron resume after deployment failed",
                                 action="resume",
-                                job_id=JOB_ID,
+                                job_id=job_id,
                             )
-                        final_job = copy.deepcopy(cron_read_call(JOB_ID))
+                        final_job = copy.deepcopy(cron_read_call(job_id))
                         if not isinstance(final_job, dict):
                             raise ConfigurationError(
                                 "cron disappeared after deployment finalization"
@@ -766,7 +900,7 @@ def apply_configuration(
                         # prior process died. Never reactivate it; retain the
                         # journal so a later apply can converge again.
                         try:
-                            _pause_cron_for_deployment(cron_call, cron_read_call)
+                            _pause_cron_for_deployment(cron_call, cron_read_call, job_id)
                         except Exception as pause_exc:
                             raise ConfigurationError(
                                 f"{exc}; stale deployment could not be kept paused: "
@@ -798,6 +932,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply", action="store_true", help="perform deployment and cron update"
     )
+    identity = parser.add_mutually_exclusive_group()
+    identity.add_argument("--job-id", default=JOB_ID, help="existing job in the selected profile")
+    identity.add_argument("--create-paused", action="store_true",
+                          help="create a paused job; pause the prior shared-runtime owner BEFORE deployment")
     parser.add_argument(
         "--backport",
         action="append",
@@ -812,24 +950,35 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    plan = cron_update(args.runtime_home, args.hermes_home)
+    plan = cron_update(args.runtime_home, args.hermes_home, job_id=args.job_id)
+    if args.create_paused:
+        plan.pop("job_id")
+        plan["action"] = "create-paused"
     if not args.apply:
         if args.backport:
             raise ConfigurationError("--backport requires --apply")
         validate_sources(SOURCE_HOME)
         print(
             json.dumps(
-                {"apply": False, "cron": plan, "video_model": VIDEO_MODEL}, indent=2
+                {"apply": False, "hermes_home": str(args.hermes_home.expanduser().resolve()),
+                 "cron": plan, "video_model": VIDEO_MODEL, "video_provider": "openrouter"}, indent=2
             )
         )
         return 0
 
-    result = apply_configuration(
-        source_home=SOURCE_HOME,
-        runtime_home=args.runtime_home,
-        hermes_home=args.hermes_home,
-        backport_commits=args.backport or None,
-    )
+    if args.create_paused:
+        if args.backport:
+            raise ConfigurationError("create the paused job before queuing a backport")
+        result = create_paused_configuration(source_home=SOURCE_HOME, runtime_home=args.runtime_home,
+                                             hermes_home=args.hermes_home)
+    else:
+        result = apply_configuration(
+            source_home=SOURCE_HOME,
+            runtime_home=args.runtime_home,
+            hermes_home=args.hermes_home,
+            job_id=args.job_id,
+            backport_commits=args.backport or None,
+        )
     request = args.runtime_home / "state/run-request.json" if args.backport else None
     print(
         json.dumps(

@@ -1,6 +1,6 @@
 /**
  * liveGateway — the GatewayService layer backed by the real Python `tui_gateway`
- * (spec v4 §2/§3.2). Adapts RawGatewayClient to GatewayServiceShape:
+ * (spec v4 §2/§3.2). Adapts RawGatewayClient to GatewayTransport:
  *   - decodes each raw event ONCE with the GatewayEvent Schema
  *     (decodeUnknownOption → unrecognized/malformed events skipped, never crash),
  *   - coalesces decoded events on a 16ms debounce flushed inside Solid `batch()`
@@ -24,7 +24,7 @@ import {
   decodeSessionCloseResponse,
   decodeSessionResumeResponse
 } from '../schema/SessionOrchestratorResponses.ts'
-import { GatewayService, type GatewayServiceShape } from './GatewayService.ts'
+import { GatewayService, type GatewayTransport } from './GatewayService.ts'
 import { RawGatewayClient, RawGatewayRequestError } from './client.ts'
 
 const COALESCE_MS = 16
@@ -112,7 +112,7 @@ export function gatewayErrorFromRawFailure(method: string, cause: unknown): Gate
   })
 }
 
-function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
+function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
   const log = getLog()
   const handlers = new Set<(event: GatewayEvent) => void>()
   let sessionId: string | undefined
@@ -207,7 +207,7 @@ function makeLiveGateway(): { service: GatewayServiceShape; stop: () => void } {
     onExit
   })
 
-  const service: GatewayServiceShape = {
+  const service: GatewayTransport = {
     subscribe: handler =>
       Effect.sync(() => {
         handlers.add(handler)

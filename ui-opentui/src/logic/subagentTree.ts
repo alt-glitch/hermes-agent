@@ -261,45 +261,36 @@ export function descendantIds<T extends SubagentTreeItem>(node: SubagentNode<T>)
   return ids
 }
 
+const SUBAGENT_STATUS_ALIASES = new Map<string, SubagentStatus>([
+  ['complete', 'completed'],
+  ['completed', 'completed'],
+  ['done', 'completed'],
+  ['ok', 'completed'],
+  ['succeeded', 'completed'],
+  ['success', 'completed'],
+  ['error', 'error'],
+  ['failed', 'failed'],
+  ['failure', 'failed'],
+  ['canceled', 'interrupted'],
+  ['cancelled', 'interrupted'],
+  ['interrupted', 'interrupted'],
+  ['stopped', 'interrupted'],
+  ['timed_out', 'timeout'],
+  ['timeout', 'timeout'],
+  ['pending', 'queued'],
+  ['queued', 'queued'],
+  ['spawn_requested', 'queued'],
+  ['replying', 'running'],
+  ['running', 'running'],
+  ['started', 'running'],
+  ['thinking', 'running'],
+  ['tool', 'running'],
+  ['working', 'running']
+])
+
 function knownSubagentStatus(status: unknown): SubagentStatus | undefined {
   if (typeof status !== 'string') return undefined
-
-  const normalized = status.trim().toLowerCase().replaceAll('-', '_').replaceAll(' ', '_')
-  switch (normalized) {
-    case 'complete':
-    case 'completed':
-    case 'done':
-    case 'ok':
-    case 'succeeded':
-    case 'success':
-      return 'completed'
-    case 'error':
-      return 'error'
-    case 'failed':
-    case 'failure':
-      return 'failed'
-    case 'canceled':
-    case 'cancelled':
-    case 'interrupted':
-    case 'stopped':
-      return 'interrupted'
-    case 'timed_out':
-    case 'timeout':
-      return 'timeout'
-    case 'pending':
-    case 'queued':
-    case 'spawn_requested':
-      return 'queued'
-    case 'replying':
-    case 'running':
-    case 'started':
-    case 'thinking':
-    case 'tool':
-    case 'working':
-      return 'running'
-    default:
-      return undefined
-  }
+  return SUBAGENT_STATUS_ALIASES.get(status.trim().toLowerCase().replaceAll('-', '_').replaceAll(' ', '_'))
 }
 
 function terminalStatus(status: SubagentStatus | undefined): TerminalSubagentStatus | undefined {

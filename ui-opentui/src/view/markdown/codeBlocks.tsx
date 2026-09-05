@@ -146,6 +146,6 @@ const mermaidCodeBlock: CodeBlockPlugin = (token, context) => {
 }
 
 /** Fence language → plugin. Unmapped languages use OpenTUI's default `<code>`. */
-export const CODE_BLOCKS: Readonly<Record<string, CodeBlockPlugin>> = {
+export const CODE_BLOCKS = {
   mermaid: mermaidCodeBlock
-}
+} satisfies Readonly<Record<string, CodeBlockPlugin>>

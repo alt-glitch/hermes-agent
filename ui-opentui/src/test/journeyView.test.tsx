@@ -168,6 +168,43 @@ describe('JourneyOverlay', () => {
     }
   })
 
+  test('keeps the learning list interactive when optional chart and legend data are malformed', async () => {
+    const h = await mount({
+      frames: async () => ({ ...FRAME, frames: [{ grid: [[null]] }], legend: [null], categories: 'broken' })
+    })
+    try {
+      await h.probe.settle()
+      expect(h.probe.frame()).toContain('Deploy skill')
+      expect(h.probe.frame()).toContain('2 learnings')
+      expect(h.probe.frame()).not.toContain('invalid learning.frames')
+      h.probe.keys.pressEnter()
+      await h.probe.settle()
+      expect(h.probe.frame()).toContain('detail for s1')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('renders valid typed chart, legend, and category data', async () => {
+    const h = await mount({
+      frames: async () => ({
+        ...FRAME,
+        frames: [{ grid: [[['chart marker', 'skill', 0.7, '#abcdef']]] }],
+        legend: [{ glyph: '●', label: 'skills (1)', style: 'skill' }],
+        categories: [{ glyph: '●', label: 'development (1)', color: '#abcdef' }]
+      })
+    })
+    try {
+      await h.probe.settle()
+      expect(h.probe.frame()).toContain('chart marker')
+      expect(h.probe.frame()).toContain('skills (1)')
+      expect(h.probe.frame()).toContain('development (1)')
+      expect(h.probe.frame()).toContain('Deploy skill')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
   test('keeps chart, summary, and timeline entries inside single allocated rows', async () => {
     const h = await mount({ frames: async () => CROWDED_FRAME }, { height: 24, width: 90 })
     try {

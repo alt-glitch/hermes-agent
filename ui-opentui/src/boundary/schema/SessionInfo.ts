@@ -1,32 +1,7 @@
-/**
- * SessionInfo + Catalog decoders — the decode-at-boundary idiom (spec v4 §3.3),
- * mirroring GatewayEvent.ts. These two payloads are UNTRUSTED loose JSON from the
- * Python `tui_gateway` (`session.info` event / `session.create`/`resume` result
- * `info`, and the `startup.catalog` RPC result), so they are decoded ONCE with an
- * Effect Schema instead of hand-rolled `as`-cast readers.
- *
- * Decode with `Schema.decodeUnknownOption`: a malformed/partial payload yields
- * `Option.none` and the caller falls back to an empty patch / leaves the catalog
- * unset — a stray shape never crashes the reducer.
- *
- * Wire field names are verified against `tui_gateway/server.py`:
- *   - session.info  → `_session_info()` (server.py:~1798): top-level `model`,
- *     `reasoning_effort`, `fast`, `cwd`, `branch`, `running`, `profile_name`,
- *     `update_behind` (Optional[int] — null until the prefetched check lands),
- *     `update_command`, `mcp_servers` (list of {name,transport,connected,tools}
- *     dicts from `get_mcp_status()`), plus a nested `usage` (`_get_usage()`,
- *     server.py:~1683) carrying `context_used`, `context_max`,
- *     `context_percent`, `compressions` (context_* only present when the
- *     compressor knows a context length) and `cost_usd` (only when the pricing
- *     estimate succeeds).
- *   - startup.catalog → `@method("startup.catalog")` (server.py:~8521):
- *     `{ tools:{total, toolsets:[{name,count,enabled,tools}]},
- *        skills:{total, categories:[{name,count}]}, mcp:{servers:[]} }`.
- *
- * These schemas are used PURELY as decoders; they do NOT Effect-ify the store's
- * reactivity or control flow (Solid stays the runtime — spec v4 §1).
- */
-import { Schema } from 'effect'
+// Session-info patches and startup catalogs cross the shared Python boundary.
+// Invalid payloads leave existing state intact; optional telemetry is recovered
+// field-by-field so one bad metric does not discard valid session identity.
+import { Effect, Option, Schema } from 'effect'
 
 const Str = Schema.String
 const Num = Schema.Number
@@ -34,12 +9,21 @@ const Bool = Schema.Boolean
 const opt = Schema.optionalKey
 const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 
+// A malformed telemetry field is omitted without discarding valid session info.
+const OptionalMetric = opt(Schema.Finite).pipe(Schema.catchDecoding(() => Effect.succeed(Option.none())))
+const TelemetryFields = {
+  avg_latency_s: OptionalMetric,
+  avg_tps: OptionalMetric,
+  cache_hit_pct: OptionalMetric
+}
+
 // ── session.info / session.create.info ────────────────────────────────
 // Context/usage numbers arrive nested under `usage`; the same names may also
 // appear at the top level depending on the RPC vs event path (the reader prefers
 // `usage.context_*`, then the top-level fallback). All keys are optional — a
 // `session.info` patch only carries the fields that actually changed.
 const UsageSchema = Schema.Struct({
+  ...TelemetryFields,
   active_subagents: opt(NonNegativeInt),
   context_used: opt(Num),
   context_max: opt(Num),
@@ -56,6 +40,7 @@ const ProjectInfoSchema = Schema.Struct({
 })
 
 export const SessionInfoPatchSchema = Schema.Struct({
+  ...TelemetryFields,
   model: opt(Str),
   reasoning_effort: opt(Str),
   fast: opt(Bool),

@@ -2,7 +2,7 @@ import { assert, describe, it } from '@effect/vitest'
 import { Cause, Effect, Exit } from 'effect'
 
 import { GatewayError } from '../boundary/errors.ts'
-import type { GatewayServiceShape } from '../boundary/gateway/GatewayService.ts'
+import type { GatewayTransport } from '../boundary/gateway/GatewayService.ts'
 import {
   activateSession,
   branchSession,
@@ -13,7 +13,7 @@ import {
 import { createSessionStore } from '../logic/store.ts'
 
 interface FakeGateway {
-  readonly service: GatewayServiceShape
+  readonly service: GatewayTransport
   readonly calls: Array<{ method: string; params: unknown }>
 }
 
@@ -319,7 +319,7 @@ describe('resumeSession', () => {
     store.setSessionId('old-live')
     let current: string | undefined = 'old-live'
     const calls: string[] = []
-    const service: GatewayServiceShape = {
+    const service: GatewayTransport = {
       request: <A>(method: string) =>
         Effect.sync(() => {
           calls.push(method)
@@ -369,7 +369,7 @@ describe('resumeSession', () => {
   it.effect('preserves the latest draft typed while an ordinary resume RPC is in flight', () => {
     const store = createSessionStore()
     store.setSessionId('old-live')
-    const service: GatewayServiceShape = {
+    const service: GatewayTransport = {
       request: <A>() =>
         Effect.sync(() => {
           store.setComposerDraft('typed after resume started')
@@ -393,7 +393,7 @@ describe('resumeSession', () => {
   it.effect('same-session recovery snapshots the latest queue/edit/draft at commit time', () => {
     const store = createSessionStore()
     store.setSessionId('dead-live')
-    const service: GatewayServiceShape = {
+    const service: GatewayTransport = {
       request: <A>() =>
         Effect.sync(() => {
           store.enqueuePrompt('queued during recovery')
@@ -425,7 +425,7 @@ describe('resumeSession', () => {
   it.effect('failed resume aborts the buffer and preserves the prior live session', () => {
     const store = createSessionStore()
     store.setSessionId('old-live')
-    const service: GatewayServiceShape = {
+    const service: GatewayTransport = {
       request: <A>(method: string) => {
         if (method !== 'session.resume')
           return Effect.die('old session must not close') as Effect.Effect<A, GatewayError>
@@ -456,7 +456,7 @@ describe('resumeSession', () => {
 
   it.effect('blank response SID aborts buffering with a typed protocol failure', () => {
     const store = createSessionStore()
-    const service: GatewayServiceShape = {
+    const service: GatewayTransport = {
       request: <A>() => Effect.succeed({ session_id: ' ' } as A),
       sessionId: () => 'old-live',
       logTail: () => [],
@@ -475,7 +475,7 @@ describe('resumeSession', () => {
 
   it.effect('null response is schema-rejected and the buffer finalizer always rolls back', () => {
     const store = createSessionStore()
-    const service: GatewayServiceShape = {
+    const service: GatewayTransport = {
       request: <A>() => Effect.succeed(null as A),
       sessionId: () => 'old-live',
       logTail: () => [],

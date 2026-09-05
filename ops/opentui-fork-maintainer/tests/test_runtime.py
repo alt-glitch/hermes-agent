@@ -784,6 +784,10 @@ def install_success_mocks(
     monkeypatch.setattr(runtime, "_run_termctrl", fake_termctrl)
     monkeypatch.setattr(runtime, "_run_reviewer", fake_reviewer)
     monkeypatch.setattr(
+        runtime, "_publish_pr_evidence",
+        lambda *args, **kwargs: {"url": "https://github.com/alt-glitch/hermes-agent/pull/42"},
+    )
+    monkeypatch.setattr(
         runtime,
         "_invoke_video_analyze",
         lambda _path: json.dumps({
@@ -875,6 +879,16 @@ def test_termctrl_uses_dependency_complete_fork_python_and_exact_candidate(
     monkeypatch.setattr(runtime, "FORK_VENV_PYTHON", python)
     monkeypatch.setattr(runtime, "_run_termctrl", fake_termctrl)
     monkeypatch.setattr(runtime.time, "sleep", lambda _seconds: None)
+    startup_overrides = (
+        "HERMES_TUI_QUERY", "HERMES_TUI_PROMPT", "HERMES_TUI_IMAGE",
+        "HERMES_TUI_RESUME", "HERMES_TUI_GATEWAY_URL", "HERMES_TUI_FAKE",
+        "HERMES_TUI_ACTIVE_SESSION_FILE", "HERMES_SESSION_ID", "HERMES_UI_SESSION_ID",
+        "HERMES_SESSION_SOURCE", "HERMES_TUI_DIR", "HERMES_TUI_SKILLS",
+        "HERMES_ACCEPT_HOOKS", "NODE_OPTIONS", "LD_PRELOAD", "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY", "PYTHONHOME", "HERMES_TUI_FUTURE_INPUT",
+    )
+    for key in startup_overrides:
+        monkeypatch.setenv(key, "untrusted-private-value")
     runtime.verify_termctrl_drive(
         {
             "cols": 132,
@@ -899,6 +913,9 @@ def test_termctrl_uses_dependency_complete_fork_python_and_exact_candidate(
     assert env["HERMES_PYTHON"] == str(python)
     assert env["HERMES_PYTHON_SRC_ROOT"] == str(candidate)
     assert env["HERMES_CWD"] == str(candidate)
+    assert env["TERMINAL_CWD"] == str(candidate)
+    assert env["HERMES_HOME"] == str(runtime.SYNTHETIC_PROFILE)
+    assert all(key not in env for key in startup_overrides)
     video_call = next(argv for argv, _env in calls if argv[0] == "video")
     edit_path = Path(video_call[video_call.index("--edit") + 1])
     assert json.loads(edit_path.read_text(encoding="utf-8")) == {
@@ -1434,6 +1451,104 @@ def test_finalize_failure_records_durable_status_and_recovers_request(
     assert Path(durable["evidence_path"]) == evidence / "run-outcome.json"
     assert (state / "run-request.json").exists()
     assert not (state / "run-request.inflight.json").exists()
+
+
+def test_pr_evidence_failure_prevents_target_cas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+
+    def refuse(*args, **kwargs):
+        assert all(c["status"] == "passed" for c in args[2]["checks"])
+        raise runtime.ControlError("PR upload not acknowledged")
+
+    monkeypatch.setattr(runtime, "_publish_pr_evidence", refuse)
+    with pytest.raises(runtime.ControlError, match="PR upload not acknowledged"):
+        runtime.gate_and_ship(
+            repo, packet, evidence / "gate.json", state_dir=state, cwd=worktree,
+            base_sha=base, candidate_sha=candidate, token="test-token",
+        )
+    assert remote_sha(repo) == base
+    assert not (state / "publish-journal.json").exists()
+
+
+def test_pr_evidence_is_bound_in_manifest_and_publish_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    proof = {"url": "https://github.com/alt-glitch/hermes-agent/pull/42", "candidate_sha": candidate}
+
+    def publish(*args, **kwargs):
+        assert remote_sha(repo) == base
+        assert all(c["status"] == "passed" for c in args[2]["checks"])
+        return proof
+
+    monkeypatch.setattr(runtime, "_publish_pr_evidence", publish)
+    manifest = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo, packet, manifest, state_dir=state, cwd=worktree,
+        base_sha=base, candidate_sha=candidate, token="test-token",
+    )
+    assert remote_sha(repo) == candidate
+    journal = json.loads((state / "publish-journal.json").read_text())
+    assert journal["pr_evidence"] == proof
+    assert json.loads(manifest.read_text())["pr_evidence"] == proof
+    assert journal["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("home,profile,allowed", [
+    ("/home/daimon/.hermes/profiles/opentui-maintainer", "opentui-maintainer", True),
+    ("/home/daimon/.hermes", "opentui-maintainer", True),
+    ("/home/daimon/.hermes/profiles/opentui-maintainer", "demo", True),
+])
+def test_capture_only_marks_isolated_help_flow_publishable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, home: str, profile: str, allowed: bool
+) -> None:
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    evidence = tmp_path / "evidence"
+    packet, _ = make_gate_packet(evidence, worktree, base, candidate)
+    drive = next(c["drive"] for c in json.loads(packet.read_text())["checks"] if c["id"] == "termctrl-smoke")
+    install_success_mocks(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", home)
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    proof = runtime.verify_termctrl_drive(drive, evidence, worktree)
+    assert (proof["publication_scope"] is not None) == allowed
+
+
+def test_contaminated_capture_cannot_reach_video_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, base, candidate, worktree = make_repo(tmp_path)
+    evidence = tmp_path / "evidence"
+    packet, _ = make_gate_packet(evidence, worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    original = runtime._run_termctrl
+
+    def contaminated(argv, **kwargs):
+        result = original(argv, **kwargs)
+        if argv[0] == "start":
+            kwargs["env"]["HERMES_TUI_QUERY"] = "unsupported private input"
+        return result
+
+    monkeypatch.setattr(runtime, "_run_termctrl", contaminated)
+    monkeypatch.setattr(runtime, "_invoke_video_analyze", lambda *_: pytest.fail("must not upload"))
+    result = runtime.run_gate(
+        packet, evidence / "gate.json", cwd=worktree, branch="sid/opentui",
+        base_sha=base, candidate_sha=candidate, token="test-token",
+    )
+    video = next(c for c in result["checks"] if c["id"] == "video-analysis")
+    assert video["status"] == "failed"
+    assert "sanitized synthetic capture" in Path(video["output_path"]).read_text(encoding="utf-8")
 
 
 def test_atomic_gate_and_ship_is_only_publish_cli(
@@ -2402,15 +2517,17 @@ def test_video_raw_output_rejects_symlink(
     assert outside.read_text() == "keep"
 
 
-def test_nous_endpoint_normalization_is_exact() -> None:
-    assert runtime._canonical_nous("https://inference-api.nousresearch.com/v1/")
-    assert not runtime._canonical_nous(
-        "https://proxy.invalid/inference-api.nousresearch.com/v1"
+def test_video_endpoint_normalization_is_exact() -> None:
+    assert runtime._canonical_video_endpoint("https://openrouter.ai/api/v1/")
+    assert not runtime._canonical_video_endpoint(
+        "https://proxy.invalid/openrouter.ai/api/v1"
     )
-    assert not runtime._canonical_nous("http://inference-api.nousresearch.com/v1")
+    assert not runtime._canonical_video_endpoint("http://openrouter.ai/api/v1")
+    assert not runtime._canonical_video_endpoint("https://openrouter.ai.attacker.invalid/api/v1")
+    assert not runtime._canonical_video_endpoint("https://inference-api.nousresearch.com/v1")
 
 
-def test_video_analysis_in_process_uses_canonical_nous_route(
+def test_video_analysis_in_process_uses_canonical_openrouter_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from types import SimpleNamespace
@@ -2420,19 +2537,19 @@ def test_video_analysis_in_process_uses_canonical_nous_route(
 
     video = tmp_path / "acceptance.mp4"
     video.write_bytes(b"video")
-    client = SimpleNamespace(base_url="https://inference-api.nousresearch.com/v1/")
+    client = SimpleNamespace(base_url="https://openrouter.ai/api/v1/")
     preflight: list[dict[str, object]] = []
     calls: list[dict[str, object]] = []
 
     def fake_resolve(**kwargs: object):
         preflight.append(kwargs)
-        return "nous", client, runtime.VIDEO_MODEL
+        return "openrouter", client, runtime.VIDEO_MODEL
 
     async def fake_network_call(**kwargs: object):
         calls.append(kwargs)
         route_info = kwargs["route_info"]
         assert isinstance(route_info, dict)
-        route_info.update(provider="nous", model=runtime.VIDEO_MODEL)
+        route_info.update(provider="openrouter", model=runtime.VIDEO_MODEL)
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -2449,7 +2566,7 @@ def test_video_analysis_in_process_uses_canonical_nous_route(
         vision_tools,
         "_cfg_auxiliary",
         lambda *_args, **_kwargs: {
-            "provider": "openrouter",
+            "provider": "nous",
             "model": "user-model",
             "base_url": "https://custom.invalid/v1",
         },
@@ -2461,7 +2578,7 @@ def test_video_analysis_in_process_uses_canonical_nous_route(
     assert result["success"] is True
     assert preflight == [
         {
-            "provider": "nous",
+            "provider": "openrouter",
             "model": runtime.VIDEO_MODEL,
             "base_url": runtime.VIDEO_BASE_URL,
             "api_key": None,
@@ -2471,12 +2588,12 @@ def test_video_analysis_in_process_uses_canonical_nous_route(
     assert len(calls) == 1
     call = calls[0]
     assert call["task"] == "vision"
-    assert call["provider"] == "nous"
+    assert call["provider"] == "openrouter"
     assert call["model"] == runtime.VIDEO_MODEL
     assert call["base_url"] == runtime.VIDEO_BASE_URL
     assert call["api_key"] is None
     assert call["route_info"] == {
-        "provider": "nous",
+        "provider": "openrouter",
         "model": runtime.VIDEO_MODEL,
     }
     messages = call["messages"]
@@ -2486,7 +2603,7 @@ def test_video_analysis_in_process_uses_canonical_nous_route(
     assert auxiliary_client._start_recovery_ladder is original_recovery
 
 
-def test_video_analysis_in_process_rejects_custom_nous_endpoint(
+def test_video_analysis_in_process_rejects_custom_openrouter_endpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from types import SimpleNamespace
@@ -2499,13 +2616,13 @@ def test_video_analysis_in_process_rejects_custom_nous_endpoint(
         auxiliary_client,
         "resolve_vision_provider_client",
         lambda **kwargs: (
-            "nous",
+            "openrouter",
             SimpleNamespace(base_url="https://custom.invalid/v1"),
             runtime.VIDEO_MODEL,
         ),
     )
 
-    with pytest.raises(runtime.ControlError, match="canonical Nous"):
+    with pytest.raises(runtime.ControlError, match="canonical OpenRouter"):
         runtime._invoke_video_analyze_in_process(video)
 
 
@@ -2537,7 +2654,7 @@ def test_video_analysis_rejects_custom_endpoint_after_canonical_preflight(
 
     def alternating_resolve(**kwargs: object):
         resolution_calls.append(kwargs)
-        return "nous", next(resolved_clients), runtime.VIDEO_MODEL
+        return "openrouter", next(resolved_clients), runtime.VIDEO_MODEL
 
     monkeypatch.setattr(
         auxiliary_client, "resolve_vision_provider_client", alternating_resolve
@@ -2548,7 +2665,7 @@ def test_video_analysis_rejects_custom_endpoint_after_canonical_preflight(
     result = json.loads(runtime._invoke_video_analyze_in_process(video))
 
     assert result["success"] is False
-    assert "canonical Nous route" in result["error"]
+    assert "canonical OpenRouter route" in result["error"]
     assert len(resolution_calls) == 2
     assert network_calls == []
     assert auxiliary_client._resolve_call_client is original_resolver
@@ -2578,6 +2695,9 @@ def test_video_analysis_uses_fixed_trusted_runtime_boundary(
     monkeypatch.setattr(runtime, "TRUSTED_HERMES_ROOT", trusted)
     monkeypatch.setattr(runtime, "TRUSTED_HERMES_PYTHON", python)
     monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setenv("HERMES_HOME", "/home/daimon/.hermes")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "wrong-parent-key")
+    monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "wss://private.invalid")
 
     assert runtime._invoke_video_analyze(video) == expected
     [(argv, kwargs)] = calls
@@ -2595,6 +2715,12 @@ def test_video_analysis_uses_fixed_trusted_runtime_boundary(
     assert env["HERMES_PYTHON"] == str(python)
     assert env["HERMES_CWD"] == str(trusted)
     assert env["TERMINAL_CWD"] == str(trusted)
+    assert env["HERMES_HOME"] == str(runtime.SYNTHETIC_PROFILE)
+    assert "OPENROUTER_API_KEY" not in env
+    assert "HERMES_TUI_GATEWAY_URL" not in env
+    assert runtime.os.environ["HERMES_HOME"] == "/home/daimon/.hermes"
+    assert runtime.os.environ["OPENROUTER_API_KEY"] == "wrong-parent-key"
+    assert "load_external_secrets=False" in argv[3]
     assert "PYTHONHOME" not in env
 
 
@@ -2610,6 +2736,14 @@ def test_video_analysis_default_runtime_is_managed_install() -> None:
 def _write_fake_video_runtime(root: Path, label: str) -> None:
     (root / "agent").mkdir(parents=True)
     (root / "tools").mkdir()
+    (root / "hermes_cli").mkdir()
+    (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "hermes_cli" / "env_loader.py").write_text(
+        "def load_hermes_dotenv(*, project_env, load_external_secrets):\n"
+        "    assert project_env is None\n"
+        "    assert load_external_secrets is False\n",
+        encoding="utf-8",
+    )
     (root / "agent" / "__init__.py").write_text("", encoding="utf-8")
     (root / "tools" / "__init__.py").write_text("", encoding="utf-8")
     (root / "agent" / "auxiliary_client.py").write_text(

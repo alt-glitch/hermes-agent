@@ -154,6 +154,7 @@ def _resolve_openrouter_runtime(
     cfg_api_mode = rp._parse_api_mode(model_cfg.get("api_mode"))
     # Explicit "custom" stays "custom" rather than relabeling to "openrouter".
     if requested_norm != "custom":
+        cfg_api_mode = rp._configured_api_mode("openrouter", model_cfg)
         return rp._runtime("openrouter", cfg_api_mode or rp._detect_api_mode_for_url(base_url) or "chat_completions", base_url,
                            api_key, source=source)
     if base_url:

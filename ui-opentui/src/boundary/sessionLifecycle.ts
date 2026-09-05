@@ -8,7 +8,7 @@
  */
 import { Data, Effect, Option, Schema } from 'effect'
 
-import type { GatewayServiceShape } from './gateway/GatewayService.ts'
+import type { GatewayTransport } from './gateway/GatewayService.ts'
 import {
   decodeSessionActivateResponse,
   decodeSessionBranchResponse,
@@ -69,7 +69,7 @@ export class SessionProtocolError extends Data.TaggedError('SessionProtocolError
 
 /** Create and schema-decode a session without any close/setup policy. */
 export const createSession = Effect.fn('SessionLifecycle.create')(function* (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   options: CreateSessionOptions
 ) {
   const createdRaw = yield* gateway.request<unknown>('session.create', {
@@ -100,7 +100,7 @@ export const createSession = Effect.fn('SessionLifecycle.create')(function* (
 })
 
 export const replaceSession = Effect.fn('SessionLifecycle.replace')(function* (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   options: ReplaceSessionOptions
 ) {
   const setupRaw = yield* gateway.request<unknown>('setup.status', {})
@@ -257,7 +257,7 @@ function liveSnapshotStartedAtMs(response: LiveSessionSnapshot): number | undefi
  * previous live id so it can close that session off the resume critical path.
  */
 export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   store: SessionStore,
   options: ResumeSessionOptions
 ) {
@@ -339,7 +339,7 @@ export interface ActivateSessionOptions {
  * previous session. The activate snapshot and any racing target events commit
  * atomically; failure replays only the still-current session's buffered events. */
 export const activateSession = Effect.fn('SessionLifecycle.activate')(function* (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   store: SessionStore,
   options: ActivateSessionOptions
 ) {
@@ -387,7 +387,7 @@ export const activateSession = Effect.fn('SessionLifecycle.activate')(function* 
 })
 
 export const branchSession = Effect.fn('SessionLifecycle.branch')(function* (
-  gateway: GatewayServiceShape,
+  gateway: GatewayTransport,
   store: SessionStore,
   options: { readonly name: string }
 ) {

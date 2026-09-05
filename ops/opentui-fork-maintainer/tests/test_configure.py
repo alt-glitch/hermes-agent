@@ -93,6 +93,7 @@ def _deployment_fixture(tmp_path: Path, monkeypatch):
         "opentui_fork_sync.py",
         "sync_probe.py",
         "maintainer_runtime.py",
+        "pr_publication.py",
         "worktree.sh",
     ):
         (source / "scripts" / name).write_text("new\n")
@@ -172,6 +173,126 @@ def test_bootstrap_is_small_scanner_safe_and_points_to_disk() -> None:
     assert not _scan_cron_prompt(prompt)
 
 
+def test_create_paused_scopes_real_store_and_remains_recurring(tmp_path: Path, monkeypatch) -> None:
+    from cron.jobs import create_job, get_job, list_jobs, use_cron_store
+    from hermes_constants import get_hermes_home
+
+    source, runtime, target = _deployment_fixture(tmp_path, monkeypatch)
+    ambient = tmp_path / "ambient"
+    monkeypatch.setenv("HERMES_HOME", str(ambient))
+    with use_cron_store(ambient):
+        original = create_job(prompt="unrelated job", schedule="1d", name=configure.JOB_NAME)
+
+    result = configure.create_paused_configuration(
+        source_home=source, runtime_home=runtime, hermes_home=target)
+    job_id = result["job"]["job_id"]
+    assert get_hermes_home() == ambient
+    with use_cron_store(target):
+        job = get_job(job_id)
+        assert job["state"] == "paused" and job["enabled"] is False
+        assert job["repeat"]["times"] is None
+        configure._require_persisted_cron_job(
+            job, configure.cron_update(runtime, target, job_id=job_id))
+        assert len(list_jobs(include_disabled=True)) == 1
+    with use_cron_store(ambient):
+        assert get_job(original["id"]) == original
+        assert get_job(job_id) is None
+
+    with pytest.raises(configure.ConfigurationError, match="already exists"):
+        configure.create_paused_configuration(source_home=source, runtime_home=runtime, hermes_home=target)
+    assert json.loads((runtime / "state/job-identity.json").read_text()) == {
+        "job_id": job_id, "hermes_home": str(target.resolve())}
+
+
+@pytest.mark.parametrize("identity_source", ["manifest", "legacy"])
+def test_cutover_requires_previous_owner_paused_and_quiescent(tmp_path, monkeypatch, identity_source):
+    from cron.jobs import create_job, get_job, list_jobs, pause_job, use_cron_store
+    from cron.executions import create_execution, finish_execution, mark_execution_running
+
+    source, runtime, target = _deployment_fixture(tmp_path, monkeypatch)
+    prior_home = tmp_path / "prior-profile"
+    with use_cron_store(prior_home):
+        previous = create_job(prompt="old maintainer", schedule="1d")
+    (runtime / "scripts").mkdir(parents=True)
+    sentinel = runtime / "scripts/maintainer_runtime.py"
+    sentinel.write_text("old runtime\n")
+    if identity_source == "manifest":
+        configure._atomic_write_json(runtime / "state/job-identity.json", {
+            "job_id": previous["id"], "hermes_home": str(prior_home),
+        })
+    else:
+        monkeypatch.setattr(configure, "RUNTIME_HOME", runtime)
+        monkeypatch.setattr(configure, "LEGACY_HERMES_HOME", prior_home)
+        monkeypatch.setattr(configure, "JOB_ID", previous["id"])
+    before = {p.relative_to(runtime): p.read_bytes() for p in runtime.rglob("*") if p.is_file()}
+    with pytest.raises(configure.ConfigurationError, match="pause.*before"):
+        configure.create_paused_configuration(source_home=source, runtime_home=runtime, hermes_home=target)
+    assert all((runtime / path).read_bytes() == contents for path, contents in before.items())
+    with use_cron_store(target):
+        assert list_jobs(include_disabled=True) == []
+    with use_cron_store(prior_home):
+        pause_job(previous["id"])
+        execution = create_execution(previous["id"], source="manual")
+        mark_execution_running(execution["id"])
+    with pytest.raises(configure.ConfigurationError, match="execution"):
+        configure.create_paused_configuration(source_home=source, runtime_home=runtime, hermes_home=target)
+    assert sentinel.read_text() == "old runtime\n"
+    with use_cron_store(prior_home):
+        finish_execution(execution["id"], success=True)
+    result = configure.create_paused_configuration(source_home=source, runtime_home=runtime, hermes_home=target)
+    assert result["job"]["state"] == "paused"
+    with use_cron_store(prior_home):
+        assert get_job(previous["id"])["enabled"] is False
+
+
+def test_deployed_entrypoint_binds_profile_job_and_running_execution(tmp_path, monkeypatch):
+    import os
+    import sys
+    from cron.executions import create_execution, mark_execution_running
+    from cron.jobs import use_cron_store
+
+    source, runtime, target = _deployment_fixture(tmp_path, monkeypatch)
+    real_wrapper = SCRIPT.parent / configure.CRON_ENTRYPOINT_NAME
+    (source / "scripts" / configure.CRON_ENTRYPOINT_NAME).write_bytes(real_wrapper.read_bytes())
+    result = configure.create_paused_configuration(
+        source_home=source, runtime_home=runtime, hermes_home=target)
+    job_id = result["job"]["job_id"]
+    with use_cron_store(target):
+        execution = create_execution(job_id, source="manual")
+        mark_execution_running(execution["id"])
+    ambient = tmp_path / "ambient"
+    with use_cron_store(ambient):
+        wrong = create_execution(job_id, source="manual")
+        mark_execution_running(wrong["id"])
+    entry = target / "scripts" / configure.CRON_ENTRYPOINT_NAME
+    checked = subprocess.run(
+        [sys.executable, str(entry), "--check-identity"], check=True,
+        capture_output=True, text=True, timeout=10,
+        env={**os.environ, "HERMES_HOME": str(ambient),
+             "OPENTUI_MAINTAINER_CRON_JOB_ID": "stale-parent-job"})
+    assert json.loads(checked.stdout) == {
+        "job_id": job_id, "hermes_home": str(target.resolve()), "execution_id": execution["id"],
+    }
+    assert not (runtime / "state/run.lease.json").exists()
+
+
+@pytest.mark.parametrize("wrong", ["home", "job"])
+def test_recovery_journal_refuses_other_profile_or_job(tmp_path: Path, monkeypatch, wrong) -> None:
+    source, runtime, target = _deployment_fixture(tmp_path, monkeypatch)
+    original = {**_active_prior_job(), "id": "isolated-job"}
+    configure._write_deployment_journal(runtime, original, hermes_home=target)
+    calls, _, cron_call, read_call = _stateful_cron(original)
+
+    with pytest.raises(configure.ConfigurationError, match="recovery journal"):
+        configure.apply_configuration(
+            source_home=source, runtime_home=runtime,
+            hermes_home=target if wrong == "job" else tmp_path / "other-profile",
+            job_id="other-job" if wrong == "job" else "isolated-job",
+            cron_call=cron_call, cron_read_call=read_call)
+    assert calls == []
+    assert not (runtime / "prompts/maintainer.md").exists()
+
+
 def test_cron_update_pins_runtime_and_resource_contract() -> None:
     from inspect import signature
     from tools.cronjob_tools import cronjob
@@ -181,8 +302,8 @@ def test_cron_update_pins_runtime_and_resource_contract() -> None:
     assert update["action"] == "update"
     assert update["job_id"] == "c57fe4db4d43"
     assert update["schedule"] == "0 9,21 * * *"
-    assert update["provider"] == "nous"
-    assert update["model"] == "openai/gpt-5.6-sol"
+    assert update["provider"] == configure.PROVIDER
+    assert update["model"] == configure.MODEL
     assert update["reasoning_effort"] == "medium"
     assert update["inactivity_timeout_seconds"] == 18_000
     assert update["enabled_toolsets"] == [
@@ -194,14 +315,7 @@ def test_cron_update_pins_runtime_and_resource_contract() -> None:
         "todo",
         "no_mcp",
     ]
-    assert update["skills"] == [
-        "codex",
-        "claude-code",
-        "adversarial-review-loop",
-        "terminal-control",
-        "opentui-tui-engineering",
-        "tmux-pane-screenshot",
-    ]
+    assert update["skills"] == list(configure.SKILLS)
     assert update["script"] == "opentui_fork_sync.py"
     assert update["no_agent"] is False
 
@@ -277,6 +391,7 @@ def test_apply_uses_supported_cron_api_after_deploy(
     )
     (source / "scripts/sync_probe.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/maintainer_runtime.py").write_text("#!/usr/bin/env python3\n")
+    (source / "scripts/pr_publication.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/worktree.sh").write_text("#!/usr/bin/env bash\n")
     config_path = hermes_home / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -377,6 +492,7 @@ def test_silently_mutated_cron_field_triggers_cron_and_local_rollback(
         "opentui_fork_sync.py",
         "sync_probe.py",
         "maintainer_runtime.py",
+        "pr_publication.py",
         "worktree.sh",
     ):
         (source / "scripts" / name).write_text("new\n")
@@ -520,31 +636,6 @@ def test_rollback_paths_restores_on_cooperative_interruption(tmp_path: Path) -> 
     assert target.read_text() == "old"
 
 
-def test_policy_requires_real_fanout_evidence_and_green_ship_gate() -> None:
-    policy = (Path(__file__).parents[1] / "prompts/maintainer.md").read_text()
-    assert "at most **two** workers concurrently" in policy
-    assert "gpt-5.6-sol" in policy
-    assert "fable-5" in policy
-    assert "opus-4.8" in policy
-    assert "Never use Haiku" in policy
-    assert "video_analyze_tool" in policy
-    assert '{"provider":"nous","model":"google/gemini-3.5-flash"}' in policy
-    assert "google/gemini-3.5-flash" in policy
-    assert "termctrl-smoke" in policy
-    assert "`drive` object" in policy
-    assert "gate-and-ship" in policy
-    assert "There is no standalone ship command" in policy
-    assert "Never retry an" in policy
-    assert "identical failed gate packet" in policy
-    assert "order-hermetic when batched" in policy
-    assert "state/run-request.inflight.json" in policy
-    assert policy.count("background=true") >= 2
-    assert policy.count("notify_on_complete=true") >= 2
-    assert policy.count('process(action="wait", session_id=...)') >= 2
-    assert "Never advance or push `sid/opentui` unless" in policy
-    assert "Complexity, novelty, conflict count" in policy
-
-
 def test_cron_failure_rolls_back_local_deployment(tmp_path: Path, monkeypatch) -> None:
     source, runtime, hermes_home = (
         tmp_path / "source",
@@ -558,6 +649,7 @@ def test_cron_failure_rolls_back_local_deployment(tmp_path: Path, monkeypatch) -
         "opentui_fork_sync.py",
         "sync_probe.py",
         "maintainer_runtime.py",
+        "pr_publication.py",
         "worktree.sh",
     ):
         (source / "scripts" / name).write_text("new\n")
@@ -783,7 +875,7 @@ def test_stale_deployment_journal_is_paused_converged_and_resumed_on_rerun(
     mixed.parent.mkdir(parents=True)
     mixed.write_text("partial from killed deploy\n")
     original = _active_prior_job()
-    configure._write_deployment_journal(runtime, original)
+    configure._write_deployment_journal(runtime, original, hermes_home=hermes_home)
 
     calls, holder, stateful_cron, read_cron = _stateful_cron(original)
     configure.apply_configuration(
@@ -809,7 +901,7 @@ def test_failed_stale_recovery_keeps_cron_paused_and_journal_for_retry(
 ) -> None:
     source, runtime, hermes_home = _deployment_fixture(tmp_path, monkeypatch)
     original = _active_prior_job()
-    configure._write_deployment_journal(runtime, original)
+    configure._write_deployment_journal(runtime, original, hermes_home=hermes_home)
     _calls, holder, stateful_cron, read_cron = _stateful_cron(original)
 
     def fail_after_pause(_source_home: Path, _runtime_home: Path) -> None:

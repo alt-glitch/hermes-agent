@@ -5,34 +5,13 @@ import {
   decodeJourneyDetail,
   decodeJourneyFrames,
   decodeJourneyMutation,
-  type JourneyFrames
+  type JourneyFrames,
+  type JourneyRun
 } from '../../boundary/schema/JourneyResponses.ts'
 import { journeyRows, journeyStep, journeyWindowStart } from '../../logic/journey.ts'
 import { useDimensions } from '../dimensions.tsx'
 import { useCloseLayer } from '../keymap.tsx'
 import { useTheme } from '../theme.tsx'
-
-interface JourneyLegendItem {
-  color?: string
-  glyph: string
-  label: string
-  style?: string
-}
-interface JourneyRun {
-  0: string
-  1?: string
-  2?: number
-  3?: string | null
-}
-interface JourneyFrame {
-  grid?: JourneyRun[][]
-}
-interface JourneyVisual {
-  axis: { end: string; start: string }
-  categories?: JourneyLegendItem[]
-  frames: JourneyFrame[]
-  legend: JourneyLegendItem[]
-}
 
 export interface JourneyOps {
   frames(cols: number, rows: number): Promise<unknown>
@@ -61,10 +40,9 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
     [confirm, setConfirm] = createSignal(false),
     [content, setContent] = createSignal('')
   const rows = createMemo(() => journeyRows(data()))
-  const visual = createMemo(() => data() as unknown as JourneyVisual | undefined)
   const chart = createMemo(() => {
     if (dims().width < 80) return []
-    const grid = visual()?.frames.at(-1)?.grid ?? []
+    const grid = data()?.frames.at(-1)?.grid ?? []
     return grid
       .filter(
         row =>
@@ -291,16 +269,16 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
       <Show when={mode() === 'timeline'}>
         <box style={{ flexDirection: 'column', flexShrink: 0, overflow: 'hidden' }}>
           <text flexShrink={0} truncate wrapMode="none">
-            {visual()?.legend.map((item, index) => (
+            {data()?.legend.map((item, index) => (
               <span style={{ fg: item.color || theme().color.muted }}>
                 {index ? '   ' : ''}
                 {item.glyph} {item.label}
               </span>
             ))}
           </text>
-          <Show when={visual()?.categories?.length}>
+          <Show when={data()?.categories?.length}>
             <text flexShrink={0} truncate wrapMode="none">
-              {visual()?.categories?.map((item, index) => (
+              {data()?.categories?.map((item, index) => (
                 <span style={{ fg: item.color || theme().color.muted }}>
                   {index ? '  ' : ''}
                   {item.glyph} {item.label}
@@ -324,10 +302,10 @@ export function JourneyOverlay(props: { ops: JourneyOps; onClose(): void }) {
           </For>
           <box style={{ flexDirection: 'row', flexShrink: 0, justifyContent: 'space-between', overflow: 'hidden' }}>
             <text flexShrink={0} fg={theme().color.muted} wrapMode="none">
-              {visual()?.axis.start}
+              {data()?.axis.start}
             </text>
             <text flexShrink={0} fg={theme().color.muted} wrapMode="none">
-              {visual()?.axis.end}
+              {data()?.axis.end}
             </text>
           </box>
         </box>

@@ -15,10 +15,17 @@ A's last output into job B's prompt), `workdir` (run with that directory's `AGEN
 loaded), multi-platform delivery.
 
 Hardening invariants — each guards a real failure; don't weaken without answering for it:
-- **3-minute hard interrupt** on cron sessions: runaway loops cannot monopolise the scheduler.
+- **Inactivity watchdog, not a fixed wall-clock cutoff.** The job's
+  `inactivity_timeout_seconds` takes precedence; the default is 600 seconds.
+  Zero disables that inactivity limit. Long-running maintainers also need their
+  own bounded lease and durable execution/claim heartbeats; don't confuse a
+  healthy long tool call with permission to bypass ownership checks.
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
 - File lock `~/.hermes/cron/.tick.lock` prevents duplicate ticks across processes.
-- Cron sessions pass `skip_memory=True`; memory providers intentionally do not run during cron.
+- Cron sessions currently pass `skip_memory=False` and load profile SOUL identity;
+  `skip_background_review=True` suppresses human-oriented review forks. Isolate
+  an autonomous maintainer's profile explicitly instead of assuming cron strips
+  personal memory. Project context loads only when the job has a workdir.
 - Deliveries are **not mirrored** into the target gateway session — they land in their own cron
   session with a header/footer frame so the main conversation's role alternation stays intact.
 - The cron ticker runs in the desktop-spawned backend when `HERMES_DESKTOP=1` — that env var means

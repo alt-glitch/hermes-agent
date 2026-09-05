@@ -2164,7 +2164,7 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
         cost_usd: 0.5,
         compressions: 2
       }
-    } as never)
+    })
     expect(store.state.info.contextUsed).toBe(84000)
     store.clearTranscript()
     expect(store.state.info.contextUsed).toBeUndefined()
@@ -2180,12 +2180,46 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
 
   test('resume snapshot reset also clears status telemetry', () => {
     const store = createSessionStore()
-    store.applyInfo({ usage: { avg_latency_s: 1.25, avg_tps: 42.4, cache_hit_pct: 73 } } as never)
+    store.applyInfo({ usage: { avg_latency_s: 1.25, avg_tps: 42.4, cache_hit_pct: 73 } })
     expect(store.state.info).toMatchObject({ avgLatencyS: 1.25, avgTps: 42.4, cacheHitPct: 73 })
     store.commitSnapshot([])
     expect(store.state.info.avgLatencyS).toBeUndefined()
     expect(store.state.info.avgTps).toBeUndefined()
     expect(store.state.info.cacheHitPct).toBeUndefined()
+  })
+
+  test('telemetry prefers valid nested values and falls back per field', () => {
+    const store = createSessionStore()
+    store.applyInfo({
+      model: 'model',
+      avg_latency_s: 4,
+      avg_tps: 50,
+      cache_hit_pct: 70,
+      usage: { avg_latency_s: Number.NaN, avg_tps: 0, cache_hit_pct: 'invalid', context_used: 100 }
+    })
+    expect(store.state.info).toMatchObject({
+      model: 'model',
+      avgLatencyS: 4,
+      avgTps: 0,
+      cacheHitPct: 70,
+      contextUsed: 100
+    })
+  })
+
+  test('invalid or omitted telemetry leaves prior gauges while valid fields update', () => {
+    const store = createSessionStore()
+    store.applyInfo({ usage: { avg_latency_s: 2, avg_tps: 40, cache_hit_pct: 70 } })
+    store.applyInfo({
+      title: 'updated',
+      usage: { avg_latency_s: null, avg_tps: Number.POSITIVE_INFINITY, context_used: 200 }
+    })
+    expect(store.state.info).toMatchObject({
+      title: 'updated',
+      avgLatencyS: 2,
+      avgTps: 40,
+      cacheHitPct: 70,
+      contextUsed: 200
+    })
   })
 
   test('pending images survive same-session clear/recovery and reset on detach', () => {
