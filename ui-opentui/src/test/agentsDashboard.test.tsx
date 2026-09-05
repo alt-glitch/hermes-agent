@@ -1,94 +1,111 @@
-/**
- * Agents dashboard (P2 de-crowd) — the master list is ONE line per subagent
- * (long goals truncate, no multi-line prompt dump) and the detail pane renders
- * the TYPED trace by kind (⚡ tool / · progress / ✓ summary).
- */
+/** Native structure/data tests. Forced frames do not prove spontaneous live repaint. */
+import { MarkdownRenderable, type Renderable } from '@opentui/core'
 import { describe, expect, test } from 'vitest'
 
 import { createSessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
+import { agentMessages } from '../view/overlays/agents/messages.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
-import { captureFrame, renderProbe } from './lib/render.ts'
+import { renderProbe } from './lib/render.ts'
 
-const LONG_GOAL =
-  'Poll the current UTC time 10 times with a 3-second sleep between each poll, run date -u and record each result, then report all ten timestamps as a timing exercise'
+function descendants(root: Renderable): Renderable[] {
+  return root.getChildren().flatMap(child => [child, ...descendants(child)])
+}
 
-function dash() {
+function fixture() {
   const store = createSessionStore()
   store.apply({ type: 'gateway.ready' })
   store.apply({
     type: 'subagent.start',
-    payload: { subagent_id: 'a1', goal: LONG_GOAL, model: 'anthropic/claude-opus-4-8', depth: 0 }
+    payload: { subagent_id: 'a1', goal: 'Inspect the release changelog and report verified changes', depth: 0 }
   })
-  store.apply({ type: 'subagent.tool', payload: { subagent_id: 'a1', tool_name: 'terminal', text: 'date -u' } })
-  store.apply({ type: 'subagent.progress', payload: { subagent_id: 'a1', text: 'poll 4 of 10 recorded' } })
-  store.apply({ type: 'subagent.complete', payload: { subagent_id: 'a1', summary: 'all ten timestamps collected' } })
+  store.apply({
+    type: 'subagent.tool',
+    payload: { subagent_id: 'a1', tool_name: 'terminal', text: 'PRIVATE_TOOL_DIAGNOSTIC' }
+  })
   store.openDashboard()
-  return () => (
+  const node = () => (
     <ThemeProvider theme={() => store.state.theme}>
       <App store={store} />
     </ThemeProvider>
   )
+  return { store, node }
 }
 
-describe('agents dashboard de-crowd (P2)', () => {
-  test('a long goal is truncated to one line in the master list (no full-prompt wall)', async () => {
-    const frame = await captureFrame(dash(), { until: 'Spawn tree', width: 116, height: 30 })
-    // The master row truncates to one line — the head shows with an ellipsis.
-    // (The detail pane below still shows the full goal; that's the inspect half.)
-    expect(frame).toContain('Poll the current UTC time')
-    expect(frame).toContain('…') // ellipsis proves the master row is one-line, not a wrapped wall
-  })
-
-  test('the detail pane renders the typed trace by kind (tool ⚡, summary ✓)', async () => {
-    const probe = await renderProbe(dash(), { height: 30, width: 116 })
+describe('agents message-first native view', () => {
+  test('messages are primary and tool details are available but collapsed', async () => {
+    const { store, node } = fixture()
+    store.apply({ type: 'subagent.complete', payload: { subagent_id: 'a1', summary: '**Verified** release report' } })
+    const probe = await renderProbe(node, { width: 132, height: 32 })
     try {
+      expect(probe.frame()).toContain('Messages')
+      expect(probe.frame()).toContain('▸ Tool calls')
+      expect(probe.frame()).not.toContain('PRIVATE_TOOL_DIAGNOSTIC')
+      const markdown = descendants(probe.renderer.root).filter(item => item instanceof MarkdownRenderable)
+      expect(markdown.filter(item => item.content === '**Verified** release report')).toHaveLength(1)
       probe.keys.pressEnter()
+      probe.keys.pressKey('t')
       await probe.settle()
-      let frame = probe.frame()
-      expect(frame).toContain('⚡') // tool entry glyph
-      expect(frame).toContain('Terminal("date -u")') // canonical tool summary
-      probe.keys.pressKey('g', { shift: true })
-      await probe.settle()
-      frame = probe.frame()
-      expect(frame).toContain('✓') // summary entry glyph
-      expect(frame).toContain('all ten timestamps collected') // summary text (detail, not master)
-      expect(frame).toContain('poll 4 of 10 recorded') // progress trace
+      expect(probe.frame()).toContain('PRIVATE_TOOL_DIAGNOSTIC')
     } finally {
       probe.destroy()
     }
   })
 
-  test('a streamed subagent reply renders as a coalesced ❯ reply line (subagent.text)', async () => {
-    const store = createSessionStore()
-    store.apply({ type: 'gateway.ready' })
+  test('mounted reply deltas preserve native identity, isolate siblings and finalize once', async () => {
+    const { store, node } = fixture()
     store.apply({
-      type: 'subagent.start',
-      payload: { subagent_id: 'a1', goal: 'summarize the changelog', model: 'anthropic/claude-opus-4-8', depth: 0 }
+      type: 'subagent.text',
+      payload: { subagent_id: 'a1', text: '# Release\n\n| Change | State |\n| --- | --- |\n| Native' }
     })
-    // per-token reply mirror — three frames the server emits one token at a time
-    store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'The release ' } })
-    store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'ships two ' } })
-    store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'features.' } })
-    store.openDashboard()
-    const probe = await renderProbe(
-      () => (
-        <ThemeProvider theme={() => store.state.theme}>
-          <App store={store} />
-        </ThemeProvider>
-      ),
-      { width: 116, height: 30 }
-    )
+    const probe = await renderProbe(node, { width: 132, height: 34 })
     try {
-      probe.keys.pressEnter()
+      const reply = descendants(probe.renderer.root).find(
+        item => item instanceof MarkdownRenderable && item.content.startsWith('# Release')
+      )
+      expect(reply).toBeInstanceOf(MarkdownRenderable)
+      if (!(reply instanceof MarkdownRenderable)) throw new Error('missing native reply')
+      expect(reply.streaming).toBe(true)
+      store.apply({ type: 'subagent.start', payload: { subagent_id: 'sibling', goal: 'Separate work', depth: 0 } })
+      store.apply({ type: 'subagent.text', payload: { subagent_id: 'sibling', text: 'SIBLING_PRIVATE_REPLY' } })
+      store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: ' | ready |\n' } })
       await probe.settle()
-      const frame = probe.frame()
-      expect(frame).toContain('❯') // reply entry glyph (terminal-safe single-width, not a color emoji)
-      // the three per-token frames COALESCED into one line, not three '❯' rows
-      expect(frame).toContain('The release ships two features.')
-      expect(frame.split('❯').length - 1).toBe(1) // exactly one reply glyph in the frame
+      expect(descendants(probe.renderer.root)).toContain(reply)
+      expect(reply.content).toContain('| Native | ready |')
+      const mounted = descendants(probe.renderer.root).filter(item => item instanceof MarkdownRenderable)
+      expect(mounted.some(item => item.content === 'SIBLING_PRIVATE_REPLY')).toBe(false)
+      const final = reply.content
+      store.apply({ type: 'subagent.complete', payload: { subagent_id: 'a1', summary: final } })
+      await probe.settle()
+      expect(reply.streaming).toBe(false)
+      expect(
+        descendants(probe.renderer.root).filter(item => item instanceof MarkdownRenderable && item.content === final)
+      ).toHaveLength(1)
     } finally {
       probe.destroy()
     }
+  })
+
+  test('final dedupe preserves separate equal earlier replies and supports summary-only archives', () => {
+    const base = { id: 'a', goal: 'Task', depth: 0, status: 'completed' }
+    const final = 'Final result'
+    const plan = agentMessages({
+      ...base,
+      summary: final,
+      trace: [
+        { kind: 'reply', text: final },
+        { kind: 'tool', text: 'check' },
+        { kind: 'reply', text: final },
+        { kind: 'summary', text: final }
+      ]
+    })
+    expect(plan.replies).toHaveLength(2)
+    expect(plan.appendSummary).toBe(false)
+    expect(agentMessages({ ...base, summary: final }).appendSummary).toBe(true)
+    expect(
+      agentMessages({ ...base, summary: 'result', traceTruncated: true, trace: [{ kind: 'reply', text: final }] })
+        .appendSummary
+    ).toBe(false)
+    expect(agentMessages({ ...base, trace: [{ kind: 'summary', text: final }] }).summary).toBe(final)
   })
 })

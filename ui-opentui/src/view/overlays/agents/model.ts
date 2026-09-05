@@ -41,6 +41,10 @@ export interface DashboardOutputEntry {
  * view-boundary normalizer below.
  */
 export interface DashboardAgent extends SubagentTreeItem {
+  readonly taskLabel?: string
+  readonly endedAt?: number
+  readonly traceDropped?: number
+  readonly traceTruncated?: boolean
   readonly apiCalls?: number
   readonly delegationId?: string
   readonly goal: string
@@ -119,12 +123,24 @@ function readTrace(value: Readonly<Record<string, unknown>>): readonly TraceEntr
   for (const item of candidate) {
     const row = record(item)
     const kind = row === undefined ? undefined : readString(row, 'kind')
-    const text = row === undefined ? undefined : readString(row, 'text')
+    const body = row?.['text']
+    const text = typeof body === 'string' && body.trim() ? body : undefined
     if (
       text !== undefined &&
-      (kind === 'start' || kind === 'tool' || kind === 'progress' || kind === 'summary' || kind === 'reply')
+      (kind === 'start' ||
+        kind === 'tool' ||
+        kind === 'progress' ||
+        kind === 'summary' ||
+        kind === 'reasoning' ||
+        kind === 'reply')
     ) {
-      entries.push({ kind, text })
+      const id = row === undefined ? undefined : readNumber(row, 'id')
+      entries.push({
+        kind,
+        text,
+        ...(id === undefined ? {} : { id }),
+        ...(row?.['truncated'] === true ? { truncated: true } : {})
+      })
     }
   }
   return entries
@@ -160,6 +176,10 @@ export function dashboardAgentFromRecord(value: unknown, position = 0): Dashboar
   if (row === undefined) return undefined
 
   const id = stableSpawnAgentId(row, position)
+  const taskLabel = readString(row, 'task_label', 'taskLabel')
+  const endedAt = epochMs(readNumber(row, 'ended_at', 'endedAt'))
+  const traceDropped = readNumber(row, 'trace_dropped', 'traceDropped')
+  const traceTruncated = row['trace_truncated'] === true || row['traceTruncated'] === true
   const parentId = readString(row, 'parent_id', 'parentId')
   const model = readString(row, 'model')
   const summary = readString(row, 'summary')
@@ -187,6 +207,10 @@ export function dashboardAgentFromRecord(value: unknown, position = 0): Dashboar
   const trace = readTrace(row)
 
   return {
+    ...(taskLabel === undefined ? {} : { taskLabel }),
+    ...(endedAt === undefined ? {} : { endedAt }),
+    ...(traceDropped === undefined ? {} : { traceDropped }),
+    ...(traceTruncated ? { traceTruncated: true } : {}),
     depth: Math.max(0, readNumber(row, 'depth') ?? 0),
     goal: readString(row, 'goal') ?? 'subagent',
     id,

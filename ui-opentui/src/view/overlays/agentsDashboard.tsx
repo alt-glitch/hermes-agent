@@ -95,8 +95,11 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   const [flash, setFlash] = createSignal('')
   const [actionPending, setActionPending] = createSignal(false)
   const [nowMs, setNowMs] = createSignal(Date.now())
+  const [following, setFollowing] = createSignal(true)
+  const [masterHeight, setMasterHeight] = createSignal(0)
   const [sections, setSections] = createSignal<Readonly<Record<string, boolean>>>({})
   let rootRef: BoxRenderable | undefined
+  let masterRef: BoxRenderable | undefined
   let detailScroll: ScrollBoxRenderable | undefined
   let previousLiveCount = props.subagents.length
 
@@ -126,9 +129,14 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
     const index = selectedIndex()
     return index < 0 ? undefined : rows()[index]
   })
-  const showTimeline = () => dims().width >= 78 && dims().height >= 22
-  const listCapacity = () => Math.max(4, Math.min(18, dims().height - (showTimeline() ? 16 : 10)))
+  const wide = () => dims().width >= 110
+  const listWidth = () => (wide() ? Math.min(52, Math.floor(dims().width * 0.4)) : Math.max(12, dims().width - 4))
+  const showTimeline = () => dims().width >= 78 && dims().height >= 26
+  const timelineRows = () => Math.min(4, rows().length)
+  const listCapacity = () => Math.max(1, Math.floor((masterHeight() - 1) / 2))
+  const nodesById = createMemo(() => new Map(rows().map(node => [node.item.id, node])))
   const visible = createMemo(() => dashboardWindow(rows(), selectedIndex(), listCapacity()))
+  const visibleIds = createMemo(() => visible().rows.map(node => node.item.id))
   const peak = createMemo(() => peakHotness(tree()))
   const pressure = createMemo(() =>
     delegationPressure(delegation(), {
@@ -170,19 +178,28 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
         : ''
     const full = `↑↓/jk move · g/G top/bottom · Enter/→ open detail${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · q close`
     const medium = `↑↓ move · Enter/→ open detail · s/f view${locked} · q close`
-    const compact = `↑↓ move · Enter open · s/f view${locked} · q close`
+    const compact = `↑↓ move · Enter open · q close${replayMode() ? ' · controls locked' : ''}`
+    const tiny = `↑↓ · Enter open · q close`
     const available = Math.max(8, dims().width - 4)
-    const footer = full.length + 2 <= available ? full : medium.length + 2 <= available ? medium : compact
+    const footer =
+      full.length + 2 <= available
+        ? full
+        : medium.length + 2 <= available
+          ? medium
+          : compact.length <= available
+            ? compact
+            : tiny
     return truncRight(footer, available)
   })
   const detailFooter = createMemo(() => {
     const controls = replayMode()
       ? ' · controls locked'
       : ` · x kill · X subtree · p ${delegation().paused ? 'resume' : 'pause'}`
-    const full = `↑↓/jk scroll · PgUp/PgDn page · g/G top/bottom · Esc/← back${controls} · q close`
-    const compact = `↑↓ scroll · PgUp/PgDn page · Esc back${controls} · q close`
+    const full = `↑↓ scroll · PgUp/PgDn · G/L live · Esc/← back · r thinking · t tools${controls} · q close`
+    const compact = `↑↓ scroll · L live · Esc back · q close`
+    const tiny = `Esc back · L live · q close`
     const available = Math.max(8, dims().width - 4)
-    return full.length + 2 <= available ? full : truncRight(compact, available)
+    return full.length + 2 <= available ? full : truncRight(compact.length <= available ? compact : tiny, available)
   })
 
   function closeWithCleanup(): void {
@@ -237,8 +254,9 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   createEffect(() => {
     selectedId()
     historyIndex()
-    mode()
-    detailScroll?.scrollTo(0)
+    setFollowing(!replayMode())
+    setSections({})
+    detailScroll?.scrollTo(replayMode() ? 0 : Number.MAX_SAFE_INTEGER)
   })
 
   createEffect(() => {
@@ -338,16 +356,18 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   }
 
   function toggleSection(name: string): void {
-    const defaults: Readonly<Record<string, boolean>> = {
-      Budget: true,
-      Files: false,
-      'Live trace': true,
-      Output: true,
-      Progress: false,
-      Summary: true,
-      'Tool calls': true
-    }
-    setSections(current => ({ ...current, [name]: !(current[name] ?? defaults[name] ?? false) }))
+    setFollowing(false)
+    setSections(current => ({ ...current, [name]: !(current[name] ?? false) }))
+  }
+
+  function returnLive(): void {
+    setFollowing(!replayMode())
+    detailScroll?.scrollTo(Number.MAX_SAFE_INTEGER)
+  }
+
+  function scrollDetail(delta: number): void {
+    setFollowing(false)
+    detailScroll?.scrollBy(delta)
   }
 
   useKeyboard(key => {
@@ -379,16 +399,40 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       return
     }
 
+    if (key.name === 'tab') {
+      setMode(current => (current === 'list' ? 'detail' : 'list'))
+      return
+    }
+    if (key.name === 'l' && key.shift) {
+      setMode('detail')
+      returnLive()
+      return
+    }
     if (mode() === 'detail') {
+      const sectionKeys: Readonly<Record<string, string>> = {
+        r: 'Reasoning',
+        a: 'Activity',
+        t: 'Tool calls',
+        o: 'Output',
+        b: 'Budget',
+        d: 'Details',
+        e: 'Live trace'
+      }
+      const section = sectionKeys[key.name]
+      if (section !== undefined && !key.ctrl && !key.meta) {
+        toggleSection(section)
+        return
+      }
       if (key.name === 'left' || key.name === 'h') setMode('list')
-      else if (key.name === 'pageup' || (key.ctrl && key.name === 'u'))
-        detailScroll?.scrollBy(-Math.max(4, dims().height - 12))
-      else if (key.name === 'pagedown' || (key.ctrl && key.name === 'd'))
-        detailScroll?.scrollBy(Math.max(4, dims().height - 12))
-      else if (key.name === 'up' || key.name === 'k') detailScroll?.scrollBy(-2)
-      else if (key.name === 'down' || key.name === 'j') detailScroll?.scrollBy(2)
-      else if (key.name === 'g' && key.shift) detailScroll?.scrollTo(Number.MAX_SAFE_INTEGER)
-      else if (key.name === 'g') detailScroll?.scrollTo(0)
+      else if (key.name === 'pageup' || (key.ctrl && key.name === 'u')) scrollDetail(-Math.max(4, dims().height - 12))
+      else if (key.name === 'pagedown' || (key.ctrl && key.name === 'd')) scrollDetail(Math.max(4, dims().height - 12))
+      else if (key.name === 'up' || key.name === 'k') scrollDetail(-2)
+      else if (key.name === 'down' || key.name === 'j') scrollDetail(2)
+      else if (key.name === 'g' && key.shift) returnLive()
+      else if (key.name === 'g') {
+        setFollowing(false)
+        detailScroll?.scrollTo(0)
+      }
       return
     }
 
@@ -445,54 +489,113 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                 </box>
               }
             >
-              <Show
-                when={mode() === 'list'}
-                fallback={
-                  <box style={{ flexDirection: 'column', flexGrow: 1, minHeight: 0, paddingLeft: 1 }}>
-                    <Show when={selected()}>
-                      {node => (
-                        <AgentDetail
-                          bindScroll={scroll => (detailScroll = scroll)}
-                          node={node()}
-                          onToggleSection={toggleSection}
-                          rowNumber={selectedIndex() + 1}
-                          sectionOpen={sectionOpen}
-                          width={Math.max(20, dims().width - 5)}
-                        />
-                      )}
-                    </Show>
-                  </box>
-                }
-              >
-                <box style={{ flexDirection: 'column', flexGrow: 1, minHeight: 0, paddingLeft: 1, paddingRight: 1 }}>
-                  <Show when={showTimeline()}>
-                    <AgentsTimeline
-                      maxRows={6}
-                      nodes={rows()}
-                      nowMs={displayNowMs()}
-                      selectedId={selected()?.item.id}
-                      width={Math.max(30, dims().width - 4)}
-                    />
-                  </Show>
-                  <box style={{ flexDirection: 'column', flexGrow: 0, flexShrink: 0, overflow: 'hidden' }}>
-                    <For each={visible().rows}>
-                      {(node, offset) => {
-                        const absoluteIndex = () => visible().start + offset()
-                        return (
-                          <AgentListRow
-                            active={node.item.id === selected()?.item.id}
-                            absoluteIndex={absoluteIndex()}
-                            node={node}
-                            onSelect={() => setSelectedId(node.item.id)}
-                            peak={peak()}
-                            width={Math.max(20, dims().width - 5)}
-                          />
-                        )
-                      }}
-                    </For>
-                  </box>
-                </box>
+              <Show when={showTimeline()}>
+                <AgentsTimeline
+                  maxRows={timelineRows()}
+                  nodes={rows()}
+                  nowMs={displayNowMs()}
+                  selectedId={selectedId()}
+                  width={Math.max(20, dims().width - 4)}
+                />
               </Show>
+              <box flexDirection="row" flexGrow={1} minHeight={0} minWidth={0}>
+                <box
+                  id="agents-master"
+                  ref={element => (masterRef = element)}
+                  onSizeChange={() => {
+                    const master = masterRef
+                    // Updating Solid's mounted window during native layout invalidates
+                    // the layout traversal. Read its settled size after this pass.
+                    queueMicrotask(() => {
+                      if (master !== undefined && !master.isDestroyed) setMasterHeight(master.height)
+                    })
+                  }}
+                  visible={wide() || mode() === 'list'}
+                  flexDirection="column"
+                  flexGrow={wide() ? 0 : 1}
+                  flexShrink={0}
+                  minHeight={0}
+                  width={listWidth()}
+                  paddingLeft={1}
+                  paddingRight={1}
+                  overflow="hidden"
+                  onMouseScroll={event => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    setMode('list')
+                    if (event.scroll?.direction === 'up') moveSelection(-1)
+                    else if (event.scroll?.direction === 'down') moveSelection(1)
+                  }}
+                >
+                  <For each={visibleIds()}>
+                    {(id, offset) => (
+                      <Show when={nodesById().get(id)}>
+                        {node => (
+                          <AgentListRow
+                            active={id === selectedId()}
+                            absoluteIndex={visible().start + offset()}
+                            node={node()}
+                            nowMs={displayNowMs()}
+                            onSelect={() => {
+                              setSelectedId(id)
+                              setMode('list')
+                            }}
+                            peak={peak()}
+                            width={Math.max(10, listWidth() - 2)}
+                          />
+                        )}
+                      </Show>
+                    )}
+                  </For>
+                  <Show when={rows().length > listCapacity()}>
+                    <text fg={theme().color.muted} wrapMode="none">
+                      {String(visible().start + 1)}–{String(visible().start + visible().rows.length)} /{' '}
+                      {String(rows().length)} · wheel / ↑↓
+                    </text>
+                  </Show>
+                </box>
+                <box
+                  id="agents-detail"
+                  visible={wide() || mode() === 'detail'}
+                  flexDirection="column"
+                  flexGrow={1}
+                  minHeight={0}
+                  minWidth={0}
+                  paddingLeft={1}
+                  border={wide() ? ['left'] : []}
+                  borderColor={theme().color.border}
+                >
+                  <Show when={!wide()}>
+                    <text fg={theme().color.accent} onMouseDown={() => setMode('list')}>
+                      ← Back to agents
+                    </text>
+                  </Show>
+                  <Show when={selected()}>
+                    {node => (
+                      <AgentDetail
+                        bindScroll={scroll => {
+                          detailScroll = scroll
+                          scroll.focusable = false
+                        }}
+                        node={node()}
+                        nowMs={displayNowMs()}
+                        replay={replayMode()}
+                        following={following()}
+                        onPauseFollow={() => {
+                          setFollowing(false)
+                          setMode('detail')
+                        }}
+                        onReturnLive={returnLive}
+                        onFocus={() => setMode('detail')}
+                        onToggleSection={toggleSection}
+                        rowNumber={selectedIndex() + 1}
+                        sectionOpen={sectionOpen}
+                        width={Math.max(10, dims().width - (wide() ? listWidth() : 0) - 6)}
+                      />
+                    )}
+                  </Show>
+                </box>
+              </box>
             </Show>
 
             <box style={{ flexDirection: 'column', flexShrink: 0, paddingLeft: 1, paddingRight: 1 }}>

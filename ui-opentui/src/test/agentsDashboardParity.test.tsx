@@ -1,12 +1,18 @@
+import { MarkdownRenderable, ScrollBoxRenderable, type Renderable } from '@opentui/core'
 import { createSignal } from 'solid-js'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { createDelegationState } from '../logic/agentStatus.ts'
 import type { SpawnHistoryState, SpawnSnapshot } from '../logic/spawnHistory.ts'
 import { dashboardAgentFromRecord, type DashboardAgent } from '../view/overlays/agents/model.ts'
+import { agentEndTime } from '../view/overlays/agents/timeline.tsx'
 import { AgentsDashboard } from '../view/overlays/agentsDashboard.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { captureFrame, renderProbe } from './lib/render.ts'
+
+function descendants(root: Renderable): Renderable[] {
+  return root.getChildren().flatMap(child => [child, ...descendants(child)])
+}
 
 const START = Date.now() - 12_000
 
@@ -115,6 +121,7 @@ describe('native agents dashboard parity', () => {
   })
 
   test('timeline keeps simultaneous fan-outs as distinct lanes with a scaled ruler', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(START + 42_000)
     const simultaneous = [
       agent('lane-1', 'First parallel task', { durationSeconds: 42, startedAt: START }),
       agent('lane-2', 'Second parallel task', { durationSeconds: 42, index: 1, startedAt: START }),
@@ -132,8 +139,8 @@ describe('native agents dashboard parity', () => {
       width: 116
     })
     const lanes = frame.split('\n').filter(line => line.includes('╺'))
-    const ruler = frame.split('\n').find(line => line.includes('┼'))
-    const labels = frame.split('\n').find(line => /0\s+\d+s\s+\d+s/.test(line))
+    const ruler = frame.split('\n').find(line => line.includes('0─'))
+    const labels = frame.split('\n').find(line => /┤\s+42s/.test(line))
 
     expect(lanes).toHaveLength(4)
     expect(lanes.slice(0, 3).every(line => line.includes('●'))).toBe(true)
@@ -154,7 +161,7 @@ describe('native agents dashboard parity', () => {
   })
 
   test('list navigation opens rich detail and Escape returns to the list', async () => {
-    const probe = await renderProbe(dashboardNode(), { height: 34, kittyKeyboard: true, width: 116 })
+    const probe = await renderProbe(dashboardNode(), { height: 34, kittyKeyboard: true, width: 96 })
     try {
       probe.keys.pressArrow('down')
       await probe.settle()
@@ -167,13 +174,17 @@ describe('native agents dashboard parity', () => {
       probe.keys.pressKey('g', { shift: true })
       await probe.settle()
       frame = probe.frame()
-      expect(frame).toContain('Summary')
-      expect(frame).toContain('All four artifacts are signed.')
+      expect(frame).toContain('Final reply')
+      expect(
+        descendants(probe.renderer.root).some(
+          item => item instanceof MarkdownRenderable && item.content === 'All four artifacts are signed.'
+        )
+      ).toBe(true)
 
       probe.keys.pressEscape()
       await probe.settle()
       frame = probe.frame()
-      expect(frame).toContain('Enter/→ open detail')
+      expect(frame).toContain('Enter')
       expect(frame).toContain('Research the release blockers')
     } finally {
       probe.destroy()
@@ -376,6 +387,7 @@ describe('native agents dashboard parity', () => {
     )
     try {
       probe.keys.pressEnter()
+      probe.keys.pressKey('e')
       await probe.settle()
       expect((probe.frame().match(/TRACE_/g) ?? []).length).toBeLessThan(20)
 
@@ -386,6 +398,173 @@ describe('native agents dashboard parity', () => {
       expect(frame).toContain('TRACE_08')
       expect(frame).toContain('TRACE_27')
       expect(frame).toContain('q close')
+    } finally {
+      probe.destroy()
+    }
+  })
+  test('wide master-detail uses measured height, stable row instances and wheel selection across resize', async () => {
+    const many = Array.from({ length: 100 }, (_, index) =>
+      agent(`row-${String(index)}`, `Task ${String(index)}`, { index })
+    )
+    const [items, setItems] = createSignal<readonly DashboardAgent[]>(many)
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider>
+          <AgentsDashboard subagents={items()} onClose={() => {}} />
+        </ThemeProvider>
+      ),
+      { width: 140, height: 62 }
+    )
+    try {
+      const master = descendants(probe.renderer.root).find(item => item.id === 'agents-master')
+      const first = descendants(probe.renderer.root).find(item => item.id === 'agent-row-row-0')
+      const detail = descendants(probe.renderer.root).find(item => item.id === 'agents-detail')
+      expect(master?.visible).toBe(true)
+      expect(detail?.visible).toBe(true)
+      expect(descendants(probe.renderer.root).filter(item => item.id.startsWith('agent-row-')).length).toBeGreaterThan(
+        18
+      )
+      expect(descendants(probe.renderer.root).filter(item => item.id.startsWith('agent-row-')).length).toBeLessThan(100)
+      setItems(current => current.map(item => (item.id === 'row-1' ? { ...item, status: 'failed' } : item)))
+      await probe.settle()
+      expect(descendants(probe.renderer.root)).toContain(first)
+      if (master === undefined) throw new Error('missing master')
+      await probe.scroll(master.x + 3, master.y + 2, 'down')
+      expect(probe.frame()).toContain('#2')
+      probe.resize(76, 18)
+      await probe.settle()
+      expect(detail?.visible).toBe(false)
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(probe.frame()).toContain('#2')
+      expect(probe.frame()).toContain('← Back to agents')
+      probe.keys.pressKey('h')
+      await probe.settle()
+      probe.keys.pressKey('g', { shift: true })
+      await probe.settle()
+      expect(probe.frame()).toContain('Task 99')
+      probe.resize(140, 62)
+      await probe.settle()
+      expect(probe.frame()).toContain('#100')
+      expect(detail?.visible).toBe(true)
+      for (const width of [80, 40]) {
+        probe.resize(width, 12)
+        await probe.settle()
+        expect(probe.frame()).toContain('Task 99')
+        expect(probe.frame()).toContain('q close')
+        expect(
+          descendants(probe.renderer.root).filter(item => item.id.startsWith('agent-row-')).length
+        ).toBeLessThanOrEqual(Math.max(1, Math.floor((master.height - 1) / 2)))
+      }
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('unknown terminal time stays unknown while the active sibling advances', async () => {
+    const finished = agent('finished', 'Finished without timestamp', { status: 'completed', startedAt: START })
+    const active = agent('active', 'Still working', { startedAt: START })
+    expect(agentEndTime(finished, START + 1_000)).toBeUndefined()
+    expect(agentEndTime(finished, START + 50_000)).toBeUndefined()
+    expect(agentEndTime(active, START + 50_000)).toBe(START + 50_000)
+    expect(agentEndTime({ ...finished, endedAt: START + 5_000 }, START + 50_000)).toBe(START + 5_000)
+    const frame = await captureFrame(dashboardNode({ subagents: [finished, active] }), { width: 132, height: 32 })
+    expect(frame).toContain('timing unknown')
+    expect(frame).toContain('Finished without timestamp')
+    expect(frame).toContain('Still working')
+  })
+
+  test('replay preserves trace metadata and keeps real reasoning separate from activity', async () => {
+    const record = dashboardAgentFromRecord({
+      subagent_id: 'retained',
+      goal: 'Full original goal',
+      task_label: 'Readable task',
+      status: 'completed',
+      ended_at: START + 4_000,
+      trace_dropped: 3,
+      trace_truncated: true,
+      thinking: ['ACTIVITY_ONLY'],
+      trace: [
+        { id: 4, kind: 'reasoning', text: '**MODEL_REASONING**', truncated: true },
+        { id: 5, kind: 'reply', text: 'Retained final reply' }
+      ]
+    })
+    if (record === undefined) throw new Error('missing normalized archive')
+    expect(record.taskLabel).toBe('Readable task')
+    expect(record.endedAt).toBe(START + 4_000)
+    expect(record.trace?.map(entry => entry.id)).toEqual([4, 5])
+    const archived = snapshot('retained-snapshot', 'Retained work', [record], 0)
+    const probe = await renderProbe(dashboardNode({ subagents: [], history: { snapshots: [archived] } }), {
+      width: 132,
+      height: 34
+    })
+    try {
+      expect(probe.frame()).toContain('Readable task')
+      expect(probe.frame()).toContain('3 events omitted')
+      expect(probe.frame()).toContain('▸ Reasoning')
+      expect(probe.frame()).not.toContain('ACTIVITY_ONLY')
+      expect(
+        descendants(probe.renderer.root).some(
+          item => item instanceof MarkdownRenderable && item.content === '**MODEL_REASONING**'
+        )
+      ).toBe(false)
+      probe.keys.pressEnter()
+      probe.keys.pressKey('r')
+      await probe.settle()
+      const reasoning = descendants(probe.renderer.root).find(
+        item => item instanceof MarkdownRenderable && item.content === '**MODEL_REASONING**'
+      )
+      expect(reasoning).toBeInstanceOf(MarkdownRenderable)
+      if (!(reasoning instanceof MarkdownRenderable)) throw new Error('missing native reasoning')
+      expect(reasoning.streaming).toBe(false)
+      expect(probe.frame()).not.toContain('ACTIVITY_ONLY')
+      probe.keys.pressKey('a')
+      await probe.settle()
+      expect(
+        descendants(probe.renderer.root).some(
+          item => item instanceof MarkdownRenderable && item.content === 'ACTIVITY_ONLY'
+        )
+      ).toBe(true)
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('reader wheel/keyboard pauses following, append preserves position, and live action resumes', async () => {
+    const trace = Array.from({ length: 30 }, (_, index) => ({
+      id: index,
+      kind: 'reply' as const,
+      text: `Retained paragraph ${String(index)}`
+    }))
+    const current = agent('stream', 'Observe retained messages', { trace })
+    const [items, setItems] = createSignal<readonly DashboardAgent[]>([current])
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider>
+          <AgentsDashboard subagents={items()} onClose={() => {}} />
+        </ThemeProvider>
+      ),
+      { width: 132, height: 30 }
+    )
+    try {
+      const scroll = descendants(probe.renderer.root).find(item => item.id === 'agent-detail-scroll')
+      if (!(scroll instanceof ScrollBoxRenderable)) throw new Error('missing detail scroll')
+      expect(scroll.scrollTop).toBeGreaterThan(0)
+      expect(probe.frame()).toContain('Following live')
+      await probe.scroll(scroll.x + 5, scroll.y + 3, 'up')
+      await probe.settle()
+      expect(probe.frame()).toContain('Scroll paused')
+      const position = scroll.scrollTop
+      setItems([{ ...current, trace: [...trace, { id: 30, kind: 'reply', text: 'Newest reply' }] }])
+      await probe.settle()
+      expect(scroll.scrollTop).toBe(position)
+      probe.keys.pressKey('l', { shift: true })
+      await probe.settle()
+      expect(probe.frame()).toContain('Following live')
+      expect(scroll.scrollTop).toBeGreaterThan(position)
+      probe.keys.pressArrow('up')
+      await probe.settle()
+      expect(probe.frame()).toContain('Scroll paused')
     } finally {
       probe.destroy()
     }

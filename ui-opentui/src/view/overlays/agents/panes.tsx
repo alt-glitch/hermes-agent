@@ -14,10 +14,14 @@ import {
 } from '../../../logic/subagentTree.ts'
 import { delegationTaskPrefix } from '../../../logic/delegationLabels.ts'
 import type { Theme } from '../../../logic/theme.ts'
-import { truncRight } from '../../../logic/truncate.ts'
+import { truncRightCells as truncRight } from '../../../logic/truncate.ts'
 import { useTheme } from '../../theme.tsx'
 import type { DashboardAgent, DashboardOutputEntry } from './model.ts'
 import { snapshotDashboardAgents } from './model.ts'
+import { AgentMessages } from './messages.tsx'
+import { agentElapsed } from './timeline.tsx'
+import { Markdown } from '../../markdown.tsx'
+export { AgentsTimeline } from './timeline.tsx'
 
 interface StatusVisual {
   readonly color: string
@@ -47,14 +51,8 @@ function rowId(index: number): string {
   return String(index + 1).padStart(2, ' ')
 }
 
-function elapsedSeconds(agent: DashboardAgent, nowMs: number): number | undefined {
-  if (agent.durationSeconds !== undefined) return Math.max(0, agent.durationSeconds)
-  if (agent.startedAt === undefined) return undefined
-  const status = normalizeSubagentStatus(agent.status)
-  return status === 'running' || status === 'queued' ? Math.max(0, (nowMs - agent.startedAt) / 1000) : undefined
-}
-
 export function AgentListRow(props: {
+  readonly nowMs: number
   readonly active: boolean
   readonly absoluteIndex: number
   readonly node: SubagentNode<DashboardAgent>
@@ -85,164 +83,55 @@ export function AgentListRow(props: {
     const paren = value.indexOf('(')
     return truncRight((paren > 0 ? value.slice(0, paren) : value).trim(), 14)
   })
-  const goalBudget = createMemo(() => Math.max(8, props.width - 30 - props.node.item.depth * 2))
+  const goalBudget = createMemo(() => Math.max(8, props.width - 10 - Math.min(4, props.node.item.depth) * 2))
   const tools = createMemo(() =>
     props.node.aggregate.totalTools > 0 ? ` ·${String(props.node.aggregate.totalTools)}t` : ''
   )
   const kids = createMemo(() => (props.node.children.length > 0 ? ` ·${String(props.node.children.length)}↓` : ''))
 
   return (
-    <text
-      bg={props.active ? theme().color.selectionBg : 'transparent'}
-      fg={props.active ? theme().color.accent : theme().color.text}
+    <box
+      id={`agent-row-${props.node.item.id}`}
+      flexDirection="column"
+      height={2}
+      flexShrink={0}
       onMouseDown={props.onSelect}
-      wrapMode="none"
     >
-      <span style={{ fg: props.active ? theme().color.accent : theme().color.muted }}>
-        {' '}
-        {rowId(props.absoluteIndex)}{' '}
-      </span>
-      <span style={{ fg: theme().color.muted }}>{'  '.repeat(Math.max(0, props.node.item.depth))}</span>
-      <Show when={heat()}>{color => <span style={{ fg: color() }}>▍</span>}</Show>
-      <span style={{ fg: props.active ? theme().color.accent : visual().color }}>{visual().glyph} </span>
-      <span style={{ fg: props.active ? theme().color.accent : theme().color.text }}>
-        {truncRight(`${taskPrefix()}${props.node.item.goal || 'subagent'}`, goalBudget())}
-      </span>
-      <span style={{ fg: props.active ? theme().color.accent : theme().color.muted }}>
-        {tools()}
-        {kids()}
-        {toolShort() ? ` · ${toolShort()}` : ''}
-      </span>
-    </text>
-  )
-}
-
-interface TimelineSpan {
-  readonly endAt: number
-  readonly node: SubagentNode<DashboardAgent>
-  readonly startAt: number
-}
-
-export function AgentsTimeline(props: {
-  readonly maxRows: number
-  readonly nodes: readonly SubagentNode<DashboardAgent>[]
-  readonly nowMs: number
-  readonly selectedId: string | undefined
-  readonly width: number
-}) {
-  const theme = useTheme()
-  const spans = createMemo<readonly TimelineSpan[]>(() =>
-    props.nodes.flatMap(node => {
-      const startAt = node.item.startedAt
-      if (startAt === undefined) return []
-      const endAt =
-        node.item.durationSeconds === undefined ? props.nowMs : startAt + Math.max(0, node.item.durationSeconds) * 1000
-      return endAt < startAt ? [] : [{ endAt, node, startAt }]
-    })
-  )
-  const globalStart = createMemo(() => Math.min(...spans().map(span => span.startAt)))
-  const globalEnd = createMemo(() => Math.max(...spans().map(span => span.endAt)))
-  const totalSpan = createMemo(() => Math.max(1, globalEnd() - globalStart()))
-  const barWidth = createMemo(() => Math.max(10, props.width - 18))
-  const selectedSpanIndex = createMemo(() => {
-    const selected = props.selectedId
-    const index = selected === undefined ? -1 : spans().findIndex(span => span.node.item.id === selected)
-    return index < 0 ? 0 : index
-  })
-  const windowStart = createMemo(() =>
-    Math.max(
-      0,
-      Math.min(
-        Math.max(0, spans().length - props.maxRows),
-        selectedSpanIndex() - Math.floor(Math.max(1, props.maxRows) / 2)
-      )
-    )
-  )
-  const shown = createMemo(() => spans().slice(windowStart(), windowStart() + Math.max(1, props.maxRows)))
-  const duration = createMemo(() => Math.max(0, (globalEnd() - globalStart()) / 1000))
-  const lane = (span: TimelineSpan, endGlyph: string): string => {
-    const width = barWidth()
-    const start = Math.min(width - 1, Math.floor(((span.startAt - globalStart()) / totalSpan()) * (width - 1)))
-    const end = Math.max(
-      start,
-      Math.min(width - 1, Math.ceil(((span.endAt - globalStart()) / totalSpan()) * (width - 1)))
-    )
-    const chars = Array.from({ length: width }, () => ' ')
-    if (start === end) {
-      chars[start] = endGlyph
-      return chars.join('')
-    }
-    chars[start] = '╺'
-    for (let column = start + 1; column < end; column += 1) chars[column] = '━'
-    chars[end] = endGlyph
-    return chars.join('')
-  }
-  const ruler = createMemo(() =>
-    Array.from({ length: barWidth() }, (_, column) => {
-      if (column > 0 && column % 10 === 0) return '┼'
-      if (column > 0 && column % 5 === 0) return '·'
-      return '─'
-    }).join('')
-  )
-  const rulerLabels = createMemo(() => {
-    if (duration() <= 0) return ''
-    const width = barWidth()
-    const step = duration() < 20 && width > 20 ? 5 : 10
-    const chars = Array.from({ length: width }, () => ' ')
-    for (let column = 0; column < width; column += step) {
-      const seconds = (column / Math.max(1, width - 1)) * duration()
-      const label = column === 0 ? '0' : seconds >= 1 ? `${String(Math.round(seconds))}s` : `${seconds.toFixed(1)}s`
-      for (let offset = 0; offset < label.length && column + offset < width; offset += 1) {
-        chars[column + offset] = label[offset] ?? ' '
-      }
-    }
-    return chars.join('')
-  })
-
-  return (
-    <Show when={spans().length > 0}>
-      <box style={{ flexDirection: 'column', flexShrink: 0, marginBottom: 1 }}>
-        <text fg={theme().color.muted} wrapMode="none">
-          Timeline · {fmtDuration(duration())}
-          {spans().length > props.maxRows
-            ? ` · ${String(windowStart() + 1)}-${String(Math.min(spans().length, windowStart() + props.maxRows))}/${String(spans().length)}`
-            : ''}
-        </text>
-        <For each={shown()}>
-          {span => {
-            const active = () => span.node.item.id === props.selectedId
-            const visual = () => statusVisual(span.node.item.status, theme())
-            const elapsed = () => elapsedSeconds(span.node.item, props.nowMs)
-            return (
-              <text wrapMode="none">
-                <span style={{ fg: active() ? theme().color.accent : theme().color.muted }}>
-                  {rowId(props.nodes.findIndex(node => node.item.id === span.node.item.id))}
-                  {'  '}
-                </span>
-                <span style={{ fg: active() ? theme().color.accent : visual().color }}>
-                  {lane(span, visual().glyph)}
-                </span>
-                <span style={{ fg: theme().color.muted }}>
-                  {elapsed() === undefined ? '' : `  ${fmtDuration(elapsed() ?? 0)}`}
-                </span>
-              </text>
-            )
-          }}
-        </For>
-        <text fg={theme().color.muted} wrapMode="none">
-          {'    '}
-          {ruler()}
-        </text>
-        <Show when={rulerLabels()}>
-          {labels => (
-            <text fg={theme().color.muted} wrapMode="none">
-              {'    '}
-              {labels()}
-            </text>
+      <text
+        bg={props.active ? theme().color.selectionBg : 'transparent'}
+        fg={props.active ? theme().color.accent : theme().color.text}
+        onMouseDown={props.onSelect}
+        wrapMode="none"
+      >
+        <span style={{ fg: props.active ? theme().color.accent : theme().color.muted }}>
+          {' '}
+          {rowId(props.absoluteIndex)}{' '}
+        </span>
+        <span style={{ fg: theme().color.muted }}>{'  '.repeat(Math.min(4, Math.max(0, props.node.item.depth)))}</span>
+        <Show when={heat()}>{color => <span style={{ fg: color() }}>▍</span>}</Show>
+        <span style={{ fg: props.active ? theme().color.accent : visual().color }}>{visual().glyph} </span>
+        <span style={{ fg: props.active ? theme().color.accent : theme().color.text }}>
+          {truncRight(
+            `${taskPrefix()}${props.node.item.taskLabel || props.node.item.goal || 'subagent'}`,
+            goalBudget()
           )}
-        </Show>
-      </box>
-    </Show>
+        </span>
+        <span style={{ fg: props.active ? theme().color.accent : theme().color.muted }}>{kids()}</span>
+      </text>
+      <text fg={theme().color.muted} wrapMode="none" bg={props.active ? theme().color.selectionBg : 'transparent'}>
+        {truncRight(
+          `    ${normalizeSubagentStatus(props.node.item.status)} · ${agentElapsed(props.node.item, props.nowMs) === undefined ? 'elapsed ?' : fmtDuration(agentElapsed(props.node.item, props.nowMs) ?? 0)}${tools()} · ${
+            props.node.item.trace
+              ?.findLast(entry => entry.kind === 'reply' || entry.kind === 'progress')
+              ?.text.replace(/\s+/g, ' ')
+              .trim() ||
+            toolShort() ||
+            'waiting'
+          }`,
+          props.width
+        )}
+      </text>
+    </box>
   )
 }
 
@@ -293,6 +182,12 @@ function OutputLine(props: { readonly entry: DashboardOutputEntry }) {
 }
 
 export function AgentDetail(props: {
+  readonly following: boolean
+  readonly onPauseFollow: () => void
+  readonly onReturnLive: () => void
+  readonly onFocus: () => void
+  readonly replay: boolean
+  readonly nowMs: number
   readonly bindScroll: (scroll: ScrollBoxRenderable) => void
   readonly node: SubagentNode<DashboardAgent>
   readonly onToggleSection: (title: string) => void
@@ -312,211 +207,246 @@ export function AgentDetail(props: {
   const outputTail = () => agent().outputTail ?? []
   const tools = () => ToolLines({ agent: agent() })
   const progress = () => agent().notes ?? []
-  const latestThought = () => agent().thought ?? agent().thinking?.at(-1)
-  const trace = () => agent().trace ?? []
+  const thinking = () =>
+    agent().thinking?.length ? (agent().thinking ?? []) : agent().thought ? [agent().thought ?? ''] : []
+  const trace = () =>
+    (agent().trace ?? []).filter(
+      entry => entry.kind !== 'reply' && entry.kind !== 'summary' && entry.kind !== 'reasoning'
+    )
   const filesOverflow = () => Math.max(0, filesRead().length - 8) + Math.max(0, filesWritten().length - 8)
 
   return (
-    <scrollbox ref={props.bindScroll} style={{ flexGrow: 1, minHeight: 0, paddingBottom: 3, paddingRight: 1 }}>
-      <text fg={theme().color.text} wrapMode="word">
-        <span style={{ fg: theme().color.accent }}>#{String(props.rowNumber)} </span>
-        <span style={{ fg: visual().color }}>{visual().glyph} </span>
-        <b>{agent().goal}</b>
+    <box flexDirection="column" flexGrow={1} minHeight={0} minWidth={0} onMouseDown={props.onFocus}>
+      <text flexShrink={0} height={1} fg={theme().color.accent} wrapMode="none" onMouseDown={props.onReturnLive}>
+        {props.replay
+          ? 'Replay · retained messages'
+          : props.following
+            ? normalizeSubagentStatus(agent().status) === 'running' ||
+              normalizeSubagentStatus(agent().status) === 'queued'
+              ? 'Following live · ↑ to inspect'
+              : 'Latest messages · ↑ to inspect'
+            : 'Scroll paused · L / click to return live'}
       </text>
+      <scrollbox
+        id="agent-detail-scroll"
+        ref={props.bindScroll}
+        stickyScroll={props.following}
+        stickyStart="bottom"
+        scrollX={false}
+        onMouseScroll={event => {
+          if (event.scroll?.direction === 'up') props.onPauseFollow()
+        }}
+        onMouseDrag={props.onPauseFollow}
+        style={{ flexGrow: 1, minHeight: 0, paddingBottom: 1, paddingRight: 1 }}
+      >
+        <text fg={theme().color.text} wrapMode="word">
+          <span style={{ fg: theme().color.accent }}>#{String(props.rowNumber)} </span>
+          <span style={{ fg: visual().color }}>{visual().glyph} </span>
+          <b>{truncRight(agent().taskLabel || agent().goal, Math.max(8, props.width - 8))}</b>
+        </text>
 
-      <box style={{ flexDirection: 'column', marginTop: 1 }}>
-        <Field
-          name="depth"
-          value={`${String(agent().depth)} · ${normalizeSubagentStatus(agent().status)}`}
-          width={props.width}
+        <AgentMessages
+          agent={agent()}
+          replay={props.replay}
+          reasoningOpen={props.sectionOpen('Reasoning', false)}
+          onToggleReasoning={() => props.onToggleSection('Reasoning')}
         />
-        <Show when={agent().model}>{model => <Field name="model" value={model()} width={props.width} />}</Show>
-        <Show when={(agent().toolsets?.length ?? 0) > 0}>
-          <Field name="toolsets" value={(agent().toolsets ?? []).join(', ')} width={props.width} />
-        </Show>
-        <Field
-          name="tools"
-          value={`${String(agent().toolCount ?? 0)} (subtree ${String(props.node.aggregate.totalTools)})`}
-          width={props.width}
-        />
-        <Field
-          name="subtree"
-          value={`${String(props.node.aggregate.descendantCount)} agent${props.node.aggregate.descendantCount === 1 ? '' : 's'} · d${String(props.node.aggregate.maxDepthFromHere)} · ⚡${String(props.node.aggregate.activeCount)}`}
-          width={props.width}
-        />
-        <Show when={agent().durationSeconds !== undefined}>
-          <Field name="elapsed" value={fmtDuration(agent().durationSeconds ?? 0)} width={props.width} />
-        </Show>
-        <Show when={agent().iteration !== undefined}>
-          <Field name="iteration" value={String(agent().iteration)} width={props.width} />
-        </Show>
-        <Show when={agent().apiCalls !== undefined}>
-          <Field name="api calls" value={String(agent().apiCalls)} width={props.width} />
-        </Show>
-        <Show when={latestThought()}>{thought => <Field name="thinking" value={thought()} width={props.width} />}</Show>
-      </box>
-
-      <Show when={localTokens() > 0 || (agent().costUsd ?? 0) > 0}>
-        <Section
-          open={props.sectionOpen('Budget', true)}
-          onToggle={() => props.onToggleSection('Budget')}
-          title="Budget"
-        >
-          <Field
-            name="tokens"
-            value={`${fmtTokens(inputTokens())} in · ${fmtTokens(outputTokens())} out${(agent().reasoningTokens ?? 0) > 0 ? ` · ${fmtTokens(agent().reasoningTokens ?? 0)} reasoning` : ''}`}
-            width={props.width}
-          />
-          <Show when={subtreeTokens() > 0}>
-            <Field name="subtree tokens" value={`+${fmtTokens(subtreeTokens())}`} width={props.width} />
-          </Show>
-          <Show when={(agent().costUsd ?? 0) > 0}>
-            <Field name="cost" value={fmtCost(agent().costUsd ?? 0)} width={props.width} />
-          </Show>
-        </Section>
-      </Show>
-
-      <Show when={filesRead().length + filesWritten().length > 0}>
-        <Section
-          count={filesRead().length + filesWritten().length}
-          open={props.sectionOpen('Files', false)}
-          onToggle={() => props.onToggleSection('Files')}
-          title="Files"
-        >
-          <For each={filesWritten().slice(0, 8)}>
-            {path => (
-              <text fg={theme().color.statusGood} wrapMode="none">
-                +{truncRight(path, Math.max(8, props.width - 3))}
-              </text>
-            )}
-          </For>
-          <For each={filesRead().slice(0, 8)}>
-            {path => (
-              <text fg={theme().color.text} wrapMode="none">
-                <span style={{ fg: theme().color.muted }}>· </span>
-                {truncRight(path, Math.max(8, props.width - 3))}
-              </text>
-            )}
-          </For>
-          <Show when={filesOverflow() > 0}>
-            <text fg={theme().color.muted}>…+{String(filesOverflow())} more</text>
-          </Show>
-        </Section>
-      </Show>
-
-      <Show when={tools().length > 0}>
-        <Section
-          count={tools().length}
-          open={props.sectionOpen('Tool calls', true)}
-          onToggle={() => props.onToggleSection('Tool calls')}
-          title="Tool calls"
-        >
-          <For each={tools().slice(-16)}>
-            {line => (
-              <text fg={theme().color.text} wrapMode="word">
-                <span style={{ fg: theme().color.muted }}>· </span>
-                {line}
-              </text>
-            )}
-          </For>
-          <Show when={tools().length > 16}>
-            <text fg={theme().color.muted}>…{String(tools().length - 16)} earlier calls hidden</text>
-          </Show>
-        </Section>
-      </Show>
-
-      <Show when={outputTail().length > 0}>
-        <Section
-          count={outputTail().length}
-          open={props.sectionOpen('Output', true)}
-          onToggle={() => props.onToggleSection('Output')}
-          title="Output"
-        >
-          <For each={outputTail().slice(-8)}>{entry => <OutputLine entry={entry} />}</For>
-          <Show when={outputTail().length > 8}>
-            <text fg={theme().color.muted}>…{String(outputTail().length - 8)} earlier outputs hidden</text>
-          </Show>
-        </Section>
-      </Show>
-
-      <Show when={trace().length > 0}>
-        <Section
-          count={trace().length}
-          open={props.sectionOpen('Live trace', true)}
-          onToggle={() => props.onToggleSection('Live trace')}
-          title="Live trace"
-        >
-          <For each={trace().slice(-20)}>
-            {entry => {
-              const glyph =
-                entry.kind === 'tool'
-                  ? '⚡'
-                  : entry.kind === 'summary'
-                    ? '✓'
-                    : entry.kind === 'start'
-                      ? '▶'
-                      : entry.kind === 'reply'
-                        ? '❯'
-                        : '·'
-              const color =
-                entry.kind === 'tool'
-                  ? theme().color.accent
-                  : entry.kind === 'summary'
-                    ? theme().color.ok
-                    : entry.kind === 'start'
-                      ? theme().color.label
-                      : entry.kind === 'reply'
-                        ? theme().color.text
-                        : theme().color.muted
-              return (
-                <text
-                  fg={entry.kind === 'summary' || entry.kind === 'reply' ? theme().color.text : theme().color.muted}
-                  wrapMode="word"
-                >
-                  <span style={{ fg: color }}>{glyph} </span>
-                  {entry.text}
-                </text>
-              )
-            }}
-          </For>
-          <Show when={trace().length > 20}>
-            <text fg={theme().color.muted}>…{String(trace().length - 20)} earlier events hidden</text>
-          </Show>
-        </Section>
-      </Show>
-
-      <Show when={progress().length > 0}>
-        <Section
-          count={progress().length}
-          open={props.sectionOpen('Progress', false)}
-          onToggle={() => props.onToggleSection('Progress')}
-          title="Progress"
-        >
-          <For each={progress().slice(-6)}>
-            {line => (
-              <text fg={theme().color.text} wrapMode="word">
-                <span style={{ fg: theme().color.label }}>· </span>
-                {line}
-              </text>
-            )}
-          </For>
-        </Section>
-      </Show>
-
-      <Show when={agent().summary}>
-        {summary => (
+        <Show when={thinking().length > 0}>
           <Section
-            open={props.sectionOpen('Summary', true)}
-            onToggle={() => props.onToggleSection('Summary')}
-            title="Summary"
+            title="Activity"
+            open={props.sectionOpen('Activity', false)}
+            onToggle={() => props.onToggleSection('Activity')}
           >
-            <text fg={theme().color.text} wrapMode="word">
-              {summary()}
-            </text>
+            <text fg={theme().color.muted}>Reported activity, not model reasoning.</text>
+            <For each={thinking()}>{text => <Markdown text={text} fg={theme().color.muted} />}</For>
           </Section>
-        )}
-      </Show>
-    </scrollbox>
+        </Show>
+        <Section
+          title="Details"
+          open={props.sectionOpen('Details', false)}
+          onToggle={() => props.onToggleSection('Details')}
+        >
+          <Markdown text={agent().goal} />
+          <box style={{ flexDirection: 'column', marginTop: 1 }}>
+            <Field
+              name="depth"
+              value={`${String(agent().depth)} · ${normalizeSubagentStatus(agent().status)}`}
+              width={props.width}
+            />
+            <Show when={agent().model}>{model => <Field name="model" value={model()} width={props.width} />}</Show>
+            <Show when={(agent().toolsets?.length ?? 0) > 0}>
+              <Field name="toolsets" value={(agent().toolsets ?? []).join(', ')} width={props.width} />
+            </Show>
+            <Field
+              name="tools"
+              value={`${String(agent().toolCount ?? 0)} (subtree ${String(props.node.aggregate.totalTools)})`}
+              width={props.width}
+            />
+            <Field
+              name="subtree"
+              value={`${String(props.node.aggregate.descendantCount)} agent${props.node.aggregate.descendantCount === 1 ? '' : 's'} · d${String(props.node.aggregate.maxDepthFromHere)} · ⚡${String(props.node.aggregate.activeCount)}`}
+              width={props.width}
+            />
+            <Show when={agentElapsed(agent(), props.nowMs) !== undefined}>
+              <Field name="elapsed" value={fmtDuration(agentElapsed(agent(), props.nowMs) ?? 0)} width={props.width} />
+            </Show>
+            <Show when={agent().iteration !== undefined}>
+              <Field name="iteration" value={String(agent().iteration)} width={props.width} />
+            </Show>
+            <Show when={agent().apiCalls !== undefined}>
+              <Field name="api calls" value={String(agent().apiCalls)} width={props.width} />
+            </Show>
+          </box>
+        </Section>
+
+        <Show when={localTokens() > 0 || (agent().costUsd ?? 0) > 0}>
+          <Section
+            open={props.sectionOpen('Budget', false)}
+            onToggle={() => props.onToggleSection('Budget')}
+            title="Budget"
+          >
+            <Field
+              name="tokens"
+              value={`${fmtTokens(inputTokens())} in · ${fmtTokens(outputTokens())} out${(agent().reasoningTokens ?? 0) > 0 ? ` · ${fmtTokens(agent().reasoningTokens ?? 0)} reasoning` : ''}`}
+              width={props.width}
+            />
+            <Show when={subtreeTokens() > 0}>
+              <Field name="subtree tokens" value={`+${fmtTokens(subtreeTokens())}`} width={props.width} />
+            </Show>
+            <Show when={(agent().costUsd ?? 0) > 0}>
+              <Field name="cost" value={fmtCost(agent().costUsd ?? 0)} width={props.width} />
+            </Show>
+          </Section>
+        </Show>
+
+        <Show when={filesRead().length + filesWritten().length > 0}>
+          <Section
+            count={filesRead().length + filesWritten().length}
+            open={props.sectionOpen('Files', false)}
+            onToggle={() => props.onToggleSection('Files')}
+            title="Files"
+          >
+            <For each={filesWritten().slice(0, 8)}>
+              {path => (
+                <text fg={theme().color.statusGood} wrapMode="none">
+                  +{truncRight(path, Math.max(8, props.width - 3))}
+                </text>
+              )}
+            </For>
+            <For each={filesRead().slice(0, 8)}>
+              {path => (
+                <text fg={theme().color.text} wrapMode="none">
+                  <span style={{ fg: theme().color.muted }}>· </span>
+                  {truncRight(path, Math.max(8, props.width - 3))}
+                </text>
+              )}
+            </For>
+            <Show when={filesOverflow() > 0}>
+              <text fg={theme().color.muted}>…+{String(filesOverflow())} more</text>
+            </Show>
+          </Section>
+        </Show>
+
+        <Show when={tools().length > 0}>
+          <Section
+            count={tools().length}
+            open={props.sectionOpen('Tool calls', false)}
+            onToggle={() => props.onToggleSection('Tool calls')}
+            title="Tool calls"
+          >
+            <For each={tools().slice(-16)}>
+              {line => (
+                <text fg={theme().color.text} wrapMode="word">
+                  <span style={{ fg: theme().color.muted }}>· </span>
+                  {line}
+                </text>
+              )}
+            </For>
+            <Show when={tools().length > 16}>
+              <text fg={theme().color.muted}>…{String(tools().length - 16)} earlier calls hidden</text>
+            </Show>
+          </Section>
+        </Show>
+
+        <Show when={outputTail().length > 0}>
+          <Section
+            count={outputTail().length}
+            open={props.sectionOpen('Output', false)}
+            onToggle={() => props.onToggleSection('Output')}
+            title="Output"
+          >
+            <For each={outputTail().slice(-8)}>{entry => <OutputLine entry={entry} />}</For>
+            <Show when={outputTail().length > 8}>
+              <text fg={theme().color.muted}>…{String(outputTail().length - 8)} earlier outputs hidden</text>
+            </Show>
+          </Section>
+        </Show>
+
+        <Show when={trace().length > 0}>
+          <Section
+            count={trace().length}
+            open={props.sectionOpen('Live trace', false)}
+            onToggle={() => props.onToggleSection('Live trace')}
+            title="Live trace"
+          >
+            <For each={trace().slice(-20)}>
+              {entry => {
+                const glyph =
+                  entry.kind === 'tool'
+                    ? '⚡'
+                    : entry.kind === 'summary'
+                      ? '✓'
+                      : entry.kind === 'start'
+                        ? '▶'
+                        : entry.kind === 'reply'
+                          ? '❯'
+                          : '·'
+                const color =
+                  entry.kind === 'tool'
+                    ? theme().color.accent
+                    : entry.kind === 'summary'
+                      ? theme().color.ok
+                      : entry.kind === 'start'
+                        ? theme().color.label
+                        : entry.kind === 'reply'
+                          ? theme().color.text
+                          : theme().color.muted
+                return (
+                  <text
+                    fg={entry.kind === 'summary' || entry.kind === 'reply' ? theme().color.text : theme().color.muted}
+                    wrapMode="word"
+                  >
+                    <span style={{ fg: color }}>{glyph} </span>
+                    {entry.text}
+                  </text>
+                )
+              }}
+            </For>
+            <Show when={trace().length > 20}>
+              <text fg={theme().color.muted}>…{String(trace().length - 20)} earlier events hidden</text>
+            </Show>
+          </Section>
+        </Show>
+
+        <Show when={progress().length > 0}>
+          <Section
+            count={progress().length}
+            open={props.sectionOpen('Progress', false)}
+            onToggle={() => props.onToggleSection('Progress')}
+            title="Progress"
+          >
+            <For each={progress().slice(-6)}>
+              {line => (
+                <text fg={theme().color.text} wrapMode="word">
+                  <span style={{ fg: theme().color.label }}>· </span>
+                  {line}
+                </text>
+              )}
+            </For>
+          </Section>
+        </Show>
+      </scrollbox>
+    </box>
   )
 }
 
