@@ -29,6 +29,28 @@ from cron.jobs import (
 )
 
 
+def test_builtin_one_shot_handoff_requires_its_dispatch_token(tmp_cron_dir, monkeypatch):
+    from cron.jobs import heartbeat_fire_claim, trigger_job
+
+    job = create_job(schedule=(_hermes_now() + timedelta(minutes=1)).isoformat(), prompt="test")
+    trigger_job(job["id"])
+    dispatched = get_due_jobs()[0]
+    token = dispatched["run_claim"]["token"]
+    assert claim_job_for_fire(job["id"]) is False
+    assert claim_job_for_fire(job["id"], expected_run_claim_token="stale") is False
+    claimed = claim_job_for_fire(
+        job["id"], expected_run_claim_token=token, return_job=True)
+    assert claimed["fire_claim"]["token"] == token
+    owner = claimed["fire_claim"]["by"]
+    later = _hermes_now() + timedelta(seconds=5)
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: later)
+    assert heartbeat_fire_claim(job["id"], expected_owner=owner)
+    assert get_job(job["id"])["run_claim"]["at"] == later.isoformat()
+    # Shutdown holds the unique fire owner, which fences this same one-shot token.
+    assert mark_job_run(job["id"], False, "shutdown", expected_fire_owner=owner)
+    assert get_job(job["id"])["last_error"] == "shutdown"
+
+
 # =========================================================================
 # parse_duration
 # =========================================================================
@@ -1007,9 +1029,8 @@ class TestGetDueJobs:
                                 lambda t0=t0, g=gap: t0 + timedelta(seconds=g))
             assert get_due_jobs() == [], f"double-dispatched at +{gap}s"
 
-    def test_one_shot_run_claim_expires_after_ttl(self, tmp_cron_dir, monkeypatch):
-        """A claiming tick that DIED mid-run must not wedge the one-shot forever:
-        once the run_claim is older than the TTL it is re-dispatched (recovered)."""
+    def test_expired_one_shot_claim_requires_explicit_retrigger(self, tmp_cron_dir, monkeypatch):
+        """TTL expiry is not proof of worker death; a late retry needs user intent."""
         # Pin the inactivity timeout unset so the derived TTL is deterministic.
         monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
         from cron.jobs import _hermes_now, _oneshot_run_claim_ttl_seconds
@@ -1028,11 +1049,15 @@ class TestGetDueJobs:
                             lambda: t0 + timedelta(seconds=ttl - 10))
         assert get_due_jobs() == []
 
-        # Just past the TTL: stale claim → re-dispatched (recovered), re-claimed.
+        # Past TTL/grace, preserve the record without replaying external side effects.
         monkeypatch.setattr("cron.jobs._hermes_now",
                             lambda: t0 + timedelta(seconds=ttl + 10))
         recovered = get_due_jobs()
-        assert [j["id"] for j in recovered] == ["wedged"]
+        assert recovered == []
+        assert get_job("wedged")["run_claim"] is not None
+        from cron.jobs import trigger_job
+        assert trigger_job("wedged") is not None
+        assert [j["id"] for j in get_due_jobs()] == ["wedged"]
 
     def test_run_claim_ttl_derived_from_cron_timeout(self, tmp_cron_dir, monkeypatch):
         """The stale-recovery TTL tracks HERMES_CRON_TIMEOUT (3x headroom), with
@@ -1093,7 +1118,7 @@ class TestGetDueJobs:
         condition as a dead tick. When the scheduler in this process still has
         the job in its running set, the stale-entry recovery must keep the
         record so the in-flight run's mark_job_run() can land its outcome —
-        and remove it only once the run is actually gone.
+        and retain it when local membership disappears (another process may still run it).
         """
         import cron.scheduler as scheduler_mod
         from cron.jobs import _hermes_now, _machine_id, _oneshot_run_claim_ttl_seconds
@@ -1119,12 +1144,12 @@ class TestGetDueJobs:
         assert get_due_jobs() == []
         assert get_job("inflight") is not None  # still visible to list/run
 
-        # The claiming tick really died (running set empty) → recovered as before.
+        # Empty local membership cannot prove another process stopped; preserve its outcome slot.
         monkeypatch.setattr(
             scheduler_mod, "get_running_job_ids", lambda: frozenset()
         )
         assert get_due_jobs() == []
-        assert get_job("inflight") is None  # stale entry cleaned up
+        assert get_job("inflight") is not None
 
     def test_stale_maxed_oneshot_kept_when_running_check_errors(
         self, tmp_cron_dir, monkeypatch
@@ -1246,6 +1271,9 @@ class TestGetDueJobs:
         current_time[0] = t0 + timedelta(
             seconds=_oneshot_run_claim_ttl_seconds() + 1
         )
+        from cron.jobs import trigger_job
+        assert get_due_jobs() == []
+        assert trigger_job("reclaimed") is not None
         second = get_due_jobs()[0]["run_claim"]
 
         assert first == {
@@ -1273,6 +1301,10 @@ class TestGetDueJobs:
             "reclaimed", False, "unfenced failure"
         ) is False
         assert get_job("reclaimed") == before
+        from cron.jobs import clear_run_claim
+        assert clear_run_claim("reclaimed", expected_token="dispatch-a") is False
+        assert get_job("reclaimed") == before
+        assert clear_run_claim("reclaimed", expected_token="dispatch-b") is True
 
     def test_heartbeat_run_claim_noop_without_claim(self, tmp_cron_dir):
         """heartbeat_run_claim is a safe no-op when there is nothing to refresh

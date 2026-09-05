@@ -22,6 +22,15 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   healthy long tool call with permission to bypass ownership checks.
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
 - File lock `~/.hermes/cron/.tick.lock` prevents duplicate ticks across processes.
+- Jobs-store lock contention is bounded and fails closed; do not enter a foreign live
+  transaction after timeout. A scheduler tick ledgers/submits gated workers before one
+  batched schedule advance, then opens their gates; failed dispatch must not lose a fire.
+- One-shot dispatch tokens survive module extraction: the built-in tick must present its
+  captured token to adopt the external fire lease, and terminal writes must match that token
+  or its matching unique fire owner. TTL expiry alone does not prove worker death. Beyond
+  the original grace window retain a stale claimed record without replay; retry requires
+  explicit user intent (`trigger_job`/re-arm). Tokens fence completion, not external effects
+  already performed by another worker.
 - Cron sessions currently pass `skip_memory=False` and load profile SOUL identity;
   `skip_background_review=True` suppresses human-oriented review forks. Isolate
   an autonomous maintainer's profile explicitly instead of assuming cron strips

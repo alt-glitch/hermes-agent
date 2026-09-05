@@ -18,6 +18,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -26,6 +27,34 @@ from cron import jobs
 
 # Repo root (parent of the ``cron`` package) so the child process can import it.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(jobs.__file__)))
+
+
+def test_lock_timeout_resets_nesting_and_releases_thread_lock(tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(jobs, "_acquire_flock", lambda *args: False)
+    with jobs.use_cron_store(tmp_path):
+        with pytest.raises(jobs.CronStoreLockTimeout):
+            with jobs.cron_store_transaction():
+                pytest.fail("entered an unlocked transaction")
+        assert jobs._jobs_lock_state.depth == 0
+        assert jobs._jobs_lock_state.load_stamp is None
+
+        acquired = threading.Event()
+        def acquire_from_other_thread():
+            if jobs._jobs_file_lock.acquire(timeout=1):
+                try:
+                    acquired.set()
+                finally:
+                    jobs._jobs_file_lock.release()
+        thread = threading.Thread(target=acquire_from_other_thread)
+        thread.start()
+        thread.join(timeout=2)
+        assert acquired.is_set()
+        with patch.object(jobs, "_acquire_flock", return_value=True) as acquire:
+            with jobs.cron_store_transaction():
+                assert jobs._jobs_lock_state.depth == 1
+            acquire.assert_called_once()
 
 
 @pytest.mark.skipif(jobs.fcntl is None, reason="POSIX fcntl/flock required")

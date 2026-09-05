@@ -40,6 +40,115 @@ def _completed_execution_record():
 
 
 class TestCronjobRunExecutesImmediately:
+    @pytest.mark.parametrize("failure", ["registration_refused", "registration_raised", "heartbeat"])
+    def test_unstarted_one_shot_releases_its_claim_without_recording_a_run(
+        self, tmp_path, monkeypatch, failure
+    ):
+        from datetime import timedelta
+        import cron.jobs as jobs
+        import cron.executions as executions
+        import cron.scheduler as scheduler
+        import tools.cronjob_tools as tool
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with jobs.use_cron_store(tmp_path):
+            job = jobs.create_job(
+                prompt="test", schedule=(jobs._hermes_now() + timedelta(minutes=1)).isoformat()
+            )
+            claimed, error = tool._claim_for_manual_run(job["id"], "test")
+            assert error is None
+            before = jobs.get_job(job["id"])
+            if failure == "heartbeat":
+                def fail_heartbeat(_name):
+                    raise RuntimeError("setup failed")
+                monkeypatch.setattr(tool, "_run_heartbeat", fail_heartbeat)
+            else:
+                def register(*args, **kwargs):
+                    if failure == "registration_raised":
+                        raise RuntimeError("setup failed")
+                    return False
+                monkeypatch.setattr(scheduler, "try_register_running_job", register)
+            with patch.object(scheduler, "run_one_job") as run:
+                result = tool._run_claimed_job(claimed)
+            assert result["success"] is False
+            run.assert_not_called()
+            after = jobs.get_job(job["id"])
+            assert after["last_run_at"] == before["last_run_at"]
+            assert after["repeat"] == before["repeat"]
+            assert after["run_claim"] is None
+            assert after["fire_claim"] is None
+            assert executions.list_executions(job_id=job["id"])[0]["status"] == "failed"
+            assert jobs.claim_job_for_fire(job["id"], return_job=True)
+
+    @pytest.mark.parametrize("replacement", ["run_token", "fire_owner", "missing_snapshot_token"])
+    def test_unstarted_cleanup_cannot_release_another_attempt(self, tmp_path, replacement):
+        from datetime import timedelta
+        import cron.jobs as jobs
+        import tools.cronjob_tools as tool
+
+        with jobs.use_cron_store(tmp_path):
+            job = jobs.create_job(
+                prompt="test", schedule=(jobs._hermes_now() + timedelta(minutes=1)).isoformat()
+            )
+            claimed, error = tool._claim_for_manual_run(job["id"], "test")
+            assert error is None
+            current = jobs.get_job(job["id"])
+            if replacement == "run_token":
+                current["run_claim"]["token"] = "replacement"
+            elif replacement == "fire_owner":
+                current["fire_claim"]["by"] = "replacement"
+            else:
+                claimed.pop("run_claim")
+            jobs.save_jobs([current])
+            before = jobs.get_job(job["id"])
+            with patch("cron.scheduler.try_register_running_job", return_value=False):
+                assert tool._run_claimed_job(claimed)["success"] is False
+            assert jobs.get_job(job["id"]) == before
+
+    def test_started_one_shot_failure_is_not_replayed(self, tmp_path):
+        from datetime import timedelta
+        import cron.jobs as jobs
+
+        with jobs.use_cron_store(tmp_path):
+            job = jobs.create_job(
+                prompt="test", schedule=(jobs._hermes_now() + timedelta(minutes=1)).isoformat()
+            )
+            with patch("cron.scheduler.run_one_job", side_effect=RuntimeError("after side effect")):
+                assert _execute_job_now(job)["success"] is False
+            after = jobs.get_job(job["id"])
+            assert after["last_run_at"] is not None
+            assert after["repeat"]["completed"] == 1
+            assert not jobs.claim_job_for_fire(job["id"], return_job=True)
+
+    def test_manual_run_has_durable_attempt_before_claim_and_execution(self, tmp_path, monkeypatch):
+        import cron.jobs as jobs
+        import cron.executions as executions
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        seen = []
+        real_claim = jobs.claim_job_for_fire
+
+        def claim(job_id, **kwargs):
+            rows = executions.list_executions(job_id=job_id)
+            assert len(rows) == 1
+            assert rows[0]["status"] == "claimed"
+            seen.append(rows[0]["id"])
+            return real_claim(job_id, **kwargs)
+
+        def run(job, **kwargs):
+            assert job["execution_id"] == seen[0]
+            assert jobs.mark_job_run(
+                job["id"], True, expected_fire_owner=job["fire_claim"]["by"])
+            executions.finish_execution(job["execution_id"], success=True)
+            return True
+
+        with jobs.use_cron_store(tmp_path):
+            job = jobs.create_job(prompt="test", schedule="every 5m")
+            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=claim), patch(
+                "cron.scheduler.run_one_job", side_effect=run
+            ):
+                assert _execute_job_now(job) == {"claimed": True, "success": True, "error": None}
+
     def test_run_action_claims_and_fires_via_run_one_job(self):
         """action='run' must claim the job then fire it through run_one_job."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}

@@ -14,6 +14,7 @@ import time
 import os
 import re
 import uuid
+import secrets
 
 # Cross-process advisory locking for jobs.json: fcntl (Unix) or msvcrt (Windows). If both are
 # absent, _jobs_lock() degrades to in-process locking rather than failing.
@@ -254,6 +255,10 @@ def _jobs_lock_file() -> Path:
     return _current_cron_store().cron_dir / ".jobs.lock"
 
 
+class CronStoreLockTimeout(RuntimeError):
+    """The store transaction could not acquire its cross-process lock in time."""
+
+
 def _acquire_flock(lock_fd, timeout: float) -> Optional[bool]:
     """Bounded exclusive lock: True when acquired, False on timeout, None when no backend exists. A
     blocking flock(LOCK_EX) taken under the in-process lock would let a wedged sibling freeze
@@ -293,9 +298,8 @@ def _jobs_lock():
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
-    reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
-    degrades to in-process-only locking: a briefly torn cross-process write beats a dead
-    scheduler."""
+    reuse the held lock. A contended lock times out without entering another process's
+    transaction; platforms without a lock backend retain in-process serialization."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
         _jobs_lock_state.depth = depth + 1
@@ -322,12 +326,12 @@ def _jobs_lock():
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
-                        "it. Proceeding with in-process locking only "
-                        "so the scheduler stays alive (#60703).",
+                        "it. Refusing an unlocked store transaction.",
                         _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file())
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
+                    raise CronStoreLockTimeout("Timed out acquiring cron jobs lock")
             except (OSError, IOError) as e:
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
@@ -2306,6 +2310,7 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    expected_run_claim_token: Optional[str] = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2316,6 +2321,18 @@ def mark_job_run(
     can't be taken, the job is missing, or ``expected_fire_owner`` no longer holds the fire claim.
     """
     def apply(jobs, _i, job):
+        run_claim = job.get("run_claim")
+        stored_token = run_claim.get("token") if isinstance(run_claim, dict) else None
+        fire_claim = job.get("fire_claim")
+        matching_fire_fence = (
+            expected_run_claim_token is None and expected_fire_owner is not None
+            and isinstance(fire_claim, dict) and fire_claim.get("by") == expected_fire_owner
+            and stored_token and fire_claim.get("token") == stored_token
+        )
+        if ((stored_token or expected_run_claim_token)
+                and stored_token != expected_run_claim_token and not matching_fire_fence):
+            logger.warning("mark_job_run: job_id %s run claim changed; discarding stale completion", job_id)
+            return False
         if expected_fire_owner is not None:
             claim = job.get("fire_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
@@ -2459,47 +2476,71 @@ def claim_dispatch(job_id: str) -> bool:
     return claimed
 
 
-def _refresh_claim(jobs: List[Dict[str, Any]], claim: Any, expected_owner: str) -> bool:
-    """Compare-and-refresh a claim's ``at`` stamp; False unless *expected_owner* still holds it."""
-    if not isinstance(claim, dict) or claim.get("by") != expected_owner:
-        return False
-    claim["at"] = _hermes_now().isoformat()
-    save_jobs(jobs)
-    return True
+def run_claim_is_owned(job_id: str, *, expected_token: str) -> bool:
+    """Check the captured dispatch nonce, not a reusable process identity."""
+    def apply(_jobs, _i, job):
+        claim = job.get("run_claim")
+        return bool(expected_token and job.get("schedule", {}).get("kind") == "once"
+                    and isinstance(claim, dict) and claim.get("token") == expected_token)
+    return _with_job(job_id, apply, False)
 
 
-def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
-    """Refresh a one-shot's ``run_claim`` timestamp while its run is alive, so an expired claim
-    really means the claiming process died. Compare-and-refresh on ``expected_owner`` stops a stale
-    runner from extending a claim another process has since taken over.
-
-    Called periodically from the scheduler's run monitor (#62002) so a legitimately long run keeps its claim
-    fresh: an expired claim then really does mean "the claiming process died", and neither another process's
-    tick nor this process's own next tick will re-dispatch or stale-remove the job while the run is in
-    flight. mark_job_run() clears the claim on completion.
-    """
+def heartbeat_run_claim(
+    job_id: str, *, expected_owner: Optional[str] = None, expected_token: Optional[str] = None,
+) -> bool:
+    """Keep an owned one-shot lease fresh. Current schedulers use the dispatch nonce;
+    owner matching remains for legacy claims. When both are given both must match.
+    A matching fire lease shares the renewal; expiry alone never proves worker death."""
     def apply(jobs, _i, job):
         if job.get("schedule", {}).get("kind") != "once":
             return False
-        return _refresh_claim(jobs, job.get("run_claim"), expected_owner)
+        claim = job.get("run_claim")
+        if (not isinstance(claim, dict)
+                or (expected_token is None and expected_owner is None)
+                or (expected_token is not None and claim.get("token") != expected_token)
+                or (expected_owner is not None and claim.get("by") != expected_owner)):
+            return False
+        claim["at"] = _hermes_now().isoformat()
+        fire_claim = job.get("fire_claim")
+        if expected_token and isinstance(fire_claim, dict) and fire_claim.get("token") == expected_token:
+            fire_claim["at"] = claim["at"]
+        save_jobs(jobs)
+        return True
 
     return _with_job(job_id, apply, False)
 
 
-def clear_run_claim(job_id: str) -> bool:
+def clear_run_claim(
+    job_id: str, *, expected_token: Optional[str] = None,
+    expected_fire_owner: Optional[str] = None,
+) -> bool:
     """Clear a one-shot's ``run_claim`` when dispatch itself fails: such a job never reaches
     mark_job_run, so the stale claim would block re-dispatch until the TTL expires.
 
-    Calling this on every early-exit path restores the "the job stays due and will fire on the next healthy
-    tick" invariant that the scheduler comment promises (#86522).
+    A manual dispatch may already own a fire lease: release that lease only when both its
+    owner and the run token still match, before execution has started.
     """
     def apply(jobs, _i, job):
         if job.get("schedule", {}).get("kind") != "once" or job.get("run_claim") is None:
             return False  # recurring, or already cleared
+        claim = job.get("run_claim")
+        if expected_token is not None and (
+            not isinstance(claim, dict) or claim.get("token") != expected_token
+        ):
+            return False
+        if expected_fire_owner is not None:
+            fire_claim = job.get("fire_claim")
+            if (expected_token is None or not isinstance(fire_claim, dict)
+                    or fire_claim.get("by") != expected_fire_owner
+                    or fire_claim.get("token") != expected_token):
+                return False
+            job["fire_claim"] = None
         job["run_claim"] = None
         save_jobs(jobs)
         return True
 
+    if expected_fire_owner is not None:
+        return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
     return _with_job(job_id, apply, False)
 
 
@@ -2554,6 +2595,7 @@ def _machine_id() -> str:
 
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = 300, force: bool = False, return_job: bool = False,
+    expected_run_claim_token: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2562,7 +2604,9 @@ def claim_job_for_fire(
     stale callback cannot resurrect a paused job). Lose if a claim younger than
     ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
-    ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    ``next_run_at`` so a stale re-delivery cannot re-fire. The built-in tick passes its
+    ``expected_run_claim_token`` to adopt its own one-shot dispatch; external callers
+    cannot adopt a fresh run claim without that nonce."""
     def apply(jobs, _i, job):
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
@@ -2573,11 +2617,27 @@ def claim_job_for_fire(
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
             return False  # someone holds a fresh claim
+        run_claim = job.get("run_claim")
+        if job.get("schedule", {}).get("kind") == "once":
+            if expected_run_claim_token is not None:
+                if not isinstance(run_claim, dict) or run_claim.get("token") != expected_run_claim_token:
+                    return False
+            elif _claim_is_live(run_claim, now, _oneshot_run_claim_ttl_seconds(job)):
+                return False
         if force:
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        if job.get("schedule", {}).get("kind") == "once":
+            run_claim = job.get("run_claim")
+            if not isinstance(run_claim, dict) or not _claim_is_live(
+                run_claim, now, _oneshot_run_claim_ttl_seconds(job)
+            ):
+                run_claim = {"at": now.isoformat(), "by": _machine_id(), "token": secrets.token_urlsafe(32)}
+                job["run_claim"] = run_claim
+            if run_claim.get("token"):
+                job["fire_claim"]["token"] = run_claim["token"]
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
@@ -2592,7 +2652,17 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     """Refresh an active ``fire_claim`` without extending another owner's lease: an execution may
     outlive the TTL, and the owner check stops a stale runner from refreshing a recovered claim."""
     def apply(jobs, _i, job):
-        return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
+        claim = job.get("fire_claim")
+        if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+            return False
+        now = _hermes_now().isoformat()
+        claim["at"] = now
+        run_claim = job.get("run_claim")
+        if (claim.get("token") and isinstance(run_claim, dict)
+                and run_claim.get("token") == claim["token"]):
+            run_claim["at"] = now
+        save_jobs(jobs)
+        return True
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 
@@ -3004,7 +3074,7 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan) -> bool:
         # same HERMES_HOME must not re-dispatch it while in flight, and advancing next_run_at by a
         # fixed window is not enough for a run that outlives a tick. The other process sees the
         # fresh claim and skips; mark_job_run() clears it. The TTL only covers a tick that DIES.
-        claim = {"at": now.isoformat(), "by": _machine_id()}
+        claim = {"at": now.isoformat(), "by": _machine_id(), "token": secrets.token_urlsafe(32)}
         job["run_claim"] = claim
         scan.persist(job["id"], run_claim=claim)
 

@@ -316,7 +316,7 @@ class TestInFlightDedupe:
         assert seen_during_run["registered"] is True
         assert "job-bg-09" not in sched.get_running_job_ids()  # released after
 
-    def test_run_claimed_job_registers_refreshed_one_shot_claim_token(self):
+    def test_run_claimed_job_registers_its_one_shot_claim_token(self):
         """Manual one-shots keep the fork's shutdown-fencing claim token."""
         from cron import scheduler as sched
         from tools.cronjob_tools import _run_claimed_job
@@ -333,13 +333,14 @@ class TestInFlightDedupe:
             patch("cron.scheduler.run_one_job", side_effect=probe_run),
             patch(
                 "tools.cronjob_tools.get_job",
-                side_effect=[
-                    {"run_claim": {"token": "manual-dispatch-token"}},
-                    {"last_status": "ok", "last_error": None},
-                ],
+                return_value={"last_status": "ok", "last_error": None},
             ),
         ):
-            res = _run_claimed_job(_job("job-bg-token"))
+            claimed = {
+                **_job("job-bg-token"),
+                "run_claim": {"token": "manual-dispatch-token"},
+            }
+            res = _run_claimed_job(claimed)
 
         assert res["success"] is True
         assert seen_during_run["token"] == "manual-dispatch-token"

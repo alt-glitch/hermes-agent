@@ -315,7 +315,7 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
 
     assert delivered == []
     assert marked == [
-        (("j6", False, "KeyboardInterrupt"), {"delivery_error": None})
+        (("j6", False, "KeyboardInterrupt"), {})
     ]
     assert finished == [
         (
@@ -378,5 +378,4 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_delivery["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after the full lifecycle returned (no leak).
     assert ss.current_secret_scope() is None
-
 

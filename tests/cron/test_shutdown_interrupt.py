@@ -26,10 +26,160 @@ def _reset_scheduler_state():
     sched._running_job_ids.clear()
     sched._running_fire_owners.clear()
     sched._interrupted_job_ids.clear()
+    sched._running_run_claim_tokens.clear()
+    sched._gated_dispatches.clear()
     yield
     sched._running_job_ids.clear()
     sched._running_fire_owners.clear()
     sched._interrupted_job_ids.clear()
+    sched._running_run_claim_tokens.clear()
+    sched._gated_dispatches.clear()
+
+
+@pytest.mark.parametrize("gate_open", [False, True])
+def test_shutdown_cancels_unstarted_dispatch_without_consuming_one_shot(
+    tmp_path, monkeypatch, gate_open
+):
+    import concurrent.futures
+    from datetime import timedelta
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+
+    callbacks = []
+    class DeferredPool:
+        def submit(self, callback):
+            callbacks.append(callback)
+            return concurrent.futures.Future()
+
+    monkeypatch.setattr(sched, "_get_hermes_home", lambda: tmp_path)
+    with jobs.use_cron_store(tmp_path):
+        job = jobs.create_job(
+            prompt="test", schedule=(jobs._hermes_now() + timedelta(minutes=1)).isoformat())
+        jobs.trigger_job(job["id"])
+        dispatched = jobs.get_due_jobs()[0]
+        before = jobs.get_job(job["id"])
+        process = lambda current: sched._process_due_job(current, None, None, False)
+        pending = sched._submit_with_guard(dispatched, DeferredPool(), process)
+        if gate_open:
+            pending[3].set()
+        assert sched.mark_running_jobs_interrupted("shutdown") == [job["id"]]
+        assert callbacks.pop(0)() is False
+        after = jobs.get_job(job["id"])
+        assert after["last_run_at"] == before["last_run_at"]
+        assert after["repeat"] == before["repeat"]
+        assert after["state"] == before["state"]
+        assert after["run_claim"] is None
+        assert executions.get_execution(pending[2])["status"] == "failed"
+        assert not sched._is_interrupted(job["id"])
+
+        retried = jobs.get_due_jobs()[0]
+        assert retried["run_claim"]["token"] != dispatched["run_claim"]["token"]
+        def complete(current, **kwargs):
+            assert jobs.claim_dispatch(current["id"])
+            assert jobs.mark_job_run(
+                current["id"], True, expected_fire_owner=current["fire_claim"]["by"])
+            executions.finish_execution(current["execution_id"], success=True)
+            return True
+        with patch.object(sched, "run_one_job", side_effect=complete) as run:
+            retried_pending = sched._submit_with_guard(retried, DeferredPool(), process)
+            retried_pending[3].set()
+            assert callbacks.pop(0)() is True
+            run.assert_called_once()
+        assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
+        assert executions.get_execution(retried_pending[2])["status"] == "completed"
+
+
+def test_shutdown_during_ledger_creation_cancels_before_submit(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from unittest.mock import Mock
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+
+    monkeypatch.setattr(sched, "_get_hermes_home", lambda: tmp_path)
+    with jobs.use_cron_store(tmp_path):
+        job = jobs.create_job(
+            prompt="test", schedule=(jobs._hermes_now() + timedelta(minutes=1)).isoformat())
+        jobs.trigger_job(job["id"])
+        dispatched = jobs.get_due_jobs()[0]
+        def create(*args, **kwargs):
+            row = executions.create_execution(*args, **kwargs)
+            sched.mark_running_jobs_interrupted("shutdown while creating ledger")
+            return row
+        pool = Mock()
+        with patch.object(sched, "create_execution", side_effect=create):
+            assert sched._submit_with_guard(dispatched, pool, Mock()) is None
+        pool.submit.assert_not_called()
+        after = jobs.get_job(job["id"])
+        assert after["last_run_at"] is None
+        assert after["repeat"]["completed"] == 0
+        assert after["run_claim"] is None
+        assert executions.list_executions(job_id=job["id"])[0]["status"] == "failed"
+        assert job["id"] not in sched.get_running_job_ids()
+
+
+def test_worker_start_wins_shutdown_race_without_replay(tmp_path, monkeypatch):
+    import concurrent.futures
+    from datetime import timedelta
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+
+    entered = threading.Event()
+    finish = threading.Event()
+    def process(_job):
+        entered.set()
+        assert finish.wait(timeout=3)
+        return True
+    monkeypatch.setattr(sched, "_get_hermes_home", lambda: tmp_path)
+    with jobs.use_cron_store(tmp_path), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        job = jobs.create_job(
+            prompt="test", schedule=(jobs._hermes_now() + timedelta(minutes=1)).isoformat())
+        jobs.trigger_job(job["id"])
+        pending = sched._submit_with_guard(jobs.get_due_jobs()[0], pool, process)
+        try:
+            pending[3].set()
+            assert entered.wait(timeout=3)
+            assert job["id"] not in sched._gated_dispatches
+            assert sched.mark_running_jobs_interrupted("shutdown after start") == [job["id"]]
+            assert not pending[4].is_set()
+            assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
+            assert jobs.get_due_jobs() == []
+        finally:
+            finish.set()
+        assert pending[0].result(timeout=3)
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_shutdown_fences_registered_one_shot_before_fire_adoption(tmp_path, monkeypatch, replacement):
+    from datetime import timedelta
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+
+    monkeypatch.setattr(sched, "_get_hermes_home", lambda: tmp_path)
+    with jobs.use_cron_store(tmp_path):
+        job = jobs.create_job(
+            prompt="test", schedule=(jobs._hermes_now() + timedelta(minutes=1)).isoformat())
+        jobs.trigger_job(job["id"])
+        dispatched = jobs.get_due_jobs()[0]
+        token = dispatched["run_claim"]["token"]
+        assert sched.try_register_running_job(job["id"], run_claim_token=token)
+        try:
+            if replacement:
+                dispatched["run_claim"]["token"] = "replacement"
+                jobs.save_jobs([dispatched])
+            before = jobs.get_job(job["id"])
+            marked = sched.mark_running_jobs_interrupted("shutdown")
+            after = jobs.get_job(job["id"])
+            if replacement:
+                assert marked == []
+                assert after == before
+            else:
+                assert marked == [job["id"]]
+                assert after["last_error"] == "shutdown"
+                assert after["run_claim"] is None
+        finally:
+            sched.release_running_job(job["id"])
 
 
 class TestGetRunningJobIds:

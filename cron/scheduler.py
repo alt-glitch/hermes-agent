@@ -480,8 +480,9 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 
 
 from cron.jobs import (
-    _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
+    _ensure_cron_dir, advance_next_run, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
+    run_claim_is_owned,
     save_job_output, use_cron_store, resolve_cron_inactivity_timeout_seconds)
 from cron.executions import (
     _TERMINAL_STATES, create_execution, finish_execution, get_execution,
@@ -582,7 +583,26 @@ def get_running_job_ids() -> "frozenset[str]":
         return frozenset(_running_job_ids | _running_fire_owners.keys())
 
 
-def try_register_running_job(job_id: str) -> bool:
+_running_run_claim_tokens: dict[str, str] = {}
+
+
+@dataclass
+class _GatedDispatch:
+    start_gate: threading.Event
+    cancelled: threading.Event
+    profile_home: Path
+    run_token: Optional[str]
+    execution_id: Optional[str] = None
+
+
+# Removed under _running_lock immediately before entering the worker callable.
+_gated_dispatches: dict[str, _GatedDispatch] = {}
+
+
+def try_register_running_job(
+    job_id: str, *, run_claim_token: Optional[str] = None,
+    gated_dispatch: Optional[_GatedDispatch] = None,
+) -> bool:
     """Atomically add ``job_id`` to the in-flight set; False (caller must skip) if already mid-run.
     Single dedupe owner for ticker + manual runs (the fire claim's 300s TTL is outlived by real
     jobs). Callers MUST pair success with ``release_running_job`` in a ``finally``.
@@ -598,6 +618,10 @@ def try_register_running_job(job_id: str) -> bool:
         if job_id in _running_job_ids:
             return False
         _running_job_ids.add(job_id)
+        if run_claim_token:
+            _running_run_claim_tokens[job_id] = run_claim_token
+        if gated_dispatch is not None:
+            _gated_dispatches[job_id] = gated_dispatch
         # Same critical section as the add: no window where an in-flight id lacks an age the sweep
         # can bound. Sentinel is replaced by the real future once ``pool.submit`` returns.
         _running_since[job_id] = time.time()
@@ -611,6 +635,8 @@ def release_running_job(job_id: str) -> None:
         _running_job_ids.discard(job_id)
         _running_since.pop(job_id, None)
         _running_futures.pop(job_id, None)
+        _running_run_claim_tokens.pop(job_id, None)
+        _gated_dispatches.pop(job_id, None)
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -841,6 +867,11 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             _running_job_ids.discard(job_id)
             _running_since.pop(job_id, None)
             _running_futures.pop(job_id, None)
+            _running_run_claim_tokens.pop(job_id, None)
+            pending = _gated_dispatches.pop(job_id, None)
+            if pending is not None:
+                pending.cancelled.set()
+                pending.start_gate.set()
             _forced_release_count += 1
             stale.append((job_id, age, allowance, fut, reason))
 
@@ -861,6 +892,9 @@ def mark_running_jobs_interrupted(
     """
     with _running_lock:
         restart_safe_waiters = set(_restart_safe_waiter_job_ids)
+        cancelled_dispatches = dict(_gated_dispatches) if only_owners is None else {}
+        for pending in cancelled_dispatches.values():
+            pending.cancelled.set()
         active_fires = [
             (token, job_id, owner, profile_home)
             for job_id, executions in _running_fire_owners.items()
@@ -874,16 +908,43 @@ def mark_running_jobs_interrupted(
             active_fires.extend(
                 (None, job_id, None, _get_hermes_home())
                 for job_id in (
-                    _running_job_ids - registered_ids - restart_safe_waiters
+                    _running_job_ids - registered_ids - restart_safe_waiters - cancelled_dispatches.keys()
                 )
             )
         _interrupted_job_ids.update(
             token if token is not None else job_id
             for token, job_id, _owner, _profile_home in active_fires
         )
+        run_claim_tokens = dict(_running_run_claim_tokens)
     marked = []
+    for job_id, pending in cancelled_dispatches.items():
+        try:
+            with use_cron_store(pending.profile_home):
+                if pending.run_token:
+                    try:
+                        clear_run_claim(job_id, expected_token=pending.run_token)
+                    except Exception:
+                        logger.warning("Failed clearing cancelled cron claim %s", job_id, exc_info=True)
+                if pending.execution_id:
+                    _finish_execution_best_effort(
+                        pending.execution_id, success=False,
+                        error=f"Cancelled before execution started: {reason}")
+        except Exception:
+            logger.warning("Failed clearing cancelled cron dispatch %s", job_id, exc_info=True)
+        finally:
+            pending.start_gate.set()
+        marked.append(job_id)
     for _token, job_id, fire_owner, profile_home in active_fires:
         if not fire_owner:
+            run_token = run_claim_tokens.get(job_id)
+            if run_token:
+                try:
+                    with use_cron_store(profile_home):
+                        if mark_job_run(job_id, False, reason, expected_run_claim_token=run_token):
+                            marked.append(job_id)
+                except Exception:
+                    logger.warning("Failed marking interrupted one-shot %s", job_id, exc_info=True)
+                continue
             logger.warning(
                 "Job '%s' interrupted before its durable fire owner was registered; "
                 "leaving persisted state untouched",
@@ -1756,6 +1817,7 @@ def _run_agent_with_watchdog(
     _is_oneshot = isinstance(_job_schedule, dict) and _job_schedule.get("kind") == "once"
     _run_claim = job.get("run_claim")
     _run_claim_owner = str(_run_claim.get("by") or "") if isinstance(_run_claim, dict) else ""
+    _run_claim_token = str(_run_claim.get("token") or "") if isinstance(_run_claim, dict) else ""
     _last_claim_heartbeat = time.monotonic()
 
     def _abort_if_fire_claim_lost() -> None:
@@ -1774,7 +1836,9 @@ def _run_agent_with_watchdog(
             return
         _last_claim_heartbeat = _mono
         try:
-            heartbeat_run_claim(job_id, expected_owner=_run_claim_owner)
+            heartbeat_run_claim(job_id, **(
+                {"expected_token": _run_claim_token} if _run_claim_token
+                else {"expected_owner": _run_claim_owner}))
         except Exception:
             logger.debug("Job '%s': run_claim heartbeat failed", job_name, exc_info=True)
 
@@ -2652,6 +2716,8 @@ class _FireOwnership:
         self.fire_claim_lost = fire_claim_lost
         claim = job.get("fire_claim")
         self.owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
+        run_claim = job.get("run_claim")
+        self.run_token = str(run_claim.get("token") or "") if isinstance(run_claim, dict) else ""
 
     def side_effect_fence(self):
         if self.owner is None:
@@ -2661,6 +2727,12 @@ class _FireOwnership:
     def lost(self) -> bool:
         if self.fire_claim_lost is not None and self.fire_claim_lost.is_set():
             return True
+        if self.run_token:
+            try:
+                if not run_claim_is_owned(self.job["id"], expected_token=self.run_token):
+                    return True
+            except Exception:
+                return True
         if self.owner is None:
             return False
         try:
@@ -2785,12 +2857,16 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
     mark_kwargs = {"delivery_error": d.delivery_error}
+    run_claim = job.get("run_claim")
+    run_token = run_claim.get("token") if isinstance(run_claim, dict) else None
+    if run_token:
+        mark_kwargs["expected_run_claim_token"] = run_token
     if fire_owner is not None:
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
     marked = mark_job_run(job["id"], d.success, d.error, **mark_kwargs)
-    if fire_owner is not None and not marked:
+    if (fire_owner is not None or run_token) and not marked:
         finish_execution(
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
@@ -3013,6 +3089,8 @@ def _run_one_job_body(
         try:
             if not _consume_interrupted_flag(job["id"], execution_token):
                 mark_kwargs = {}
+                if fence.run_token:
+                    mark_kwargs["expected_run_claim_token"] = fence.run_token
                 if fire_owner is not None:
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
@@ -3603,7 +3681,11 @@ def _sweep_mcp_orphans() -> None:
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
-    claimed = claim_job_for_fire(job["id"], return_job=True)
+    run_claim = job.get("run_claim")
+    kwargs = {"return_job": True}
+    if isinstance(run_claim, dict) and run_claim.get("token"):
+        kwargs["expected_run_claim_token"] = run_claim["token"]
+    claimed = claim_job_for_fire(job["id"], **kwargs)
     if not claimed:
         finish_execution(
             job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
@@ -3612,6 +3694,14 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
+
+
+def _finish_execution_best_effort(execution_id: str, **kwargs) -> None:
+    """Do not strand other gated workers when failure bookkeeping is unavailable."""
+    try:
+        finish_execution(execution_id, **kwargs)
+    except Exception:
+        logger.warning("Failed finishing cron execution %s", execution_id, exc_info=True)
 
 
 def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job):
@@ -3637,7 +3727,9 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         if not (isinstance(_schedule, dict) and _schedule.get("kind") == "once"):
             return
         try:
-            clear_run_claim(job_id)
+            claim = job.get("run_claim")
+            token = claim.get("token") if isinstance(claim, dict) else None
+            clear_run_claim(job_id, **({"expected_token": token} if token else {}))
         except Exception as claim_err:
             logger.warning(
                 "Could not clear run_claim for job '%s' after dispatch "
@@ -3659,14 +3751,27 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _not_dispatched_shutdown()
         _clear_run_claim_best_effort()
         return None
-    if not try_register_running_job(job_id):
+    run_claim = job.get("run_claim")
+    run_token = run_claim.get("token") if isinstance(run_claim, dict) else None
+    pending = _GatedDispatch(
+        threading.Event(), threading.Event(), _get_hermes_home().resolve(), run_token)
+    if not try_register_running_job(job_id, run_claim_token=run_token, gated_dispatch=pending):
         logger.info("Job '%s' already running — skipping", job_label)
+        advance_next_run(job_id)
         return None
     # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
     try:
         execution = create_execution(job_id, source="builtin")
         dispatched_job = dict(job, execution_id=execution["id"])
         _ctx = contextvars.copy_context()
+        with _running_lock:
+            pending.execution_id = execution["id"]
+            cancelled = pending.cancelled.is_set()
+        if cancelled:
+            _finish_execution_best_effort(
+                execution["id"], success=False, error="Cancelled before execution started: shutdown")
+            release_running_job(job_id)
+            return None
     except Exception as execution_err:
         # Release the claim so the next tick retries instead of wedging "already running".
         release_running_job(job_id)
@@ -3675,8 +3780,16 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
             "Job '%s' not dispatched: execution creation failed: %s", job_label, execution_err)
         return None
 
+    start_gate = pending.start_gate
+    dispatch_cancelled = pending.cancelled
+
     def _run_and_release(j=dispatched_job, ctx=_ctx):
         try:
+            start_gate.wait()
+            with _running_lock:
+                if dispatch_cancelled.is_set():
+                    return False
+                _gated_dispatches.pop(job_id, None)
             return ctx.run(process_job, j)
         finally:
             release_running_job(j["id"])
@@ -3697,7 +3810,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     with _running_lock:
         if job_id in _running_job_ids:
             _running_futures[job_id] = fut
-    return fut
+    return fut, job_id, execution["id"], start_gate, dispatch_cancelled
 
 
 def _sweep_mcp_orphans_when_all_done(futures: list) -> None:
@@ -3778,11 +3891,6 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
-        # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
-        # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
-        advance_next_runs([job["id"] for job in due_jobs])
-
         _max_workers = _resolve_max_parallel_workers()
         if verbose:
             logger.info(
@@ -3798,10 +3906,30 @@ def tick(
         _results: list = []
         _all_futures: list = []
         pool = _get_parallel_pool(_max_workers)
-        for job in due_jobs:
-            fut = _submit_with_guard(job, pool, _process_job)
-            if fut is None:
-                continue
+        pending_dispatches = []
+        try:
+            for job in due_jobs:
+                pending = _submit_with_guard(job, pool, _process_job)
+                if pending is not None:
+                    pending_dispatches.append(pending)
+            if pending_dispatches:
+                advance_next_runs([pending[1] for pending in pending_dispatches])
+        except BaseException as advance_err:
+            for pending in pending_dispatches:
+                pending[4].set()
+            dispatched_ids = {pending[1] for pending in pending_dispatches}
+            for job in due_jobs:
+                claim = job.get("run_claim")
+                if job["id"] in dispatched_ids and isinstance(claim, dict) and claim.get("token"):
+                    with contextlib.suppress(Exception):
+                        clear_run_claim(job["id"], expected_token=claim["token"])
+            for pending in pending_dispatches:
+                pending[3].set()
+                _finish_execution_best_effort(
+                    pending[2], success=False, error=f"Schedule advance failed: {advance_err}")
+            raise
+        for fut, _, _, start_gate, _ in pending_dispatches:
+            start_gate.set()
             _all_futures.append(fut)
             if not sync:
                 _results.append(True)  # optimistically counted

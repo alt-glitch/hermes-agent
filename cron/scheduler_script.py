@@ -430,8 +430,9 @@ def _run_job_script_with_claim_heartbeat(
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     schedule = job.get("schedule")
     claim = job.get("run_claim")
+    token = str(claim.get("token") or "") if isinstance(claim, dict) else ""
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
-    if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
+    if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and (token or owner)):
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
 
     job_id = str(job.get("id") or "")
@@ -440,7 +441,10 @@ def _run_job_script_with_claim_heartbeat(
     def _heartbeat_loop() -> None:
         while not stop.wait(_sched._RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
-                _sched.heartbeat_run_claim(job_id, expected_owner=owner)
+                kwargs = {"expected_token": token} if token else {"expected_owner": owner}
+                if not _sched.heartbeat_run_claim(job_id, **kwargs):
+                    logger.warning("Job '%s': script run claim ownership lost", job_id)
+                    return
             except Exception:
                 logger.debug("Job '%s': script run_claim heartbeat failed", job_id, exc_info=True)
 
