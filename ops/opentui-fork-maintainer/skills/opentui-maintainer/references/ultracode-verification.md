@@ -56,6 +56,22 @@ and inspect findings against code. Report each behavior as passed, failed or
 unverified. A requested workflow that never invoked `Workflow` is not an Ultracode
 verification run. An enabled but inactive gateway is not a running scheduler.
 
+In print mode, do not end the parent turn after launching a background workflow.
+The 2026-09-05 two-agent run produced the UI evidence and 48 passing lifecycle
+tests, but its parent exited before collecting the second agent's structured
+result. A zero CLI exit was therefore not a completed orchestration result.
+Explicitly load `TaskOutput` if deferred, call it with the returned task ID and
+`block: true`, and repeat until terminal status before writing the final report.
+A separate one-agent sentinel probe exercised that join successfully on 2.1.261
+(`wf_bba3d37f-40b`, `completed`, `ULTRACODE_JOIN_OK`). This validates the join
+mechanism, not the earlier application's missing whole-workflow verdict.
+
+Supply a bounded source diff through the reviewer's stdin. A read-only reviewer
+may be unable to read evidence outside its working directory; an approval that
+never compared the baseline is not a completed before/after review. Inspect
+permission failures and completeness before accepting the verdict. Keep private
+conversation and credential data out of all review packets.
+
 These supplemental results do not replace the candidate-bound publication gate.
 If they uncover a defect, repair and retest it before starting `gate-and-ship`.
 Only the existing publication workflow may upload eligible sanitized media; do
