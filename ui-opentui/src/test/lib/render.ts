@@ -88,16 +88,19 @@ export async function renderProbe(
   })
   // Same multi-click selection seam as the live renderer (boundary/renderer.ts
   // installs it after createCliRenderer) so mouse tests exercise the shim.
-  installMultiClickSelection(setup.renderer)
-  // renderOnce → flush → renderOnce: flush awaits async work (scrollbox measure,
-  // Tree-sitter markdown tokenization) that a single sync pass would miss. The
-  // native `<markdown internalBlockMode="top-level">` commits blocks over several
-  // native frames, so settle to visual idle too (best-effort).
-  await setup.renderOnce()
-  await setup.flush()
-  await setup.waitForVisualIdle?.()
-  await setup.renderOnce()
-  await setup.flush()
+  try {
+    installMultiClickSelection(setup.renderer)
+    // Forced passes verify settled layout, not whether live work schedules paint.
+    // Use waitForFrame after mounted updates for that separate contract.
+    await setup.renderOnce()
+    await setup.flush()
+    await setup.waitForVisualIdle()
+    await setup.renderOnce()
+    await setup.flush()
+  } catch (error) {
+    setup.renderer.destroy()
+    throw error
+  }
 
   return {
     frame: () => setup.captureCharFrame(),
