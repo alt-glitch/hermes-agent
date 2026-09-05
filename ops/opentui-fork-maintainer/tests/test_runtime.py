@@ -426,6 +426,170 @@ def test_nonblocking_lock_denies_second_holder(tmp_path: Path) -> None:
                 pass
 
 
+def repair_request(base="a" * 40, source="b" * 40):
+    return {"mode": "repair", "pr": 40, "base_sha": base,
+            "source_sha": source, "instruction": "Fix and verify this PR before publishing."}
+
+
+def claim_repair(state, evidence, base, source):
+    claim_backport(state, evidence, base, source)
+    value = repair_request(base, source)
+    for path in (state / "run-request.inflight.json", evidence / "request.claimed.json"):
+        path.write_text(json.dumps(value))
+    return value
+
+
+def test_explicit_request_submission_is_idempotent_and_preserves_other_work(tmp_path):
+    state, evidence = tmp_path / "state", tmp_path / "run"
+    value = repair_request()
+    first = runtime.submit_request(state, value)
+    duplicate = runtime.submit_request(state, value)
+    assert first["created"] is True and duplicate["created"] is False
+    assert first["request_id"] == duplicate["request_id"]
+    assert runtime.claim_request(state, evidence) == value
+    assert runtime.submit_request(state, value)["status"] == "claimed"
+    with pytest.raises(runtime.ControlError, match="another request"):
+        runtime.submit_request(state, {**value, "pr": 41})
+    assert json.loads((state / "run-request.inflight.json").read_text()) == value
+
+
+@pytest.mark.parametrize("change", [
+    {"pr": True}, {"pr": 0}, {"base_sha": "abc1234"},
+    {"source_sha": "main"}, {"instruction": " "}, {"instruction": "x" * 4001},
+    {"extra": "unrecognized"},
+])
+def test_invalid_repair_request_never_enters_queue(tmp_path, change):
+    with pytest.raises(runtime.ControlError):
+        runtime.submit_request(tmp_path, {**repair_request(), **change})
+    assert not (tmp_path / "run-request.json").exists()
+
+
+def test_repair_gate_publishes_linear_source_without_advancing_upstream(tmp_path, monkeypatch):
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    value = claim_repair(state, evidence, base, candidate)
+    marker = state / "last_synced_upstream.sha"
+    marker.write_text(base + "\n")
+    packet, _ = make_gate_packet(evidence, worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    result = runtime.gate_and_ship(repo, packet, manifest_path, state_dir=state,
+        cwd=worktree, base_sha=base, candidate_sha=candidate, token="test-token")
+    assert result["run_binding"]["mode"] == "repair"
+    assert result["run_binding"]["request_sha256"] == runtime._canonical_json_sha256(value)
+    assert result["review_proof"]["review_mode"] == "linear-candidate"
+    assert remote_sha(repo) == candidate
+    runtime.finalize_success(repo, manifest_path, state_dir=state,
+        evidence_dir=evidence, cwd=worktree, token="test-token")
+    assert marker.read_text() == base + "\n"
+    assert json.loads((evidence / "request.consumed.json").read_text()) == value
+    assert not worktree.exists()
+
+
+def test_agent_entry_cli_returns_stable_machine_readable_handles(tmp_path):
+    state = tmp_path / "state"
+    request_file = tmp_path / "request.json"
+    request_file.write_text(json.dumps(repair_request()))
+    command = [sys.executable, str(SCRIPT), "submit-request", "--state", str(state),
+               "--request", str(request_file)]
+    first = json.loads(subprocess.run(command, check=True, capture_output=True, text=True).stdout)
+    duplicate = json.loads(subprocess.run(command, check=True, capture_output=True, text=True).stdout)
+    assert first["created"] and not duplicate["created"]
+    assert first["request_id"] == duplicate["request_id"]
+    status = subprocess.run([sys.executable, str(SCRIPT), "request-status", "--state",
+        str(state), "--request-id", first["request_id"]], check=True, capture_output=True, text=True)
+    assert json.loads(status.stdout) == {
+        "request_id": first["request_id"], "pending": "queued", "runs": []}
+    assert not (state / "run.lease.json").exists()
+
+
+def test_request_status_keeps_pending_and_terminal_run_facts_separate(tmp_path):
+    state = tmp_path / "state"
+    value = repair_request()
+    submitted = runtime.submit_request(state, value)
+    request_id = submitted["request_id"]
+    assert runtime.request_status(state, request_id) == {
+        "request_id": request_id, "pending": "queued", "runs": []}
+    run = state / "runs" / "test-run"
+    runtime.claim_request(state, run)
+    before = {p: p.read_bytes() for p in state.rglob("*.json")}
+    status = runtime.request_status(state, request_id)
+    assert status["pending"] == "claimed"
+    assert status["runs"][0]["status"] == "unknown"  # a claim is not liveness
+    assert {p: p.read_bytes() for p in state.rglob("*.json")} == before
+    (run / "run-outcome.json").write_text(json.dumps({
+        "status": "failed", "published": False, "token": "never-return-this"}))
+    runtime.recover_request(state)
+    status = runtime.request_status(state, request_id)
+    assert status["pending"] == "queued"
+    assert status["runs"][0]["status"] == "failed"
+    assert "token" not in status["runs"][0]
+
+
+def test_request_status_ignores_unidentifiable_historical_claims(tmp_path):
+    state = tmp_path / "state"
+    submitted = runtime.submit_request(state, repair_request())
+    damaged = state / "runs" / "old-run" / "request.claimed.json"
+    damaged.parent.mkdir(parents=True)
+    damaged.write_text("{incomplete")
+    assert runtime.request_status(state, submitted["request_id"]) == {
+        "request_id": submitted["request_id"], "pending": "queued", "runs": []}
+    assert damaged.read_text() == "{incomplete"
+
+
+def test_repair_rejects_a_candidate_missing_the_requested_source(tmp_path, monkeypatch):
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    claim_repair(state, evidence, base, "f" * 40)
+    monkeypatch.setattr(runtime, "run_gate", lambda *a, **kw: pytest.fail("must reject before gates"))
+    with pytest.raises(runtime.ControlError, match="retain the requested PR source"):
+        runtime.gate_and_ship(repo, evidence / "packet.json", evidence / "gate.json",
+            state_dir=state, cwd=worktree, base_sha=base, candidate_sha=candidate, token="test-token")
+    assert remote_sha(repo) == base
+
+
+def test_repair_rejects_request_replacement_during_verification(tmp_path, monkeypatch):
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    value = claim_repair(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    real_gate = runtime.run_gate
+
+    def changed_after_gate(*args, **kwargs):
+        result = real_gate(*args, **kwargs)
+        for path in (state / "run-request.inflight.json", evidence / "request.claimed.json"):
+            path.write_text(json.dumps({**value, "instruction": "different request"}))
+        return result
+
+    monkeypatch.setattr(runtime, "run_gate", changed_after_gate)
+    monkeypatch.setattr(runtime, "_publish_pr_evidence", lambda *a, **kw: pytest.fail("must reject before PR writes"))
+    with pytest.raises(runtime.ControlError, match="request changed during verification"):
+        runtime.gate_and_ship(repo, packet, evidence / "gate.json", state_dir=state,
+            cwd=worktree, base_sha=base, candidate_sha=candidate, token="test-token")
+    assert remote_sha(repo) == base
+
+
+def test_repair_request_cannot_silently_follow_a_moved_base(tmp_path):
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    value = claim_repair(state, evidence, "a" * 40, "b" * 40)
+    value["base_sha"] = "c" * 40
+    for path in (state / "run-request.inflight.json", evidence / "request.claimed.json"):
+        path.write_text(json.dumps(value))
+    with pytest.raises(runtime.ControlError, match="repair base has moved"):
+        runtime._derive_run_binding(state, evidence, "test-token")
+
+
+def test_repair_rejects_an_upstream_merge(tmp_path):
+    repo, base, _, _, candidate = make_upstream_merge_repo(tmp_path)
+    with pytest.raises(runtime.ControlError, match="repair review requires a linear"):
+        runtime._review_scope(repo, base, candidate, expected_mode="repair")
+
+
 def test_request_claim_is_recoverable_and_one_shot(tmp_path: Path) -> None:
     state, evidence = tmp_path / "state", tmp_path / "evidence"
     state.mkdir()

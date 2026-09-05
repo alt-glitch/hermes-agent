@@ -401,6 +401,20 @@ def test_up_to_date_probe_is_a_terminal_no_agent_tick(tmp_path: Path) -> None:
     launch_watchdog.assert_not_called()
 
 
+@pytest.mark.parametrize("name", ["run-request.json", "run-request.inflight.json"])
+def test_explicit_request_wakes_parent_when_upstream_is_current(tmp_path, name):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / name).write_text(json.dumps({"mode": "repair", "pr": 40}))
+    summary, _, bind_count, watchdog_count = _run_with_payload(
+        tmp_path, {"status": "up_to_date", "gap": 0}
+    )
+    assert summary["wakeAgent"] is True
+    assert bind_count == 1 and watchdog_count == 1
+    assert (state / "run.lease.json").exists()
+    assert (state / name).exists()  # validation/claiming belongs to the parent runtime
+
+
 def test_up_to_date_release_failure_is_not_reported_as_success(
     tmp_path: Path,
 ) -> None:

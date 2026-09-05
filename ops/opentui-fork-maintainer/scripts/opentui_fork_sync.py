@@ -805,7 +805,11 @@ def main() -> int:
         # execution ledger, and hold the whole-run lease until the agent exits.
         # Persist the probe result first, then release the exact lease owner
         # before returning the scheduler's explicit no-wake gate.
-        if payload.get("status") == "up_to_date":
+        pending_request = any(
+            (STATE_DIR / name).exists()
+            for name in ("run-request.json", "run-request.inflight.json")
+        )
+        if payload.get("status") == "up_to_date" and not pending_request:
             _write_text_atomic(INGEST_FILE, json.dumps(payload, indent=2) + "\n")
             if not _release_lease(run_token):
                 raise RuntimeError("up-to-date lease release lost ownership")

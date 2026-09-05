@@ -1,9 +1,15 @@
 ---
 name: opentui-maintainer
-description: Maintain the sid/opentui Hermes fork in an isolated cron profile, with upstream integration, native TUI verification, reviewed publication, and durable run evidence.
+description: Start or inspect headless OpenTUI fork maintenance from a user's natural-language request, or execute a claimed maintainer run with native verification and reviewed publication.
 ---
 
 # OpenTUI maintenance
+
+When the user asks you to start, retry or check maintenance from an ordinary
+chat, read [agent-orchestration.md](references/agent-orchestration.md). You
+operate the internal commands; the user should not need a CLI. A status question
+never authorizes starting or retrying work. Once inside a claimed cron run,
+follow the worker policy below instead of submitting another request.
 
 Own the maintenance run, not the user's interactive installation. Read the
 deployed `prompts/maintainer.md` named in the cron prompt before taking action.

@@ -375,16 +375,91 @@ def _request_lock(state_dir: Path) -> Iterator[None]:
 
 
 def _validate_request(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict) and value.get("mode") == "repair":
+        if set(value) != {"mode", "pr", "base_sha", "source_sha", "instruction"}:
+            raise ControlError("repair request has an invalid shape")
+        if type(value["pr"]) is not int or value["pr"] <= 0:
+            raise ControlError("repair request requires a positive PR number")
+        for name in ("base_sha", "source_sha"):
+            if not isinstance(value[name], str) or not SHA_RE.fullmatch(value[name]):
+                raise ControlError(f"repair request requires an exact {name}")
+        instruction = value["instruction"]
+        if not isinstance(instruction, str) or not 1 <= len(instruction.strip()) <= 4000:
+            raise ControlError("repair instruction must contain 1 to 4000 characters")
+        return {**value, "instruction": instruction.strip()}
     if not isinstance(value, dict) or set(value) != {"mode", "commits"}:
         raise ControlError("request must contain exactly mode and commits")
     commits = value.get("commits")
     if value.get("mode") != "backport" or not isinstance(commits, list):
         raise ControlError("request must be a backport with a commit list")
-    if not 1 <= len(commits) <= 20 or len(set(commits)) != len(commits):
-        raise ControlError("request must contain 1 to 20 unique commits")
     if not all(isinstance(sha, str) and SHORT_SHA_RE.fullmatch(sha) for sha in commits):
         raise ControlError("request contains an invalid commit id")
+    if not 1 <= len(commits) <= 20 or len({sha.lower() for sha in commits}) != len(commits):
+        raise ControlError("request must contain 1 to 20 unique commits")
     return {"mode": "backport", "commits": [sha.lower() for sha in commits]}
+
+
+def submit_request(state_dir: Path, value: Any) -> dict[str, Any]:
+    """Queue explicit agent-orchestrated work without replacing another request."""
+    value = _validate_request(value)
+    with _request_lock(state_dir):
+        pending = [state_dir / name for name in
+                   ("run-request.json", "run-request.inflight.json")
+                   if (state_dir / name).exists()]
+        if len(pending) > 1:
+            raise ControlError("both queued and in-flight requests exist; inspect before submitting")
+        if pending:
+            existing = _read_bound_request(pending[0], state_dir, label="pending request")
+            if existing != value:
+                raise ControlError("another request is pending; inspect it instead of replacing it")
+            status = "claimed" if pending[0].name.endswith("inflight.json") else "queued"
+            created = False
+        else:
+            _atomic_json(state_dir / "run-request.json", value)
+            status, created = "queued", True
+    return {"request_id": _canonical_json_sha256(value), "status": status, "created": created}
+
+
+def request_status(state_dir: Path, request_id: str) -> dict[str, Any]:
+    """Inspect one request without dispatching, recovering or replacing work."""
+    if not SHA256_RE.fullmatch(request_id):
+        raise ControlError("request id must be the full SHA-256 returned by submission")
+    pending = None
+    with _request_lock(state_dir):
+        for name, status in (("run-request.json", "queued"),
+                             ("run-request.inflight.json", "claimed")):
+            path = state_dir / name
+            if path.exists():
+                value = _read_bound_request(path, state_dir, label="pending request")
+                if _canonical_json_sha256(value) == request_id:
+                    pending = status
+    runs = []
+    root = state_dir / "runs"
+    for run in sorted(root.iterdir()) if root.is_dir() else []:
+        if not run.is_dir() or run.is_symlink():
+            continue
+        claim = run / "request.claimed.json"
+        if not claim.exists():
+            continue
+        try:
+            value = _read_bound_request(claim, run, label="run request")
+        except (OSError, json.JSONDecodeError, ControlError):
+            # An unreadable historical claim cannot identify this request.
+            continue
+        if _canonical_json_sha256(value) != request_id:
+            continue
+        entry: dict[str, Any] = {"run_id": run.name, "evidence_dir": str(run), "status": "unknown"}
+        outcome_path = run / "run-outcome.json"
+        if outcome_path.exists():
+            safe = _evidence_path(str(outcome_path), run, label="run outcome")
+            outcome = json.loads(safe.read_text(encoding="utf-8"))
+            if not isinstance(outcome, dict):
+                raise ControlError("run outcome must be an object")
+            for key in ("status", "stage", "published", "candidate_sha", "needs_finalization"):
+                if key in outcome:
+                    entry[key] = outcome[key]
+        runs.append(entry)
+    return {"request_id": request_id, "pending": pending, "runs": runs}
 
 
 def _record_retry_context(
@@ -528,7 +603,7 @@ def _canonical_json_sha256(value: Any) -> str:
 def _derive_run_binding(
     state_dir: Path, evidence_dir: Path, token: str
 ) -> dict[str, Any]:
-    """Bind a gate to either the scheduled sync or one exact claimed backport."""
+    """Bind a gate to the scheduled sync or one exact claimed manual request."""
     evidence_root = Path(os.path.abspath(evidence_dir))
     with _request_lock(state_dir):
         queued = state_dir / "run-request.json"
@@ -547,7 +622,7 @@ def _derive_run_binding(
                 raise ControlError(
                     "claimed backport request does not match in-flight state"
                 )
-            mode = "backport"
+            mode = claimed_value["mode"]
             request_sha = _canonical_json_sha256(claimed_value)
         else:
             if queued.exists() or inflight.exists():
@@ -592,6 +667,8 @@ def _derive_run_binding(
         or not SHA_RE.fullmatch(str(context.get("upstream_sha", "")))
     ):
         raise ControlError("captured run context does not match the active lease")
+    if mode == "repair" and claimed_value["base_sha"] != context["base_sha"]:
+        raise ControlError("repair base has moved; a new explicit request is required")
     return {
         "mode": mode,
         "request_sha256": request_sha,
@@ -1062,7 +1139,7 @@ def validate_gate_manifest(
             "captured_upstream",
             "captured_base",
         }
-        or binding.get("mode") not in {"scheduled", "backport"}
+        or binding.get("mode") not in {"scheduled", "backport", "repair"}
     ):
         raise ControlError("gate manifest run binding is invalid")
     proof = value.get("review_proof")
@@ -1236,6 +1313,10 @@ def ship_candidate(
     with _lease_lock(state_dir):
         lease = _lease_value(state_dir)
         _validate_lease_value(lease, token, int(time.time()))
+        if manifest["run_binding"]["mode"] == "repair" and _derive_run_binding(
+            state_dir, manifest_path.parent, token
+        ) != manifest["run_binding"]:
+            raise ControlError("repair request changed after verification")
         # All expensive implementation and acceptance work is complete. Bound
         # the only remaining crash window before touching the remote so a
         # post-push process death can be retried after minutes, not six hours.
@@ -2012,8 +2093,8 @@ def _review_scope(
         raise ControlError(
             "scheduled review candidate must begin with a two-parent upstream merge"
         )
-    if expected_mode == "backport":
-        raise ControlError("manual backport review requires a linear candidate")
+    if expected_mode in {"backport", "repair"}:
+        raise ControlError(f"manual {expected_mode} review requires a linear candidate")
     if any(len(_commit_parents(repo, commit)) != 1 for commit in commits[1:]):
         raise ControlError("post-merge adaptation history must be linear")
     upstream_sha = parents[1]
@@ -2744,7 +2825,7 @@ def run_gate(
             "captured_upstream",
             "captured_base",
         }
-        or run_binding.get("mode") not in {"scheduled", "backport"}
+        or run_binding.get("mode") not in {"scheduled", "backport", "repair"}
     ):
         raise ControlError("gate run binding is invalid")
     node_proof = _validate_node_runtime()
@@ -3019,6 +3100,16 @@ def gate_and_ship(
     run_binding = _derive_run_binding(state_dir, manifest_path.parent, token)
     if run_binding["captured_base"] != base_sha:
         raise ControlError("gate base does not match captured fork snapshot")
+    if run_binding["mode"] == "repair":
+        request = _read_bound_request(
+            evidence_root / "request.claimed.json", evidence_root, label="repair request"
+        )
+        source = request["source_sha"]
+        if (
+            _git_status(cwd, ["merge-base", "--is-ancestor", base_sha, source])
+            or _git_status(cwd, ["merge-base", "--is-ancestor", source, candidate_sha])
+        ):
+            raise ControlError("repair candidate must retain the requested PR source above its captured base")
     result = run_gate(
         packet_path,
         manifest_path,
@@ -3036,6 +3127,10 @@ def gate_and_ship(
         repo, manifest_path, base_sha=base_sha, candidate_sha=candidate_sha,
         token=token, branch=branch,
     )
+    if run_binding["mode"] == "repair" and _derive_run_binding(
+        state_dir, evidence_root, token
+    ) != run_binding:
+        raise ControlError("repair request changed during verification")
     proof = _publish_pr_evidence(repo, evidence_root, result, remote)
     result["pr_evidence"] = proof
     _atomic_json(manifest_path, result)
@@ -3491,6 +3586,12 @@ def reconcile_run(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    submit = sub.add_parser("submit-request")
+    submit.add_argument("--state", type=Path, required=True)
+    submit.add_argument("--request", type=Path, required=True)
+    status = sub.add_parser("request-status")
+    status.add_argument("--state", type=Path, required=True)
+    status.add_argument("--request-id", required=True)
     claim = sub.add_parser("claim-request")
     claim.add_argument("--state", type=Path, required=True)
     claim.add_argument("--evidence", type=Path, required=True)
@@ -3550,6 +3651,13 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "submit-request":
+        value = json.loads(args.request.read_text(encoding="utf-8"))
+        print(json.dumps(submit_request(args.state, value)))
+        return 0
+    if args.command == "request-status":
+        print(json.dumps(request_status(args.state, args.request_id)))
+        return 0
     if args.command == "claim-request":
         with run_lock(args.state):
             validate_lease(args.state, args.token)
