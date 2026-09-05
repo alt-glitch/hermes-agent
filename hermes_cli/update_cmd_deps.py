@@ -541,6 +541,16 @@ def _repair_node_deps_on_current_checkout(
 
 
 def _update_node_dependencies() -> list[str]:
+    """Refresh both the standalone OpenTUI engine and upstream Node workspaces."""
+    from hermes_cli.main_tui_launch import _update_opentui_package
+
+    failures = _update_workspace_node_dependencies()
+    if not _update_opentui_package():
+        failures.append("OpenTUI engine")
+    return failures
+
+
+def _update_workspace_node_dependencies() -> list[str]:
     """Refresh Node deps for ui-tui and web. Returns labels whose npm install failed (empty on
     success) so the caller reports a partial update instead of ``Update complete!``.
 

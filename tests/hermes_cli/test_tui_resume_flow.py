@@ -7,7 +7,7 @@ import textwrap
 import types
 
 import pytest
-from hermes_cli import main_tui_launch
+from hermes_cli import _startup_fast, main_tui_launch
 
 
 def _args(**overrides):
@@ -507,7 +507,7 @@ def test_termux_ultrafast_version_runs_before_heavy_startup(
     monkeypatch.delenv("HERMES_TERMUX_DISABLE_FAST_CLI", raising=False)
     monkeypatch.setattr(sys, "argv", ["hermes", "--version"])
 
-    assert main_mod._try_termux_ultrafast_version() is True
+    assert _startup_fast.try_fast_version() is True
 
     out = capsys.readouterr().out
     assert "Hermes Agent v" in out
@@ -525,7 +525,7 @@ def test_read_openai_version_fast(monkeypatch, tmp_path, main_mod):
     )
     monkeypatch.setattr(sys, "path", [str(tmp_path)])
 
-    assert main_mod._read_openai_version_fast() == "9.8.7"
+    assert _startup_fast.read_openai_version() == "9.8.7"
 
 
 def test_termux_fast_cli_launch_skips_help(monkeypatch, main_mod):
@@ -776,7 +776,9 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     # _make_tui_argv now dispatches on the TUI engine first; resolving "opentui"
     # availability probes `node --version` (a subprocess.run this test would
     # otherwise record). Pin the Ink engine — this test covers the Ink dev path.
-    monkeypatch.setattr(main_mod, "_resolve_tui_engine", lambda: "ink")
+    monkeypatch.setattr(
+        main_tui_launch, "_resolve_tui_engine", lambda **_kwargs: "ink"
+    )
 
     calls = []
 

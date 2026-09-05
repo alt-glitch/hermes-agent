@@ -17,7 +17,7 @@ import stat
 
 import pytest
 
-import hermes_cli.main as main_mod
+from hermes_cli import main_tui_launch as main_mod
 
 
 def _fake_node(path, version: str) -> None:

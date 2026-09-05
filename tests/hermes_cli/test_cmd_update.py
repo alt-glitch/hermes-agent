@@ -300,6 +300,8 @@ class TestCmdUpdateBranchFallback:
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
+            if "rev-parse" in cmd and "--verify" in cmd and "origin/main" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(
                     cmd, 0, stdout=f"{next(branch_reads)}\n", stderr=""

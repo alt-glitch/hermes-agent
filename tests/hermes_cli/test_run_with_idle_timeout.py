@@ -23,6 +23,16 @@ import pytest
 from hermes_cli.main_web_build import _run_with_idle_timeout
 
 
+def _process_exited(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        proc_status = Path(f"/proc/{pid}/status")
+        return proc_status.is_file() and "State:\tZ" in proc_status.read_text()
+    except (ProcessLookupError, FileNotFoundError):
+        # Reaping may race either the liveness probe or the /proc read.
+        return True
+
+
 def test_streams_output_and_returns_zero_on_success(tmp_path):
     script = tmp_path / "ok.py"
     script.write_text("print('line one'); print('line two')\n")
@@ -88,12 +98,7 @@ def test_idle_timeout_kills_the_whole_process_tree(tmp_path):
     pid = int(grandchild_pid.read_text())
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        proc_status = Path(f"/proc/{pid}/status")
-        if proc_status.is_file() and "State:\tZ" in proc_status.read_text():
+        if _process_exited(pid):
             break
         time.sleep(0.05)
     else:
@@ -128,12 +133,7 @@ def test_normal_leader_exit_reaps_background_descendant(tmp_path):
         pid = int(grandchild_pid.read_text())
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                break
-            proc_status = Path(f"/proc/{pid}/status")
-            if proc_status.is_file() and "State:\tZ" in proc_status.read_text():
+            if _process_exited(pid):
                 break
             time.sleep(0.05)
         else:
@@ -168,7 +168,7 @@ def test_parent_termination_reaps_silent_isolated_tree(
     parent_script.write_text(
         "import sys\n"
         "from pathlib import Path\n"
-        "from hermes_cli.main import _run_with_idle_timeout\n"
+        "from hermes_cli.main_web_build import _run_with_idle_timeout\n"
         "_run_with_idle_timeout([sys.executable, sys.argv[1], sys.argv[2]], "
         "cwd=Path(sys.argv[3]), idle_timeout_seconds=30)\n"
     )
@@ -203,12 +203,7 @@ def test_parent_termination_reaps_silent_isolated_tree(
 
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            proc_status = Path(f"/proc/{child_pid}/status")
-            if proc_status.is_file() and "State:\tZ" in proc_status.read_text():
+            if _process_exited(child_pid):
                 break
             time.sleep(0.05)
         else:
@@ -249,7 +244,7 @@ def test_signal_fence_reaps_tree_started_from_worker_thread(
     parent_script.write_text(
         "import sys, threading\n"
         "from pathlib import Path\n"
-        "from hermes_cli.main import _run_with_idle_timeout\n"
+        "from hermes_cli.main_web_build import _run_with_idle_timeout\n"
         "from hermes_cli.subprocess_lifecycle import install_signal_cleanup\n"
         "cleanup = install_signal_cleanup()\n"
         "thread = threading.Thread(target=_run_with_idle_timeout, "
@@ -290,12 +285,7 @@ def test_signal_fence_reaps_tree_started_from_worker_thread(
 
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            proc_status = Path(f"/proc/{child_pid}/status")
-            if proc_status.is_file() and "State:\tZ" in proc_status.read_text():
+            if _process_exited(child_pid):
                 break
             time.sleep(0.05)
         else:

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -17,6 +18,7 @@ import time as _time
 
 from pathlib import Path
 from typing import Callable
+from hermes_cli import subprocess_lifecycle as _subprocess_lifecycle
 from hermes_cli.main_tui_launch import (
     _npm_lifecycle_env, _termux_workspace_install_context, _workspace_root)
 
@@ -205,33 +207,119 @@ def _console_print(text: str) -> None:
         print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
 
-def _run_with_idle_timeout(
-    cmd: list[str], cwd: Path, *, idle_timeout_seconds: int = 180, indent: str = "    ",
-    env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    """Stream a subprocess, killing it after *idle_timeout_seconds* of silence (a silent captured
-    Vite build on a low-memory host looks like a hang and users reboot mid-install). Returns merged
-    stdout, empty stderr, rc 124 if terminate raced a clean exit; never raises on idle timeout.
+def _terminate_subprocess_tree(proc: subprocess.Popen) -> int:
+    """Terminate then force-kill the isolated subprocess tree."""
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — POSIX branch
+        except ProcessLookupError:
+            return proc.wait()
+        try:
+            rc = proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX branch
+            except ProcessLookupError:
+                pass
+            return proc.wait()
+        # The session leader may exit before a child that ignored SIGTERM.
+        # Kill any remaining member of the isolated group before returning.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX branch
+        except ProcessLookupError:
+            pass
+        return rc
 
-    Issue #33788: ``npm run build`` (Vite) was invoked with ``capture_output=True`` and no timeout. On
-    low-memory hosts (notably WSL2 with the default 4 GB cap) the build can stall or sit silent for minutes;
-    users see a frozen terminal, assume the update is hung, and reboot — leaving the editable install in a
-    half-state with the ``hermes`` launcher present but ``hermes_cli`` not importable.
-    This helper fixes both halves: stdout is streamed (so the user sees progress), and if no bytes have
-    appeared on stdout/stderr for ``idle_timeout_seconds``, the process is terminated and the call returns
-    with a non-zero ``returncode``. The caller's existing stale-dist fallback (#23817) takes over from
-    there.
+    if os.name == "nt":
+        # CREATE_NEW_PROCESS_GROUP below lets taskkill address the full tree.
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            if result.returncode == 0:
+                return proc.wait()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    proc.terminate()
+    try:
+        return proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return proc.wait()
+
+
+class _BuildParentTermination(BaseException):
+    """Internal control flow for default TERM/HUP during an isolated build."""
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _run_with_idle_timeout(
+    cmd: list[str],
+    cwd: Path,
+    *,
+    idle_timeout_seconds: int = 180,
+    indent: str = "    ",
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a subprocess that streams output, with an idle-output timeout.
+
+    Issue #33788: ``npm run build`` (Vite) was invoked with
+    ``capture_output=True`` and no timeout. On low-memory hosts (notably
+    WSL2 with the default 4 GB cap) the build can stall or sit silent for
+    minutes; users see a frozen terminal, assume the update is hung, and
+    reboot — leaving the editable install in a half-state with the
+    ``hermes`` launcher present but ``hermes_cli`` not importable.
+
+    This helper fixes both halves: stdout is streamed (so the user sees
+    progress), and if no bytes have appeared on stdout/stderr for
+    ``idle_timeout_seconds``, the process is terminated and the call
+    returns with a non-zero ``returncode``. The caller's existing
+    stale-dist fallback (#23817) takes over from there.
+
+    Returns a ``CompletedProcess`` with merged stdout (text), empty
+    stderr, and an integer returncode. Never raises on idle timeout —
+    propagation of failure is via the returncode.
     """
     merged_chunks: list[str] = []
     last_output_ts = _time.monotonic()
     lock = threading.Lock()
 
+    popen_options = {}
+    if os.name == "posix":
+        popen_options["start_new_session"] = True
+    elif os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
     try:
         proc = subprocess.Popen(
-            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+            **popen_options,
+        )
     except OSError as exc:
         # E.g. npm not on PATH between the which() check and now.
         return subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(exc))
+
+    # Register immediately after Popen: dashboard hydration runs this helper
+    # in a worker thread, so its main event-loop task and TERM/HUP handler need
+    # a thread-safe way to own the isolated process group.
+    managed_proc = _subprocess_lifecycle.register_isolated_subprocess(
+        proc, _terminate_subprocess_tree
+    )
 
     def _reader() -> None:
         nonlocal last_output_ts
@@ -244,44 +332,107 @@ def _run_with_idle_timeout(
                 last_output_ts = _time.monotonic()
 
     reader_thread = threading.Thread(target=_reader, daemon=True)
-    reader_thread.start()
+    try:
+        reader_thread.start()
+    except BaseException:
+        managed_proc.terminate()
+        managed_proc.close()
+        raise
+
+    previous_termination_handlers: dict[int, object] = {}
+
+    def _raise_parent_termination(signum, _frame) -> None:
+        raise _BuildParentTermination(signum)
+
+    def _restore_termination_handlers() -> None:
+        while previous_termination_handlers:
+            signum, previous = previous_termination_handlers.popitem()
+            signal.signal(signum, previous)
+
+    # setsid protects the caller from descendants and enables reliable group
+    # cleanup, but it also shields a silent child from terminal HUP when the
+    # Python parent receives its default TERM/HUP disposition. Temporarily turn
+    # only those default dispositions into Python control flow so the process
+    # group is reaped first. Respect daemon/custom handlers, and signal APIs are
+    # only legal from Python's main thread.
+    try:
+        if os.name == "posix" and threading.current_thread() is threading.main_thread():
+            for termination_signal in (signal.SIGTERM, signal.SIGHUP):  # windows-footgun: ok — POSIX branch
+                previous = signal.getsignal(termination_signal)
+                if previous == signal.SIG_DFL:
+                    signal.signal(termination_signal, _raise_parent_termination)
+                    previous_termination_handlers[termination_signal] = previous
+    except BaseException:
+        try:
+            managed_proc.terminate()
+        finally:
+            managed_proc.close()
+            _restore_termination_handlers()
+        raise
 
     idle_killed = False
-    while True:
-        try:
-            rc = proc.wait(timeout=5)
-            break
-        except subprocess.TimeoutExpired:
-            with lock:
-                idle = _time.monotonic() - last_output_ts
-            if idle > idle_timeout_seconds:
-                idle_killed = True
-                proc.terminate()
-                try:
-                    rc = proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    rc = proc.wait()
+    parent_termination_signal: int | None = None
+    leader_reaped = False
+    wait_poll_seconds = min(5.0, max(0.05, idle_timeout_seconds / 4))
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=wait_poll_seconds)
+                leader_reaped = True
                 break
+            except subprocess.TimeoutExpired:
+                with lock:
+                    idle = _time.monotonic() - last_output_ts
+                if idle > idle_timeout_seconds:
+                    idle_killed = True
+                    rc = managed_proc.terminate()
+                    break
+    except _BuildParentTermination as exc:
+        rc = managed_proc.terminate()
+        parent_termination_signal = exc.signum
+    except BaseException:
+        managed_proc.terminate()
+        reader_thread.join(timeout=2)
+        raise
+    finally:
+        _restore_termination_handlers()
+        try:
+            if leader_reaped and os.name == "posix":
+                # A successful process-group leader may have backgrounded a
+                # descendant that still owns stdout. Drain the isolated group
+                # before unregistering it; otherwise dashboard shutdown can no
+                # longer find the child and the daemon reader remains blocked.
+                managed_proc.terminate()
+        finally:
+            managed_proc.close()
 
     # Drain reader so we don't leak the stdout file descriptor.
     reader_thread.join(timeout=2)
 
+    if parent_termination_signal is not None:
+        # Re-deliver with the original default disposition so callers and
+        # supervisors observe the same signal exit status as without this
+        # cleanup fence. The SystemExit is a defensive fallback for platforms
+        # that unexpectedly decline self-delivery.
+        os.kill(os.getpid(), parent_termination_signal)
+        raise SystemExit(128 + parent_termination_signal)
+
     combined = "".join(merged_chunks)
     if idle_killed:
-        combined += (
+        msg = (
             f"\n  ⚠ Build produced no output for {idle_timeout_seconds}s — terminated.\n"
             "    Common causes: out-of-memory on a low-RAM host (WSL/container),\n"
             "    a stuck Node process, or an antivirus scan stalling I/O.\n"
         )
+        combined += msg
+        # Force a non-zero rc even if terminate() raced with a clean exit.
         if rc == 0:
             rc = 124  # GNU `timeout` convention
     return subprocess.CompletedProcess(cmd, rc, stdout=combined, stderr="")
 
 
 def _nixos_build_env() -> dict[str, str] | None:
-    """``PYTHON=`` env for node-gyp on NixOS (bare PATH lookup fails outside nix-shell): the hermes
-    venv python3, else a ``nix-shell``-resolved store path. None off NixOS / python3 on PATH."""
+    """Resolve a node-gyp Python on NixOS; leave other hosts unchanged."""
     from hermes_cli.main import PROJECT_ROOT
     import re
     try:

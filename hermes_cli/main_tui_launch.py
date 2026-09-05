@@ -405,6 +405,173 @@ def _run_opentui_build_command(*args, **kwargs):
     return _run_with_idle_timeout(*args, **kwargs)
 
 
+def _update_opentui_package() -> bool:
+    """Refresh the standalone OpenTUI package during ``hermes update``.
+
+    Dependency-graph changes run npm ci + build in a sibling staging tree and
+    promote node_modules + dist only after both succeed. Source/config-only
+    changes use the cheaper transactional dist build. Either failure leaves the
+    previously launchable runtime intact. This is deliberately best-effort so
+    unsupported hosts keep Ink or their prior OpenTUI runtime.
+    """
+    if sys.platform.startswith("win") or _is_termux_startup_environment():
+        return True
+
+    seed_dir = _project_root() / "ui-opentui"
+    if not (seed_dir / "package.json").is_file():
+        return True
+    location = _opentui_runtime_location(report_error=False)
+    if location is None:
+        print(
+            "  ⚠ OpenTUI update skipped: the packaged runtime seed is incomplete; "
+            "reinstall Hermes to restore its build inputs."
+        )
+        return False
+    app_dir = location.runtime_dir
+
+    node = _node26_bin_or_none()
+    if node is None:
+        print(
+            "  ⚠ OpenTUI update skipped: Node.js >= 26.3.0 is unavailable; "
+            "the previous bundle/Ink fallback is unchanged."
+        )
+        return False
+    identity = _opentui_node_identity(node, report_error=False)
+    if identity is None:
+        print(
+            "  ⚠ OpenTUI update skipped: the selected Node 26 runtime identity "
+            "could not be queried; the previous runtime is unchanged."
+        )
+        return False
+
+    packaged_current = _opentui_runtime.packaged_runtime_current(location)
+    initial = _opentui_runtime.inspect_runtime(app_dir, identity)
+    state_dir = _opentui_runtime_state_dir()
+    if (
+        packaged_current
+        and not initial.refresh_required
+        and not _opentui_runtime.promotion_debris_present(app_dir)
+    ):
+        _opentui_runtime.clear_refresh_failure(
+            state_dir, _opentui_refresh_failure_key(location, identity)
+        )
+        return True
+
+    try:
+        with _opentui_runtime.refresh_lock(app_dir):
+            locked_identity = _opentui_node_identity(node, report_error=False)
+            if locked_identity is None:
+                print(
+                    "  ⚠ OpenTUI update skipped: the selected Node 26 runtime "
+                    "identity changed or became unavailable."
+                )
+                return False
+            identity = locked_identity
+            _opentui_runtime.recover_interrupted_promotion(app_dir)
+            _opentui_runtime.prune_abandoned_staging(app_dir)
+            inspection = _opentui_runtime.inspect_runtime(app_dir, identity)
+            packaged_current = _opentui_runtime.packaged_runtime_current(location)
+            _prune_validated_opentui_backups(
+                location,
+                inspection,
+                packaged_current=packaged_current,
+            )
+            failure_key = _opentui_refresh_failure_key(location, identity)
+            if packaged_current and not inspection.refresh_required:
+                _opentui_runtime.clear_refresh_failure(state_dir, failure_key)
+                return True
+            npm_command = _opentui_runtime.npm_command(node)
+            if npm_command is None:
+                if failure_key is not None:
+                    _opentui_runtime.record_refresh_failure(state_dir, failure_key)
+                print(
+                    "  ⚠ OpenTUI update skipped: npm paired with the selected "
+                    "Node 26 installation was not found; the previous runtime "
+                    "is unchanged."
+                )
+                return False
+
+            print("→ Updating the OpenTUI engine transactionally…")
+            env = _opentui_runtime.build_environment(node)
+            if location.is_packaged:
+                success, result, promotion = (
+                    _opentui_runtime.refresh_packaged_runtime(
+                        location,
+                        identity=identity,
+                        npm=npm_command,
+                        env=env,
+                        runner=_run_opentui_build_command,
+                    )
+                )
+                success_message = (
+                    "  ✓ OpenTUI writable runtime hydrated + production bundle updated"
+                )
+            elif not inspection.dependency_refresh_required:
+                success, result, promotion = _opentui_runtime.build_bundle(
+                    app_dir,
+                    npm=npm_command,
+                    env=env,
+                    runner=_run_opentui_build_command,
+                )
+                success_message = "  ✓ OpenTUI production bundle updated"
+            else:
+                success, result, promotion = _opentui_runtime.refresh_runtime(
+                    app_dir,
+                    identity=identity,
+                    npm=npm_command,
+                    env=env,
+                    runner=_run_opentui_build_command,
+                )
+                success_message = (
+                    "  ✓ OpenTUI dependencies + production bundle updated"
+                )
+            if not success:
+                if failure_key is not None:
+                    _opentui_runtime.record_refresh_failure(state_dir, failure_key)
+                preview = _opentui_runtime.failure_preview(result)
+                print("  ⚠ OpenTUI refresh failed; the previous runtime is unchanged.")
+                if preview:
+                    print(preview)
+                return False
+
+            if promotion is None:
+                raise RuntimeError(
+                    "successful OpenTUI refresh has no promotion transaction"
+                )
+            try:
+                (
+                    refresh_current,
+                    completed,
+                    completed_packaged_current,
+                ) = _completed_opentui_refresh(location, identity)
+            except BaseException:
+                promotion.rollback()
+                raise
+            if not refresh_current:
+                promotion.rollback()
+                if failure_key is not None:
+                    _opentui_runtime.record_refresh_failure(state_dir, failure_key)
+                print(
+                    "  ⚠ OpenTUI refresh produced a non-current runtime; "
+                    "refusing to launch it."
+                )
+                return False
+
+            promotion.commit()
+            _opentui_runtime.clear_refresh_failure(state_dir, failure_key)
+            _prune_validated_opentui_backups(
+                location,
+                completed,
+                packaged_current=completed_packaged_current,
+            )
+            print(success_message)
+            return True
+    except Exception as exc:
+        print(f"  ⚠ OpenTUI update failed; the previous runtime is unchanged: {exc}")
+        return False
+
+
+
 def _config_tui_engine_early() -> str | None:
     """Read ``display.tui_engine`` from config via a minimal YAML read.
 

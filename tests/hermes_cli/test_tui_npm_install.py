@@ -25,9 +25,9 @@ def _pin_ink_engine(monkeypatch):
     would route ``_make_tui_argv`` away from the npm path under test. Pin the
     engine to ink, mirroring test_tui_resume_flow.py.
     """
-    import hermes_cli.main as m
-
-    monkeypatch.setattr(m, "_resolve_tui_engine", lambda: "ink")
+    monkeypatch.setattr(
+        main_tui_launch, "_resolve_tui_engine", lambda **_kwargs: "ink"
+    )
 
 
 def _touch_ink(root: Path) -> None:

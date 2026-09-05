@@ -4511,6 +4511,13 @@ class TestPtyWebSocket:
         self.ws_module = ws
         monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
         ws.app.state.pty_active_session_files = {}
+        monkeypatch.setattr(
+            main_tui_launch,
+            "_make_tui_argv",
+            lambda *_args, **_kwargs: pytest.fail(
+                "PTY test must provide synthetic argv; never build the real TUI"
+            ),
+        )
         self.token = ws._SESSION_TOKEN
         self.client = TestClient(ws.app)
 
@@ -4525,15 +4532,14 @@ class TestPtyWebSocket:
 
     def test_resolve_chat_argv_uses_dashboard_scroll_env(self, monkeypatch):
         """Dashboard chat runs the TUI in browser-scrollback mode."""
-        import hermes_cli.main as main_mod
 
         monkeypatch.setattr(
-            main_mod,
+            main_tui_launch,
             "_make_tui_argv",
             lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
-        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+        _argv, _cwd, env = _web_server_chat._resolve_chat_argv()
 
         assert env["HERMES_TUI_DASHBOARD"] == "1"
         assert env["HERMES_TUI_INLINE"] == "1"
@@ -4541,10 +4547,9 @@ class TestPtyWebSocket:
 
     def test_resolve_chat_argv_applies_opentui_native_env(self, monkeypatch):
         """Dashboard launches get the same selected-Node native env as CLI launches."""
-        import hermes_cli.main as main_mod
 
         monkeypatch.setattr(
-            main_mod,
+            main_tui_launch,
             "_make_tui_argv",
             lambda project_root, tui_dev=False: (
                 ["/opt/node-arm64/bin/node", "dist/main.js"],
@@ -4557,9 +4562,9 @@ class TestPtyWebSocket:
             observed.append((argv, cwd))
             env["OPENTUI_LIBC"] = "musl"
 
-        monkeypatch.setattr(main_mod, "_apply_opentui_native_env", apply_native_env)
+        monkeypatch.setattr(main_tui_launch, "_apply_opentui_native_env", apply_native_env)
 
-        argv, cwd, env = self.ws_module._resolve_chat_argv()
+        argv, cwd, env = _web_server_chat._resolve_chat_argv()
 
         assert observed == [(argv, cwd)]
         assert env["OPENTUI_LIBC"] == "musl"
@@ -4569,31 +4574,29 @@ class TestPtyWebSocket:
         chalk in the TUI child degrade skin hex colors to the xterm 256
         palette (gold banner rendered salmon-red). xterm.js always supports
         24-bit color, so the PTY env must advertise truecolor."""
-        import hermes_cli.main as main_mod
 
         monkeypatch.setattr(
-            main_mod,
+            main_tui_launch,
             "_make_tui_argv",
             lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
         monkeypatch.delenv("COLORTERM", raising=False)
 
-        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+        _argv, _cwd, env = _web_server_chat._resolve_chat_argv()
 
         assert env["COLORTERM"] == "truecolor"
 
     def test_resolve_chat_argv_keeps_operator_colorterm(self, monkeypatch):
         """An explicit operator COLORTERM wins over the backfill."""
-        import hermes_cli.main as main_mod
 
         monkeypatch.setattr(
-            main_mod,
+            main_tui_launch,
             "_make_tui_argv",
             lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
         monkeypatch.setenv("COLORTERM", "24bit")
 
-        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+        _argv, _cwd, env = _web_server_chat._resolve_chat_argv()
 
         assert env["COLORTERM"] == "24bit"
 
@@ -4605,12 +4608,12 @@ class TestPtyWebSocket:
         monkeypatch.delenv("HERMES_PYTHON", raising=False)
         monkeypatch.delenv("HERMES_CWD", raising=False)
         monkeypatch.setattr(
-            main_mod,
+            main_tui_launch,
             "_make_tui_argv",
             lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
-        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+        _argv, _cwd, env = _web_server_chat._resolve_chat_argv()
 
         assert env is not None
         assert env["HERMES_PYTHON_SRC_ROOT"] == str(main_mod.PROJECT_ROOT)
@@ -4625,12 +4628,12 @@ class TestPtyWebSocket:
         monkeypatch.setenv("HERMES_PYTHON", "/definitely/missing/python")
         monkeypatch.setenv("HERMES_CWD", "/definitely/missing/cwd")
         monkeypatch.setattr(
-            main_mod,
+            main_tui_launch,
             "_make_tui_argv",
             lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
-        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+        _argv, _cwd, env = _web_server_chat._resolve_chat_argv()
 
         assert env is not None
         assert env["HERMES_PYTHON_SRC_ROOT"] == str(main_mod.PROJECT_ROOT)
@@ -4641,7 +4644,6 @@ class TestPtyWebSocket:
         self, monkeypatch, tmp_path
     ):
         """Relative Python paths are resolved from the TUI child's cwd."""
-        import hermes_cli.main as main_mod
 
         relative_python = Path(".review-venv") / "bin" / Path(sys.executable).name
         python_path = tmp_path / relative_python
@@ -4652,12 +4654,12 @@ class TestPtyWebSocket:
         monkeypatch.setenv("HERMES_CWD", str(tmp_path))
         monkeypatch.setenv("HERMES_PYTHON", str(relative_python))
         monkeypatch.setattr(
-            main_mod,
+            main_tui_launch,
             "_make_tui_argv",
             lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
         )
 
-        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+        _argv, _cwd, env = _web_server_chat._resolve_chat_argv()
 
         assert env is not None
         assert env["HERMES_PYTHON"] == str(relative_python)
@@ -4762,12 +4764,12 @@ class TestPtyWebSocket:
                 managed.close()
                 finished.set()
 
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
+        monkeypatch.setattr(_web_server_chat, "_resolve_chat_argv", fake_resolve)
 
         async def run_cancel():
             self.ws_module.app.state.chat_argv_lock = asyncio.Lock()
             self.ws_module.app.state.chat_argv_scopes = set()
-            task = asyncio.create_task(self.ws_module._resolve_chat_argv_async())
+            task = asyncio.create_task(_web_server_chat._resolve_chat_argv_async())
             try:
                 assert await asyncio.to_thread(entered.wait, 3)
                 task.cancel()
@@ -4821,7 +4823,7 @@ class TestPtyWebSocket:
                 managed.close()
                 finished.set()
 
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
+        monkeypatch.setattr(_web_server_chat, "_resolve_chat_argv", fake_resolve)
 
         async def run_cancel():
             loop = asyncio.get_running_loop()
@@ -4830,7 +4832,7 @@ class TestPtyWebSocket:
             )
             self.ws_module.app.state.chat_argv_lock = asyncio.Lock()
             self.ws_module.app.state.chat_argv_scopes = set()
-            task = asyncio.create_task(self.ws_module._resolve_chat_argv_async())
+            task = asyncio.create_task(_web_server_chat._resolve_chat_argv_async())
             try:
                 deadline = loop.time() + 3
                 while not entered.is_set() and loop.time() < deadline:
@@ -4894,7 +4896,7 @@ class TestPtyWebSocket:
             captured["profile"] = profile
             return (["/bin/sh", "-c", "printf async-resolve-ok"], None, None)
 
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv_async", fake_resolve_async)
+        monkeypatch.setattr(_web_server_chat, "_resolve_chat_argv_async", fake_resolve_async)
 
         with self.client.websocket_connect(self._url(resume="sess-99")) as conn:
             try:

@@ -14,7 +14,9 @@ from pathlib import Path
 import pytest
 
 import hermes_cli.main as main_mod
+from hermes_cli import main_tui_launch as launch
 from hermes_cli import opentui_runtime as runtime
+from hermes_cli import update_cmd_deps
 
 
 TEST_IDENTITY = runtime.NodeIdentity(
@@ -39,7 +41,14 @@ def _isolate_runtime_state(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        main_mod, "_opentui_runtime_state_dir", lambda: tmp_path / "runtime-state"
+        launch, "_opentui_runtime_state_dir", lambda: tmp_path / "runtime-state"
+    )
+    monkeypatch.setattr(
+        launch,
+        "_run_opentui_build_command",
+        lambda *_args, **_kwargs: pytest.fail(
+            "packaging test must explicitly provide its simulated build runner"
+        ),
     )
 
 
@@ -471,7 +480,7 @@ class TestPairedNpm:
         monkeypatch.setattr(runtime.platform, "libc_ver", lambda: ("musl", "1.2"))
         env = {}
 
-        main_mod._apply_opentui_native_env(
+        launch._apply_opentui_native_env(
             ["/node-26", "--experimental-ffi", "dist/main.js"],
             tmp_path / "artifacts" / "seed" / "runtime",
             env,
@@ -628,11 +637,11 @@ class TestPackagedRuntimeCache:
         location = runtime.select_runtime_location(tmp_path, state_dir)
         assert location is not None and location.is_packaged
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_opentui_runtime_state_dir", lambda: state_dir)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_opentui_runtime_state_dir", lambda: state_dir)
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod,
-            "_run_with_idle_timeout",
+            launch,
+            "_run_opentui_build_command",
             lambda *_args, **_kwargs: pytest.fail(
                 "validated baked runtime must not contact npm or rebuild"
             ),
@@ -640,7 +649,7 @@ class TestPackagedRuntimeCache:
 
         _set_tree_modes(seed, directory=0o555, file=0o444)
         try:
-            argv, cwd = main_mod._make_opentui_argv(tui_dev=False)
+            argv, cwd = launch._make_opentui_argv(tui_dev=False)
         finally:
             _set_tree_modes(seed, directory=0o755, file=0o644)
 
@@ -680,10 +689,10 @@ class TestPackagedRuntimeCache:
         seed, _fixture_dependencies = _make_packaged_seed(tmp_path)
         state_dir = tmp_path / "profile-cache"
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_opentui_runtime_state_dir", lambda: state_dir)
-        monkeypatch.setattr(main_mod, "_node26_bin_or_none", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_opentui_runtime_state_dir", lambda: state_dir)
+        monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: "/node-26")
 
-        assert not main_mod._opentui_available()
+        assert not launch._opentui_available()
         assert not state_dir.exists()
         assert not (seed / "node_modules").exists()
 
@@ -695,10 +704,10 @@ class TestPackagedRuntimeCache:
         state_dir = tmp_path / "hermes-home" / "cache" / "opentui-runtime"
         seed_snapshot = runtime.refresh_digest(seed)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", site_root)
-        monkeypatch.setattr(main_mod, "_opentui_runtime_state_dir", lambda: state_dir)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_opentui_runtime_state_dir", lambda: state_dir)
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
@@ -716,10 +725,10 @@ class TestPackagedRuntimeCache:
                 _write(Path(command[-1]) / "main.js", "cached production bundle")
             return _ok(command)
 
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
         _set_tree_modes(seed, directory=0o555, file=0o444)
         try:
-            argv, cwd = main_mod._make_opentui_argv(tui_dev=False)
+            argv, cwd = launch._make_opentui_argv(tui_dev=False)
         finally:
             _set_tree_modes(seed, directory=0o755, file=0o644)
 
@@ -828,13 +837,13 @@ class TestPackagedRuntimeCache:
         assert not runtime.packaged_runtime_current(upgraded)
 
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
         def reject_completed(location, identity):
             inspection = runtime.inspect_runtime(
@@ -843,11 +852,11 @@ class TestPackagedRuntimeCache:
             return False, inspection, True
 
         monkeypatch.setattr(
-            main_mod, "_completed_opentui_refresh", reject_completed
+            launch, "_completed_opentui_refresh", reject_completed
         )
 
         with pytest.raises(SystemExit):
-            main_mod._make_opentui_argv(
+            launch._make_opentui_argv(
                 tui_dev=False, runtime_state_dir=state_dir
             )
 
@@ -890,15 +899,15 @@ class TestPackagedRuntimeCache:
         backup = location.runtime_dir.parent / ".runtime.previous-crashed"
         shutil.copytree(location.runtime_dir, backup)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_opentui_runtime_state_dir", lambda: state_dir)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_opentui_runtime_state_dir", lambda: state_dir)
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod,
-            "_run_with_idle_timeout",
+            launch,
+            "_run_opentui_build_command",
             lambda *_args, **_kwargs: pytest.fail("fresh runtime must not rebuild"),
         )
 
-        argv, cwd = main_mod._make_opentui_argv(tui_dev=False)
+        argv, cwd = launch._make_opentui_argv(tui_dev=False)
 
         assert seed == location.seed_dir
         assert cwd == location.runtime_dir
@@ -1255,14 +1264,14 @@ class TestMainIntegration:
     def test_fresh_launch_does_not_build(self, tmp_path, monkeypatch):
         app = _make_runtime(tmp_path)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod,
-            "_run_with_idle_timeout",
+            launch,
+            "_run_opentui_build_command",
             lambda *_args, **_kwargs: pytest.fail("fresh launch must not build"),
         )
 
-        argv, cwd = main_mod._make_opentui_argv(tui_dev=False)
+        argv, cwd = launch._make_opentui_argv(tui_dev=False)
 
         assert cwd == app
         assert argv[-1] == str(app / "dist" / "main.js")
@@ -1277,14 +1286,14 @@ class TestMainIntegration:
         shutil.copytree(app / "node_modules", node_backup)
         shutil.copytree(app / "dist", dist_backup)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod,
-            "_run_with_idle_timeout",
+            launch,
+            "_run_opentui_build_command",
             lambda *_args, **_kwargs: pytest.fail("fresh runtime must not rebuild"),
         )
 
-        argv, cwd = main_mod._make_opentui_argv(tui_dev=False)
+        argv, cwd = launch._make_opentui_argv(tui_dev=False)
 
         assert cwd == app
         assert argv[-1] == str(app / "dist" / "main.js")
@@ -1298,14 +1307,14 @@ class TestMainIntegration:
         staging = tmp_path / ".ui-opentui-update-crashed"
         _write(staging / "src" / "stale.ts", "abandoned")
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod,
-            "_run_with_idle_timeout",
+            launch,
+            "_run_opentui_build_command",
             lambda *_args, **_kwargs: pytest.fail("fresh runtime must not rebuild"),
         )
 
-        main_mod._make_opentui_argv(tui_dev=False)
+        launch._make_opentui_argv(tui_dev=False)
 
         assert not staging.exists()
 
@@ -1315,14 +1324,14 @@ class TestMainIntegration:
         app = _make_runtime(tmp_path, stamped=False)
         _prune_build_toolchain(app)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: pytest.fail("fresh pruned launch must stay offline"),
         )
 
-        argv, _cwd = main_mod._make_opentui_argv(tui_dev=False)
+        argv, _cwd = launch._make_opentui_argv(tui_dev=False)
 
         assert argv[-1] == str(app / "dist" / "main.js")
 
@@ -1332,9 +1341,9 @@ class TestMainIntegration:
         os.utime(app / "src" / "runtime" / "old.ts", (300, 300))
         calls = []
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
@@ -1347,9 +1356,9 @@ class TestMainIntegration:
                 _write(Path(command[-1]) / "main.js", "rebuilt")
             return _ok(command)
 
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
-        argv, _cwd = main_mod._make_opentui_argv(tui_dev=False)
+        argv, _cwd = launch._make_opentui_argv(tui_dev=False)
 
         assert "ci" in calls[0]
         assert argv[-1] == str(app / "dist" / "main.js")
@@ -1365,9 +1374,9 @@ class TestMainIntegration:
         shutil.rmtree(app / "node_modules" / native_package)
         calls = []
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
@@ -1383,9 +1392,9 @@ class TestMainIntegration:
                 _write(Path(command[-1]) / "main.js", "recovered")
             return _ok(command)
 
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
-        argv, _cwd = main_mod._make_opentui_argv(tui_dev=False)
+        argv, _cwd = launch._make_opentui_argv(tui_dev=False)
 
         assert "ci" in calls[0]
         assert argv[-1] == str(app / "dist" / "main.js")
@@ -1404,45 +1413,45 @@ class TestMainIntegration:
         assert package_name is not None
         shutil.rmtree(app / "node_modules" / package_name)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
-        monkeypatch.setattr(main_mod, "_node26_bin_or_none", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
         monkeypatch.setattr(
-            main_mod,
-            "_run_with_idle_timeout",
+            launch,
+            "_run_opentui_build_command",
             lambda command, **_kwargs: subprocess.CompletedProcess(
                 command, 1, stdout="", stderr="offline"
             ),
         )
 
-        assert not main_mod._opentui_available()
+        assert not launch._opentui_available()
         with pytest.raises(SystemExit):
-            main_mod._make_opentui_argv(tui_dev=False)
+            launch._make_opentui_argv(tui_dev=False)
         assert (app / "dist" / "main.js").read_text() == "old bundle"
 
     def test_source_build_failure_uses_prior_runtime(self, tmp_path, monkeypatch):
         app = _make_runtime(tmp_path)
         os.utime(app / "src" / "runtime" / "old.ts", (300, 300))
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
         monkeypatch.setattr(
-            main_mod,
-            "_run_with_idle_timeout",
+            launch,
+            "_run_opentui_build_command",
             lambda command, **_kwargs: subprocess.CompletedProcess(
                 command, 1, stdout="", stderr="compiler failed"
             ),
         )
 
-        argv, _cwd = main_mod._make_opentui_argv(tui_dev=False)
+        argv, _cwd = launch._make_opentui_argv(tui_dev=False)
 
         assert argv[-1] == str(app / "dist" / "main.js")
         assert (app / "dist" / "main.js").read_text() == "old bundle"
@@ -1453,22 +1462,22 @@ class TestMainIntegration:
         app = _make_runtime(tmp_path)
         (app / "dist" / "main.js").write_bytes(b"")
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
         monkeypatch.setattr(
-            main_mod,
-            "_run_with_idle_timeout",
+            launch,
+            "_run_opentui_build_command",
             lambda command, **_kwargs: subprocess.CompletedProcess(
                 command, 1, stdout="", stderr="compiler failed"
             ),
         )
 
         with pytest.raises(SystemExit):
-            main_mod._make_opentui_argv(tui_dev=False)
+            launch._make_opentui_argv(tui_dev=False)
 
         assert not runtime.bundle_payload_present(app)
 
@@ -1478,9 +1487,9 @@ class TestMainIntegration:
         app = _make_runtime(tmp_path)
         _change_dependency_lock(app)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
@@ -1499,12 +1508,12 @@ class TestMainIntegration:
             )
             return False, inspection, True
 
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
         monkeypatch.setattr(
-            main_mod, "_completed_opentui_refresh", reject_completed
+            launch, "_completed_opentui_refresh", reject_completed
         )
 
-        argv, cwd = main_mod._make_opentui_argv(tui_dev=False)
+        argv, cwd = launch._make_opentui_argv(tui_dev=False)
 
         assert cwd == app
         assert argv[-1] == str(app / "dist" / "main.js")
@@ -1525,9 +1534,9 @@ class TestMainIntegration:
         selected_node = ["/node-a"]
         attempts = []
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: selected_node[0])
+        monkeypatch.setattr(launch, "_node26_bin", lambda: selected_node[0])
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda node: [node, "/npm-cli.js"],
         )
@@ -1538,18 +1547,18 @@ class TestMainIntegration:
                 command, 1, stdout="", stderr="registry offline"
             )
 
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
-        main_mod._make_opentui_argv(tui_dev=False)
-        main_mod._make_opentui_argv(tui_dev=False)
+        launch._make_opentui_argv(tui_dev=False)
+        launch._make_opentui_argv(tui_dev=False)
         assert len(attempts) == 1
 
         _write(app / "src" / "runtime" / "old.ts", "new digest")
-        main_mod._make_opentui_argv(tui_dev=False)
+        launch._make_opentui_argv(tui_dev=False)
         assert len(attempts) == 2
 
         selected_node[0] = "/node-b"
-        main_mod._make_opentui_argv(tui_dev=False)
+        launch._make_opentui_argv(tui_dev=False)
         assert len(attempts) == 3
 
     def test_force_and_explicit_update_bypass_failed_refresh_backoff(
@@ -1559,11 +1568,11 @@ class TestMainIntegration:
         _change_dependency_lock(app)
         attempts = []
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
-        monkeypatch.setattr(main_mod, "_node26_bin_or_none", lambda: "/node-26")
-        monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: False)
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_is_termux_startup_environment", lambda: False)
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda node: [node, "/npm-cli.js"],
         )
@@ -1574,18 +1583,18 @@ class TestMainIntegration:
                 command, 1, stdout="", stderr="registry offline"
             )
 
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
-        main_mod._make_opentui_argv(tui_dev=False)
-        main_mod._make_opentui_argv(tui_dev=False)
+        launch._make_opentui_argv(tui_dev=False)
+        launch._make_opentui_argv(tui_dev=False)
         assert len(attempts) == 1
 
         monkeypatch.setenv("HERMES_TUI_FORCE_BUILD", "1")
-        main_mod._make_opentui_argv(tui_dev=False)
+        launch._make_opentui_argv(tui_dev=False)
         assert len(attempts) == 2
 
         monkeypatch.delenv("HERMES_TUI_FORCE_BUILD")
-        assert not main_mod._update_opentui_package()
+        assert not launch._update_opentui_package()
         assert len(attempts) == 3
 
     def test_lock_refresh_failure_uses_coherent_prior_runtime(
@@ -1594,21 +1603,21 @@ class TestMainIntegration:
         app = _make_runtime(tmp_path)
         _change_dependency_lock(app)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_node26_bin", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_node26_bin", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
         monkeypatch.setattr(
-            main_mod,
-            "_run_with_idle_timeout",
+            launch,
+            "_run_opentui_build_command",
             lambda command, **_kwargs: subprocess.CompletedProcess(
                 command, 1, stdout="", stderr="registry offline"
             ),
         )
 
-        argv, _cwd = main_mod._make_opentui_argv(tui_dev=False)
+        argv, _cwd = launch._make_opentui_argv(tui_dev=False)
 
         assert argv[-1] == str(app / "dist" / "main.js")
         assert (app / "dist" / "main.js").read_text() == "old bundle"
@@ -1623,10 +1632,10 @@ class TestMainIntegration:
         _change_dependency_lock(app)
         calls = []
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: False)
-        monkeypatch.setattr(main_mod, "_node26_bin_or_none", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_is_termux_startup_environment", lambda: False)
+        monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
@@ -1641,9 +1650,9 @@ class TestMainIntegration:
                 _write(Path(command[-1]) / "main.js", "updated")
             return _ok(command)
 
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
-        assert main_mod._update_opentui_package()
+        assert launch._update_opentui_package()
         install_command, install_kwargs = calls[0]
         assert "ci" in install_command
         assert "--include=dev" in install_command
@@ -1659,10 +1668,10 @@ class TestMainIntegration:
         app = _make_runtime(tmp_path)
         _change_dependency_lock(app)
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: False)
-        monkeypatch.setattr(main_mod, "_node26_bin_or_none", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_is_termux_startup_environment", lambda: False)
+        monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
@@ -1681,12 +1690,12 @@ class TestMainIntegration:
             )
             return False, inspection, True
 
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
         monkeypatch.setattr(
-            main_mod, "_completed_opentui_refresh", reject_completed
+            launch, "_completed_opentui_refresh", reject_completed
         )
 
-        assert not main_mod._update_opentui_package()
+        assert not launch._update_opentui_package()
         assert (app / "dist" / "main.js").read_text() == "old bundle"
         assert (app / "node_modules" / "old-runtime.txt").read_text() == (
             "old dependencies"
@@ -1703,10 +1712,10 @@ class TestMainIntegration:
         os.utime(app / "src" / "runtime" / "old.ts", (300, 300))
         calls = []
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: False)
-        monkeypatch.setattr(main_mod, "_node26_bin_or_none", lambda: "/node-26")
+        monkeypatch.setattr(launch, "_is_termux_startup_environment", lambda: False)
+        monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: "/node-26")
         monkeypatch.setattr(
-            main_mod._opentui_runtime,
+            launch._opentui_runtime,
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
@@ -1716,9 +1725,9 @@ class TestMainIntegration:
             _write(Path(command[-1]) / "main.js", "updated source bundle")
             return _ok(command)
 
-        monkeypatch.setattr(main_mod, "_run_with_idle_timeout", runner)
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
-        assert main_mod._update_opentui_package()
+        assert launch._update_opentui_package()
         assert len(calls) == 1
         assert "run" in calls[0]
         assert "ci" not in calls[0]
@@ -1727,14 +1736,14 @@ class TestMainIntegration:
     def test_update_wrapper_always_includes_standalone_package(self, monkeypatch):
         calls = []
         monkeypatch.setattr(
-            main_mod,
+            update_cmd_deps,
             "_update_workspace_node_dependencies",
-            lambda: calls.append("workspaces"),
+            lambda: calls.append("workspaces") or [],
         )
         monkeypatch.setattr(
-            main_mod, "_update_opentui_package", lambda: calls.append("opentui")
+            launch, "_update_opentui_package", lambda: calls.append("opentui") or True
         )
 
-        main_mod._update_node_dependencies()
+        assert update_cmd_deps._update_node_dependencies() == []
 
         assert calls == ["workspaces", "opentui"]

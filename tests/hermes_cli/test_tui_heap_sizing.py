@@ -11,7 +11,8 @@ import builtins
 import io
 from unittest import mock
 
-import hermes_cli.main as m
+import hermes_cli.main as main_mod
+from hermes_cli import main_tui_launch as m
 from hermes_cli import main_tui_launch
 
 V2 = "/sys/fs/cgroup/memory.max"
@@ -109,7 +110,7 @@ class TestExposeGcOnOpenTuiArgv:
         (app_dir / "node_modules" / "@opentui").mkdir(parents=True)
         (app_dir / "dist").mkdir()
         (app_dir / "dist" / "main.js").write_text("// built")
-        with mock.patch.object(m, "PROJECT_ROOT", tmp_path), \
+        with mock.patch.object(main_mod, "PROJECT_ROOT", tmp_path), \
              mock.patch.object(m, "_node26_bin", return_value="/usr/bin/node"), \
              mock.patch.object(
                  m,
