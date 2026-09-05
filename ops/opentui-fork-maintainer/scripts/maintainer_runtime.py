@@ -460,7 +460,8 @@ def request_status(state_dir: Path, request_id: str) -> dict[str, Any]:
             outcome = json.loads(safe.read_text(encoding="utf-8"))
             if not isinstance(outcome, dict):
                 raise ControlError("run outcome must be an object")
-            for key in ("status", "stage", "published", "candidate_sha", "needs_finalization", "request_retired"):
+            for key in ("status", "stage", "published", "candidate_sha", "needs_finalization",
+                        "request_retired", "retirement_undecided"):
                 if key in outcome:
                     entry[key] = outcome[key]
         runs.append(entry)
@@ -597,7 +598,7 @@ def _read_bound_request(path: Path, root: Path, *, label: str) -> dict[str, Any]
     safe_path = _evidence_path(str(path), root, label=label)
     try:
         value = json.loads(safe_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         raise ControlError(f"{label} is invalid: {type(exc).__name__}") from exc
     return _validate_request(value)
 
@@ -659,7 +660,7 @@ def _captured_run_context(state_dir: Path, evidence_root: Path, token: str) -> d
     context_path = evidence_root / "run-context.json"
     try:
         context = json.loads(context_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         raise ControlError("captured run context is missing or invalid") from exc
     expected_context = {
         "schema_version",
@@ -3420,12 +3421,19 @@ def finalize_failure(
             )
     claimed = evidence_root / "request.claimed.json"
     inflight = state_dir / "run-request.inflight.json"
-    request_recovered = request_retired = False
+    request_recovered = request_retired = retirement_undecided = False
     with _request_lock(state_dir):
         if claimed.exists():
+            if (evidence_root / "request.consumed.json").exists():
+                raise ControlError("a consumed request cannot be finalized as failed")
             claimed_value = _read_bound_request(claimed, evidence_root, label="claimed request")
             stale = evidence_root / "request.stale.json"
-            if not inflight.exists() and stale.exists():
+            queued = state_dir / "run-request.json"
+            if not inflight.exists() and queued.exists():
+                if _read_bound_request(queued, state_dir, label="queued request") != claimed_value:
+                    raise ControlError("queued request does not match this failed run")
+                request_recovered = True
+            elif not inflight.exists() and stale.exists():
                 if _read_bound_request(stale, evidence_root, label="stale request") != claimed_value:
                     raise ControlError("stale request does not match this failed run")
                 request_retired = True
@@ -3435,9 +3443,17 @@ def finalize_failure(
                 if _read_bound_request(inflight, state_dir, label="in-flight request") != claimed_value:
                     raise ControlError("failed run claim does not match the in-flight request")
                 if claimed_value["mode"] == "repair":
-                    context = _captured_run_context(
-                        state_dir, evidence_root, _lease_value(state_dir)["token"])
-                    request_retired = claimed_value["base_sha"] != context["base_sha"]
+                    try:
+                        context_token = _lease_value(state_dir).get("token")
+                        if not isinstance(context_token, str):
+                            raise ControlError("run lease token is invalid")
+                        context = _captured_run_context(
+                            state_dir, evidence_root, context_token)
+                        request_retired = claimed_value["base_sha"] != context["base_sha"]
+                    except ControlError:
+                        # Without trustworthy context, preserve authorization
+                        # unchanged for a new run; never guess that it is stale.
+                        retirement_undecided = True
                 if request_retired:
                     os.replace(inflight, stale)
                 else:
@@ -3456,6 +3472,7 @@ def finalize_failure(
             "needs_finalization": False,
             "request_recovered": request_recovered,
             "request_retired": request_retired,
+            "retirement_undecided": retirement_undecided,
         },
     )
 

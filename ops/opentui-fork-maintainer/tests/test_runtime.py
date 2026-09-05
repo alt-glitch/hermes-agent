@@ -581,9 +581,10 @@ def test_valid_repair_failure_remains_retryable(tmp_path):
     state, evidence = tmp_path / "state", tmp_path / "evidence"
     write_live_lease(state)
     value = claim_repair(state, evidence, "a" * 40, "b" * 40)
-    result = runtime.finalize_failure(state, evidence, stage="gate", reason_code="gate-failed")
-    assert result["request_recovered"] is True
-    assert result["request_retired"] is False
+    for _ in range(2):  # re-queue-before-outcome interruption is also recoverable
+        result = runtime.finalize_failure(state, evidence, stage="gate", reason_code="gate-failed")
+        assert result["request_recovered"] is True
+        assert result["request_retired"] is False
     assert json.loads((state / "run-request.json").read_text()) == value
 
 
@@ -593,10 +594,31 @@ def test_untrusted_context_cannot_retire_a_repair(tmp_path):
     value = claim_repair(state, evidence, "a" * 40, "b" * 40)
     path = evidence / "run-context.json"
     path.write_text(json.dumps(json.loads(path.read_text()) | {"base_sha": "c" * 40}))
-    with pytest.raises(runtime.ControlError, match="does not match the active lease"):
-        runtime.finalize_failure(state, evidence, stage="gate", reason_code="gate-failed")
-    assert json.loads((state / "run-request.inflight.json").read_text()) == value
+    result = runtime.finalize_failure(state, evidence, stage="gate", reason_code="gate-failed")
+    assert result["retirement_undecided"] is True
+    assert result["request_recovered"] is True
+    assert json.loads((state / "run-request.json").read_text()) == value
     assert not (evidence / "request.stale.json").exists()
+
+
+def test_non_utf8_queue_is_reported_without_changing_it(tmp_path):
+    state = tmp_path / "state"
+    submitted = runtime.submit_request(state, repair_request())
+    path = state / "run-request.json"
+    path.write_bytes(b"\xff")
+    assert runtime.request_status(state, submitted["request_id"])["queue_errors"] == [path.name]
+    assert path.read_bytes() == b"\xff"
+
+
+def test_consumed_repair_cannot_be_rerecorded_as_a_failed_retirement(tmp_path):
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    value = claim_repair(state, evidence, "a" * 40, "b" * 40)
+    runtime.consume_request(state, evidence)
+    (evidence / "request.stale.json").write_text(json.dumps(value))
+    with pytest.raises(runtime.ControlError, match="consumed request"):
+        runtime.finalize_failure(state, evidence, stage="gate", reason_code="gate-failed")
+    assert not (evidence / "run-outcome.json").exists()
 
 
 def test_repair_rejects_a_candidate_missing_the_requested_source(tmp_path, monkeypatch):
