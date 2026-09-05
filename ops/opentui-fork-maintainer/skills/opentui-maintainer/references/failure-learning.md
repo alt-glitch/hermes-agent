@@ -79,3 +79,28 @@ only the Windows scanner: both execute in the same remote CI job.
 - The approved Gemini route was tested with a new sanitized recording and
   returned `VERDICT: PASS` through OpenRouter. It does not authorize sending
   user conversations, old recordings or default-profile credentials.
+
+## Extraction-preservation audit (2026-09-05)
+
+The first broad fork audit found five missing RPC registrations and 147 failing
+tests after upstream's module extraction, despite narrower green gates. Inventory
+actual client calls and backend registrations, then map old behavior to its new
+owner. Module counts and successful Git ancestry do not establish parity.
+
+- Real ownership fences require realistic registered sessions and temporary
+  leases in tests. Update stale fixtures without bypassing the fence or dropping
+  assertions. Run unrelated Python files in separate processes to avoid leaked
+  import mocks; inspect actual executed counts and parser errors, not only the
+  runner's estimated total or exit status.
+- A dispatcher returning normally can still refuse a turn. Propagate its
+  explicit result before acknowledging notifications, consuming loop claims,
+  or discarding queued user correlations. Test refusal and retry, not only the
+  successful path. A rejected original RPC and a concurrently accepted queued
+  prompt have different acknowledgment obligations.
+- Shutdown cannot infer "never started" from a missing fire-owner record:
+  external handoff has such a window. Track the existing scheduler's gated
+  dispatch explicitly and serialize cancellation with worker entry. Release only
+  captured claim identities; never refresh a job and adopt another run's token.
+- Review diffs must include changed facade signatures and unchanged contract
+  context. Refute missing-context findings with source, not assertion changes.
+  Targeted title events also avoid racing a full stale session-state snapshot.
