@@ -100,6 +100,11 @@ def _normalize_task_list(
             return None, f"Task {i} must be an object, got {type(task).__name__}."
         if not task.get("goal", "").strip():
             return None, f"Task {i} is missing a 'goal'."
+        if "task_label" in task:
+            label = task["task_label"]
+            if (not isinstance(label, str) or not label.strip() or len(label) > 120
+                    or any(ord(char) < 32 or 127 <= ord(char) <= 159 or char in "\u2028\u2029" for char in label)):
+                return None, f"Task {i} task_label must be one non-empty line of at most 120 characters."
     # The single-goal form is exempt from the batch gate (short goals are valid there).
     batch_error = _validate_batch_tasks(task_list) if isinstance(tasks, list) else None
     return (None, batch_error) if batch_error else (task_list, None)

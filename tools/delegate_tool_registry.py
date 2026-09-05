@@ -34,7 +34,8 @@ def get_subagent_attribution(task_id: Optional[str]) -> Optional[Dict[str, Any]]
         record = _active_subagents.get(task_id) or _recent_subagents.get(task_id)
     if record is None:
         return None
-    return {"subagent_id": task_id, "goal": record.get("goal"), "delegation_id": record.get("delegation_id")}
+    return {"subagent_id": task_id, "goal": record.get("goal"), "delegation_id": record.get("delegation_id"),
+            **({"task_label": record["task_label"]} if "task_label" in record else {})}
 
 def set_spawn_paused(paused: bool) -> bool:
     """Globally block/unblock NEW delegate_task spawns (active children keep running). Returns the new state."""
@@ -66,6 +67,8 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
         if not sid:
             return
         _recent_subagents[sid] = {k: record.get(k) for k in ("goal", "delegation_id", "owner_agent_session_id")}
+        if "task_label" in record:
+            _recent_subagents[sid]["task_label"] = record["task_label"]
         while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
             _recent_subagents.pop(next(iter(_recent_subagents)), None)
 
@@ -238,6 +241,7 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
             "subagent_id": r.get("subagent_id"),
             "parent_id": r.get("parent_id"),
             "goal": r.get("goal"),
+            **({"task_label": r["task_label"]} if "task_label" in r else {}),
             "model": r.get("model"),
             "status": r.get("status"),
             "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,

@@ -369,6 +369,7 @@ _SUBAGENT_FIELDS = (
     ("files_read", bool, _str_list), ("files_written", bool, _str_list), ("output_tail", bool, list),
     ("tool_name", bool, str), ("text", bool, str), ("status", bool, str), ("summary", bool, str),
     ("duration_seconds", _not_none, float),
+    ("started_at", _not_none, float), ("task_label", bool, str),
 )
 
 
@@ -383,10 +384,7 @@ def _progress_subagent(sid, name, preview, kw, event_type):
     if preview and event_type == "subagent.tool":
         payload["tool_preview"] = str(preview)
         payload["text"] = str(preview)
-    # subagent.text is the child's per-token reply, relayed solely to feed a watch window's live mirror
-    # (keyed off the child sid); on the parent it's hundreds of ignored frames, so skip it.
-    if event_type != "subagent.text":
-        _emit(event_type, sid, payload)
+    _emit(event_type, sid, payload)
     _mirror_subagent_to_child(event_type, payload)
 
 
@@ -404,10 +402,11 @@ def _on_tool_progress(
     sid: str, event_type: str, name: str | None = None, preview: str | None = None,
     _args: dict | None = None, **_kwargs,
 ):
-    if not _tool_progress_enabled(sid) or (event_type == "tool.started" and name):
-        return
+    # Branch state and messages are application data, independent of tool-progress chrome.
     if event_type.startswith("subagent."):
         return _progress_subagent(sid, name, preview, _kwargs, event_type)
+    if not _tool_progress_enabled(sid) or (event_type == "tool.started" and name):
+        return
     handler, requires = _PROGRESS_HANDLERS.get(event_type, (None, None))
     if handler is not None and (requires is None or {"name": name, "preview": preview}[requires]):
         handler(sid, name, preview, _kwargs)

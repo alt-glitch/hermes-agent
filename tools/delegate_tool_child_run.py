@@ -290,6 +290,11 @@ def _register_child(
     if owner_session_id and (owner_transport is None or owner_session_record is None):
         owner_transport, owner_session_record = _capture_gateway_steer_authority(owner_session_id)
     _raw_depth = getattr(child, "_delegate_depth", 1)
+    started_at = time.time()
+    task_label = _str_or_none(getattr(child, "_delegate_task_label", None))
+    identity_ref = getattr(child, "_progress_identity_ref", None)
+    if isinstance(identity_ref, dict):
+        identity_ref["started_at"] = started_at
     _register_subagent({
         "subagent_id": _subagent_id,
         "parent_id": _str_or_none(getattr(child, "_parent_subagent_id", None)),
@@ -297,7 +302,8 @@ def _register_child(
         "goal": goal,
         "delegation_id": _str_or_none(getattr(child, "_delegation_id", None)),
         "model": _str_or_none(getattr(child, "model", None)),
-        "started_at": time.time(), "status": "running", "tool_count": 0, "agent": child,
+        "started_at": started_at, "status": "running", "tool_count": 0, "agent": child,
+        **({"task_label": task_label} if task_label is not None else {}),
         # Owning conversation's durable session id (same lineage completion delivery routes by), sourced from the
         # child's stamp so it survives a parent_agent rebuild between dispatch and run; used for list/steer/stop
         # ownership when the weakref chain breaks.
@@ -570,13 +576,15 @@ class _ChildRun:
         return round(time.monotonic() - self.child_start, 2)
 
     def relay_text(self, delta: str) -> None:
-        """Stream callback forwarding the child's reply text up the progress relay so gateway watch windows mirror it
-        live (subagent.text → message.delta). Inert under CLI/TUI: their progress handlers ignore non-tool events."""
+        """Forward supplied reply deltas to the parent tree and child-session live mirror."""
         if delta:
             _safe_progress(self.child_progress_cb, "subagent.text", preview=delta)
 
     def attach_worktree(self, entry_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Inspect + prune the child worktree, reporting into the entry (no-op without isolation)."""
+        task_label = _str_or_none(getattr(self.child, "_delegate_task_label", None))
+        if task_label is not None:
+            entry_dict["task_label"] = task_label
         info = self.worktree_info
         if info is None:
             return entry_dict

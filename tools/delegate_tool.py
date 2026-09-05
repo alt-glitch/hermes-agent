@@ -171,6 +171,7 @@ def _build_child_agent(
     override_acp_args: Optional[List[str]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    task_label: Optional[str] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -201,6 +202,8 @@ def _build_child_agent(
     # Shared ref: session_id once the child exists, delegation_id once
     # delegate_task stamps it — both ride on every relayed event.
     child_session_ref: Dict[str, Any] = {}
+    if task_label is not None:
+        child_session_ref["task_label"] = task_label
     child_progress_cb = _build_child_progress_callback(
         task_index, goal, parent_agent, task_count, subagent_id=subagent_id, parent_id=parent_subagent_id,
         depth=max(0, child_depth - 1),  # 0 = first-level child for the UI
@@ -231,6 +234,10 @@ def _build_child_agent(
                     (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
                     if child_progress_cb else None
                 ),
+                reasoning_callback=(
+                    (lambda text: _safe_progress(child_progress_cb, "subagent.reasoning", preview=text) if text else None)
+                    if child_progress_cb else None
+                ),
                 session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
@@ -250,6 +257,8 @@ def _build_child_agent(
     # reference), and no parent teardown can close it out from under a background child (#81267).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     child._progress_identity_ref = child_session_ref
+    if task_label is not None:
+        child._delegate_task_label = task_label
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     _apply_child_compression_cap(child, delegation_cfg)
@@ -374,6 +383,7 @@ def _build_children(
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                **({"task_label": t["task_label"]} if "task_label" in t else {}),
             )
         except ValueError as exc:
             return [], str(exc)
@@ -589,6 +599,10 @@ DELEGATE_TASK_SCHEMA = {
                             "string",
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
+                        ),
+                        "task_label": _p(
+                            "string", "Optional short display label: one phrase for this task (not progress or reasoning).",
+                            minLength=1, maxLength=120,
                         ),
                         "output_schema": _p(
                             "object",

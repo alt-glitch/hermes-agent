@@ -19,7 +19,7 @@ _child_mirrors_lock = threading.Lock()
 _active_child_runs: dict[str, float] = {}
 # Anything quiet this long lost its completion event — don't pin "running".
 _CHILD_RUN_STALE_S = 3600.0
-_CHILD_DELTA_EVENTS = {"subagent.thinking": "reasoning.delta", "subagent.text": "message.delta",
+_CHILD_DELTA_EVENTS = {"subagent.thinking": "reasoning.delta", "subagent.reasoning": "reasoning.delta", "subagent.text": "message.delta",
                        "subagent.start": "message.delta"}
 
 

@@ -395,6 +395,10 @@ def _finalize_child_results(
 ) -> None:
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
+        for entry in results:
+            index = entry.get("task_index", -1)
+            if isinstance(index, int) and 0 <= index < len(task_list) and "task_label" in task_list[index]:
+                entry["task_label"] = task_list[index]["task_label"]
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
         _notify_memory_manager(results, task_list, child_by_index, parent_agent)

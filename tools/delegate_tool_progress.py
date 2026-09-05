@@ -289,6 +289,9 @@ class _ChildProgressRelay:
         for src, dst in (("session_id", "child_session_id"), ("delegation_id", "delegation_id")):
             if self.session_ref.get(src):
                 kw[dst] = str(self.session_ref[src])
+        for key in ("task_label", "started_at"):
+            if self.session_ref.get(key) is not None:
+                kw[key] = self.session_ref[key]
         kw["tool_count"] = self.tool_count
         return kw
 
@@ -327,9 +330,7 @@ class _ChildProgressRelay:
         self._relay("subagent.complete", preview=preview, **kwargs)
 
     def _on_text(self, tool_name, preview, args, kwargs):
-        # Streamed child reply text, relayed verbatim for gateway watch windows;
-        # inert on CLI/TUI (their progress handlers ignore non-tool events).
-        self._relay("subagent.text", preview=preview)
+        self._relay("subagent.text", preview=preview, **kwargs)
 
     # ── DelegateEvent handlers ──
     def _on_thinking(self, tool_name, preview, args, kwargs):
@@ -367,6 +368,14 @@ class _ChildProgressRelay:
                 self._flush()
 
     def __call__(self, event_type, tool_name: str = None, preview: str = None, args=None, **kwargs):
+        # A grandchild's qualified event is already attributed. Adding this relay's
+        # defaults would borrow its parent's label/session when optional fields are absent.
+        if isinstance(event_type, str) and event_type.startswith("subagent.") and kwargs.get("subagent_id"):
+            _safe_progress(self.parent_cb, event_type, tool_name, preview, args, **kwargs)
+            return
+        if event_type in ("subagent.spawn_requested", "subagent.reasoning"):
+            self._relay(event_type, tool_name, preview, args, **kwargs)
+            return
         key = _normalize_event(event_type)
         method = None if key is None else _EVENT_HANDLERS.get(key, "_on_tool_started")
         if method is not None:
