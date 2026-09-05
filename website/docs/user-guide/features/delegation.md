@@ -349,6 +349,30 @@ The TUI ships a `/agents` overlay (alias `/tasks`) that turns recursive `delegat
 
 The classic CLI just prints `/agents` as a text summary; the TUI is where the overlay shines. See [TUI — Slash commands](/user-guide/tui#slash-commands).
 
+### Inspecting agents in OpenTUI
+
+Wide terminals show the parent/child tree beside the selected agent's messages.
+On narrow terminals, press Enter to open an agent and Esc to return to the tree.
+The list uses the available height; mouse wheel and ↑/↓ move through it.
+Named timeline lanes show relative starts and run durations, not estimated
+completion percentages. Finished agents stop extending their bars; unavailable
+historical timing is labeled unknown.
+
+Messages render as Markdown. Supplied model reasoning is collapsed separately
+from activity previews; tools, outputs, budget and other diagnostics also start
+collapsed. In the reader, scroll up to pause following and press **Shift+L** to
+return to the latest content. Press `r` for reasoning, `t` for tools, or click a
+section heading. Tab switches keyboard control between tree and reader on wide
+terminals. `[` and `]` navigate retained turns; replay disables live controls.
+Older retained text can be truncated to bound memory, with an explicit notice.
+Old snapshots cannot recover messages that were never recorded.
+
+The spawning agent can optionally supply `tasks[].task_label`, a single phrase
+of at most 120 characters, for example `"Audit dependency versions"`. It changes
+only the display label: the full `goal` remains available under Details and is
+still the child's instruction. Omit it to keep the existing goal-based label;
+a one-entry `tasks` array supports a labeled single task.
+
 On the classic CLI and every gateway platform (Telegram, Discord, Slack, ...),
 `/agents` also lists **background delegations with live per-child activity**,
 sampled directly from each running child:

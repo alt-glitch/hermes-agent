@@ -36,3 +36,14 @@ frames, plus a separate isolated real-Hermes callback run. Label those proofs
 separately: a synthetic renderer fixture does not prove model/provider delivery;
 a successful backend run does not prove the view painted. Retain exact commands,
 exit codes, source SHA and recordings, then run check/build and independent review.
+
+The checked-in `ui-opentui/scripts/agents-demo.tsx` is a credential-free native
+fixture, not a second implementation. From `ui-opentui`, build with
+`node scripts/build.mjs scripts/agents-demo.tsx dist/agents-demo`, then launch
+`node --experimental-ffi --no-warnings dist/agents-demo/agents-demo.js` under
+termctrl's OpenTUI host. Keep generated bundles under `dist/` so the normal
+typed lint pass never inspects generated JavaScript. Keys: `2` appends real
+store events, `4` adds forty rows, `3` completes the fixture and opens replay.
+Use `termctrl resize <name> --cols 80 --rows 24`, not positional dimensions.
+Compare message lines when testing a paused reader: the scrollbar thumb may
+change as the retained document grows without moving the reading position.

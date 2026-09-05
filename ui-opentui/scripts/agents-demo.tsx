@@ -85,7 +85,7 @@ function Fixture() {
       })
     }
     if (key.name === '3') {
-      for (const id of ['lead', 'child']) {
+      for (const id of store.state.subagents.filter(agent => agent.status === 'running').map(agent => agent.id)) {
         const agent = store.state.subagents.find(item => item.id === id)
         const summary = agent?.trace?.filter(entry => entry.kind === 'reply').at(-1)?.text ?? 'Complete'
         store.apply({
