@@ -826,6 +826,7 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
     floor_seconds = _inflight_min_allowance_minutes() * 60.0
     now = time.time()
     stale: list = []
+    cancelled_dispatches = {}
     from cron.executions import _TERMINAL_STATES as _terminal_states
 
     _latest = _latest_executions_for_releasable_claims()
@@ -871,13 +872,34 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             pending = _gated_dispatches.pop(job_id, None)
             if pending is not None:
                 pending.cancelled.set()
-                pending.start_gate.set()
+                cancelled_dispatches[job_id] = pending
             _forced_release_count += 1
             stale.append((job_id, age, allowance, fut, reason))
 
+    for job_id, pending in cancelled_dispatches.items():
+        _finish_cancelled_dispatch(job_id, pending, "stale in-flight registration")
     for job_id, age, allowance, fut, _reason in stale:
         _record_stale_release(by_id.get(job_id) or {}, job_id, age, allowance, fut, _reason)
     return [s[0] for s in stale]
+
+
+def _finish_cancelled_dispatch(job_id: str, pending: _GatedDispatch, reason: str) -> None:
+    """Close a proven-unstarted dispatch before waking its cancelled worker."""
+    try:
+        with use_cron_store(pending.profile_home):
+            if pending.run_token:
+                try:
+                    clear_run_claim(job_id, expected_token=pending.run_token)
+                except Exception:
+                    logger.warning("Failed clearing cancelled cron claim %s", job_id, exc_info=True)
+            if pending.execution_id:
+                _finish_execution_best_effort(
+                    pending.execution_id, success=False,
+                    error=f"Cancelled before execution started: {reason}")
+    except Exception:
+        logger.warning("Failed clearing cancelled cron dispatch %s", job_id, exc_info=True)
+    finally:
+        pending.start_gate.set()
 
 
 def mark_running_jobs_interrupted(
@@ -918,21 +940,7 @@ def mark_running_jobs_interrupted(
         run_claim_tokens = dict(_running_run_claim_tokens)
     marked = []
     for job_id, pending in cancelled_dispatches.items():
-        try:
-            with use_cron_store(pending.profile_home):
-                if pending.run_token:
-                    try:
-                        clear_run_claim(job_id, expected_token=pending.run_token)
-                    except Exception:
-                        logger.warning("Failed clearing cancelled cron claim %s", job_id, exc_info=True)
-                if pending.execution_id:
-                    _finish_execution_best_effort(
-                        pending.execution_id, success=False,
-                        error=f"Cancelled before execution started: {reason}")
-        except Exception:
-            logger.warning("Failed clearing cancelled cron dispatch %s", job_id, exc_info=True)
-        finally:
-            pending.start_gate.set()
+        _finish_cancelled_dispatch(job_id, pending, reason)
         marked.append(job_id)
     for _token, job_id, fire_owner, profile_home in active_fires:
         if not fire_owner:
@@ -2853,10 +2861,19 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
         error="Interrupted by gateway shutdown before terminal completion.")
 
 
+def _finite_recurring_job(job: dict) -> bool:
+    limit = (job.get("repeat") or {}).get("times")
+    return (isinstance(job.get("schedule"), dict)
+            and job["schedule"].get("kind") in {"cron", "interval"}
+            and limit is not None and limit > 0)
+
+
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
     mark_kwargs = {"delivery_error": d.delivery_error}
+    if _finite_recurring_job(job):
+        mark_kwargs["expected_execution_id"] = execution_id
     run_claim = job.get("run_claim")
     run_token = run_claim.get("token") if isinstance(run_claim, dict) else None
     if run_token:
@@ -2946,13 +2963,17 @@ def _run_one_job_body(
     _scope_token = None
     _terminal_scope_token = None
     try:
-        # Commit a finite one-shot's dispatch BEFORE its side effect so a tick dying mid-run cannot
-        # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
-        # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
-        # fire_due) get at-most-times semantics. See #38758.
-        if not claim_dispatch(job["id"]):
+        # Reserve finite attempts before side effects, including manual and external worker paths.
+        # Win the recurring execution CAS first: a duplicate invocation must not spend another slot.
+        dispatch_kwargs = {}
+        external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
+        if _finite_recurring_job(job):
+            if not external_owner and mark_execution_running(execution_id) is None:
+                return True
+            dispatch_kwargs = {"execution_id": execution_id, "expected_fire_owner": fire_owner}
+        if not claim_dispatch(job["id"], **dispatch_kwargs):
             logger.info(
-                "Job '%s': one-shot dispatch limit reached — skipping",
+                "Job '%s': dispatch claim rejected — skipping",
                 job.get("name", job["id"]))
             finish_execution(
                 execution_id, success=False,
@@ -2962,8 +2983,7 @@ def _run_one_job_body(
         # Claimed durably before dispatch; becomes running only right before the actual run.
         # Detached workers transition to running while adopting; in-process paths must win the
         # claimed->running CAS here before any user script or agent side effect may begin.
-        external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
-        if not external_owner and mark_execution_running(execution_id) is None:
+        if not dispatch_kwargs and not external_owner and mark_execution_running(execution_id) is None:
             logger.warning("Cron job %s lost execution ownership before start; skipping", job["id"])
             return True
 
@@ -3089,6 +3109,8 @@ def _run_one_job_body(
         try:
             if not _consume_interrupted_flag(job["id"], execution_token):
                 mark_kwargs = {}
+                if _finite_recurring_job(job):
+                    mark_kwargs["expected_execution_id"] = execution_id
                 if fence.run_token:
                     mark_kwargs["expected_run_claim_token"] = fence.run_token
                 if fire_owner is not None:
@@ -3768,8 +3790,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
             pending.execution_id = execution["id"]
             cancelled = pending.cancelled.is_set()
         if cancelled:
-            _finish_execution_best_effort(
-                execution["id"], success=False, error="Cancelled before execution started: shutdown")
+            _finish_cancelled_dispatch(job_id, pending, "dispatch cancelled")
             release_running_job(job_id)
             return None
     except Exception as execution_err:

@@ -2255,7 +2255,7 @@ def _record_run_outcome(
         job["run_claim"] = None
 
 
-def _advance_after_run(job: Dict[str, Any], now: str) -> None:
+def _advance_after_run(job: Dict[str, Any], now: str, *, dispatch_preclaimed: bool = False) -> None:
     """Bump ``repeat.completed`` and recompute ``next_run_at``; retire the record as a terminal
     completion when the repeat limit is reached or a one-shot has no further run."""
     # If no next run, decide whether this is terminal completion (one-shot) or a transient failure
@@ -2273,7 +2273,7 @@ def _advance_after_run(job: Dict[str, Any], now: str) -> None:
         completed = repeat.get("completed", 0)
         # Finite one-shots were pre-claimed by claim_dispatch() (completed already incremented) —
         # do not double-count; recurring jobs and direct callers still get the increment.
-        if not (kind == "once" and finite and completed > 0):
+        if not (dispatch_preclaimed or (kind == "once" and finite and completed > 0)):
             completed += 1
             repeat["completed"] = completed
         if finite and completed >= times:
@@ -2311,6 +2311,7 @@ def mark_job_run(
     *,
     expected_fire_owner: Optional[str] = None,
     expected_run_claim_token: Optional[str] = None,
+    expected_execution_id: Optional[str] = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2340,9 +2341,27 @@ def mark_job_run(
                     "mark_job_run: job_id %s fire claim owner changed; discarding stale completion",
                     job_id)
                 return False
+        reservation = job.get("dispatch_claim")
+        dispatch_preclaimed = False
+        repeat_limit = (job.get("repeat") or {}).get("times")
+        if isinstance(reservation, dict) and repeat_limit is not None and repeat_limit > 0:
+            if expected_execution_id is not None:
+                dispatch_preclaimed = reservation.get("execution_id") == expected_execution_id
+                if expected_fire_owner is not None:
+                    dispatch_preclaimed = dispatch_preclaimed and reservation.get("fire_owner") == expected_fire_owner
+                if not dispatch_preclaimed:
+                    return False
+            elif expected_fire_owner is not None:
+                dispatch_preclaimed = reservation.get("fire_owner") == expected_fire_owner
+            if dispatch_preclaimed and reservation.get("settled"):
+                return False
+            if not dispatch_preclaimed and not reservation.get("settled"):
+                return False  # An unidentified completion cannot settle someone else's spent attempt.
         now = _hermes_now().isoformat()
         _record_run_outcome(job, success, error, delivery_error, status, now)
-        _advance_after_run(job, now)
+        _advance_after_run(job, now, dispatch_preclaimed=dispatch_preclaimed)
+        if dispatch_preclaimed:
+            reservation["settled"] = True
         save_jobs(jobs)
         return True
 
@@ -2421,20 +2440,34 @@ def _write_missed_oneshot_diagnostic(job: Dict[str, Any], next_run: str) -> None
         "missed-oneshot")
 
 
-def claim_dispatch(job_id: str) -> bool:
-    """Atomically claim a finite one-shot dispatch BEFORE execution: ``repeat.completed`` is bumped
-    and persisted under the jobs lock so a tick dying mid-execution cannot lose the dispatch
-    (*at-most-times* instead of *at-least-once*). True if the caller may run the job; False when
-    the limit is already reached. Only ``kind == "once"`` with ``repeat.times > 0`` is claimed.
+def claim_dispatch(
+    job_id: str, *, execution_id: Optional[str] = None, expected_fire_owner: Optional[str] = None,
+) -> bool:
+    """Reserve a finite attempt before execution, surviving crashes and completion-lock refusal.
 
-    Increments ``repeat.completed`` under the cross-process jobs lock and persists the claim immediately, so
-    that if the tick dies mid-execution (gateway kill, OOM, segfault, hard-timeout) the dispatch is not
-    lost. This converts finite one-shot jobs from *at-least-once* to *at-most-times* semantics — a job that
-    self-destructs fires at most ``repeat.times`` times instead of infinitely (issue #38758).
+    One-shots retain their original at-most-times accounting. Recurring callers supply an
+    execution ID and fire owner so completion can settle that exact reservation without counting
+    twice. A crash after reservation can spend an attempt without running user code; exhausted
+    recurring records remain inspectable, never silently removed or replayed.
     """
     def apply(jobs, i, job):
         repeat = job.get("repeat") or {}
         times = repeat.get("times")
+        if (job.get("schedule", {}).get("kind") in {"cron", "interval"}
+                and times is not None and times > 0 and execution_id is not None):
+            fire_owner = (job.get("fire_claim") or {}).get("by")
+            if fire_owner != expected_fire_owner:
+                return False
+            reservation = job.get("dispatch_claim")
+            if isinstance(reservation, dict) and reservation.get("execution_id") == execution_id:
+                return reservation.get("fire_owner") == expected_fire_owner and not reservation.get("settled")
+            if repeat.get("completed", 0) >= times:
+                return False
+            repeat["completed"] = repeat.get("completed", 0) + 1
+            job["dispatch_claim"] = {
+                "execution_id": execution_id, "fire_owner": expected_fire_owner, "settled": False}
+            save_jobs(jobs)
+            return True
         # Recurring jobs use advance_next_run(); no/infinite repeat limit always dispatches.
         if job.get("schedule", {}).get("kind") != "once" or times is None or times <= 0:
             return True
@@ -2466,7 +2499,10 @@ def claim_dispatch(job_id: str) -> bool:
         logger.debug("Job '%s': claimed dispatch %d/%d", label, repeat["completed"], times)
         return True
 
-    claimed = _with_job(job_id, apply, missing=_MISSING)
+    if execution_id is not None:
+        claimed = _under_fire_fence(job_id, lambda: _with_job(job_id, apply, missing=_MISSING))
+    else:
+        claimed = _with_job(job_id, apply, missing=_MISSING)
     if claimed is _MISSING:
         logger.debug(
             "claim_dispatch: job_id %s not in store — proceeding without claim "
@@ -2596,6 +2632,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = 300, force: bool = False, return_job: bool = False,
     expected_run_claim_token: Optional[str] = None,
+    respect_local_running: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2606,8 +2643,13 @@ def claim_job_for_fire(
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire. The built-in tick passes its
     ``expected_run_claim_token`` to adopt its own one-shot dispatch; external callers
-    cannot adopt a fresh run claim without that nonce."""
+    cannot adopt a fresh run claim without that nonce. Manual callers set ``respect_local_running``
+    so an expired lease cannot displace a worker still known to this process."""
     def apply(jobs, _i, job):
+        if respect_local_running and _job_running_in_this_process(job_id):
+            return False
+        if _reserved_recurring_limit_reached(job):
+            return False
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``
@@ -2631,8 +2673,10 @@ def claim_job_for_fire(
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
         if job.get("schedule", {}).get("kind") == "once":
             run_claim = job.get("run_claim")
-            if not isinstance(run_claim, dict) or not _claim_is_live(
-                run_claim, now, _oneshot_run_claim_ttl_seconds(job)
+            # Adoption keeps the validated dispatch identity even after a long queue wait.
+            if expected_run_claim_token is None and (
+                not isinstance(run_claim, dict) or not _claim_is_live(
+                    run_claim, now, _oneshot_run_claim_ttl_seconds(job))
             ):
                 run_claim = {"at": now.isoformat(), "by": _machine_id(), "token": secrets.token_urlsafe(32)}
                 job["run_claim"] = run_claim
@@ -3028,12 +3072,24 @@ def _oneshot_dispatch_limit_reached(job: Dict[str, Any], scan: _DueScan) -> bool
     return True
 
 
+def _reserved_recurring_limit_reached(job: Dict[str, Any]) -> bool:
+    """An unsettled final reservation is still spent; the execution ledger records its outcome."""
+    repeat = job.get("repeat") or {}
+    times = repeat.get("times")
+    return bool(
+        job.get("schedule", {}).get("kind") in {"cron", "interval"}
+        and isinstance(job.get("dispatch_claim"), dict)
+        and times is not None and times > 0 and repeat.get("completed", 0) >= times)
+
+
 def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan) -> bool:
     """Decide whether one enabled, non-terminal job fires this tick, persisting any repairs.
     Ordering matters: recover missing next_run_at, repair timezone shifts, re-arm stale-error
     recurring jobs; then once due: re-anchor stale cron instants, fast-forward missed recurring
     runs, retire/guard one-shots, and finally stamp the run claim / dispatch record."""
     now = scan.now
+    if _reserved_recurring_limit_reached(job):
+        return False
     # Cross-process guard: another process's live one-shot run_claim (younger than TTL) — do NOT
     # re-dispatch. Malformed/future-dated claims (clock/TZ skew) count as stale, never eternally
     # fresh.

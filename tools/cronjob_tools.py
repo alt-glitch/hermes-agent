@@ -186,7 +186,7 @@ def _claim_for_manual_run(job_id: str, log_label: str):
     try:
         from cron.executions import create_execution, finish_execution
         execution_id = create_execution(job_id, source="manual")["id"]
-        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        claimed_job = claim_job_for_fire(job_id, return_job=True, respect_local_running=True)
         if isinstance(claimed_job, dict):
             return dict(claimed_job, execution_id=execution_id), None
         refreshed = get_job(job_id)

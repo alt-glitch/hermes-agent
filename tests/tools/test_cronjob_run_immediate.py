@@ -166,7 +166,7 @@ class TestCronjobRunExecutesImmediately:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-run-1", return_job=True)
+        m_claim.assert_called_once_with("job-run-1", return_job=True, respect_local_running=True)
         m_run.assert_called_once_with(
             {**claimed, "execution_id": ANY},
             adapters=None,
