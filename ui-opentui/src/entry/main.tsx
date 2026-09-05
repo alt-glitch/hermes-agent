@@ -22,7 +22,7 @@
 import { createDefaultOpenTuiKeymap } from '@opentui/keymap/opentui'
 import { KeymapProvider } from '@opentui/keymap/solid'
 import { render } from '@opentui/solid'
-import { Cause, Deferred, Duration, Effect, Option } from 'effect'
+import { Cause, Deferred, Duration, Effect } from 'effect'
 import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import type { KeyEvent } from '@opentui/core'
@@ -40,7 +40,7 @@ import { startMemoryMonitor } from '../boundary/memoryMonitor.ts'
 import { startProactiveGc } from '../boundary/proactiveGc.ts'
 import { registerRemoteParsers } from '../boundary/parsers.ts'
 import { acquireRenderer, redrawRenderer, selectionCopyText } from '../boundary/renderer.ts'
-import { decodeSubagentInterruptResponse } from '../boundary/schema/Delegation.ts'
+import { createAgentInterrupts } from '../boundary/agentInterrupts.ts'
 import { decodeImageAttachResponse, decodeSetupStatusResponse } from '../boundary/schema/ExternalInputResponses.ts'
 import { decodeVoiceRecordResponse } from '../boundary/schema/VoiceResponses.ts'
 import { decodePetGalleryResponse, decodePetSelectResponse } from '../boundary/schema/PetResponses.ts'
@@ -2180,25 +2180,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         delete: (id: string) => Effect.runPromise(gateway.request('learning.delete', { id }))
       }
       const agentsOps = {
+        ...createAgentInterrupts(id => Effect.runPromise(gateway.request('subagent.interrupt', { subagent_id: id }))),
         refresh: () => delegationStatusRefresher.refresh(true).then(() => undefined),
-        interrupt: async (id: string): Promise<string> => {
-          try {
-            const raw = await Effect.runPromise(gateway.request('subagent.interrupt', { subagent_id: id }))
-            const decoded = decodeSubagentInterruptResponse(raw)
-            if (Option.isNone(decoded)) throw new Error('invalid response')
-            return decoded.value.found ? `killing ${id}` : `not found: ${id}`
-          } catch {
-            throw new Error(`kill failed: ${id}`)
-          }
-        },
-        interruptSubtree: (ids: readonly string[]): Promise<void> => {
-          for (const id of ids) {
-            void Effect.runPromise(gateway.request('subagent.interrupt', { subagent_id: id })).catch(cause =>
-              getLog().warn('agents', 'subtree interrupt failed', { cause: String(cause), subagent_id: id })
-            )
-          }
-          return Promise.resolve()
-        },
         setPaused: async (paused: boolean): Promise<string> => {
           try {
             const raw = await Effect.runPromise(gateway.request('delegation.pause', { paused }))

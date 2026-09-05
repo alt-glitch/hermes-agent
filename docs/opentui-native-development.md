@@ -31,6 +31,23 @@ selection during updates, reader scroll-up versus bottom-follow, and replay
 control locks. Native Markdown finalizes on terminal transitions. A missing
 end time must not turn a finished agent into an endlessly growing bar.
 
+The native traversal matrix covers all seven canonical statuses (queued,
+running, completed, failed, error, interrupted, timeout), live and replay,
+and narrow/wide layouts. Killing is unavailable for terminal rows; a terminal
+parent may still stop its active descendants. `p` pauses **new spawning**, not
+agents already running. Replay controls are read-only, even for a historical
+row whose last recorded status was running. Preserve the inspected snapshot
+when history prepends or prunes entries; `]` must still reach an empty live turn.
+
+`?` shows the keyboard map. Tab switches list/detail; Home/End and g/G reach
+the bounds; PageUp/PageDown page either pane. Detail shortcuts: r reasoning,
+a activity, t tools, o output, b budget, d details, e trace, f files, n progress.
+L follows the latest messages (or reaches the replay bottom). Escape/Ctrl+C
+backs out of help, then detail, then closes. Test empty filters and pending or
+rejected controls without losing navigation. Always pair keyboard assertions
+with native mouse/resize checks; do not infer actual glyph painting solely
+from a mounted MarkdownRenderable.
+
 Use a fresh termctrl PTY with sanitized fixture data for matched before/after
 frames, plus a separate isolated real-Hermes callback run. Label those proofs
 separately: a synthetic renderer fixture does not prove model/provider delivery;

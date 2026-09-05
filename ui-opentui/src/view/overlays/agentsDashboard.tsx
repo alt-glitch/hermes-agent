@@ -6,7 +6,12 @@ import { type BoxRenderable, type ScrollBoxRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
-import { createDelegationState, delegationPressure, type DelegationState } from '../../logic/agentStatus.ts'
+import {
+  createDelegationState,
+  delegationPressure,
+  isActiveSubagentStatus,
+  type DelegationState
+} from '../../logic/agentStatus.ts'
 import { diffSpawnSnapshots, type SpawnHistoryState, type SpawnSnapshot } from '../../logic/spawnHistory.ts'
 import {
   buildSubagentTree,
@@ -89,8 +94,19 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   const [sort, setSort] = createSignal<AgentsSortMode>('depth-first')
   const [filter, setFilter] = createSignal<AgentsFilterMode>('all')
   const [selectedId, setSelectedId] = createSignal<string | undefined>(props.preselect)
-  const [historyIndex, setHistoryIndex] = createSignal(
-    Math.max(0, Math.min(props.history?.snapshots.length ?? 0, Math.floor(props.initialHistoryIndex ?? 0)))
+  const initialHistoryIndex = Math.max(
+    0,
+    Math.min(props.history?.snapshots.length ?? 0, Math.floor(props.initialHistoryIndex ?? 0))
+  )
+  const [lastTurn, setLastTurn] = createSignal(initialHistoryIndex === 0 && props.subagents.length === 0)
+  // Retain the inspected snapshot itself: prepending or pruning history must
+  // never replace the run under the user's cursor.
+  const [replaySnapshot, setReplaySnapshot] = createSignal<SpawnSnapshot | undefined>(
+    initialHistoryIndex > 0
+      ? props.history?.snapshots[initialHistoryIndex - 1]
+      : props.subagents.length === 0
+        ? props.history?.snapshots[0]
+        : undefined
   )
   const [flash, setFlash] = createSignal('')
   const [actionPending, setActionPending] = createSignal(false)
@@ -98,21 +114,18 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   const [following, setFollowing] = createSignal(true)
   const [masterHeight, setMasterHeight] = createSignal(0)
   const [sections, setSections] = createSignal<Readonly<Record<string, boolean>>>({})
+  const [showKeys, setShowKeys] = createSignal(false)
   let rootRef: BoxRenderable | undefined
   let masterRef: BoxRenderable | undefined
   let detailScroll: ScrollBoxRenderable | undefined
+  let helpScroll: ScrollBoxRenderable | undefined
   let previousLiveCount = props.subagents.length
 
   const history = () => props.history ?? EMPTY_HISTORY
   const delegation = () => props.delegation ?? EMPTY_DELEGATION
-  const replaySnapshot = createMemo(() => {
-    const index = historyIndex()
-    if (index > 0) return history().snapshots[index - 1]
-    // The store archives before clearing live rows. Preserve that last turn in
-    // the boundary render as well as in the following effect, avoiding an
-    // empty-frame flash while historyIndex catches up.
-    if (props.subagents.length === 0) return history().snapshots[0]
-    return undefined
+  const historyIndex = createMemo(() => {
+    const snapshot = replaySnapshot()
+    return snapshot === undefined ? 0 : history().snapshots.findIndex(item => item.id === snapshot.id) + 1
   })
   const replayMode = () => replaySnapshot() !== undefined
   const displayNowMs = () => replaySnapshot()?.finishedAtMs ?? nowMs()
@@ -165,7 +178,8 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   const title = createMemo(() => {
     const snapshot = replaySnapshot()
     if (snapshot === undefined) return `Spawn tree${delegation().paused ? ' · ⏸ paused' : ''}`
-    if (historyIndex() === 0) return 'Last turn'
+    if (lastTurn() && history().snapshots[0]?.id === snapshot.id) return 'Last turn'
+    if (historyIndex() === 0) return 'Retained replay'
     return `Replay ${String(historyIndex())}/${String(history().snapshots.length)} · finished ${new Date(snapshot.finishedAtMs).toLocaleTimeString()}`
   })
   const listFooter = createMemo(() => {
@@ -176,10 +190,10 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       history().snapshots.length > 0
         ? ` · [ / ] history ${String(historyIndex())}/${String(history().snapshots.length)}`
         : ''
-    const full = `↑↓/jk move · g/G top/bottom · Enter/→ open detail${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · q close`
-    const medium = `↑↓ move · Enter/→ open detail · s/f view${locked} · q close`
-    const compact = `↑↓ move · Enter open · q close${replayMode() ? ' · controls locked' : ''}`
-    const tiny = `↑↓ · Enter open · q close`
+    const full = `↑↓/jk move · g/G top/bottom · Enter/→ open detail${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · ? keys · q close`
+    const medium = `↑↓ move · Enter/→ open detail · s/f view${locked} · ? keys · q close`
+    const compact = `↑↓ move · Enter open · ? keys · q close${replayMode() ? ' · controls locked' : ''}`
+    const tiny = `↑↓ · Enter open · ? keys · q close`
     const available = Math.max(8, dims().width - 4)
     const footer =
       full.length + 2 <= available
@@ -195,9 +209,9 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
     const controls = replayMode()
       ? ' · controls locked'
       : ` · x kill · X subtree · p ${delegation().paused ? 'resume' : 'pause'}`
-    const full = `↑↓ scroll · PgUp/PgDn · G/L live · Esc/← back · r reasoning · a activity · t tools${controls} · q close`
-    const compact = `↑↓ scroll · L live · Esc back · q close`
-    const tiny = `Esc back · L live · q close`
+    const full = `↑↓ scroll · PgUp/PgDn · G/L bottom · Esc/← back · r reasoning · a activity · t tools${controls} · ? keys · q close`
+    const compact = `↑↓ scroll · L bottom · Esc back · ? keys · q close`
+    const tiny = `Esc back · ? keys · q close`
     const available = Math.max(8, dims().width - 4)
     return full.length + 2 <= available ? full : truncRight(compact.length <= available ? compact : tiny, available)
   })
@@ -208,7 +222,8 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   }
 
   function backOrClose(): void {
-    if (props.diffPair !== undefined) closeWithCleanup()
+    if (showKeys()) setShowKeys(false)
+    else if (props.diffPair !== undefined) closeWithCleanup()
     else if (mode() === 'detail') setMode('list')
     else closeWithCleanup()
   }
@@ -226,6 +241,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
     const options = rows()
     if (options.length === 0) {
       if (selectedId() !== undefined) setSelectedId(undefined)
+      setMode('list')
       return
     }
     const current = selectedId()
@@ -235,15 +251,11 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   })
 
   createEffect(() => {
-    const maximum = history().snapshots.length
-    if (historyIndex() > maximum) setHistoryIndex(maximum)
-  })
-
-  createEffect(() => {
     const liveCount = props.subagents.length
     const archiveCount = history().snapshots.length
-    if (historyIndex() === 0 && previousLiveCount > 0 && liveCount === 0 && archiveCount > 0) {
-      setHistoryIndex(1)
+    if (!replayMode() && previousLiveCount > 0 && liveCount === 0 && archiveCount > 0) {
+      setReplaySnapshot(history().snapshots[0])
+      setLastTurn(true)
       setMode('list')
       setSelectedId(undefined)
       setFlash('turn finished · inspect freely · q to close')
@@ -252,7 +264,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   })
 
   createEffect(
-    on([selectedId, historyIndex, () => replaySnapshot()?.id], () => {
+    on([selectedId, () => replaySnapshot()?.id], () => {
       setFollowing(!replayMode())
       setSections({})
       detailScroll?.scrollTo(replayMode() ? 0 : Number.MAX_SAFE_INTEGER)
@@ -279,15 +291,14 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   }
 
   function stepHistory(delta: -1 | 1): void {
-    setHistoryIndex(current => {
-      const next = Math.max(0, Math.min(history().snapshots.length, current + delta))
-      if (next !== current) {
-        setMode('list')
-        setSelectedId(undefined)
-        setFlash(next === 0 ? 'live turn' : `replay · ${String(next)}/${String(history().snapshots.length)}`)
-      }
-      return next
-    })
+    const next = Math.max(0, Math.min(history().snapshots.length, historyIndex() + delta))
+    const snapshot = next === 0 ? undefined : history().snapshots[next - 1]
+    if (snapshot === replaySnapshot()) return
+    setReplaySnapshot(snapshot)
+    setLastTurn(false)
+    setMode('list')
+    setSelectedId(undefined)
+    setFlash(next === 0 ? 'live turn' : `replay · ${String(next)}/${String(history().snapshots.length)}`)
   }
 
   async function runAction(
@@ -304,7 +315,10 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       setFlash(unavailable)
       return
     }
-    if (actionPending()) return
+    if (actionPending()) {
+      setFlash('control request pending — navigation remains available')
+      return
+    }
     setActionPending(true)
     setFlash(pending)
     try {
@@ -329,7 +343,14 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
 
   function killOne(): void {
     const node = selected()
-    if (node === undefined) return
+    if (node === undefined) {
+      setFlash('no agent selected')
+      return
+    }
+    if (!replayMode() && !isActiveSubagentStatus(node.item.status)) {
+      setFlash('agent already finished — messages remain available')
+      return
+    }
     const id = node.item.id
     void runAction(
       'kill control unavailable',
@@ -341,7 +362,14 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
 
   function killSubtree(): void {
     const node = selected()
-    if (node === undefined) return
+    if (node === undefined) {
+      setFlash('no agent selected')
+      return
+    }
+    if (!replayMode() && node.aggregate.activeCount === 0) {
+      setFlash('subtree already finished — messages remain available')
+      return
+    }
     const ids = [node.item.id, ...descendantIds(node)]
     void runAction(
       'subtree control unavailable',
@@ -371,12 +399,33 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   }
 
   useKeyboard(key => {
+    if (key.ctrl || key.meta) {
+      if (key.ctrl && !key.meta && (key.name === 'u' || key.name === 'd')) {
+        const delta = (key.name === 'u' ? -1 : 1) * Math.max(4, dims().height - 12)
+        if (showKeys()) helpScroll?.scrollBy(delta)
+        else if (mode() === 'detail') scrollDetail(delta)
+      }
+      return
+    }
     const sequence = key.sequence
-    if (sequence === 'q' && !key.ctrl && !key.meta) {
+    if (sequence === 'q') {
       closeWithCleanup()
       return
     }
     if (props.diffPair !== undefined) return
+    if (sequence === '?') {
+      setShowKeys(current => !current)
+      return
+    }
+    if (showKeys()) {
+      if (key.name === 'up' || key.name === 'k') helpScroll?.scrollBy(-1)
+      else if (key.name === 'down' || key.name === 'j') helpScroll?.scrollBy(1)
+      else if (key.name === 'pageup') helpScroll?.scrollBy(-5)
+      else if (key.name === 'pagedown') helpScroll?.scrollBy(5)
+      else if (key.name === 'home' || (key.name === 'g' && !key.shift)) helpScroll?.scrollTo(0)
+      else if (key.name === 'end' || (key.name === 'g' && key.shift)) helpScroll?.scrollTo(Number.MAX_SAFE_INTEGER)
+      return
+    }
 
     if (sequence === '<' || sequence === '[') {
       stepHistory(1)
@@ -386,7 +435,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       stepHistory(-1)
       return
     }
-    if (key.name === 'p' && !key.ctrl && !key.meta) {
+    if (key.name === 'p') {
       togglePause()
       return
     }
@@ -394,16 +443,17 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       killSubtree()
       return
     }
-    if (key.name === 'x' && !key.ctrl && !key.meta) {
+    if (key.name === 'x') {
       killOne()
       return
     }
 
     if (key.name === 'tab') {
-      setMode(current => (current === 'list' ? 'detail' : 'list'))
+      if (selected() !== undefined) setMode(current => (current === 'list' ? 'detail' : 'list'))
       return
     }
     if (key.name === 'l' && key.shift) {
+      if (selected() === undefined) return
       setMode('detail')
       returnLive()
       return
@@ -416,20 +466,22 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
         o: 'Output',
         b: 'Budget',
         d: 'Details',
+        f: 'Files',
+        n: 'Progress',
         e: 'Live trace'
       }
       const section = sectionKeys[key.name]
-      if (section !== undefined && !key.ctrl && !key.meta) {
+      if (section !== undefined) {
         toggleSection(section)
         return
       }
       if (key.name === 'left' || key.name === 'h') setMode('list')
-      else if (key.name === 'pageup' || (key.ctrl && key.name === 'u')) scrollDetail(-Math.max(4, dims().height - 12))
-      else if (key.name === 'pagedown' || (key.ctrl && key.name === 'd')) scrollDetail(Math.max(4, dims().height - 12))
+      else if (key.name === 'pageup') scrollDetail(-Math.max(4, dims().height - 12))
+      else if (key.name === 'pagedown') scrollDetail(Math.max(4, dims().height - 12))
       else if (key.name === 'up' || key.name === 'k') scrollDetail(-2)
       else if (key.name === 'down' || key.name === 'j') scrollDetail(2)
-      else if (key.name === 'g' && key.shift) returnLive()
-      else if (key.name === 'g') {
+      else if (key.name === 'end' || (key.name === 'g' && key.shift)) returnLive()
+      else if (key.name === 'home' || key.name === 'g') {
         setFollowing(false)
         detailScroll?.scrollTo(0)
       }
@@ -440,10 +492,12 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       setMode('detail')
     } else if (key.name === 'up' || key.name === 'k') moveSelection(-1)
     else if (key.name === 'down' || key.name === 'j') moveSelection(1)
-    else if (key.name === 'g' && key.shift) {
+    else if (key.name === 'pageup') moveSelection(-listCapacity())
+    else if (key.name === 'pagedown') moveSelection(listCapacity())
+    else if (key.name === 'end' || (key.name === 'g' && key.shift)) {
       const options = rows()
       setSelectedId(options.at(-1)?.item.id)
-    } else if (key.name === 'g') setSelectedId(rows()[0]?.item.id)
+    } else if (key.name === 'home' || key.name === 'g') setSelectedId(rows()[0]?.item.id)
     else if (key.name === 's') setSort(current => cycleDashboardValue(AGENTS_SORT_ORDER, current))
     else if (key.name === 'f') setFilter(current => cycleDashboardValue(AGENTS_FILTER_ORDER, current))
   })
@@ -460,6 +514,24 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
         fallback={
           <>
             <box style={{ flexDirection: 'column', flexShrink: 0, paddingLeft: 1, paddingRight: 1 }}>
+              <Show when={showKeys()}>
+                <scrollbox
+                  id="agents-key-help"
+                  ref={element => {
+                    helpScroll = element
+                    element.focusable = false
+                  }}
+                  height={Math.max(2, Math.min(8, dims().height - 8))}
+                  flexShrink={0}
+                  scrollX={false}
+                >
+                  <text wrapMode="word" fg={theme().color.text}>
+                    {
+                      'Keys · Tab: list/detail · ↑↓/jk: move/scroll · PgUp/PgDn: page · Home/g: top · End/G: bottom\n[ older · ] newer/live · Enter/→/l: detail · Esc/←/h: back · q: close\nDetail: r reasoning · a activity · t tools · o output · b budget · d details · e trace · f files · n progress · L follow/bottom\nList: s sort · f filter · x kill agent · X kill subtree · p pause/resume spawning (does not pause running agents)'
+                    }
+                  </text>
+                </scrollbox>
+              </Show>
               <text wrapMode="none">
                 <span style={{ fg: replayMode() ? theme().color.border : theme().color.primary }}>
                   <b>{title()}</b>
@@ -484,7 +556,9 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
               fallback={
                 <box style={{ flexDirection: 'column', flexGrow: 1, paddingLeft: 1 }}>
                   <text fg={theme().color.muted}>
-                    No subagents this turn. Trigger delegate_task to populate the tree.
+                    {agents().length === 0
+                      ? 'No subagents this turn. Trigger delegate_task to populate the tree.'
+                      : `No agents match filter: ${AGENTS_FILTER_LABEL[filter()]}. Press f to change filter.`}
                   </text>
                 </box>
               }
@@ -613,7 +687,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                 )}
               </Show>
               <text fg={theme().color.muted} wrapMode="none">
-                {mode() === 'list' ? listFooter() : detailFooter()}
+                {showKeys() ? '↑↓ scroll keys · Esc back · q close' : mode() === 'list' ? listFooter() : detailFooter()}
               </text>
             </box>
           </>

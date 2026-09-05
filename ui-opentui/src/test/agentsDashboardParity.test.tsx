@@ -1,4 +1,5 @@
 import { MarkdownRenderable, ScrollBoxRenderable, type Renderable } from '@opentui/core'
+import { KeyCodes } from '@opentui/core/testing'
 import { createSignal } from 'solid-js'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
@@ -97,6 +98,370 @@ describe('native agents dashboard parity', () => {
   afterEach(() => {
     vi.restoreAllMocks()
     vi.useRealTimers()
+  })
+
+  test.each(
+    ['queued', 'running', 'completed', 'failed', 'error', 'interrupted', 'timeout'].flatMap(status =>
+      [false, true].flatMap(replay => [96, 124].map(width => ({ status, replay, width })))
+    )
+  )('$status agents: sections and navigation (replay=$replay, width=$width)', async ({ status, replay, width }) => {
+    const row = agent('state-row', `Inspect ${status}`, {
+      ...RICH_AGENTS[0],
+      id: 'state-row',
+      status,
+      thinking: ['Activity marker'],
+      notes: ['Progress marker'],
+      trace: [
+        { kind: 'reasoning', text: 'Reasoning marker' },
+        { kind: 'tool', text: 'Trace marker' }
+      ]
+    })
+    const killed = vi.fn()
+    const probe = await renderProbe(
+      dashboardNode({
+        subagents: replay ? [] : [row],
+        history: { snapshots: [snapshot('state-snapshot', 'state snapshot', [row], 0)] },
+        onKillAgent: killed
+      }),
+      {
+        width,
+        height: 50,
+        kittyKeyboard: true
+      }
+    )
+    try {
+      probe.keys.pressTab()
+      await probe.settle()
+      for (const [key, title] of [
+        ['a', 'Activity'],
+        ['t', 'Tool calls'],
+        ['o', 'Output'],
+        ['d', 'Details'],
+        ['b', 'Budget'],
+        ['e', 'Live trace'],
+        ['f', 'Files'],
+        ['n', 'Progress']
+      ] as const) {
+        probe.keys.pressKey(key)
+        probe.keys.pressKey('g')
+        await probe.settle()
+        expect(probe.frame()).toContain(`▾ ${title}`)
+        probe.keys.pressKey(key)
+        await probe.settle()
+        expect(probe.frame()).toContain(`▸ ${title}`)
+      }
+      probe.keys.pressKey('r')
+      await probe.settle()
+      expect(
+        descendants(probe.renderer.root).some(
+          item => item instanceof MarkdownRenderable && item.content === 'Reasoning marker'
+        )
+      ).toBe(true)
+      probe.keys.pressKey('x')
+      await probe.settle()
+      if (!replay && (status === 'queued' || status === 'running')) expect(killed).toHaveBeenCalledWith('state-row')
+      else {
+        expect(killed).not.toHaveBeenCalled()
+        expect(probe.frame()).toContain(replay ? 'replay mode — controls disabled' : 'agent already finished')
+      }
+      probe.keys.pressEscape()
+      await probe.settle()
+      expect(probe.frame()).toContain('Enter')
+      probe.keys.pressArrow('right')
+      await probe.settle()
+      expect(probe.frame()).toContain('Esc back')
+      probe.keys.pressArrow('left')
+      await probe.settle()
+      expect(probe.frame()).toContain('Enter')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('replay stays on its snapshot through prepend and pruning, and can return to empty live', async () => {
+    const first = snapshot('first', 'first', [agent('first-agent', 'Original replay')], 0)
+    const second = snapshot('second', 'second', [agent('second-agent', 'Newer replay')], 1000)
+    const [history, setHistory] = createSignal<SpawnHistoryState>({ snapshots: [first] })
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider>
+          <AgentsDashboard subagents={[]} history={history()} onClose={() => {}} />
+        </ThemeProvider>
+      ),
+      { width: 96, height: 30 }
+    )
+    try {
+      expect(probe.frame()).toContain('Original replay')
+      setHistory({ snapshots: [second, first] })
+      await probe.settle()
+      expect(probe.frame()).toContain('Original replay')
+      expect(probe.frame()).not.toContain('Newer replay')
+      setHistory({ snapshots: [second] })
+      await probe.settle()
+      expect(probe.frame()).toContain('Original replay')
+      probe.keys.pressKey(']')
+      await probe.settle()
+      expect(probe.frame()).toContain('No subagents this turn')
+      probe.keys.pressTab()
+      probe.keys.pressKey('f')
+      probe.keys.pressKey('[')
+      await probe.settle()
+      expect(probe.frame()).toContain('Newer replay')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('pending and rejected controls never trap navigation or multiply requests', async () => {
+    let rejectAction: (reason: Error) => void = () => {}
+    const kill = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectAction = reject
+        })
+    )
+    const close = vi.fn()
+    const probe = await renderProbe(dashboardNode({ onKillAgent: kill, onClose: close }), { width: 96, height: 34 })
+    try {
+      probe.keys.pressKey('x')
+      await probe.settle()
+      probe.keys.pressKey('x')
+      probe.keys.pressArrow('down')
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(kill).toHaveBeenCalledTimes(1)
+      expect(probe.frame()).toContain('control request pending')
+      expect(probe.frame()).toContain('Audit native platform artifacts')
+      rejectAction(new Error('Backend unavailable'))
+      await probe.settle()
+      expect(probe.frame()).toContain('Backend unavailable')
+      probe.keys.pressKey('q')
+      await probe.settle()
+      expect(close).toHaveBeenCalledOnce()
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('page, home/end, help, modifiers and Ctrl+C work without trapping focus', async () => {
+    const close = vi.fn()
+    const kill = vi.fn()
+    const rows = Array.from({ length: 30 }, (_, index) =>
+      agent(`key-${String(index)}`, `Key task ${String(index)}`, {
+        index,
+        status: index % 2 ? 'completed' : 'running',
+        notes: Array.from(
+          { length: 6 },
+          (_, line) => `Progress line ${String(line)}\n${'retained progress\n'.repeat(15)}`
+        )
+      })
+    )
+    const probe = await renderProbe(dashboardNode({ subagents: rows, onClose: close, onKillSubtree: kill }), {
+      width: 96,
+      height: 30,
+      kittyKeyboard: true
+    })
+    try {
+      probe.keys.pressKey(KeyCodes.END)
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(probe.frame()).toContain('#30')
+      probe.keys.pressTab({ shift: true })
+      probe.keys.pressKey(KeyCodes.HOME)
+      probe.keys.pressKey('\u001b[6~')
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(probe.frame()).not.toContain('#1 ')
+      probe.keys.pressKey('n')
+      await probe.settle()
+      probe.keys.pressKey(KeyCodes.END)
+      await probe.settle()
+      const scroll = descendants(probe.renderer.root).find(
+        (item): item is ScrollBoxRenderable => item instanceof ScrollBoxRenderable
+      )
+      expect(scroll).toBeDefined()
+      const bottom = scroll!.scrollTop
+      expect(bottom).toBeGreaterThan(0)
+      probe.keys.pressKey('u', { ctrl: true })
+      await probe.settle()
+      expect(scroll!.scrollTop).toBeLessThan(bottom)
+      probe.keys.pressKey('d', { ctrl: true })
+      await probe.settle()
+      expect(scroll!.scrollTop).toBe(bottom)
+      probe.keys.pressKey('x', { ctrl: true, shift: true })
+      await probe.settle()
+      expect(kill).not.toHaveBeenCalled()
+      probe.keys.pressKey('?')
+      await probe.settle()
+      expect(probe.frame()).toContain('files · n progress')
+      probe.keys.pressEscape()
+      await probe.settle()
+      expect(probe.frame()).not.toContain('files · n progress')
+      expect(close).not.toHaveBeenCalled()
+      probe.keys.pressCtrlC()
+      await probe.settle()
+      expect(close).not.toHaveBeenCalled()
+      probe.keys.pressCtrlC()
+      await probe.settle()
+      expect(close).toHaveBeenCalledOnce()
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('a finished parent can stop its still-running descendants, but not an entirely finished tree', async () => {
+    const stop = vi.fn()
+    const [rows, setRows] = createSignal([
+      agent('parent', 'Finished parent', { status: 'completed' }),
+      agent('child', 'Running child', { parentId: 'parent', depth: 1 })
+    ])
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider>
+          <AgentsDashboard subagents={rows()} onClose={() => {}} onKillSubtree={stop} />
+        </ThemeProvider>
+      ),
+      { width: 96, height: 30 }
+    )
+    try {
+      probe.keys.pressKey('x', { shift: true })
+      await probe.settle()
+      expect(stop).toHaveBeenCalledWith(['parent', 'child'])
+      setRows(current => current.map(row => ({ ...row, status: 'interrupted' })))
+      await probe.settle()
+      probe.keys.pressKey('x', { shift: true })
+      await probe.settle()
+      expect(stop).toHaveBeenCalledOnce()
+      expect(probe.frame()).toContain('subtree already finished')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('empty filtered views recover with f, while diff ignores hidden help and closes once', async () => {
+    const probe = await renderProbe(
+      dashboardNode({ subagents: [agent('done', 'Done task', { status: 'completed' })] }),
+      { width: 80, height: 24 }
+    )
+    try {
+      probe.keys.pressKey('f')
+      await probe.settle()
+      expect(probe.frame()).toContain('No agents match filter: running')
+      probe.keys.pressTab()
+      probe.keys.pressKey('f')
+      probe.keys.pressKey('f')
+      await probe.settle()
+      expect(probe.frame()).toContain('Done task')
+    } finally {
+      probe.destroy()
+    }
+    const close = vi.fn()
+    const clear = vi.fn()
+    const diff = await renderProbe(
+      dashboardNode({
+        onClose: close,
+        onClearDiff: clear,
+        diffPair: {
+          baseline: snapshot('a', 'before', RICH_AGENTS, 0),
+          candidate: snapshot('b', 'after', RICH_AGENTS, 1000)
+        }
+      }),
+      { width: 96, height: 30, kittyKeyboard: true }
+    )
+    try {
+      diff.keys.pressKey('?')
+      diff.keys.pressEscape()
+      await diff.settle()
+      expect(close).toHaveBeenCalledOnce()
+      expect(clear).toHaveBeenCalledOnce()
+    } finally {
+      diff.destroy()
+    }
+  })
+
+  test('spawning can pause/resume, and all controls stay locked after live rows archive', async () => {
+    const [delegation, setDelegation] = createSignal(createDelegationState())
+    const [rows, setRows] = createSignal<readonly DashboardAgent[]>(RICH_AGENTS)
+    const [history, setHistory] = createSignal<SpawnHistoryState>({ snapshots: [] })
+    const pause = vi.fn((paused: boolean) => {
+      setDelegation(current => ({ ...current, paused }))
+    })
+    const kill = vi.fn()
+    const subtree = vi.fn()
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider>
+          <AgentsDashboard
+            subagents={rows()}
+            history={history()}
+            delegation={delegation()}
+            onClose={() => {}}
+            onPauseChange={pause}
+            onKillAgent={kill}
+            onKillSubtree={subtree}
+          />
+        </ThemeProvider>
+      ),
+      { width: 96, height: 30 }
+    )
+    try {
+      probe.keys.pressKey('p')
+      await probe.settle()
+      expect(delegation().paused).toBe(true)
+      probe.keys.pressKey('p')
+      await probe.settle()
+      expect(delegation().paused).toBe(false)
+      setHistory({ snapshots: [snapshot('finished', 'finished', RICH_AGENTS, 1000)] })
+      setRows([])
+      await probe.settle()
+      expect(probe.frame()).toContain('Last turn')
+      for (const key of ['p', 'x', 'X']) {
+        probe.keys.pressKey(key.toLowerCase(), { shift: key === 'X' })
+        await probe.settle()
+        expect(probe.frame()).toContain('replay mode — controls disabled')
+      }
+      expect(pause).toHaveBeenCalledTimes(2)
+      expect(kill).not.toHaveBeenCalled()
+      expect(subtree).not.toHaveBeenCalled()
+      probe.resize(40, 12)
+      probe.keys.pressKey('?')
+      await probe.settle()
+      probe.keys.pressKey(KeyCodes.END)
+      await probe.settle()
+      expect(probe.frame()).toContain('running agents)')
+      probe.keys.pressKey('?')
+      probe.keys.pressKey(']')
+      setRows(RICH_AGENTS)
+      await probe.settle()
+      expect(probe.frame()).toContain('Spawn tree')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('clicking scrollable help never steals close-layer focus or double-scrolls', async () => {
+    const close = vi.fn()
+    const probe = await renderProbe(dashboardNode({ onClose: close }), { width: 40, height: 12, kittyKeyboard: true })
+    try {
+      probe.keys.pressKey('?')
+      await probe.settle()
+      const help = descendants(probe.renderer.root).find(
+        (item): item is ScrollBoxRenderable => item instanceof ScrollBoxRenderable && item.id === 'agents-key-help'
+      )
+      expect(help).toBeDefined()
+      await probe.click(help!.x + 2, help!.y + 1)
+      const before = help!.scrollTop
+      probe.keys.pressArrow('down')
+      await probe.settle()
+      expect(help!.scrollTop).toBe(before + 1)
+      probe.keys.pressKey('?')
+      await probe.settle()
+      probe.keys.pressEscape()
+      await probe.settle()
+      expect(close).toHaveBeenCalledOnce()
+    } finally {
+      probe.destroy()
+    }
   })
 
   test('legacy archived rows without a status remain completed', () => {
