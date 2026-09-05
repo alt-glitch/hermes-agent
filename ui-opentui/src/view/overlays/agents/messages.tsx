@@ -26,7 +26,7 @@ export function agentMessages(agent: DashboardAgent) {
   const lastReply = replies.at(-1)
   const represented =
     summary !== undefined &&
-    (summary.trim() === lastReply?.entry.text.trim() ||
+    (lastReply?.entry.text.trim().startsWith(summary.trim()) === true ||
       (agent.traceTruncated === true && lastReply?.entry.text.endsWith(summary) === true))
   const appendSummary = Boolean(summary?.trim() && !represented)
   return { appendSummary, entries, replies, summary }

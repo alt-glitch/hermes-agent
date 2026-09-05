@@ -90,7 +90,12 @@ function Fixture() {
         const summary = agent?.trace?.filter(entry => entry.kind === 'reply').at(-1)?.text ?? 'Complete'
         store.apply({
           type: 'subagent.complete',
-          payload: { subagent_id: id, status: 'completed', summary, duration_seconds: id === 'lead' ? 35 : 23 }
+          payload: {
+            subagent_id: id,
+            status: 'completed',
+            summary: summary.slice(0, 500),
+            duration_seconds: id === 'lead' ? 35 : 23
+          }
         })
       }
       store.apply({ type: 'message.complete', payload: { text: 'Fixture complete' } })

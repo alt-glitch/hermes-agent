@@ -77,6 +77,18 @@ describe('agent message retention and completion', () => {
     }
   })
 
+  test('a shortened completion preview preserves the full last streamed reply', () => {
+    const store = createSessionStore()
+    const agent = start(store)
+    const full = 'Verified result. '.repeat(80)
+    text(store, full)
+    const reply = agent.trace?.at(-1)
+    store.apply({ type: 'subagent.complete', payload: { subagent_id: 'a', summary: full.slice(0, 500) } })
+    expect(agent.trace?.at(-1)).toBe(reply)
+    expect(reply?.text).toBe(full)
+    expect(agent.trace?.some(entry => entry.kind === 'summary')).toBe(false)
+  })
+
   test('identical messages separated by a tool are not globally deduplicated', () => {
     const store = createSessionStore()
     const agent = start(store)

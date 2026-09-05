@@ -21,6 +21,8 @@ export function appendSubagentTrace(agent: SubagentInfo, kind: TraceEntry['kind'
 /** Reconcile only the current reply; identical earlier messages are independent. */
 export function finishSubagentTrace(agent: SubagentInfo, summary: string): void {
   const last = agent.trace?.at(-1)
+  // The backend completion summary can be a shortened preview of the reply.
+  if (last?.kind === 'reply' && last.text.startsWith(summary)) return
   if (last?.kind === 'reply' && (summary.startsWith(last.text) || (last.truncated && summary.endsWith(last.text)))) {
     last.text = summary
     delete last.truncated

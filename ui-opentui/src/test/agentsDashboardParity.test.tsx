@@ -491,6 +491,29 @@ describe('native agents dashboard parity', () => {
     expect(frame).not.toContain('waiting')
   })
 
+  test('a shortened completion preview is not a second final answer in replay', async () => {
+    const full = 'Verified result. '.repeat(40) + '\n\nFULL_REPLY_END'
+    const completed = agent('completed', 'Verify contracts', {
+      status: 'completed',
+      summary: full.slice(0, 500),
+      trace: [{ id: 1, kind: 'reply', text: full }]
+    })
+    const archived = snapshot('short-preview', 'Completed work', [completed], 0)
+    const probe = await renderProbe(dashboardNode({ subagents: [], history: { snapshots: [archived] } }), {
+      width: 132,
+      height: 42
+    })
+    try {
+      const bodies = descendants(probe.renderer.root).filter(item => item instanceof MarkdownRenderable)
+      expect(bodies).toHaveLength(1)
+      expect(bodies[0]).toHaveProperty('content', full)
+      expect(probe.frame()).not.toContain('Final reply')
+      expect(probe.frame().match(/❯ Assistant/g)).toHaveLength(1)
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('unknown terminal time stays unknown while the active sibling advances', async () => {
     const finished = agent('finished', 'Finished without timestamp', { status: 'completed', startedAt: START })
     const active = agent('active', 'Still working', { startedAt: START })
