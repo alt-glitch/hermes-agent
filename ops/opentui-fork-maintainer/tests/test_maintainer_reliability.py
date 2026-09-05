@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -101,6 +102,59 @@ def test_watchdog_reconciles_terminal_execution_without_token_in_argv(
     assert sync._watch_execution("run-1", evidence, "execution-1") == 0
     assert seen["argv"][-1] == token
     assert queued == ["run-1"]
+
+
+def test_reconcile_cli_reports_live_gate_as_retryable(tmp_path, monkeypatch):
+    runtime = load("runtime_busy_reconcile", "scripts/maintainer_runtime.py")
+    sync = load("sync_busy_reconcile", "scripts/opentui_fork_sync.py")
+    monkeypatch.setattr(sync, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(sync, "PROJECT_HOME", tmp_path)
+    monkeypatch.setattr(sync, "RUNTIME", ROOT / "scripts/maintainer_runtime.py")
+    with runtime.run_lock(sync.STATE_DIR):
+        result = sync._invoke_reconcile("synthetic-token", tmp_path / "evidence")
+    assert result.returncode == 75
+    assert not (sync.STATE_DIR / "last-run.json").exists()
+
+
+@pytest.mark.parametrize("transition", ["completed", "replaced", "expired"])
+def test_watchdog_observes_gate_completion_after_parent_exits(tmp_path, monkeypatch, transition):
+    runtime = load("runtime_gate_completion", "scripts/maintainer_runtime.py")
+    sync = load("sync_gate_completion", "scripts/opentui_fork_sync.py")
+    state = tmp_path / "state"
+    monkeypatch.setattr(sync, "STATE_DIR", state)
+    token = sync._claim_lease()
+    owned = sync._owned_run(token)
+    evidence = Path(owned["evidence_dir"])
+    monkeypatch.setattr(sync, "_execution_state", lambda *_args: ("ok", "failed"))
+    queued = []
+    monkeypatch.setattr(sync, "_queue_reconciliation_failure", queued.append)
+    attempts = []
+
+    def busy(*_args, **_kwargs):
+        attempts.append(True)
+        return SimpleNamespace(returncode=75, stdout="")
+
+    def finish_gate(_seconds):
+        assert sync._owned_run(token)["run_id"] == owned["run_id"]
+        if transition == "completed":
+            runtime._record_run_outcome(state, evidence, {"status": "success"})
+            assert sync._release_lease(token)
+        else:
+            path = state / "run.lease.json"
+            lease = json.loads(path.read_text())
+            if transition == "replaced":
+                lease.update(run_id="new-owner", token="new-token")
+            else:
+                lease.update(expires_unix=0, max_expires_unix=0)
+            path.write_text(json.dumps(lease))
+
+    monkeypatch.setattr(sync, "_invoke_reconcile", busy)
+    monkeypatch.setattr(sync.time, "sleep", finish_gate)
+    assert sync._watch_execution(owned["run_id"], evidence, "execution-1") == {
+        "completed": 0, "replaced": 2, "expired": 75,
+    }[transition]
+    assert attempts == [True] * (2 if transition == "expired" else 1)
+    assert queued == ([owned["run_id"]] if transition == "expired" else [])
 
 
 def test_watchdog_launcher_does_not_expose_lease_token(tmp_path, monkeypatch):

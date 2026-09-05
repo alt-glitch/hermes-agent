@@ -284,10 +284,38 @@ def test_unknown_base_policy_fails_closed(tmp_path, monkeypatch, response):
         pub.required_check_policy(tmp_path)
 
 
-def test_required_workflow_policy_fails_closed_instead_of_matching_display_names(tmp_path, monkeypatch):
+@pytest.mark.parametrize("rule_type", [
+    "creation", "update", "deletion", "required_linear_history",
+    "required_signatures", "pull_request", "non_fast_forward",
+])
+def test_non_check_rules_preserve_required_checks_and_merge_policy(tmp_path, monkeypatch, rule_type):
+    rule = {"type": rule_type}
+    checks_rule = {"type": "required_status_checks", "parameters": {
+        "required_status_checks": [{"context": "integration", "integration_id": 456}],
+    }}
     responses = iter([
         {"data": {"repository": {"ref": {"name": pub.BASE, "branchProtectionRule": None}}}},
-        [[{"type": "workflows", "parameters": {"workflows": [{"path": ".github/workflows/security.yml"}]}}]],
+        [[rule], [checks_rule]],
+    ])
+    monkeypatch.setattr(pub, "_run", lambda argv, cwd: json.dumps(next(responses)))
+    policy = pub.required_check_policy(tmp_path)
+    assert policy["rules"] == [rule, checks_rule]
+    pr = review_pr()
+    assert pub.review_status(pr, [review_comment()], "a" * 40, policy) is None
+    pr["statusCheckRollup"].append({
+        "__typename": "CheckRun", "name": "integration", "status": "COMPLETED",
+        "conclusion": "SUCCESS", "checkSuite": {"app": {"databaseId": 456}},
+    })
+    assert pub.review_status(pr, [review_comment()], "a" * 40, policy)["score"] == "5/5"
+    pr["mergeStateStatus"] = "BLOCKED"
+    assert pub.review_status(pr, [review_comment()], "a" * 40, policy) is None
+
+
+@pytest.mark.parametrize("rule_type", ["workflows", "merge_queue", "required_deployments", "unknown_future_rule"])
+def test_unsupported_check_policy_fails_closed_instead_of_matching_display_names(tmp_path, monkeypatch, rule_type):
+    responses = iter([
+        {"data": {"repository": {"ref": {"name": pub.BASE, "branchProtectionRule": None}}}},
+        [[{"type": rule_type, "parameters": {"workflows": [{"path": ".github/workflows/security.yml"}]}}]],
     ])
     monkeypatch.setattr(pub, "_run", lambda argv, cwd: json.dumps(next(responses)))
     with pytest.raises(pub.PublicationError, match="unsupported branch rule"):

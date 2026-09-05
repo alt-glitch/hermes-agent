@@ -611,48 +611,48 @@ def _watch_execution(
         now = int(time.time())
         if now >= expires_unix or now >= max_expires_unix:
             allow_expired_reconcile = True
-            break
-        if ledger_state in {"error", "untracked"}:
+        elif ledger_state in {"error", "untracked"}:
             time.sleep(WATCHDOG_POLL_SECONDS)
             continue
-        if ledger_state == "missing":
+        elif ledger_state == "missing":
             missing_polls += 1
-            if missing_polls >= 3:
-                break
-            time.sleep(WATCHDOG_POLL_SECONDS)
-            continue
-        missing_polls = 0
-        if status not in {"running", "claimed"}:
-            break
-        if status in {"running", "claimed"}:
+            if missing_polls < 3:
+                time.sleep(WATCHDOG_POLL_SECONDS)
+                continue
+        elif status in {"running", "claimed"}:
+            missing_polls = 0
             post_publish_deadline = _post_publish_deadline(evidence_dir)
-            if (
+            needs_recovery = (
                 max_expires_unix - now <= WATCHDOG_GRACE_SECONDS
                 or post_publish_deadline is not None
                 and post_publish_deadline - now <= WATCHDOG_GRACE_SECONDS
-            ):
-                break
-            if expires_unix - now <= WATCHDOG_GRACE_SECONDS:
-                if not _renew_lease(token, now=now):
-                    return 2
+            )
+            if not needs_recovery:
+                if expires_unix - now <= WATCHDOG_GRACE_SECONDS:
+                    if not _renew_lease(token, now=now):
+                        return 2
+                time.sleep(WATCHDOG_POLL_SECONDS)
+                continue
+
+        result = _invoke_reconcile(
+            token,
+            evidence_dir,
+            allow_expired=allow_expired_reconcile,
+        )
+        if result.returncode == 75 and not allow_expired_reconcile:
+            # Parent completion does not imply its background publication gate ended.
             time.sleep(WATCHDOG_POLL_SECONDS)
             continue
-
-    result = _invoke_reconcile(
-        token,
-        evidence_dir,
-        allow_expired=allow_expired_reconcile,
-    )
-    if result.returncode != 0:
-        _queue_reconciliation_failure(run_id)
-        return result.returncode
-    try:
-        outcome = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return 2
-    if outcome.get("status") == "failed":
-        _queue_reconciliation_failure(run_id)
-    return 0
+        if result.returncode != 0:
+            _queue_reconciliation_failure(run_id)
+            return result.returncode
+        try:
+            outcome = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return 2
+        if outcome.get("status") == "failed":
+            _queue_reconciliation_failure(run_id)
+        return 0
 
 
 def _launch_watchdog(run: dict[str, Any], execution_id: str) -> None:

@@ -229,6 +229,10 @@ class ControlError(RuntimeError):
     """A state transition was unsafe or its preconditions were not proven."""
 
 
+class RunBusyError(ControlError):
+    """A live gate still owns the run lock."""
+
+
 def _reject_symlink_path(path: Path, root: Path) -> Path:
     """Return an absolute in-root path after rejecting every symlink component."""
     root = Path(os.path.abspath(root))
@@ -331,7 +335,7 @@ def run_lock(state_dir: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise ControlError(
+            raise RunBusyError(
                 "another maintainer run holds the nonblocking lock"
             ) from exc
         handle.seek(0)
@@ -3781,13 +3785,16 @@ def main(argv: list[str] | None = None) -> int:
         renew_lease(args.state, args.token)
         return 0
     if args.command == "reconcile-run":
-        with run_lock(args.state):
-            result = reconcile_run(
-                args.state,
-                args.evidence,
-                token=args.token,
-                allow_expired=args.allow_expired,
-            )
+        try:
+            with run_lock(args.state):
+                result = reconcile_run(
+                    args.state,
+                    args.evidence,
+                    token=args.token,
+                    allow_expired=args.allow_expired,
+                )
+        except RunBusyError:
+            return 75  # EX_TEMPFAIL: the watchdog must observe the existing gate.
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "release-lease":

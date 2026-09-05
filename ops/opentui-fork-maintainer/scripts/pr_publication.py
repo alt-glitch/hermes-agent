@@ -27,6 +27,11 @@ FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state"
 # Immutable GitHub App IDs, verified against this fork's live check suites.
 REQUIRED_CHECK_APPS = {"Greptile Review": 867647, "All required checks pass": 15368}
 REQUIRED_CONTEXTS = set(REQUIRED_CHECK_APPS)
+# These rules add no check contexts; GitHub still enforces them at merge/push.
+NON_CHECK_RULES = frozenset({
+    "creation", "update", "deletion", "required_linear_history",
+    "required_signatures", "pull_request", "non_fast_forward",
+})
 
 
 class PublicationError(RuntimeError):
@@ -197,6 +202,8 @@ def required_check_policy(root: Path) -> dict[str, Any]:
         raise PublicationError("base branch ruleset policy could not be determined")
     rules = [rule for page in pages for rule in page]
     for rule in rules:
+        if rule.get("type") in NON_CHECK_RULES:
+            continue
         if rule.get("type") != "required_status_checks":
             # Workflow requirements cannot be identified by a job's display name.
             raise PublicationError(f"unsupported branch rule requires review: {rule.get('type')}")
