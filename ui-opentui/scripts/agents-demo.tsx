@@ -10,7 +10,7 @@ import { AgentsDashboard } from '../src/view/overlays/agentsDashboard.tsx'
 import { ThemeProvider } from '../src/view/theme.tsx'
 
 // Sanitized deterministic renderer fixture. No gateway, credentials or model calls.
-// 2 appends messages, 3 finishes, 4 adds rows. Verify backend delivery separately.
+// 2 appends messages, 3 finishes, 4 adds rows, 5 fills details. Verify backend delivery separately.
 installFfiCoordSafety()
 registerRemoteParsers()
 const store = createSessionStore()
@@ -74,6 +74,24 @@ const renderer = await createCliRenderer({
 let step = 0
 function Fixture() {
   useKeyboard(key => {
+    if (key.name === '5') {
+      store.apply({
+        type: 'subagent.progress',
+        payload: {
+          subagent_id: 'lead',
+          files_read: Array.from({ length: 40 }, (_, index) => `/fixture/read-${String(index).padStart(2, '0')}.ts`),
+          files_written: Array.from(
+            { length: 40 },
+            (_, index) => `/fixture/written-${String(index).padStart(2, '0')}.ts`
+          )
+        }
+      })
+      for (let index = 0; index < 40; index += 1)
+        store.apply({
+          type: 'subagent.progress',
+          payload: { subagent_id: 'lead', text: `Retained event ${String(index).padStart(2, '0')}` }
+        })
+    }
     if (key.name === '2') {
       step += 1
       store.apply({
@@ -120,7 +138,7 @@ function Fixture() {
         <ThemeProvider theme={() => store.state.theme}>
           <box flexDirection="column" width="100%" height="100%">
             <text flexShrink={0}>
-              Synthetic agent fixture · 2 append · 3 complete/replay · 4 add rows · Ctrl+C quit
+              Synthetic agent fixture · 2 append · 3 complete/replay · 4 add rows · 5 fill details · Ctrl+C quit
             </text>
             <AgentsDashboard
               subagents={store.state.subagents}

@@ -218,7 +218,6 @@ export function AgentDetail(props: {
     (agent().trace ?? []).filter(
       entry => entry.kind !== 'reply' && entry.kind !== 'summary' && entry.kind !== 'reasoning'
     )
-  const filesOverflow = () => Math.max(0, filesRead().length - 8) + Math.max(0, filesWritten().length - 8)
 
   return (
     <box flexDirection="column" flexGrow={1} minHeight={0} minWidth={0} onMouseDown={props.onFocus}>
@@ -331,24 +330,21 @@ export function AgentDetail(props: {
             onToggle={() => props.onToggleSection('Files')}
             title="Files"
           >
-            <For each={filesWritten().slice(0, 8)}>
+            <For each={filesWritten()}>
               {path => (
-                <text fg={theme().color.statusGood} wrapMode="none">
-                  +{truncRight(path, Math.max(8, props.width - 3))}
+                <text fg={theme().color.statusGood} wrapMode="word">
+                  +{path}
                 </text>
               )}
             </For>
-            <For each={filesRead().slice(0, 8)}>
+            <For each={filesRead()}>
               {path => (
-                <text fg={theme().color.text} wrapMode="none">
+                <text fg={theme().color.text} wrapMode="word">
                   <span style={{ fg: theme().color.muted }}>· </span>
-                  {truncRight(path, Math.max(8, props.width - 3))}
+                  {path}
                 </text>
               )}
             </For>
-            <Show when={filesOverflow() > 0}>
-              <text fg={theme().color.muted}>…+{String(filesOverflow())} more</text>
-            </Show>
           </Section>
         </Show>
 
@@ -359,7 +355,7 @@ export function AgentDetail(props: {
             onToggle={() => props.onToggleSection('Tool calls')}
             title="Tool calls"
           >
-            <For each={tools().slice(-16)}>
+            <For each={tools()}>
               {line => (
                 <text fg={theme().color.text} wrapMode="word">
                   <span style={{ fg: theme().color.muted }}>· </span>
@@ -367,9 +363,6 @@ export function AgentDetail(props: {
                 </text>
               )}
             </For>
-            <Show when={tools().length > 16}>
-              <text fg={theme().color.muted}>…{String(tools().length - 16)} earlier calls hidden</text>
-            </Show>
           </Section>
         </Show>
 
@@ -380,10 +373,7 @@ export function AgentDetail(props: {
             onToggle={() => props.onToggleSection('Output')}
             title="Output"
           >
-            <For each={outputTail().slice(-8)}>{entry => <OutputLine entry={entry} />}</For>
-            <Show when={outputTail().length > 8}>
-              <text fg={theme().color.muted}>…{String(outputTail().length - 8)} earlier outputs hidden</text>
-            </Show>
+            <For each={outputTail()}>{entry => <OutputLine entry={entry} />}</For>
           </Section>
         </Show>
 
@@ -394,7 +384,7 @@ export function AgentDetail(props: {
             onToggle={() => props.onToggleSection('Live trace')}
             title="Live trace"
           >
-            <For each={trace().slice(-20)}>
+            <For each={trace()}>
               {entry => {
                 const glyph = entry.kind === 'tool' ? '⚡' : entry.kind === 'start' ? '▶' : '·'
                 const color =
@@ -411,9 +401,6 @@ export function AgentDetail(props: {
                 )
               }}
             </For>
-            <Show when={trace().length > 20}>
-              <text fg={theme().color.muted}>…{String(trace().length - 20)} earlier events hidden</text>
-            </Show>
           </Section>
         </Show>
 
@@ -424,7 +411,7 @@ export function AgentDetail(props: {
             onToggle={() => props.onToggleSection('Progress')}
             title="Progress"
           >
-            <For each={progress().slice(-6)}>
+            <For each={progress()}>
               {line => (
                 <text fg={theme().color.text} wrapMode="word">
                   <span style={{ fg: theme().color.label }}>· </span>

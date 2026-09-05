@@ -100,6 +100,69 @@ describe('native agents dashboard parity', () => {
     vi.useRealTimers()
   })
 
+  test.each([false, true].flatMap(replay => [96, 124].map(width => ({ replay, width }))))(
+    'every retained detail row is reachable by paging (replay=$replay, width=$width)',
+    async ({ replay, width }) => {
+      const labels = (prefix: string, count: number) =>
+        Array.from({ length: count }, (_, index) => `${prefix}-${String(index).padStart(2, '0')}`)
+      const filesRead = labels('read', 40)
+      const filesWritten = labels('written', 40)
+      const tools = labels('call', 24)
+      const outputs = labels('output', 12)
+      const events = labels('event', 40)
+      const notes = labels('note', 12)
+      const row = agent('retained', 'Inspect retained records', {
+        filesRead,
+        filesWritten,
+        tools,
+        outputTail: outputs.map(preview => ({ preview, tool: 'terminal', isError: false })),
+        trace: events.map(text => ({ kind: 'tool', text })),
+        notes,
+        status: replay ? 'completed' : 'running'
+      })
+      const probe = await renderProbe(
+        dashboardNode({
+          subagents: replay ? [] : [row],
+          history: { snapshots: replay ? [snapshot('retained-run', 'Retained records', [row], 0)] : [] }
+        }),
+        { width, height: 30 }
+      )
+      try {
+        probe.keys.pressEnter()
+        await probe.settle()
+        const scroll = descendants(probe.renderer.root).find(
+          (item): item is ScrollBoxRenderable => item instanceof ScrollBoxRenderable
+        )
+        expect(scroll).toBeDefined()
+        for (const { key, entries } of [
+          { key: 'f', entries: [...filesWritten, ...filesRead] },
+          { key: 't', entries: tools },
+          { key: 'o', entries: outputs },
+          { key: 'e', entries: events },
+          { key: 'n', entries: notes }
+        ]) {
+          probe.keys.pressKey(key)
+          await probe.settle()
+          probe.keys.pressKey(KeyCodes.HOME)
+          await probe.settle()
+          let frames = probe.frame()
+          for (let page = 0; page < 30; page += 1) {
+            const before = scroll!.scrollTop
+            probe.keys.pressKey('\u001b[6~')
+            await probe.settle()
+            frames += probe.frame()
+            if (scroll!.scrollTop === before) break
+          }
+          for (const entry of entries) expect(frames, `section ${key}`).toContain(entry)
+          probe.keys.pressKey(key)
+          await probe.settle()
+        }
+      } finally {
+        probe.destroy()
+      }
+    }
+  )
+
   test.each(
     ['queued', 'running', 'completed', 'failed', 'error', 'interrupted', 'timeout'].flatMap(status =>
       [false, true].flatMap(replay => [96, 124].map(width => ({ status, replay, width })))
@@ -759,10 +822,15 @@ describe('native agents dashboard parity', () => {
       probe.resize(100, 42)
       await probe.settle()
       const frame = probe.frame()
-      expect(frame.match(/TRACE_/g)).toHaveLength(20)
+      expect((frame.match(/TRACE_/g) ?? []).length).toBeGreaterThan(20)
       expect(frame).toContain('TRACE_08')
-      expect(frame).toContain('TRACE_27')
       expect(frame).toContain('q close')
+      probe.keys.pressKey(KeyCodes.END)
+      await probe.settle()
+      expect(probe.frame()).toContain('TRACE_27')
+      probe.keys.pressKey(KeyCodes.HOME)
+      await probe.settle()
+      expect(probe.frame()).toContain('TRACE_00')
     } finally {
       probe.destroy()
     }
