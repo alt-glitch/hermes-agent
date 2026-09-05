@@ -95,3 +95,25 @@ install/verify a dedicated cron-only gateway, run a fresh real integration cycle
 and check its PR, full gate, exact remote commit and finalized journal. Preserve
 old history and other gateways. Update this ledger with actual outcomes rather
 than replacing the missing proof with a successful unit-test summary.
+
+## Reviewed preservation follow-up, 2026-09-06
+
+PR #40 carries the extraction-preservation work and subsequent corrections:
+`cefd1b6b466`, `2d435410aef`, and `5b173e13612`. Gateway and cron correction
+reviews both returned APPROVED from Fable 5.1 with real source reads. Cron's final
+review recorded no permission denials. These were static reviews, not test runs.
+
+- Cron: 380 passing tests across 14 fresh processes; root independently confirmed
+  the 21-case regression file. Includes real subprocess crash/no-replay coverage.
+- Gateway: combined suite 1,780 passed, one skipped; fresh-process sweep 1,779
+  passed, one failed, one skipped. The hosted-room migration failure passed on a
+  standalone 39-test rerun. Keep the original failure as a caveat.
+- Root's three focused gateway files: 21 passed. Pre-fix gateway reproduction:
+  10 failures and three passing controls.
+- Actual compression parser/trigger probe: configured 300k cap becomes 300k for
+  1.05M context, and 96k for 128k context. Not a live 300k summary-quality test.
+
+Local evidence index:
+`~/projects/opentui-fork-maintainer/state/verification/20260905-preservation-candidate/README.md`.
+The target/global install and paused cron have not been advanced by these tests.
+Require fresh current-head CI and Greptile 5/5; older approvals do not carry over.

@@ -118,3 +118,26 @@ owner. Module counts and successful Git ancestry do not establish parity.
   replaying the recording. Preserve rejected results and the reason for any
   rerun. Even a passing judge can misread labels; source and native frames own
   exact text, and a startup/help clip proves only that interaction.
+
+## Preservation corrections (2026-09-06)
+
+- Taking the registry lock before a turn's mutation lock can freeze unrelated
+  sessions on disconnect. Recheck identity and transport after acquiring mutation,
+  including orphan reapers and supersession, not only explicit session close.
+- An accepted submission needs a terminal event even when its client sends no
+  correlation ID. Test both client shapes. A synchronous rejected RPC remains a
+  separate contract and must not invent a started turn.
+- Clear a previous turn's Stop flag when claiming new work, under the existing
+  history lock. Preserve a Stop arriving after that claim. On refused synthetic
+  dispatch, release the delivery receipt and return the event to its queue.
+- Reserve finite recurring attempts durably before execution and settle by exact
+  execution/owner identity. A crash may spend an attempt without a result; retain
+  the exhausted record and explain it instead of replaying it. Proven cancellation
+  before entry spends none. Failed external handoffs retain their existing attempt
+  accounting, even when a previous execution has an unsettled reservation.
+- Shutdown's first outcome write can fail. Retry only execution-deduplicated
+  settlement in the interrupted tail; repeating legacy counter updates is unsafe.
+- A fresh-process sweep exposed a hosted-room timing failure that passed alone.
+  Preserve both logs; a rerun is not evidence that the first run was green or
+  definitive proof of a pre-existing cause. Avoid broadening a reviewed correction
+  based only on timing speculation.
