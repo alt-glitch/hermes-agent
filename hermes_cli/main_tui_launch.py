@@ -472,7 +472,8 @@ NODE26_MIN_VERSION = (26, 3, 0)
 def _node_version_tuple(node_bin: str) -> tuple[int, int, int] | None:
     """Return (major, minor, patch) for a node binary, or ``None`` if unreadable."""
     try:
-        out = subprocess.run([node_bin, "--version"], capture_output=True, text=True, timeout=5)
+        out = subprocess.run([node_bin, "--version"], capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=5)
     except Exception:
         return None
     if out.returncode != 0:

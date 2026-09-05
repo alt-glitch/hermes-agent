@@ -78,7 +78,8 @@ class _ScriptedEnv(BaseEnvironment):
 
     def execute(self, command, cwd="", **kwargs):
         import subprocess
-        proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+        proc = subprocess.run(["bash", "-c", command], capture_output=True,
+                              text=True, encoding="utf-8", timeout=10)
         return {"output": "echo login-noise\n" + proc.stdout + proc.stderr, "returncode": proc.returncode}
 
 
@@ -95,3 +96,95 @@ def test_fetch_file_round_trips_bytes_and_enforces_the_in_sandbox_size_cap(tmp_p
         env.fetch_file(str(src), dest, max_bytes=100)
     with pytest.raises(FileFetchError, match="could not read"):
         env.fetch_file(str(tmp_path), dest, max_bytes=100)  # a directory is not a regular file
+
+
+@pytest.mark.parametrize("swap_parent", [False, True])
+def test_delivery_refuses_symlink_swap_after_remote_validation(monkeypatch, tmp_path, swap_parent):
+    home = tmp_path / "home"
+    public = home / "out"
+    private = home / ".ssh"
+    public.mkdir(parents=True)
+    private.mkdir()
+    artifact = public / "report.txt"
+    artifact.write_bytes(b"PUBLIC-ARTIFACT")
+    secret = private / "report.txt"
+    secret.write_bytes(b"DENIED-SENSITIVE-CONTENT")
+    cache = tmp_path / "cache"
+
+    class RacingEnv(_ScriptedEnv):
+        _remote_home = str(home)
+
+        def fetch_file(self, remote_path, local_dest, *, max_bytes):
+            if swap_parent:
+                public.rename(home / "original-out")
+                public.symlink_to(private, target_is_directory=True)
+            else:
+                artifact.unlink()
+                artifact.symlink_to(secret)
+            super().fetch_file(remote_path, local_dest, max_bytes=max_bytes)
+
+    monkeypatch.setattr(media_fetch, "_active_remote_env", RacingEnv)
+    monkeypatch.setattr("gateway.platforms.base.DOCUMENT_CACHE_DIR", cache)
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (cache,))
+    assert media_fetch.fetch_remote_media(str(artifact)) is None
+    assert not list(cache.glob("*"))
+
+
+def test_fetch_refuses_hard_link_alias_and_fifo(tmp_path):
+    import os
+
+    source = tmp_path / "private.txt"
+    source.write_bytes(b"SECRET")
+    alias = tmp_path / "alias.txt"
+    alias.hardlink_to(source)
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    dest = tmp_path / "copy"
+    for path in (alias, fifo):
+        with pytest.raises(FileFetchError, match="could not read"):
+            _ScriptedEnv().fetch_file(str(path), dest, max_bytes=100)
+        assert not dest.exists()
+
+
+def test_transfer_reads_the_open_file_even_if_its_name_changes(tmp_path):
+    import shlex
+
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"PUBLIC-ARTIFACT")
+    secret = tmp_path / "secret.bin"
+    secret.write_bytes(b"SECRET")
+    dest = tmp_path / "copy.bin"
+
+    class SwapAfterOpen(_ScriptedEnv):
+        def execute(self, command, **kwargs):
+            argv = shlex.split(command)
+            # Interpose the actual remote os.open, after it returns a descriptor.
+            # The production read script is otherwise unchanged.
+            prefix = f"""
+import os
+original_open = os.open
+def swapping_open(path, *args, **kwargs):
+    fd = original_open(path, *args, **kwargs)
+    if path == 'artifact.bin':
+        os.rename({str(source)!r}, {str(source.with_suffix('.old'))!r})
+        os.symlink({str(secret)!r}, {str(source)!r})
+    return fd
+os.open = swapping_open
+"""
+            argv[4] = prefix + argv[4]
+            return super().execute(shlex.join(argv), **kwargs)
+
+    SwapAfterOpen().fetch_file(str(source), dest, max_bytes=100)
+    assert source.is_symlink()
+    assert dest.read_bytes() == b"PUBLIC-ARTIFACT"
+
+
+def test_missing_remote_python_fails_closed_with_actionable_error(tmp_path):
+    class MissingPython(_ScriptedEnv):
+        def execute(self, command, **kwargs):
+            return {"returncode": 127, "output": "python3: command not found"}
+
+    dest = tmp_path / "copy"
+    with pytest.raises(FileFetchError, match="require python3 in the sandbox"):
+        MissingPython().fetch_file("/out/file", dest, max_bytes=100)
+    assert not dest.exists()

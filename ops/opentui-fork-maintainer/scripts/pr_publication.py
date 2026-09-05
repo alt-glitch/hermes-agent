@@ -9,6 +9,7 @@ import re
 import struct
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -145,6 +146,74 @@ def _published_block(body: str, identity: str) -> tuple[str, str] | None:
     if "./" in block or "file:" in block or "/home/" in block:
         raise PublicationError("published evidence still contains a local reference")
     return block, urls[0]
+
+
+def review_status(pr: dict[str, Any], comments: list[dict[str, Any]], candidate: str) -> dict[str, Any] | None:
+    """Accept only the current candidate's bot score and completed green checks."""
+    if pr.get("headRefOid") != candidate or pr.get("state") != "OPEN" or pr.get("baseRefName") != BASE:
+        raise PublicationError("review target changed or closed before publication")
+    summaries = [
+        comment for comment in comments
+        if (comment.get("user") or {}).get("login") == "greptile-apps[bot]"
+        and "Confidence Score:" in comment.get("body", "")
+    ]
+    latest = max(summaries, key=lambda item: (item["updated_at"], item["id"]), default=None)
+    if latest is None:
+        return None
+    body = latest["body"]
+    reviewed = re.search(r"Last reviewed commit:.*?/commit/([0-9a-f]{40})", body)
+    if not reviewed or reviewed[1] != candidate:
+        return None
+    scores = re.findall(r"Confidence Score:\s*([0-5])/5", body)
+    if scores != ["5"]:
+        raise PublicationError("current Greptile review is not 5/5; fix findings before publication")
+    checks = pr.get("statusCheckRollup") or []
+    if not checks:
+        return None
+    for check in checks:
+        if check.get("__typename") == "CheckRun":
+            if check.get("status") != "COMPLETED":
+                return None
+            if check.get("conclusion") not in {"SUCCESS", "SKIPPED", "NEUTRAL"}:
+                raise PublicationError(f"PR check failed: {check.get('name', 'unknown')}")
+        elif check.get("__typename") == "StatusContext":
+            if check.get("state") in {"PENDING", "EXPECTED"}:
+                return None
+            if check.get("state") != "SUCCESS":
+                raise PublicationError(f"PR status failed: {check.get('context', 'unknown')}")
+        else:
+            raise PublicationError("unknown PR check shape; refusing publication")
+    if not any(check.get("name") == "Greptile Review" for check in checks):
+        return None
+    return {
+        "candidate_sha": candidate,
+        "score": "5/5",
+        "comment_url": latest["html_url"],
+        "comment_updated_at": latest["updated_at"],
+        "checks": checks,
+    }
+
+
+def wait_for_review(root: Path, number: int, candidate: str) -> dict[str, Any]:
+    """Wait up to 30 minutes; a missing review is never an implicit approval."""
+    deadline = time.monotonic() + 1800
+    while True:
+        pr = json.loads(_run([
+            str(GH), "pr", "view", str(number), "--repo", REPOSITORY,
+            "--json", "state,headRefOid,baseRefName,statusCheckRollup",
+        ], root))
+        pages = json.loads(_run([
+            str(GH), "api", "--paginate", "--slurp",
+            f"repos/{REPOSITORY}/issues/{number}/comments?per_page=100",
+        ], root))
+        proof = review_status(pr, [item for page in pages for item in page], candidate)
+        if proof is not None:
+            _write(root / "pr-review.json", json.dumps(proof, indent=2) + "\n")
+            return proof
+        if time.monotonic() >= deadline:
+            raise PublicationError("PR review/checks still pending; target branch was not updated")
+        print(f"PR #{number}: waiting for current-head Greptile 5/5 and green checks", flush=True)
+        time.sleep(30)
 
 
 def publish_preview(
@@ -338,5 +407,7 @@ def publish_preview(
         "gh_version": "2.100.0",
         "scope": "synthetic-startup-help",
     }
+    _write(root / "pr-evidence.json", json.dumps(proof, indent=2) + "\n")
+    proof["review"] = wait_for_review(root, pr["number"], candidate)
     _write(root / "pr-evidence.json", json.dumps(proof, indent=2) + "\n")
     return proof

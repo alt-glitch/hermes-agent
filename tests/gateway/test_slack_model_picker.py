@@ -7,6 +7,7 @@ override and the ``hermes_model_provider`` / ``hermes_model_model`` /
 """
 
 import sys
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -117,6 +118,51 @@ class TestSlackModelPickerSend:
     """Test send_model_picker sends the provider-stage Block Kit."""
 
     @pytest.mark.asyncio
+    async def test_registered_actions_reach_callback_once_during_double_selection(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        handlers = {}
+
+        def register(action_id):
+            def accept(callback):
+                handlers[action_id] = callback
+                return callback
+            return accept
+
+        adapter._app.action = register
+        adapter._register_bolt_handlers()
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def switch(*args):
+            entered.set()
+            await release.wait()
+            return "Switched!"
+
+        callback = AsyncMock(side_effect=switch)
+        result = await adapter.send_model_picker(
+            "C1", _PROVIDERS, "old", "openrouter", "session", callback,
+            metadata={"team_id": "T1"},
+        )
+        assert result.success
+        ack = AsyncMock()
+        await handlers["hermes_model_provider"](ack, _interaction_body(), {
+            "action_id": "hermes_model_provider", "selected_option": {"value": "0"},
+        })
+        action = {"action_id": "hermes_model_model", "selected_option": {"value": "1"}}
+        first = asyncio.create_task(handlers["hermes_model_model"](ack, _interaction_body(), action))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            await handlers["hermes_model_model"](ack, _interaction_body(), action)
+            callback.assert_awaited_once_with("C1", "openai/gpt-5", "openrouter")
+        finally:
+            release.set()
+            await first
+        assert ack.await_count == 3
+        assert not adapter._model_picker.state
+
+    @pytest.mark.asyncio
     async def test_sends_provider_dropdown(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
@@ -158,8 +204,8 @@ class TestSlackModelPickerSend:
         assert elements[1]["action_id"] == "hermes_model_cancel"
 
         # State should be stashed for the callback (no metadata → bare ts key)
-        assert "1234.5678" in adapter._model_picker_state
-        state = adapter._model_picker_state["1234.5678"]
+        assert "1234.5678" in adapter._model_picker.state
+        state = adapter._model_picker.state["1234.5678"]
         assert state["stage"] == "provider"
         assert state["session_key"] == "test-session"
 
@@ -268,7 +314,7 @@ class TestSlackModelPickerAction:
         # bare_ts=True mirrors the metadata-poor send path: no team id, so the
         # state is keyed by the raw ts instead of the (team_id, ts) marker.
         key = msg_ts if bare_ts else ("T1", msg_ts)
-        adapter._model_picker_state[key] = {
+        adapter._model_picker.state[key] = {
             "providers": _PROVIDERS if providers is None else providers,
             "session_key": "s1",
             "chat_id": "C1",
@@ -294,7 +340,7 @@ class TestSlackModelPickerAction:
             "selected_option": {"value": "0"},  # index 0 = openrouter
         }
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         ack.assert_called_once()
         mock_client.chat_update.assert_called_once()
@@ -307,7 +353,7 @@ class TestSlackModelPickerAction:
         assert elements[1]["action_id"] == "hermes_model_back"
         assert elements[2]["action_id"] == "hermes_model_cancel"
 
-        state = adapter._model_picker_state[("T1", "1234.5678")]
+        state = adapter._model_picker.state[("T1", "1234.5678")]
         assert state["stage"] == "model"
         assert state["selected_provider_slug"] == "openrouter"
 
@@ -331,11 +377,11 @@ class TestSlackModelPickerAction:
             "selected_option": {"value": "0"},  # index 0 = openrouter
         }
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         ack.assert_called_once()
         mock_client.chat_update.assert_called_once()
-        state = adapter._model_picker_state["1234.5678"]
+        state = adapter._model_picker.state["1234.5678"]
         assert state["stage"] == "model"
         assert state["selected_provider_slug"] == "openrouter"
 
@@ -359,12 +405,12 @@ class TestSlackModelPickerAction:
             "selected_option": {"value": "0"},  # the single seeded provider
         }
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         ack.assert_called_once()
         mock_client.chat_update.assert_called_once()
         assert "No models available" in mock_client.chat_update.call_args[1]["text"]
-        assert ("T1", "1234.5678") not in adapter._model_picker_state
+        assert ("T1", "1234.5678") not in adapter._model_picker.state
 
     @pytest.mark.asyncio
     async def test_model_select_calls_callback(self):
@@ -389,13 +435,13 @@ class TestSlackModelPickerAction:
             "selected_option": {"value": "0"},  # index 0 = anthropic/claude-sonnet-4
         }
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         ack.assert_called_once()
         assert events == [("C1", "anthropic/claude-sonnet-4", "openrouter")]
 
         # State cleaned up
-        assert ("T1", "1234.5678") not in adapter._model_picker_state
+        assert ("T1", "1234.5678") not in adapter._model_picker.state
 
         # chat_update called twice: "Switching..." then the confirmation
         assert mock_client.chat_update.call_count == 2
@@ -420,7 +466,7 @@ class TestSlackModelPickerAction:
         ack = AsyncMock()
         action = {"action_id": "hermes_model_model", "selected_option": {"value": "1"}}
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         last_update = mock_client.chat_update.call_args_list[-1][1]
         assert "⚙ Model Switch Failed" in last_update["text"]
@@ -446,7 +492,7 @@ class TestSlackModelPickerAction:
         ack = AsyncMock()
         action = {"action_id": "hermes_model_model", "selected_option": {"value": "0"}}
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         last_update = mock_client.chat_update.call_args_list[-1][1]
         assert last_update["text"].startswith("⚙ Model Switch Failed")
@@ -474,13 +520,13 @@ class TestSlackModelPickerAction:
             "selected_option": {"value": "bogus"},
         }
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         ack.assert_called_once()
         on_selected.assert_not_called()
         mock_client.chat_update.assert_called_once()
         assert "expired" in mock_client.chat_update.call_args[1]["text"].lower()
-        assert ("T1", "1234.5678") not in adapter._model_picker_state
+        assert ("T1", "1234.5678") not in adapter._model_picker.state
 
     @pytest.mark.asyncio
     async def test_model_select_out_of_range_index_expires_picker(self):
@@ -501,13 +547,13 @@ class TestSlackModelPickerAction:
                 "selected_option": {"value": token},
             }
             # Re-seed: the first miss pops the entry.
-            if ("T1", "1234.5678") not in adapter._model_picker_state:
+            if ("T1", "1234.5678") not in adapter._model_picker.state:
                 self._seed_state(
                     adapter, stage="model", selected_provider="openrouter",
                     on_selected=on_selected,
                 )
 
-            await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+            await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
             on_selected.assert_not_called()
         assert "expired" in mock_client.chat_update.call_args[1]["text"].lower()
@@ -526,12 +572,12 @@ class TestSlackModelPickerAction:
             "selected_option": {"value": "7"},  # only 2 providers seeded
         }
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         ack.assert_called_once()
         mock_client.chat_update.assert_called_once()
         assert "expired" in mock_client.chat_update.call_args[1]["text"].lower()
-        assert ("T1", "1234.5678") not in adapter._model_picker_state
+        assert ("T1", "1234.5678") not in adapter._model_picker.state
 
     @pytest.mark.asyncio
     async def test_cancel_clears_state(self):
@@ -544,10 +590,10 @@ class TestSlackModelPickerAction:
         ack = AsyncMock()
         action = {"action_id": "hermes_model_cancel", "value": "cancel"}
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         ack.assert_called_once()
-        assert ("T1", "1234.5678") not in adapter._model_picker_state
+        assert ("T1", "1234.5678") not in adapter._model_picker.state
         mock_client.chat_update.assert_called_once()
         assert "cancelled" in mock_client.chat_update.call_args[1]["text"].lower()
 
@@ -562,13 +608,13 @@ class TestSlackModelPickerAction:
         ack = AsyncMock()
         action = {"action_id": "hermes_model_back", "value": "openrouter"}
 
-        await adapter._handle_model_picker_action(ack, _interaction_body(), action)
+        await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         mock_client.chat_update.assert_called_once()
         update_kwargs = mock_client.chat_update.call_args[1]
         elements = update_kwargs["blocks"][1]["elements"]
         assert elements[0]["action_id"] == "hermes_model_provider"
-        state = adapter._model_picker_state[("T1", "1234.5678")]
+        state = adapter._model_picker.state[("T1", "1234.5678")]
         assert state["stage"] == "provider"
         assert state["selected_provider_slug"] == ""
 
@@ -587,7 +633,7 @@ class TestSlackModelPickerAction:
         ack = AsyncMock()
         action = {"action_id": "hermes_model_provider", "selected_option": {"value": "0"}}
 
-        await adapter._handle_model_picker_action(
+        await adapter._model_picker.handle_action(
             ack, _interaction_body(msg_ts="nonexistent"), action
         )
         ack.assert_called_once()
@@ -605,14 +651,14 @@ class TestSlackModelPickerAction:
         ack = AsyncMock()
         action = {"action_id": "hermes_model_provider", "selected_option": {"value": "openrouter"}}
 
-        await adapter._handle_model_picker_action(
+        await adapter._model_picker.handle_action(
             ack, _interaction_body(user="intruder", uid="U_BAD"), action
         )
 
         ack.assert_called_once()
         mock_client.chat_update.assert_not_called()
         # State unchanged
-        assert adapter._model_picker_state[("T1", "1234.5678")]["stage"] == "provider"
+        assert adapter._model_picker.state[("T1", "1234.5678")]["stage"] == "provider"
 
 
 # ===========================================================================

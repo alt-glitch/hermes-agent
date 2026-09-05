@@ -88,8 +88,12 @@ most two concurrent workers. Background long calls and observe their exit status
 The complete gate installs the committed lockfile, runs focused contracts and
 the full OpenTUI check/build, obtains independent review, drives the candidate
 with termctrl, and analyzes its actual recording. The PR stage publishes the
-verified candidate branch and sanitized Preview evidence before the existing
-target compare-and-swap. The target update remains the only publication boundary;
+verified candidate branch and sanitized Preview evidence, then waits for a
+current-candidate Greptile 5/5 and completed green GitHub checks before the existing
+target compare-and-swap. A lower score, failed check or 30-minute observation timeout
+leaves the PR open and the target unchanged. Inspect the actual findings; fix real
+defects without gaming the score or widening the change into speculative refactors.
+The target update remains the only publication boundary;
 do not bypass it with `gh pr merge` or worker pushes. A startup/help Preview is
 not proof of a different feature interaction. Use the `before-and-after` skill
 for real matched comparisons and verify uploaded attachment URLs.

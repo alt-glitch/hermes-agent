@@ -196,21 +196,26 @@ class BaseEnvironment(ABC):
         """Copy a regular file out of the backend filesystem to ``local_dest`` on the host.
 
         One transport for every backend: base64 over the exec channel, bounded INSIDE the sandbox
-        (``head -c max+1`` so /dev/zero can't stream unbounded data into host memory — the same
-        shape ``tools.image_source`` uses to read sandbox images). The payload is fenced between
+        (a max+1 byte read from one regular-file descriptor). Every pathname component is opened
+        without following symlinks, so a caller's resolved-path policy cannot be bypassed by a
+        subsequent symlink swap. Requires Python 3 and POSIX no-follow support in the sandbox.
+        The payload is fenced between
         unique markers so login-shell noise in the merged stdout/stderr can't corrupt the decode.
         Raises :class:`FileFetchError` on a missing/unreadable/oversized file.
         """
         import base64
         import binascii
+        from tools.environments.file_fetch import file_fetch_command
+
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
         marker = f"__HERMES_FETCH_{uuid.uuid4().hex[:12]}__"
-        quoted = shlex.quote(remote_path)
-        # ``[ -f ]`` follows symlinks, so a link to a denied host file is judged by the CALLER on
-        # ``readlink -f`` output before any bytes move.
         result = self.execute(
-            f"[ -f {quoted} ] && echo {marker} && head -c {max_bytes + 1} < {quoted} | base64 && echo {marker}",
+            file_fetch_command(remote_path, max_bytes, marker),
             timeout=_FETCH_TIMEOUT_SECONDS, rewrite_compound_background=False)
         output = result.get("output") or ""
+        if result.get("returncode") == 127:
+            raise FileFetchError("secure remote media reads require python3 in the sandbox")
         first, last = output.find(marker), output.rfind(marker)
         if int(result.get("returncode") or 0) != 0 or first == -1 or last <= first:
             raise FileFetchError(f"could not read {remote_path!r} in the sandbox (missing, not a regular file, or unreadable)")

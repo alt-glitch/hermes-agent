@@ -232,7 +232,7 @@ class SignalCleanup:
         if os.name != "posix" or threading.current_thread() is not threading.main_thread():
             return self
 
-        for signum in (signal.SIGTERM, signal.SIGHUP):
+        for signum in (signal.SIGTERM, signal.SIGHUP):  # windows-footgun: ok — POSIX guard above
             previous = signal.getsignal(signum)
 
             def _handle(

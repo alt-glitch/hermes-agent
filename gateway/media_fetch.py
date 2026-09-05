@@ -10,7 +10,8 @@ there is not fetched — set ``_remote_home`` on the environment to opt in.
 
 The remote path is screened against the same denylist as local deliveries BEFORE any bytes move,
 and again after ``readlink -f`` (fail closed when it cannot resolve) — a remote fetch must never
-become a bypass of the host denylist. Strict mode (``HERMES_MEDIA_DELIVERY_STRICT``) keeps its
+become a bypass of the host denylist. Transfer requires sandbox Python 3 and POSIX no-follow
+opens; changed symlinks and hard-linked files are refused. Strict mode (``HERMES_MEDIA_DELIVERY_STRICT``) keeps its
 pre-existing behaviour: nothing is fetched, since a fetched copy would land in an allowlisted root
 and skip the recency gate strict mode exists for.
 """
@@ -97,8 +98,8 @@ def fetch_remote_media(path: str) -> Optional[str]:
     if not candidate.startswith("/") or remote_path_is_denied(candidate, remote_home):
         return None
     try:
-        # ``[ -f ]`` in fetch_file follows symlinks, so the link TARGET is what gets screened;
-        # an unresolvable path fails closed rather than trusting the unresolved name.
+        # Screen the canonical target; fetch_file then opens every component with
+        # no-follow semantics and reads that descriptor, refusing intervening swaps.
         resolved = env.fetch_realpath(candidate)
         if resolved is None or remote_path_is_denied(resolved, remote_home):
             return None

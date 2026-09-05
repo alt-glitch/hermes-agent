@@ -32,6 +32,20 @@ were retained. These are historical facts, not current health: read
 Save evidence first, generalize only after verifying cause and repair. Don't
 accumulate universal prohibitions or entire transcripts in skills.
 
+## Review timing correction (2026-09-05)
+
+PR #39 advanced the fork after local gates passed, but Greptile finished nine
+minutes later with 3/5. Its upstream-imported media symlink race reproduced on
+both leaf and parent-directory swaps; passing focused tests had not covered that
+window. The publisher now observes a current-head 5/5 and completed green remote
+checks before target CAS. A pending review is not approval, and the bot's green
+check conclusion alone does not mean its confidence score is 5/5. Keep PR findings
+separate from maintainer health: the cron stayed paused while these were repaired.
+
+The attribution workflow also compared every PR against `main`, even when targeting
+`sid/opentui`; this falsely charged earlier fork history to the new PR. Compare
+against the actual PR base before changing contributor records.
+
 ## Environment campaign corrections
 
 - A nonzero herdr prompt wait did not mean rejection: the real agent completed

@@ -91,6 +91,8 @@ class Github:
             self.ref = candidate + "\t" + ref
             result = "ok"
             phase = "push"
+        elif argv[:2] == [str(pub.GH), "api"]:
+            return json.dumps([[review_comment()]])
         else:
             phase = argv[2]
             if phase == "list":
@@ -106,6 +108,7 @@ class Github:
                     "headRefOid": "a" * 40,
                     "baseRefName": pub.BASE,
                     "state": "OPEN",
+                    "statusCheckRollup": green_checks(),
                 }
                 result = self.pr["url"]
             elif phase == "edit":
@@ -135,6 +138,69 @@ def github(monkeypatch):
 def publish(capture):
     root, manifest, _ = capture
     return pub.publish_preview(root.parent, root, manifest, node=NODE)
+
+
+def green_checks():
+    return [{
+        "__typename": "CheckRun", "name": name,
+        "status": "COMPLETED", "conclusion": "SUCCESS",
+    } for name in ("Greptile Review", "Python tests")]
+
+
+def review_comment(score="5", candidate="a" * 40, login="greptile-apps[bot]"):
+    return {
+        "id": 1, "user": {"login": login}, "updated_at": "2026-09-05T16:00:00Z",
+        "html_url": "https://github.com/alt-glitch/hermes-agent/pull/42#issuecomment-1",
+        "body": f"Confidence Score: {score}/5\nLast reviewed commit: [title](https://github.com/alt-glitch/hermes-agent/commit/{candidate})",
+    }
+
+
+def review_pr():
+    return {"headRefOid": "a" * 40, "state": "OPEN", "baseRefName": pub.BASE,
+            "statusCheckRollup": green_checks()}
+
+
+@pytest.mark.parametrize("comment", [
+    review_comment(candidate="b" * 40),
+    review_comment(login="not-the-review-bot"),
+    {**review_comment(), "user": None},
+])
+def test_review_requires_authenticated_current_candidate(comment):
+    assert pub.review_status(review_pr(), [comment], "a" * 40) is None
+
+
+def test_review_rejects_lower_score_and_later_downgrade():
+    earlier = review_comment()
+    later = {**review_comment(score="3"), "id": 2}
+    with pytest.raises(pub.PublicationError, match="not 5/5"):
+        pub.review_status(review_pr(), [earlier, later], "a" * 40)
+
+
+@pytest.mark.parametrize("change", [{"headRefOid": "b" * 40}, {"state": "MERGED"}, {"baseRefName": "main"}])
+def test_review_refuses_changed_pr(change):
+    with pytest.raises(pub.PublicationError, match="changed or closed"):
+        pub.review_status({**review_pr(), **change}, [review_comment()], "a" * 40)
+
+
+def test_review_requires_finished_green_checks():
+    pr = review_pr()
+    pr["statusCheckRollup"][1]["status"] = "IN_PROGRESS"
+    assert pub.review_status(pr, [review_comment()], "a" * 40) is None
+    pr["statusCheckRollup"][1].update(status="COMPLETED", conclusion="FAILURE")
+    with pytest.raises(pub.PublicationError, match="PR check failed"):
+        pub.review_status(pr, [review_comment()], "a" * 40)
+
+
+def test_review_timeout_keeps_target_untouched(capture, github, monkeypatch):
+    root, _, _ = capture
+    github.pr = review_pr()
+    github.pr["statusCheckRollup"] = []
+    clock = iter([0, 1801])
+    monkeypatch.setattr(pub.time, "monotonic", lambda: next(clock))
+    with pytest.raises(pub.PublicationError, match="still pending"):
+        pub.wait_for_review(root, 42, "a" * 40)
+    assert all(argv[0] == str(pub.GH) for argv in github.calls)
+    assert not (root / "pr-review.json").exists()
 
 
 def test_real_formatter_preview_seals_head_media_and_preserves_only_cas_publisher(
