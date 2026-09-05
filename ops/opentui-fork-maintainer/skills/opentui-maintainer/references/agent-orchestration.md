@@ -32,8 +32,14 @@ is needed; don't write a request unsupported by the installed worker.
    a different pending request is refused rather than overwritten. `created:
    false` means inspect the existing work, not start another worker.
 3. Dispatch the existing job headlessly, using the hosting service manager so
-   it survives the caller chat. On this Linux host, use a transient user systemd
-   **service**, not another timer or scheduler. Give it the deterministic name
+   it survives the caller chat. First inspect the job's enabled/state fields:
+   `cron run` refuses paused jobs, even when its CLI exits zero. If this task
+   authorizes enabling maintenance, use `cron resume <job_id>` in the owner
+   profile and verify its next run; otherwise ask before changing that pause.
+   Never treat a transient service starting as proof that an agent ran: verify
+   the durable cron execution and the request claim. On this Linux host, use a
+   transient user systemd **service**, not another timer or scheduler. Give it
+   the deterministic name
    `hermes-opentui-repair-<request_id>`; set its working directory to the managed
    Hermes checkout and `HERMES_HOME` to the identity file's profile. Run the
    absolute managed `venv/bin/hermes cron run <job_id>` entry point. Preserve the
