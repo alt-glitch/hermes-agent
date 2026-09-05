@@ -3013,13 +3013,33 @@ def test_video_analysis_uses_fixed_trusted_runtime_boundary(
     assert "PYTHONHOME" not in env
 
 
-def test_video_analysis_default_runtime_is_managed_install() -> None:
-    assert runtime.TRUSTED_HERMES_ROOT == Path.home() / ".hermes/hermes-agent"
-    assert runtime.TRUSTED_HERMES_ROOT != runtime.FORK_SOURCE_ROOT
-    assert (
-        runtime.TRUSTED_HERMES_PYTHON
-        == runtime.TRUSTED_HERMES_ROOT / "venv/bin/python"
+def test_video_analysis_default_runtime_is_managed_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hostile_home = tmp_path / "hostile-home"
+    hostile_hermes_home = tmp_path / "hostile-hermes-home"
+    hostile_home.mkdir()
+    hostile_hermes_home.mkdir()
+    monkeypatch.setenv("HOME", str(hostile_home))
+    monkeypatch.setenv("HERMES_HOME", str(hostile_hermes_home))
+
+    spec = importlib.util.spec_from_file_location(
+        "maintainer_runtime_conflicting_home", SCRIPT
     )
+    assert spec and spec.loader
+    fresh_runtime = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh_runtime)
+
+    assert Path.home() == hostile_home
+    assert fresh_runtime.TRUSTED_HERMES_ROOT == runtime.TRUSTED_HERMES_ROOT
+    assert fresh_runtime.TRUSTED_HERMES_PYTHON == runtime.TRUSTED_HERMES_PYTHON
+    assert fresh_runtime.TRUSTED_HERMES_ROOT != fresh_runtime.FORK_SOURCE_ROOT
+    assert (
+        fresh_runtime.TRUSTED_HERMES_PYTHON
+        == fresh_runtime.TRUSTED_HERMES_ROOT / "venv/bin/python"
+    )
+    assert not fresh_runtime.TRUSTED_HERMES_ROOT.is_relative_to(hostile_home)
+    assert not fresh_runtime.TRUSTED_HERMES_ROOT.is_relative_to(hostile_hermes_home)
 
 
 def _write_fake_video_runtime(root: Path, label: str) -> None:
