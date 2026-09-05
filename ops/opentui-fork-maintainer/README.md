@@ -119,3 +119,9 @@ slop. Failure lessons live with the compact maintainer skill.
 See `prompts/maintainer.md` for the control-plane protocol and `tests/` for its
 failure-path contracts. `docs/handoffs/opentui-maintainer-dashboard.md` describes
 a future read-only dashboard; no dashboard is deployed by this workflow.
+
+For supplemental Fable 5.1 agentic checks, follow
+`skills/opentui-maintainer/references/ultracode-verification.md`. Ultracode runs
+in a separate owned verification session; the formal publication reviewer keeps
+its read-only restrictions. Require actual workflow and interaction evidence,
+not merely a model summary or a successfully parsed setting.

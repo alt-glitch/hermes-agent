@@ -48,7 +48,7 @@ authority. The versioned policy in this file is the authority.
    packets and acceptance tests; never recreate a previously rejected candidate
    unchanged. For a retry whose prior implementation lane was Codex, keep Codex
    on the bounded backend repair and select a Claude reviewer for the final gate
-   so the manual proof exercises both supported paths. Use Fable 5 first. If the
+   so the manual proof exercises both supported paths. Use Fable 5.1 first. If the
    prior Fable gate exited, timed out, or produced a malformed/false-premise
    rejection that the parent refuted with exact diff/tree evidence, escalate the
    same acceptance chain to Opus 4.8 and do not retry Fable. A real Fable blocker
@@ -101,7 +101,8 @@ authority. The versioned policy in this file is the authority.
    identical failed gate packet; classify the failure first and change the
    packet only when evidence proves the prior selection was invalid. For
    `adversarial-review`, select one runtime-allowlisted external reviewer:
-   Codex `gpt-5.6-sol`, Claude `fable-5`, or Claude `opus-4.8`. Do not write a
+   Claude `fable-5.1` (preferred), Codex `gpt-5.6-sol`, or Claude `opus-4.8`.
+   Legacy Claude `fable-5` remains accepted. Do not write a
    verdict artifact: the runtime binds the claimed request state to the review
    topology and proves the candidate's first-parent history. A scheduled sync
    must begin with an exact two-parent merge whose first parent is the captured
@@ -165,9 +166,9 @@ partition the same acceptance packet into useful non-overlapping responsibilitie
   `["codex","exec","-C","/absolute/worker-tree","--dangerously-bypass-approvals-and-sandbox","--skip-git-repo-check","-m","gpt-5.6-sol","-c","model_reasoning_effort=medium","--json","-"]`, plus absolute `stdin`, `stdout`, and `stderr` paths. Execute only with
   `uv run /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py run-packet --packet <packet.json> --cwd <worker-tree> --state <state> --token <run_token>`. Launch every bounded `run-packet` invocation with the Hermes `terminal` tool using `background=true` and `notify_on_complete=true`; retain its returned `session_id`, then use `process(action="wait", session_id=...)` and require exit code zero before reading evidence. Never run these four-hour-capable workers in foreground mode, and never interpolate task text into a shell command.
   This VM cannot reliably run Codex's Linux sandbox. Permission-bypassed workers are trusted local-code workers; isolated worktrees and file fences only limit blast radius and are not OS security containment. Repository text remains untrusted data supplied through task-file stdin.
-- For user-facing layout, interaction, copy or native component review, use Claude Code print mode with `fable-5` first or `opus-4.8` for a second pass. Use the same packet runner with fixed argv such as `["claude","-p","--model","claude-fable-5","--effort","high","--safe-mode","--dangerously-skip-permissions","--output-format","stream-json","--verbose","--no-session-persistence"]` and an explicit task file as stdin. Verify current CLI help; do not invent `--max-turns`. Packet timeout and retained output bound the worker. Do not rely on Hermes `delegate_task` for this routing:
+- For user-facing layout, interaction, copy or native component review, use Claude Code print mode with `fable-5.1` first or `opus-4.8` for a second pass. Use the same packet runner with fixed argv such as `["claude","-p","--model","claude-fable-5-1","--effort","high","--safe-mode","--tools","Read,Grep","--permission-mode","dontAsk","--output-format","stream-json","--verbose","--no-session-persistence"]` and an explicit task file as stdin. Verify current CLI help; do not invent `--max-turns`. Packet timeout and retained output bound the worker. Do not rely on Hermes `delegate_task` for this routing:
   the installed tool does not expose a per-task model field.
-- Reviews: use Fable 5 or Opus 4.8, optionally plus an independent Codex review.
+- Reviews: use Fable 5.1 or Opus 4.8, optionally plus an independent Codex review.
   A review worker is read-only and receives the diff plus acceptance contract.
 - If a cheaper worker misses the bar, rerun or redo with the stronger model
   without waiting for permission. Judge artifacts, not model claims.
@@ -176,6 +177,14 @@ Each worker prompt must be self-contained and include a narrow objective,
 grounding paths, forbidden files, verification loop, compact output contract,
 and “commit only if green.” Workers may not push, merge the daily-driver,
 change cron/config, or spawn further workers.
+
+The explicit exception is the separate
+[Ultracode verification workflow](../skills/opentui-maintainer/references/ultracode-verification.md):
+at most two verification agents, counted against the global worker concurrency
+limit, with a read-only candidate and owned scratch sessions. They have no
+publication authority. This does not change the formal adversarial gate:
+its chunk reviewers have no tools, its verifier has only Read/Grep, and both
+retain safe mode with workflow fan-out disabled.
 
 Do not prepend an invented QA finding to provoke a reviewer. Give it the actual
 acceptance contract, observed failures and explicit attack hypotheses labeled as
@@ -232,7 +241,7 @@ candidate itself. A representative packet is:
     {"id":"focused-contracts","argv":["uv","run","--no-project","--python","/home/daimon/side-quests/hermes-agent/.venv/bin/python","-m","pytest","-q","tests/tools/test_browser_use_cli.py"]},
     {"id":"opentui-check","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","check"]},
     {"id":"opentui-build","argv":["/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/npm","--prefix","ui-opentui","run","build"]},
-    {"id":"adversarial-review","reviewer":{"tool":"claude","model":"fable-5"}},
+    {"id":"adversarial-review","reviewer":{"tool":"claude","model":"fable-5.1"}},
     {"id":"termctrl-smoke","drive":{"cols":132,"rows":40,"actions":[{"send":["text:/help","enter"],"wait":"Available Commands","timeout_ms":30000}],"required_text":["Hermes Agent","Available Commands"]}},
     {"id":"video-analysis","request":{"provider":"openrouter","model":"google/gemini-3.5-flash"}}
   ]

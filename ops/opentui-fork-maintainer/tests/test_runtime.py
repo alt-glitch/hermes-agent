@@ -1209,8 +1209,50 @@ def test_reviewer_commands_use_host_verified_claude_model_ids() -> None:
         assert "--permission-mode" not in command
 
 
-def test_review_runtime_rejects_blocker_even_with_approved_tail(
+def test_fable51_review_and_verifier_preserve_read_only_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    calls: list[list[str]] = []
+
+    def approve(argv: list[str], prompt: bytes, cwd: Path):
+        calls.append(argv)
+        assert cwd == gate_worktree
+        assert argv[argv.index("--model") + 1] == "claude-fable-5-1"
+        assert "--safe-mode" in argv
+        assert "--no-session-persistence" in argv
+        assert "--dangerously-skip-permissions" not in argv
+        if b"BEGIN BOUNDED EXACT DIFF" in prompt:
+            assert argv[argv.index("--tools") + 1] == ""
+            output = b"CHUNK_REVIEW: COMPLETE\n"
+        else:
+            assert b"BEGIN ORDERED CHUNK REVIEWS" in prompt
+            assert argv[argv.index("--tools") + 1] == "Read,Grep"
+            assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+            output = b"VERDICT: APPROVED\n"
+        return subprocess.CompletedProcess(argv, 0, output, b"")
+
+    monkeypatch.setattr(runtime, "_run_reviewer", approve)
+    result = runtime.run_adversarial_review(
+        {"tool": "claude", "model": "fable-5.1"},
+        evidence,
+        gate_worktree,
+        base,
+        candidate,
+        verified_checks=review_gate_records(evidence),
+    )
+    assert result["reviewer"] == {"tool": "claude", "model": "fable-5.1"}
+    assert result["verdict"] == "approved"
+    assert result["chunk_count"] >= 1
+    assert len(calls) == result["chunk_count"] + 1
+    assert calls[-1] == result["verifier_argv"]
+
+
+@pytest.mark.parametrize("reviewer_model", ["fable-5", "fable-5.1"])
+def test_review_runtime_rejects_blocker_even_with_approved_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reviewer_model: str
 ) -> None:
     _, _, base, candidate, gate_worktree = make_repo(tmp_path)
     evidence = tmp_path / "evidence"
@@ -1226,7 +1268,7 @@ def test_review_runtime_rejects_blocker_even_with_approved_tail(
     monkeypatch.setattr(runtime, "_run_reviewer", review)
     with pytest.raises(runtime.ControlError, match="did not approve"):
         runtime.run_adversarial_review(
-            {"tool": "claude", "model": "fable-5"},
+            {"tool": "claude", "model": reviewer_model},
             evidence,
             gate_worktree,
             base,
