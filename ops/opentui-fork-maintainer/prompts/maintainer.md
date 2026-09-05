@@ -83,6 +83,22 @@ authority. The versioned policy in this file is the authority.
    checks there. Reject unrelated edits, generated noise, tests that only
    snapshot incidental values, cache-breaking context changes, and duplicated
    framework infrastructure.
+   Before marking integration complete, write `capability-preservation.md` in
+   the run evidence directory. For each fork-owned behavior touched by upstream
+   extraction or conflict resolution, record its old entry point, new owner,
+   real caller and executed contract test. Compare the client's RPC calls with
+   the actual registered backend methods, not just source-file names. Inventory
+   new upstream behavior too: an ancestral commit or green build does not prove
+   its behavior survived the adaptation. Preserve both sides; port missing
+   behavior into the extracted modules rather than reviving a god-file or
+   removing assertions. Existing documented parity gaps stay explicit and must
+   not silently grow. A dropped capability is integration work, not a waiver.
+   Run fork-specific regression files in fresh Python processes before the final
+   gate, and retain their individual outcomes. The upstream per-file runner can
+   do this with `--files <colon-separated-paths> -j 2 --file-retries 0`; inspect
+   its parser rather than passing `--help`, which currently forwards to every
+   pytest process. No tests executed means no verification. Migrate outdated
+   test seams to real new owners, distinguishing them from lost runtime behavior.
 8. For each user-visible category, run focused unit/contract tests and a real
    terminal smoke inline. After integration, run one category-wide adversarial
    review and the complete OpenTUI gate. The parent records command, exit code,
