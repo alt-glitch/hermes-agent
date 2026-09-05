@@ -23,6 +23,10 @@ On retry, verify prior artifact hashes and candidate identity before reusing
 integration evidence; the final candidate-bound gate still runs in full. The
 300k compression cap is not a guarantee that a provider accepts requests that
 large during peak load. A capacity rejection is not an authentication failure.
+Terminal previews are capped at 12,000 characters in this profile; full output
+remains in the tool's spill file or your redirected artifact. Search those files
+for failures and read the relevant ranges, not the whole spill back into context.
+This does not limit instruction/skill reads or change the compression threshold.
 
 Before a Codex worker, run `codex login status` from the Hermes terminal child
 environment. This profile sets `terminal.home_mode: real` so external CLIs see

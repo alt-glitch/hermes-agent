@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 from dotenv import dotenv_values
 import pytest
@@ -62,7 +66,35 @@ def test_apply_isolates_credentials_and_installs_policy(environment):
     assert config["compression"]["threshold_tokens"] == 300_000
     assert config["mcp_servers"] == {} and config["fallback_model"] is None
     assert config["terminal"]["home_mode"] == "real"
+    assert config["tool_output"]["max_bytes"] == 12_000
     assert any(path.read_text() == "old identity\n" for path in (profile / "setup-backups").rglob("SOUL.md"))
+
+
+def test_provisioned_preview_limit_preserves_full_terminal_output(environment):
+    profile, demo, source, skill = environment
+    provisioner.provision(skill, demo, True)
+    probe = """
+import json
+from pathlib import Path
+from tools.terminal_tool import terminal_tool
+result = json.loads(terminal_tool('/usr/bin/seq 1 10000', task_id='maintainer-preview-probe'))
+assert result['exit_code'] == 0, result
+assert 'OUTPUT TRUNCATED' in result['output']
+assert len(result['output']) < 13000
+assert '5000\\n' not in result['output']
+full = Path(result['full_output_path']).read_text()
+# The raw spill also retains the terminal's trailing cwd marker.
+assert full.startswith(''.join(f'{i}\\n' for i in range(1, 10001)))
+print(json.dumps({'preview_chars': len(result['output']), 'full_chars': len(full)}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe], cwd=SCRIPT.parents[3],
+        env={"PATH": os.defpath, "HOME": str(profile), "HERMES_HOME": str(profile)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    sizes = json.loads(result.stdout)
+    assert sizes["preview_chars"] < sizes["full_chars"]
 
 
 def test_repeated_refresh_preserves_prior_versions_outside_skill_discovery(environment):

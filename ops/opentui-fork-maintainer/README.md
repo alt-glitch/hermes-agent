@@ -33,6 +33,11 @@ profile. Verify login and a bounded real tool call from the actual child
 environment, not just from the orchestration shell. A 401 from an empty worker
 HOME is distinct from the parent's provider capacity errors.
 
+The profile sets `tool_output.max_bytes: 12000` (the existing setting counts
+characters) to bound terminal previews. Full command output remains available
+in spill files or redirected evidence logs. This reduces accidental context
+growth; it does not guarantee provider capacity or lower the 300k compaction cap.
+
 ## Provision and migrate
 
 Use the managed Hermes Python with `uv`. Inspect the printed plan before apply.

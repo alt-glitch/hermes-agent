@@ -123,6 +123,7 @@ def provision(dev_skill: Path, credential_home: Path, apply: bool, refresh_skill
     plan = {
         "profile": str(PROFILE), "model": MODEL, "provider": "openrouter",
         "api_mode": "codex_responses", "compaction_tokens": 300_000,
+        "terminal_preview_chars": 12_000,
         "credential_source": str(credential_home / ".env"),
         "credential_names": ["OPENROUTER_API_KEY"], "skills": list(sources),
         "applied": apply, "refresh_skills": refresh_skills,
@@ -150,6 +151,7 @@ def provision(dev_skill: Path, credential_home: Path, apply: bool, refresh_skill
     config["fallback_model"] = None
     config["mcp_servers"] = {}
     config.setdefault("terminal", {})["home_mode"] = "real"
+    config.setdefault("tool_output", {})["max_bytes"] = plan["terminal_preview_chars"]
     config.setdefault("display", {}).update({"tui_engine": "opentui", "tui_compact": True})
     config.setdefault("auxiliary", {})["compression"] = {"provider": "openrouter", "model": MODEL}
     config_text = StringIO()
