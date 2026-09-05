@@ -54,10 +54,11 @@ claims that only the fake gateway existed.
 - Composition root: `entry/main.tsx` intentionally constructs application and
   fixture Layers. The generic constructor-import rule currently reports this
   legitimate wiring; do not relocate or rename construction to evade it.
-- Journey rendering: `journey.tsx` casts decoded data through `unknown` to a
-  visual contract, while `JourneyResponses.ts` leaves frames/legend unparsed.
-  This needs an actual visual schema and malformed-frame tests before removing
-  the assertion. Replacing it with a single assertion would conceal the gap.
+- Journey rendering: the follow-up added visual schemas in `JourneyResponses.ts`
+  and removed the view's double assertion. Malformed frames or legends fall back
+  independently to empty visuals without hiding the validated learning list;
+  `journey.test.ts` and `journeyView.test.tsx` cover this boundary and interaction.
+  The initial diagnostic totals above predate this follow-up.
 - Assertions: justify only invariants established by real code. Prefer removing
   the assertion or fixing the owner contract over adding a stock safety comment.
 

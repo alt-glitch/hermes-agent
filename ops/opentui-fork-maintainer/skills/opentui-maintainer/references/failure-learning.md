@@ -104,3 +104,17 @@ owner. Module counts and successful Git ancestry do not establish parity.
 - Review diffs must include changed facade signatures and unchanged contract
   context. Refute missing-context findings with source, not assertion changes.
   Targeted title events also avoid racing a full stale session-state snapshot.
+
+## Review evidence fidelity (2026-09-06)
+
+- A manual static Claude review without the formal tool-free prompt returned
+  XML-shaped pretend tool calls, despite a successful process exit. The actual
+  runtime chunk prompt passed its smoke test unchanged; real read-only source
+  tools also worked. Preserve malformed output as a failed attempt, verify the
+  actual runner, and never count process success as a review verdict.
+- The video judge reported duplicate help rows that did not exist in any
+  recorded output state. Require timestamp/region evidence, distinguish a row
+  persisting across frames from duplicates in one frame, and verify claims by
+  replaying the recording. Preserve rejected results and the reason for any
+  rerun. Even a passing judge can misread labels; source and native frames own
+  exact text, and a startup/help clip proves only that interaction.

@@ -107,7 +107,11 @@ REVIEW_PREREQUISITE_GATES = (
 )
 VIDEO_RESULT_PREFIX = b"HERMES_VIDEO_RESULT_B64="
 VIDEO_PROMPT = (
-    "Review this Hermes OpenTUI acceptance recording. End with exactly "
+    "Review this Hermes OpenTUI acceptance recording. Ground each finding in a "
+    "timestamp and screen location, quoting the visible text when relevant. "
+    "Distinguish a row persisting across frames from duplicate rows visible "
+    "in the same frame. Do not infer unseen content or unseen interactions. "
+    "End with exactly "
     "VERDICT: PASS only if the tested flow is visibly complete and there is no "
     "crash, clipping, corruption, duplicate content, or stuck overlay; otherwise "
     "end with exactly VERDICT: FAIL and explain every finding. The final line "
