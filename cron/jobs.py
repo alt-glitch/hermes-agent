@@ -2075,6 +2075,9 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dic
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    dispatch_error = unsettled_dispatch_limit_error(job)
+    if dispatch_error:
+        raise ValueError(dispatch_error)
     if is_terminal_job(job):
         name = job.get("name", job_id)
         raise ValueError(
@@ -3080,6 +3083,16 @@ def _reserved_recurring_limit_reached(job: Dict[str, Any]) -> bool:
         job.get("schedule", {}).get("kind") in {"cron", "interval"}
         and isinstance(job.get("dispatch_claim"), dict)
         and times is not None and times > 0 and repeat.get("completed", 0) >= times)
+
+
+def unsettled_dispatch_limit_error(job: Dict[str, Any]) -> Optional[str]:
+    """Explain a spent final reservation without claiming the worker is still running."""
+    if _reserved_recurring_limit_reached(job) and not job["dispatch_claim"].get("settled"):
+        return (
+            f"Job has exhausted its repeat budget; execution {job['dispatch_claim']['execution_id']} "
+            "has an unsettled reserved attempt. Inspect its execution record before increasing "
+            "the repeat limit or creating a new job.")
+    return None
 
 
 def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan) -> bool:

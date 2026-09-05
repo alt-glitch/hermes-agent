@@ -293,3 +293,85 @@ def test_cancelled_recurring_dispatch_spends_no_slot(tmp_path, monkeypatch):
             assert jobs.claim_job_for_fire(created["id"])
         finally:
             scheduler.release_running_job(created["id"])
+
+
+@pytest.mark.parametrize("early_shutdown", [True, False])
+def test_interrupted_finite_run_settles_when_shutdown_could_not_write(tmp_path, monkeypatch, early_shutdown):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    with jobs.use_cron_store(tmp_path):
+        created = jobs.create_job(prompt="interrupt", schedule="every 5m", repeat=1, deliver="local")
+        claimed = jobs.claim_job_for_fire(created["id"], return_job=True)
+        assert scheduler.try_register_running_job(created["id"])
+
+        def launch(_job):
+            if early_shutdown:
+                assert scheduler.mark_running_jobs_interrupted("early shutdown") == [created["id"]]
+            return False
+
+        def run(*args, **kwargs):
+            if not early_shutdown:
+                with patch.object(scheduler, "mark_job_run", side_effect=jobs.CronStoreLockTimeout("busy")):
+                    scheduler.mark_running_jobs_interrupted("store busy during shutdown")
+            return True, "result", "result", None
+
+        try:
+            with patch.object(scheduler, "_launch_external_cron_worker", side_effect=launch), \
+                    patch.object(scheduler, "run_job", side_effect=run):
+                assert scheduler.run_one_job(claimed)
+            stored = jobs.get_job(created["id"])
+            assert stored["repeat"]["completed"] == 1
+            assert stored["dispatch_claim"]["settled"] is True
+            assert stored["last_run_at"] is not None
+            assert stored["last_status"] == "error"
+            assert executions.get_execution(claimed["execution_id"])["status"] == "failed"
+        finally:
+            scheduler.release_running_job(created["id"])
+            scheduler._interrupted_job_ids.discard(created["id"])
+
+
+def test_exhausted_unsettled_attempt_rejects_trigger_and_explains_manual_refusal(tmp_path):
+    with jobs.use_cron_store(tmp_path):
+        created = jobs.create_job(prompt="spent", schedule="every 5m", repeat=1)
+        claimed = jobs.claim_job_for_fire(created["id"], return_job=True)
+        assert jobs.claim_dispatch(created["id"], execution_id="pending-result", expected_fire_owner=claimed["fire_claim"]["by"])
+        before = jobs.get_job(created["id"])
+        with pytest.raises(ValueError, match="exhausted.*pending-result"):
+            jobs.trigger_job(created["id"])
+        result = _execute_job_now(before)
+        assert result["claimed"] is False
+        assert "exhausted" in result["error"]
+        assert "pending-result" in result["error"]
+        assert jobs.get_job(created["id"]) == before
+
+
+def test_due_claim_lock_refusal_finishes_unstarted_execution(tmp_path):
+    with jobs.use_cron_store(tmp_path):
+        created = jobs.create_job(prompt="claim failure", schedule="every 5m", repeat=1)
+        row = executions.create_execution(created["id"], source="test")
+        created["execution_id"] = row["id"]
+        with patch.object(scheduler, "claim_job_for_fire", side_effect=jobs.CronStoreLockTimeout("busy")):
+            with pytest.raises(jobs.CronStoreLockTimeout):
+                scheduler._process_due_job(created, None, None, False)
+        assert executions.get_execution(row["id"])["status"] == "failed"
+        assert jobs.get_job(created["id"])["repeat"]["completed"] == 0
+
+
+@pytest.mark.parametrize("prior_reserved", [False, True])
+def test_failed_external_handoff_counts_its_attempt_not_prior_reservation(tmp_path, monkeypatch, prior_reserved):
+    now = jobs._hermes_now()
+    with jobs.use_cron_store(tmp_path):
+        created = jobs.create_job(prompt="failed handoff", schedule="every 5m", repeat=3)
+        if prior_reserved:
+            old = jobs.claim_job_for_fire(created["id"], return_job=True)
+            assert jobs.claim_dispatch(created["id"], execution_id="old", expected_fire_owner=old["fire_claim"]["by"])
+        monkeypatch.setattr(jobs, "_hermes_now", lambda: now + timedelta(hours=3))
+        claimed = jobs.claim_job_for_fire(created["id"], return_job=True)
+        before = jobs.get_job(created["id"])["repeat"]["completed"]
+        with patch.object(scheduler, "_launch_external_cron_worker", side_effect=RuntimeError("launch failed")):
+            assert scheduler.run_one_job(claimed)
+        stored = jobs.get_job(created["id"])
+        assert stored["repeat"]["completed"] == before + 1
+        assert stored["dispatch_claim"]["execution_id"] == claimed["execution_id"]
+        assert stored["dispatch_claim"]["settled"] is True
+        assert stored["last_status"] == "error"

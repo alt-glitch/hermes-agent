@@ -41,6 +41,7 @@ from cron.jobs import (
     remove_job,
     resolve_job_ref,
     resume_job,
+    unsettled_dispatch_limit_error,
     update_job)
 from tools.cronjob_prompt_scan import _scan_cron_prompt
 from tools.cronjob_job_args import (
@@ -192,6 +193,8 @@ def _claim_for_manual_run(job_id: str, log_label: str):
         refreshed = get_job(job_id)
         if refreshed is None:
             reason = "Job no longer exists; nothing to run."
+        elif dispatch_error := unsettled_dispatch_limit_error(refreshed):
+            reason = dispatch_error
         elif not is_job_runnable(refreshed):
             reason = "Job is paused/disabled; resume it before running."
         else:

@@ -480,6 +480,7 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 
 
 from cron.jobs import (
+    CronStoreLockTimeout,
     _ensure_cron_dir, advance_next_run, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     run_claim_is_owned,
@@ -2587,12 +2588,16 @@ def run_one_job(
             claim = job.get("fire_claim")
             owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
             try:
-                mark_job_run(
-                    job["id"],
-                    False,
-                    error,
-                    **({"expected_fire_owner": owner} if owner else {}),
-                )
+                mark_kwargs = {"expected_fire_owner": owner} if owner else {}
+                reserved = True
+                if _finite_recurring_job(job):
+                    # Failed handoffs already count as attempts. Bind that accounting to this
+                    # execution too, without settling a previous owner's unfinished reservation.
+                    mark_kwargs["expected_execution_id"] = execution_id
+                    reserved = claim_dispatch(
+                        job["id"], execution_id=execution_id, expected_fire_owner=owner or None)
+                if reserved:
+                    mark_job_run(job["id"], False, error, **mark_kwargs)
             finally:
                 finish_execution(execution_id, success=False, error=error)
             return True
@@ -2842,8 +2847,10 @@ def _save_compose_deliver(
 
 
 def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Optional[str]) -> None:
-    """Shutdown already wrote last_status, so mark_job_run is skipped (a second call would skip a
-    fire or auto-delete the job); an unsent notice is recorded via update_job instead."""
+    """Settle finite reservations idempotently if shutdown could not persist the outcome.
+
+    Legacy jobs still skip the second mark: their counters are not execution-deduplicated.
+    """
     if delivery_error:
         try:
             # The gateway shutdown already wrote last_status for this run, so mark_job_run is skipped below
@@ -2856,6 +2863,12 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
         except Exception as _rec_err:
             logger.debug(
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
+    if _finite_recurring_job(job):
+        claim = job.get("fire_claim") or {}
+        mark_job_run(
+            job["id"], False, "Interrupted by gateway shutdown before terminal completion.",
+            delivery_error=delivery_error, expected_execution_id=execution_id,
+            expected_fire_owner=claim.get("by"))
     finish_execution(
         execution_id, success=False,
         error="Interrupted by gateway shutdown before terminal completion.")
@@ -3707,7 +3720,13 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     kwargs = {"return_job": True}
     if isinstance(run_claim, dict) and run_claim.get("token"):
         kwargs["expected_run_claim_token"] = run_claim["token"]
-    claimed = claim_job_for_fire(job["id"], **kwargs)
+    try:
+        claimed = claim_job_for_fire(job["id"], **kwargs)
+    except CronStoreLockTimeout as exc:
+        _finish_execution_best_effort(
+            job["execution_id"], success=False,
+            error=f"Fire claim failed before dispatch: {exc}")
+        raise
     if not claimed:
         finish_execution(
             job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
