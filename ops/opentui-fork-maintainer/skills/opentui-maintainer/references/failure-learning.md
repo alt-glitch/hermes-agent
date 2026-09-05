@@ -46,6 +46,19 @@ The attribution workflow also compared every PR against `main`, even when target
 `sid/opentui`; this falsely charged earlier fork history to the new PR. Compare
 against the actual PR base before changing contributor records.
 
+PR #40's first review found the next missing case: GitHub's status rollup lists
+reported checks, not the base branch's requirements. An absent required check must
+remain pending even when every reported item is green. Read protection and ruleset
+policy, then also require GitHub's clean merge decision; don't weaken checks to
+raise the review score.
+
+The full session-store tests caught a merge omission that the focused gates missed:
+model rankings had retained picker activations but lost their API-call updates.
+Restore the pre-merge delta accounting in the extracted usage module, preserving
+absolute counters and provider-fallback attribution. Include these tests when
+rebasing session-store changes. Also run the compatibility-pointer checker, not
+only the Windows scanner: both execute in the same remote CI job.
+
 ## Environment campaign corrections
 
 - A nonzero herdr prompt wait did not mean rejection: the real agent completed

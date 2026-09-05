@@ -120,9 +120,8 @@ class TestModelPickerUsage:
         import hermes_state_common
         import hermes_state_schema
 
-        assert hermes_state_common.SCHEMA_SQL == hermes_state.SCHEMA_SQL
-        assert hermes_state_schema.SCHEMA_SQL == hermes_state.SCHEMA_SQL
-        assert "CREATE TABLE IF NOT EXISTS model_picker_usage" in hermes_state.SCHEMA_SQL
+        assert hermes_state_schema.SCHEMA_SQL == hermes_state_common.SCHEMA_SQL
+        assert "CREATE TABLE IF NOT EXISTS model_picker_usage" in hermes_state_common.SCHEMA_SQL
 
     def test_record_activation_upserts_and_normalizes_endpoint(self, db, monkeypatch):
         timestamps = iter((10.0, 20.0))

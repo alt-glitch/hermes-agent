@@ -90,9 +90,16 @@ the full OpenTUI check/build, obtains independent review, drives the candidate
 with termctrl, and analyzes its actual recording. The PR stage publishes the
 verified candidate branch and sanitized Preview evidence, then waits for a
 current-candidate Greptile 5/5 and completed green GitHub checks before the existing
-target compare-and-swap. A lower score, failed check or 30-minute observation timeout
+target compare-and-swap. It reads classic branch protection and active rulesets for
+the exact base, requires every configured status context to be reported, and waits
+for GitHub's clean merge decision (including source-app bindings). Unreadable policy
+or unsupported rules such as required workflows fail closed for maintainer review;
+they are never inferred from display names. A lower score, failed check or 30-minute observation timeout
 leaves the PR open and the target unchanged. Inspect the actual findings; fix real
 defects without gaming the score or widening the change into speculative refactors.
+Even on an unprotected branch, `Greptile Review` and CI's final `All required
+checks pass` aggregate must report; a workflow that never starts cannot authorize
+publication.
 The target update remains the only publication boundary;
 do not bypass it with `gh pr merge` or worker pushes. A startup/help Preview is
 not proof of a different feature interaction. Use the `before-and-after` skill

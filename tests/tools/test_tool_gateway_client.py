@@ -56,6 +56,37 @@ def make_client(transport):
     )
 
 
+def test_default_auth_reads_rotated_credentials_for_trusted_origins(tmp_path, monkeypatch):
+    from tools.tool_gateway.client import _default_header_provider
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CONNECTOR_GATEWAY_URL", "https://connector.test")
+    monkeypatch.setenv("TOOL_GATEWAY_URL", "https://tool.test")
+    for token in ("first-synthetic-token", "rotated-synthetic-token"):
+        monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", token)
+        for origin in ("https://connector.test", "https://tool.test"):
+            assert _default_header_provider(origin + "/v1/connectors/search") == {
+                "Authorization": f"Bearer {token}",
+            }
+    for untrusted in ("https://connector.test.evil", "http://connector.test", "https://connector.test:444", "https://elsewhere.test"):
+        assert _default_header_provider(untrusted) == {}
+
+
+def test_default_auth_has_no_dependency_on_temporary_compat_helpers(tmp_path, monkeypatch):
+    import tools.managed_tool_gateway as gateway
+    from tools.tool_gateway.client import _default_header_provider
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CONNECTOR_GATEWAY_URL", "https://connector.test")
+    monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "synthetic-token")
+    # Model the scheduled removal without importing a deprecated alias.
+    for name in ("managed_gateway_auth_headers", "is_managed_nous_gateway_url"):
+        monkeypatch.delitem(vars(gateway), name, raising=False)
+    assert _default_header_provider("https://connector.test/v1/connectors/search") == {
+        "Authorization": "Bearer synthetic-token",
+    }
+
+
 def execute_envelope(results):
     errors = sum(1 for r in results if r.get("error"))
     return {

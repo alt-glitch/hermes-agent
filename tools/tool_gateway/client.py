@@ -1,8 +1,7 @@
 """HTTP client for the connector routes on the managed tool gateway.
 
 Constructed per dispatch — a portal access token expires within the hour, so
-auth headers are read fresh on every call (the ``managed_gateway_auth_headers``
-idiom). Sync ``requests`` on purpose: the bridge branch cannot reach the
+auth headers are read fresh on every call. Sync ``requests`` on purpose: the bridge branch cannot reach the
 registry's async bridge, so every call here runs on the calling thread.
 
 Injectable seams (``transport`` / ``endpoint_resolver`` / ``header_provider``)
@@ -31,6 +30,7 @@ from __future__ import annotations
 import logging
 import uuid
 from typing import Any, Callable, Optional, Protocol, Sequence
+from urllib.parse import urlsplit
 
 import requests
 
@@ -99,9 +99,22 @@ def _default_endpoint_resolver() -> Optional[str]:
 
 
 def _default_header_provider(url: str) -> dict:
-    from tools.managed_tool_gateway import managed_gateway_auth_headers
+    from tools.managed_tool_gateway import (
+        connector_gateway_origin,
+        managed_gateway_origin,
+        read_nous_access_token,
+    )
 
-    return managed_gateway_auth_headers(url)
+    try:
+        actual = urlsplit(url)
+        trusted = {urlsplit(origin())[:2] for origin in (connector_gateway_origin, managed_gateway_origin)}
+        if not actual.scheme or actual[:2] not in trusted:
+            return {}
+        token = read_nous_access_token()
+    except Exception as exc:
+        logger.debug("Connector gateway auth resolution failed: %s", exc)
+        return {}
+    return {"Authorization": f"Bearer {token.strip()}"} if isinstance(token, str) and token.strip() else {}
 
 
 class ConnectorClient:

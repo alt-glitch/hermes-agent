@@ -400,6 +400,30 @@ class SessionUsageMixin:
             conn.execute(sql, params)
             if record_model_usage:
                 self._record_model_usage(conn, session_id, **usage)
+            picker_delta = max(0, int(api_call_count) - int(existing.get("api_call_count") or 0)) if absolute else max(0, int(api_call_count))
+            if picker_delta <= 0:
+                return
+            route = conn.execute(
+                "SELECT billing_provider, model, billing_base_url FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            # Per-call identity wins over the sticky display route after fallback.
+            if route is None:
+                return
+            provider_id = str(billing_provider or route[0] or "").strip()
+            model_id = str(model or route[1] or "").strip()
+            endpoint = str(billing_base_url or route[2] or "").strip().rstrip("/")
+            if not provider_id or not model_id:
+                return
+            conn.execute(
+                """INSERT INTO model_picker_usage
+                       (provider_id, model, base_url, last_used_at, activation_count)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(provider_id, model, base_url) DO UPDATE SET
+                       last_used_at = excluded.last_used_at,
+                       activation_count = model_picker_usage.activation_count + excluded.activation_count""",
+                (provider_id, model_id, endpoint, time.time(), picker_delta),
+            )
         self._execute_write(_do)
 
     def _record_model_usage(

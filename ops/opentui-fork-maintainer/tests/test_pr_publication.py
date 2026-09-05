@@ -92,6 +92,10 @@ class Github:
             result = "ok"
             phase = "push"
         elif argv[:2] == [str(pub.GH), "api"]:
+            if argv[2] == "graphql":
+                return json.dumps({"data": {"repository": {"ref": {"name": pub.BASE, "branchProtectionRule": None}}}})
+            if "/rules/branches/" in argv[-1]:
+                return "[[]]"
             return json.dumps([[review_comment()]])
         else:
             phase = argv[2]
@@ -109,6 +113,7 @@ class Github:
                     "baseRefName": pub.BASE,
                     "state": "OPEN",
                     "statusCheckRollup": green_checks(),
+                    "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE",
                 }
                 result = self.pr["url"]
             elif phase == "edit":
@@ -144,7 +149,7 @@ def green_checks():
     return [{
         "__typename": "CheckRun", "name": name,
         "status": "COMPLETED", "conclusion": "SUCCESS",
-    } for name in ("Greptile Review", "Python tests")]
+    } for name in ("Greptile Review", "Python tests", "All required checks pass")]
 
 
 def review_comment(score="5", candidate="a" * 40, login="greptile-apps[bot]"):
@@ -157,7 +162,11 @@ def review_comment(score="5", candidate="a" * 40, login="greptile-apps[bot]"):
 
 def review_pr():
     return {"headRefOid": "a" * 40, "state": "OPEN", "baseRefName": pub.BASE,
+            "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE",
             "statusCheckRollup": green_checks()}
+
+
+POLICY = {"base": pub.BASE, "contexts": ["Python tests"], "classic": None, "rules": []}
 
 
 @pytest.mark.parametrize("comment", [
@@ -166,29 +175,85 @@ def review_pr():
     {**review_comment(), "user": None},
 ])
 def test_review_requires_authenticated_current_candidate(comment):
-    assert pub.review_status(review_pr(), [comment], "a" * 40) is None
+    assert pub.review_status(review_pr(), [comment], "a" * 40, POLICY) is None
 
 
 def test_review_rejects_lower_score_and_later_downgrade():
     earlier = review_comment()
     later = {**review_comment(score="3"), "id": 2}
     with pytest.raises(pub.PublicationError, match="not 5/5"):
-        pub.review_status(review_pr(), [earlier, later], "a" * 40)
+        pub.review_status(review_pr(), [earlier, later], "a" * 40, POLICY)
 
 
 @pytest.mark.parametrize("change", [{"headRefOid": "b" * 40}, {"state": "MERGED"}, {"baseRefName": "main"}])
 def test_review_refuses_changed_pr(change):
     with pytest.raises(pub.PublicationError, match="changed or closed"):
-        pub.review_status({**review_pr(), **change}, [review_comment()], "a" * 40)
+        pub.review_status({**review_pr(), **change}, [review_comment()], "a" * 40, POLICY)
 
 
 def test_review_requires_finished_green_checks():
     pr = review_pr()
     pr["statusCheckRollup"][1]["status"] = "IN_PROGRESS"
-    assert pub.review_status(pr, [review_comment()], "a" * 40) is None
+    assert pub.review_status(pr, [review_comment()], "a" * 40, POLICY) is None
     pr["statusCheckRollup"][1].update(status="COMPLETED", conclusion="FAILURE")
     with pytest.raises(pub.PublicationError, match="PR check failed"):
-        pub.review_status(pr, [review_comment()], "a" * 40)
+        pub.review_status(pr, [review_comment()], "a" * 40, POLICY)
+
+
+def test_missing_required_check_cannot_be_approved_even_with_green_greptile():
+    pr = review_pr()
+    pr["statusCheckRollup"] = green_checks()[:1]
+    assert pub.review_status(pr, [review_comment()], "a" * 40, POLICY) is None
+    pr["statusCheckRollup"] = green_checks()
+    assert pub.review_status(pr, [review_comment()], "a" * 40, POLICY)["score"] == "5/5"
+
+
+@pytest.mark.parametrize("state", ["BLOCKED", "BEHIND", "UNKNOWN", "UNSTABLE", "DRAFT"])
+def test_green_rollup_does_not_override_github_merge_policy(state):
+    assert pub.review_status({**review_pr(), "mergeStateStatus": state}, [review_comment()], "a" * 40, POLICY) is None
+
+
+def test_policy_combines_classic_and_active_branch_rules(tmp_path, monkeypatch):
+    responses = iter([
+        {"data": {"repository": {"ref": {"name": pub.BASE, "branchProtectionRule": {
+            "requiresStatusChecks": True, "requiredStatusCheckContexts": ["unit"],
+            "requiredStatusChecks": [{"context": "unit", "app": {"databaseId": 123}}],
+        }}}}},
+        [[{"type": "required_status_checks", "parameters": {"required_status_checks": [
+            {"context": "integration", "integration_id": 456},
+        ]}}]],
+    ])
+    monkeypatch.setattr(pub, "_run", lambda argv, cwd: json.dumps(next(responses)))
+    policy = pub.required_check_policy(tmp_path)
+    assert set(policy["contexts"]) == {"integration", "unit", *pub.REQUIRED_CONTEXTS}
+    assert policy["classic"]["requiredStatusChecks"][0]["app"]["databaseId"] == 123
+
+
+@pytest.mark.parametrize("response", [{"errors": [{"message": "denied"}]}, {"data": {"repository": {"ref": None}}}])
+def test_unknown_base_policy_fails_closed(tmp_path, monkeypatch, response):
+    monkeypatch.setattr(pub, "_run", lambda argv, cwd: json.dumps(response))
+    with pytest.raises(pub.PublicationError, match="could not be determined"):
+        pub.required_check_policy(tmp_path)
+
+
+def test_required_workflow_policy_fails_closed_instead_of_matching_display_names(tmp_path, monkeypatch):
+    responses = iter([
+        {"data": {"repository": {"ref": {"name": pub.BASE, "branchProtectionRule": None}}}},
+        [[{"type": "workflows", "parameters": {"workflows": [{"path": ".github/workflows/security.yml"}]}}]],
+    ])
+    monkeypatch.setattr(pub, "_run", lambda argv, cwd: json.dumps(next(responses)))
+    with pytest.raises(pub.PublicationError, match="unsupported branch rule"):
+        pub.required_check_policy(tmp_path)
+
+
+def test_unprotected_fork_still_requires_ci_aggregate(capture, github):
+    policy = pub.required_check_policy(capture[0])
+    assert set(policy["contexts"]) == pub.REQUIRED_CONTEXTS
+    pr = review_pr()
+    pr["statusCheckRollup"] = green_checks()[:1]
+    assert pub.review_status(pr, [review_comment()], "a" * 40, policy) is None
+    pr["statusCheckRollup"] = green_checks()
+    assert pub.review_status(pr, [review_comment()], "a" * 40, policy)["score"] == "5/5"
 
 
 def test_review_timeout_keeps_target_untouched(capture, github, monkeypatch):

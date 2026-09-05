@@ -12,6 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 GH = Path("/home/daimon/.local/bin/gh")
 FORMATTER = Path("/home/daimon/.agents/skills/before-and-after/scripts/format.mjs")
@@ -23,6 +24,7 @@ START = "<!-- before-and-after:start -->"
 END = "<!-- before-and-after:end -->"
 ATTACHMENT = re.compile(r"https://github\.com/user-attachments/assets/[a-zA-Z0-9-]+")
 FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state"
+REQUIRED_CONTEXTS = {"Greptile Review", "All required checks pass"}
 
 
 class PublicationError(RuntimeError):
@@ -148,10 +150,55 @@ def _published_block(body: str, identity: str) -> tuple[str, str] | None:
     return block, urls[0]
 
 
-def review_status(pr: dict[str, Any], comments: list[dict[str, Any]], candidate: str) -> dict[str, Any] | None:
+def required_check_policy(root: Path) -> dict[str, Any]:
+    """Read classic protection and active rulesets for the exact publication base."""
+    query = """query($owner:String!, $repo:String!, $ref:String!){
+      repository(owner:$owner,name:$repo){ref(qualifiedName:$ref){name
+        branchProtectionRule{requiresStatusChecks requiredStatusCheckContexts
+          requiredStatusChecks{context app{databaseId}}}
+      }}
+    }"""
+    owner, repo = REPOSITORY.split("/")
+    data = json.loads(_run([
+        str(GH), "api", "graphql", "-f", f"query={query}",
+        "-f", f"owner={owner}", "-f", f"repo={repo}", "-f", f"ref=refs/heads/{BASE}",
+    ], root))
+    ref = ((data.get("data") or {}).get("repository") or {}).get("ref")
+    if data.get("errors") or not ref or ref.get("name") != BASE or "branchProtectionRule" not in ref:
+        raise PublicationError("base branch check policy could not be determined")
+    classic = ref["branchProtectionRule"]
+    # The fork currently has no branch protection. CI's final aggregate is
+    # still mandatory; otherwise an unstarted CI workflow looks like success.
+    contexts = set(REQUIRED_CONTEXTS)
+    if classic is not None:
+        if not isinstance(classic.get("requiresStatusChecks"), bool):
+            raise PublicationError("unrecognized branch protection policy")
+        if classic["requiresStatusChecks"]:
+            contexts.update(classic["requiredStatusCheckContexts"] or [])
+            contexts.update(check["context"] for check in classic["requiredStatusChecks"] or [])
+    pages = json.loads(_run([
+        str(GH), "api", "--paginate", "--slurp",
+        f"repos/{REPOSITORY}/rules/branches/{quote(BASE, safe='')}?per_page=100",
+    ], root))
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        raise PublicationError("base branch ruleset policy could not be determined")
+    rules = [rule for page in pages for rule in page]
+    for rule in rules:
+        if rule.get("type") != "required_status_checks":
+            # Workflow requirements cannot be identified by a job's display name.
+            raise PublicationError(f"unsupported branch rule requires review: {rule.get('type')}")
+        contexts.update(check["context"] for check in rule["parameters"]["required_status_checks"])
+    if any(not isinstance(context, str) or not context for context in contexts):
+        raise PublicationError("invalid required check context")
+    return {"base": BASE, "contexts": sorted(contexts), "classic": classic, "rules": rules}
+
+
+def review_status(pr: dict[str, Any], comments: list[dict[str, Any]], candidate: str, policy: dict[str, Any]) -> dict[str, Any] | None:
     """Accept only the current candidate's bot score and completed green checks."""
     if pr.get("headRefOid") != candidate or pr.get("state") != "OPEN" or pr.get("baseRefName") != BASE:
         raise PublicationError("review target changed or closed before publication")
+    if policy.get("base") != BASE or not isinstance(policy.get("contexts"), list):
+        raise PublicationError("verified base branch check policy is required")
     summaries = [
         comment for comment in comments
         if (comment.get("user") or {}).get("login") == "greptile-apps[bot]"
@@ -185,12 +232,21 @@ def review_status(pr: dict[str, Any], comments: list[dict[str, Any]], candidate:
             raise PublicationError("unknown PR check shape; refusing publication")
     if not any(check.get("name") == "Greptile Review" for check in checks):
         return None
+    reported = {check.get("name") or check.get("context") for check in checks}
+    if not set(policy["contexts"]).issubset(reported):
+        return None
+    # GitHub additionally enforces source-app bindings, required reviews and
+    # up-to-date rules; a rollup of green jobs alone is not that decision.
+    if pr.get("mergeStateStatus") != "CLEAN" or pr.get("mergeable") != "MERGEABLE":
+        return None
     return {
         "candidate_sha": candidate,
         "score": "5/5",
         "comment_url": latest["html_url"],
         "comment_updated_at": latest["updated_at"],
         "checks": checks,
+        "required_check_policy": policy,
+        "merge_state": pr["mergeStateStatus"],
     }
 
 
@@ -200,13 +256,14 @@ def wait_for_review(root: Path, number: int, candidate: str) -> dict[str, Any]:
     while True:
         pr = json.loads(_run([
             str(GH), "pr", "view", str(number), "--repo", REPOSITORY,
-            "--json", "state,headRefOid,baseRefName,statusCheckRollup",
+            "--json", "state,headRefOid,baseRefName,statusCheckRollup,mergeStateStatus,mergeable",
         ], root))
         pages = json.loads(_run([
             str(GH), "api", "--paginate", "--slurp",
             f"repos/{REPOSITORY}/issues/{number}/comments?per_page=100",
         ], root))
-        proof = review_status(pr, [item for page in pages for item in page], candidate)
+        policy = required_check_policy(root)
+        proof = review_status(pr, [item for page in pages for item in page], candidate, policy)
         if proof is not None:
             _write(root / "pr-review.json", json.dumps(proof, indent=2) + "\n")
             return proof
