@@ -20,6 +20,7 @@ def test_branch_stream_preserves_owner_identity_and_child_mirror(monkeypatch, mo
     from tui_gateway import server
     from tools.delegate_tool_child_run import _ChildRun
     from tools.delegate_tool_progress import _build_child_progress_callback
+    from agent.turn_response_intake import _relay_thinking
 
     parent_wire, child_wire, unrelated_wire = _Transport(), _Transport(), _Transport()
     monkeypatch.setattr(server, "_sessions", {
@@ -45,7 +46,8 @@ def test_branch_stream_preserves_owner_identity_and_child_mirror(monkeypatch, mo
     callback("subagent.spawn_requested", preview="Inspect the parser")
     callback("subagent.start", preview="Inspect the parser")
     callback("tool.started", "read_file", "parser.py")
-    callback("reasoning.available", "_thinking", "Supplied preview")
+    callback("_thinking", "Working...")
+    _relay_thinking(SimpleNamespace(_delegate_depth=1, tool_progress_callback=callback), "Supplied preview\nSecond line")
     reasoning = ["Compare", " ", "the paths"]
     for chunk in reasoning:
         callback("subagent.reasoning", preview=chunk)
@@ -56,7 +58,7 @@ def test_branch_stream_preserves_owner_identity_and_child_mirror(monkeypatch, mo
 
     frames = parent_wire.frames
     types = [frame["type"] for frame in frames]
-    assert types == ["subagent.spawn_requested", "subagent.start", "subagent.tool", "subagent.thinking",
+    assert types == ["subagent.spawn_requested", "subagent.start", "subagent.tool", "subagent.thinking", "subagent.thinking",
                      *["subagent.reasoning" for _ in reasoning],
                      *["subagent.text" for _ in chunks], "subagent.complete"]
     for frame in frames:
@@ -74,7 +76,8 @@ def test_branch_stream_preserves_owner_identity_and_child_mirror(monkeypatch, mo
     mirrored = [f["payload"]["text"] for f in child_wire.frames if f["type"] == "message.delta"]
     assert mirrored == ["Inspect the parser\n", *chunks]
     assert [f["payload"]["text"] for f in frames if f["type"] == "subagent.reasoning"] == reasoning
-    assert [f["payload"]["text"] for f in child_wire.frames if f["type"] == "reasoning.delta"] == ["Supplied preview", *reasoning]
+    assert [f["payload"]["text"] for f in child_wire.frames if f["type"] == "reasoning.delta"] == reasoning
+    assert [f["payload"]["text"] for f in child_wire.frames if f["type"] == "thinking.delta"] == ["Working...", "Supplied preview"]
     assert child_wire.frames[-1]["type"] == "message.complete"
     assert server._child_mirrors == {}
     assert server._active_child_runs == {}

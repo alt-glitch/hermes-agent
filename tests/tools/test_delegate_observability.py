@@ -29,6 +29,11 @@ def test_task_metadata_survives_dispatch_registry_callbacks_and_completion(monke
     # Only the model call and detached scheduling are replaced. Construction,
     # callbacks, worker execution, registry ownership and completion stay real.
     def supplied_conversation(child, user_message, task_id, stream_callback):
+        from types import SimpleNamespace
+        from agent.chat_completion_helpers import _assistant_reasoning_text
+        from agent.turn_response_intake import _relay_thinking
+
+        child._stream_callback = stream_callback
         live = next(r for r in records.list_active_subagents() if r["subagent_id"] == child._subagent_id)
         observations.append((child._subagent_id, live, child.ephemeral_system_prompt))
         child.thinking_callback("Working...")
@@ -36,6 +41,10 @@ def test_task_metadata_survives_dispatch_registry_callbacks_and_completion(monke
             child._fire_reasoning_delta(chunk)
         for chunk in ("Answer", "\n", "  body"):
             stream_callback(chunk)
+        # Post-stream response intake must not repeat the assembled reasoning.
+        message = SimpleNamespace(content="Answer\n  body", reasoning_content="Compare paths")
+        assert _assistant_reasoning_text(child, message) == "Compare paths"
+        _relay_thinking(child, message.content)
         if shape == "nested" and user_message == "Inspect the parser":
             nested_results.append(json.loads(dt.delegate_task(
                 tasks=[{"goal": "Inspect parser edge cases", "task_label": "Check edge cases"}], parent_agent=child)))
@@ -86,7 +95,7 @@ def test_task_metadata_survives_dispatch_registry_callbacks_and_completion(monke
             assert next(e for e in branch if e["event"] == "subagent.start")["started_at"] == live["started_at"]
             assert [e["preview"] for e in branch if e["event"] == "subagent.reasoning"] == ["Compare", " ", "paths"]
             assert [e["preview"] for e in branch if e["event"] == "subagent.text"] == ["Answer", "\n", "  body"]
-            assert [e["preview"] for e in branch if e["event"] == "subagent.thinking"] == ["Working..."]
+            assert [e["preview"] for e in branch if e["event"] == "subagent.thinking"] == ["Working...", "Answer"]
             assert records.get_subagent_attribution(child_id).get("task_label") == label
             assert label is None or label not in prompt  # display metadata never changes the child prompt
         assert result["results"][0].get("task_label") == expected.get("Inspect the parser")

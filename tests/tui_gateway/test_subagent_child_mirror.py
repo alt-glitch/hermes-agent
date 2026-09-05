@@ -94,11 +94,11 @@ def test_live_child_session_gets_native_stream(server, emits):
 
     child = [(e, p) for e, s, p in emits if s == "live-1"]
 
-    # Synthetic turn: start → tool → reasoning → tool rotation → close + summary.
+    # Synthetic turn: start → tool → activity → tool rotation → close + summary.
     assert [e for e, _ in child] == [
         "message.start",
         "tool.start",
-        "reasoning.delta",
+        "thinking.delta",
         "tool.complete",
         "tool.start",
         "tool.complete",
@@ -236,5 +236,4 @@ def test_text_mirrors_as_message_delta(server, emits):
         ("message.delta", {"text": "Here is "}),
         ("message.delta", {"text": "the answer."}),
     ]
-
 
