@@ -1,7 +1,7 @@
 import { PassThrough } from 'stream'
 
 import { Box, renderSync, ScrollBox, type ScrollBoxHandle, Text } from '@hermes/ink'
-import React, { useLayoutEffect, useRef } from 'react'
+import React, { act, useLayoutEffect, useRef } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { MAX_HISTORY } from '../config/limits.js'
@@ -531,15 +531,17 @@ describe('useVirtualHistory offset cache reuse', () => {
       await delay(20)
       const scroll = expose.current!.scroll!
 
-      scroll.scrollTo(0)
-      await delay(20)
+      await act(async () => scroll.scrollTo(0))
+      expect(expose.current!.virtualHistory.start).toBe(0)
+
       scroll.scrollTo(5)
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
       const staleHeights = new Map(initialHeights)
 
       staleHeights.set(items[0]!.key, 1)
-      instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
-      await delay(40)
+      await act(async () =>
+        instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
+      )
 
       expect(adjustScrollTop).toHaveBeenCalledOnce()
       expect(adjustScrollTop).toHaveBeenCalledWith(1)
