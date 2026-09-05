@@ -61,6 +61,17 @@ does not prove it has a ticker. Install/start a dedicated profile gateway with
 with no messaging platforms is intentionally allowed to execute cron jobs.
 Do not restart the user's other gateways to test the maintainer.
 
+On this host, the user has a shell setup file named `~/.local/bin/env` that
+returns success without executing its arguments. The generated gateway unit
+places that directory before `/usr/bin`. Keep a maintainer-only systemd drop-in
+at `~/.config/systemd/user/hermes-gateway-opentui-maintainer.service.d/10-controlled-path.conf`
+whose `[Service]` `Environment="PATH=..."` keeps the managed venv and pinned Node
+first, then `/usr/bin:/bin`, then `~/.local/bin` and the other tool directories.
+Run `systemctl --user daemon-reload` and inspect the effective unit environment
+before starting. Verify that `env` resolves to `/usr/bin/env` and actually runs
+a sentinel command. Do not edit the user's setup file or other gateway units.
+This drop-in survives normal Hermes gateway reinstalls.
+
 Configuration deployment retains the existing pause/journal/verify/rollback
 protocol. Recovery journals are bound to both profile home and job ID. Relative
 entrypoint scripts remain inside that profile's `scripts/` directory, as required
