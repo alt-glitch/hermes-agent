@@ -20,6 +20,11 @@ diagnostics to 1,089 (905 in production source and 184 in tests). These are
 review findings, not 1,089 proven bugs. Counts are a dated observation, not a
 baseline to copy into tests or use as a pass threshold.
 
+Rechecked on 2026-09-06 at `34d649c13b2`: 1,086 diagnostics, with the audit
+still correctly exiting nonzero. The Journey follow-up removed one chained
+assertion and two assertion-comment findings. This is measured incremental
+cleanup, not a claim that the migration or every diagnostic is resolved.
+
 | Rule | Remaining |
 | --- | ---: |
 | no-runtime-typeof | 279 |
