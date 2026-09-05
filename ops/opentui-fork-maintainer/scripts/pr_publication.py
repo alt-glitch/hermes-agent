@@ -24,7 +24,9 @@ START = "<!-- before-and-after:start -->"
 END = "<!-- before-and-after:end -->"
 ATTACHMENT = re.compile(r"https://github\.com/user-attachments/assets/[a-zA-Z0-9-]+")
 FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state"
-REQUIRED_CONTEXTS = {"Greptile Review", "All required checks pass"}
+# Immutable GitHub App IDs, verified against this fork's live check suites.
+REQUIRED_CHECK_APPS = {"Greptile Review": 867647, "All required checks pass": 15368}
+REQUIRED_CONTEXTS = set(REQUIRED_CHECK_APPS)
 
 
 class PublicationError(RuntimeError):
@@ -170,12 +172,23 @@ def required_check_policy(root: Path) -> dict[str, Any]:
     # The fork currently has no branch protection. CI's final aggregate is
     # still mandatory; otherwise an unstarted CI workflow looks like success.
     contexts = set(REQUIRED_CONTEXTS)
+    app_ids = dict(REQUIRED_CHECK_APPS)
+
+    def bind_app(context: str, app_id: int | None) -> None:
+        if app_id is None:
+            return
+        if type(app_id) is not int or app_id <= 0 or app_ids.get(context, app_id) != app_id:
+            raise PublicationError(f"unsupported required check app binding: {context}")
+        app_ids[context] = app_id
+
     if classic is not None:
         if not isinstance(classic.get("requiresStatusChecks"), bool):
             raise PublicationError("unrecognized branch protection policy")
         if classic["requiresStatusChecks"]:
             contexts.update(classic["requiredStatusCheckContexts"] or [])
             contexts.update(check["context"] for check in classic["requiredStatusChecks"] or [])
+            for check in classic["requiredStatusChecks"] or []:
+                bind_app(check["context"], (check.get("app") or {}).get("databaseId"))
     pages = json.loads(_run([
         str(GH), "api", "--paginate", "--slurp",
         f"repos/{REPOSITORY}/rules/branches/{quote(BASE, safe='')}?per_page=100",
@@ -188,9 +201,42 @@ def required_check_policy(root: Path) -> dict[str, Any]:
             # Workflow requirements cannot be identified by a job's display name.
             raise PublicationError(f"unsupported branch rule requires review: {rule.get('type')}")
         contexts.update(check["context"] for check in rule["parameters"]["required_status_checks"])
+        for check in rule["parameters"]["required_status_checks"]:
+            bind_app(check["context"], check.get("integration_id"))
     if any(not isinstance(context, str) or not context for context in contexts):
         raise PublicationError("invalid required check context")
-    return {"base": BASE, "contexts": sorted(contexts), "classic": classic, "rules": rules}
+    return {"base": BASE, "contexts": sorted(contexts), "app_ids": app_ids, "classic": classic, "rules": rules}
+
+
+def candidate_checks(root: Path, candidate: str) -> list[dict[str, Any]]:
+    """gh pr view omits producer identity; read the candidate's complete rollup."""
+    query = """query($owner:String!, $repo:String!, $sha:String!, $endCursor:String){
+      repository(owner:$owner,name:$repo){object(expression:$sha){... on Commit{
+        oid statusCheckRollup{contexts(first:100,after:$endCursor){
+          pageInfo{hasNextPage endCursor}
+          nodes{__typename
+            ... on CheckRun{name status conclusion checkSuite{app{databaseId}}}
+            ... on StatusContext{context state creator{login}}
+          }
+        }}
+      }}}
+    }"""
+    owner, repo = REPOSITORY.split("/")
+    pages = json.loads(_run([
+        str(GH), "api", "graphql", "--paginate", "--slurp", "-f", f"query={query}",
+        "-f", f"owner={owner}", "-f", f"repo={repo}", "-f", f"sha={candidate}",
+    ], root))
+    checks = []
+    if not isinstance(pages, list) or not pages:
+        raise PublicationError("candidate check producers could not be determined")
+    for page in pages:
+        commit = ((page.get("data") or {}).get("repository") or {}).get("object")
+        if page.get("errors") or not commit or commit.get("oid") != candidate:
+            raise PublicationError("candidate check producers could not be determined")
+        rollup = commit.get("statusCheckRollup")
+        if rollup is not None:
+            checks.extend(rollup["contexts"]["nodes"])
+    return checks
 
 
 def review_status(pr: dict[str, Any], comments: list[dict[str, Any]], candidate: str, policy: dict[str, Any]) -> dict[str, Any] | None:
@@ -230,11 +276,18 @@ def review_status(pr: dict[str, Any], comments: list[dict[str, Any]], candidate:
                 raise PublicationError(f"PR status failed: {check.get('context', 'unknown')}")
         else:
             raise PublicationError("unknown PR check shape; refusing publication")
-    if not any(check.get("name") == "Greptile Review" for check in checks):
-        return None
-    reported = {check.get("name") or check.get("context") for check in checks}
-    if not set(policy["contexts"]).issubset(reported):
-        return None
+    app_ids = {**policy.get("app_ids", {}), **REQUIRED_CHECK_APPS}
+    for context in set(policy["contexts"]) | REQUIRED_CONTEXTS:
+        matches = [check for check in checks if (check.get("name") or check.get("context")) == context]
+        if not matches:
+            return None
+        for check in matches:
+            if context in app_ids:
+                app_id = ((check.get("checkSuite") or {}).get("app") or {}).get("databaseId")
+                if check.get("__typename") != "CheckRun" or app_id != app_ids[context]:
+                    raise PublicationError(f"untrusted producer for required check: {context}")
+            if check.get("__typename") == "CheckRun" and check.get("conclusion") != "SUCCESS":
+                raise PublicationError(f"required check did not succeed: {context}")
     # GitHub additionally enforces source-app bindings, required reviews and
     # up-to-date rules; a rollup of green jobs alone is not that decision.
     if pr.get("mergeStateStatus") != "CLEAN" or pr.get("mergeable") != "MERGEABLE":
@@ -256,8 +309,9 @@ def wait_for_review(root: Path, number: int, candidate: str) -> dict[str, Any]:
     while True:
         pr = json.loads(_run([
             str(GH), "pr", "view", str(number), "--repo", REPOSITORY,
-            "--json", "state,headRefOid,baseRefName,statusCheckRollup,mergeStateStatus,mergeable",
+            "--json", "state,headRefOid,baseRefName,mergeStateStatus,mergeable",
         ], root))
+        pr["statusCheckRollup"] = candidate_checks(root, candidate)
         pages = json.loads(_run([
             str(GH), "api", "--paginate", "--slurp",
             f"repos/{REPOSITORY}/issues/{number}/comments?per_page=100",

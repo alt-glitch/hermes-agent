@@ -93,6 +93,12 @@ class Github:
             phase = "push"
         elif argv[:2] == [str(pub.GH), "api"]:
             if argv[2] == "graphql":
+                if "--paginate" in argv:
+                    return json.dumps([{"data": {"repository": {"object": {
+                        "oid": "a" * 40, "statusCheckRollup": {"contexts": {
+                            "nodes": self.pr["statusCheckRollup"],
+                        }},
+                    }}}}])
                 return json.dumps({"data": {"repository": {"ref": {"name": pub.BASE, "branchProtectionRule": None}}}})
             if "/rules/branches/" in argv[-1]:
                 return "[[]]"
@@ -149,6 +155,7 @@ def green_checks():
     return [{
         "__typename": "CheckRun", "name": name,
         "status": "COMPLETED", "conclusion": "SUCCESS",
+        "checkSuite": {"app": {"databaseId": 867647 if name == "Greptile Review" else 15368}},
     } for name in ("Greptile Review", "Python tests", "All required checks pass")]
 
 
@@ -167,6 +174,24 @@ def review_pr():
 
 
 POLICY = {"base": pub.BASE, "contexts": ["Python tests"], "classic": None, "rules": []}
+
+
+@pytest.mark.parametrize("name", ["Greptile Review", "All required checks pass"])
+@pytest.mark.parametrize("replacement", [
+    {"checkSuite": {"app": {"databaseId": 999999, "slug": "unrelated-forged-app"}}},
+    {"checkSuite": None},
+    {"__typename": "StatusContext", "state": "SUCCESS", "creator": {"login": "unrelated-user"}},
+    {"conclusion": "SKIPPED"},
+    {"conclusion": "NEUTRAL"},
+])
+def test_required_checks_cannot_be_impersonated_or_skipped(name, replacement):
+    pr = review_pr()
+    check = next(check for check in pr["statusCheckRollup"] if check["name"] == name)
+    check.update(replacement)
+    if check["__typename"] == "StatusContext":
+        check["context"] = check.pop("name")
+    with pytest.raises(pub.PublicationError, match="required check"):
+        pub.review_status(pr, [review_comment()], "a" * 40, POLICY)
 
 
 @pytest.mark.parametrize("comment", [
@@ -227,6 +252,29 @@ def test_policy_combines_classic_and_active_branch_rules(tmp_path, monkeypatch):
     policy = pub.required_check_policy(tmp_path)
     assert set(policy["contexts"]) == {"integration", "unit", *pub.REQUIRED_CONTEXTS}
     assert policy["classic"]["requiredStatusChecks"][0]["app"]["databaseId"] == 123
+    assert policy["app_ids"] == {**pub.REQUIRED_CHECK_APPS, "unit": 123, "integration": 456}
+    pr = review_pr()
+    for context, app_id in (("unit", 123), ("integration", 456)):
+        pr["statusCheckRollup"].append({
+            "__typename": "CheckRun", "name": context, "status": "COMPLETED",
+            "conclusion": "SUCCESS", "checkSuite": {"app": {"databaseId": app_id}},
+        })
+    assert pub.review_status(pr, [review_comment()], "a" * 40, policy)
+    pr["statusCheckRollup"][-1]["checkSuite"]["app"]["databaseId"] = 999
+    with pytest.raises(pub.PublicationError, match="untrusted producer"):
+        pub.review_status(pr, [review_comment()], "a" * 40, policy)
+
+
+def test_candidate_check_query_preserves_all_pages_and_producers(tmp_path, monkeypatch):
+    checks = green_checks()
+    pages = [{"data": {"repository": {"object": {
+        "oid": "a" * 40, "statusCheckRollup": {"contexts": {"nodes": [check]}},
+    }}}} for check in checks]
+    monkeypatch.setattr(pub, "_run", lambda argv, cwd: json.dumps(pages))
+    assert pub.candidate_checks(tmp_path, "a" * 40) == checks
+    pages[-1]["data"]["repository"]["object"]["oid"] = "b" * 40
+    with pytest.raises(pub.PublicationError, match="could not be determined"):
+        pub.candidate_checks(tmp_path, "a" * 40)
 
 
 @pytest.mark.parametrize("response", [{"errors": [{"message": "denied"}]}, {"data": {"repository": {"ref": None}}}])
