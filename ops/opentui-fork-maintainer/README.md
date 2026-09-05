@@ -25,6 +25,14 @@ Only maintainer-owned synthetic test captures are eligible; inherited startup
 prompts, images and session overrides must be cleared before capture. Runtime
 constants validate the exact judge route and reject cross-provider fallback.
 
+The maintainer sets `terminal.home_mode: real` for external CLI workers. Hermes
+state remains scoped by `HERMES_HOME`; this setting keeps Codex/Claude using
+their existing OS-user login instead of an empty profile-home credential store.
+No external CLI credentials or personal conversations are copied into the
+profile. Verify login and a bounded real tool call from the actual child
+environment, not just from the orchestration shell. A 401 from an empty worker
+HOME is distinct from the parent's provider capacity errors.
+
 ## Provision and migrate
 
 Use the managed Hermes Python with `uv`. Inspect the printed plan before apply.

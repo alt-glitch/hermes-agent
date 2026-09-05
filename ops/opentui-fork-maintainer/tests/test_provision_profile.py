@@ -61,6 +61,7 @@ def test_apply_isolates_credentials_and_installs_policy(environment):
     assert config["model"] == {"default": provisioner.MODEL, "provider": "openrouter", "api_mode": "codex_responses"}
     assert config["compression"]["threshold_tokens"] == 300_000
     assert config["mcp_servers"] == {} and config["fallback_model"] is None
+    assert config["terminal"]["home_mode"] == "real"
     assert any(path.read_text() == "old identity\n" for path in (profile / "setup-backups").rglob("SOUL.md"))
 
 

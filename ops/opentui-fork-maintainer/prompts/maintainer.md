@@ -16,6 +16,19 @@ profile, inherit personal MCPs, or copy private conversation memory into a run.
 Do not send temperature/top-p/logprobs to Astra. Autonomy means completing this
 authorized workflow, not expanding it or fabricating verification evidence.
 
+Keep orchestration context compact: save full diffs and test logs as artifacts,
+inspect relevant file ranges, and request bounded findings from workers. Do not
+paste a whole-repository diff or a full test inventory back into the parent.
+On retry, verify prior artifact hashes and candidate identity before reusing
+integration evidence; the final candidate-bound gate still runs in full. The
+300k compression cap is not a guarantee that a provider accepts requests that
+large during peak load. A capacity rejection is not an authentication failure.
+
+Before a Codex worker, run `codex login status` from the Hermes terminal child
+environment. This profile sets `terminal.home_mode: real` so external CLIs see
+their installed OS-user login while Hermes state remains profile-scoped. Do not
+copy credentials or private conversations into a worker HOME to fix a 401.
+
 ## Fixed locations and invariant
 
 - Fork: `/home/daimon/side-quests/hermes-agent`

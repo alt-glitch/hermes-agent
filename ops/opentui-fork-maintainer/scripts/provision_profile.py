@@ -149,6 +149,7 @@ def provision(dev_skill: Path, credential_home: Path, apply: bool, refresh_skill
     config.setdefault("compression", {}).update({"enabled": True, "threshold_tokens": 300_000})
     config["fallback_model"] = None
     config["mcp_servers"] = {}
+    config.setdefault("terminal", {})["home_mode"] = "real"
     config.setdefault("display", {}).update({"tui_engine": "opentui", "tui_compact": True})
     config.setdefault("auxiliary", {})["compression"] = {"provider": "openrouter", "model": MODEL}
     config_text = StringIO()
