@@ -102,6 +102,7 @@ const FIELD_ALIASES = new Map<string, string>([
   ['costUsd', 'cost_usd'],
   ['delegationId', 'delegation_id'],
   ['durationSeconds', 'duration_seconds'],
+  ['endedAt', 'ended_at'],
   ['filesRead', 'files_read'],
   ['filesWritten', 'files_written'],
   ['id', 'subagent_id'],
@@ -115,6 +116,9 @@ const FIELD_ALIASES = new Map<string, string>([
   ['reasoningTokens', 'reasoning_tokens'],
   ['startedAt', 'started_at'],
   ['taskCount', 'task_count'],
+  ['taskLabel', 'task_label'],
+  ['traceDropped', 'trace_dropped'],
+  ['traceTruncated', 'trace_truncated'],
   ['toolCount', 'tool_count']
 ])
 

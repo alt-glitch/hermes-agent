@@ -64,6 +64,7 @@ export const SpawnTreeSubagentSchema = Schema.StructWithRest(
     subagent_id: opt(Str),
     summary: opt(Str),
     task_count: opt(PositiveInt),
+    task_label: opt(Str),
     task_index: opt(NonNegativeInt),
     text: opt(Str),
     thinking: opt(Schema.Array(Str)),

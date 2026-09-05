@@ -1223,10 +1223,10 @@ describe('session store — subagents (Phase 5e agents dashboard)', () => {
     // thinking text is transient (not in the trace), the rest is a concise TYPED log
     expect(sa.thought).toBe('considering options')
     expect(sa.trace).toEqual([
-      { kind: 'start', text: 'crunch data' },
-      { kind: 'tool', text: 'Web Search("opentui")' },
-      { kind: 'progress', text: 'found 3 hits' },
-      { kind: 'summary', text: 'done crunching' }
+      { id: 0, kind: 'start', text: 'crunch data' },
+      { id: 1, kind: 'tool', text: 'Web Search("opentui")' },
+      { id: 2, kind: 'progress', text: 'found 3 hits' },
+      { id: 3, kind: 'summary', text: 'done crunching' }
     ])
   })
 
@@ -1239,13 +1239,13 @@ describe('session store — subagents (Phase 5e agents dashboard)', () => {
     const sa = store.state.subagents[0]!
     // grows by ONE (the reply), not two — the start entry + one coalesced reply
     expect(sa.trace).toHaveLength(2)
-    expect(sa.trace![1]).toEqual({ kind: 'reply', text: 'Hello, world' })
+    expect(sa.trace![1]).toEqual({ id: 1, kind: 'reply', text: 'Hello, world' })
     expect(sa.status).toBe('running')
     // a non-reply entry between two text frames breaks coalescing → a fresh reply line
     store.apply({ type: 'subagent.progress', payload: { subagent_id: 'a1', text: 'mid' } })
     store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'again' } })
     expect(sa.trace).toHaveLength(4)
-    expect(sa.trace![3]).toEqual({ kind: 'reply', text: 'again' })
+    expect(sa.trace![3]).toEqual({ id: 3, kind: 'reply', text: 'again' })
   })
 
   test('clearTranscript also clears subagents', () => {

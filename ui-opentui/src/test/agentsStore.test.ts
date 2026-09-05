@@ -198,6 +198,7 @@ describe('Agents live reducer', () => {
     store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: ' ships two ' } })
     store.apply({ type: 'subagent.text', payload: { subagent_id: 'a1', text: 'features.' } })
     expect(store.state.subagents[0]?.trace?.at(-1)).toEqual({
+      id: 1,
       kind: 'reply',
       text: 'The release ships two features.'
     })

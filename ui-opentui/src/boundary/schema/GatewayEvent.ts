@@ -391,6 +391,7 @@ const SubagentComplete = Schema.Struct({ type: Schema.Literal('subagent.complete
 // token, so the store COALESCES consecutive frames into one growing trace line
 // (see store.ts reducer) rather than one line per token.
 const SubagentText = Schema.Struct({ type: Schema.Literal('subagent.text'), ...SubagentShape })
+const SubagentReasoning = Schema.Struct({ type: Schema.Literal('subagent.reasoning'), ...SubagentShape })
 
 // transport errors
 const ErrorEvent = Schema.Struct({
@@ -482,6 +483,7 @@ const ChromeTransportEvents = Schema.Union([
   SubagentProgress,
   SubagentComplete,
   SubagentText,
+  SubagentReasoning,
   ErrorEvent,
   GatewayStderr,
   GatewayStartTimeout,

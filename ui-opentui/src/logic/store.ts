@@ -84,6 +84,7 @@ import {
   type ClarifyBatchQuestion
 } from './clarifyBatch.ts'
 import { billingWallAction, billingWallCopy, runBillingWallAction, type BillingWallHost } from './billingWall.ts'
+import { appendSubagentTrace, finishSubagentTrace, trimSubagentTrace } from './subagentTrace.ts'
 
 /** Monotonic identity for one concrete overlay instance. Async work must carry
  * this token back to patch/close so a completion from an old session cannot
@@ -313,8 +314,10 @@ export interface CompletionItem {
 /** One typed entry in a subagent's activity trace — `kind` drives glyph + color
  *  in the dashboard so the trace reads like a transcript, not flat dumped lines. */
 export interface TraceEntry {
-  kind: 'start' | 'tool' | 'progress' | 'summary' | 'reply'
+  id?: number
+  kind: 'start' | 'tool' | 'progress' | 'summary' | 'reply' | 'reasoning'
   text: string
+  truncated?: boolean
 }
 
 export interface SubagentOutputEntry {
@@ -336,6 +339,7 @@ export interface SubagentInfo {
   delegationId?: string
   depth: number
   durationSeconds?: number
+  endedAt?: number
   filesRead?: string[]
   filesWritten?: string[]
   goal: string
@@ -353,6 +357,7 @@ export interface SubagentInfo {
   status: string
   summary?: string
   taskCount?: number
+  taskLabel?: string
   thinking?: string[]
   toolCount?: number
   tools?: string[]
@@ -360,12 +365,13 @@ export interface SubagentInfo {
   lastTool?: string
   /** Live activity trace (item 15) — typed entries, newest last; rendered by kind. */
   trace?: TraceEntry[]
+  traceDropped?: number
+  traceSequence?: number
+  traceTruncated?: boolean
   /** Latest thinking text (transient; not appended to the trace to avoid flooding). */
   thought?: string
 }
 
-/** Cap on a subagent's retained trace lines. */
-const SUBAGENT_TRACE_LIMIT = 200
 const SUBAGENT_THINKING_LIMIT = 6
 const SUBAGENT_NOTES_LIMIT = 6
 const SUBAGENT_TOOLS_LIMIT = 8
@@ -473,6 +479,7 @@ function mergeSubagentPayload(subagent: SubagentInfo, payload: SpawnTreeSubagent
   if (payload.started_at !== undefined) subagent.startedAt = epochMilliseconds(payload.started_at)
   if (payload.summary !== undefined) subagent.summary = payload.summary
   if (payload.task_count !== undefined) subagent.taskCount = payload.task_count
+  if (payload.task_label !== undefined) subagent.taskLabel = payload.task_label
   if (payload.task_index !== undefined) subagent.index = payload.task_index
   if (payload.thinking !== undefined) subagent.thinking = [...payload.thinking].slice(-SUBAGENT_THINKING_LIMIT)
   if (payload.tool_count !== undefined) subagent.toolCount = payload.tool_count
@@ -3205,6 +3212,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
       case 'subagent.tool':
       case 'subagent.progress':
       case 'subagent.complete':
+      case 'subagent.reasoning':
       case 'subagent.text': {
         const id =
           event.payload.subagent_id ??
@@ -3222,6 +3230,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
               draft.subagents.push(sa)
               draft.subagents.sort((left, right) => left.depth - right.depth || (left.index ?? 0) - (right.index ?? 0))
             } else {
+              if (
+                (event.type === 'subagent.text' || event.type === 'subagent.reasoning') &&
+                isTerminalStatus(sa.status)
+              )
+                return
               mergeSubagentPayload(sa, event.payload)
             }
 
@@ -3233,7 +3246,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
               if (!isTerminalStatus(sa.status)) sa.status = 'queued'
             } else if (event.type === 'subagent.start') {
               if (!isTerminalStatus(sa.status)) sa.status = 'running'
-              trace.push({ kind: 'start', text: sa.goal || 'started' })
+              appendSubagentTrace(sa, 'start', sa.goal || 'started')
             } else if (event.type === 'subagent.thinking') {
               sa.status = keepTerminalElseRunning(sa.status)
               if (text) {
@@ -3245,29 +3258,31 @@ export function createSessionStore(options?: SessionStoreOptions) {
               if (tool) {
                 const line = formatSubagentTool(tool, event.payload.tool_preview ?? text)
                 pushUniqueBounded((sa.tools ??= []), line, SUBAGENT_TOOLS_LIMIT)
-                trace.push({ kind: 'tool', text: line })
+                appendSubagentTrace(sa, 'tool', line)
               }
             } else if (event.type === 'subagent.progress') {
               sa.status = keepTerminalElseRunning(sa.status)
               if (text) {
                 pushUniqueBounded((sa.notes ??= []), text, SUBAGENT_NOTES_LIMIT)
-                trace.push({ kind: 'progress', text })
+                appendSubagentTrace(sa, 'progress', text)
               }
             } else if (event.type === 'subagent.complete') {
               sa.status = normalizeTerminalStatus(event.payload.status)
+              sa.endedAt ??= Date.now()
               const summary = event.payload.summary || text || sa.summary
               if (summary) sa.summary = summary
-              trace.push({ kind: 'summary', text: summary || 'done' })
+              finishSubagentTrace(sa, summary || 'done')
             }
-            // Per-token reply text (subagent.text): COALESCE into one growing
-            // line. It is update-only like every other post-start variant.
+            // Coalesce adjacent deltas of the same channel without flattening
+            // reasoning, messages and tools into one body.
             else if (rawText) {
               sa.status = keepTerminalElseRunning(sa.status)
+              const kind = event.type === 'subagent.reasoning' ? 'reasoning' : 'reply'
               const last = trace[trace.length - 1]
-              if (last && last.kind === 'reply') last.text += rawText
-              else trace.push({ kind: 'reply', text: rawText })
+              if (last && last.kind === kind) last.text += rawText
+              else appendSubagentTrace(sa, kind, rawText)
             }
-            if (trace.length > SUBAGENT_TRACE_LIMIT) trace.splice(0, trace.length - SUBAGENT_TRACE_LIMIT)
+            trimSubagentTrace(sa)
           })
         )
         if (mayCreate) maybeQueueAgentsNudge()
