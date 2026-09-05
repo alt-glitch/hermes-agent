@@ -86,10 +86,11 @@ def _refuse_prompt_turn_locked(sid: str, session: dict, message: str, submission
     session.pop("_auto_continue_attempt", None)
     session.pop("_auto_continue_prompt", None)
     _clear_inflight_turn(session)
-    if failed_ids:
+    try:
         _emit_terminal_turn_error(
             sid, session, message, client_submission_ids=failed_ids,
             history_lock_owned=True, retire_marker=False)
+    finally:
         _clear_inflight_turn(session)
 
 
@@ -487,6 +488,7 @@ def _run_post_turn_followups(
             if session.get("running"):
                 return  # user already sent something — their turn wins
             session["running"] = True
+            session["_turn_cancel_requested"] = False
         _dispatch_followup_turn(rid, sid, session, goal_followup, "goal continuation dispatch")
     # Safety net for completion events that arrived mid-turn.  Ownership is positive-proof
     # and compression-chain aware (same fail-closed gate as the poller): session B must
@@ -504,6 +506,7 @@ def _run_post_turn_followups(
                         process_registry.completion_queue.put(pending_evt)
                     break
                 session["running"] = True
+                session["_turn_cancel_requested"] = False
             from tools.async_delegation import (
                 claim_event_delivery, complete_event_delivery, release_event_delivery)
             _claim = claim_event_delivery(_evt, "tui-post-turn")
@@ -511,10 +514,15 @@ def _run_post_turn_followups(
                 _notif_release_turn(session)
                 continue
             _emit_process_completion_card(sid, _evt, synth)
+
+            def retry_delivery(evt=_evt, claim=_claim):
+                release_event_delivery(evt, claim)
+                process_registry.completion_queue.put(evt)
+
             _dispatch_followup_turn(
                 rid, sid, session, synth, "completion notification dispatch",
                 on_done=lambda: complete_event_delivery(_evt, _claim),
-                on_error=lambda: release_event_delivery(_evt, _claim))
+                on_error=retry_delivery)
     except Exception as _drain_exc:
         _hook_failure("completion queue drain", _drain_exc)
 

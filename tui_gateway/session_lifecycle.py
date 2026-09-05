@@ -589,7 +589,7 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
 
     def _reap() -> None:
         # Serialize the re-check against session.resume (rebinds under _session_resume_lock). Claim teardown by popping
-        # under both locks, then release the resume lock before slow finalization. Order: resume_lock -> sessions_lock.
+        # under the mutation/registry locks, then release resume before slow finalization.
         reschedule_delay = interrupt_session = session = None
         with _session_resume_lock:
             # Drop this Timer's registration so a concurrent _cancel_ws_orphan_reap can't cancel a dead Timer while a
@@ -602,7 +602,10 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
             if _session_has_active_delegations(sid, current):
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif not current.get("running"):
-                session = _pop_session_by_id(sid)
+                session = _pop_session_by_id(
+                    sid, predicate=lambda record: record is current and _ws_session_is_orphaned(record))
+                if session is None and _ws_session_is_detached(current):
+                    reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif not current.get("_client_gone_interrupt_requested") and _ws_orphan_turn_activity_is_fresh(current):
                 # Client-absent but producing: keep running detached (the sentinel buffers emits), re-check each grace.
                 logger.debug("client_gone sid=%s action=defer (turn activity fresh; stale threshold %.0fs)",
@@ -618,7 +621,8 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
                     logger.error(
                         "client_gone sid=%s: turn did not settle after %d interrupt polls (%.0fs) — force-reaping detached session",
                         sid, polls - 1, (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S)
-                    session = _pop_session_by_id(sid)
+                    session = _pop_session_by_id(
+                        sid, predicate=lambda record: record is current and _ws_session_is_detached(record))
                 else:
                     if not current.get("_client_gone_interrupt_requested"):
                         current["_client_gone_interrupt_requested"] = True
@@ -661,9 +665,9 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
     for sid, session in owned:
         claimed_for_teardown = None
         should_schedule_reap = False
-        # session.resume fast-path rebinds under _session_resume_lock: take it so a reconnect can't move the transport
-        # between check and claim.
-        with _session_resume_lock, _sessions_lock:
+        # Revalidate after waiting for mutation; never hold the registry while
+        # waiting for a turn's mutation lock. Resume uses this same outer lock.
+        with _session_resume_lock, _session_mutation_lock(session), _sessions_lock:
             current = _sessions.get(sid)
             if current is not session:
                 continue

@@ -126,6 +126,7 @@ def _notif_claim_turn(session: dict) -> bool:
         if session.get("running") or session.get("_closing") or session.get("_finalized"):
             return False
         session["running"] = True
+        session["_turn_cancel_requested"] = False
         return True
 
 
@@ -210,6 +211,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         if not mgr.is_due(now):
             return
         session["running"] = True
+        session["_turn_cancel_requested"] = False
 
     wakeup = mgr.fire_tick()
     if not wakeup:

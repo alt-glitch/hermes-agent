@@ -50,6 +50,45 @@ def _submit(sid, client_id, *, queued=False):
     })
 
 
+@pytest.mark.parametrize("with_submission_id", [False, True])
+def test_interrupt_after_ready_check_still_settles_accepted_submit(
+    monkeypatch, registered_session, with_submission_id,
+):
+    sid, session, events = registered_session
+    entered, release = threading.Event(), threading.Event()
+    actual_submit = server._run_prompt_submit
+
+    def paused_admission(*args, **kwargs):
+        entered.set()
+        assert release.wait(3), "test did not release turn admission"
+        return actual_submit(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
+    monkeypatch.setattr(server, "_get_usage", lambda _: {})
+    monkeypatch.setattr(server, "_run_prompt_submit", paused_admission)
+    params = {"session_id": sid, "text": "synthetic accepted prompt"}
+    if with_submission_id:
+        params["client_submission_id"] = "accepted"
+    response = server.handle_request({"id": "accepted", "method": "prompt.submit", "params": params})
+    try:
+        assert response["result"]["status"] == "streaming"
+        assert entered.wait(2)
+        interrupt = server.handle_request({"id": "stop", "method": "session.interrupt", "params": {"session_id": sid}})
+        assert "error" not in interrupt
+    finally:
+        release.set()
+        session["_run_thread"].join(2)
+
+    assert not session["_run_thread"].is_alive()
+    assert not any(kind == "message.start" for kind, _, _ in events)
+    terminal = [payload for kind, _, payload in events if kind == "message.complete"]
+    assert len(terminal) == 1
+    assert terminal[0]["status"] == "error"
+    assert terminal[0].get("client_submission_ids", []) == (["accepted"] if with_submission_id else [])
+    assert session["running"] is False
+    assert session["inflight_turn"] is None
+
+
 @pytest.mark.parametrize("failure, code", [(False, 5072), (RuntimeError("synthetic storage failure"), 5071),
                                           (OSError(errno.ENOSPC, "synthetic full disk"), 5070)])
 @pytest.mark.parametrize("with_queued_input", [False, True])

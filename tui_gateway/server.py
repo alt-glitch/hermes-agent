@@ -2485,9 +2485,12 @@ def _claim_parked_runtimes(session_key: str, *, keep_sid: str, profile_home=_ANY
             if old_sid != keep_sid and not old.get("_finalized")
             and _session_lookup_key(old, fallback=old_sid) == session_key
             and _live_profile_matches(old, profile_home) and old.get("transport") is _detached_ws_transport]
-    for old_sid, _old in candidates:
+    for old_sid, old in candidates:
         _cancel_ws_orphan_reap(old_sid)
-        if (popped := _pop_session_by_id(old_sid)) is not None:
+        if (popped := _pop_session_by_id(
+            old_sid, predicate=lambda record, expected=old: (
+                record is expected and record.get("transport") is _detached_ws_transport)
+        )) is not None:
             stale.append((old_sid, popped))
     return stale
 
