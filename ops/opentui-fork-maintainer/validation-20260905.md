@@ -117,3 +117,24 @@ Local evidence index:
 `~/projects/opentui-fork-maintainer/state/verification/20260905-preservation-candidate/README.md`.
 The target/global install and paused cron have not been advanced by these tests.
 Require fresh current-head CI and Greptile 5/5; older approvals do not carry over.
+
+### Reference refresh before cutover
+
+The follow-up worktree initially lacked `.repos`, which would make provisioning
+select the older installed OpenTUI skill. Copied the clean owned snapshots there
+and ran the existing allowlisted refresh command on 2026-09-06 local time.
+OpenTUI, Effect and anti-slop stayed at the SHAs above. OpenCode v2 advanced to
+`7a4ad68af6577c5448a8395b0b95e24ceb623faf`; Executor advanced to
+`2dc399e51094fccd2a45103a38d77179c6d648ff`.
+
+Inspected the deltas: OpenCode adds a bounded initialization-only 400 fallback
+beside 404, restoring the user's original MCP URL only when the client added the
+query parameter. Its tests retain user-specified values and refuse fallback after
+initialization. This supports the existing principle of undoing only our own
+transformations, not broad retry behavior. Executor's delta is release metadata,
+changelogs and lock/version updates, not new runtime source. No Hermes dependency
+pins or transport implementations changed to follow these references.
+
+Provisioning's read-only plan passes with the durable supplied development-skill
+source. Profile application remains pending; keep the referenced owned checkout
+until the installed manifest has been refreshed and verified.

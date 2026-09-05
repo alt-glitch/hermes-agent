@@ -141,3 +141,10 @@ owner. Module counts and successful Git ancestry do not establish parity.
   Preserve both logs; a rerun is not evidence that the first run was green or
   definitive proof of a pre-existing cause. Avoid broadening a reviewed correction
   based only on timing speculation.
+- Native Relay E2E tests blocked the consumer thread waiting for a finalizer,
+  but that thread also owned the private event loop needed to reach stream EOF.
+  Reproduced on unchanged upstream test/source. Hold the final chunk unprocessed
+  and advance the real iterator to EOF on its owner thread instead; keep an
+  assertion that finalization precedes consumption. Ten fresh runs passed, while
+  a collector-terminal-chunk omission still failed the original usage/tool-call
+  assertions. Fix the ordering mechanism, not the timeout or assertion strength.

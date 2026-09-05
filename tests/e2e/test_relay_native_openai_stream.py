@@ -1,9 +1,8 @@
 """Native OpenAI SDK streaming through Relay's managed execution path.
 
-Relay runs its finalizer as soon as the provider stream ends — concurrently with Hermes'
-consumer thread, which may not have processed the last chunk yet. Each test forces that
-ordering deterministically (finalizer runs BEFORE the consumer sees a chosen chunk) and
-asserts Relay's LLM end event still records the full response.
+Relay may finalize before Hermes processes the last provider chunk. Each test holds that
+chunk at the consumer boundary and advances the managed stream to EOF on its owning
+thread, then asserts Relay's LLM end event still records the full response.
 """
 
 from __future__ import annotations
@@ -53,14 +52,12 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
     consumer = "test.openai_relay"
     subscriber_name = "test.openai_stream"
     events = []
-    relay_finalizer_started = threading.Event()
-    allow_relay_finalizer = threading.Event()
     relay_finalizer_finished = threading.Event()
+    consumer_processed_target = threading.Event()
     run_relay_finalizer = relay_llm.ManagedLlmStream._relay_finalizer
 
     def run_synchronized_relay_finalizer(managed_stream, attempt):
-        relay_finalizer_started.set()
-        assert allow_relay_finalizer.wait(5), "consumer did not release Relay's finalizer"
+        assert not consumer_processed_target.is_set(), "consumer processed the target before Relay finalized"
         try:
             return run_relay_finalizer(managed_stream, attempt)
         finally:
@@ -73,9 +70,13 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
     def count_chunk_after_relay_finalizes(self, diag, chunk):
         # ``_count_chunk`` is the first thing the consumer does with every chunk.
         if finalize_before(chunk):
-            assert relay_finalizer_started.wait(5), "Relay's finalizer did not start"
-            allow_relay_finalizer.set()
-            assert relay_finalizer_finished.wait(5), "Relay's finalizer did not finish"
+            # The consumer also drives Relay's private loop. Waiting here would
+            # prevent the producer from reaching EOF, so finish its real iterator
+            # while this final chunk is still unprocessed by Hermes.
+            exhausted = object()
+            assert next(self.managed_stream_holder["stream"], exhausted) is exhausted, "target must be the final chunk"
+            assert relay_finalizer_finished.is_set(), "Relay did not finalize at EOF"
+            consumer_processed_target.set()
         return count_chunk(self, diag, chunk)
 
     monkeypatch.setattr(chat_completion_helpers._StreamingCall, "_count_chunk", count_chunk_after_relay_finalizes)
@@ -98,6 +99,7 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
         if isinstance(event, nemo_relay.ScopeEvent) and event.name == "openai.chat_completions"
         and event.category == "llm" and event.scope_category == "end"
     ]
+    assert consumer_processed_target.is_set(), "the fixture never reached its target chunk"
     assert len(llm_end_events) == 1
     assert llm_end_events[0].annotated_response is not None
     return result, llm_end_events[0]
