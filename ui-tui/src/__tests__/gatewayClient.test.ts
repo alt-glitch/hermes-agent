@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 interface ListenerEntry {
   callback: (event: any) => void
@@ -115,9 +116,11 @@ function fakeSpawnedGateway() {
   const stdin = new PassThrough()
   const stdout = new PassThrough()
   const stderr = new PassThrough()
+
   const kill = vi.fn(() => {
     events.emit('exit', 0, null)
     events.emit('close', 0, null)
+
     return true
   })
 
@@ -182,10 +185,12 @@ describe('GatewayClient websocket attach mode', () => {
     gw.start()
 
     expect(spawnMock).toHaveBeenCalledOnce()
+
     const options = spawnMock.mock.calls[0]?.[2] as {
       cwd?: string
       env?: Record<string, string | undefined>
     }
+
     expect(options.cwd).toBe('/runtime/hermes-agent')
     expect(options.env?.HERMES_CWD).toBe('/project/.worktrees/hermes-test')
     expect(options.env?.TERMINAL_CWD).toBe('/project/.worktrees/hermes-test')

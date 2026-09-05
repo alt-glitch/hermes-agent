@@ -16,10 +16,12 @@ describe('startMemlog (Ink 1Hz memory trace, OpenTUI-compatible)', () => {
 
   beforeEach(() => {
     saved = {}
+
     for (const k of ENV_KEYS) {
       saved[k] = process.env[k]
       delete process.env[k]
     }
+
     home = mkdtempSync(join(tmpdir(), 'hermes-memlog-test-'))
     process.env.HERMES_HOME = home
     vi.useFakeTimers()
@@ -27,10 +29,15 @@ describe('startMemlog (Ink 1Hz memory trace, OpenTUI-compatible)', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+
     for (const k of ENV_KEYS) {
-      if (saved[k] === undefined) delete process.env[k]
-      else process.env[k] = saved[k]
+      if (saved[k] === undefined) {
+        delete process.env[k]
+      } else {
+        process.env[k] = saved[k]
+      }
     }
+
     rmSync(home, { force: true, recursive: true })
   })
 
@@ -55,7 +62,10 @@ describe('startMemlog (Ink 1Hz memory trace, OpenTUI-compatible)', () => {
     //  "2026-06-15T0914"), so memwatch-report.mjs reads both engines.
     expect(files[0]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{4}-\d+\.jsonl$/)
 
-    const lines = readFileSync(join(memwatch(home), files[0]), 'utf8').trim().split('\n')
+    const lines = readFileSync(join(memwatch(home), files[0]), 'utf8')
+      .trim()
+      .split('\n')
+
     expect(lines.length).toBe(3) // one per second
   })
 
@@ -127,9 +137,11 @@ describe('startMemlog (Ink 1Hz memory trace, OpenTUI-compatible)', () => {
     vi.advanceTimersByTime(1000)
     // now make appendFileSync blow up — the collector must clearInterval, not throw
     const fs = require('node:fs')
+
     const spy = vi.spyOn(fs, 'appendFileSync').mockImplementation(() => {
       throw new Error('disk full')
     })
+
     expect(() => vi.advanceTimersByTime(1000)).not.toThrow()
     // interval cleared: further ticks do nothing even after restoring fs
     spy.mockRestore()

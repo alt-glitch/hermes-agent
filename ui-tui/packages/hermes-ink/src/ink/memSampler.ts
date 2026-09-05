@@ -24,17 +24,24 @@ export function countNodes(root: WalkableNode): { dom: number; yoga: number } {
   let dom = 0
   let yoga = 0
   const stack: WalkableNode[] = [root]
+
   while (stack.length > 0) {
     const node = stack.pop() as WalkableNode
     dom++
-    if (node.yogaNode !== undefined && node.yogaNode !== null) yoga++
+
+    if (node.yogaNode !== undefined && node.yogaNode !== null) {
+      yoga++
+    }
+
     const children = node.childNodes
+
     if (children) {
       for (let i = 0; i < children.length; i++) {
         stack.push(children[i] as WalkableNode)
       }
     }
   }
+
   return { dom, yoga }
 }
 
@@ -44,6 +51,7 @@ export function countNodes(root: WalkableNode): { dom: number; yoga: number } {
  */
 export function maybeStartMemSampler(root: WalkableNode, intervalMs?: number): () => void {
   const rawFd = process.env['HERMES_TUI_MEMSAMPLE_FD']
+
   if (!rawFd) {
     return () => {}
   }

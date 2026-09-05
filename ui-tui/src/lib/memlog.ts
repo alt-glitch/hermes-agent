@@ -50,25 +50,40 @@ const falsy = (v?: string) => /^(?:0|false|no|off)$/i.test((v ?? '').trim())
 function memlogEnabled(): boolean {
   const diag = truthy(process.env.HERMES_TUI_DIAGNOSTICS)
   const raw = (process.env.HERMES_TUI_MEMLOG ?? '').trim()
-  if (truthy(raw)) return true
-  if (falsy(raw)) return false
+
+  if (truthy(raw)) {
+    return true
+  }
+
+  if (falsy(raw)) {
+    return false
+  }
+
   return diag
 }
 
 function memwatchDir(): string {
   const home = process.env.HERMES_HOME?.trim()
   const base = home && home.length > 0 ? home : join(homedir(), '.hermes')
+
   return join(base, 'logs', 'memwatch')
 }
 
 function pruneOld(dir: string): void {
   const cutoff = Date.now() - RETENTION_DAYS * 24 * 3600 * 1000
+
   try {
     for (const name of readdirSync(dir)) {
-      if (!name.endsWith('.jsonl')) continue
+      if (!name.endsWith('.jsonl')) {
+        continue
+      }
+
       const p = join(dir, name)
+
       try {
-        if (statSync(p).mtimeMs < cutoff) unlinkSync(p)
+        if (statSync(p).mtimeMs < cutoff) {
+          unlinkSync(p)
+        }
       } catch {
         /* best-effort */
       }
@@ -80,28 +95,36 @@ function pruneOld(dir: string): void {
 
 /** Start the self-sampler (no-op unless enabled). Returns a stop function. */
 export function startMemlog(): () => void {
-  if (!memlogEnabled()) return () => {}
+  if (!memlogEnabled()) {
+    return () => {}
+  }
+
   try {
     const dir = memwatchDir()
     mkdirSync(dir, { recursive: true })
     pruneOld(dir)
     const boot = new Date().toISOString().replace(/[:.]/g, '').slice(0, 15)
     const file = join(dir, `${boot}-${process.pid}.jsonl`)
+
     const timer = setInterval(() => {
       try {
         const m = process.memoryUsage()
+
         const line = JSON.stringify({
           t: Math.floor(Date.now() / 1000),
           rss_kb: Math.floor(m.rss / 1024),
           heap_used_kb: Math.floor(m.heapUsed / 1024),
           external_kb: Math.floor(m.external / 1024)
         })
+
         appendFileSync(file, line + '\n')
       } catch {
         clearInterval(timer) // a failing diagnostic must not retry forever
       }
     }, SAMPLE_MS)
+
     timer.unref?.()
+
     return () => clearInterval(timer)
   } catch {
     return () => {}
