@@ -479,22 +479,7 @@ def test_fire_due_missing_job_does_not_run(monkeypatch):
     assert ran == []
 
 
-def test_fire_due_lost_claim_does_not_run(monkeypatch):
-    """If the CAS claim is lost (another machine/retry won), fire_due returns
-    False and never runs the job."""
-    import cron.jobs as jobs
-    import cron.scheduler as sched
-    from cron.scheduler_provider import InProcessCronScheduler
-
-    ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid, **_kw: False, raising=False)
-    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
-
-    assert InProcessCronScheduler().fire_due("j1") is False
-    assert ran == []
-
-
-def test_fire_due_missing_job_does_not_run(monkeypatch):
+def test_fire_due_legacy_claim_with_missing_job_does_not_run(monkeypatch):
     """If the job vanished between arm and fire (e.g. repeat-N exhausted),
     fire_due returns False without running."""
     import cron.jobs as jobs

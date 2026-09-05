@@ -111,6 +111,8 @@ def _copy_setup_checkout(tmp_path: Path) -> Path:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     shutil.copy2(SETUP_HERMES_SH, checkout / "setup-hermes.sh")
+    (checkout / "scripts").mkdir()
+    shutil.copy2(REPO_ROOT / "scripts/write-hermes-launcher.sh", checkout / "scripts")
     return checkout
 
 

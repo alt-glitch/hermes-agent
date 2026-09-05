@@ -38,6 +38,8 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
     result = tmp_path / "launch-result"
     venv_bin.mkdir(parents=True)
     minimal_path.mkdir()
+    (install_dir / "scripts").mkdir()
+    shutil.copy2(REPO_ROOT / "scripts/write-hermes-launcher.sh", install_dir / "scripts")
 
     dirname = shutil.which("dirname")
     assert dirname is not None
@@ -72,6 +74,7 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
         "INSTALL_DIR": str(install_dir),
         "DISTRO": "macos",
         "COMMAND_LINK_DIR": str(command_dir),
+        "_SCRIPT_DIR": str(install_dir / "scripts"),
     }
     subprocess.run(["/bin/bash", "-c", harness], env=env, check=True)
 

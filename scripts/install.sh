@@ -128,7 +128,7 @@ while [[ $# -gt 0 ]]; do
             # both SSH + HTTPS forms so the clone fallback still works).
             REPO_EXPLICIT=true
             case "$2" in
-                git@*|https://*|http://*|ssh://*)
+                git@*|https://*|http://*|ssh://*|file://*)
                     REPO_URL_SSH="$2"
                     REPO_URL_HTTPS="$2"
                     ;;

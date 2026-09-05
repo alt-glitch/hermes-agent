@@ -20,6 +20,11 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    # Route sequencing must not depend on the CI runner's free RAM/GPU.
+    monkeypatch.setattr("hermes_cli.local_runtime.hardware.probe_budget",
+                        lambda **kwargs: HardwareBudget(64 << 30, 64 << 30, 64 << 30))
     from hermes_cli import web_server
 
     test_client = TestClient(web_server.app)

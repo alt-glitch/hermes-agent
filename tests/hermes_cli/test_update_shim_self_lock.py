@@ -200,8 +200,8 @@ def test_up_to_date_run_never_hands_off(venv, monkeypatch, capsys):
     including the ``Already up to date!`` case that never touches the venv —
     spawned a child and returned to the shell, leaving the child printing
     into a console it no longer owned. ``--check`` is the cheapest real run
-    that reaches ``cmd_update`` and exits without syncing; nothing may be
-    spawned along the way.
+    that reaches ``cmd_update`` and exits without syncing; ordinary git probes
+    may run, but the updater must not hand off to a detached interpreter.
     """
     monkeypatch.setattr(sys, "argv", [str(venv / "hermes.exe"), "update", "--check"])
     calls = _capture_popen(monkeypatch)
@@ -209,7 +209,11 @@ def test_up_to_date_run_never_hands_off(venv, monkeypatch, capsys):
 
     cli_main.cmd_update(types.SimpleNamespace(check=True, branch=None))
 
-    assert calls == [], "an up-to-date run must not spawn a detached child"
+    assert not any(cmd and cmd[0] == str(venv / "python.exe") for cmd, _, _ in calls), (
+        "an up-to-date run must not hand off to the venv interpreter"
+    )
+    assert not any(options.get("creationflags") or options.get("start_new_session")
+                   for _, _, options in calls), "an up-to-date run must not detach a child"
 
 
 def test_sync_guard_hands_off_when_only_the_shim_is_held(venv, monkeypatch):

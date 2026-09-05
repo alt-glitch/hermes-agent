@@ -573,24 +573,20 @@ def _update_opentui_package() -> bool:
 
 
 def _config_tui_engine_early() -> str | None:
-    """Read ``display.tui_engine`` from config via a minimal YAML read.
+    """Read ``display.tui_engine`` through the profile-aware config owner.
 
     Returns the configured engine string, or ``None`` when unset/unreadable so the
     caller can apply the availability-gated default. Mirrors
     :func:`_config_default_interface_early`.
     """
     try:
-        cfg_path = get_hermes_home() / "config.yaml"
-        if cfg_path.exists():
-            import yaml as _yaml_eng
+        from hermes_cli.config import load_config_readonly
 
-            with open(cfg_path, encoding="utf-8") as _f:
-                raw = _yaml_eng.safe_load(_f) or {}
-            disp = raw.get("display", {})
-            if isinstance(disp, dict):
-                eng = disp.get("tui_engine")
-                if isinstance(eng, str) and eng.strip():
-                    return eng.strip().lower()
+        disp = load_config_readonly().get("display", {})
+        if isinstance(disp, dict):
+            eng = disp.get("tui_engine")
+            if isinstance(eng, str) and eng.strip():
+                return eng.strip().lower()
     except Exception:
         pass
     return None
@@ -1417,7 +1413,7 @@ def _read_cgroup_memory_limit() -> Optional[int]:
 
 
 def _config_tui_heap_mb_early() -> int | None:
-    """Read ``display.tui_heap_mb`` from config via a minimal YAML read.
+    """Read ``display.tui_heap_mb`` through the profile-aware config owner.
 
     Returns the configured V8 heap cap in MB, or ``None`` when unset/unreadable.
     Mirrors :func:`_config_tui_engine_early`. A non-secret behavioral setting, so
@@ -1426,23 +1422,19 @@ def _config_tui_heap_mb_early() -> int | None:
     override on top of this.
     """
     try:
-        cfg_path = get_hermes_home() / "config.yaml"
-        if cfg_path.exists():
-            import yaml as _yaml_heap
+        from hermes_cli.config import load_config_readonly
 
-            with open(cfg_path, encoding="utf-8") as _f:
-                raw = _yaml_heap.safe_load(_f) or {}
-            disp = raw.get("display", {})
-            if isinstance(disp, dict):
-                val = disp.get("tui_heap_mb")
-                if isinstance(val, bool):  # guard: YAML true/false is an int subclass
-                    return None
-                if isinstance(val, int) and val > 0:
-                    return val
-                if isinstance(val, str) and val.strip().isdigit():
-                    n = int(val.strip())
-                    if n > 0:
-                        return n
+        disp = load_config_readonly().get("display", {})
+        if isinstance(disp, dict):
+            val = disp.get("tui_heap_mb")
+            if isinstance(val, bool):  # guard: YAML true/false is an int subclass
+                return None
+            if isinstance(val, int) and val > 0:
+                return val
+            if isinstance(val, str) and val.strip().isdigit():
+                n = int(val.strip())
+                if n > 0:
+                    return n
     except Exception:
         pass
     return None

@@ -93,7 +93,8 @@ def test_install_sh_repository_stage_recovers_from_autostash_conflict(
     }
 
     result = subprocess.run(
-        ["bash", str(INSTALL_SH), "--stage", "repository", "--non-interactive"],
+        ["bash", str(INSTALL_SH), "--stage", "repository", "--non-interactive",
+         "--branch", "main", "--repo", (tmp_path / "origin.git").as_uri()],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -179,7 +180,8 @@ def test_install_sh_repository_stage_clean_apply_drops_stash(
         "HERMES_INSTALL_DIR": str(managed),
     }
     result = subprocess.run(
-        ["bash", str(INSTALL_SH), "--stage", "repository", "--non-interactive"],
+        ["bash", str(INSTALL_SH), "--stage", "repository", "--non-interactive",
+         "--branch", "main", "--repo", remote.as_uri()],
         cwd=tmp_path,
         env=env,
         capture_output=True,

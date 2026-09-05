@@ -27,6 +27,9 @@ import model_tools
 @pytest.fixture(autouse=True)
 def _clear_cache():
     """Each test starts with an empty quiet_mode cache."""
+    # Resolve lazy registrations and availability probes before testing cache
+    # aliasing. A computation whose verdict snapshot changes is not cacheable.
+    model_tools.get_tool_definitions(quiet_mode=True)
     model_tools._tool_defs_cache.clear()
     yield
     model_tools._tool_defs_cache.clear()

@@ -241,22 +241,31 @@ class TestShutdownDeliversNoticeBeforeDisconnect:
 
 
 class TestDeliveryErrorIsRecordedWhenTheNoticeCannotBeSent:
-    def test_interrupted_run_records_delivery_error_without_mark_job_run(self):
-        """``_consume_interrupted_flag`` short-circuits ``mark_job_run``,
-        which used to discard ``delivery_error`` along with it. The recovery
-        path must use ``update_job`` so the repeat counter and next_run_at
-        bookkeeping that ``mark_job_run`` owns is not run twice for one run.
-        """
-        import inspect
-
+    def test_interrupted_legacy_run_records_delivery_error_without_recounting(self):
+        """Legacy shutdown recovery records delivery without advancing the job again."""
         import cron.scheduler as sched
 
-        body_src = inspect.getsource(sched._run_one_job_body)
-        src = inspect.getsource(sched._finish_interrupted_run)
-        assert 'update_job(job["id"], {"last_delivery_error": delivery_error})' in src, (
-            "interrupted runs must still persist the delivery failure"
-        )
-        # The recovery branch hangs off the interrupted-flag short-circuit,
-        # not off a second mark_job_run call.
-        assert "_consume_interrupted_flag(" in body_src and "_finish_interrupted_run(" in body_src
-        assert "if delivery_error:" in src and "mark_job_run(" not in src
+        with patch("cron.jobs.update_job") as update, \
+             patch.object(sched, "mark_job_run") as mark, \
+             patch.object(sched, "finish_execution") as finish:
+            sched._finish_interrupted_run(_telegram_job(), "execution-1", "adapter closed")
+        update.assert_called_once_with("be62d36a9914", {"last_delivery_error": "adapter closed"})
+        mark.assert_not_called()
+        assert finish.call_args.args == ("execution-1",)
+        assert finish.call_args.kwargs["success"] is False
+
+    def test_interrupted_finite_run_settles_with_execution_deduplication(self):
+        import cron.scheduler as sched
+
+        job = _telegram_job() | {
+            "schedule": {"kind": "interval"}, "repeat": {"times": 3},
+            "fire_claim": {"by": "owner-1"}}
+        with patch("cron.jobs.update_job") as update, \
+             patch.object(sched, "mark_job_run") as mark, \
+             patch.object(sched, "finish_execution"):
+            sched._finish_interrupted_run(job, "execution-1", "adapter closed")
+        update.assert_called_once_with(job["id"], {"last_delivery_error": "adapter closed"})
+        assert mark.call_count == 1
+        assert mark.call_args.kwargs["expected_execution_id"] == "execution-1"
+        assert mark.call_args.kwargs["expected_fire_owner"] == "owner-1"
+        assert mark.call_args.kwargs["delivery_error"] == "adapter closed"

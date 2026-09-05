@@ -54,6 +54,26 @@ def _run_py(code: str, env_extra: dict[str, str], tmp_path: Path) -> dict:
     return json.loads(out_file.read_text(encoding="utf-8"))
 
 
+def test_tui_launch_settings_use_expansion_and_managed_overlay(tmp_path):
+    home = tmp_path / "home"
+    managed = tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    original = 'display:\n  tui_engine: "${TUI_TEST_ENGINE}"\n  tui_heap_mb: 512\n'
+    (home / "config.yaml").write_text(original)
+    (managed / "config.yaml").write_text("display:\n  tui_heap_mb: 1536\n")
+    out = _run_py(textwrap.dedent('''
+        import json, os
+        from pathlib import Path
+        from hermes_cli.main_tui_launch import _config_tui_engine_early, _config_tui_heap_mb_early
+        Path(os.environ["E2E_OUT_FILE"]).write_text(json.dumps({
+            "engine": _config_tui_engine_early(), "heap": _config_tui_heap_mb_early()}))
+    '''), {"HERMES_HOME": str(home), "HERMES_MANAGED_DIR": str(managed),
+           "TUI_TEST_ENGINE": "opentui"}, tmp_path)
+    assert out == {"engine": "opentui", "heap": 1536}
+    assert (home / "config.yaml").read_text() == original
+
+
 def test_behavioral_read_gets_expansion_and_overlay_while_writeback_stays_raw(
     tmp_path,
 ):
