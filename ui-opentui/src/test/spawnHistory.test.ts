@@ -231,6 +231,7 @@ describe('spawn replay diff', () => {
         outputTail: [{ isError: false, preview: 'ok', tool: 'read_file' }],
         parentId: 'p',
         startedAt: 1_700_000_000_000,
+        endedAt: 1_700_000_012_000,
         status: 'completed',
         toolCount: 2
       }
@@ -241,6 +242,7 @@ describe('spawn replay diff', () => {
         output_tail: [{ is_error: false, preview: 'ok', tool: 'read_file' }],
         parent_id: 'p',
         started_at: 1_700_000_000,
+        ended_at: 1_700_000_012,
         status: 'completed',
         subagent_id: 'sa-1',
         tool_count: 2

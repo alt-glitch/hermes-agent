@@ -429,7 +429,7 @@ function canonicalRecord(agent: SpawnAgentRecord): Readonly<Record<string, unkno
     const mapped = FIELD_ALIASES.get(key) ?? key
     // An explicit snake_case field is authoritative when both forms exist.
     if (mapped !== key && Object.hasOwn(agent, mapped)) continue
-    if (mapped === 'started_at' && typeof value === 'number' && Number.isFinite(value)) {
+    if ((mapped === 'started_at' || mapped === 'ended_at') && typeof value === 'number' && Number.isFinite(value)) {
       canonical[mapped] = epochMs(value)
       continue
     }

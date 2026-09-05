@@ -123,6 +123,20 @@ describe('agent message retention and completion', () => {
     )
   })
 
+  test('retention never splits a supplementary Unicode character', () => {
+    const store = createSessionStore()
+    const agent = start(store)
+    text(store, '😀' + 'x'.repeat(SUBAGENT_TRACE_TEXT_LIMIT - 1))
+    expect(agent.trace?.at(-1)?.text.isWellFormed()).toBe(true)
+    expect(agent.trace?.at(-1)?.text.length).toBeLessThanOrEqual(SUBAGENT_TRACE_TEXT_LIMIT)
+    store.apply({
+      type: 'subagent.complete',
+      payload: { subagent_id: 'a', summary: '😀' + 'y'.repeat(SUBAGENT_SUMMARY_LIMIT - 1) }
+    })
+    expect(agent.summary?.isWellFormed()).toBe(true)
+    expect(agent.summary?.length).toBeLessThanOrEqual(SUBAGENT_SUMMARY_LIMIT)
+  })
+
   test('entry trimming preserves monotonic IDs and is disclosed in immutable archives', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start' })
