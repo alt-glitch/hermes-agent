@@ -549,11 +549,12 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    invocation_started: bool = False
 
 
 def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
     """Bind scopes, sync the agent, snapshot history, build the run message; returns
-    ``(prompt, run_message, cols, streamer)`` or None when @-expansion was refused.
+    ``(prompt, run_message, cols, streamer)``; refusals use the terminal error path.
     Scopes fill field by field so a failure midway still leaves every bound token for the
     finally; the profile's terminal policy is bound too (a failed install leaves a
     fail-closed refusal scope).  The config-model sync is skipped under a /model --once
@@ -592,6 +593,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     cols = session.get("cols", 80)
     streamer = make_stream_renderer(cols)
     prompt = text
+    st.prompt_text = prompt if isinstance(prompt, str) else ""
     if isinstance(prompt, str) and "@" in prompt:
         from agent.context_references import preprocess_context_references
         from agent.model_metadata import get_model_context_length
@@ -604,9 +606,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
         ctx = preprocess_context_references(
             prompt, cwd=cwd, allowed_root=cwd, context_length=ctx_len)
         if ctx.blocked:
-            _emit(
-                "error", sid, {"message": "\n".join(ctx.warnings) or "Context injection refused."})
-            return None
+            raise ValueError("\n".join(ctx.warnings) or "Context injection refused.")
         prompt = ctx.message
     st.prompt_text = prompt if isinstance(prompt, str) else ""
     run_message: Any = _route_turn_images(agent, prompt, images) if images else prompt
@@ -675,6 +675,7 @@ def _invoke_agent(
     agent._on_session_title = lambda title, _source: _emit_title_refresh(sid, title)
     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
     try:
+        st.invocation_started = True
         st.result = agent.run_conversation(run_message, **st.run_kwargs)
     finally:
         # Stop AND join before anything emits: a tick surviving past message.complete would
@@ -862,8 +863,9 @@ def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseExcept
         _emit("error", sid, {"message": (
             "accepted steer retained after the turn crash because the next-turn "
             "queue is at its 4 MiB safety limit")})
-    # A finalizer exception can leave in-memory history at the turn-start snapshot.
-    _restore_agent_history_after_turn_error(session, st.agent)
+    # Before invocation a resumed agent's buffer may still be empty; the session owns history.
+    if st.invocation_started:
+        _restore_agent_history_after_turn_error(session, st.agent)
     if st.terminal_callback is not None and not st.receipt_attempted:
         st.receipt_attempted = True
         try:
@@ -976,10 +978,7 @@ def _run_prompt_submit(
         goal_followup = None
         loop_claim_settled = False
         try:
-            prepared = _prepare_turn_input(sid, session, st, text, images)
-            if prepared is None:
-                return
-            prompt, run_message, cols, streamer = prepared
+            prompt, run_message, cols, streamer = _prepare_turn_input(sid, session, st, text, images)
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata)
