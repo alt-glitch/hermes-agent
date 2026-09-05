@@ -425,12 +425,17 @@ def request_status(state_dir: Path, request_id: str) -> dict[str, Any]:
     if not SHA256_RE.fullmatch(request_id):
         raise ControlError("request id must be the full SHA-256 returned by submission")
     pending = None
+    queue_errors = []
     with _request_lock(state_dir):
         for name, status in (("run-request.json", "queued"),
                              ("run-request.inflight.json", "claimed")):
             path = state_dir / name
             if path.exists():
-                value = _read_bound_request(path, state_dir, label="pending request")
+                try:
+                    value = _read_bound_request(path, state_dir, label="pending request")
+                except ControlError:
+                    queue_errors.append(name)
+                    continue
                 if _canonical_json_sha256(value) == request_id:
                     pending = status
     runs = []
@@ -455,11 +460,14 @@ def request_status(state_dir: Path, request_id: str) -> dict[str, Any]:
             outcome = json.loads(safe.read_text(encoding="utf-8"))
             if not isinstance(outcome, dict):
                 raise ControlError("run outcome must be an object")
-            for key in ("status", "stage", "published", "candidate_sha", "needs_finalization"):
+            for key in ("status", "stage", "published", "candidate_sha", "needs_finalization", "request_retired"):
                 if key in outcome:
                     entry[key] = outcome[key]
         runs.append(entry)
-    return {"request_id": request_id, "pending": pending, "runs": runs}
+    result = {"request_id": request_id, "pending": pending, "runs": runs}
+    if queue_errors:
+        result["queue_errors"] = queue_errors
+    return result
 
 
 def _record_retry_context(
@@ -635,6 +643,19 @@ def _derive_run_binding(
     )
     if last_synced is not None and not SHA_RE.fullmatch(last_synced):
         raise ControlError("last synced upstream marker is invalid")
+    context = _captured_run_context(state_dir, evidence_root, token)
+    if mode == "repair" and claimed_value["base_sha"] != context["base_sha"]:
+        raise ControlError("repair base has moved; a new explicit request is required")
+    return {
+        "mode": mode,
+        "request_sha256": request_sha,
+        "last_synced_upstream": last_synced,
+        "captured_upstream": context["upstream_sha"],
+        "captured_base": context["base_sha"],
+    }
+
+
+def _captured_run_context(state_dir: Path, evidence_root: Path, token: str) -> dict[str, Any]:
     context_path = evidence_root / "run-context.json"
     try:
         context = json.loads(context_path.read_text(encoding="utf-8"))
@@ -667,15 +688,7 @@ def _derive_run_binding(
         or not SHA_RE.fullmatch(str(context.get("upstream_sha", "")))
     ):
         raise ControlError("captured run context does not match the active lease")
-    if mode == "repair" and claimed_value["base_sha"] != context["base_sha"]:
-        raise ControlError("repair base has moved; a new explicit request is required")
-    return {
-        "mode": mode,
-        "request_sha256": request_sha,
-        "last_synced_upstream": last_synced,
-        "captured_upstream": context["upstream_sha"],
-        "captured_base": context["base_sha"],
-    }
+    return context
 
 
 @contextmanager
@@ -3407,22 +3420,31 @@ def finalize_failure(
             )
     claimed = evidence_root / "request.claimed.json"
     inflight = state_dir / "run-request.inflight.json"
-    request_recovered = False
-    if claimed.exists():
-        claimed_value = _read_bound_request(
-            claimed, evidence_root, label="claimed request"
-        )
-        if not inflight.exists():
-            raise ControlError("failed run claim is no longer in flight")
-        if (
-            _read_bound_request(inflight, state_dir, label="in-flight request")
-            != claimed_value
-        ):
-            raise ControlError("failed run claim does not match the in-flight request")
-        recover_request(state_dir)
-        request_recovered = True
-    elif inflight.exists():
-        raise ControlError("in-flight request is not bound to this failed run")
+    request_recovered = request_retired = False
+    with _request_lock(state_dir):
+        if claimed.exists():
+            claimed_value = _read_bound_request(claimed, evidence_root, label="claimed request")
+            stale = evidence_root / "request.stale.json"
+            if not inflight.exists() and stale.exists():
+                if _read_bound_request(stale, evidence_root, label="stale request") != claimed_value:
+                    raise ControlError("stale request does not match this failed run")
+                request_retired = True
+            else:
+                if not inflight.exists():
+                    raise ControlError("failed run claim is no longer in flight")
+                if _read_bound_request(inflight, state_dir, label="in-flight request") != claimed_value:
+                    raise ControlError("failed run claim does not match the in-flight request")
+                if claimed_value["mode"] == "repair":
+                    context = _captured_run_context(
+                        state_dir, evidence_root, _lease_value(state_dir)["token"])
+                    request_retired = claimed_value["base_sha"] != context["base_sha"]
+                if request_retired:
+                    os.replace(inflight, stale)
+                else:
+                    _recover_request_unlocked(state_dir)
+                    request_recovered = True
+        elif inflight.exists():
+            raise ControlError("in-flight request is not bound to this failed run")
     return _record_run_outcome(
         state_dir,
         evidence_root,
@@ -3433,6 +3455,7 @@ def finalize_failure(
             "published": False,
             "needs_finalization": False,
             "request_recovered": request_recovered,
+            "request_retired": request_retired,
         },
     )
 

@@ -538,6 +538,67 @@ def test_request_status_ignores_unidentifiable_historical_claims(tmp_path):
     assert damaged.read_text() == "{incomplete"
 
 
+def test_request_status_retains_run_result_when_queue_is_unreadable(tmp_path):
+    state = tmp_path / "state"
+    submitted = runtime.submit_request(state, repair_request())
+    run = state / "runs" / "prior-run"
+    runtime.claim_request(state, run)
+    (run / "run-outcome.json").write_text(json.dumps({"status": "failed", "published": False}))
+    (state / "run-request.inflight.json").write_text("{invalid")
+    status = runtime.request_status(state, submitted["request_id"])
+    assert status["queue_errors"] == ["run-request.inflight.json"]
+    assert status["runs"][0]["status"] == "failed"
+    assert (state / "run-request.inflight.json").read_text() == "{invalid"
+
+
+def test_stale_repair_is_retired_without_blocking_the_next_scheduled_run(tmp_path):
+    state, evidence = tmp_path / "state", tmp_path / "state/runs/stale"
+    write_live_lease(state)
+    value = claim_repair(state, evidence, "a" * 40, "b" * 40)
+    value["base_sha"] = "c" * 40
+    for path in (state / "run-request.inflight.json", evidence / "request.claimed.json"):
+        path.write_text(json.dumps(value))
+    for _ in range(2):  # retry after archive-before-outcome interruption is safe
+        result = runtime.finalize_failure(state, evidence, stage="gate", reason_code="gate-failed")
+        assert result["request_retired"] is True
+        assert result["request_recovered"] is False
+    assert json.loads((evidence / "request.stale.json").read_text()) == value
+    assert not (state / "run-request.json").exists()
+    assert not (state / "run-request.inflight.json").exists()
+
+    following = state / "runs/next"
+    following.mkdir()
+    context = json.loads((evidence / "run-context.json").read_text()) | {"run_id": "next"}
+    (following / "run-context.json").write_text(json.dumps(context))
+    lease = json.loads((state / "run.lease.json").read_text()) | {
+        "run_id": "next", "evidence_dir": str(following),
+        "run_context_sha256": file_hash(following / "run-context.json")}
+    (state / "run.lease.json").write_text(json.dumps(lease))
+    assert runtime._derive_run_binding(state, following, "test-token")["mode"] == "scheduled"
+
+
+def test_valid_repair_failure_remains_retryable(tmp_path):
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    value = claim_repair(state, evidence, "a" * 40, "b" * 40)
+    result = runtime.finalize_failure(state, evidence, stage="gate", reason_code="gate-failed")
+    assert result["request_recovered"] is True
+    assert result["request_retired"] is False
+    assert json.loads((state / "run-request.json").read_text()) == value
+
+
+def test_untrusted_context_cannot_retire_a_repair(tmp_path):
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    value = claim_repair(state, evidence, "a" * 40, "b" * 40)
+    path = evidence / "run-context.json"
+    path.write_text(json.dumps(json.loads(path.read_text()) | {"base_sha": "c" * 40}))
+    with pytest.raises(runtime.ControlError, match="does not match the active lease"):
+        runtime.finalize_failure(state, evidence, stage="gate", reason_code="gate-failed")
+    assert json.loads((state / "run-request.inflight.json").read_text()) == value
+    assert not (evidence / "request.stale.json").exists()
+
+
 def test_repair_rejects_a_candidate_missing_the_requested_source(tmp_path, monkeypatch):
     repo, _, base, candidate, worktree = make_repo(tmp_path)
     state, evidence = tmp_path / "state", tmp_path / "evidence"

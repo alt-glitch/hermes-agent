@@ -47,8 +47,10 @@ is needed; don't write a request unsupported by the installed worker.
    failed agent and release its lease. A new process session alone does not
    escape systemd's cgroup. Never use `--scope`, which remains attached to the
    caller. Check that same unit if dispatch times out: don't resubmit an
-   uncertain launch. A failed launch leaves the request queued for an explicitly
-   requested retry; it is not evidence that the maintainer ran.
+   uncertain launch. Submission authorizes the existing scheduler to execute
+   the request; dispatch only accelerates it. A failed launch leaves the request
+   queued for the next scheduled tick, not waiting for another approval. It is
+   not evidence that the maintainer ran.
 4. Acknowledge the request ID and observed dispatch state. Say “queued” until
    dispatch is observed, not “published” or “tests passed.” Keep the unit handle
    and request ID in the caller's handoff. Use the caller's existing completion
@@ -57,7 +59,9 @@ is needed; don't write a request unsupported by the installed worker.
 
 The worker is instructed to claim the request, fetch `refs/pull/<pr>/head`, verify its SHA,
 and preserves it in a linear candidate above the captured fork base. If the
-base moved, report the stale request; don't silently broaden authorization.
+base moved, failure finalization retires the request into `request.stale.json`
+and reports `request_retired: true`. Report it and ask for a new request against
+the new base; don't silently broaden authorization or retry that stale request.
 Every publication still requires the full gates, independent review, current
 head Greptile 5/5, required CI checks and remote compare-and-swap. Repairs do not
 advance the upstream-sync watermark. Runtime gates enforce source/base ancestry;
@@ -73,6 +77,8 @@ is not proof of a live process: check the retained systemd unit and the actual
 cron execution if liveness matters. Match the run's claimed request hash; the
 latest global run may belong to somebody else. Inspect logs/PR evidence for
 details, without printing credentials or lease tokens.
+If `queue_errors` is present, report unreadable queue state rather than claiming
+the queue is empty. Historical run results remain inspectable.
 
 Report published/not published, candidate SHA, PR link, actual checks and any
 blocker. A scheduler exit is not successful publication. On an explicit retry,
