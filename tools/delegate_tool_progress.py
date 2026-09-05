@@ -269,6 +269,8 @@ class _ChildProgressRelay:
         )
         self.batch: List[str] = []
         self.tool_count = 0  # per-subagent running counter
+        self._event_lock = threading.RLock()
+        self._completed = False
 
     def _prefix(self) -> str:
         # The batch tag is resolved lazily from session_ref: the relay is built
@@ -301,11 +303,11 @@ class _ChildProgressRelay:
             with _quiet("Parent callback failed: %s"):
                 self.parent_cb(event_type, tool_name, preview, args, **{**self._identity_kwargs(), **kwargs})
 
-    def _tree_line(self, text: str) -> None:
+    def _tree_line(self, text: str, prefix: Optional[str] = None) -> None:
         """Print one tree-view line above the CLI spinner (no-op without a spinner)."""
         if self.spinner:
             with _quiet("Spinner print_above failed: %s"):
-                self.spinner.print_above(f" {self._prefix()}├─ {text}")
+                self.spinner.print_above(f" {self._prefix() if prefix is None else prefix}├─ {text}")
 
     def _flush(self) -> None:
         """Flush remaining batched tool names to the gateway."""
@@ -314,19 +316,27 @@ class _ChildProgressRelay:
             self.batch.clear()
 
     # ── Lifecycle events emitted by the orchestrator itself ──
+    def _show_lifecycle(self, event_type, preview, kwargs):
+        goal = kwargs.get("goal") or ""
+        if event_type == "subagent.start" and goal:
+            line = f"🔀 {_short(goal, 55)}"
+        elif event_type == "subagent.complete" and kwargs.get("status") in SUBAGENT_FAILURE_STATUSES:
+            line = format_subagent_failure_line(
+                goal, kwargs.get("status"), error=kwargs.get("summary") or preview,
+                duration_seconds=kwargs.get("duration_seconds"),
+            )
+        else:
+            return
+        self._tree_line(line, _batch_prefix(
+            kwargs.get("delegation_id"), kwargs.get("task_index", 0), kwargs.get("task_count", 1),
+        ))
+
     def _on_start(self, tool_name, preview, args, kwargs):
-        if self.goal_label:
-            self._tree_line(f"🔀 {_short(self.goal_label, 55)}")
+        self._show_lifecycle("subagent.start", preview, {**self._identity_kwargs(), **kwargs})
         self._relay("subagent.start", preview=preview or self.goal_label or "", **kwargs)
 
     def _on_complete(self, tool_name, preview, args, kwargs):
-        # Failed child: echo one clean reason line into the CLI tree so the human
-        # sees WHY, not just a vanished branch (gateway renders off the relayed event).
-        if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES:
-            self._tree_line(format_subagent_failure_line(
-                self.goal_label, kwargs.get("status"), error=kwargs.get("summary") or preview,
-                duration_seconds=kwargs.get("duration_seconds"),
-            ))
+        self._show_lifecycle("subagent.complete", preview, {**self._identity_kwargs(), **kwargs})
         self._relay("subagent.complete", preview=preview, **kwargs)
 
     def _on_text(self, tool_name, preview, args, kwargs):
@@ -368,9 +378,21 @@ class _ChildProgressRelay:
                 self._flush()
 
     def __call__(self, event_type, tool_name: str = None, preview: str = None, args=None, **kwargs):
+        # Timeout is cooperative: the provider may still call us while unwinding.
+        # Serialize terminal delivery with deltas without touching newer callbacks.
+        with self._event_lock:
+            own_event = kwargs.get("subagent_id", self.subagent_id) == self.subagent_id
+            if self._completed and own_event:
+                return
+            if event_type == "subagent.complete" and own_event:
+                self._completed = True
+            self._dispatch(event_type, tool_name, preview, args, **kwargs)
+
+    def _dispatch(self, event_type, tool_name, preview, args, **kwargs):
         # A grandchild's qualified event is already attributed. Adding this relay's
         # defaults would borrow its parent's label/session when optional fields are absent.
         if isinstance(event_type, str) and event_type.startswith("subagent.") and kwargs.get("subagent_id"):
+            self._show_lifecycle(event_type, preview, kwargs)
             _safe_progress(self.parent_cb, event_type, tool_name, preview, args, **kwargs)
             return
         if event_type in ("subagent.spawn_requested", "subagent.reasoning"):

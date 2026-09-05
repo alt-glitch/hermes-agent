@@ -95,6 +95,37 @@ def test_child_tree_prefix_without_batch_id_is_unchanged():
     assert parent._delegate_spinner.lines[0].startswith(" [1/3] ├─ 🔀 solo goal")
 
 
+def test_nested_lifecycle_keeps_its_own_cli_goal_and_batch():
+    parent = types.SimpleNamespace(_delegate_spinner=_Spinner(), tool_progress_callback=None)
+    outer = _build_child_progress_callback(
+        0, "Outer coordinator", parent, 3, subagent_id="outer",
+        session_ref={"delegation_id": "outer-batch"},
+    )
+    inner = _build_child_progress_callback(
+        1, "Inspect nested parser", types.SimpleNamespace(tool_progress_callback=outer), 2,
+        subagent_id="inner", parent_id="outer", session_ref={"delegation_id": "inner-batch"},
+    )
+    inner("subagent.start")
+    inner("subagent.complete", status="timeout", summary="Parser request stalled", duration_seconds=30)
+    # A nested completion must not close or relabel the coordinator's own relay.
+    outer("subagent.start")
+    lines = parent._delegate_spinner.lines
+    assert len(lines) == 3
+    assert all("Inspect nested parser" in line and "Outer coordinator" not in line for line in lines[:2])
+    assert all(_batch_prefix("inner-batch", 1, 2) in line for line in lines[:2])
+    assert "Parser request stalled" in lines[1]
+    assert "Outer coordinator" in lines[2]
+    outer("subagent.complete", status="completed")
+    # Detached descendants still own their events after the coordinator finishes.
+    detached = _build_child_progress_callback(
+        0, "Detached nested worker", types.SimpleNamespace(tool_progress_callback=outer), subagent_id="detached",
+    )
+    detached("subagent.start")
+    assert "Detached nested worker" in lines[-1]
+    inner("subagent.start")  # the timed-out branch itself cannot restart
+    assert len(lines) == 4
+
+
 def test_batch_completion_lines_are_attributable_across_two_batches(monkeypatch, tmp_path):
     """Two interleaved batches: every ✓ line names its own ``set N``."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))

@@ -87,3 +87,84 @@ def test_branch_stream_preserves_owner_identity_and_child_mirror(monkeypatch, mo
     before = len(frames)
     server._on_tool_progress("parent", "reasoning.available", "_thinking", "ordinary chrome")
     assert len(frames) == before + (mode != "off")
+
+
+def test_timed_out_worker_cannot_reopen_child_mirror(monkeypatch):
+    import json
+    import threading
+
+    from run_agent import AIAgent
+    from tools import delegate_tool as dt
+    from tools.delegate_tool_progress import _build_child_progress_callback
+    from tui_gateway import server
+
+    parent_wire, child_wire = _Transport(), _Transport()
+    watch = {"session_key": "pending", "agent": None, "transport": child_wire}
+    monkeypatch.setattr(server, "_sessions", {
+        "parent": {"transport": parent_wire, "tool_progress_mode": "off"}, "watch": watch,
+    })
+    monkeypatch.setattr(server, "_child_mirrors", {})
+    monkeypatch.setattr(server, "_active_child_runs", {})
+    monkeypatch.setattr(dt, "_get_child_timeout", lambda: 0.2)
+    release, closed = threading.Event(), threading.Event()
+    observed = {}
+
+    def blocked_provider(child, user_message, task_id, stream_callback):
+        observed["child"] = child
+        watch["session_key"] = child.session_id
+        original_close = child.close
+
+        def close():
+            try:
+                original_close()
+            finally:
+                closed.set()
+
+        child.close = close
+        child._stream_callback = stream_callback
+        child._claim_stream_writer()
+        child._fire_reasoning_delta("Early reasoning")
+        stream_callback("Early answer")
+        assert release.wait(timeout=5)
+        observed["superseded"] = child._stream_writer_superseded()
+        child._fire_reasoning_delta("Late reasoning")
+        stream_callback("Late answer")
+        child.thinking_callback("Late activity")
+        return {"final_response": "Late answer", "completed": True, "api_calls": 1, "messages": []}
+
+    monkeypatch.setattr(AIAgent, "run_conversation", blocked_provider)
+    parent = AIAgent(
+        api_key="test-key", base_url="http://127.0.0.1:1/v1", provider="openai-compat", model="test-model",
+        enabled_toolsets=["file"], quiet_mode=True, skip_context_files=True, skip_memory=True,
+        save_trajectories=False, session_id="timeout-parent",
+        tool_progress_callback=server._agent_cbs("parent")["tool_progress_callback"],
+    )
+    try:
+        result = json.loads(dt.delegate_task(goal="Inspect timeout ownership", parent_agent=parent))
+        assert result["results"][0]["status"] == "timeout", result
+        assert child_wire.frames[-1]["type"] == "message.complete"
+        parent_count, child_count = len(parent_wire.frames), len(child_wire.frames)
+        release.set()
+        assert closed.wait(timeout=5)
+        assert observed["superseded"] is False  # stop != newer stream attempt
+        assert len(parent_wire.frames) == parent_count
+        assert len(child_wire.frames) == child_count
+        assert not server._child_run_active(watch["session_key"])
+        assert not server._child_mirrors
+
+        # A fresh owner for the same session remains free to stream and complete.
+        fresh = _build_child_progress_callback(
+            0, "New run", parent, subagent_id="new-child",
+            session_ref={"session_id": watch["session_key"]},
+        )
+        fresh("subagent.start")
+        fresh("subagent.reasoning", preview="New reasoning")
+        assert server._child_run_active(watch["session_key"])
+        fresh("subagent.complete", status="completed", summary="New answer")
+        assert child_wire.frames[-1]["payload"]["text"] == "New answer"
+        assert not server._child_run_active(watch["session_key"])
+    finally:
+        release.set()
+        if "child" in observed:
+            assert closed.wait(timeout=5)
+        parent.close()
