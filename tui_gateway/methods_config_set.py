@@ -295,6 +295,8 @@ _REASONING_DISPLAY_WORDS = (
 
 @_cfgset_guarded
 def _set_reasoning(rid, params, key, value, session):
+    if "session_id" in params and session is None:
+        return _err(rid, 4006, f"unknown session: {params.get('session_id')}")
     from hermes_constants import parse_reasoning_effort
     arg = _word(value)
     scope = _word(params.get("scope"))
@@ -352,7 +354,7 @@ def _word_setters() -> dict:
         "approvals.mode": (_word, _APPROVAL_MODES, "unknown approval mode: {value}; pick one of manual|smart|off",
                            lambda w: (_write_config_key("approvals.mode", w), _emit_all_session_info())),
         "details_mode": (_word, _DETAIL_MODES, "unknown details_mode: {value}", lambda w: _write_display_sections(
-            sections={section: w for section in _DETAIL_SECTION_NAMES}, details_mode=w)),
+            sections={section: w for section in _GLOBAL_DETAIL_SECTION_NAMES}, details_mode=w)),
         # thinking_mode also keeps details_mode aligned (compat bridge).
         "thinking_mode": (_word, {"collapsed", "truncated", "full"}, "unknown thinking_mode: {value}", lambda w: (
             _write_config_key("display.thinking_mode", w),
@@ -385,6 +387,20 @@ def _set_details_section(rid, params, key, value, session):
         return _err(rid, 4002, f"unknown details_mode: {value}")
     _write_display_sections(sections={section: nv} if nv else None, drop_sections=() if nv else (section,))
     return _kv(rid, key, nv)
+
+
+def _set_browser_backend(rid, params, key, value, session):
+    """Persist the next session's backend and invalidate gateway-owned availability checks."""
+    raw = _word(value)
+    if raw not in {"on", "off"}:
+        return _err(rid, 4002, f"unknown browser backend value: {value} (use on|off)")
+    from tools.browser_use_cli import BACKEND_DISABLED
+    from tools.registry import invalidate_check_fn_cache
+
+    backend = "browser-use" if raw == "on" else BACKEND_DISABLED
+    _write_config_key("browser.backend", backend)
+    invalidate_check_fn_cache()
+    return _kv(rid, key, raw, backend=backend)
 
 
 def _toggle_setters() -> dict:
@@ -476,6 +492,7 @@ _CONFIG_SETTERS = {
     "approval_mode": _set_approval_mode, "approvals.mode": _set_word, "yolo": _set_yolo,
     "reasoning": _set_reasoning, "details_mode": _set_word, "thinking_mode": _set_word,
     "density": _set_toggle, "battery": _set_toggle, "theme": _set_word,
+    "browser_backend": _set_browser_backend,
     "statusbar": _set_toggle, "mouse": _set_toggle, "indicator": _set_word,
     "cwd": _set_cwd, "terminal.cwd": _set_cwd, "workdir": _set_cwd,
     "prompt": _set_prompt, "personality": _set_personality, "skin": _set_skin}

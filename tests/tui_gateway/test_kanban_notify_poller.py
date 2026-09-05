@@ -14,6 +14,8 @@ unsubscribe) and ``_format_kanban_event_text``.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
@@ -273,21 +275,38 @@ class TestNotificationPollerLoopKanbanWiring:
     busy-session pending buffer that flushes once the session goes idle.
     """
 
+    @pytest.fixture(autouse=True)
+    def _isolated_sessions(self, monkeypatch, tmp_path):
+        import tui_gateway.server as server
+
+        monkeypatch.setattr(server, "_sessions", {})
+        monkeypatch.setattr(server, "_hermes_home", tmp_path)
+        monkeypatch.setattr(server, "_load_cfg", lambda: {})
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        yield
+        for session in server._sessions.values():
+            assert server._release_active_session_slot(session)
+
     def _start_poller(self, session: dict, monkeypatch):
         import threading
         import tui_gateway.server as server
 
         emits: list = []
         submits: list = []
+        monkeypatch.setitem(server._sessions, "sid-poller-test", session)
         monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        monkeypatch.setattr(
-            server,
-            "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
-        )
+
+        def submit(rid, sid, sess, text):
+            # Exercise the real ownership/start gate; stop before agent execution.
+            if server._admit_prompt_turn(sid, sess, text, None, None, []) is None:
+                return False
+            submits.append(text)
+            return True
+
+        monkeypatch.setattr(server, "_run_prompt_submit", submit)
         stop = threading.Event()
         thread = threading.Thread(
             target=server._notification_poller_loop,
@@ -312,6 +331,7 @@ class TestNotificationPollerLoopKanbanWiring:
         import threading
 
         return {
+            "agent": SimpleNamespace(),
             "session_key": SESSION_KEY,
             "history_lock": threading.Lock(),
             "running": running,

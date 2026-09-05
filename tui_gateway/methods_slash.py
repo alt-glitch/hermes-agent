@@ -275,6 +275,15 @@ def _mirror_approvals(sid, session, agent, arg) -> None:
         broadcast_session_info()
 
 
+def _mirror_yolo(sid, session, agent, arg) -> None:
+    # The slash worker's process-local flag cannot change gateway approval checks.
+    from tools.approval import disable_session_yolo, enable_session_yolo, is_session_yolo_enabled
+    key = session["session_key"]
+    enabled = _BOOL_WORDS.get(arg.lower(), not is_session_yolo_enabled(key))
+    (enable_session_yolo if enabled else disable_session_yolo)(key)
+    _emit("session.info", sid, _session_info(agent, session))
+
+
 def _mirror_personality(sid, session, agent, arg) -> None:
     if arg and agent:
         pname, new_prompt = _validate_personality(arg, _load_cfg())
@@ -339,7 +348,8 @@ def _mirror_stop(sid, session, agent, arg) -> None:
 _SLASH_MIRRORS = {
     "model": lambda sid, session, agent, arg: (
         _apply_model_switch(sid, session, arg).get("warning", "") if arg and agent else ""),
-    "approvals": _mirror_approvals, "personality": _mirror_personality, "prompt": _mirror_prompt,
+    "approvals": _mirror_approvals, "yolo": _mirror_yolo,
+    "personality": _mirror_personality, "prompt": _mirror_prompt,
     "compress": lambda sid, session, agent, arg: (
         _compress_live_with_feedback(sid, session, agent, arg, snapshot_kwargs=False) if agent else ""),
     "fast": _mirror_fast,

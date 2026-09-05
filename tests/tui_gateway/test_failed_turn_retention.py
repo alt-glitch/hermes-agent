@@ -89,6 +89,13 @@ def turn_env(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
     monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    yield
+    for session in server._sessions.values():
+        assert server._release_active_session_slot(session)
 
 
 def _events(captured, name):
@@ -153,6 +160,7 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
+    server._sessions["sid"] = session
     server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     completes = _events(emits, "message.complete")
@@ -190,6 +198,7 @@ def test_returned_error_result_carries_error_surface(emits, turn_env):
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
+    server._sessions["sid"] = session
     server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     payload = _events(emits, "message.complete")[0]
@@ -223,6 +232,7 @@ def test_returned_error_without_reason_omits_no_frame(emits, turn_env):
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "go")
 
+    server._sessions["sid"] = session
     server._run_prompt_submit("rid", "sid", session, "go")
 
     payload = _events(emits, "message.complete")[0]
@@ -240,6 +250,7 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
+    server._sessions["sid"] = session
     server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     completes = _events(emits, "message.complete")
@@ -266,6 +277,7 @@ def test_exception_closes_turn_with_terminal_complete_and_partial(emits, turn_en
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
+    server._sessions["sid"] = session
     server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     # Terminal frame, not a bare error event.
@@ -305,6 +317,7 @@ def test_live_session_payload_exposes_retained_failure(emits, turn_env, monkeypa
     )
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "long job")
+    server._sessions["sid"] = session
     server._run_prompt_submit("rid", "sid", session, "long job")
 
     # What session.resume's live fast path hands a reconnecting client.
@@ -343,6 +356,7 @@ def test_next_turn_replaces_retained_error_snapshot(emits, turn_env):
     server._start_inflight_turn(session, "old failed prompt")
     server._fail_inflight_turn(session, "previous turn failed")
 
+    server._sessions["sid"] = session
     server._run_prompt_submit("rid", "sid", session, "new prompt")
 
     # The new turn must have started a fresh inflight turn, not inherited the

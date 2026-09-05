@@ -120,12 +120,11 @@ def _abs_completion_prefix_exists(path_part: str) -> bool:
         return False
 
 
-_DETAILS_SECTIONS = ("thinking", "tools", "subagents", "activity")
 _DETAILS_MODES = ("hidden", "collapsed", "expanded")
 
 
 def _details_root_meta(candidate: str) -> str:
-    if candidate in _DETAILS_SECTIONS:
+    if candidate in _DETAIL_SECTION_NAMES:
         return "section override"
     return "cycle global mode" if candidate == "cycle" else "global mode"
 
@@ -140,7 +139,7 @@ def _details_completions(text: str) -> list[dict] | None:
     body = text[len("/details") :].removeprefix(" ")
     parts = body.split()
     trailing = text.endswith(" ")
-    root_candidates = (*_DETAILS_MODES, "cycle", *_DETAILS_SECTIONS)
+    root_candidates = (*_DETAILS_MODES, "cycle", *_DETAIL_SECTION_NAMES)
     if not body or (not parts and trailing):
         lead = "" if trailing else " "
         return [_item(f"{lead}{c}", _details_root_meta(c)) for c in root_candidates]
@@ -148,7 +147,7 @@ def _details_completions(text: str) -> list[dict] | None:
         prefix = parts[0].lower()
         return [_item(c, _details_root_meta(c)) for c in root_candidates if c.startswith(prefix) and c != prefix]
     section = parts[0].lower() if parts else ""
-    if section not in _DETAILS_SECTIONS:
+    if section not in _DETAIL_SECTION_NAMES:
         return []
 
     def section_meta(candidate: str) -> str:

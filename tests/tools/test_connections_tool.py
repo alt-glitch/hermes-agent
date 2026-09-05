@@ -164,24 +164,11 @@ def _session_tool_names(enabled_toolsets, *, connectors, disabled_toolsets=None)
 
 
 def test_bundle_membership_is_not_evidence_of_reachability():
-    """Pins the trap that let the first fix ship broken.
-
-    The tool registers into the toolset "connections", which lives only in the
-    registry — never in TOOLSETS. Membership in _HERMES_CORE_TOOLS puts the
-    NAME inside every hermes-* composite, and asserting that was mistaken for
-    proof that sessions could call it. They could not: no production caller
-    passes a composite name. Every reachability assertion below therefore goes
-    through the real per-platform resolution instead.
-    """
-    from toolsets import TOOLSETS, resolve_toolset
-
-    assert "connections" not in TOOLSETS  # registry-only; no platform can list it
-    for bundle in ("hermes-cli", "hermes-cron", "hermes-gateway", "hermes-telegram"):
-        assert "manage_connections" in resolve_toolset(bundle), bundle
-    # And the narrow/posture bundles genuinely do not carry it — which is why
-    # reachability cannot be a property of the bundle.
-    for bundle in ("coding", "hermes-acp", "hermes-webhook", "hermes-api-server"):
-        assert "manage_connections" not in resolve_toolset(bundle), bundle
+    """Membership can change as upstream derives bundles from core; the actual
+    contract is availability-gated injection even when no bundle selected it."""
+    for selection in ([], ["coding"], ["hermes-cli"]):
+        assert "manage_connections" in _session_tool_names(selection, connectors=True)
+        assert "manage_connections" not in _session_tool_names(selection, connectors=False)
 
 
 def test_cli_session_gets_the_tool_outside_a_code_workspace(tmp_path, monkeypatch):

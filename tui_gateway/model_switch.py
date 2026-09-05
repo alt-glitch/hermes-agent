@@ -223,7 +223,11 @@ def _apply_model_switch(
         custom_providers=custom_provs)
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
-    restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
+    restore_snapshot = None
+    if one_turn and agent:
+        restore_snapshot = session.get("one_turn_model_restore")
+        if restore_snapshot is None:
+            restore_snapshot = _snapshot_agent_model_runtime(agent)
     if agent:
         _merge_preflight_warning(result, agent, session, cfg, custom_provs)
     if not confirm_expensive_model:

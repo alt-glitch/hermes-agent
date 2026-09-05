@@ -127,7 +127,9 @@ def _session_row_summary(row: dict, *, tip_row: dict | None = None, resolved_id=
     return {"id": row["id"], **({} if resolved_id is None else {"resolved_id": resolved_id}),
             "title": row.get("title") or "", "preview": tip_row.get("preview") or "",
             "started_at": row.get("started_at") or 0, "message_count": tip_row.get("message_count") or 0,
-            "source": row.get("source") or ""}
+            "source": row.get("source") or "", "cwd": row.get("cwd") or None,
+            "last_active": tip_row.get("last_active") or row.get("started_at") or 0,
+            "ended_at": tip_row.get("ended_at"), "model": tip_row.get("model") or None}
 
 
 # Hidden from human listings (sub-agent runs, kanban workers); a deny-list so new platforms surface automatically.
@@ -390,14 +392,86 @@ def _session_list_by_title(rid, db, title_lookup: str) -> dict:
 @method("session.list")
 @_with_db(5006, session_scoped=False)
 def _(rid, params: dict, db) -> dict:
+    """List by source / id query with bounded pagination, preserving upstream title lookup."""
     try:
         if title_lookup := _str_param(params, "title"):
             return _session_list_by_title(rid, db, title_lookup)
-        limit = int(params.get("limit", 200) or 200)
-        # Over-fetch: per-source filtering + tip merging must not leave us short. ``include_hidden`` is for
-        # surfaces that OWN hidden sessions (Bots pane, pickers).
-        rows = _listing_rows(db, max(limit * 2, 200), include_hidden=_flag(params, "include_hidden"))[:limit]
-        return _ok(rid, {"sessions": [_session_row_summary(s) for s in rows]})
+        try:
+            limit = max(1, int(params.get("limit", 200) or 200))
+        except (TypeError, ValueError):
+            limit = 200
+        try:
+            offset = max(0, int(params.get("offset", 0) or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        query = str(params.get("query") or "").strip()
+        raw_sources = params.get("sources")
+        sources: list = []
+        if isinstance(raw_sources, (list, tuple)):
+            sources = [
+                str(s).strip().lower() for s in raw_sources if str(s).strip()
+            ]
+
+        if not sources and not query and offset == 0:
+            # Legacy path (no filter params), with upstream's last-active
+            # ordering and compact projection. Over-fetch modestly so
+            # per-source filtering doesn't leave us short; compression-tip
+            # projection can also merge rows.
+            fetch_limit = max(limit * 2, 200)
+            rows = [
+                s
+                for s in db.list_sessions_rich(
+                    source=None,
+                    limit=fetch_limit,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                    include_hidden=_flag(params, "include_hidden"),
+                )
+                if (s.get("source") or "").strip().lower() not in _LISTING_DENY_SOURCES
+            ][:limit]
+            list_truncated = False
+        else:
+            # Filtered/paginated path. Single source pushes into SQL; the
+            # deny-list and multi-source filter run gateway-side, so keep
+            # scanning DB pages until the requested window is full (bounded
+            # by a generous safety cap so a pathological DB can't pin us).
+            source_arg = sources[0] if len(sources) == 1 else None
+            allowed = frozenset(sources) if sources else None
+            wanted = offset + limit
+
+            def _eligible(row: dict) -> bool:
+                src = (row.get("source") or "").strip().lower()
+                if src in _LISTING_DENY_SOURCES:
+                    return False
+                return allowed is None or src in allowed
+
+            collected: list = []
+            db_offset = 0
+            page = max(wanted * 2, 200)
+            scan_capped = False
+            while len(collected) < wanted:
+                if db_offset >= 10_000:
+                    # Safety cap hit with the window still unfilled — report it
+                    # honestly (``truncated``) so the client can say "results
+                    # truncated" instead of silently serving an empty page.
+                    scan_capped = True
+                    break
+                batch = db.list_sessions_rich(
+                    source=source_arg,
+                    limit=page,
+                    offset=db_offset,
+                    order_by_last_active=True,
+                    id_query=query or None,
+                    compact_rows=True,
+                    include_hidden=_flag(params, "include_hidden"),
+                )
+                collected.extend(r for r in batch if _eligible(r))
+                if len(batch) < page:
+                    break
+                db_offset += page
+            rows = collected[offset : offset + limit]
+            list_truncated = scan_capped and len(collected) < wanted
+        return _ok(rid, {"sessions": [_session_row_summary(row) for row in rows], "truncated": list_truncated})
     except Exception as e:
         return _err(rid, 5006, str(e))
 
@@ -493,7 +567,9 @@ class _Resume:
         return self.db.get_messages_as_conversation(self.target, repair_alternation=repair, include_row_ids=True)
 
     def messages(self, display: list) -> list:
-        return [] if self.omit_messages else _history_to_messages(display)
+        return [] if self.omit_messages else _history_to_messages(
+            display, include_tool_output=_flag(self.params, "with_tool_output"),
+            include_ui_chrome=is_truthy_value(self.params.get("with_ui_chrome", self.params.get("with_tool_output", False))))
 
     def read_history(self) -> tuple:
         """One lineage SELECT, two projections: model-fed copy alternation-repaired (healed once
@@ -637,7 +713,9 @@ def _resume_reuse_live(ctx: _Resume, sid: str, session: dict) -> dict:
             return _err(ctx.rid, 4009, "session disconnect interrupt settling")
         _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
         payload = _live_session_payload(sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
-                                        transport=current_transport() or _stdio_transport)
+                                        transport=current_transport() or _stdio_transport,
+                                        include_tool_output=_flag(ctx.params, "with_tool_output"),
+                                        include_ui_chrome=is_truthy_value(ctx.params.get("with_ui_chrome", ctx.params.get("with_tool_output", False))))
         payload["resumed"] = ctx.target
         if ctx.defer_history:
             payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
@@ -892,7 +970,9 @@ def _(rid, params: dict, session: dict) -> dict:
     """Attach the frontend to a live TUI session without closing the previously focused one."""
     return _ok(rid, _live_session_payload(
         str(params.get("session_id") or ""), session, touch=True, transport=current_transport() or _stdio_transport,
-        omit_messages=is_truthy_value(params.get("omit_messages", False))))
+        omit_messages=is_truthy_value(params.get("omit_messages", False)),
+        include_tool_output=_flag(params, "with_tool_output"),
+        include_ui_chrome=is_truthy_value(params.get("with_ui_chrome", params.get("with_tool_output", False)))))
 
 
 @method("session.delete")
@@ -1763,7 +1843,8 @@ def _compress_live(rid, sid: str, session: dict, focus_topic: str) -> dict:
             "status": "aborted" if summary["aborted"] else "compressed", "removed": removed,
             "before_messages": before_count, "after_messages": len(messages),
             "before_tokens": before_tokens, "after_tokens": after_tokens, "summary": summary,
-            "usage": usage, "info": info, "messages": _history_to_messages(messages)})
+            "usage": usage, "info": info, "session_key": session["session_key"],
+            "messages": _history_to_messages(messages)})
     finally:
         # Always clear the pinned compressing status (success, no-op, or raise).
         _status_update(sid, "ready")
@@ -1913,7 +1994,8 @@ def _(rid, params: dict, session: dict) -> dict:
         agent = _build_branch_agent(session, new_sid, new_key, history, source)
     except Exception as e:
         return _err(rid, 5000, f"agent init failed on branch: {e}")
-    return _ok(rid, {"session_id": new_sid, "stored_session_id": new_key, "title": title, "parent": old_key,
+    return _ok(rid, {"session_id": new_sid, "stored_session_id": new_key, "session_key": new_key,
+                     "title": title, "parent": old_key,
                      "message_count": len(history), "messages": _history_to_messages(history),
                      "info": _session_info(agent, _sessions.get(new_sid))})
 
@@ -2184,6 +2266,135 @@ def _(rid, params: dict) -> dict:
     """Replay-buffer telemetry (ops/debug)."""
     from tui_gateway import event_replay
     return _ok(rid, event_replay.replay_stats())
+
+
+@method("session.peek")
+def _(rid, params: dict) -> dict:
+    """DB-only preview of a stored session for the resume picker.
+
+    ``{session_id, head?, tail?}`` → session metadata plus the first ``head``
+    and last ``tail`` displayable messages (``user``/``assistant`` rows with
+    non-empty text content; tool spam and empty tool-call carriers are
+    skipped). Purely a read: no agent is constructed, no live session state
+    is created or switched — this powers the picker's Space preview, which
+    must stay cheap while the user scrolls.
+
+    Response shape::
+
+        {
+          "session": {id, title, source, model, cwd, started_at, ended_at,
+                      end_reason, message_count, last_active, cost_usd},
+          "head": [{id, role, content, truncated, timestamp}, ...],
+          "tail": [{...}],            # never overlaps head
+          "total_messages": <int>     # displayable (user/assistant) count
+        }
+    """
+    target = str(params.get("session_id") or "").strip()
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    try:
+        head = max(0, int(params.get("head", 2) or 0))
+    except (TypeError, ValueError):
+        head = 2
+    try:
+        tail = max(0, int(params.get("tail", 2) or 0))
+    except (TypeError, ValueError):
+        tail = 2
+    try:
+        with _profile_db(params) as db:
+            if db is None:
+                return _db_unavailable_error(rid, code=5046)
+            target = db.resolve_resume_session_id(target) or target
+            row = db.get_session(target)
+            if not row:
+                return _err(rid, 4007, "session not found")
+
+            msgs = db.get_messages_as_conversation(
+                target, include_ancestors=True, include_compacted=True, include_row_ids=True)
+            last_active = (
+                (msgs[-1].get("timestamp") if msgs else None)
+                or row.get("started_at")
+                or 0
+            )
+
+            def _displayable(m: dict) -> bool:
+                if m.get("display_kind") == "hidden":
+                    return False
+                if (m.get("role") or "") not in ("user", "assistant"):
+                    return False
+                content = m.get("content")
+                if isinstance(content, str):
+                    return bool(content.strip())
+                return bool(content)  # multimodal parts list
+
+            def _peek_msg(m: dict) -> dict:
+                content = m.get("content")
+                if not isinstance(content, str):
+                    try:
+                        content = json.dumps(content, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        content = str(content)
+                content = content or ""
+                return {
+                    "id": m.get("_row_id", m.get("id")),
+                    "role": m.get("role") or "",
+                    "content": content[:2000],
+                    "truncated": len(content) > 2000,
+                    "timestamp": m.get("timestamp"),
+                }
+
+            display = [m for m in msgs if _displayable(m)]
+            head_msgs = display[:head] if head else []
+            # Slice the remainder so head and tail never overlap, even when
+            # head + tail >= len(display).
+            tail_msgs = display[head:][-tail:] if tail else []
+
+            cost = row.get("actual_cost_usd")
+            if cost is None:
+                cost = row.get("estimated_cost_usd")
+
+            return _ok(
+                rid,
+                {
+                    "session": {
+                        "id": row["id"],
+                        "title": row.get("title") or "",
+                        "source": row.get("source") or "",
+                        "model": row.get("model") or None,
+                        "cwd": row.get("cwd") or None,
+                        "started_at": row.get("started_at") or 0,
+                        "ended_at": row.get("ended_at"),
+                        "end_reason": row.get("end_reason"),
+                        "message_count": row.get("message_count") or 0,
+                        "last_active": last_active,
+                        "cost_usd": cost,
+                    },
+                    "head": [_peek_msg(m) for m in head_msgs],
+                    "tail": [_peek_msg(m) for m in tail_msgs],
+                    "total_messages": len(display),
+                },
+            )
+    except Exception as e:
+        return _err(rid, 5046, str(e))
+
+
+@method("dashboard.new_session_requested")
+def _(rid, params: dict) -> dict:
+    """Publish a hosted TUI's idle-exit request through the active transport.
+
+    The dashboard owns the embedded PTY lifecycle, so hosted clients request a
+    fresh chat instead of terminating themselves.  Keeping this event-only lets
+    the existing transport multiplexer route the frame to a session-bound sink
+    or, when no session id is available yet, to the request's current sink.
+    """
+    session_id = str(params.get("session_id") or "").strip()
+    reason = str(params.get("reason") or "").strip() or "idle_exit_hotkey"
+    _emit(
+        "dashboard.new_session_requested",
+        session_id,
+        {"reason": reason},
+    )
+    return _ok(rid, {"ok": True})
 
 
 def register(server) -> None:

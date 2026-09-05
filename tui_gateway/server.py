@@ -147,7 +147,8 @@ _WS_ORPHAN_INTERRUPT_REAP_POLL_S = 1.0
 # pre-existing stuck-`running` safety net's role of breaking the deadlock.
 _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS = 60
 _TURN_SETTLE_BEFORE_CLOSE_SECONDS = 5.0
-_DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
+_GLOBAL_DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
+_DETAIL_SECTION_NAMES = (*_GLOBAL_DETAIL_SECTION_NAMES, "delegation")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 
 # ── Async RPC dispatch: slow handlers (seconds to minutes) would leave approval.respond and
@@ -174,7 +175,7 @@ _LONG_HANDLERS = frozenset({
     "setup.runtime_check", "setup.status", "voice.toggle", "voice.record", "voice.tts", "wake.start",
     "wake.status", "session.active_list", "session.branch", "session.compress", "session.list",
     "session.resume", "session.workspace.move", "shell.exec", "skills.manage", "slash.exec",
-    "tools.configure",
+    "tools.configure", "startup.catalog", "model.custom.probe", "model.custom.save", "session.peek",
 })
 
 _rpc_pool_workers = max(2, env_int("HERMES_TUI_RPC_POOL_WORKERS", 8))
@@ -2304,6 +2305,9 @@ def _make_agent(
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
         **_agent_cbs(sid))
+    if getattr(agent, "service_tier", None) == "priority":
+        from tui_gateway.agent_runtime_install import apply_service_tier_override
+        apply_service_tier_override(agent, "priority")
     if context_cwd_is_launch_artifact is None:
         with _sessions_lock:
             context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(_sessions.get(sid))
@@ -2701,7 +2705,8 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
 
 def _live_session_payload(
     sid: str, session: dict, *, cols: int | None = None, touch: bool = False,
-    transport: Transport | None = None, omit_messages: bool = False) -> dict:
+    transport: Transport | None = None, omit_messages: bool = False,
+    include_tool_output: bool = False, include_ui_chrome: bool = False) -> dict:
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
@@ -2727,9 +2732,11 @@ def _live_session_payload(
     else:
         with _session_db(session) as db:
             history = _live_visible_history(session, db, in_memory_history)
+    messages = [] if omit_messages else _history_to_messages(
+        history, include_tool_output=include_tool_output, include_ui_chrome=include_ui_chrome)
     payload = {
-        "info": _fallback_session_info(session), "message_count": len(history),
-        "messages": [] if omit_messages else _history_to_messages(history),
+        "info": _fallback_session_info(session), "message_count": len(history) if omit_messages else len(messages),
+        "messages": messages,
         "messages_omitted": omit_messages, "running": running, "turn_started_at": turn_started_at,
         "session_id": sid, "session_key": _session_lookup_key(session, fallback=sid),
         "started_at": float(session.get("created_at") or time.time()),

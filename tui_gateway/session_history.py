@@ -171,7 +171,9 @@ _HISTORY_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details"
 _HISTORY_ROLES = frozenset({"user", "assistant", "tool", "system"})
 
 
-def _history_to_messages(history: list[dict]) -> list[dict]:
+def _history_to_messages(
+    history: list[dict], include_tool_output: bool = False, include_ui_chrome: bool = False,
+) -> list[dict]:
     messages = []
     tool_call_args = {}
     for m in history:
@@ -203,8 +205,20 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             name = tc_name or m.get("tool_name") or "tool"
             args = tc_args or {}
             # `context` is an 80-char preview; ship args so a full-call renderer isn't truncated.
-            messages.append({"role": "tool", "name": name, "context": _tool_ctx(name, args), **({"args": args} if args else {})})
+            tool_msg = {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
+            # Desktop keeps full args; native activation stays compact while cold resume opts into output.
+            if args and (include_tool_output or not include_ui_chrome):
+                tool_msg["args"] = args
+            if include_tool_output and content_text.strip():
+                tool_msg["result_text"] = _redact_tui_verbose_text(content_text)
+            messages.append(tool_msg)
             continue
+        # Display projection only: the full reinjection remains in persisted/model history.
+        if (include_ui_chrome or include_tool_output) and role == "user":
+            notification = _async_delegation_notice_from_text(content_text)
+            if notification is not None:
+                messages.append({"role": "notification", "text": notification["text"], "notification": notification})
+                continue
         # A reasoning-only assistant turn is kept so "Thinking…" still shows after resume/reload.
         has_reasoning = role == "assistant" and any(m.get(key) for key in _HISTORY_REASONING_KEYS)
         if not content_text.strip() and not has_reasoning:

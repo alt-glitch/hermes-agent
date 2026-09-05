@@ -62,6 +62,7 @@ def server(hermes_home, monkeypatch):
     monkeypatch.setattr(mod, "_cfg_cache", None)
     monkeypatch.setattr(mod, "_cfg_mtime", None)
     monkeypatch.setattr(mod, "_cfg_path", None)
+    monkeypatch.setattr(mod, "_sessions", {})
     yield mod
     # Reset module-level session state without re-importing. importlib.reload
     # would re-register the module's atexit hooks (ThreadPoolExecutor
@@ -69,6 +70,8 @@ def server(hermes_home, monkeypatch):
     # buffer at interpreter shutdown and surface as Fatal Python error:
     # _enter_buffered_busy. Clearing the per-session dicts gives the
     # next test a clean slate.
+    for session in mod._sessions.values():
+        assert mod._release_active_session_slot(session)
     mod._sessions.clear()
     mod._pending.clear()
     mod._answers.clear()
@@ -285,6 +288,7 @@ def test_active_goal_retries_once_without_judging_failed_turn(
         clear_interrupt=lambda: None,
     )
     session = _turn_session(agent, session_key)
+    server._sessions["sid"] = session
 
     server._run_prompt_submit("rid", "sid", session, "initial work")
 
@@ -321,6 +325,7 @@ def test_second_consecutive_exhaustion_pauses_goal_instead_of_looping(
         clear_interrupt=lambda: None,
     )
     session = _turn_session(agent, session_key)
+    server._sessions["sid"] = session
 
     server._run_prompt_submit("rid", "sid", session, "initial work")
 
@@ -370,6 +375,7 @@ def test_real_queued_prompt_preempts_goal_compression_retry(
         clear_interrupt=lambda: None,
     )
     session = _turn_session(agent, session_key)
+    server._sessions["sid"] = session
     session_holder["session"] = session
 
     server._run_prompt_submit("rid", "sid", session, "initial work")

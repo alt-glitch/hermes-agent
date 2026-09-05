@@ -439,30 +439,48 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
     return None, fields
 
 
-def _persist_session_row_for_submit(rid, session):
+def _persist_session_row_for_submit(rid, sid, session):
     """Lazily persist the DB row now that the user sent a message (a branch becomes real
-    here); the error reply is the only user-visible signal (desktop maps it to a toast)."""
+    here); reject this RPC and terminally settle any concurrently accepted inputs."""
+    error = None
     try:
         if _ensure_session_db_row(session) is False:
-            return _err(
+            error = _err(
                 rid, 5072,
                 "session storage unavailable: "
                 f"{_db_error or 'state.db could not be opened'} — the message "
                 "was not saved; repair state.db and try again")
-        _persist_branch_seed(session)
+        else:
+            _persist_branch_seed(session)
     except Exception as exc:
         from hermes_state_errors import is_disk_full_error
-        with session["history_lock"]:
-            session["running"] = False
-            session["last_active"] = time.time()
-            _clear_inflight_turn(session)
         if is_disk_full_error(exc):
-            return _err(
+            error = _err(
                 rid, 5070,
                 "disk full: session storage could not be written — free some disk space and try again")
-        logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
-        return _err(rid, 5071, f"session storage could not be written: {exc}")
-    return None
+        else:
+            logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
+            error = _err(rid, 5071, f"session storage could not be written: {exc}")
+    if error is None:
+        return None
+    with session["history_lock"]:
+        session["running"] = False
+        session["last_active"] = time.time()
+        failed_submission_ids = _settle_pending_input_ids_locked(session)
+        _clear_inflight_turn(session)
+        if failed_submission_ids:
+            try:
+                _emit_terminal_turn_error(
+                    sid, session, error["error"]["message"],
+                    error_surface={"layer": "runtime", "code": "session_storage_failed", "retryable": True},
+                    client_submission_ids=failed_submission_ids,
+                    history_lock_owned=True, retire_marker=False,
+                )
+            finally:
+                # This RPC was never accepted; do not retain its optimistic input
+                # as a failed conversation turn while settling the queued receipts.
+                _clear_inflight_turn(session)
+    return error
 
 
 def _run_after_agent_ready(
@@ -500,17 +518,22 @@ def _run_after_agent_ready(
                 client_submission_ids=failed_submission_ids,
                 history_lock_owned=True,
             )
-        _emit("session.info", sid, _session_info(session.get("agent"), session))
+        # message.complete settles the turn. A later idle snapshot can race a
+        # client's next optimistic submit and overwrite its running state.
         return
     with session["history_lock"]:
         if session.get("_turn_cancel_requested") or not session.get("running"):
             session["running"] = False
-            _clear_inflight_turn(session)
-            # Without this emit the turn vanishes silently after {"status": "streaming"}.
-            _emit("error", sid, {"message": (
-                "Turn cancelled before the agent was ready"
-                if session.get("_turn_cancel_requested")
-                else "Session no longer running before the agent was ready")})
+            failed_submission_ids = _settle_pending_input_ids_locked(session, client_submission_ids)
+            try:
+                _emit_terminal_turn_error(sid, session, (
+                    "Turn cancelled before the agent was ready"
+                    if session.get("_turn_cancel_requested")
+                    else "Session no longer running before the agent was ready"),
+                    error_surface={"layer": "runtime", "code": "turn_cancelled", "retryable": True},
+                    client_submission_ids=failed_submission_ids, history_lock_owned=True)
+            finally:
+                _clear_inflight_turn(session)
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
@@ -691,7 +714,7 @@ def _(rid, params: dict) -> dict:
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s", sid,
             isolated_response["error"].get("message", "unknown error"))
-    if (err := _persist_session_row_for_submit(rid, session)) is not None:
+    if (err := _persist_session_row_for_submit(rid, sid, session)) is not None:
         return err
     # A completed FAILED build must not wedge the session: rebuild, don't replay it.
     if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):

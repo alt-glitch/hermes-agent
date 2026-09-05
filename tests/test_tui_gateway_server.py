@@ -510,7 +510,7 @@ def test_concurrent_first_turn_keeps_one_lease_through_transfer_and_release(
 
     state_dir = tmp_path / "runtime"
     monkeypatch.setattr(
-        active_sessions, "_state_dir", lambda registry_home=None: state_dir
+        active_sessions, "_registry_home", lambda registry_home=None: state_dir.parent
     )
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 2})
     session = {"session_key": "concurrent-first-turn", "source": "desktop"}
@@ -654,7 +654,7 @@ def test_concurrent_first_turn_never_retains_unregistered_lease(
 
     state_dir = tmp_path / "runtime"
     monkeypatch.setattr(
-        active_sessions, "_state_dir", lambda registry_home=None: state_dir
+        active_sessions, "_registry_home", lambda registry_home=None: state_dir.parent
     )
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 2})
     session = {"session_key": "registry-invariant", "source": "desktop"}
@@ -4068,8 +4068,8 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
 
         def get_resume_conversations(self, session_id):
             return (
-                self.get_messages_as_conversation(session_id, repair_alternation=True),
-                self.get_messages_as_conversation(session_id, include_ancestors=True),
+                self.get_messages_as_conversation(session_id, repair_alternation=True, include_row_ids=True),
+                self.get_messages_as_conversation(session_id, include_ancestors=True, include_row_ids=True),
             )
 
         def get_ancestor_display_prefix(self, _sid):
@@ -4108,6 +4108,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
                         "tool_call_id": "call_1",
                     },
                     {"role": "assistant", "content": "root answer"},
+                    {"role": "user", "content": "tip prompt"},
                 ]
                 if include_ancestors
                 else [{"role": "user", "content": "tip prompt"}]
@@ -4153,56 +4154,41 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
             "result_text": "found the persisted result",
         },
         {"role": "assistant", "text": "root answer"},
+        {"role": "user", "text": "tip prompt"},
     ]
     expected = [] if omit_messages else full_display
     assert resp["result"]["messages"] == expected
-    assert resp["result"]["message_count"] == 3
+    # Omitted-message resume intentionally loads/counts the tip only, not its ancestors.
+    assert resp["result"]["message_count"] == (1 if omit_messages else len(full_display))
     assert resp["result"]["messages_omitted"] is omit_messages
-    expected_calls = [
-        (target, False, False),
-        (target, True, False),
-    ]
+    expected_calls = [(target, False, True)]
+    if not omit_messages:
+        expected_calls.append((target, True, True))
     assert captured["history_calls"] == expected_calls
     live_sid = resp["result"]["session_id"]
     assert server._sessions[live_sid]["history"] == [
         {"role": "user", "content": "tip prompt"}
     ]
-    assert server._sessions[live_sid]["display_history"] == [
-        {"role": "user", "content": "root prompt"},
+    # Warm activation reads authoritative display lineage from the DB, not a second cached transcript.
+    warm = server.handle_request(
         {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "function": {
-                        "name": "search_files",
-                        "arguments": json.dumps({"pattern": "resume"}),
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "content": "found the persisted result",
-            "tool_call_id": "call_1",
-        },
-        {"role": "assistant", "content": "root answer"},
+            "id": "2",
+            "method": "session.activate",
+            "params": {"session_id": live_sid, "with_ui_chrome": True},
+        }
+    )
+    assert warm["result"]["messages"] == [
+        {"role": "user", "text": "root prompt"},
+        {"role": "tool", "name": "search_files", "context": "resume"},
+        {"role": "assistant", "text": "root answer"},
+        {"role": "user", "text": "tip prompt"},
     ]
-    if omit_messages:
-        warm = server.handle_request(
-            {
-                "id": "2",
-                "method": "session.activate",
-                "params": {"session_id": live_sid, "with_ui_chrome": True},
-            }
-        )
-        assert warm["result"]["messages"] == [
-            {"role": "user", "text": "root prompt"},
-            {"role": "tool", "name": "search_files", "context": "resume"},
-            {"role": "assistant", "text": "root answer"},
-        ]
-        assert warm["result"]["message_count"] == 3
+    assert warm["result"]["message_count"] == len(full_display)
+    assert captured["history_calls"][-1] == (target, True, True)
+    verbose_warm = server.handle_request(
+        {"id": "3", "method": "session.resume", "params": params | {"omit_messages": False}}
+    )
+    assert verbose_warm["result"]["messages"] == full_display
 
 
 def test_cold_then_live_resume_keeps_verbatim_verification_history(
@@ -4247,11 +4233,24 @@ def test_cold_then_live_resume_keeps_verbatim_verification_history(
             }
         )
         live_session = server._sessions[cold["result"]["session_id"]]
+        retained = db.get_messages_as_conversation("verified-session", include_row_ids=True)[:1]
         with live_session["history_lock"]:
-            live_session["history"] = [{"role": "user", "content": "check this"}]
+            live_session["history"] = retained
             live_session["history_version"] += 1
+        before_durable_truncate = server._live_session_payload(
+            cold["result"]["session_id"], live_session
+        )
+        # Undo/edit updates storage as well as model memory; removed rows remain recoverable but
+        # inactive. A memory-only projection change must not erase the durable verification answer.
+        db.replace_messages(
+            "verified-session", retained, active_only=True, archive_dropped=True,
+            reject_active_turn_lease=True,
+        )
         truncated = server._live_session_payload(
             cold["result"]["session_id"], live_session
+        )
+        expected_truncated = server._history_to_messages(
+            db.get_messages_as_conversation("verified-session", include_ancestors=True, include_row_ids=True)
         )
     finally:
         db.close()
@@ -4263,9 +4262,11 @@ def test_cold_then_live_resume_keeps_verbatim_verification_history(
         "verification candidate",
         "verified final",
     ]
-    # A model-history prefix rewrite (undo/edit/truncate) invalidates the
-    # immutable display projection so removed durable rows cannot resurrect.
-    assert truncated["messages"] == [{"role": "user", "text": "check this"}]
+    assert before_durable_truncate["messages"] == live["result"]["messages"]
+    assert truncated["messages"] == expected_truncated
+    assert [(message["role"], message["text"]) for message in truncated["messages"]] == [
+        ("user", "check this")
+    ]
 
 
 def test_live_visible_history_prefers_db_display_with_candidate():
@@ -13684,21 +13685,21 @@ def test_session_info_includes_session_title(monkeypatch):
     assert server._session_info(agent, session)["title"] == "db title"
 
 
-def test_emit_title_refresh_pushes_session_info(monkeypatch):
-    """_emit_title_refresh emits a session.info for a live session and is a
+def test_emit_title_refresh_pushes_title_without_stale_running_state(monkeypatch):
+    """_emit_title_refresh emits only title chrome for a live session and is a
     silent no-op for unknown/agent-less sessions (it runs on the auto-title
     worker thread -- it must never raise)."""
     events = []
     monkeypatch.setattr(
         server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
     )
-    monkeypatch.setattr(server, "_session_info", lambda agent, session: {"title": "t"})
+    monkeypatch.setattr(server, "_session_live_title", lambda session, key: "t")
 
     agent = types.SimpleNamespace(tools=[], model="m", provider="p")
     monkeypatch.setitem(server._sessions, "title-test", {"agent": agent, "session_key": "k"})
 
     server._emit_title_refresh("title-test")
-    assert events == [("session.info", "title-test", {"title": "t"})]
+    assert events == [("session.title", "title-test", {"session_id": "k", "title": "t"})]
 
     # Unknown sid / no agent -> no emission, no exception.
     server._emit_title_refresh("missing-sid")
@@ -14991,6 +14992,7 @@ def test_interrupt_drops_queued_prompt_for_session():
 def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
     """Stop during lazy agent startup must not start the turn after init finishes."""
     threads = []
+    emitted = []
     calls = {"run_prompt": 0}
 
     class _FakeThread:
@@ -15010,7 +15012,7 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
 
     try:
         monkeypatch.setattr(server.threading, "Thread", _FakeThread)
-        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
@@ -15027,7 +15029,7 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
             {
                 "id": "1",
                 "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "hello"},
+                "params": {"session_id": "sid", "text": "hello", "client_submission_id": "original"},
             }
         )
         assert submit.get("result"), f"got error: {submit.get('error')}"
@@ -15044,21 +15046,16 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
         assert calls["run_prompt"] == 0
         assert session["running"] is False
         assert session.get("inflight_turn") is None
+        terminal = [e[2] for e in emitted if e[0] == "message.complete" and e[1] == "sid"]
+        assert len(terminal) == 1
+        assert terminal[0]["status"] == "error"
+        assert terminal[0]["client_submission_ids"] == ["original"]
     finally:
         server._sessions.pop("sid", None)
 
 
 def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
-    """A turn cancelled during lazy agent startup must surface an error event.
-
-    Sibling of test_interrupt_before_agent_ready_prevents_late_turn_start: that
-    test only asserts `_run_prompt_submit` is skipped, mocking `_emit` to a
-    no-op so it cannot catch a silent drop. This test captures `_emit` and
-    asserts the client receives an `error` event with a human-readable message,
-    so the Desktop composer can show feedback instead of hanging on a
-    `{"status":"streaming"}` reply that never produces a turn (issue #63078
-    server-side half).
-    """
+    """Cancellation during lazy startup terminally settles the accepted receipt."""
     threads = []
     emitted = []
     calls = {"run_prompt": 0}
@@ -15097,7 +15094,7 @@ def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
             {
                 "id": "1",
                 "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "hello"},
+                "params": {"session_id": "sid", "text": "hello", "client_submission_id": "original"},
             }
         )
         assert submit.get("result"), f"got error: {submit.get('error')}"
@@ -15117,10 +15114,12 @@ def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
         assert calls["run_prompt"] == 0
         assert session["running"] is False
         assert session.get("inflight_turn") is None
-        # Exactly one error event addressed to this session.
-        error_events = [e for e in emitted if e and len(e) >= 2 and e[0] == "error" and e[1] == "sid"]
-        assert len(error_events) == 1, f"expected one error event, got: {emitted}"
-        msg = error_events[0][2].get("message", "")
+        terminal = [e[2] for e in emitted if e[0] == "message.complete" and e[1] == "sid"]
+        assert len(terminal) == 1
+        assert terminal[0]["status"] == "error"
+        assert terminal[0]["client_submission_ids"] == ["original"]
+        assert not any(e[0] == "error" for e in emitted)
+        msg = terminal[0]["error"]
         assert "cancelled" in msg.lower(), f"unexpected message: {msg}"
     finally:
         server._sessions.pop("sid", None)
@@ -15129,7 +15128,7 @@ def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
 def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
     """When `running` is cleared by something other than an explicit interrupt
     (e.g. a concurrent session.create race that resets the flag), the deferred
-    run thread must still emit an error event rather than disappearing silently.
+    run thread must still emit a correlated terminal frame rather than disappear.
     """
     threads = []
     emitted = []
@@ -15169,7 +15168,7 @@ def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
             {
                 "id": "1",
                 "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "hello"},
+                "params": {"session_id": "sid", "text": "hello", "client_submission_id": "original"},
             }
         )
         assert submit.get("result"), f"got error: {submit.get('error')}"
@@ -15184,9 +15183,12 @@ def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
 
         assert calls["run_prompt"] == 0
         assert session.get("inflight_turn") is None
-        error_events = [e for e in emitted if e and len(e) >= 2 and e[0] == "error" and e[1] == "sid"]
-        assert len(error_events) == 1, f"expected one error event, got: {emitted}"
-        msg = error_events[0][2].get("message", "")
+        terminal = [e[2] for e in emitted if e[0] == "message.complete" and e[1] == "sid"]
+        assert len(terminal) == 1
+        assert terminal[0]["status"] == "error"
+        assert terminal[0]["client_submission_ids"] == ["original"]
+        assert not any(e[0] == "error" for e in emitted)
+        msg = terminal[0]["error"]
         assert "no longer running" in msg.lower(), f"unexpected message: {msg}"
     finally:
         server._sessions.pop("sid", None)
@@ -19469,6 +19471,7 @@ class _PickerDB:
         order_by_last_active=False,
         id_query=None,
         compact_rows=False,
+        include_hidden=False,
     ):
         self.calls.append(
             {
@@ -19645,6 +19648,12 @@ class _PeekDB:
 
     def get_messages(self, session_id):
         return [dict(m) for m in self.messages]
+
+    def resolve_resume_session_id(self, session_id):
+        return session_id
+
+    def get_messages_as_conversation(self, session_id, **kwargs):
+        return self.get_messages(session_id)
 
 
 def _peek_db():

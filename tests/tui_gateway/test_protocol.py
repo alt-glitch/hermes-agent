@@ -1456,15 +1456,17 @@ def test_session_branch_forwards_original_timestamps(server, monkeypatch):
 
 def test_persist_branch_seed_forwards_original_timestamps(server, monkeypatch):
     """First-turn branch seed persist must carry each copied message's
-    original timestamp through to append_message (#28841)."""
+    original timestamp through the bounded batch write (#28841)."""
     import contextlib
 
     append_calls = []
+    batch_calls = []
 
     class _DB:
-        def append_message(self, **kwargs):
-            append_calls.append(kwargs)
-            return None
+        def append_messages_batch(self, session_id, messages, *, chunk_rows):
+            batch_calls.append((session_id, chunk_rows))
+            append_calls.extend(dict(message, session_id=session_id) for message in messages)
+            return list(range(1, len(messages) + 1))
 
     @contextlib.contextmanager
     def _fake_session_db(_session):
@@ -1487,6 +1489,10 @@ def test_persist_branch_seed_forwards_original_timestamps(server, monkeypatch):
 
     assert session.get("_branch_seed_persisted") is True
     assert [c.get("timestamp") for c in append_calls] == original_ts
+    assert batch_calls[0][0] == session["session_key"]
+    assert batch_calls[0][1] > 0
+    server._persist_branch_seed(session)
+    assert len(batch_calls) == 1
 
 
 def test_make_agent_accepts_list_system_prompt(server, monkeypatch):

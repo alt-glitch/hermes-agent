@@ -81,6 +81,13 @@ def turn_env(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
     monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    yield
+    for session in server._sessions.values():
+        assert server._release_active_session_slot(session)
 
 
 def _finished(caplog):
@@ -90,6 +97,7 @@ def _finished(caplog):
 
 
 def _run(session, prompt="go"):
+    server._sessions["ui-sid"] = session
     server._run_prompt_submit("rid", "ui-sid", session, prompt)
 
 

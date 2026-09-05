@@ -78,6 +78,13 @@ def turn_env(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
     monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    yield
+    for session in server._sessions.values():
+        assert server._release_active_session_slot(session)
 
 
 def _records(caplog, needle):
@@ -96,6 +103,7 @@ def test_accepted_and_finished_records_on_success(turn_env, caplog):
     session = _session(agent=agent, running=True)
 
     with caplog.at_level(logging.INFO, logger="tui_gateway.server"):
+        server._sessions["ui-sid"] = session
         server._run_prompt_submit("rid", "ui-sid", session, SECRETISH_PROMPT)
 
     accepted = _records(caplog, "tui prompt accepted")
@@ -134,6 +142,7 @@ def test_finished_record_reflects_mid_turn_rotation(turn_env, caplog):
     session = _session(agent=agent, running=True)
 
     with caplog.at_level(logging.INFO, logger="tui_gateway.server"):
+        server._sessions["ui-sid"] = session
         server._run_prompt_submit("rid", "ui-sid", session, "go")
 
     accepted = _records(caplog, "tui prompt accepted")[0].getMessage()
@@ -154,6 +163,7 @@ def test_finished_record_fires_on_exception_path(turn_env, caplog):
     session = _session(agent=agent, running=True)
 
     with caplog.at_level(logging.INFO, logger="tui_gateway.server"):
+        server._sessions["ui-sid"] = session
         server._run_prompt_submit("rid", "ui-sid", session, "go")
 
     finished = _records(caplog, "tui turn finished")
@@ -176,6 +186,7 @@ def test_finished_record_fires_on_returned_error(turn_env, caplog):
     session = _session(agent=agent, running=True)
 
     with caplog.at_level(logging.INFO, logger="tui_gateway.server"):
+        server._sessions["ui-sid"] = session
         server._run_prompt_submit("rid", "ui-sid", session, "go")
 
     finished = _records(caplog, "tui turn finished")

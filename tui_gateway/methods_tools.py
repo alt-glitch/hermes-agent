@@ -1466,6 +1466,163 @@ def _(rid, params: dict) -> dict:
         on_result=lambda r: _ok(rid, {"stdout": r.stdout[-4000:], "stderr": r.stderr[-2000:], "code": r.returncode}))
 
 
+def _startup_tool_catalog(definitions) -> dict:
+    """Group actual callable schemas for the native startup panel.
+
+    A tool may be referenced by several convenience toolsets, so summing
+    get_all_toolsets() metadata double-counts it and can expose disabled
+    families when an agent's configured toolset list is empty. Ink renders
+    agent.tools instead; keep the OpenTUI producer on that same authority and
+    deduplicate defensively by callable name.
+    """
+    from model_tools import get_toolset_for_tool
+
+    grouped: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for definition in definitions or []:
+        if not isinstance(definition, dict):
+            continue
+        function = definition.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        group = str(get_toolset_for_tool(name) or "other")
+        grouped.setdefault(group, []).append(name)
+
+    return {
+        "total": len(seen),
+        "toolsets": [
+            {
+                "name": group,
+                "count": len(names),
+                "enabled": True,
+                "tools": sorted(names),
+            }
+            for group, names in sorted(grouped.items())
+        ],
+    }
+
+
+@method("startup.catalog")
+def _(rid, params: dict) -> dict:
+    # Aggregate tools / skills / MCP servers for the native engine's startup panel
+    # (item 9). Opt-in RPC — only the opentui home screen calls it, so the Ink path
+    # is untouched. Skills/MCP remain best-effort, but active-agent readiness is
+    # authoritative: a timeout/failure must be distinguishable from a real
+    # zero-tool agent so the client can warn and retry only the still-pending case.
+    tools: dict = {"total": 0, "toolsets": []}
+    readiness: dict = {"status": "ready"}
+    try:
+        session_id = str(params.get("session_id") or "")
+        session = _sessions.get(session_id)
+        if session is not None:
+            # Fresh create/resume is intentionally deferred. Join that one
+            # authoritative build here (this method runs in _LONG_HANDLERS) so
+            # the panel cannot race an empty agent then fall back to every
+            # globally registered toolset.
+            active_session = session
+            session, err = _sess({"session_id": session_id}, rid)
+            if err:
+                error = err.get("error") if isinstance(err, dict) else None
+                error = error if isinstance(error, dict) else {}
+                message = str(error.get("message") or "agent initialization failed")
+                ready = active_session.get("agent_ready")
+                agent = active_session.get("agent")
+                # Close the timeout-boundary race: the build can settle between
+                # _wait_agent's timed wait and this worker inspecting the result.
+                if (
+                    ready is not None
+                    and ready.is_set()
+                    and agent is not None
+                    and not active_session.get("agent_error")
+                ):
+                    definitions = getattr(agent, "tools", [])
+                    err = None
+                still_pending = (
+                    err is not None
+                    and error.get("code") == 5032
+                    and ready is not None
+                    and not ready.is_set()
+                    and not active_session.get("agent_error")
+                )
+                if err is not None:
+                    readiness = {
+                        "status": "pending" if still_pending else "failed",
+                        "warning": (
+                            f"tool catalog pending: {message}; retrying after agent readiness"
+                            if still_pending
+                            else f"tool catalog unavailable: {message}"
+                        ),
+                    }
+                    if still_pending:
+                        readiness["retry_after_ms"] = 1000
+                    definitions = []
+            else:
+                agent = session.get("agent") if session is not None else None
+                if agent is None:
+                    readiness = {
+                        "status": "failed",
+                        "warning": "tool catalog unavailable: agent initialization returned no agent",
+                    }
+                    definitions = []
+                else:
+                    definitions = getattr(agent, "tools", [])
+        else:
+            # Isolated/demo callers without a live session still receive the
+            # configured, availability-filtered tool schemas. This is the only
+            # fallback: an active session never substitutes global state for its
+            # own agent/profile authority.
+            from model_tools import get_tool_definitions
+
+            definitions = get_tool_definitions(
+                enabled_toolsets=_load_enabled_toolsets(), quiet_mode=True
+            )
+        tools = _startup_tool_catalog(definitions)
+    except Exception as exc:
+        readiness = {
+            "status": "failed",
+            "warning": f"tool catalog unavailable: {exc}",
+        }
+
+    skills: dict = {"total": 0, "categories": []}
+    try:
+        from hermes_cli.banner import get_available_skills
+
+        by_cat = get_available_skills() or {}
+        for cat in sorted(by_cat.keys()):
+            names = by_cat[cat] or []
+            skills["categories"].append({"name": cat, "count": len(names)})
+            skills["total"] += len(names)
+    except Exception:
+        pass
+
+    mcp_servers: list = []
+    try:
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.tools_config import _parse_enabled_flag
+
+        raw_cfg = read_raw_config() or {}
+        servers = raw_cfg.get("mcp_servers")
+        if isinstance(servers, dict):
+            for name, cfg in servers.items():
+                if isinstance(cfg, dict) and _parse_enabled_flag(cfg.get("enabled", True), default=True):
+                    mcp_servers.append(str(name))
+    except Exception:
+        pass
+
+    return _ok(
+        rid,
+        {
+            "tools": tools,
+            "skills": skills,
+            "mcp": {"servers": sorted(mcp_servers)},
+            "readiness": readiness,
+        },
+    )
+
 def register(server) -> None:
     """Rebind this module's helpers + handlers onto ``server`` and register the handlers."""
     bind_module(globals(), server, skip=("_",))

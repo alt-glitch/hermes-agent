@@ -21,6 +21,9 @@ def _notify_session_boundary(event_type: str, session_id: str | None, platform: 
 
 
 _SESSION_OWNERSHIP_UNAVAILABLE = "Hermes could not safely reserve this session. Try again."
+_SESSION_CLOSED_DURING_ADMISSION = (
+    "session closed while starting the turn — create or resume a session and retry"
+)
 _AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "idle_timeout", "lru_evict", "tui_shutdown"})
 
 
@@ -66,17 +69,82 @@ def _claim_active_session_slot(
 
 
 def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
-    """Claim this session's cap slot on its first real turn; None when ok. session.create/resume deliberately
-    do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
-    that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible."""
-    if session.get("active_session_lease") is not None:
-        return None
-    lease, limit_message = _claim_active_session_slot(
-        str(session.get("session_key") or ""), live_session_id=sid,
-        surface=_session_source(session), profile_home=session.get("profile_home"))
-    if limit_message is None:
-        session["active_session_lease"] = lease
-    return limit_message
+    """Claim one slot per first-turn generation without holding the mutation lock during registry I/O."""
+    # Keep registry I/O outside the per-session mutation lock: claiming may
+    # block on the cross-process active-session file lock. Elect one owner for
+    # each no-lease admission generation so same-session peers cannot replace
+    # each other's durable same-writer lease while the lock is released.
+    claim_owner = False
+    with _session_mutation_lock(session):
+        if not _session_registry_matches(sid, session) or session.get("_finalized"):
+            return _SESSION_CLOSED_DURING_ADMISSION
+        if session.get("active_session_lease") is not None:
+            return None
+        claim_state = session.get("_active_session_claim")
+        if claim_state is None:
+            claim_state = {
+                "event": threading.Event(),
+                "result": _SESSION_OWNERSHIP_UNAVAILABLE,
+            }
+            session["_active_session_claim"] = claim_state
+            claim_owner = True
+
+    if not claim_owner:
+        completed = claim_state["event"].wait(timeout=5.0)
+        with _session_mutation_lock(session):
+            if not _session_registry_matches(sid, session) or session.get("_finalized"):
+                return _SESSION_CLOSED_DURING_ADMISSION
+            if session.get("active_session_lease") is not None:
+                return None
+            if not completed:
+                return _SESSION_OWNERSHIP_UNAVAILABLE
+            peer_result = claim_state.get("result")
+            return (
+                peer_result
+                if peer_result is not None
+                else _SESSION_OWNERSHIP_UNAVAILABLE
+            )
+
+    lease = None
+    limit_message = None
+    claim_error = None
+    try:
+        lease, limit_message = _claim_active_session_slot(
+            str(session.get("session_key") or ""),
+            live_session_id=sid,
+            surface=_session_source(session),
+            profile_home=session.get("profile_home"),
+        )
+    except BaseException as exc:
+        claim_error = exc
+
+    result = limit_message or _SESSION_OWNERSHIP_UNAVAILABLE
+    with _session_mutation_lock(session):
+        if not _session_registry_matches(sid, session) or session.get("_finalized"):
+            # Teardown detached/finalized this exact record while the
+            # cross-process lease claim was in flight. This is not the same as
+            # a concurrent successful claimant: prompt.submit must stop here.
+            result = _SESSION_CLOSED_DURING_ADMISSION
+        elif session.get("active_session_lease") is not None:
+            # A lifecycle helper installed a lease while the elected claim was
+            # outside the lock. Keep that winner and release ours below.
+            result = None
+        elif claim_error is None and limit_message is None and lease is not None:
+            session["active_session_lease"] = lease
+            lease = None  # ownership transferred to the session
+            result = None
+        claim_state["result"] = result
+        if session.get("_active_session_claim") is claim_state:
+            session.pop("_active_session_claim", None)
+        claim_state["event"].set()
+
+    # Never leave a lease behind when teardown or another lifecycle path won
+    # while this generation's owner was outside the mutation lock.
+    if lease is not None:
+        _release_active_session_slot({"active_session_lease": lease})
+    if claim_error is not None:
+        raise claim_error
+    return result
 
 
 def _lease_retry(attempts: int, fn) -> Exception | None:
@@ -228,6 +296,16 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # Automatic Desktop cleanup releases its lease inside the lifecycle guard below; other paths keep force/end semantics.
     if not _desktop_automatic_cleanup:
         _release_active_session_slot(session)
+    failure_sid = _lifecycle_own_sid(session)
+    with (session.get("history_lock") or contextlib.nullcontext()):
+        failed_ids = _settle_pending_input_ids_locked(session)
+        session["running"] = False
+        session["_turn_cancel_requested"] = True
+        if failed_ids:
+            _emit_terminal_turn_error(
+                failure_sid, session,
+                "session closed before accepted input could run",
+                client_submission_ids=failed_ids, history_lock_owned=True)
     if (stop_event := session.get("_notif_stop")) is not None:
         stop_event.set()
     agent = session.get("agent")
@@ -341,7 +419,9 @@ def _session_mutation_lock(session: dict):
         return session.setdefault("_mutation_lock", threading.RLock())
 
 
-def _pop_session_by_id(sid: str) -> dict | None:
+def _pop_session_by_id(
+    sid: str, *, predicate: Callable[[dict], bool] | None = None
+) -> dict | None:
     """Atomically detach one live session from the registry.
 
     Serialize close against agent replacement and release the global registry
@@ -354,6 +434,8 @@ def _pop_session_by_id(sid: str) -> dict | None:
     with _session_mutation_lock(session):
         with _sessions_lock:
             if _sessions.get(sid) is not session:
+                return None
+            if predicate is not None and not predicate(session):
                 return None
             session["_closing"] = True
             _sessions.pop(sid, None)
@@ -385,11 +467,7 @@ def _close_session_by_id(
     ``_session_resume_lock`` and call ``_teardown_popped_session`` after releasing it). Automatic reapers pass
     ``predicate`` to revalidate under ``_sessions_lock`` right before the claim, so a stale scan can't close a
     session that reattached."""
-    with _sessions_lock:  # RLock: predicate + claim in one critical section
-        current = _sessions.get(sid)
-        if predicate is not None and (current is None or not predicate(current)):
-            return False
-        session = _pop_session_by_id(sid)
+    session = _pop_session_by_id(sid, predicate=predicate)
     return _teardown_popped_session(session, end_reason=end_reason)
 
 

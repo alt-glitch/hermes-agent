@@ -15,6 +15,7 @@ _AT_DIRECTIVE_HINTS = [
     ("@diff", "git diff"), ("@staged", "staged diff"), ("@file:", "attach file"),
     ("@folder:", "attach folder"), ("@url:", "fetch url"), ("@git:", "git log")]
 _SLASH_EXTRAS = [
+    ("/fortune", "Show a random or daily local fortune"),
     ("/density", "Toggle compact display mode"), ("/details", "Control agent detail visibility"),
     ("/logs", "Show recent gateway log lines"),
     ("/mouse", "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]")]
@@ -282,9 +283,46 @@ def _(rid, params: dict) -> dict:
     from hermes_cli.inventory import build_model_options_payload
     # A spawned agent owns the live provider/model/base_url; empty attributes must
     # NOT clobber disk config (with_overrides is truthy-only).
-    return _ok(rid, build_model_options_payload(
+    payload = build_model_options_payload(
         _model_picker_context(_session_agent(params)), explicit_only=bool(params.get("explicit_only")),
-        include_unconfigured=bool(params.get("include_unconfigured")), refresh=bool(params.get("refresh"))))
+        include_unconfigured=bool(params.get("include_unconfigured")), refresh=bool(params.get("refresh")))
+    db = _get_db()
+    providers = [row for row in payload.get("providers", []) if isinstance(row, dict)]
+
+    def available_usage(usage_rows):
+        available = []
+        for usage in usage_rows:
+            if not isinstance(usage, dict):
+                continue
+            provider = str(usage.get("provider_id") or "").strip().removeprefix("custom:")
+            model = str(usage.get("model") or "").strip()
+            endpoint = str(usage.get("base_url") or "").strip().rstrip("/").lower()
+            match = next((row for row in providers
+                          if model in (row.get("models") or []) and (
+                              row.get("slug") == provider or (
+                                  endpoint and str(row.get("api_url") or "").strip().rstrip("/").lower() == endpoint))), None)
+            if match is not None:
+                available.append({
+                    **usage, "provider": str(match.get("slug") or provider),
+                    "provider_name": str(match.get("name") or match.get("slug") or provider),
+                })
+        return available
+
+    recent = available_usage(db.list_recent_models(limit=6)) if db is not None else []
+    frequent = available_usage(db.list_frequent_models(limit=6)) if db is not None else []
+    current = next((row for row in providers if row.get("is_current") is True), None)
+    model = str(payload.get("model") or "")
+    if model and current is not None and not any(
+        row.get("model") == model and row.get("provider") == current.get("slug") for row in recent
+    ):
+        recent.insert(0, {
+            "provider": str(current.get("slug") or ""),
+            "provider_name": str(current.get("name") or current.get("slug") or ""),
+            "model": model, "base_url": str(current.get("api_url") or ""),
+            "last_used_at": time.time(), "activation_count": 0,
+        })
+    payload.update(recent_models=recent[:6], frequent_models=frequent[:6])
+    return _ok(rid, payload)
 
 
 @method("model.save_key")
@@ -337,6 +375,50 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4005, f"no credentials found for {slug}")
     return _ok(rid, {"slug": slug, "name": pconfig.name if pconfig else slug, "disconnected": True})
 
+
+@method("model.custom.probe")
+def _(rid, params: dict) -> dict:
+    """Probe an OpenAI/Anthropic-compatible local endpoint without saving it."""
+    try:
+        from hermes_cli.custom_provider_service import probe_custom_provider
+
+        base_url = str(params.get("base_url") or "").strip()
+        if not base_url:
+            return _err(rid, 4001, "base_url is required")
+        result = probe_custom_provider(
+            base_url,
+            api_key=str(params.get("api_key") or ""),
+            api_mode=str(params.get("api_mode") or "chat_completions"),
+        )
+        return _ok(rid, result)
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
+    except Exception as exc:
+        return _err(rid, 5034, f"provider probe failed: {exc}")
+
+
+@method("model.custom.save")
+def _(rid, params: dict) -> dict:
+    """Persist a canonical custom provider; credentials never enter config.yaml."""
+    try:
+        from hermes_cli.custom_provider_service import save_custom_provider
+
+        result = save_custom_provider(
+            display_name=str(params.get("display_name") or ""),
+            base_url=str(params.get("base_url") or ""),
+            model=str(params.get("model") or ""),
+            api_key=str(params.get("api_key") or ""),
+            api_mode=str(params.get("api_mode") or "chat_completions"),
+            context_length=params.get("context_length"),
+            discover_models=bool(params.get("discover_models", True)),
+        )
+        return _ok(rid, result)
+    except PermissionError as exc:
+        return _err(rid, 4006, str(exc))
+    except (TypeError, ValueError) as exc:
+        return _err(rid, 4002, str(exc))
+    except Exception as exc:
+        return _err(rid, 5035, f"provider save failed: {exc}")
 
 def register(server) -> None:
     """Rebind this module's helpers + handlers onto ``server`` and register the handlers."""

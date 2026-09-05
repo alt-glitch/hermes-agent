@@ -51,8 +51,8 @@ class _InlineThread:
         return None
 
 
-def _session(agent=None, **extra):
-    return {
+def _session(agent=None, *, sid="sid", **extra):
+    session = {
         "agent": agent if agent is not None else types.SimpleNamespace(),
         "session_key": "session-key",
         "history": [],
@@ -68,6 +68,17 @@ def _session(agent=None, **extra):
         "inflight_turn": None,
         **extra,
     }
+    server._sessions[sid] = session
+    return session
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_registry(monkeypatch):
+    sessions = {}
+    monkeypatch.setattr(server, "_sessions", sessions)
+    yield
+    for session in sessions.values():
+        server._release_active_session_slot(session)
 
 
 @pytest.fixture()
@@ -178,7 +189,7 @@ def test_interrupt_racing_marker_write_cannot_leave_recovery_state(
         interrupt=lambda: interrupted.append(True),
         run_conversation=lambda message, **kwargs: {"final_response": "stopped"},
     )
-    session = _session(agent=agent, running=True)
+    session = _session(agent=agent, running=True, sid="runtime-race")
     _patch_local_interrupt(monkeypatch, session)
 
     def write_after_stop(home, key, prompt, *, attempts=0):
@@ -365,7 +376,7 @@ def schedule_env(monkeypatch, marker_home):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda rid, sid, session, text, **kw: submitted.append((text, kw)),
+        lambda rid, sid, session, text, **kw: submitted.append((text, kw)) or True,
     )
     return submitted
 
@@ -384,7 +395,9 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert text.startswith("[System note: Your previous turn was interrupted")
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
-    assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
+    # The real turn admission owns message.start; scheduling must not emit a
+    # duplicate empty assistant row before the accepted turn begins.
+    assert not [event for event, _sid, _payload in emits if event == "message.start"]
 
 
 def test_hosted_room_marker_is_left_to_the_driver(schedule_env, marker_home):
@@ -530,3 +543,33 @@ def test_dispatch_failure_releases_auto_continue_guard(
 
 # ── End to end: continuation runs a real turn and clears the marker ────
 
+
+def test_continuation_runs_once_and_retires_marker(
+    monkeypatch, emits, turn_env, marker_home
+):
+    seen = []
+
+    def run(message, **_kwargs):
+        seen.append((message, read_turn_marker(marker_home, "session-key")))
+        return {"final_response": "continued"}
+
+    session = _session(agent=types.SimpleNamespace(
+        session_id="session-key", run_conversation=run, clear_interrupt=lambda: None,
+    ))
+    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda session, rid, timeout: None)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    record_turn_start(marker_home, "session-key", "finish the work")
+
+    result = server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert result["attempt"] == 1
+    assert len(seen) == 1
+    assert "finish the work" in seen[0][0]
+    assert seen[0][1]["attempts"] == 1
+    assert seen[0][1]["prompt"] == "finish the work"
+    assert read_turn_marker(marker_home, "session-key") is None
+    assert session["running"] is False
+    assert [(event, sid) for event, sid, _payload in emits if event == "message.start"] == [
+        ("message.start", "sid"),
+    ]

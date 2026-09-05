@@ -117,14 +117,22 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             session["_auto_continue_attempt"], session["_auto_continue_prompt"] = attempt, marker["prompt"]
         try:
             _emit("status.update", sid, {"kind": "process", "text": "Resuming interrupted turn…"})
-            _emit("message.start", sid)
             submit_kwargs = {"display_kind": "auto_continue"}
             if loop_claim_id:
                 submit_kwargs["loop_claim_id"] = loop_claim_id
-            _run_prompt_submit(rid, sid, session, text, **submit_kwargs)
+            if _run_prompt_submit(rid, sid, session, text, **submit_kwargs) is False:
+                with session["history_lock"]:
+                    session["_auto_continue_scheduled"] = False
+                    session.pop("_auto_continue_attempt", None)
+                    session.pop("_auto_continue_prompt", None)
+                    session["running"] = False
         except Exception as exc:
             _notif_log_failure("auto-continue dispatch failed", exc)
-            _notif_release_turn(session)  # rebound from session_notifications
+            with session["history_lock"]:
+                session["_auto_continue_scheduled"] = False
+                session.pop("_auto_continue_attempt", None)
+                session.pop("_auto_continue_prompt", None)
+                session["running"] = False
     threading.Thread(target=kickoff, daemon=True).start()
     logger.info("auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago)", session_key, attempt, age)
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}

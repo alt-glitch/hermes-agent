@@ -79,47 +79,135 @@ def _plan_goal_compression_recovery(
         "Run /compress, then /goal resume to continue.")
 
 
+def _refuse_prompt_turn_locked(sid: str, session: dict, message: str, submission_ids: list[str]) -> None:
+    """Settle accepted input and discard recovery metadata before releasing admission."""
+    failed_ids = _settle_pending_input_ids_locked(session, submission_ids)
+    session["running"] = False
+    session.pop("_auto_continue_attempt", None)
+    session.pop("_auto_continue_prompt", None)
+    _clear_inflight_turn(session)
+    if failed_ids:
+        _emit_terminal_turn_error(
+            sid, session, message, client_submission_ids=failed_ids,
+            history_lock_owned=True, retire_marker=False)
+        _clear_inflight_turn(session)
+
+
 def _admit_prompt_turn(
     sid: str, session: dict, text: Any, image_paths: list[str] | None,
-    queued_prompt_generation: int | None) -> tuple[list[str], Any] | None:
-    """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
-    Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
-    bypass that once let a second backend run a duplicate turn."""
-    # When the session already holds its lease this is a cheap dict check. See #94778.
+    queued_prompt_generation: int | None, client_submission_ids: list[str],
+) -> tuple[list[str], Any] | None:
+    """Fence ownership and publish message.start atomically against close and interrupt."""
+    if session.get("_closing") or _session_is_detached(sid, session):
+        with session["history_lock"]:
+            _refuse_prompt_turn_locked(sid, session, "session closed before turn start", client_submission_ids)
+        return None
+
+    # Ownership admission at the ONE chokepoint every fresh turn source must
+    # cross. prompt.submit already claims the slot in its RPC handler (so this
+    # is a no-op re-check there), but crash auto-continue, wake-ups and other
+    # synthesized turns call _run_prompt_submit directly — the exact bypass
+    # that let a second backend run a duplicate turn in #94778. When the
+    # session already holds its lease this is a cheap dict check.
     if (ownership_refusal := _ensure_active_session_slot(sid, session)) is not None:
         logger.info(
             "Refusing turn for session %s at _run_prompt_submit: %s",
             session.get("session_key") or sid,
-            getattr(ownership_refusal, "reason", None) or "refused")
+            getattr(ownership_refusal, "reason", None) or "refused",
+        )
         with session["history_lock"]:
-            session["running"] = False
+            _refuse_prompt_turn_locked(sid, session, str(ownership_refusal), client_submission_ids)
         _emit("error", sid, {"message": str(ownership_refusal)})
         return None
-    with session["history_lock"]:
-        if session.get("_closing") or (
-            queued_prompt_generation is not None
-            and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation):
-            session["running"] = False
+
+    # Final admission fence: the ownership claim above may block on durable
+    # registry I/O, so its successful return is not proof that ``sid`` still
+    # names this exact record. Serialize lifecycle mutation through the
+    # history-lock start claim/message.start commit. Global order is session
+    # mutation -> session registry -> history; close/replacement uses the same
+    # order, so it cannot detach the record between identity validation and
+    # publishing the accepted turn.
+    with _session_mutation_lock(session):
+        if (
+            not _session_registry_matches(sid, session)
+            or session.get("_finalized")
+        ):
+            with session["history_lock"]:
+                _refuse_prompt_turn_locked(sid, session, "session replaced before turn start", client_submission_ids)
             return None
-        images = list(session.get("attached_images", []) if image_paths is None else image_paths)
-        if image_paths is None:
-            session["attached_images"] = []
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
-        agent = session["agent"]
-        with contextlib.suppress(Exception):
-            _clear_agent_interrupt_for_turn(session, agent)
+        agent = session.get("agent")
+        if agent is None:
+            with session["history_lock"]:
+                session["running"] = False
+                session.pop("_auto_continue_attempt", None)
+                session.pop("_auto_continue_prompt", None)
+                _emit_terminal_turn_error(
+                    sid,
+                    session,
+                    "session agent unavailable before turn start",
+                    client_submission_ids=client_submission_ids,
+                    history_lock_owned=True,
+                )
+            return None
+        with session["history_lock"]:
+            # Claim start atomically against session.interrupt. The start event
+            # is written while holding the same lock, so the interrupt response
+            # can never overtake it on the wire; clients flush start events
+            # before resolving a later interrupt response.
+            if (
+                session.get("_closing")
+                or session.get("_turn_cancel_requested")
+                or not session.get("running")
+            ):
+                session["_turn_cancel_requested"] = False
+                _refuse_prompt_turn_locked(sid, session, "turn cancelled before it started", client_submission_ids)
+                return None
+            if (
+                queued_prompt_generation is not None
+                and int(session.get("_queued_prompt_generation", 0))
+                != queued_prompt_generation
+            ):
+                _refuse_prompt_turn_locked(sid, session, "queued turn cancelled before it started", client_submission_ids)
+                return None
+            session["_steer_admission_closed"] = False
+            if image_paths is None:
+                images = list(session.get("attached_images", []))
+                session["attached_images"] = []
+            else:
+                images = list(image_paths)
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new turn starts — replace it, never append onto it.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
+            if hasattr(agent, "clear_interrupt"):
+                try:
+                    _clear_agent_interrupt_for_turn(session, agent)
+                except Exception:
+                    pass
+            active_ids = list(session.get("_active_client_submission_ids") or [])
+            session["_active_client_submission_ids"] = list(
+                dict.fromkeys([*active_ids, *client_submission_ids])
+            )
+            turn_start_submission_ids = list(
+                session["_active_client_submission_ids"]
+            )
+            if turn_start_submission_ids:
+                _emit(
+                    "message.start",
+                    sid,
+                    {"client_submission_ids": turn_start_submission_ids},
+                )
+            else:
+                # Preserve the shared Ink/desktop gateway call shape for legacy
+                # clients and tests; the wire frame is identical to payload=None.
+                _emit("message.start", sid)
+
     return images, agent
 
 
 def _record_turn_marker(session: dict, text: Any) -> str:
-    """Write the durable crash marker; returns the session key it was written under (compression
-    can rotate session_key mid-turn).  A surviving marker means the process died mid-turn.
-    The key is published before the disk write so an interrupt racing startup can retire
-    it; the post-write cancel check closes the inverse race (Stop landed first, no file)."""
+    """Write the crash marker and retire it if interruption raced the write."""
     marker_home = _session_home(session)
     marker_key = str(session.get("session_key") or "")
     marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
@@ -228,10 +316,19 @@ def _commit_turn_history(
         current_no_markers = [e for e in current_history if not _is_pivot_marker(e)]
         if current_no_markers == history_no_markers and any(
                 _is_pivot_marker(e) for e in current_history):
-            # Auto-compression can leave the result shorter than the turn-start history.
             msgs = result["messages"]
-            new_messages = msgs[len(history):] if len(msgs) > len(history) else list(msgs)
-            session["history"] = current_history + new_messages
+            if msgs[:len(history)] == history:
+                session["history"] = current_history + msgs[len(history):]
+            else:
+                # Compression replaced the prefix. Preserve pending pivots without
+                # resurrecting the old model context or slicing off the new summary.
+                rebased = [entry for entry in msgs if not _is_pivot_marker(entry)]
+                pivots = [entry for entry in current_history if _is_pivot_marker(entry)]
+                index = next((i for i in range(len(rebased) - 1, -1, -1)
+                              if isinstance(rebased[i], dict) and rebased[i].get("role") == "user"),
+                             len(rebased))
+                rebased[index:index] = pivots
+                session["history"] = rebased
             session["history_version"] = current_version + 1
             return None
         print(
@@ -260,8 +357,6 @@ def _turn_outcome(result: Any) -> tuple[Any, str, str | None]:
     # parity).  An empty successful turn still renders as empty.
     if (not raw) and result.get("error") and (result.get("failed") or result.get("partial")):
         raw = f"Error: {result.get('error')}"
-    # "Operation interrupted: waiting for model response (…)" is cancellation
-    # metadata, not assistant prose (gateway/run.py and ACP suppress it too).
     # "Operation interrupted: waiting for model response (…)" is cancellation metadata, not assistant prose.
     # gateway/run.py and the ACP adapter already suppress this sentinel; without this the desktop paints it
     # as the agent's reply whenever a stop/steer lands mid-request (#7921).
@@ -270,6 +365,8 @@ def _turn_outcome(result: Any) -> tuple[Any, str, str | None]:
         raw = ""
     lr = result.get("last_reasoning")
     last_reasoning = lr.strip() if isinstance(lr, str) and lr.strip() else None
+    if isinstance(raw, str) and last_reasoning == raw.strip():
+        last_reasoning = None
     return raw, status, last_reasoning
 
 
@@ -361,8 +458,12 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
     """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
     release ``running``."""
     try:
-        _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, prompt)
+        dispatched = _run_prompt_submit(rid, sid, session, prompt)
+        if dispatched is False:
+            if on_error is not None:
+                on_error()
+            _notif_release_turn(session)
+            return
         if on_done is not None:
             on_done()
     except Exception as exc:
@@ -407,7 +508,9 @@ def _run_post_turn_followups(
                 claim_event_delivery, complete_event_delivery, release_event_delivery)
             _claim = claim_event_delivery(_evt, "tui-post-turn")
             if _claim is None:
+                _notif_release_turn(session)
                 continue
+            _emit_process_completion_card(sid, _evt, synth)
             _dispatch_followup_turn(
                 rid, sid, session, synth, "completion notification dispatch",
                 on_done=lambda: complete_event_delivery(_evt, _claim),
@@ -509,6 +612,19 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     return prompt, _prepend_note(run_message, _hud_surface_note(session)), cols, streamer
 
 
+def _emit_title_refresh(sid: str, title: str | None = None) -> None:
+    """Refresh native title chrome when the asynchronous title worker finishes."""
+    try:
+        session = _sessions.get(sid)
+        if session is not None and session.get("agent") is not None:
+            _emit("session.title", sid, {
+                "session_id": session.get("session_key") or sid,
+                "title": _session_live_title(session, session.get("session_key") or sid) if title is None else title,
+            })
+    except Exception:
+        logger.debug("title chrome refresh failed", exc_info=True)
+
+
 def _invoke_agent(
     sid: str, session: dict, st: _TurnRun, prompt: Any, run_message: Any, streamer,
     images: list[str], display_kind: str | None, display_metadata: dict | None) -> None:
@@ -548,9 +664,7 @@ def _invoke_agent(
         run_kwargs["persist_user_display_kind"] = display_kind
         run_kwargs["persist_user_display_metadata"] = display_metadata
     # Live-rename hook: auto-titling fires inside the turn prologue.
-    _title_key = session.get("session_key") or sid
-    agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
-        "session.title", sid, {"session_id": _k, "title": t})
+    agent._on_session_title = lambda title, _source: _emit_title_refresh(sid, title)
     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
     try:
         st.result = agent.run_conversation(run_message, **st.run_kwargs)
@@ -636,12 +750,13 @@ def _complete_turn_payload(
         payload["reasoning"] = last_reasoning
     if status_note:
         payload["warning"] = status_note
-    if result.get("response_previewed"):
+    result_fields = result if isinstance(result, dict) else {}
+    if result_fields.get("response_previewed"):
         payload["response_previewed"] = True
     # Structured billing-wall descriptor: the client renders recovery without re-parsing text.
-    if _billing_block := result.get("billing_block"):
+    if _billing_block := result_fields.get("billing_block"):
         payload["billing"] = _billing_block
-        payload["failure_reason"] = result.get("failure_reason")
+        payload["failure_reason"] = result_fields.get("failure_reason")
     if rendered := render_message(raw, cols):
         payload["rendered"] = rendered
     # Advisory {layer, code, retryable} descriptor; computed before the retain so resume
@@ -657,7 +772,7 @@ def _complete_turn_payload(
             _error_surface = None
     leftover_steer_retained, completed_submission_ids = _seal_turn_steers(
         session, agent, result)
-    error_value = result.get("error")
+    error_value = result_fields.get("error")
     with session["history_lock"]:
         if status == "error":
             # Retain the failed turn: resume's inflight payload is the only carrier of the
@@ -665,7 +780,7 @@ def _complete_turn_payload(
             _fail_inflight_turn(session, error_value, error_surface=_error_surface)
             st.error_retained = True
             st.error_detail = _turn_failure_detail(
-                error_value, result.get("failure_reason"), st.prompt_text)
+                error_value, result_fields.get("failure_reason"), st.prompt_text)
         else:
             _clear_inflight_turn(session)
     if leftover_steer_retained:
@@ -823,7 +938,7 @@ def _run_prompt_submit(
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     loop_claim_id: str = "") -> bool:
     client_submission_ids = list(client_submission_ids or [])
-    admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
+    admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation, client_submission_ids)
     if admitted is None:
         return False
     images, agent = admitted
@@ -841,17 +956,6 @@ def _run_prompt_submit(
         "kind=%s chars=%s images=%d",
         sid, session.get("session_key") or "", getattr(agent, "session_id", "") or "",
         display_kind or "user", len(text) if isinstance(text, str) else "-", len(images))
-    with session["history_lock"]:
-        session["_steer_admission_closed"] = False
-        active_ids = list(session.get("_active_client_submission_ids") or [])
-        session["_active_client_submission_ids"] = list(
-            dict.fromkeys([*active_ids, *client_submission_ids]))
-        turn_start_submission_ids = list(session["_active_client_submission_ids"])
-    if turn_start_submission_ids:
-        _emit("message.start", sid, {"client_submission_ids": turn_start_submission_ids})
-    else:
-        _emit("message.start", sid)
-
     def run():
         # RPC-dispatcher ContextVars do not follow onto this thread: rebind the transport
         # before any tool can commission a child (delegate_task captures it as authority).

@@ -12,9 +12,8 @@ def test_spurious_eof_restores_blocking_stdin(monkeypatch):
     set_blocking: list[tuple[int, bool]] = []
     recovery_times: list[float] = []
 
-    monkeypatch.setattr(recovery, "_HAS_FCNTL", True)
-    monkeypatch.setattr(recovery, "_fcntl", _fcntl_returning(recovery.os.O_NONBLOCK))
-    monkeypatch.setattr(recovery, "_HAS_SOCKET", False)
+    monkeypatch.setattr(recovery, "fcntl", _fcntl_returning(recovery.os.O_NONBLOCK))
+    monkeypatch.setattr(recovery, "_stdin_sockopt", lambda _getter: None)
     monkeypatch.setattr(recovery, "diagnose_stdin_state", lambda: "O_NONBLOCK=1")
     monkeypatch.setattr(recovery.time, "time", lambda: 100.0)
     monkeypatch.setattr(recovery.os, "set_blocking", lambda fd, blocking: set_blocking.append((fd, blocking)))
@@ -29,8 +28,7 @@ def test_genuine_eof_exits_without_mutating_stdin(monkeypatch):
     logs: list[str] = []
     set_blocking: list[tuple[int, bool]] = []
 
-    monkeypatch.setattr(recovery, "_HAS_FCNTL", True)
-    monkeypatch.setattr(recovery, "_fcntl", _fcntl_returning(0))
+    monkeypatch.setattr(recovery, "fcntl", _fcntl_returning(0))
     monkeypatch.setattr(recovery.os, "set_blocking", lambda fd, blocking: set_blocking.append((fd, blocking)))
 
     assert recovery.handle_spurious_eof([], logs.append) is False
@@ -43,8 +41,7 @@ def test_recovery_rate_limit_exits_before_restoring_stdin(monkeypatch):
     set_blocking: list[tuple[int, bool]] = []
     recovery_times = [99.0] * recovery.MAX_RECOVERIES_PER_MINUTE
 
-    monkeypatch.setattr(recovery, "_HAS_FCNTL", True)
-    monkeypatch.setattr(recovery, "_fcntl", _fcntl_returning(recovery.os.O_NONBLOCK))
+    monkeypatch.setattr(recovery, "fcntl", _fcntl_returning(recovery.os.O_NONBLOCK))
     monkeypatch.setattr(recovery.time, "time", lambda: 100.0)
     monkeypatch.setattr(recovery.os, "set_blocking", lambda fd, blocking: set_blocking.append((fd, blocking)))
 
@@ -60,8 +57,7 @@ def test_recovery_rate_limit_exits_before_restoring_stdin(monkeypatch):
 def test_platform_without_fcntl_treats_eof_as_peer_close(monkeypatch):
     logs: list[str] = []
 
-    monkeypatch.setattr(recovery, "_HAS_FCNTL", False)
-    monkeypatch.setattr(recovery, "_fcntl", None)
+    monkeypatch.setattr(recovery, "fcntl", None)
 
     assert recovery.handle_spurious_eof([], logs.append) is False
     assert logs == ["stdin EOF (peer closed)"]

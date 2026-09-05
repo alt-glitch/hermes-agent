@@ -25,5 +25,5 @@ def test_model_options_binds_requested_profile_home(monkeypatch, tmp_path):
 
     response = server._methods["model.options"](1, {"profile": "fred-work"})
 
-    assert response["result"] == {"providers": []}
+    assert response["result"]["providers"] == []
     assert seen["home"] == profile_home

@@ -14,6 +14,7 @@ from .method_ctx import bind_module
 # parent (#34095).
 _TUI_VERBOSE_TEXT_MAX_CHARS = 1_000
 _TUI_VERBOSE_TEXT_MAX_LINES = 16
+_DIFF_UNIFIED_MAX_BYTES = 512 * 1024
 
 _TODO_TOOL_NAMES = ("todo_list", "todo")  # legacy alias: pre-rename replays
 
@@ -42,6 +43,44 @@ def _redact_tui_verbose_text(text: str) -> str:
     except Exception:
         return ""
     return _cap_tui_verbose_text(redacted)
+
+
+def _cap_diff_unified(diff: str, max_bytes: int = _DIFF_UNIFIED_MAX_BYTES) -> str:
+    """Bound collapsed native diffs without truncating UTF-8 or a surviving line."""
+    raw = diff.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return diff
+    head = raw[:max_bytes].decode("utf-8", errors="ignore")
+    cut = head.rfind("\n")
+    if cut > 0:
+        head = head[:cut]
+    omitted = len(raw) - len(head.encode("utf-8"))
+    return f"{head}\n# … diff truncated ({omitted} more bytes)"
+
+
+def _result_sans_diff_echo(result: str) -> str:
+    """Keep diagnostics, not a second truncated JSON diff, beside the native diff."""
+    try:
+        data = json.loads(result)
+    except (ValueError, TypeError):
+        return result
+    if not isinstance(data, dict) or "diff" not in data:
+        return result
+    return json.dumps({key: value for key, value in data.items() if key != "diff"}, ensure_ascii=False)
+
+
+def _tool_error_from_result(result: str) -> str | None:
+    """Use the explicit tool-result convention; ordinary text is not a failure."""
+    try:
+        data = json.loads(result)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if isinstance(error, str) and error.strip():
+        return " ".join(error.split())[:300]
+    return "tool reported failure" if data.get("success") is False else None
 
 
 def _verbose_text(render, fallback) -> str:
@@ -210,6 +249,8 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
 
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
     payload = {"tool_id": tool_call_id, "name": name, "args": args}
+    if error := _tool_error_from_result(result):
+        payload["error"] = error
     session = _sessions.get(sid)
     snapshot = session.setdefault("edit_snapshots", {}).pop(tool_call_id, None) if session is not None else None
     started_at = session.setdefault("tool_started_at", {}).pop(tool_call_id, None) if session is not None else None
@@ -223,8 +264,6 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
-    if _session_verbose(sid) and (result_text := _tool_result_text(result)):
-        payload["result_text"] = result_text
     todo_state = _normalize_todo_state(payload.get("result")) if name in _TODO_TOOL_NAMES else None
     if todo_state is not None:
         payload.update(todo_state)
@@ -235,7 +274,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         rendered: list[str] = []
         if render_edit_diff_with_delta(name, result, function_args=args, snapshot=snapshot, print_fn=rendered.append):
             payload["inline_diff"] = "\n".join(rendered)
-    if (_tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name)
+    with contextlib.suppress(Exception):
+        from agent.display import extract_edit_diff
+        if diff := extract_edit_diff(name, result, function_args=args, snapshot=snapshot):
+            payload["diff_unified"] = _cap_diff_unified(diff)
+    verbose_result = _result_sans_diff_echo(result) if payload.get("diff_unified") else result
+    if _session_verbose(sid) and (result_text := _tool_result_text(verbose_result)):
+        payload["result_text"] = result_text
+    if (_tool_progress_enabled(sid) or payload.get("inline_diff") or payload.get("diff_unified") or _tool_lifecycle_required_for_ui(name)
             or name in _TODO_TOOL_NAMES):
         _emit("tool.complete", sid, payload)
     # Task state is application data, not tool-progress chrome: a dedicated full-snapshot event lets

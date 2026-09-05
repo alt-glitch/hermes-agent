@@ -122,21 +122,24 @@ def _notif_release_turn(session: dict) -> None:
 
 def _notif_claim_turn(session: dict) -> bool:
     """Claim the idle session (running=True) under history_lock; False if a turn is live."""
-    with session["history_lock"]:
-        claimed = not session.get("running")
+    with _mcp_reload_admission_lock, session["history_lock"]:
+        if session.get("running") or session.get("_closing") or session.get("_finalized"):
+            return False
         session["running"] = True
-        return claimed
+        return True
 
 
 def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
-    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
+def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
+    """Submit a claimed turn; _run_prompt_submit owns its single message.start."""
     try:
-        _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, text, **kwargs)
+        admitted = _run_prompt_submit(rid, sid, session, text, **kwargs)
+        if admitted is False:
+            _notif_release_turn(session)
+        return admitted
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
@@ -163,8 +166,15 @@ def _notif_slash_loop_tick(rid: str, sid: str, session: dict, mgr, wakeup: str, 
             if not _notif_claim_turn(session):
                 mgr.abandon_tick(claim_id)
                 return
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, payload["message"], loop_claim_id=claim_id)
+            try:
+                admitted = _notif_submit(
+                    rid, sid, session, payload["message"], "loop wakeup dispatch failed", loop_claim_id=claim_id)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    mgr.abandon_tick(claim_id)
+                return
+            if admitted is False:
+                mgr.abandon_tick(claim_id)
             return
     except Exception:
         pass
@@ -212,8 +222,10 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         if wakeup.lstrip().startswith("/"):
             _notif_slash_loop_tick(rid, sid, session, mgr, wakeup, claim_id)
         else:
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, wakeup, loop_claim_id=claim_id)
+            if _notif_submit(
+                rid, sid, session, wakeup, "loop wakeup dispatch failed", loop_claim_id=claim_id
+            ) is False:
+                mgr.abandon_tick(claim_id)
     except Exception as exc:
         _notif_log_failure("loop wakeup dispatch failed", exc)
         _notif_release_turn(session)
@@ -354,23 +366,39 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
         return
     with session["history_lock"]:
         batch, session["_kanban_pending"] = list(session.get("_kanban_pending") or []), []
-    with contextlib.suppress(Exception):
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch), "kanban notification dispatch failed")
+    admitted = False
+    try:
+        admitted = _notif_submit(
+            f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch), "kanban notification dispatch failed")
+    except Exception:
+        pass  # _notif_submit already logs the dispatch failure and releases the turn.
+    finally:
+        if admitted is False:
+            with session["history_lock"]:
+                session["_kanban_pending"] = batch + list(session.get("_kanban_pending") or [])
 
 
-def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
-    """Run the claimed (running=True) agent turn for one notification event."""
+def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
+    """Dispatch a claimed turn; False leaves the event eligible for retry."""
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
     if (claim := claim_event_delivery(evt, "tui-poller")) is None:
-        return
+        _notif_release_turn(session)
+        return True  # Another consumer owns the event; do not create a retry duplicate.
     kwargs = ({"display_kind": "async_delegation_complete", "display_metadata": _async_delegation_display_metadata(evt)}
               if evt.get("type") == "async_delegation" else {})
     try:
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
+        _emit_process_completion_card(sid, evt, text)
+        admitted = _notif_submit(
+            f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
+        _notif_release_turn(session)
         release_event_delivery(evt, claim)
-        return
+        return False
+    if admitted is False:
+        release_event_delivery(evt, claim)
+        return False
     complete_event_delivery(evt, claim)
+    return True
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred) -> bool:
@@ -407,15 +435,18 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred) -> 
     # while distinct watch_match events from one process must stay visible.
     dedup_key = _notification_event_dedup_key(evt)
     if dedup_key not in emitted:
-        _emit("status.update", sid, {"kind": "process", "text": text})
+        if is_delegation:
+            notice = _async_delegation_notice(evt, text)
+            _emit("status.update", sid, {"kind": "status", "text": notice["text"]})
+        else:
+            _emit("status.update", sid, {"kind": "process", "text": text})
         emitted.add(dedup_key)
-    if not _notif_claim_turn(session):
+    if not _notif_claim_turn(session) or not _notif_dispatch_event(sid, session, evt, text):
         queue.put(evt)
         if deferred is not None:
             return False
         time.sleep(0.25)  # back off: the re-queued event keeps the queue non-empty, else this loop spins at 100% CPU
         return True
-    _notif_dispatch_event(sid, session, evt, text)
     return True
 
 
@@ -478,6 +509,149 @@ def _async_delegation_display_metadata(evt: dict) -> dict:
     return {"delegation_id": str(evt.get("delegation_id") or ""), "task_count": task_count,
             "completed_count": completed_count or task_count - failed_count, "failed_count": failed_count,
             **({"duration_seconds": duration} if isinstance(duration, (int, float)) else {})}
+
+
+def _duration_label(value: Any) -> str:
+    """Compact a process/delegation duration for one-line notification chrome."""
+    if value in (None, "", "?"):
+        return ""
+    try:
+        seconds = max(0, int(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        text = str(value).strip()
+        return text if text.endswith(("s", "m", "h")) else f"{text}s"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m" if seconds == 0 else f"{minutes}m{seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h" if minutes == 0 else f"{hours}h{minutes}m"
+
+
+def _async_delegation_notice(evt: dict, detail: str) -> dict:
+    """Build compact UI chrome while keeping the full detail for disclosure."""
+    deleg_id = str(evt.get("delegation_id") or "delegation")
+    results = evt.get("results")
+    is_batch = bool(evt.get("is_batch")) or isinstance(results, list)
+    duration = _duration_label(
+        evt.get("total_duration_seconds")
+        if is_batch
+        else evt.get("duration_seconds")
+    )
+    if is_batch:
+        rows = results if isinstance(results, list) else []
+        goals = evt.get("goals")
+        count = len(rows) or (len(goals) if isinstance(goals, list) else int(evt.get("task_count") or 0))
+        succeeded = sum(
+            1
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("status") or "").lower() in {"completed", "success"}
+        )
+        failed = max(0, count - succeeded)
+        pieces = [
+            f"{count} agent{'s' if count != 1 else ''}",
+            "all done" if count > 0 and failed == 0 else f"{succeeded} done",
+        ]
+        if failed:
+            pieces.append(f"{failed} failed")
+        level = "success" if failed == 0 else "warn"
+    else:
+        status = str(evt.get("status") or "completed").strip().lower()
+        pieces = [status]
+        level = "success" if status in {"completed", "success"} else "warn"
+    if duration:
+        pieces.append(duration)
+    pieces.append(deleg_id)
+    return {
+        "always_visible": True,
+        "detail": detail,
+        "key": f"deleg:{deleg_id}",
+        "kind": "async delegation",
+        "level": level,
+        "text": " · ".join(pieces),
+    }
+
+
+def _async_delegation_notice_from_text(detail: str) -> dict | None:
+    """Reconstruct compact presentation metadata from a persisted reinjection."""
+    import re
+
+    header = re.match(
+        r"^\[ASYNC DELEGATION( BATCH)? COMPLETE [—-] ([^\]]+)\]",
+        detail,
+    )
+    if header is None:
+        return None
+    deleg_id = header.group(2).strip()
+    task_statuses = re.findall(
+        r"^--- ([✓✗]) TASK \d+/\d+",
+        detail,
+        flags=re.MULTILINE,
+    )
+    if header.group(1):
+        evt: dict = {
+            "delegation_id": deleg_id,
+            "is_batch": True,
+            "results": [
+                {"status": "completed" if icon == "✓" else "failed"}
+                for icon in task_statuses
+            ],
+        }
+        if not task_statuses:
+            count_match = re.search(r"fan-out of (\d+) subagent", detail)
+            if count_match is not None:
+                evt["task_count"] = int(count_match.group(1))
+        duration_match = re.search(r"Total duration:\s*([^\n]+)", detail)
+        if duration_match is not None:
+            evt["total_duration_seconds"] = duration_match.group(1).strip()
+    else:
+        status_match = re.search(r"^Status:\s*([^\s]+)", detail, flags=re.MULTILINE)
+        duration_match = re.search(r"Duration:\s*([^\s]+)", detail)
+        evt = {
+            "delegation_id": deleg_id,
+            "status": status_match.group(1) if status_match is not None else "completed",
+        }
+        if duration_match is not None:
+            evt["duration_seconds"] = duration_match.group(1)
+    return _async_delegation_notice(evt, detail)
+
+
+def _emit_process_completion_card(
+    sid: str, evt: dict, detail: str | None = None
+) -> None:
+    """Emit compact completion chrome separately from the full model-facing prompt.
+
+    Callers own delivery deduplication; watch matches are not terminal cards.
+    """
+    evt_type = evt.get("type", "completion")
+    if evt_type == "async_delegation":
+        if not detail:
+            return
+        _emit("notification.show", sid, _async_delegation_notice(evt, detail))
+        return
+    if evt_type != "completion":
+        return
+    cmd = str(evt.get("command") or "process").strip().replace("\n", " ")
+    if len(cmd) > 60:
+        cmd = cmd[:59] + "…"
+    code = evt.get("exit_code")
+    if code is None:
+        text, level = f"{cmd} finished", "info"
+    else:
+        text = f"{cmd} exited {code}"
+        level = "info" if code == 0 else "warn"
+    _emit(
+        "notification.show",
+        sid,
+        {
+            "text": text,
+            "kind": "process.complete",
+            "level": level,
+            "key": f"proc:{evt.get('session_id', '')}",
+        },
+    )
 
 
 _desktop_ui_wired = False
