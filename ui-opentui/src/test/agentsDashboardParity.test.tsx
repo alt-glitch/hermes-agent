@@ -5,7 +5,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 import { createDelegationState } from '../logic/agentStatus.ts'
 import type { SpawnHistoryState, SpawnSnapshot } from '../logic/spawnHistory.ts'
 import { dashboardAgentFromRecord, type DashboardAgent } from '../view/overlays/agents/model.ts'
-import { agentEndTime } from '../view/overlays/agents/timeline.tsx'
+import { agentElapsed, agentEndTime } from '../view/overlays/agents/timeline.tsx'
 import { AgentsDashboard } from '../view/overlays/agentsDashboard.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { captureFrame, renderProbe } from './lib/render.ts'
@@ -461,6 +461,36 @@ describe('native agents dashboard parity', () => {
     }
   })
 
+  test('terminal rows prefer measured duration and retained finals over receipt time and stale activity', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(START + 24_000)
+    const completed = agent('completed', 'Verify contracts', {
+      status: 'completed',
+      startedAt: START,
+      durationSeconds: 12,
+      endedAt: START + 24_000,
+      summary: 'VERIFIED_FINAL',
+      trace: [{ kind: 'progress', text: 'STALE_PROGRESS' }]
+    })
+    const failed = agent('failed', 'Check mirror', {
+      status: 'failed',
+      startedAt: START,
+      durationSeconds: 12,
+      endedAt: START + 24_000,
+      summary: 'MIRROR_FAILED_FINAL'
+    })
+    for (const item of [completed, failed]) {
+      expect(agentEndTime(item, START + 50_000)).toBe(START + 12_000)
+      expect(agentElapsed(item, START + 50_000)).toBe(12)
+    }
+    const frame = await captureFrame(dashboardNode({ subagents: [completed, failed] }), { width: 100, height: 24 })
+    expect(frame).toContain('completed · 12s')
+    expect(frame).toContain('failed · 12s')
+    expect(frame).toContain('VERIFIED_FINAL')
+    expect(frame).toContain('MIRROR_FAILED_FINAL')
+    expect(frame).not.toContain('STALE_PROGRESS')
+    expect(frame).not.toContain('waiting')
+  })
+
   test('unknown terminal time stays unknown while the active sibling advances', async () => {
     const finished = agent('finished', 'Finished without timestamp', { status: 'completed', startedAt: START })
     const active = agent('active', 'Still working', { startedAt: START })
@@ -530,7 +560,10 @@ describe('native agents dashboard parity', () => {
     }
   })
 
-  test('reader wheel/keyboard pauses following, append preserves position, and live action resumes', async () => {
+  test.each([
+    { width: 132, height: 30 },
+    { width: 80, height: 24 }
+  ])('reader inspection survives appends at $width×$height with separate pinned headers', async dimensions => {
     const trace = Array.from({ length: 30 }, (_, index) => ({
       id: index,
       kind: 'reply' as const,
@@ -544,9 +577,19 @@ describe('native agents dashboard parity', () => {
           <AgentsDashboard subagents={items()} onClose={() => {}} />
         </ThemeProvider>
       ),
-      { width: 132, height: 30 }
+      dimensions
     )
     try {
+      if (dimensions.width < 110) {
+        probe.keys.pressEnter()
+        await probe.settle()
+        expect(
+          probe
+            .frame()
+            .split('\n')
+            .filter(line => line.includes('← Back to agents'))
+        ).toHaveLength(1)
+      }
       const scroll = descendants(probe.renderer.root).find(item => item.id === 'agent-detail-scroll')
       if (!(scroll instanceof ScrollBoxRenderable)) throw new Error('missing detail scroll')
       expect(scroll.scrollTop).toBeGreaterThan(0)
@@ -558,6 +601,7 @@ describe('native agents dashboard parity', () => {
       setItems([{ ...current, trace: [...trace, { id: 30, kind: 'reply', text: 'Newest reply' }] }])
       await probe.settle()
       expect(scroll.scrollTop).toBe(position)
+      expect(probe.frame()).toContain('Scroll paused')
       probe.keys.pressKey('l', { shift: true })
       await probe.settle()
       expect(probe.frame()).toContain('Following live')
@@ -565,6 +609,27 @@ describe('native agents dashboard parity', () => {
       probe.keys.pressArrow('up')
       await probe.settle()
       expect(probe.frame()).toContain('Scroll paused')
+      const keyboardPosition = scroll.scrollTop
+      setItems([
+        {
+          ...current,
+          trace: [
+            ...trace,
+            { id: 30, kind: 'reply', text: 'Newest reply with more text' },
+            { id: 31, kind: 'reply', text: 'Additional reply' }
+          ]
+        }
+      ])
+      await probe.settle()
+      expect(scroll.scrollTop).toBe(keyboardPosition)
+      expect(probe.frame()).toContain('Scroll paused')
+      if (dimensions.width < 110) {
+        const lines = probe.frame().split('\n')
+        const back = lines.findIndex(line => line.includes('← Back to agents'))
+        const paused = lines.findIndex(line => line.includes('Scroll paused'))
+        expect(back).toBeGreaterThanOrEqual(0)
+        expect(paused).toBe(back + 1)
+      }
     } finally {
       probe.destroy()
     }

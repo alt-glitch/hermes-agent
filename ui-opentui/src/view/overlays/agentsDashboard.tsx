@@ -4,7 +4,7 @@
  */
 import { type BoxRenderable, type ScrollBoxRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
 import { createDelegationState, delegationPressure, type DelegationState } from '../../logic/agentStatus.ts'
 import { diffSpawnSnapshots, type SpawnHistoryState, type SpawnSnapshot } from '../../logic/spawnHistory.ts'
@@ -251,13 +251,13 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
     previousLiveCount = liveCount
   })
 
-  createEffect(() => {
-    selectedId()
-    historyIndex()
-    setFollowing(!replayMode())
-    setSections({})
-    detailScroll?.scrollTo(replayMode() ? 0 : Number.MAX_SAFE_INTEGER)
-  })
+  createEffect(
+    on([selectedId, historyIndex, () => replaySnapshot()?.id], () => {
+      setFollowing(!replayMode())
+      setSections({})
+      detailScroll?.scrollTo(replayMode() ? 0 : Number.MAX_SAFE_INTEGER)
+    })
+  )
 
   createEffect(() => {
     if (replayMode()) return
@@ -566,7 +566,13 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                   borderColor={theme().color.border}
                 >
                   <Show when={!wide()}>
-                    <text fg={theme().color.accent} onMouseDown={() => setMode('list')}>
+                    <text
+                      height={1}
+                      flexShrink={0}
+                      wrapMode="none"
+                      fg={theme().color.accent}
+                      onMouseDown={() => setMode('list')}
+                    >
                       ← Back to agents
                     </text>
                   </Show>

@@ -7,12 +7,12 @@ import { useTheme } from '../../theme.tsx'
 import type { DashboardAgent } from './model.ts'
 
 export function agentEndTime(agent: DashboardAgent, nowMs: number): number | undefined {
-  if (agent.endedAt !== undefined) return agent.endedAt
   const status = normalizeSubagentStatus(agent.status)
   if (status === 'running' || status === 'queued') return nowMs
+  // Completion receipt may be delayed; the backend's measured duration wins.
   if (agent.startedAt !== undefined && agent.durationSeconds !== undefined)
     return agent.startedAt + Math.max(0, agent.durationSeconds) * 1000
-  return undefined
+  return agent.endedAt
 }
 
 export function agentElapsed(agent: DashboardAgent, nowMs: number): number | undefined {

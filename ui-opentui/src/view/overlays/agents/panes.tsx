@@ -88,6 +88,18 @@ export function AgentListRow(props: {
     props.node.aggregate.totalTools > 0 ? ` ·${String(props.node.aggregate.totalTools)}t` : ''
   )
   const kids = createMemo(() => (props.node.children.length > 0 ? ` ·${String(props.node.children.length)}↓` : ''))
+  const activity = createMemo(() => {
+    const agent = props.node.item
+    const status = normalizeSubagentStatus(agent.status)
+    const active = status === 'running' || status === 'queued'
+    const final = active ? undefined : agent.trace?.findLast(entry => entry.kind === 'summary')?.text || agent.summary
+    const latest = agent.trace?.findLast(
+      entry => entry.kind === 'reply' || entry.kind === 'progress' || entry.kind === 'summary'
+    )?.text
+    return (
+      (final || latest)?.replace(/\s+/g, ' ').trim() || toolShort() || (active ? 'waiting' : 'no retained activity')
+    )
+  })
 
   return (
     <box
@@ -120,14 +132,7 @@ export function AgentListRow(props: {
       </text>
       <text fg={theme().color.muted} wrapMode="none" bg={props.active ? theme().color.selectionBg : 'transparent'}>
         {truncRight(
-          `    ${normalizeSubagentStatus(props.node.item.status)} · ${agentElapsed(props.node.item, props.nowMs) === undefined ? 'elapsed ?' : fmtDuration(agentElapsed(props.node.item, props.nowMs) ?? 0)}${tools()} · ${
-            props.node.item.trace
-              ?.findLast(entry => entry.kind === 'reply' || entry.kind === 'progress')
-              ?.text.replace(/\s+/g, ' ')
-              .trim() ||
-            toolShort() ||
-            'waiting'
-          }`,
+          `    ${normalizeSubagentStatus(props.node.item.status)} · ${agentElapsed(props.node.item, props.nowMs) === undefined ? 'elapsed ?' : fmtDuration(agentElapsed(props.node.item, props.nowMs) ?? 0)}${tools()} · ${activity()}`,
           props.width
         )}
       </text>
@@ -391,31 +396,15 @@ export function AgentDetail(props: {
           >
             <For each={trace().slice(-20)}>
               {entry => {
-                const glyph =
-                  entry.kind === 'tool'
-                    ? '⚡'
-                    : entry.kind === 'summary'
-                      ? '✓'
-                      : entry.kind === 'start'
-                        ? '▶'
-                        : entry.kind === 'reply'
-                          ? '❯'
-                          : '·'
+                const glyph = entry.kind === 'tool' ? '⚡' : entry.kind === 'start' ? '▶' : '·'
                 const color =
                   entry.kind === 'tool'
                     ? theme().color.accent
-                    : entry.kind === 'summary'
-                      ? theme().color.ok
-                      : entry.kind === 'start'
-                        ? theme().color.label
-                        : entry.kind === 'reply'
-                          ? theme().color.text
-                          : theme().color.muted
+                    : entry.kind === 'start'
+                      ? theme().color.label
+                      : theme().color.muted
                 return (
-                  <text
-                    fg={entry.kind === 'summary' || entry.kind === 'reply' ? theme().color.text : theme().color.muted}
-                    wrapMode="word"
-                  >
+                  <text fg={theme().color.muted} wrapMode="word">
                     <span style={{ fg: color }}>{glyph} </span>
                     {entry.text}
                   </text>
