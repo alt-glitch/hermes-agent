@@ -238,12 +238,16 @@ export function DesktopOnboardingOverlay({
   // the same dissolve, then run whatever the door opens onto. `after` runs at
   // the END so a sign-in dialog or provider picker never appears behind a
   // still-fading overlay.
-  const dismissFreeTierIntro = (after?: () => void) => {
+  const dismissFreeTierIntro = async (after?: () => void) => {
     if (leaving) {
       return
     }
 
-    void ackFreeTierIntro(ctx)
+    // The screen is keyed on the backend's notice flag: only a recorded ack takes it down.
+    // A failed ack leaves it in place for another try rather than hiding the only notice.
+    if (!(await ackFreeTierIntro(ctx))) {
+      return
+    }
 
     const reduce = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
 
@@ -411,7 +415,7 @@ function FreeTierReadyPanel({
   onDismiss
 }: {
   leaving: boolean
-  onDismiss: (after?: () => void) => void
+  onDismiss: (after?: () => void) => Promise<void>
 }) {
   const { t } = useI18n()
   const copy = t.freeTier
@@ -444,13 +448,13 @@ function FreeTierReadyPanel({
           leaving ? 'opacity-0 saturate-0' : 'opacity-100 saturate-100'
         )}
       >
-        <Button onClick={() => onDismiss()} type="button">
+        <Button onClick={() => void onDismiss()} type="button">
           {copy.begin}
         </Button>
-        <Button onClick={() => onDismiss(() => openFreeTierSignIn())} size="xs" type="button" variant="text">
+        <Button onClick={() => void onDismiss(() => openFreeTierSignIn())} size="xs" type="button" variant="text">
           {copy.signInInstead}
         </Button>
-        <Button onClick={() => onDismiss(() => startManualOnboarding(null))} size="xs" type="button" variant="text">
+        <Button onClick={() => void onDismiss(() => startManualOnboarding(null))} size="xs" type="button" variant="text">
           {copy.otherProviders}
         </Button>
       </div>
