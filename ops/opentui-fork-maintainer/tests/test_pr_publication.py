@@ -146,9 +146,11 @@ def github(monkeypatch):
     return github
 
 
-def publish(capture):
+def publish(capture, *, issue_request=None):
     root, manifest, _ = capture
-    return pub.publish_preview(root.parent, root, manifest, node=NODE)
+    return pub.publish_preview(
+        root.parent, root, manifest, node=NODE, issue_request=issue_request
+    )
 
 
 def bind_issue(
@@ -455,8 +457,9 @@ def test_recovered_issue_reuses_candidate_pr_across_distinct_leases(
     assert github.pr["body"].count("https://github.com/user-attachments/assets/") == 1
 
 
+@pytest.mark.parametrize("appeared_after_capture", [False, True])
 def test_exact_existing_implementing_pr_is_reused_without_candidate_branch(
-    capture, github
+    capture, github, appeared_after_capture
 ) -> None:
     existing = {
         "number": 42,
@@ -466,7 +469,12 @@ def test_exact_existing_implementing_pr_is_reused_without_candidate_branch(
         "head_sha": "a" * 40,
         "head_repository": pub.REPOSITORY,
     }
-    bind_issue(capture, existing_prs=[existing])
+    request = bind_issue(
+        capture, existing_prs=[] if appeared_after_capture else [existing]
+    )
+    current = (
+        {**request, "existing_prs": [existing]} if appeared_after_capture else None
+    )
     github.pr = {
         **review_pr(),
         "number": 42,
@@ -475,7 +483,7 @@ def test_exact_existing_implementing_pr_is_reused_without_candidate_branch(
         "headRefName": existing["head_branch"],
     }
 
-    proof = publish(capture)
+    proof = publish(capture, issue_request=current)
 
     assert proof["number"] == 42
     assert proof["head_branch"] == existing["head_branch"]

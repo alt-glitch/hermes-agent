@@ -464,6 +464,17 @@ def issue_request(number: int = 41) -> dict[str, object]:
     }
 
 
+def issue_pr(candidate: str, *, number: int = 42) -> dict[str, object]:
+    return {
+        "number": number,
+        "url": f"https://github.com/alt-glitch/hermes-agent/pull/{number}",
+        "base_branch": "sid/opentui",
+        "head_branch": f"feature/approved-{number}",
+        "head_sha": candidate,
+        "head_repository": "alt-glitch/hermes-agent",
+    }
+
+
 def claim_issue(state: Path, evidence: Path, base: str, upstream: str) -> dict[str, object]:
     claim_backport(state, evidence, base, upstream)
     value = issue_request()
@@ -574,7 +585,11 @@ def test_issue_gate_is_linear_revision_bound_and_never_advances_upstream(
     monkeypatch.setattr(
         runtime,
         "_finalize_delivered_issue",
-        lambda *_args, **_kwargs: {"issue": 41, "closed": True},
+        lambda *_args, **_kwargs: {
+            "issue": 41,
+            "closed": False,
+            "closure_withheld_reason": "approved_revision_changed_or_revoked",
+        },
     )
 
     manifest_path = evidence / "gate.json"
@@ -610,9 +625,88 @@ def test_issue_gate_is_linear_revision_bound_and_never_advances_upstream(
         token="test-token",
     )
     assert finalized["upstream_sha"] is None
-    assert finalized["issue_delivery"] == {"issue": 41, "closed": True}
+    assert finalized["issue_delivery"] == {
+        "issue": 41,
+        "closed": False,
+        "closure_withheld_reason": "approved_revision_changed_or_revoked",
+    }
+    assert json.loads((evidence / "run-outcome.json").read_text())["status"] == "success"
     assert marker.read_text(encoding="utf-8") == base + "\n"
     assert json.loads((evidence / "request.consumed.json").read_text()) == value
+
+
+@pytest.mark.parametrize("appeared", ["before-publish", "after-ci"])
+def test_issue_pr_appearing_after_capture_refuses_duplicate_or_target_ship(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    appeared: str,
+) -> None:
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    captured = claim_issue(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    conflict = {**captured, "existing_prs": [issue_pr("f" * 40, number=77)]}
+    observations = iter(
+        [conflict] if appeared == "before-publish" else [captured, conflict]
+    )
+    issue_api = runtime.runpy.run_path(
+        str(Path(runtime.__file__).with_name("issue_intake.py"))
+    )
+    issue_api["revalidate_approved_issue"] = (
+        lambda _state, _request: next(observations)
+    )
+    monkeypatch.setattr(
+        runtime.runpy,
+        "run_path",
+        lambda _path: issue_api,
+    )
+
+    def publish(*_args: object, **kwargs: object) -> dict[str, object]:
+        if appeared == "before-publish":
+            pytest.fail("conflicting PR must refuse before candidate PR publication")
+        assert kwargs["issue_request"] == captured
+        return {
+            "candidate_sha": candidate,
+            "number": 42,
+            "url": "https://github.com/alt-glitch/hermes-agent/pull/42",
+            "base_branch": "sid/opentui",
+            "head_branch": "codex/opentui-maint-candidate",
+        }
+
+    monkeypatch.setattr(runtime, "_publish_pr_evidence", publish)
+    with pytest.raises(runtime.ControlError, match="implementing PR"):
+        runtime.gate_and_ship(
+            repo,
+            packet,
+            evidence / "gate.json",
+            state_dir=state,
+            cwd=worktree,
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+        )
+    assert remote_sha(repo) == base
+    assert not (state / "publish-journal.json").exists()
+
+
+@pytest.mark.parametrize("publisher_created", [False, True])
+def test_revalidation_preserves_one_exact_candidate_pr(
+    publisher_created: bool,
+) -> None:
+    candidate = "a" * 40
+    current = issue_request()
+    current["existing_prs"] = [] if publisher_created else [issue_pr(candidate)]
+    expected = {
+        "candidate_sha": candidate,
+        "number": 42,
+        "url": "https://github.com/alt-glitch/hermes-agent/pull/42",
+        "base_branch": "sid/opentui",
+        "head_branch": "feature/approved-42",
+    }
+
+    runtime._reconcile_issue_candidate_prs(current, candidate, expected)
 
 
 def test_issue_failure_enters_cooldown_without_starving_explicit_queue(

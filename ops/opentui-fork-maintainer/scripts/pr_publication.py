@@ -195,7 +195,9 @@ def _safe_metadata_text(value: str) -> str:
 
 
 def _issue_metadata(
-    root: Path, manifest: dict[str, Any]
+    root: Path,
+    manifest: dict[str, Any],
+    issue_request: dict[str, Any] | None = None,
 ) -> tuple[str, str, dict[str, Any] | None]:
     binding = manifest.get("run_binding")
     if not isinstance(binding, dict) or binding.get("mode") != "issue":
@@ -224,6 +226,16 @@ def _issue_metadata(
         or not isinstance(request.get("title"), str)
     ):
         raise PublicationError("issue candidate request does not match its gate binding")
+    if issue_request is not None:
+        fixed_fields = set(request) - {"existing_prs"}
+        if (
+            not isinstance(issue_request, dict)
+            or set(issue_request) != set(request)
+            or any(issue_request.get(key) != request.get(key) for key in fixed_fields)
+            or not isinstance(issue_request.get("existing_prs"), list)
+        ):
+            raise PublicationError("refreshed issue request changed its approved binding")
+        request = {**request, "existing_prs": issue_request["existing_prs"]}
     title_text = " ".join(_safe_metadata_text(request["title"]).split())
     if not title_text:
         raise PublicationError("issue candidate title is empty")
@@ -339,46 +351,48 @@ def _reconcile_issue_pr(
     expected_prs = issue["existing_prs"]
     if not isinstance(expected_prs, list):
         raise PublicationError("issue implementing PR evidence is invalid")
-    matches: list[dict[str, Any]] = []
-    for expected in expected_prs:
-        if not isinstance(expected, dict) or type(expected.get("number")) is not int:
-            raise PublicationError("issue implementing PR evidence is invalid")
-        pr = json.loads(
-            _run(
-                [
-                    str(GH),
-                    "pr",
-                    "view",
-                    str(expected["number"]),
-                    "--repo",
-                    REPOSITORY,
-                    "--json",
-                    FIELDS,
-                ],
-                root,
-            )
-        )
-        if (
-            not isinstance(pr, dict)
-            or pr.get("number") != expected["number"]
-            or pr.get("url") != expected.get("url")
-            or pr.get("baseRefName") != BASE
-            or pr.get("headRefName") != expected.get("head_branch")
-            or pr.get("headRefOid") != expected.get("head_sha")
-            or pr.get("state") != "OPEN"
-            or not _references_issue(pr.get("body"), issue["issue"])
-        ):
-            raise PublicationError(
-                "captured implementing PR changed; re-intake the approved issue"
-            )
-        if pr["headRefOid"] == candidate:
-            matches.append(pr)
-    if len(matches) != 1:
+    if len(expected_prs) != 1:
         raise PublicationError(
-            "approved issue already has an open implementing PR that does not "
-            "uniquely match this candidate; refusing a duplicate PR"
+            "approved issue has ambiguous implementing PRs; refusing a duplicate PR"
         )
-    return matches[0]
+    expected = expected_prs[0]
+    if (
+        not isinstance(expected, dict)
+        or type(expected.get("number")) is not int
+        or expected.get("head_sha") != candidate
+    ):
+        raise PublicationError(
+            "approved issue has a conflicting implementing PR; refusing a duplicate PR"
+        )
+    pr = json.loads(
+        _run(
+            [
+                str(GH),
+                "pr",
+                "view",
+                str(expected["number"]),
+                "--repo",
+                REPOSITORY,
+                "--json",
+                FIELDS,
+            ],
+            root,
+        )
+    )
+    if (
+        not isinstance(pr, dict)
+        or pr.get("number") != expected["number"]
+        or pr.get("url") != expected.get("url")
+        or pr.get("baseRefName") != expected.get("base_branch")
+        or pr.get("headRefName") != expected.get("head_branch")
+        or pr.get("headRefOid") != candidate
+        or pr.get("state") != "OPEN"
+        or not _references_issue(pr.get("body"), issue["issue"])
+    ):
+        raise PublicationError(
+            "captured implementing PR changed; re-intake the approved issue"
+        )
+    return pr
 
 
 def _validate_pr(
@@ -664,6 +678,7 @@ def publish_preview(
     node: Path,
     remote: str = "origin",
     review_deadline_unix: int | None = None,
+    issue_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Idempotently create the candidate PR and attach one proven synthetic PNG.
 
@@ -695,7 +710,7 @@ def publish_preview(
     candidate, base = manifest["candidate_sha"], manifest["base_sha"]
     head, request_identity, candidate_identity = _candidate_head(manifest)
     candidate_marker = f"<!-- maintainer-candidate:v1:{candidate_identity} -->"
-    title, body_prefix, issue = _issue_metadata(root, manifest)
+    title, body_prefix, issue = _issue_metadata(root, manifest, issue_request)
     gh = [str(GH), "pr"]
     options = ["--repo", REPOSITORY]
     reconciled = _reconcile_issue_pr(root, issue, candidate)

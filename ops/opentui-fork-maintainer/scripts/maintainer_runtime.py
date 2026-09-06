@@ -753,8 +753,56 @@ def _valid_run_binding(value: Any) -> bool:
     )
 
 
+def _reconcile_issue_candidate_prs(
+    current: dict[str, Any],
+    candidate_sha: str,
+    expected_pr: dict[str, Any] | None = None,
+) -> None:
+    if not SHA_RE.fullmatch(candidate_sha):
+        raise ControlError("issue candidate identity is invalid")
+    prs = current.get("existing_prs")
+    if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
+        raise ControlError("approved issue implementing PR evidence is invalid")
+    if expected_pr is None:
+        if len(prs) > 1 or any(pr.get("head_sha") != candidate_sha for pr in prs):
+            raise ControlError(
+                "approved issue has an ambiguous or conflicting implementing PR"
+            )
+        return
+    if (
+        not isinstance(expected_pr, dict)
+        or expected_pr.get("candidate_sha") != candidate_sha
+        or type(expected_pr.get("number")) is not int
+        or expected_pr.get("url")
+        != f"https://github.com/alt-glitch/hermes-agent/pull/{expected_pr.get('number')}"
+        or expected_pr.get("base_branch") != BRANCH
+        or not isinstance(expected_pr.get("head_branch"), str)
+    ):
+        raise ControlError("published issue candidate PR evidence is invalid")
+    if not prs:
+        # The maintainer-created PR deliberately does not use an auto-closing
+        # keyword, so it need not appear in the issue's implementing-PR set.
+        return
+    expected = {
+        "number": expected_pr["number"],
+        "url": expected_pr["url"],
+        "base_branch": expected_pr["base_branch"],
+        "head_branch": expected_pr["head_branch"],
+        "head_sha": candidate_sha,
+    }
+    if len(prs) != 1 or any(prs[0].get(key) != value for key, value in expected.items()):
+        raise ControlError(
+            "approved issue has an ambiguous or conflicting implementing PR"
+        )
+
+
 def _revalidate_issue_request(
-    state_dir: Path, evidence_root: Path, token: str
+    state_dir: Path,
+    evidence_root: Path,
+    token: str,
+    *,
+    candidate_sha: str,
+    expected_pr: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Recheck the exact issue revision and approval under this live run."""
     binding = _derive_run_binding(state_dir, evidence_root, token)
@@ -770,8 +818,14 @@ def _revalidate_issue_request(
         current = api["revalidate_approved_issue"](state_dir, request)
     except (RuntimeError, ValueError, KeyError, OSError) as exc:
         raise ControlError("approved issue changed or could not be revalidated") from exc
-    if _canonical_json_sha256(current) != _canonical_json_sha256(request):
+    fixed_fields = set(request) - {"existing_prs"}
+    if (
+        not isinstance(current, dict)
+        or set(current) != set(request)
+        or any(current.get(key) != request.get(key) for key in fixed_fields)
+    ):
         raise ControlError("approved issue changed during revalidation")
+    _reconcile_issue_candidate_prs(current, candidate_sha, expected_pr)
     return current
 
 
@@ -3181,6 +3235,7 @@ def _publish_pr_evidence(
     *,
     state_dir: Path,
     token: str,
+    issue_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Load only the installed sibling control-plane module, never candidate code.
     publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
@@ -3203,6 +3258,7 @@ def _publish_pr_evidence(
             node=NODE26,
             remote=remote,
             review_deadline_unix=review_deadline_unix,
+            issue_request=issue_request,
         )
     except (RuntimeError, ValueError, KeyError, OSError) as exc:
         raise ControlError(f"PR evidence publication refused: {exc}") from exc
@@ -3268,8 +3324,14 @@ def gate_and_ship(
         state_dir, evidence_root, token
     ) != run_binding:
         raise ControlError("bound request changed during verification")
+    issue_request = None
     if run_binding["mode"] == "issue":
-        _revalidate_issue_request(state_dir, evidence_root, token)
+        issue_request = _revalidate_issue_request(
+            state_dir,
+            evidence_root,
+            token,
+            candidate_sha=candidate_sha,
+        )
     proof = _publish_pr_evidence(
         repo,
         evidence_root,
@@ -3277,13 +3339,20 @@ def gate_and_ship(
         remote,
         state_dir=state_dir,
         token=token,
+        issue_request=issue_request,
     )
     result["pr_evidence"] = proof
     _atomic_json(manifest_path, result)
     if run_binding["mode"] == "issue":
         # CI and review may run for hours. Recheck issue state, labels, exact
         # content revision, and trusted approval again at the publication edge.
-        _revalidate_issue_request(state_dir, evidence_root, token)
+        _revalidate_issue_request(
+            state_dir,
+            evidence_root,
+            token,
+            candidate_sha=candidate_sha,
+            expected_pr=proof,
+        )
     ship_candidate(
         repo,
         manifest_path,

@@ -54,6 +54,22 @@ def labeled(
     }
 
 
+def renamed(
+    event_id: int,
+    before: str,
+    after: str,
+    *,
+    created: str = "2026-09-06T03:00:00Z",
+) -> dict[str, object]:
+    return {
+        "id": event_id,
+        "event": "renamed",
+        "rename": {"from": before, "to": after},
+        "actor": {"login": "alt-glitch"},
+        "created_at": created,
+    }
+
+
 class GitHub:
     def __init__(
         self, issues: list[dict[str, object]], timelines: dict[int, list[dict]]
@@ -64,6 +80,8 @@ class GitHub:
         self.comments: dict[int, list[dict]] = {}
         self.pull_requests: dict[int, dict] = {}
         self.fail_on: str | None = None
+        self.comment_readback_body: str | None = None
+        self.patch_ack_only = False
 
     def run(self, argv: list[str], _cwd: Path) -> str:
         self.calls.append(argv)
@@ -90,6 +108,17 @@ class GitHub:
         if "/comments?" in route:
             number = int(route.split("/issues/", 1)[1].split("/", 1)[0])
             return json.dumps([self.comments.get(number, [])])
+        if "/issues/comments/" in route:
+            comment_id = int(route.rsplit("/", 1)[1])
+            comment = next(
+                comment
+                for comments in self.comments.values()
+                for comment in comments
+                if comment["id"] == comment_id
+            )
+            if self.comment_readback_body is not None:
+                comment = {**comment, "body": self.comment_readback_body}
+            return json.dumps(comment)
         if "/pulls/" in route:
             number = int(route.rsplit("/pulls/", 1)[1].split(" ", 1)[0])
             return json.dumps(self.pull_requests[number])
@@ -98,12 +127,30 @@ class GitHub:
         ):
             number = int(route.split("/issues/", 1)[1].split("/", 1)[0])
             body = next(value.split("=", 1)[1] for value in argv if value.startswith("body="))
-            record = {"id": len(self.comments.get(number, [])) + 1, "body": body}
+            comment_id = 1 + max(
+                (comment["id"] for comments in self.comments.values() for comment in comments),
+                default=0,
+            )
+            record = {
+                "id": comment_id,
+                "body": body,
+                "url": (
+                    "https://api.github.com/repos/alt-glitch/hermes-agent/issues/"
+                    f"comments/{comment_id}"
+                ),
+                "issue_url": f"https://api.github.com/repos/alt-glitch/hermes-agent/issues/{number}",
+                "html_url": (
+                    f"https://github.com/alt-glitch/hermes-agent/issues/{number}"
+                    f"#issuecomment-{comment_id}"
+                ),
+                "user": {"login": "alt-glitch"},
+            }
             self.comments.setdefault(number, []).append(record)
-            return json.dumps(record)
+            return json.dumps({"id": comment_id, "body": body})
         if "--method PATCH" in route:
             number = int(route.split("/issues/", 1)[1].split(" ", 1)[0])
-            self.issues[number]["state"] = "CLOSED"
+            if not self.patch_ack_only:
+                self.issues[number]["state"] = "CLOSED"
             return json.dumps({"state": "closed", "number": number})
         raise AssertionError(f"unexpected command: {argv}")
 
@@ -177,8 +224,8 @@ def test_paginated_selection_requires_revision_bound_trusted_label_and_records_p
     )
 
     github.pull_requests[77]["head"]["sha"] = "e" * 40
-    with pytest.raises(intake.IssueIntakeError, match="implementing pull request"):
-        intake.revalidate_approved_issue(tmp_path, request, runner=github.run)
+    refreshed = intake.revalidate_approved_issue(tmp_path, request, runner=github.run)
+    assert refreshed["existing_prs"][0]["head_sha"] == "e" * 40
 
 
 @pytest.mark.parametrize(
@@ -225,6 +272,40 @@ def test_configured_trusted_approver_is_exact_and_revision_edits_revoke(
     current["lastEditedAt"] = "2026-09-06T03:00:00Z"
     with pytest.raises(intake.IssueIntakeError, match="approval|revision"):
         intake.revalidate_approved_issue(tmp_path, request, runner=github.run)
+
+
+def test_title_rename_after_approval_revokes_authority_without_last_edited_at(
+    tmp_path: Path,
+) -> None:
+    current = issue(41, title="Original title")
+    timeline = [labeled(9, "alt-glitch")]
+    github = GitHub([current], {41: timeline})
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    assert request is not None
+
+    current["title"] = "Renamed after approval"
+    timeline.append(renamed(10, "Original title", "Renamed after approval"))
+
+    with pytest.raises(intake.IssueAuthorizationChanged, match="approval|revision"):
+        intake.revalidate_approved_issue(tmp_path, request, runner=github.run)
+
+
+def test_latest_numeric_rename_event_must_match_snapshot_before_reapproval(
+    tmp_path: Path,
+) -> None:
+    current = issue(41, title="Current title")
+    timeline = [
+        renamed(9, "Original title", "Stale title"),
+        renamed(10, "Stale title", "Current title"),
+        labeled(11, "alt-glitch", created="2026-09-06T04:00:00Z"),
+    ]
+    github = GitHub([current], {41: timeline})
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    assert request is not None
+
+    timeline[-2] = renamed(10, "Stale title", "Different title")
+    with pytest.raises(intake.IssueIntakeError, match="rename timeline"):
+        intake.select_approved_issue(tmp_path, now=100, runner=github.run)
 
 
 def test_api_failure_is_not_an_empty_queue(tmp_path: Path) -> None:
@@ -293,6 +374,25 @@ def test_delivery_closes_only_after_exact_receipt_and_is_idempotent(
     assert request is not None
     candidate = "a" * 40
     pr_url = "https://github.com/alt-glitch/hermes-agent/pull/88"
+    body = intake._delivery_body(request, candidate, pr_url)
+    github.comments[41] = [
+        {
+            "id": 7,
+            "body": body,
+            "url": "https://api.github.com/repos/alt-glitch/hermes-agent/issues/comments/7",
+            "issue_url": "https://api.github.com/repos/alt-glitch/hermes-agent/issues/41",
+            "html_url": "https://github.com/alt-glitch/hermes-agent/issues/41#issuecomment-7",
+            "user": {"login": "drive-by"},
+        },
+        {
+            "id": 8,
+            "body": f"Untrusted prefix\n{intake._delivery_marker(request, candidate)}",
+            "url": "https://api.github.com/repos/alt-glitch/hermes-agent/issues/comments/8",
+            "issue_url": "https://api.github.com/repos/alt-glitch/hermes-agent/issues/41",
+            "html_url": "https://github.com/alt-glitch/hermes-agent/issues/41#issuecomment-8",
+            "user": {"login": "alt-glitch"},
+        },
+    ]
 
     first = intake.finalize_delivered_issue(
         tmp_path,
@@ -313,8 +413,15 @@ def test_delivery_closes_only_after_exact_receipt_and_is_idempotent(
 
     assert first["closed"] is True and first["receipt_reused"] is False
     assert second["closed"] is True and second["receipt_reused"] is True
-    assert len(github.comments[41]) == 1
+    assert len(github.comments[41]) == 3
     assert github.issues[41]["state"] == "CLOSED"
+    assert any("/issues/comments/" in " ".join(call) for call in github.calls)
+    patch_index = next(
+        index
+        for index, call in enumerate(github.calls)
+        if "--method PATCH" in " ".join(call)
+    )
+    assert any("graphql" in call for call in github.calls[patch_index + 1 :])
     state = json.loads((tmp_path / "issue-intake-state.json").read_text())
     assert state["issues"]["41"]["status"] == "delivered"
     assert state["issues"]["41"]["candidate_sha"] == candidate
@@ -373,3 +480,69 @@ def test_auto_closed_linked_issue_gets_receipt_without_second_close(
     assert result["receipt_reused"] is False
     assert len(github.comments[41]) == 1
     assert not any("--method PATCH" in " ".join(call) for call in github.calls)
+
+
+@pytest.mark.parametrize("mutation", ["renamed", "revoked"])
+def test_delivered_changed_issue_is_left_open_and_fresh_approval_is_eligible(
+    tmp_path: Path, mutation: str
+) -> None:
+    current = issue(41, title="Approved title")
+    timeline = [labeled(9, "alt-glitch")]
+    github = GitHub([current], {41: timeline})
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    assert request is not None
+    if mutation == "renamed":
+        current["title"] = "Changed title"
+        timeline.append(renamed(10, "Approved title", "Changed title"))
+    else:
+        timeline.append(labeled(10, "alt-glitch", event="unlabeled"))
+
+    result = intake.finalize_delivered_issue(
+        tmp_path,
+        request,
+        candidate_sha="a" * 40,
+        pr_url="https://github.com/alt-glitch/hermes-agent/pull/88",
+        now=200,
+        runner=github.run,
+    )
+
+    assert result["closed"] is False
+    assert result["closure_withheld_reason"] == "approved_revision_changed_or_revoked"
+    assert current["state"] == "OPEN"
+    assert github.comments.get(41, []) == []
+    assert not any("--method PATCH" in " ".join(call) for call in github.calls)
+
+    timeline.append(labeled(11, "alt-glitch", created="2026-09-06T04:00:00Z"))
+    fresh = intake.select_approved_issue(tmp_path, now=201, runner=github.run)
+    assert fresh is not None
+    assert fresh["approval"]["event_id"] == "11"
+
+
+@pytest.mark.parametrize("failure", ["api", "comment-readback", "issue-readback"])
+def test_delivery_remote_failures_are_not_recorded_as_closure_withheld_success(
+    tmp_path: Path, failure: str
+) -> None:
+    current = issue(41)
+    github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    assert request is not None
+    if failure == "api":
+        github.fail_on = "graphql"
+    elif failure == "comment-readback":
+        github.comment_readback_body = "altered receipt"
+    else:
+        github.patch_ack_only = True
+
+    with pytest.raises(intake.IssueIntakeError):
+        intake.finalize_delivered_issue(
+            tmp_path,
+            request,
+            candidate_sha="a" * 40,
+            pr_url="https://github.com/alt-glitch/hermes-agent/pull/88",
+            runner=github.run,
+        )
+    state_path = tmp_path / "issue-intake-state.json"
+    if state_path.exists():
+        assert json.loads(state_path.read_text())["issues"].get("41", {}).get(
+            "status"
+        ) != "delivered"
