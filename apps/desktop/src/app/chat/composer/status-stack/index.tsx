@@ -25,7 +25,7 @@ import {
   type StatusGroup,
   stopBackgroundProcess
 } from '@/store/composer-status'
-import { $freeTierStatus, freeTierStripPending } from '@/store/free-tier'
+import { $freeTierRoute, $freeTierStatus, freeTierStripPending } from '@/store/free-tier'
 import { refreshSessionGoal } from '@/store/goals'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
 import { $threadScrolledUp } from '@/store/thread-scroll'
@@ -101,10 +101,11 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const scrolledUp = useStore($threadScrolledUp)
   const billing = useStore($billingBlock)
   const freeTierStatus = useStore($freeTierStatus)
+  const freeTierRoute = useStore($freeTierRoute)
   // One claimed owner across every mounted composer, so a split view shows the
   // notice once — and a non-owning stack adds no empty row to its card.
   const ownsFreeTierNotice = useFreeTierNoticeOwner()
-  const freeTierNotice = ownsFreeTierNotice && freeTierStripPending(freeTierStatus)
+  const freeTierNotice = ownsFreeTierNotice && freeTierStripPending(freeTierStatus, freeTierRoute)
 
   const groups = useMemo(() => groupStatusItems(items), [items])
 
