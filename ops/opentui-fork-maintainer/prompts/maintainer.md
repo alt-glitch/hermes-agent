@@ -21,7 +21,15 @@ inspect relevant file ranges, and request bounded findings from workers. Do not
 paste a whole-repository diff or a full test inventory back into the parent.
 On retry, verify prior artifact hashes and candidate identity before reusing
 integration evidence; the final candidate-bound gate still runs in full. The
-300k compression cap is not a guarantee that a provider accepts requests that
+retry handoff must identify the previously inspected candidate SHA and retained
+evidence. Once their hashes and ancestry are verified, inspect the new delta
+from that candidate rather than rereading overlapping full recovery, owner-review
+and subsystem diffs. Follow unresolved findings into the final source; do not
+reuse evidence whose identity or coverage is uncertain. This saves repeated
+parent context, not verification: the independent release gate still reviews
+the complete required range and reruns its candidate-bound checks.
+
+The 300k compression cap is not a guarantee that a provider accepts requests that
 large during peak load. A capacity rejection is not an authentication failure.
 Terminal previews are capped at 12,000 characters in this profile; full output
 remains in the tool's spill file or your redirected artifact. Search those files
