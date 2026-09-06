@@ -3853,7 +3853,10 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     pending = _GatedDispatch(
         threading.Event(), threading.Event(), _get_hermes_home().resolve(), run_token)
     if not try_register_running_job(job_id, run_claim_token=run_token, gated_dispatch=pending):
-        logger.info("Job '%s' already running — skipping", job_label)
+        reason = "Scheduled occurrence deferred because an in-process owner is already running."
+        execution = create_execution(job_id, source="builtin")
+        skip_execution(execution["id"], reason=reason)
+        logger.info("Job '%s': %s", job_label, reason)
         advance_next_run(job_id)
         return None
     # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).

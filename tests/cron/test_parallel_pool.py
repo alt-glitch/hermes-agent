@@ -80,6 +80,12 @@ class TestRunningJobGuard:
         n = sched.tick(verbose=False)
         assert n == 0  # skipped, not dispatched
         assert dispatched == []
+        from cron.executions import list_executions
+        skipped = list_executions(job_id="guard-job")
+        assert len(skipped) == 1
+        assert skipped[0]["status"] == "skipped"
+        assert skipped[0]["started_at"] is None
+        assert "in-process owner" in skipped[0]["error"]
 
         sched._running_job_ids.discard("guard-job")
         sched._shutdown_parallel_pool()
