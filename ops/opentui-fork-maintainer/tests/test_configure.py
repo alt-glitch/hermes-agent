@@ -463,6 +463,7 @@ def test_apply_uses_supported_cron_api_after_deploy(
     assert [call["action"] for call in calls] == ["pause", "update", "resume"]
     assert calls[1] == configure.cron_update(runtime, hermes_home)
     assert (runtime / "prompts/maintainer.md").read_text() == "policy\n"
+    assert (runtime / "README.md").read_text() == "operational owners\n"
     assert (runtime / "scripts/opentui_fork_sync.py").is_file()
     assert (hermes_home / "scripts/opentui_fork_sync.py").is_file()
     assert (runtime / "scripts/sync_probe.py").is_file()

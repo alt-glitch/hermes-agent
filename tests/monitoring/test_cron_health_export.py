@@ -57,7 +57,8 @@ def test_error_classification_avoids_auth_substring_false_positives(message):
 
 
 
-def test_terminal_execution_emission_flushes_and_failures_are_fail_open(monkeypatch):
+@pytest.mark.parametrize("status", ["completed", "failed", "skipped", "unknown"])
+def test_terminal_execution_emission_flushes_and_failures_are_fail_open(monkeypatch, status):
     from agent.monitoring import cron_health, emitter
 
     calls = []
@@ -73,10 +74,10 @@ def test_terminal_execution_emission_flushes_and_failures_are_fail_open(monkeypa
     monkeypatch.setattr(emitter, "get_emitter", lambda: FakeEmitter())
 
     cron_health.emit_execution_state(
-        {"job_id": "private", "source": "builtin", "status": "completed"}
+        {"job_id": "private", "source": "builtin", "status": status}
     )
 
-    assert calls == [("emit", "completed"), ("flush", 1.0)]
+    assert calls == [("emit", status), ("flush", 1.0)]
 
 
 
