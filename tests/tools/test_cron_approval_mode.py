@@ -6,8 +6,15 @@ import tools.approval as approval_module
 from tools import approval_context
 from tools import approval_context
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
-from tools.approval import check_all_command_guards, check_dangerous_command, detect_dangerous_command
+from tools.approval import (
+    check_all_command_guards,
+    check_dangerous_command,
+    check_execute_code_guard,
+    detect_dangerous_command,
+    request_tool_approval,
+)
 from tools.approval_context import _get_cron_approval_mode
+from tools.file_tools_write_guards import _check_approval_required_write
 
 
 @pytest.fixture(autouse=True)
@@ -477,3 +484,48 @@ class TestCronWithGatewayOrigin:
         finally:
             clear_session_vars(tokens)
 
+    @pytest.mark.parametrize(("cron_mode", "approved"), [("deny", False), ("approve", True)])
+    def test_inherited_ask_marker_keeps_every_cron_gate_unattended(
+        self, monkeypatch, cron_mode, approved
+    ):
+        """A gateway's process-wide ask marker is not a human approval channel for cron."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(
+            approval_context, "_get_cron_approval_mode", lambda: cron_mode
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        monkeypatch.setattr(
+            "agent.file_safety.is_write_approval_required", lambda _path: True
+        )
+
+        tokens = set_session_vars(
+            platform="telegram", chat_id="issue-41", cron_session="1"
+        )
+        try:
+            decisions = [
+                check_all_command_guards("rm -rf /tmp/issue-41", "local"),
+                check_execute_code_guard("print('issue-41')", "local"),
+                request_tool_approval(
+                    "terminal", "issue-41 approval", rule_key="issue-41"
+                ),
+            ]
+            write_result = _check_approval_required_write(
+                ["/tmp/issue-41/.ssh/config"], task_id="issue-41"
+            )
+            hardline = check_all_command_guards("rm -rf /", "local")
+        finally:
+            clear_session_vars(tokens)
+
+        assert [result["approved"] for result in decisions] == [approved] * 3
+        assert all(result.get("status") != "pending_approval" for result in decisions)
+        assert (write_result is None) is approved
+        assert hardline["approved"] is False

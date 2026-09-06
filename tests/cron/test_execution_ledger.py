@@ -60,6 +60,39 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert persisted == [completed]
 
 
+def test_legacy_ledger_migrates_before_recording_skipped_attempt(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+                 process_id TEXT NOT NULL, pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 handoff_pending INTEGER NOT NULL DEFAULT 0,
+                 handoff_started_at REAL, claimed_at TEXT NOT NULL,
+                 started_at TEXT, finished_at TEXT, error TEXT
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at)
+               VALUES ('legacy', 'old-job', 'builtin', 'old-process', 1,
+                       'completed', '2026-09-06T00:00:00+00:00')"""
+        )
+
+    claimed = executions.create_execution("overlap", source="builtin")
+    skipped = executions.skip_execution(
+        claimed["id"], reason="Scheduled occurrence deferred: active owner"
+    )
+
+    assert executions.get_execution("legacy")["status"] == "completed"
+    assert skipped["status"] == "skipped"
+    assert skipped["error"] == "Scheduled occurrence deferred: active owner"
+
+
 def test_execution_can_be_loaded_by_exact_attempt_id(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     first = executions.create_execution("same-job", source="builtin")

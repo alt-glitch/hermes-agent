@@ -2637,11 +2637,60 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _fire_owner_metadata() -> Dict[str, Any]:
+    """Process identity used only to prove a local claim owner's continued liveness."""
+    try:
+        import socket
+        host = socket.gethostname()
+    except Exception:
+        host = "unknown"
+    try:
+        from gateway.status import get_process_start_time
+        started_at = get_process_start_time(os.getpid())
+    except Exception:
+        started_at = None
+    return {
+        "owner_host": host,
+        "owner_pid": os.getpid(),
+        "owner_started_at": started_at,
+    }
+
+
+def _fire_owner_process_liveness(claim: Any) -> Optional[bool]:
+    """True/False only with reusable-PID-safe evidence for a claim on this host."""
+    if not isinstance(claim, dict):
+        return None
+    try:
+        import socket
+        if claim.get("owner_host") != socket.gethostname():
+            return None
+        pid = int(claim["owner_pid"])
+        started_at = int(claim["owner_started_at"])
+        from gateway.status import _pid_exists, get_process_start_time
+        if not _pid_exists(pid):
+            return False
+        current_started_at = get_process_start_time(pid)
+    except (KeyError, TypeError, ValueError):
+        return None
+    except Exception:
+        return None
+    return current_started_at is not None and int(current_started_at) == started_at
+
+
+@dataclass(frozen=True)
+class FireClaimOutcome:
+    """Atomic claim result used when a scheduler needs a truthful rejection reason."""
+    claimed_job: Optional[Dict[str, Any]] = None
+    reason: Optional[str] = None
+    existing_owner: Optional[str] = None
+
+
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = 300, force: bool = False, return_job: bool = False,
     expected_run_claim_token: Optional[str] = None,
     respect_local_running: bool = False,
-) -> Union[bool, Dict[str, Any]]:
+    return_outcome: bool = False,
+) -> Union[bool, Dict[str, Any], FireClaimOutcome]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
     fence + file lock: reject missing/terminal/paused jobs unless ``force`` (explicit manual
@@ -2653,32 +2702,56 @@ def claim_job_for_fire(
     ``expected_run_claim_token`` to adopt its own one-shot dispatch; external callers
     cannot adopt a fresh run claim without that nonce. Manual callers set ``respect_local_running``
     so an expired lease cannot displace a worker still known to this process."""
+    def reject(reason: str, claim: Any = None):
+        if not return_outcome:
+            return False
+        owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
+        return FireClaimOutcome(reason=reason, existing_owner=owner or None)
+
     def apply(jobs, _i, job):
         if respect_local_running and _job_running_in_this_process(job_id):
-            return False
+            return reject("local_owner_active")
         if _reserved_recurring_limit_reached(job):
-            return False
+            return reject("attempt_limit_reached")
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
-            return False
+            return reject("terminal")
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``
         # (Trigger-now on a paused job) bypasses the gate and atomically resumes the job below.
         if not force and not is_job_runnable(job):
-            return False
+            return reject("paused")
         now = _hermes_now()
-        if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
-            return False  # someone holds a fresh claim
+        fire_claim = job.get("fire_claim")
+        if isinstance(fire_claim, dict):
+            owner_liveness = _fire_owner_process_liveness(fire_claim)
+            heartbeat_at = fire_claim.get("heartbeat_at")
+            heartbeat_live = bool(heartbeat_at) and _claim_is_live(
+                {"at": heartbeat_at}, now, claim_ttl_seconds
+            )
+            if heartbeat_live and owner_liveness is not False:
+                # A recent heartbeat is written only by the run loop. Local process identity
+                # can disprove a stale reusable PID immediately; a remote owner remains valid
+                # only for the normal finite lease.
+                return reject("active_fire_owner", fire_claim)
+            if owner_liveness is not False and _claim_is_live(
+                fire_claim, now, claim_ttl_seconds
+            ):
+                return reject("fire_claim_held", fire_claim)
         run_claim = job.get("run_claim")
         if job.get("schedule", {}).get("kind") == "once":
             if expected_run_claim_token is not None:
                 if not isinstance(run_claim, dict) or run_claim.get("token") != expected_run_claim_token:
-                    return False
+                    return reject("run_claim_mismatch", run_claim)
             elif _claim_is_live(run_claim, now, _oneshot_run_claim_ttl_seconds(job)):
-                return False
+                return reject("run_claim_held", run_claim)
         if force:
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
-        job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        job["fire_claim"] = {
+            "at": now.isoformat(),
+            "by": f"{_machine_id()}:{uuid.uuid4().hex}",
+            **_fire_owner_metadata(),
+        }
         if job.get("schedule", {}).get("kind") == "once":
             run_claim = job.get("run_claim")
             # Adoption keeps the validated dispatch identity even after a long queue wait.
@@ -2695,9 +2768,16 @@ def claim_job_for_fire(
             if nxt:
                 job["next_run_at"] = nxt
         save_jobs(jobs)
-        return copy.deepcopy(job) if return_job else True
+        claimed_job = copy.deepcopy(job)
+        if return_outcome:
+            return FireClaimOutcome(claimed_job=claimed_job)
+        return claimed_job if return_job else True
 
-    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return reject("fire_fence_unavailable")
+        result = _with_job(job_id, apply, _MISSING)
+    return reject("missing") if result is _MISSING else result
 
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
@@ -2709,6 +2789,11 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
             return False
         now = _hermes_now().isoformat()
         claim["at"] = now
+        claim["heartbeat_at"] = now
+        # A restart-safe worker inherits the exact owner token from its launcher.
+        # Move only the liveness fingerprint to the process that is now proving
+        # ownership, so a launcher restart cannot make a live long run look dead.
+        claim.update(_fire_owner_metadata())
         run_claim = job.get("run_claim")
         if (claim.get("token") and isinstance(run_claim, dict)
                 and run_claim.get("token") == claim["token"]):

@@ -59,6 +59,51 @@ def test_claim_paused_job_returns_false(temp_home):
     assert claim_job_for_fire(job["id"]) is False
 
 
+def test_diagnostic_claim_outcomes_do_not_conflate_rejections(temp_home):
+    from cron import jobs
+
+    missing = jobs.claim_job_for_fire("missing", return_outcome=True)
+    paused_job = jobs.create_job(prompt="x", schedule="every 5m", name="paused")
+    jobs.pause_job(paused_job["id"])
+    paused = jobs.claim_job_for_fire(paused_job["id"], return_outcome=True)
+    held_job = jobs.create_job(prompt="x", schedule="every 5m", name="held")
+    assert jobs.claim_job_for_fire(held_job["id"])
+    held = jobs.claim_job_for_fire(held_job["id"], return_outcome=True)
+
+    assert (missing.reason, paused.reason, held.reason) == (
+        "missing", "paused", "fire_claim_held"
+    )
+
+
+def test_heartbeat_moves_liveness_identity_without_changing_owner_token(
+    temp_home, monkeypatch
+):
+    from cron import jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="handoff")
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    owner = claimed["fire_claim"]["by"]
+    monkeypatch.setattr(
+        jobs,
+        "_fire_owner_metadata",
+        lambda: {
+            "owner_host": "worker-host",
+            "owner_pid": 4242,
+            "owner_started_at": 9876,
+        },
+    )
+
+    assert jobs.heartbeat_fire_claim(job["id"], expected_owner=owner)
+
+    heartbeat = jobs.get_job(job["id"])["fire_claim"]
+    assert heartbeat["by"] == owner
+    assert (
+        heartbeat["owner_host"],
+        heartbeat["owner_pid"],
+        heartbeat["owner_started_at"],
+    ) == ("worker-host", 4242, 9876)
+
+
 def test_forced_claim_atomically_resumes_paused_job(temp_home):
     """Explicit manual fire may resume a paused job without exposing a due
     intermediate state to the ticker."""

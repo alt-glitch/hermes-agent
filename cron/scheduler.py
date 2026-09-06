@@ -480,7 +480,7 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 
 
 from cron.jobs import (
-    CronStoreLockTimeout,
+    FireClaimOutcome,
     _ensure_cron_dir, advance_next_run, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, cron_store_transaction, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim,
     load_jobs, mark_job_run, save_jobs,
@@ -488,7 +488,8 @@ from cron.jobs import (
     save_job_output, use_cron_store, resolve_cron_inactivity_timeout_seconds)
 from cron.executions import (
     _TERMINAL_STATES, create_execution, finish_execution, get_execution,
-    mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions)
+    mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions,
+    skip_execution)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -3739,22 +3740,55 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     run_claim = job.get("run_claim")
-    kwargs = {"return_job": True}
+    kwargs = {"return_job": True, "return_outcome": True}
     if isinstance(run_claim, dict) and run_claim.get("token"):
         kwargs["expected_run_claim_token"] = run_claim["token"]
     try:
         claimed = claim_job_for_fire(job["id"], **kwargs)
-    except CronStoreLockTimeout as exc:
+    except Exception as exc:
         _finish_execution_best_effort(
             job["execution_id"], success=False,
             error=f"Fire claim failed before dispatch: {exc}")
         raise
-    if not claimed:
+    if isinstance(claimed, FireClaimOutcome):
+        claimed_job = claimed.claimed_job
+        rejection_reason = claimed.reason
+        existing_owner = claimed.existing_owner
+    else:  # compatibility with narrow test doubles and older embedders
+        claimed_job = (
+            dict(claimed) if isinstance(claimed, dict)
+            else dict(job) if claimed is True else None
+        )
+        rejection_reason = None if claimed else "claim_lost"
+        existing_owner = None
+    if claimed_job is None:
+        if rejection_reason == "active_fire_owner":
+            reason = (
+                "Scheduled occurrence deferred because the job is already running under "
+                f"active fire owner {existing_owner}."
+            )
+            skip_execution(job["execution_id"], reason=reason)
+            logger.info("Job '%s': %s", job["id"], reason)
+            return True
+        reasons = {
+            "attempt_limit_reached": "Job exhausted its finite attempt budget before fire claim.",
+            "terminal": "Job became terminal before fire claim.",
+            "paused": "Job was paused or disabled before fire claim.",
+            "fire_claim_held": (
+                "Fire claim is held, but an active owner could not be proven; "
+                "execution was not started."
+            ),
+            "run_claim_mismatch": "One-shot run claim changed before fire claim.",
+            "run_claim_held": "One-shot run claim is held by another occurrence.",
+            "local_owner_active": "Process-local owner appeared after dispatch admission.",
+            "fire_fence_unavailable": "Fire claim fence was unavailable before dispatch.",
+            "missing": "Job disappeared before fire claim.",
+            "claim_lost": "Fire claim lost; execution was not started.",
+        }
         finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+            job["execution_id"], success=False,
+            error=reasons.get(rejection_reason, "Fire claim was rejected for an unknown reason."))
         return True
-    # CAS returns the persisted record; bool fallback only for older test doubles.
-    claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 

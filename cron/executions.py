@@ -25,7 +25,7 @@ from hermes_time import now as _hermes_now
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
-_TERMINAL_STATES = ("completed", "failed", "unknown")
+_TERMINAL_STATES = ("completed", "failed", "skipped", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -89,8 +89,7 @@ def _connect() -> sqlite3.Connection:
     return open_ledger(_current_executions_file())
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    prepare_ledger(conn, db_label="cron/executions.db")
+def _create_executions_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
@@ -100,7 +99,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
+               ('claimed','running','completed','failed','skipped','unknown')),
              handoff_pending INTEGER NOT NULL DEFAULT 0,
              handoff_started_at REAL,
              claimed_at TEXT NOT NULL,
@@ -109,6 +108,41 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              error TEXT
            )"""
     )
+
+
+def _migrate_skipped_execution_status(conn: sqlite3.Connection) -> None:
+    """Expand the original status constraint without losing deployed ledger rows."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'"
+    ).fetchone()
+    if row is None or "'skipped'" in str(row[0] or "").lower():
+        return
+
+    # SQLite cannot ALTER a CHECK constraint. A savepoint keeps the rename/copy/drop
+    # atomic, so an interrupted startup retains either the old table or the new one.
+    conn.execute("SAVEPOINT executions_add_skipped_status")
+    try:
+        conn.execute("ALTER TABLE executions RENAME TO executions_without_skipped")
+        _create_executions_table(conn)
+        columns = (
+            "id, job_id, source, process_id, pid, process_started_at, status, "
+            "handoff_pending, handoff_started_at, claimed_at, started_at, finished_at, error"
+        )
+        conn.execute(
+            f"INSERT INTO executions ({columns}) "
+            f"SELECT {columns} FROM executions_without_skipped"
+        )
+        conn.execute("DROP TABLE executions_without_skipped")
+    except BaseException:
+        conn.execute("ROLLBACK TO executions_add_skipped_status")
+        conn.execute("RELEASE executions_add_skipped_status")
+        raise
+    conn.execute("RELEASE executions_add_skipped_status")
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    prepare_ledger(conn, db_label="cron/executions.db")
+    _create_executions_table(conn)
     from hermes_cli.sqlite_util import add_column_if_missing
 
     add_column_if_missing(
@@ -118,6 +152,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "executions", "handoff_started_at", "handoff_started_at REAL"
     )
+    _migrate_skipped_execution_status(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -176,7 +211,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed','skipped','unknown')
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
@@ -264,14 +299,11 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     return record
 
 
-def finish_execution(
-    execution_id: str, *, success: bool, error: Optional[str] = None,
+def _terminalize_execution(
+    execution_id: str, *, status: str, detail: Optional[str],
     delivery_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
-    status = "completed" if success else "failed"
-    detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions
@@ -287,6 +319,26 @@ def finish_execution(
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     return record
+
+
+def finish_execution(
+    execution_id: str, *, success: bool, error: Optional[str] = None,
+    delivery_outcome: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Write a success/failure result once; terminal attempts cannot be rewritten."""
+    return _terminalize_execution(
+        execution_id,
+        status="completed" if success else "failed",
+        detail=None if success else (str(error) if error else "unknown failure"),
+        delivery_outcome=delivery_outcome,
+    )
+
+
+def skip_execution(execution_id: str, *, reason: str) -> Optional[Dict[str, Any]]:
+    """Record an occurrence that intentionally did not start, with its durable reason."""
+    return _terminalize_execution(
+        execution_id, status="skipped", detail=str(reason) or "execution was skipped"
+    )
 
 
 def recover_interrupted_executions() -> int:
