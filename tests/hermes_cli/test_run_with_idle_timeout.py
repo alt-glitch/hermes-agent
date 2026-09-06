@@ -141,7 +141,7 @@ def test_normal_leader_exit_reaps_background_descendant(tmp_path):
 
         assert result.returncode == 0
     finally:
-        if pid is not None:
+        if pid is not None and not _process_exited(pid):
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -215,7 +215,7 @@ def test_parent_termination_reaps_silent_isolated_tree(
         if parent.poll() is None:
             parent.kill()
             parent.wait(timeout=3)
-        if child_pid is not None:
+        if child_pid is not None and not _process_exited(child_pid):
             try:
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -297,7 +297,7 @@ def test_signal_fence_reaps_tree_started_from_worker_thread(
         if parent.poll() is None:
             parent.kill()
             parent.wait(timeout=3)
-        if child_pid is not None:
+        if child_pid is not None and not _process_exited(child_pid):
             try:
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
