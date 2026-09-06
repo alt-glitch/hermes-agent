@@ -2,7 +2,8 @@
 """Provision the maintainer's isolated profile from explicitly selected assets.
 
 Run with the managed Hermes Python and --apply after reviewing the printed plan.
-Only OPENROUTER_API_KEY is copied from the credential source; no conversations,
+Only OPENROUTER_API_KEY for the video gate is copied from the credential source;
+main/compaction use Hermes' shared Nous Portal OAuth resolver. No conversations,
 personal memories, MCP connections, or other credentials are inherited.
 """
 from __future__ import annotations
@@ -121,8 +122,8 @@ def provision(dev_skill: Path, credential_home: Path, apply: bool, refresh_skill
     if missing:
         raise ValueError("Missing skill sources: " + ", ".join(missing))
     plan = {
-        "profile": str(PROFILE), "model": MODEL, "provider": "openrouter",
-        "api_mode": "codex_responses", "compaction_tokens": 300_000,
+        "profile": str(PROFILE), "model": MODEL, "provider": "nous",
+        "api_mode": "chat_completions", "compaction_tokens": 300_000,
         "terminal_preview_chars": 12_000,
         "credential_source": str(credential_home / ".env"),
         "credential_names": ["OPENROUTER_API_KEY"], "skills": list(sources),
@@ -145,15 +146,21 @@ def provision(dev_skill: Path, credential_home: Path, apply: bool, refresh_skill
     config_path = PROFILE / "config.yaml"
     config = yaml.load(config_path) if config_path.exists() else {}
     config = config or {}
-    config["model"] = {"default": MODEL, "provider": "openrouter", "api_mode": "codex_responses"}
+    # Built-in Nous resolves credentials and wire mode together; no stale custom
+    # endpoint or explicit Responses override may survive reprovisioning.
+    config["model"] = {"default": MODEL, "provider": "nous"}
     config.setdefault("agent", {}).update({"reasoning_effort": "medium", "max_turns": 500})
+    config.setdefault("providers", {}).setdefault("nous", {}).setdefault("models", {}).setdefault(MODEL, {})["stale_timeout_seconds"] = 600
+    # Authorization is specific to this isolated maintainer provisioner.
+    config.setdefault("approvals", {})["mode"] = "off"
+    config["timezone"] = "Asia/Kolkata"
     config.setdefault("compression", {}).update({"enabled": True, "threshold_tokens": 300_000})
     config["fallback_model"] = None
     config["mcp_servers"] = {}
     config.setdefault("terminal", {})["home_mode"] = "real"
     config.setdefault("tool_output", {})["max_bytes"] = plan["terminal_preview_chars"]
     config.setdefault("display", {}).update({"tui_engine": "opentui", "tui_compact": True})
-    config.setdefault("auxiliary", {})["compression"] = {"provider": "openrouter", "model": MODEL}
+    config.setdefault("auxiliary", {})["compression"] = {"provider": "nous", "model": MODEL}
     config_text = StringIO()
     yaml.dump(config, config_text)
     _atomic_text(config_path, config_text.getvalue())

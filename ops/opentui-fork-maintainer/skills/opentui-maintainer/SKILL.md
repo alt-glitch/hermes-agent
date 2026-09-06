@@ -38,8 +38,11 @@ inherit personal MCP connections or conversation memory.
 
 ## Execution
 
-The parent uses `openai/gpt-6-astra` through OpenRouter Responses with medium
-reasoning. Do not send temperature/top-p/logprobs. Route settings belong in this
+The parent uses `openai/gpt-6-astra` through Nous Portal with medium
+reasoning. Hermes' shared Portal OAuth resolver owns credentials and wire mode;
+compaction uses Nous too. Preserve maintainer-only YOLO and the 600-second
+model stale allowance. The separate Gemini video gate stays on OpenRouter.
+Do not copy refresh tokens or send temperature/top-p/logprobs. Route settings belong in this
 profile/job, never the default profile. The 300,000-token compression cap is a
 trigger; Hermes may compress earlier at its ratio limit.
 

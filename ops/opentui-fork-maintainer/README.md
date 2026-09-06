@@ -9,12 +9,12 @@ only a candidate whose exact evidence passes the runtime gates.
 
 | Resource | Owner |
 | --- | --- |
-| Parent model | `openai/gpt-6-astra`, OpenRouter Responses, medium reasoning |
+| Parent model | `openai/gpt-6-astra`, Nous Portal (resolver-selected Chat Completions), medium reasoning |
 | Profile | `~/.hermes/profiles/opentui-maintainer` |
-| Credential provisioning | Only `OPENROUTER_API_KEY` from the explicitly selected demo profile |
+| Credential provisioning | Shared Hermes Portal OAuth for Nous; only the video gate's `OPENROUTER_API_KEY` is copied from an explicitly selected source |
 | Compression | 300,000-token cap; effective trigger is the lower of cap and ratio limit |
 | Skills | One compact auto-injected `opentui-maintainer`; selected supporting skills on demand |
-| Scheduling | Profile-local cron, 09:00 and 21:00 local time, dedicated cron-only gateway |
+| Scheduling | One profile-local cron, 03:00/09:00/15:00/21:00 Asia/Kolkata, dedicated cron-only gateway |
 | Runtime/state | `/home/daimon/projects/opentui-fork-maintainer/` |
 | Visual judge | Gemini through OpenRouter, using the isolated profile's credential |
 
@@ -94,8 +94,9 @@ by the scheduler. An interrupted deployment must be reconciled before resuming.
 
 Each wake binds one run token, execution ID, fork base and upstream SHA in
 `run-context.json`. No-op/up-to-date scanner ticks need not invoke a model.
-The absolute eleven-hour lease fits inside the twelve-hour cadence; healthy work
-is not killed at 600 seconds. Worker packets are bounded to four hours and at
+The absolute eleven-hour lease may span a six-hour tick; proven active-owner
+overlap is skipped, not a successful maintenance run. Healthy work is not killed
+at the separate 600-second model stale allowance. Worker packets are bounded to four hours and at
 most two concurrent workers. Background long calls and observe their exit status.
 
 The complete gate installs the committed lockfile, runs focused contracts and
@@ -107,7 +108,7 @@ target compare-and-swap. It reads classic branch protection and active rulesets 
 the exact base, requires every configured status context to be reported, and waits
 for GitHub's clean merge decision (including source-app bindings). Unreadable policy
 or unsupported rules such as required workflows fail closed for maintainer review;
-they are never inferred from display names. A lower score, failed check or 30-minute observation timeout
+they are never inferred from display names. A lower score, failed check or bounded observation timeout
 leaves the PR open and the target unchanged. Inspect the actual findings; fix real
 defects without gaming the score or widening the change into speculative refactors.
 Even on an unprotected branch, `Greptile Review` and CI's final `All required

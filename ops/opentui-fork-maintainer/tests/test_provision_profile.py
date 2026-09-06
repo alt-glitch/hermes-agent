@@ -62,12 +62,58 @@ def test_apply_isolates_credentials_and_installs_policy(environment):
     assert not (profile / "MEMORY.md").exists()
     assert (profile / "SOUL.md").read_text() == (source / "profile-SOUL.md").read_text()
     config = YAML(typ="safe").load(profile / "config.yaml")
-    assert config["model"] == {"default": provisioner.MODEL, "provider": "openrouter", "api_mode": "codex_responses"}
+    assert config["model"] == {"default": provisioner.MODEL, "provider": "nous"}
+    assert config["auxiliary"]["compression"] == {"provider": "nous", "model": provisioner.MODEL}
+    assert config["providers"]["nous"]["models"][provisioner.MODEL]["stale_timeout_seconds"] == 600
+    assert config["approvals"]["mode"] == "off"
+    assert config["timezone"] == "Asia/Kolkata"
+    assert not (profile / "auth.json").exists()
     assert config["compression"]["threshold_tokens"] == 300_000
     assert config["mcp_servers"] == {} and config["fallback_model"] is None
     assert config["terminal"]["home_mode"] == "real"
     assert config["tool_output"]["max_bytes"] == 12_000
     assert any(path.read_text() == "old identity\n" for path in (profile / "setup-backups").rglob("SOUL.md"))
+
+
+@pytest.mark.parametrize("prior_provider", ["nous", "openrouter"])
+def test_reprovisioned_job_resolves_nous_without_copying_oauth(environment, monkeypatch, prior_provider):
+    from cron.scheduler import _load_cron_job_config, _resolve_job_runtime
+    from hermes_cli import runtime_provider
+    from hermes_time import get_timezone, reset_cache
+
+    profile, demo, source, skill = environment
+    (profile / "config.yaml").write_text(
+        f"model:\n  provider: {prior_provider}\n  api_mode: codex_responses\n"
+        "  base_url: https://old.invalid\napprovals:\n  mode: 'off'\n"
+    )
+    (demo / "auth.json").write_text('{"private": "must not copy"}')
+    provisioner.provision(skill, demo, True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.delenv("HERMES_TIMEZONE", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_PROVIDER", raising=False)
+    monkeypatch.delenv("HERMES_NOUS_INFERENCE_BASE_URL", raising=False)
+    # Only the remote credential acquisition is substituted; cron and the
+    # built-in provider/wire resolver execute against the provisioned file.
+    monkeypatch.setattr(runtime_provider, "load_pool", lambda _: None)
+    calls = []
+    def credentials(**kwargs):
+        calls.append(kwargs)
+        return {"api_key": "synthetic-invoke", "base_url": "https://portal.nousresearch.com/api/inference/v1"}
+    monkeypatch.setattr(runtime_provider, "resolve_nous_runtime_credentials", credentials)
+    spec = importlib.util.spec_from_file_location("route_configure", SCRIPT.with_name("configure.py"))
+    assert spec and spec.loader
+    configure = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(configure)
+    job = configure.cron_update(profile / "runtime", profile)
+    jc = _load_cron_job_config(job, "test", "test")
+    runtime, model, provider = _resolve_job_runtime(job, "test", jc)
+    assert provider == runtime["provider"] == "nous"
+    assert runtime["api_mode"] == "chat_completions"
+    assert model == provisioner.MODEL
+    assert calls and not (profile / "auth.json").exists()
+    assert jc.cfg["auxiliary"]["compression"]["provider"] == "nous"
+    reset_cache()
+    assert str(get_timezone()) == "Asia/Kolkata"
 
 
 def test_provisioned_preview_limit_preserves_full_terminal_output(environment):

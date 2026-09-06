@@ -36,9 +36,9 @@ if str(REPO_ROOT) not in sys.path:
 
 JOB_ID = "c57fe4db4d43"
 JOB_NAME = "opentui-fork-sync"
-SCHEDULE = "0 9,21 * * *"
+SCHEDULE = "0 3,9,15,21 * * *"
 MODEL = "openai/gpt-6-astra"
-PROVIDER = "openrouter"
+PROVIDER = "nous"
 REASONING_EFFORT = "medium"
 VIDEO_MODEL = "google/gemini-3.5-flash"
 INACTIVITY_TIMEOUT_SECONDS = 18_000
@@ -55,6 +55,7 @@ MAINTAINER_SKILL_SOURCES = {
     "opentui-maintainer": SOURCE_HOME / "skills/opentui-maintainer",
 }
 RUNTIME_ASSETS = (
+    Path("README.md"),
     Path("prompts/maintainer.md"),
     Path("scripts/opentui_fork_sync.py"),
     Path("scripts/sync_probe.py"),

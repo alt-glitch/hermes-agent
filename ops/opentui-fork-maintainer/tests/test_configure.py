@@ -89,6 +89,7 @@ def _deployment_fixture(tmp_path: Path, monkeypatch):
     (source / "prompts").mkdir(parents=True)
     (source / "scripts").mkdir()
     (source / "prompts/maintainer.md").write_text("new policy\n")
+    (source / "README.md").write_text("current operational owners\n")
     for name in (
         "opentui_fork_sync.py",
         "sync_probe.py",
@@ -301,8 +302,12 @@ def test_cron_update_pins_runtime_and_resource_contract() -> None:
     assert set(update) <= set(signature(cronjob).parameters)
     assert update["action"] == "update"
     assert update["job_id"] == "c57fe4db4d43"
-    assert update["schedule"] == "0 9,21 * * *"
-    assert update["provider"] == configure.PROVIDER
+    from croniter import croniter
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    iterator = croniter(update["schedule"], datetime(2026, 1, 1, tzinfo=ZoneInfo("Asia/Kolkata")))
+    assert [iterator.get_next(datetime).hour for _ in range(4)] == [3, 9, 15, 21]
+    assert update["provider"] == "nous"
     assert update["model"] == configure.MODEL
     assert update["reasoning_effort"] == "medium"
     assert update["inactivity_timeout_seconds"] == 18_000
@@ -386,6 +391,7 @@ def test_apply_uses_supported_cron_api_after_deploy(
     (source / "prompts").mkdir(parents=True)
     (source / "scripts").mkdir()
     (source / "prompts/maintainer.md").write_text("policy\n")
+    (source / "README.md").write_text("operational owners\n")
     (source / "scripts/opentui_fork_sync.py").write_text(
         "#!/usr/bin/env python3\nprint('ok')\n"
     )
@@ -488,6 +494,7 @@ def test_silently_mutated_cron_field_triggers_cron_and_local_rollback(
     (source / "prompts").mkdir(parents=True)
     (source / "scripts").mkdir()
     (source / "prompts/maintainer.md").write_text("new policy\n")
+    (source / "README.md").write_text("current operational owners\n")
     for name in (
         "opentui_fork_sync.py",
         "sync_probe.py",
@@ -645,6 +652,7 @@ def test_cron_failure_rolls_back_local_deployment(tmp_path: Path, monkeypatch) -
     (source / "prompts").mkdir(parents=True)
     (source / "scripts").mkdir()
     (source / "prompts/maintainer.md").write_text("new policy\n")
+    (source / "README.md").write_text("current operational owners\n")
     for name in (
         "opentui_fork_sync.py",
         "sync_probe.py",
