@@ -4,7 +4,6 @@ import pytest
 
 import tools.approval as approval_module
 from tools import approval_context
-from tools import approval_context
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
 from tools.approval import (
     check_all_command_guards,
