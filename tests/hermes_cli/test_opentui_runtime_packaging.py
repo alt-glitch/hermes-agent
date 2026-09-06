@@ -1594,7 +1594,7 @@ class TestMainIntegration:
         assert len(attempts) == 2
 
         monkeypatch.delenv("HERMES_TUI_FORCE_BUILD")
-        assert not launch._update_opentui_package()
+        assert launch._update_opentui_package() is launch._OpenTUIUpdateStatus.FAILED
         assert len(attempts) == 3
 
     def test_lock_refresh_failure_uses_coherent_prior_runtime(
@@ -1652,7 +1652,7 @@ class TestMainIntegration:
 
         monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
-        assert launch._update_opentui_package()
+        assert launch._update_opentui_package() is launch._OpenTUIUpdateStatus.READY
         install_command, install_kwargs = calls[0]
         assert "ci" in install_command
         assert "--include=dev" in install_command
@@ -1695,7 +1695,7 @@ class TestMainIntegration:
             launch, "_completed_opentui_refresh", reject_completed
         )
 
-        assert not launch._update_opentui_package()
+        assert launch._update_opentui_package() is launch._OpenTUIUpdateStatus.FAILED
         assert (app / "dist" / "main.js").read_text() == "old bundle"
         assert (app / "node_modules" / "old-runtime.txt").read_text() == (
             "old dependencies"
@@ -1727,7 +1727,7 @@ class TestMainIntegration:
 
         monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
-        assert launch._update_opentui_package()
+        assert launch._update_opentui_package() is launch._OpenTUIUpdateStatus.READY
         assert len(calls) == 1
         assert "run" in calls[0]
         assert "ci" not in calls[0]
@@ -1741,9 +1741,84 @@ class TestMainIntegration:
             lambda: calls.append("workspaces") or [],
         )
         monkeypatch.setattr(
-            launch, "_update_opentui_package", lambda: calls.append("opentui") or True
+            launch,
+            "_update_opentui_package",
+            lambda: calls.append("opentui") or launch._OpenTUIUpdateStatus.READY,
         )
 
         assert update_cmd_deps._update_node_dependencies() == []
 
         assert calls == ["workspaces", "opentui"]
+
+    @pytest.mark.parametrize("missing_prerequisite", ["node", "npm"])
+    def test_update_boundary_treats_missing_optional_prerequisite_as_skip(
+        self, tmp_path, monkeypatch, missing_prerequisite
+    ):
+        app = _make_runtime(tmp_path)
+        _change_dependency_lock(app)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(launch, "_is_termux_startup_environment", lambda: False)
+        monkeypatch.setattr(
+            update_cmd_deps,
+            "_update_workspace_node_dependencies",
+            lambda: [],
+        )
+        if missing_prerequisite == "node":
+            monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: None)
+        else:
+            monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: "/node-26")
+            monkeypatch.setattr(
+                launch._opentui_runtime, "npm_command", lambda _node: None
+            )
+
+        assert update_cmd_deps._update_node_dependencies() == []
+        assert (app / "dist" / "main.js").read_text() == "old bundle"
+
+    @pytest.mark.parametrize(
+        ("refresh_ok", "workspace_failures", "expected_failures"),
+        [
+            (True, ["ui-tui, web workspaces"], ["ui-tui, web workspaces"]),
+            (False, [], ["OpenTUI engine"]),
+        ],
+    )
+    def test_update_boundary_reports_refresh_failure_independently(
+        self,
+        tmp_path,
+        monkeypatch,
+        refresh_ok,
+        workspace_failures,
+        expected_failures,
+    ):
+        app = _make_runtime(tmp_path)
+        os.utime(app / "src" / "runtime" / "old.ts", (300, 300))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(launch, "_is_termux_startup_environment", lambda: False)
+        monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: "/node-26")
+        monkeypatch.setattr(
+            launch._opentui_runtime,
+            "npm_command",
+            lambda _node: ["/node-26", "/npm-cli.js"],
+        )
+        monkeypatch.setattr(
+            update_cmd_deps,
+            "_update_workspace_node_dependencies",
+            lambda: list(workspace_failures),
+        )
+
+        def runner(command, **_kwargs):
+            if refresh_ok:
+                _write(Path(command[-1]) / "main.js", "updated source bundle")
+                return _ok(command)
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="registry offline"
+            )
+
+        monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
+
+        assert update_cmd_deps._update_node_dependencies() == expected_failures
+        expected_bundle = "updated source bundle" if refresh_ok else "old bundle"
+        assert (app / "dist" / "main.js").read_text() == expected_bundle

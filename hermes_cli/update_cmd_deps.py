@@ -542,10 +542,13 @@ def _repair_node_deps_on_current_checkout(
 
 def _update_node_dependencies() -> list[str]:
     """Refresh both the standalone OpenTUI engine and upstream Node workspaces."""
-    from hermes_cli.main_tui_launch import _update_opentui_package
+    from hermes_cli.main_tui_launch import (
+        _OpenTUIUpdateStatus,
+        _update_opentui_package,
+    )
 
     failures = _update_workspace_node_dependencies()
-    if not _update_opentui_package():
+    if _update_opentui_package() is _OpenTUIUpdateStatus.FAILED:
         failures.append("OpenTUI engine")
     return failures
 

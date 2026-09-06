@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+from enum import Enum
 
 from hermes_cli import opentui_runtime as _opentui_runtime
 from hermes_cli.config import get_hermes_home
@@ -20,6 +21,14 @@ from typing import Optional
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("hermes_cli.main")
+
+
+class _OpenTUIUpdateStatus(Enum):
+    """Outcome of the optional OpenTUI refresh attempted by ``hermes update``."""
+
+    READY = "ready"
+    SKIPPED = "skipped"
+    FAILED = "failed"
 
 
 def _read_tui_active_session_file(path: Optional[str]) -> Optional[str]:
@@ -405,28 +414,29 @@ def _run_opentui_build_command(*args, **kwargs):
     return _run_with_idle_timeout(*args, **kwargs)
 
 
-def _update_opentui_package() -> bool:
+def _update_opentui_package() -> _OpenTUIUpdateStatus:
     """Refresh the standalone OpenTUI package during ``hermes update``.
 
     Dependency-graph changes run npm ci + build in a sibling staging tree and
     promote node_modules + dist only after both succeed. Source/config-only
     changes use the cheaper transactional dist build. Either failure leaves the
-    previously launchable runtime intact. This is deliberately best-effort so
-    unsupported hosts keep Ink or their prior OpenTUI runtime.
+    previously launchable runtime intact. Unsupported prerequisites are an
+    explicit skip so Ink-only hosts can still update; runtime corruption and
+    attempted-refresh failures remain failures.
     """
     if sys.platform.startswith("win") or _is_termux_startup_environment():
-        return True
+        return _OpenTUIUpdateStatus.SKIPPED
 
     seed_dir = _project_root() / "ui-opentui"
     if not (seed_dir / "package.json").is_file():
-        return True
+        return _OpenTUIUpdateStatus.SKIPPED
     location = _opentui_runtime_location(report_error=False)
     if location is None:
         print(
-            "  ⚠ OpenTUI update skipped: the packaged runtime seed is incomplete; "
+            "  ⚠ OpenTUI update failed: the packaged runtime seed is incomplete; "
             "reinstall Hermes to restore its build inputs."
         )
-        return False
+        return _OpenTUIUpdateStatus.FAILED
     app_dir = location.runtime_dir
 
     node = _node26_bin_or_none()
@@ -435,14 +445,14 @@ def _update_opentui_package() -> bool:
             "  ⚠ OpenTUI update skipped: Node.js >= 26.3.0 is unavailable; "
             "the previous bundle/Ink fallback is unchanged."
         )
-        return False
+        return _OpenTUIUpdateStatus.SKIPPED
     identity = _opentui_node_identity(node, report_error=False)
     if identity is None:
         print(
             "  ⚠ OpenTUI update skipped: the selected Node 26 runtime identity "
             "could not be queried; the previous runtime is unchanged."
         )
-        return False
+        return _OpenTUIUpdateStatus.SKIPPED
 
     packaged_current = _opentui_runtime.packaged_runtime_current(location)
     initial = _opentui_runtime.inspect_runtime(app_dir, identity)
@@ -455,7 +465,7 @@ def _update_opentui_package() -> bool:
         _opentui_runtime.clear_refresh_failure(
             state_dir, _opentui_refresh_failure_key(location, identity)
         )
-        return True
+        return _OpenTUIUpdateStatus.READY
 
     try:
         with _opentui_runtime.refresh_lock(app_dir):
@@ -465,7 +475,7 @@ def _update_opentui_package() -> bool:
                     "  ⚠ OpenTUI update skipped: the selected Node 26 runtime "
                     "identity changed or became unavailable."
                 )
-                return False
+                return _OpenTUIUpdateStatus.SKIPPED
             identity = locked_identity
             _opentui_runtime.recover_interrupted_promotion(app_dir)
             _opentui_runtime.prune_abandoned_staging(app_dir)
@@ -479,7 +489,7 @@ def _update_opentui_package() -> bool:
             failure_key = _opentui_refresh_failure_key(location, identity)
             if packaged_current and not inspection.refresh_required:
                 _opentui_runtime.clear_refresh_failure(state_dir, failure_key)
-                return True
+                return _OpenTUIUpdateStatus.READY
             npm_command = _opentui_runtime.npm_command(node)
             if npm_command is None:
                 if failure_key is not None:
@@ -489,7 +499,7 @@ def _update_opentui_package() -> bool:
                     "Node 26 installation was not found; the previous runtime "
                     "is unchanged."
                 )
-                return False
+                return _OpenTUIUpdateStatus.SKIPPED
 
             print("→ Updating the OpenTUI engine transactionally…")
             env = _opentui_runtime.build_environment(node)
@@ -532,7 +542,7 @@ def _update_opentui_package() -> bool:
                 print("  ⚠ OpenTUI refresh failed; the previous runtime is unchanged.")
                 if preview:
                     print(preview)
-                return False
+                return _OpenTUIUpdateStatus.FAILED
 
             if promotion is None:
                 raise RuntimeError(
@@ -555,7 +565,7 @@ def _update_opentui_package() -> bool:
                     "  ⚠ OpenTUI refresh produced a non-current runtime; "
                     "refusing to launch it."
                 )
-                return False
+                return _OpenTUIUpdateStatus.FAILED
 
             promotion.commit()
             _opentui_runtime.clear_refresh_failure(state_dir, failure_key)
@@ -565,10 +575,10 @@ def _update_opentui_package() -> bool:
                 packaged_current=completed_packaged_current,
             )
             print(success_message)
-            return True
+            return _OpenTUIUpdateStatus.READY
     except Exception as exc:
         print(f"  ⚠ OpenTUI update failed; the previous runtime is unchanged: {exc}")
-        return False
+        return _OpenTUIUpdateStatus.FAILED
 
 
 
