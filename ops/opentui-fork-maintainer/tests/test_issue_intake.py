@@ -73,6 +73,24 @@ def renamed(
     }
 
 
+@pytest.mark.parametrize("healthy", [False, True])
+def test_invalid_issue_does_not_starve_valid_queue_or_look_empty(tmp_path, healthy):
+    poisoned = issue(1, body="x" * (intake.MAX_BODY_CHARS + 1))
+    github = GitHub(
+        [poisoned] + ([issue(2)] if healthy else []),
+        {1: [labeled(1, "alt-glitch")], 2: [labeled(2, "alt-glitch")]},
+    )
+    if healthy:
+        selected = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+        assert selected["issue"] == 2
+    else:
+        with pytest.raises(intake.IssueIntakeError):
+            intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    failures = json.loads((tmp_path / "issue-intake-errors.json").read_text())
+    assert failures["issues"] == [1]
+    assert poisoned["body"] not in json.dumps(failures)
+
+
 class GitHub:
     def __init__(
         self, issues: list[dict[str, object]], timelines: dict[int, list[dict]]

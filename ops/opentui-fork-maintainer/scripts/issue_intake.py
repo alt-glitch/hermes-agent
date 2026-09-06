@@ -662,13 +662,23 @@ def select_approved_issue(
     trusted = _trusted_approvers(state_dir)
     intake_state = _state(state_dir)
     eligible: list[tuple[int, int, dict[str, Any]]] = []
+    failures: list[int] = []
+    first_error: IssueIntakeError | None = None
     for number in numbers:
-        snapshot = _issue_snapshot(number, state_dir, runner)
-        timeline = _timeline(number, state_dir, runner)
-        request = _request(snapshot, timeline, trusted, state_dir, runner)
-        if request is None:
+        try:
+            snapshot = _issue_snapshot(number, state_dir, runner)
+            timeline = _timeline(number, state_dir, runner)
+            request = _request(snapshot, timeline, trusted, state_dir, runner)
+            if request is None:
+                continue
+            validate_issue_request(request)
+        except IssueIntakeError as exc:
+            # Contain one poisoned issue, but retain errors rather than silently
+            # treating a broken queue as empty. Never persist untrusted prose.
+            failures.append(number)
+            if first_error is None:
+                first_error = exc
             continue
-        validate_issue_request(request)
         record = intake_state["issues"].get(str(number))
         if _eligible_by_state(record, request, now):
             prior_selection = (
@@ -678,6 +688,11 @@ def select_approved_issue(
                 else -1
             )
             eligible.append((prior_selection, number, request))
+    _atomic_json(state_dir / "issue-intake-errors.json", {
+        "schema_version": 1, "observed_unix": now, "issues": failures,
+    })
+    if first_error is not None and not eligible:
+        raise first_error
     return min(eligible, key=lambda item: (item[0], item[1]))[2] if eligible else None
 
 
