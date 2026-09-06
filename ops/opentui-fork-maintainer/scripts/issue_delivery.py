@@ -5,6 +5,8 @@ When authorization changes at the close edge, this module therefore reopens
 only a close that can be tied to this invocation's acknowledged mutation and
 to the newly observed close event. Ambiguous ownership is persisted as a
 failure instead of being reported as successful delivery.
+See docs/handoffs/opentui-issue-close-api.md for the live-verified GraphQL
+rationale/intent fields; older schema snapshots omit these fields.
 """
 
 from __future__ import annotations
