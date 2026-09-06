@@ -100,6 +100,7 @@ def _mark_delivered(
     now: int,
     *,
     closure_withheld_reason: str | None = None,
+    compensated_receipt_id: int | None = None,
 ) -> dict[str, Any]:
     state, record = _delivery_record(
         io,
@@ -112,6 +113,8 @@ def _mark_delivered(
     )
     if closure_withheld_reason is not None:
         record["closure_withheld_reason"] = closure_withheld_reason
+    if compensated_receipt_id is not None:
+        record["compensated_receipt_id"] = compensated_receipt_id
     io.write_state(state_dir, state)
     return record
 
@@ -217,6 +220,7 @@ def _withhold_closure(
     *,
     receipt_reused: bool,
     reason: str = "approved_revision_changed_or_revoked",
+    compensated_receipt_id: int | None = None,
 ) -> dict[str, Any]:
     record = _mark_delivered(
         io,
@@ -226,6 +230,7 @@ def _withhold_closure(
         pr_url,
         now,
         closure_withheld_reason=reason,
+        compensated_receipt_id=compensated_receipt_id,
     )
     already_closed = snapshot.get("state") == "CLOSED"
     return {
@@ -486,8 +491,7 @@ def _compensate_owned_close(
             _persist_ambiguous_failure(
                 io, state_dir, request, candidate_sha, pr_url, now
             )
-    _read_delivery_receipt(io, state_dir, request, receipt["id"], body, runner)
-    return _withhold_closure(
+    result = _withhold_closure(
         io,
         state_dir,
         request,
@@ -496,7 +500,10 @@ def _compensate_owned_close(
         now,
         reopened_snapshot,
         receipt_reused=receipt_reused,
+        compensated_receipt_id=receipt["id"],
     )
+    _read_delivery_receipt(io, state_dir, request, receipt["id"], body, runner)
+    return result
 
 
 def _durable_failure_for_request(
@@ -524,7 +531,8 @@ def _preserved_transition_delivery(
         and record.get("status") == "delivered"
         and record.get("candidate_sha") == candidate_sha
         and record.get("pr_url") == pr_url
-        and record.get("closure_withheld_reason") == "later_state_transition"
+        and (record.get("closure_withheld_reason") == "later_state_transition"
+             or type(record.get("compensated_receipt_id")) is int)
     ):
         return {
             "issue": request["issue"],
@@ -564,6 +572,12 @@ def finalize_delivered_issue(
         io, state_dir, request, candidate_sha, pr_url
     )
     if preserved is not None:
+        receipt_id = preserved.get("compensated_receipt_id")
+        if type(receipt_id) is int:
+            _read_delivery_receipt(
+                io, state_dir, request, receipt_id,
+                delivery_body(request, candidate_sha, pr_url), runner,
+            )
         return preserved
 
     body = delivery_body(request, candidate_sha, pr_url)

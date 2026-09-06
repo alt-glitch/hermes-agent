@@ -676,6 +676,27 @@ def test_delivered_changed_issue_is_left_open_and_fresh_approval_is_eligible(
     assert fresh["approval"]["event_id"] == "11"
 
 
+def test_verified_compensation_survives_receipt_failure_and_retry(tmp_path):
+    current = issue(41)
+    github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    original = dict(current)
+    github.before_close = lambda: current.update(body="changed", lastEditedAt="2026-09-06T03:00:00Z")
+    github.after_reopen = lambda: setattr(github, "fail_on", "issues/comments/")
+    kwargs = dict(candidate_sha="a" * 40, pr_url="https://github.com/alt-glitch/hermes-agent/pull/88", runner=github.run)
+    with pytest.raises(intake.IssueIntakeError):
+        intake.finalize_delivered_issue(tmp_path, request, **kwargs)
+    assert current["state"] == "OPEN"
+    current.update(original)
+    # Still require a valid receipt on recovery; do not mutate the issue again.
+    with pytest.raises(intake.IssueIntakeError):
+        intake.finalize_delivered_issue(tmp_path, request, **kwargs)
+    github.fail_on = None
+    result = intake.finalize_delivered_issue(tmp_path, request, **kwargs)
+    assert result["closed"] is False
+    assert sum("mutation CloseIssue" in " ".join(c) for c in github.calls) == 1
+
+
 @pytest.mark.parametrize("mutation", ["edited", "revoked"])
 def test_authorization_change_at_close_edge_reopens_our_close(
     tmp_path: Path, mutation: str
