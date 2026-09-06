@@ -44,6 +44,19 @@ def test_claim_oneshot_cannot_be_double_claimed(temp_home):
     assert claim_job_for_fire(job["id"]) is False
 
 
+def test_unreadable_live_owner_fingerprint_does_not_steal_fresh_claim(temp_home, monkeypatch):
+    from cron import jobs
+    from gateway import status
+
+    job = jobs.create_job(prompt="x", schedule="every 5m")
+    first = jobs.claim_job_for_fire(job["id"], return_job=True)
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: None)
+    refused = jobs.claim_job_for_fire(job["id"], return_outcome=True)
+    assert refused.claimed_job is None
+    assert refused.reason == "fire_claim_held"
+    assert jobs.get_job(job["id"])["fire_claim"]["by"] == first["fire_claim"]["by"]
+
+
 def test_claim_unknown_job_returns_false(temp_home):
     from cron.jobs import claim_job_for_fire
 

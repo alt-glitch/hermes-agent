@@ -2674,7 +2674,9 @@ def _fire_owner_process_liveness(claim: Any) -> Optional[bool]:
         return None
     except Exception:
         return None
-    return current_started_at is not None and int(current_started_at) == started_at
+    if current_started_at is None:
+        return None  # An unreadable fingerprint is not proof that the owner died.
+    return int(current_started_at) == started_at
 
 
 @dataclass(frozen=True)
