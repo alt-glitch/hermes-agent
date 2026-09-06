@@ -37,8 +37,8 @@ if str(REPO_ROOT) not in sys.path:
 JOB_ID = "c57fe4db4d43"
 JOB_NAME = "opentui-fork-sync"
 SCHEDULE = "0 3,9,15,21 * * *"
-MODEL = "openai/gpt-6-astra"
-PROVIDER = "nous"
+MODEL = "gpt-6-astra"
+PROVIDER = "openai-codex"
 REASONING_EFFORT = "medium"
 VIDEO_MODEL = "google/gemini-3.5-flash"
 INACTIVITY_TIMEOUT_SECONDS = 18_000

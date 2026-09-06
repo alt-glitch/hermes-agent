@@ -62,29 +62,32 @@ def test_apply_isolates_credentials_and_installs_policy(environment):
     assert not (profile / "MEMORY.md").exists()
     assert (profile / "SOUL.md").read_text() == (source / "profile-SOUL.md").read_text()
     config = YAML(typ="safe").load(profile / "config.yaml")
-    assert config["model"] == {"default": provisioner.MODEL, "provider": "nous"}
-    assert config["auxiliary"]["compression"] == {"provider": "nous", "model": provisioner.MODEL}
-    assert config["providers"]["nous"]["models"][provisioner.MODEL]["stale_timeout_seconds"] == 600
+    assert config["model"] == {"default": provisioner.MODEL, "provider": provisioner.PROVIDER}
+    assert config["auxiliary"]["compression"] == {"provider": provisioner.PROVIDER, "model": provisioner.MODEL}
+    assert config["providers"][provisioner.PROVIDER]["models"][provisioner.MODEL]["stale_timeout_seconds"] == 600
     assert config["approvals"]["mode"] == "off"
     assert config["timezone"] == "Asia/Kolkata"
     assert not (profile / "auth.json").exists()
     assert config["compression"]["threshold_tokens"] == 300_000
     assert config["mcp_servers"] == {} and config["fallback_model"] is None
+    from hermes_cli.fallback_config import get_fallback_chain
+    assert get_fallback_chain(config) == []
     assert config["terminal"]["home_mode"] == "real"
     assert config["tool_output"]["max_bytes"] == 12_000
     assert any(path.read_text() == "old identity\n" for path in (profile / "setup-backups").rglob("SOUL.md"))
 
 
 @pytest.mark.parametrize("prior_provider", ["nous", "openrouter"])
-def test_reprovisioned_job_resolves_nous_without_copying_oauth(environment, monkeypatch, prior_provider):
+def test_reprovisioned_job_uses_subscription_for_main_and_compression(environment, monkeypatch, prior_provider):
     from cron.scheduler import _load_cron_job_config, _resolve_job_runtime
     from hermes_cli import runtime_provider
     from hermes_time import get_timezone, reset_cache
 
     profile, demo, source, skill = environment
     (profile / "config.yaml").write_text(
-        f"model:\n  provider: {prior_provider}\n  api_mode: codex_responses\n"
-        "  base_url: https://old.invalid\napprovals:\n  mode: 'off'\n"
+        f"model:\n  provider: {prior_provider}\n  api_mode: chat_completions\n"
+        "  openai_runtime: codex_app_server\n  base_url: https://old.invalid\n"
+        "approvals:\n  mode: 'off'\nfallback_providers:\n  - provider: nous\n    model: old\n"
     )
     (demo / "auth.json").write_text('{"private": "must not copy"}')
     provisioner.provision(skill, demo, True)
@@ -98,8 +101,8 @@ def test_reprovisioned_job_resolves_nous_without_copying_oauth(environment, monk
     calls = []
     def credentials(**kwargs):
         calls.append(kwargs)
-        return {"api_key": "synthetic-invoke", "base_url": "https://portal.nousresearch.com/api/inference/v1"}
-    monkeypatch.setattr(runtime_provider, "resolve_nous_runtime_credentials", credentials)
+        return {"api_key": "synthetic-invoke", "base_url": "https://chatgpt.com/backend-api/codex"}
+    monkeypatch.setattr(runtime_provider, "resolve_codex_runtime_credentials", credentials)
     spec = importlib.util.spec_from_file_location("route_configure", SCRIPT.with_name("configure.py"))
     assert spec and spec.loader
     configure = importlib.util.module_from_spec(spec)
@@ -107,11 +110,13 @@ def test_reprovisioned_job_resolves_nous_without_copying_oauth(environment, monk
     job = configure.cron_update(profile / "runtime", profile)
     jc = _load_cron_job_config(job, "test", "test")
     runtime, model, provider = _resolve_job_runtime(job, "test", jc)
-    assert provider == runtime["provider"] == "nous"
-    assert runtime["api_mode"] == "chat_completions"
+    assert provider == runtime["provider"] == "openai-codex"
+    assert runtime["api_mode"] == "codex_responses"
     assert model == provisioner.MODEL
     assert calls and not (profile / "auth.json").exists()
-    assert jc.cfg["auxiliary"]["compression"]["provider"] == "nous"
+    assert jc.cfg["auxiliary"]["compression"] == {"provider": provider, "model": model}
+    from hermes_cli.fallback_config import get_fallback_chain
+    assert get_fallback_chain(jc.cfg) == []
     reset_cache()
     assert str(get_timezone()) == "Asia/Kolkata"
 

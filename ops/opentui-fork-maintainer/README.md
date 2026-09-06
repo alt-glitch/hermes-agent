@@ -9,9 +9,9 @@ only a candidate whose exact evidence passes the runtime gates.
 
 | Resource | Owner |
 | --- | --- |
-| Parent model | `openai/gpt-6-astra`, Nous Portal (resolver-selected Chat Completions), medium reasoning |
+| Parent model | `gpt-6-astra`, `openai-codex` subscription provider (Hermes Responses loop), medium reasoning |
 | Profile | `~/.hermes/profiles/opentui-maintainer` |
-| Credential provisioning | Shared Hermes Portal OAuth for Nous; only the video gate's `OPENROUTER_API_KEY` is copied from an explicitly selected source |
+| Credential provisioning | Hermes' supported Codex login/import and credential resolver; only the video gate's `OPENROUTER_API_KEY` is copied by the provisioner |
 | Compression | 300,000-token cap; effective trigger is the lower of cap and ratio limit |
 | Skills | One compact auto-injected `opentui-maintainer`; selected supporting skills on demand |
 | Scheduling | One profile-local cron, 03:00/09:00/15:00/21:00 Asia/Kolkata, dedicated cron-only gateway |

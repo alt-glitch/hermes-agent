@@ -310,7 +310,7 @@ def test_cron_update_pins_runtime_and_resource_contract() -> None:
     from zoneinfo import ZoneInfo
     iterator = croniter(update["schedule"], datetime(2026, 1, 1, tzinfo=ZoneInfo("Asia/Kolkata")))
     assert [iterator.get_next(datetime).hour for _ in range(4)] == [3, 9, 15, 21]
-    assert update["provider"] == "nous"
+    assert update["provider"] == configure.PROVIDER
     assert update["model"] == configure.MODEL
     assert update["reasoning_effort"] == "medium"
     assert update["inactivity_timeout_seconds"] == 18_000
