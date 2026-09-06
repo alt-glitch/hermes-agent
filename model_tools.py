@@ -701,9 +701,10 @@ def _dispatch_connector_batch(
     """Dispatch a connector/mixed calls[] batch with the per-entry policy pipeline."""
     from tools import tool_search as ts
     scoped = ts.scoped_deferrable_names(current_defs)
+    defer_tools = ts.load_config_readonly().effective_defer_tools
 
     def local_dispatch(name: str, args: Dict[str, Any]):
-        if not ts.is_deferrable_tool_name(name):
+        if not ts.is_deferrable_tool_name(name, defer_tools):
             return False, tool_error(
                 f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
                 "list already, call it directly instead of via tool_call.")
