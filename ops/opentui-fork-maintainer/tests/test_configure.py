@@ -95,6 +95,7 @@ def _deployment_fixture(tmp_path: Path, monkeypatch):
         "sync_probe.py",
         "maintainer_runtime.py",
         "pr_publication.py",
+        "issue_workflow.py",
         "issue_intake.py",
         "issue_delivery.py",
         "worktree.sh",
@@ -400,6 +401,7 @@ def test_apply_uses_supported_cron_api_after_deploy(
     (source / "scripts/sync_probe.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/maintainer_runtime.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/pr_publication.py").write_text("#!/usr/bin/env python3\n")
+    (source / "scripts/issue_workflow.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/issue_intake.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/issue_delivery.py").write_text("#!/usr/bin/env python3\n")
     (source / "scripts/worktree.sh").write_text("#!/usr/bin/env bash\n")
@@ -505,6 +507,7 @@ def test_silently_mutated_cron_field_triggers_cron_and_local_rollback(
         "sync_probe.py",
         "maintainer_runtime.py",
         "pr_publication.py",
+        "issue_workflow.py",
         "issue_intake.py",
         "issue_delivery.py",
         "worktree.sh",
@@ -665,6 +668,7 @@ def test_cron_failure_rolls_back_local_deployment(tmp_path: Path, monkeypatch) -
         "sync_probe.py",
         "maintainer_runtime.py",
         "pr_publication.py",
+        "issue_workflow.py",
         "issue_intake.py",
         "issue_delivery.py",
         "worktree.sh",

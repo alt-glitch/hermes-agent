@@ -14,6 +14,7 @@ import asyncio
 import base64
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -380,13 +381,26 @@ def _request_lock(state_dir: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _issue_workflow() -> Any:
+    """Load the approved-issue lifecycle owner strictly beside this runtime.
+
+    It is loaded through ``importlib`` rather than ``runpy`` so tests that stub
+    the late ``runpy`` issue-intake load do not intercept this module, and so
+    the deployed control plane never imports candidate implementation code.
+    """
+    path = Path(__file__).with_name("issue_workflow.py")
+    spec = importlib.util.spec_from_file_location("_opentui_issue_workflow", path)
+    if not path.is_file() or spec is None or spec.loader is None:
+        raise ControlError("issue workflow owner could not be located beside the runtime")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _validate_request(value: Any) -> dict[str, Any]:
     if isinstance(value, dict) and value.get("mode") == "issue":
         try:
-            validator = runpy.run_path(
-                str(Path(__file__).with_name("issue_intake.py"))
-            )["validate_issue_request"]
-            return validator(value)
+            return _issue_workflow().validate_issue_request(value)
         except (RuntimeError, ValueError, KeyError, OSError) as exc:
             raise ControlError("issue request has an invalid trusted binding") from exc
     if isinstance(value, dict) and value.get("mode") == "repair":
@@ -452,9 +466,9 @@ def intake_issue_request(
             # Explicit and interrupted requests always precede fresh issue work.
             _read_bound_request(pending[0], state_dir, label="pending request")
             return {"status": "pending", "selected": False}
-        api = runpy.run_path(str(Path(__file__).with_name("issue_intake.py")))
+        workflow = _issue_workflow()
         try:
-            value = api["select_approved_issue"](state_dir, now=now)
+            value = workflow.select_approved_issue(state_dir, now=now)
         except (RuntimeError, ValueError, KeyError, OSError) as exc:
             raise ControlError("approved issue intake failed") from exc
         if value is None:
@@ -462,7 +476,7 @@ def intake_issue_request(
         request = _validate_request(value)
         _atomic_json(state_dir / "run-request.json", request)
         try:
-            api["mark_selected"](state_dir, request, now=now)
+            workflow.mark_selected(state_dir, request, now=now)
         except (RuntimeError, ValueError, KeyError, OSError) as exc:
             # The request is already durable and must not be replaced.  Surface
             # the bookkeeping failure so the wrapper wakes recovery rather than
@@ -712,12 +726,7 @@ def _derive_run_binding(
         "captured_base": context["base_sha"],
     }
     if mode == "issue":
-        binding["issue"] = {
-            "repository": claimed_value["repository"],
-            "number": claimed_value["issue"],
-            "revision_sha256": claimed_value["revision_sha256"],
-            "approval_event_id": claimed_value["approval"]["event_id"],
-        }
+        binding["issue"] = _issue_workflow().binding_issue_fields(claimed_value)
     return binding
 
 
@@ -738,62 +747,7 @@ def _valid_run_binding(value: Any) -> bool:
         return False
     if value["mode"] != "issue":
         return set(value) == common
-    issue = value.get("issue")
-    return (
-        set(value) == common | {"issue"}
-        and isinstance(issue, dict)
-        and set(issue)
-        == {"repository", "number", "revision_sha256", "approval_event_id"}
-        and issue.get("repository") == "alt-glitch/hermes-agent"
-        and type(issue.get("number")) is int
-        and issue["number"] > 0
-        and SHA256_RE.fullmatch(str(issue.get("revision_sha256", ""))) is not None
-        and isinstance(issue.get("approval_event_id"), str)
-        and bool(issue["approval_event_id"])
-    )
-
-
-def _reconcile_issue_candidate_prs(
-    current: dict[str, Any],
-    candidate_sha: str,
-    expected_pr: dict[str, Any] | None = None,
-) -> None:
-    if not SHA_RE.fullmatch(candidate_sha):
-        raise ControlError("issue candidate identity is invalid")
-    prs = current.get("existing_prs")
-    if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
-        raise ControlError("approved issue implementing PR evidence is invalid")
-    if expected_pr is None:
-        if len(prs) > 1 or any(pr.get("head_sha") != candidate_sha for pr in prs):
-            raise ControlError(
-                "approved issue has an ambiguous or conflicting implementing PR"
-            )
-        return
-    if (
-        not isinstance(expected_pr, dict)
-        or expected_pr.get("candidate_sha") != candidate_sha
-        or type(expected_pr.get("number")) is not int
-        or expected_pr.get("url")
-        != f"https://github.com/alt-glitch/hermes-agent/pull/{expected_pr.get('number')}"
-        or expected_pr.get("base_branch") != BRANCH
-        or not isinstance(expected_pr.get("head_branch"), str)
-    ):
-        raise ControlError("published issue candidate PR evidence is invalid")
-    if not prs:
-        # The maintainer-created PR deliberately does not use an auto-closing
-        # keyword, so it need not appear in the issue's implementing-PR set.
-        return
-    expected = {
-        "number": expected_pr["number"],
-        "url": expected_pr["url"],
-        "base_branch": expected_pr["base_branch"],
-        "head_branch": expected_pr["head_branch"],
-        "head_sha": candidate_sha,
-    }
-    if len(prs) != 1 or any(prs[0].get(key) != value for key, value in expected.items()):
-        raise ControlError(
-            "approved issue has an ambiguous or conflicting implementing PR"
-        )
+    return _issue_workflow().valid_issue_binding(value, common)
 
 
 def _revalidate_issue_request(
@@ -804,7 +758,12 @@ def _revalidate_issue_request(
     candidate_sha: str,
     expected_pr: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Recheck the exact issue revision and approval under this live run."""
+    """Recheck the exact issue revision and approval under this live run.
+
+    Binding derivation and claimed-request reading are generic request
+    machinery; the issue-specific revalidation and PR reconciliation belong to
+    the issue-workflow owner.
+    """
     binding = _derive_run_binding(state_dir, evidence_root, token)
     if binding["mode"] != "issue":
         return None
@@ -813,20 +772,16 @@ def _revalidate_issue_request(
         evidence_root,
         label="issue request",
     )
+    workflow = _issue_workflow()
     try:
-        api = runpy.run_path(str(Path(__file__).with_name("issue_intake.py")))
-        current = api["revalidate_approved_issue"](state_dir, request)
-    except (RuntimeError, ValueError, KeyError, OSError) as exc:
-        raise ControlError("approved issue changed or could not be revalidated") from exc
-    fixed_fields = set(request) - {"existing_prs"}
-    if (
-        not isinstance(current, dict)
-        or set(current) != set(request)
-        or any(current.get(key) != request.get(key) for key in fixed_fields)
-    ):
-        raise ControlError("approved issue changed during revalidation")
-    _reconcile_issue_candidate_prs(current, candidate_sha, expected_pr)
-    return current
+        return workflow.revalidate(
+            state_dir,
+            request,
+            candidate_sha=candidate_sha,
+            expected_pr=expected_pr,
+        )
+    except workflow.IssueWorkflowError as exc:
+        raise ControlError(str(exc)) from exc
 
 
 def _captured_run_context(state_dir: Path, evidence_root: Path, token: str) -> dict[str, Any]:
@@ -3378,25 +3333,16 @@ def _finalize_delivered_issue(
     consumed = evidence_root / "request.consumed.json"
     request_path = claimed if claimed.exists() else consumed
     request = _read_bound_request(request_path, evidence_root, label="delivered issue")
-    if request.get("mode") != "issue":
-        raise ControlError("issue publication is not bound to an issue request")
-    pr_evidence = journal.get("pr_evidence")
-    if (
-        not isinstance(pr_evidence, dict)
-        or pr_evidence.get("candidate_sha") != journal.get("candidate_sha")
-        or not isinstance(pr_evidence.get("url"), str)
-    ):
-        raise ControlError("issue publication has no candidate pull request evidence")
+    workflow = _issue_workflow()
     try:
-        api = runpy.run_path(str(Path(__file__).with_name("issue_intake.py")))
-        result = api["finalize_delivered_issue"](
+        result = workflow.finalize_delivered(
             state_dir,
             request,
             candidate_sha=journal["candidate_sha"],
-            pr_url=pr_evidence["url"],
+            pr_evidence=journal.get("pr_evidence"),
         )
-    except (RuntimeError, ValueError, KeyError, OSError) as exc:
-        raise ControlError("delivered issue could not be finalized") from exc
+    except workflow.IssueWorkflowError as exc:
+        raise ControlError(str(exc)) from exc
     _atomic_json(evidence_root / "issue-delivery.json", result)
     return result
 
@@ -3691,10 +3637,7 @@ def finalize_failure(
                 ) != claimed_value:
                     raise ControlError("deferred request does not match this failed run")
                 try:
-                    api = runpy.run_path(
-                        str(Path(__file__).with_name("issue_intake.py"))
-                    )
-                    cooldown = api["defer_issue"](
+                    cooldown = _issue_workflow().defer_issue(
                         state_dir,
                         claimed_value,
                         run_id=evidence_root.name,
@@ -3712,10 +3655,7 @@ def finalize_failure(
                     raise ControlError("failed run claim does not match the in-flight request")
                 if claimed_value["mode"] == "issue":
                     try:
-                        api = runpy.run_path(
-                            str(Path(__file__).with_name("issue_intake.py"))
-                        )
-                        cooldown = api["defer_issue"](
+                        cooldown = _issue_workflow().defer_issue(
                             state_dir,
                             claimed_value,
                             run_id=evidence_root.name,

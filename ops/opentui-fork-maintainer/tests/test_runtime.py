@@ -4,6 +4,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -706,7 +707,50 @@ def test_revalidation_preserves_one_exact_candidate_pr(
         "head_branch": "feature/approved-42",
     }
 
-    runtime._reconcile_issue_candidate_prs(current, candidate, expected)
+    runtime._issue_workflow().reconcile_issue_candidate_prs(current, candidate, expected)
+
+
+def _load_runtime_beside(scripts_dir: Path, *siblings: str):
+    """Install the runtime in an isolated scripts dir and load it from there."""
+    scripts_dir.mkdir(parents=True)
+    shutil.copy(SCRIPT, scripts_dir / SCRIPT.name)
+    for name in siblings:
+        shutil.copy(SCRIPT.parent / name, scripts_dir / name)
+    spec = importlib.util.spec_from_file_location(
+        f"maintainer_runtime_{scripts_dir.parent.name}", scripts_dir / SCRIPT.name
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_issue_workflow_owner_loads_strictly_beside_the_installed_runtime(
+    tmp_path: Path,
+) -> None:
+    # A deployed runtime resolves its issue-lifecycle owner by filesystem
+    # adjacency, exercising the real runtime -> issue_workflow -> issue_intake
+    # chain rather than the source tree or any installed package.
+    installed = _load_runtime_beside(
+        tmp_path / "installed" / "scripts",
+        "issue_workflow.py",
+        "issue_intake.py",
+        "issue_delivery.py",
+    )
+    request = issue_request()
+    assert installed._validate_request(request) == request
+    workflow = installed._issue_workflow()
+    conflict = {**request, "existing_prs": [issue_pr("f" * 40, number=77)]}
+    with pytest.raises(workflow.IssueWorkflowError, match="implementing PR"):
+        workflow.reconcile_issue_candidate_prs(conflict, "a" * 40)
+
+    # Without the owner beside it, the runtime refuses instead of falling back
+    # to importing candidate control code from anywhere else on the path.
+    lonely = _load_runtime_beside(tmp_path / "lonely" / "scripts", "issue_intake.py")
+    with pytest.raises(lonely.ControlError, match="located beside the runtime"):
+        lonely._issue_workflow()
+    with pytest.raises(lonely.ControlError):
+        lonely._validate_request(request)
 
 
 def test_issue_failure_enters_cooldown_without_starving_explicit_queue(
