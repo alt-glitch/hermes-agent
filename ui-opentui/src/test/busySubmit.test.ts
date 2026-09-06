@@ -496,6 +496,22 @@ describe('busy submit policy', () => {
     ).toBeUndefined()
   })
 
+  test('pre-admission retry backs off toward the 2s ceiling across attempts', () => {
+    const reloadRejection = new GatewayError({
+      code: 4009,
+      data: { kind: 'mcp_reload_in_progress', retry_after_ms: 250 },
+      message: 'reloading',
+      method: 'prompt.submit',
+      reason: 'rpc-error'
+    })
+    expect(preAdmissionRetryDelay(reloadRejection, 0)).toBe(250)
+    expect(preAdmissionRetryDelay(reloadRejection, 1)).toBe(500)
+    expect(preAdmissionRetryDelay(reloadRejection, 2)).toBe(1000)
+    expect(preAdmissionRetryDelay(reloadRejection, 3)).toBe(2000)
+    // Ceiling holds for arbitrarily long reloads without overflow.
+    expect(preAdmissionRetryDelay(reloadRejection, 50)).toBe(2000)
+  })
+
   test('synchronous cancellation owns a scheduled pre-admission retry', () => {
     vi.useFakeTimers()
     try {

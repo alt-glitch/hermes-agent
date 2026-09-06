@@ -275,8 +275,13 @@ export function deliveryFailureIsUncertain(error: GatewayError): boolean {
 }
 
 /** Return a bounded delay only for a server-proven rejection before prompt
- * admission. Retrying any timeout/transport failure risks duplicating a turn. */
-export function preAdmissionRetryDelay(error: GatewayError): number | undefined {
+ * admission. Retrying any timeout/transport failure risks duplicating a turn.
+ *
+ * `attempt` counts prior reload rejections for this submission: real reloads
+ * can run for minutes (full teardown + rediscovery serialized behind slow or
+ * parked servers), so the delay backs off exponentially from the server's
+ * hint toward a 2s ceiling instead of polling the admission fence at 4Hz. */
+export function preAdmissionRetryDelay(error: GatewayError, attempt = 0): number | undefined {
   if (error.reason !== 'rpc-error' || error.code !== 4009 || error.data === null || typeof error.data !== 'object') {
     return undefined
   }
@@ -284,7 +289,8 @@ export function preAdmissionRetryDelay(error: GatewayError): number | undefined 
   if (data.kind !== 'mcp_reload_in_progress') return undefined
   const requested =
     typeof data.retry_after_ms === 'number' && Number.isFinite(data.retry_after_ms) ? data.retry_after_ms : 250
-  return Math.min(2_000, Math.max(100, Math.round(requested)))
+  const backoff = requested * 2 ** Math.min(Math.max(attempt, 0), 10)
+  return Math.min(2_000, Math.max(100, Math.round(backoff)))
 }
 
 export interface PreAdmissionRetryTimer {
