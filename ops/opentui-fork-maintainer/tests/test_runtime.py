@@ -1171,6 +1171,9 @@ def test_termctrl_uses_dependency_complete_fork_python_and_exact_candidate(
     assert "PYTHONHOME" not in env
     video_call = next(argv for argv, _env in calls if argv[0] == "video")
     assert video_call[video_call.index("--tail-ms") + 1] == str(runtime.VIDEO_TAIL_MS)
+    image_call = next(argv for argv, _env in calls if argv[0] == "save")
+    for export in (image_call, video_call):
+        assert export[export.index("--font-family") + 1] == runtime.TERMCTRL_FONT_FAMILY
 
 
 def test_run_gate_denies_wrong_or_dirty_worktree(

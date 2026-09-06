@@ -113,6 +113,13 @@ defects without gaming the score or widening the change into speculative refacto
 Even on an unprotected branch, `Greptile Review` and CI's final `All required
 checks pass` aggregate must report; a workflow that never starts cannot authorize
 publication.
+
+PNG and MP4 exports use the same explicit `DejaVu Sans Mono` family, installed
+on the maintainer host. Verify it with `fc-match 'DejaVu Sans Mono'` when moving
+the runtime: a platform font-list fallback can make captures much thinner than
+the actual terminal. Keep original recordings and failed judge results. Diagnose
+visual findings against recorded screen states and the exported video before
+changing UI behavior or retrying; a re-export is not a passing publication gate.
 The target update remains the only publication boundary;
 do not bypass it with `gh pr merge` or worker pushes. A startup/help Preview is
 not proof of a different feature interaction. Use the `before-and-after` skill

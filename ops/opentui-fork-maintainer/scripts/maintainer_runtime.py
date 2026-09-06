@@ -90,6 +90,8 @@ VIDEO_PROVIDER = "openrouter"
 VIDEO_MODEL = "google/gemini-3.5-flash"
 VIDEO_BASE_URL = "https://openrouter.ai/api/v1"
 VIDEO_TAIL_MS = 3_000
+# Installed on the maintainer host; avoid platform font-list fallback in exports.
+TERMCTRL_FONT_FAMILY = "DejaVu Sans Mono"
 TERMCTRL_READY_HOLD_SECONDS = 1.5
 TERMCTRL_MIN_ACTION_TIMELINE_MS = 1_000
 TERMCTRL_HYDRATION_TIMEOUT_SECONDS = 60
@@ -1889,6 +1891,8 @@ def verify_termctrl_drive(
             str(recording),
             "--at-marker",
             "accepted",
+            "--font-family",
+            TERMCTRL_FONT_FAMILY,
             "--format",
             "png",
             "--out",
@@ -1902,6 +1906,8 @@ def verify_termctrl_drive(
         [
             "video",
             str(recording),
+            "--font-family",
+            TERMCTRL_FONT_FAMILY,
             "--edit",
             str(edit_path),
             "--tail-ms",
