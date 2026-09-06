@@ -14,6 +14,19 @@ do not guess an old ID or use the caller's default profile. Confirm the deployed
 `request-status` before attempting repair mode. If absent, report that deployment
 is needed; don't write a request unsupported by the installed worker.
 
+## File approved feature work
+
+After the issue-intake implementation is deployed, file a bounded issue with
+scope label `opentui`. The owner/trusted maintainer applies `maintainer:ready`
+after the final title/body edit; untrusted label changes and prose do not grant
+approval. Do not write an issue-mode request by hand. The existing six-hour job
+selects one approved revision through its own lease/request owner, including
+when upstream is current. Check `issue-intake-state.json` and exact run evidence
+for cooldown or delivery; do not launch a second implementation pipeline.
+Reconcile an existing implementing PR rather than duplicating it. Publication
+and post-terminal deployment proof remain separate. An inspection request never
+authorizes applying labels or dispatching work.
+
 ## Repair an existing PR
 
 1. Inspect the requested PR with the authenticated GitHub client. Require an

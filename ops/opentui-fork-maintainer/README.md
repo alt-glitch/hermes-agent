@@ -90,6 +90,32 @@ protocol. Recovery journals are bound to both profile home and job ID. Relative
 entrypoint scripts remain inside that profile's `scripts/` directory, as required
 by the scheduler. An interrupted deployment must be reconciled before resuming.
 
+## Approved issue queue
+
+The same job polls open fork issues carrying both `opentui` and
+`maintainer:ready`. The latest ready-label event must be by `alt-glitch` or a
+locally configured trusted approver, strictly after the current content edit.
+Edit the title/body first, then remove/reapply ready to approve the new revision.
+Comments remain context, not approval or executable instructions. Optional
+`state/issue-trust.json` has exactly `schema_version: 1`,
+`repository: "alt-glitch/hermes-agent"` and `trusted_approvers: ["login"]`.
+Do not derive trust from issue text or commit this local trust file.
+
+Explicit queued requests and interrupted publication recovery take precedence.
+Intake selects one eligible issue by number; `issue-intake-state.json` retains
+revision-specific delivery/cooldown state. Failures back off from six hours up to
+seven days while other eligible issues remain selectable. API failures are not
+empty queues. Feature-only work wakes even with no upstream delta, uses linear
+whole-diff review and leaves the upstream watermark unchanged. Captured open
+implementing PRs must be reconciled; the publisher refuses duplicate candidates.
+
+The parent claims via the existing `claim-request` command, inspects the issue
+and implementing PRs, and retains a reproduction or existing-fix contract proof.
+A label is not permission to bypass gates. Issue state, revision and approval are
+rechecked before publication and again after CI. The runtime alone records
+issue delivery after target CAS; implementation, publication, finalization and
+live deployment remain distinct stages.
+
 ## Verification and publication
 
 Each wake binds one run token, execution ID, fork base and upstream SHA in
