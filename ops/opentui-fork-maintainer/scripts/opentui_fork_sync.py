@@ -882,7 +882,8 @@ def main() -> int:
             (STATE_DIR / name).exists()
             for name in ("run-request.json", "run-request.inflight.json")
         )
-        if payload.get("status") == "up_to_date" and not pending_request:
+        # Approved work cannot wait for fast-moving upstream to become idle.
+        if payload.get("status") in {"up_to_date", "behind"} and not pending_request:
             try:
                 intake = _intake_approved_issue(run_token)
             except Exception as exc:

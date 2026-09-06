@@ -417,10 +417,13 @@ def test_up_to_date_probe_is_a_terminal_no_agent_tick(tmp_path: Path) -> None:
     launch_watchdog.assert_not_called()
 
 
-def test_approved_issue_wakes_parent_when_upstream_is_current(tmp_path: Path) -> None:
+@pytest.mark.parametrize("status,gap", [("up_to_date", 0), ("behind", 150)])
+def test_approved_issue_wakes_parent_regardless_of_upstream_gap(
+    tmp_path: Path, status: str, gap: int
+) -> None:
     summary, ingest, bind_count, watchdog_count = _run_with_payload(
         tmp_path,
-        {"status": "up_to_date", "gap": 0},
+        {"status": status, "gap": gap},
         intake_result={
             "status": "selected",
             "selected": True,
