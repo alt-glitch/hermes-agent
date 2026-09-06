@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -52,7 +53,11 @@ def test_execution_identity_uses_migrated_profile_ledger(tmp_path, monkeypatch):
 
 
 def _run_with_payload(
-    tmp_path: Path, payload: dict
+    tmp_path: Path,
+    payload: dict,
+    *,
+    intake_result: dict | None = None,
+    intake_error: Exception | None = None,
 ) -> tuple[dict, dict, int, int]:
     state = tmp_path / "state"
     payload = {
@@ -73,6 +78,12 @@ def _run_with_payload(
         ),
         patch.object(wrapper, "_bind_run_context") as bind_context,
         patch.object(wrapper, "_launch_watchdog") as launch_watchdog,
+        patch.object(
+            wrapper,
+            "_intake_approved_issue",
+            return_value=intake_result or {"status": "empty", "selected": False},
+            side_effect=intake_error,
+        ),
     ):
         stdout = io.StringIO()
         with redirect_stdout(stdout):
@@ -384,6 +395,11 @@ def test_up_to_date_probe_is_a_terminal_no_agent_tick(tmp_path: Path) -> None:
         ),
         patch.object(wrapper, "_bind_run_context") as bind_context,
         patch.object(wrapper, "_launch_watchdog") as launch_watchdog,
+        patch.object(
+            wrapper,
+            "_intake_approved_issue",
+            return_value={"status": "empty", "selected": False},
+        ),
     ):
         stdout = io.StringIO()
         with redirect_stdout(stdout):
@@ -399,6 +415,101 @@ def test_up_to_date_probe_is_a_terminal_no_agent_tick(tmp_path: Path) -> None:
     assert not (state / "run.lease.json").exists()
     bind_context.assert_not_called()
     launch_watchdog.assert_not_called()
+
+
+def test_approved_issue_wakes_parent_when_upstream_is_current(tmp_path: Path) -> None:
+    summary, ingest, bind_count, watchdog_count = _run_with_payload(
+        tmp_path,
+        {"status": "up_to_date", "gap": 0},
+        intake_result={
+            "status": "selected",
+            "selected": True,
+            "issue": 41,
+            "request_id": "f" * 64,
+        },
+    )
+    assert summary["wakeAgent"] is True
+    assert bind_count == 1 and watchdog_count == 1
+    assert ingest["issue_intake"] == {
+        "status": "selected",
+        "selected": True,
+        "issue": 41,
+        "request_id": "f" * 64,
+    }
+    assert (tmp_path / "state" / "run.lease.json").exists()
+
+
+def test_request_that_wins_issue_intake_race_wakes_parent(tmp_path: Path) -> None:
+    summary, ingest, bind_count, watchdog_count = _run_with_payload(
+        tmp_path,
+        {"status": "up_to_date", "gap": 0},
+        intake_result={"status": "pending", "selected": False},
+    )
+    assert summary["wakeAgent"] is True
+    assert bind_count == 1 and watchdog_count == 1
+    assert ingest["issue_intake"] == {"status": "pending", "selected": False}
+
+
+def test_issue_api_failure_wakes_truthful_recovery_not_empty_queue(tmp_path: Path) -> None:
+    summary, ingest, bind_count, watchdog_count = _run_with_payload(
+        tmp_path,
+        {"status": "up_to_date", "gap": 0},
+        intake_error=RuntimeError("private GitHub diagnostic"),
+    )
+    assert summary["status"] == "issue_intake_error"
+    assert summary["wakeAgent"] is True
+    assert bind_count == 1 and watchdog_count == 1
+    assert ingest["issue_intake"] == {"status": "error", "selected": False}
+    assert "private GitHub diagnostic" not in json.dumps(summary)
+
+
+def test_issue_intake_result_requires_matching_durable_request(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    request = {"mode": "issue", "issue": 41, "revision_sha256": "a" * 64}
+    request_id = hashlib.sha256(
+        json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    output = json.dumps(
+        {
+            "status": "selected",
+            "selected": True,
+            "issue": 41,
+            "request_id": request_id,
+        }
+    )
+    with (
+        patch.object(wrapper, "STATE_DIR", state),
+        patch.object(wrapper, "PROJECT_HOME", tmp_path),
+        patch.object(
+            wrapper.subprocess,
+            "run",
+            return_value=CompletedProcess([], 0, output, ""),
+        ),
+    ):
+        (state / "run-request.json").write_text(json.dumps(request))
+        assert wrapper._intake_approved_issue("token")["request_id"] == request_id
+        (state / "run-request.json").unlink()
+        with pytest.raises(RuntimeError, match="durably queued"):
+            wrapper._intake_approved_issue("token")
+
+    pending_output = json.dumps({"status": "pending", "selected": False})
+    with (
+        patch.object(wrapper, "STATE_DIR", state),
+        patch.object(wrapper, "PROJECT_HOME", tmp_path),
+        patch.object(
+            wrapper.subprocess,
+            "run",
+            return_value=CompletedProcess([], 0, pending_output, ""),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="pending result is not durable"):
+            wrapper._intake_approved_issue("token")
+        (state / "run-request.inflight.json").write_text(json.dumps(request))
+        assert wrapper._intake_approved_issue("token") == {
+            "status": "pending",
+            "selected": False,
+        }
 
 
 @pytest.mark.parametrize("name", ["run-request.json", "run-request.inflight.json"])
@@ -444,6 +555,11 @@ def test_up_to_date_release_failure_is_not_reported_as_success(
         ),
         patch.object(wrapper, "_release_lease", return_value=False),
         patch.object(wrapper, "_launch_watchdog") as launch_watchdog,
+        patch.object(
+            wrapper,
+            "_intake_approved_issue",
+            return_value={"status": "empty", "selected": False},
+        ),
     ):
         with pytest.raises(
             RuntimeError, match="up-to-date lease release lost ownership"

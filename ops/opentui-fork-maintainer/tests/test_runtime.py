@@ -439,6 +439,39 @@ def claim_repair(state, evidence, base, source):
     return value
 
 
+def issue_request(number: int = 41) -> dict[str, object]:
+    identity = {
+        "repository": "alt-glitch/hermes-agent",
+        "issue": number,
+        "issue_url": f"https://github.com/alt-glitch/hermes-agent/issues/{number}",
+        "title": "Add the approved feature",
+        "body": "Implement and verify the requested behavior.",
+        "created_at": "2026-09-06T01:00:00Z",
+        "last_edited_at": None,
+    }
+    revision = runtime._canonical_json_sha256(identity)
+    return {
+        "mode": "issue",
+        **identity,
+        "revision_sha256": revision,
+        "approval": {
+            "actor": "alt-glitch",
+            "event_id": "1234",
+            "created_at": "2026-09-06T02:00:00Z",
+            "revision_sha256": revision,
+        },
+        "existing_prs": [],
+    }
+
+
+def claim_issue(state: Path, evidence: Path, base: str, upstream: str) -> dict[str, object]:
+    claim_backport(state, evidence, base, upstream)
+    value = issue_request()
+    for path in (state / "run-request.inflight.json", evidence / "request.claimed.json"):
+        path.write_text(json.dumps(value), encoding="utf-8")
+    return value
+
+
 def test_explicit_request_submission_is_idempotent_and_preserves_other_work(tmp_path):
     state, evidence = tmp_path / "state", tmp_path / "run"
     value = repair_request()
@@ -451,6 +484,40 @@ def test_explicit_request_submission_is_idempotent_and_preserves_other_work(tmp_
     with pytest.raises(runtime.ControlError, match="another request"):
         runtime.submit_request(state, {**value, "pr": 41})
     assert json.loads((state / "run-request.inflight.json").read_text()) == value
+
+
+def test_issue_intake_queues_through_existing_request_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    value = issue_request()
+    selected: list[int] = []
+    api = {
+        "select_approved_issue": lambda _state, now=None: value,
+        "validate_issue_request": lambda request: request,
+        "mark_selected": lambda _state, request, now=None: selected.append(request["issue"]),
+    }
+    monkeypatch.setattr(runtime.runpy, "run_path", lambda _path: api)
+    result = runtime.intake_issue_request(state, now=100)
+    assert result == {
+        "status": "selected",
+        "selected": True,
+        "issue": 41,
+        "request_id": runtime._canonical_json_sha256(value),
+    }
+    assert json.loads((state / "run-request.json").read_text()) == value
+    assert selected == [41]
+
+    (state / "run-request.json").write_text(json.dumps(repair_request()))
+    monkeypatch.setattr(
+        runtime.runpy,
+        "run_path",
+        lambda _path: pytest.fail("pending explicit work must bypass issue intake"),
+    )
+    assert runtime.intake_issue_request(state) == {
+        "status": "pending",
+        "selected": False,
+    }
 
 
 @pytest.mark.parametrize("change", [
@@ -485,6 +552,92 @@ def test_repair_gate_publishes_linear_source_without_advancing_upstream(tmp_path
     assert marker.read_text() == base + "\n"
     assert json.loads((evidence / "request.consumed.json").read_text()) == value
     assert not worktree.exists()
+
+
+def test_issue_gate_is_linear_revision_bound_and_never_advances_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    value = claim_issue(state, evidence, base, candidate)
+    marker = state / "last_synced_upstream.sha"
+    marker.write_text(base + "\n", encoding="utf-8")
+    packet, _ = make_gate_packet(evidence, worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    revalidations: list[str] = []
+    monkeypatch.setattr(
+        runtime,
+        "_revalidate_issue_request",
+        lambda *_args, **_kwargs: revalidations.append("approved") or value,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_finalize_delivered_issue",
+        lambda *_args, **_kwargs: {"issue": 41, "closed": True},
+    )
+
+    manifest_path = evidence / "gate.json"
+    result = runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    binding = result["run_binding"]
+    assert binding["mode"] == "issue"
+    assert binding["request_sha256"] == runtime._canonical_json_sha256(value)
+    assert binding["issue"] == {
+        "repository": "alt-glitch/hermes-agent",
+        "number": 41,
+        "revision_sha256": value["revision_sha256"],
+        "approval_event_id": "1234",
+    }
+    assert result["review_proof"]["review_mode"] == "linear-candidate"
+    assert revalidations == ["approved", "approved"]
+    assert remote_sha(repo) == candidate
+
+    finalized = runtime.finalize_success(
+        repo,
+        manifest_path,
+        state_dir=state,
+        evidence_dir=evidence,
+        cwd=worktree,
+        token="test-token",
+    )
+    assert finalized["upstream_sha"] is None
+    assert finalized["issue_delivery"] == {"issue": 41, "closed": True}
+    assert marker.read_text(encoding="utf-8") == base + "\n"
+    assert json.loads((evidence / "request.consumed.json").read_text()) == value
+
+
+def test_issue_failure_enters_cooldown_without_starving_explicit_queue(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "issue-run"
+    write_live_lease(state)
+    value = claim_issue(state, evidence, "a" * 40, "b" * 40)
+    outcome = runtime.finalize_failure(
+        state, evidence, stage="gate", reason_code="gate-failed"
+    )
+    repeated = runtime.finalize_failure(
+        state, evidence, stage="gate", reason_code="gate-failed"
+    )
+    assert outcome["request_deferred"] is True
+    assert outcome["request_recovered"] is False
+    assert type(outcome["retry_after_unix"]) is int
+    assert repeated["retry_after_unix"] == outcome["retry_after_unix"]
+    assert json.loads((evidence / "request.deferred.json").read_text()) == value
+    assert not (state / "run-request.json").exists()
+    assert not (state / "run-request.inflight.json").exists()
+
+    repair = repair_request()
+    assert runtime.submit_request(state, repair)["created"] is True
 
 
 def test_agent_entry_cli_returns_stable_machine_readable_handles(tmp_path):
@@ -671,6 +824,22 @@ def test_repair_rejects_an_upstream_merge(tmp_path):
     repo, base, _, _, candidate = make_upstream_merge_repo(tmp_path)
     with pytest.raises(runtime.ControlError, match="repair review requires a linear"):
         runtime._review_scope(repo, base, candidate, expected_mode="repair")
+
+
+def test_issue_rejects_an_upstream_merge_and_reviews_only_whole_linear_diff(tmp_path):
+    repo, base, _, _, merge_candidate = make_upstream_merge_repo(tmp_path)
+    with pytest.raises(runtime.ControlError, match="issue review requires a linear"):
+        runtime._review_scope(repo, base, merge_candidate, expected_mode="issue")
+
+    linear_root = tmp_path / "linear"
+    linear_root.mkdir()
+    linear_repo, _, linear_base, linear_candidate, _ = make_repo(linear_root)
+    scope = runtime._review_scope(
+        linear_repo, linear_base, linear_candidate, expected_mode="issue"
+    )
+    assert scope["mode"] == "linear-candidate"
+    assert scope["ranges"] == [("candidate", linear_base, linear_candidate)]
+    assert scope["upstream_sha"] is None
 
 
 def test_request_claim_is_recoverable_and_one_shot(tmp_path: Path) -> None:

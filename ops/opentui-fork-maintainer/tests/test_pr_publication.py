@@ -151,6 +151,48 @@ def publish(capture):
     return pub.publish_preview(root.parent, root, manifest, node=NODE)
 
 
+def bind_issue(
+    capture,
+    *,
+    revision: str | None = None,
+    existing_prs: list[dict] | None = None,
+):
+    root, manifest, _ = capture
+    request = {
+        "mode": "issue",
+        "repository": pub.REPOSITORY,
+        "issue": 41,
+        "issue_url": f"https://github.com/{pub.REPOSITORY}/issues/41",
+        "title": "Readable approved feature",
+        "body": "Implement the requested feature.",
+        "created_at": "2026-09-06T01:00:00Z",
+        "last_edited_at": None,
+        "revision_sha256": revision or "d" * 64,
+        "approval": {
+            "actor": "alt-glitch",
+            "event_id": "99",
+            "created_at": "2026-09-06T02:00:00Z",
+            "revision_sha256": revision or "d" * 64,
+        },
+        "existing_prs": existing_prs or [],
+    }
+    (root / "request.claimed.json").write_text(json.dumps(request))
+    manifest["run_binding"] = {
+        "mode": "issue",
+        "request_sha256": pub._canonical_sha(request),
+        "last_synced_upstream": "e" * 40,
+        "captured_upstream": "f" * 40,
+        "captured_base": manifest["base_sha"],
+        "issue": {
+            "repository": pub.REPOSITORY,
+            "number": 41,
+            "revision_sha256": request["revision_sha256"],
+            "approval_event_id": "99",
+        },
+    }
+    return request
+
+
 def green_checks():
     return [{
         "__typename": "CheckRun", "name": name,
@@ -339,9 +381,32 @@ def test_review_timeout_keeps_target_untouched(capture, github, monkeypatch):
     clock = iter([0, 1801])
     monkeypatch.setattr(pub.time, "monotonic", lambda: next(clock))
     with pytest.raises(pub.PublicationError, match="still pending"):
-        pub.wait_for_review(root, 42, "a" * 40)
+        pub.wait_for_review(root, 42, "a" * 40, max_wait_seconds=1800)
     assert all(argv[0] == str(pub.GH) for argv in github.calls)
     assert not (root / "pr-review.json").exists()
+    assert json.loads((root / "pr-pending.json").read_text())["status"] == "pending"
+
+
+def test_review_wait_can_outlive_old_thirty_minute_limit(
+    capture, github, monkeypatch
+) -> None:
+    root, _, _ = capture
+    github.pr = review_pr()
+    github.pr["statusCheckRollup"] = []
+    clock = [0.0]
+    monkeypatch.setattr(pub.time, "monotonic", lambda: clock[0])
+
+    def complete_after_old_limit(_seconds: float) -> None:
+        clock[0] = 1_901.0
+        github.pr["statusCheckRollup"] = green_checks()
+
+    monkeypatch.setattr(pub.time, "sleep", complete_after_old_limit)
+    proof = pub.wait_for_review(
+        root, 42, "a" * 40, max_wait_seconds=4_000
+    )
+    assert proof["score"] == "5/5"
+    assert clock[0] > 1_800
+    assert not (root / "pr-pending.json").exists()
 
 
 def test_real_formatter_preview_seals_head_media_and_preserves_only_cas_publisher(
@@ -365,6 +430,155 @@ def test_real_formatter_preview_seals_head_media_and_preserves_only_cas_publishe
     state = capture[0] / "pr-evidence.json"
     assert json.loads(state.read_text()) == proof
     assert state.stat().st_mode & 0o777 == 0o600
+
+
+def test_recovered_issue_reuses_candidate_pr_across_distinct_leases(
+    capture, github
+) -> None:
+    bind_issue(capture)
+    first = publish(capture)
+    first_head = first["head_branch"]
+    capture[1]["lease_token_sha256"] = "9" * 64
+    second = publish(capture)
+
+    assert second["number"] == first["number"]
+    assert second["head_branch"] == first_head
+    assert second["request_identity"] == pub._canonical_sha(
+        capture[1]["run_binding"]["issue"]
+    )
+    assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
+    assert sum(
+        len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
+    ) == 1
+    assert github.pr["body"].startswith("<!-- maintainer-candidate:v1:")
+    assert "Approved issue: #41" in github.pr["body"]
+    assert github.pr["body"].count("https://github.com/user-attachments/assets/") == 1
+
+
+def test_exact_existing_implementing_pr_is_reused_without_candidate_branch(
+    capture, github
+) -> None:
+    existing = {
+        "number": 42,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/42",
+        "base_branch": pub.BASE,
+        "head_branch": "feature/approved-41",
+        "head_sha": "a" * 40,
+        "head_repository": pub.REPOSITORY,
+    }
+    bind_issue(capture, existing_prs=[existing])
+    github.pr = {
+        **review_pr(),
+        "number": 42,
+        "url": existing["url"],
+        "body": "Contributor context.\n\nFixes #41",
+        "headRefName": existing["head_branch"],
+    }
+
+    proof = publish(capture)
+
+    assert proof["number"] == 42
+    assert proof["head_branch"] == existing["head_branch"]
+    assert "Implements approved issue #41" in github.pr["body"]
+    assert "Contributor context." in github.pr["body"]
+    assert github.pr["body"].startswith("<!-- maintainer-candidate:v1:")
+    assert not any(call[:2] == ["git", "push"] for call in github.calls)
+    assert not any(
+        len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("captured_head", "live_head"),
+    [("b" * 40, "b" * 40), ("a" * 40, "b" * 40)],
+)
+def test_existing_implementing_pr_must_still_exactly_match_candidate(
+    capture, github, captured_head, live_head
+) -> None:
+    existing = {
+        "number": 42,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/42",
+        "base_branch": pub.BASE,
+        "head_branch": "feature/approved-41",
+        "head_sha": captured_head,
+        "head_repository": pub.REPOSITORY,
+    }
+    bind_issue(capture, existing_prs=[existing])
+    github.pr = {
+        **review_pr(),
+        "number": 42,
+        "url": existing["url"],
+        "body": "Fixes #41",
+        "headRefName": existing["head_branch"],
+        "headRefOid": live_head,
+    }
+
+    with pytest.raises(pub.PublicationError, match="implementing PR|duplicate PR"):
+        publish(capture)
+    assert not any(call[:2] == ["git", "push"] for call in github.calls)
+    assert not any(
+        len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
+    )
+
+
+def test_candidate_pr_identity_changes_with_request_base_or_candidate(capture) -> None:
+    bind_issue(capture)
+    original = pub._candidate_head(capture[1])[0]
+    changed_request = json.loads(json.dumps(capture[1]))
+    changed_request["run_binding"]["issue"]["revision_sha256"] = "8" * 64
+    changed_base = json.loads(json.dumps(capture[1]))
+    changed_base["base_sha"] = "7" * 40
+    changed_candidate = json.loads(json.dumps(capture[1]))
+    changed_candidate["candidate_sha"] = "6" * 40
+    assert {
+        pub._candidate_head(changed_request)[0],
+        pub._candidate_head(changed_base)[0],
+        pub._candidate_head(changed_candidate)[0],
+    }.isdisjoint({original})
+
+
+def test_issue_metadata_is_bounded_plain_data_and_preserves_preview_semantics(
+    capture, github
+) -> None:
+    request = bind_issue(capture)
+    metadata = {
+        "schema_version": 1,
+        "issue": 41,
+        "revision_sha256": request["revision_sha256"],
+        "title": "Show retry state clearly",
+        "outcome": "Makes publication recovery visible without weakening any gate.",
+        "implementation": ["Reuses the bound candidate PR."],
+        "verification": ["Exercised the pending and eventual-success paths."],
+        "limitations": ["No live deployment was performed."],
+    }
+    (capture[0] / "pr-metadata.json").write_text(json.dumps(metadata))
+    proof = publish(capture)
+    assert "feat(opentui): Show retry state clearly" in next(
+        call[call.index("--title") + 1]
+        for call in github.calls
+        if len(call) > 2 and call[1:3] == ["pr", "create"]
+    )
+    assert "Makes publication recovery visible" in github.pr["body"]
+    assert "Preview (Synthetic startup/help regression proof)" in github.pr["body"]
+    assert proof["issue"]["metadata_sha256"] == digest(capture[0] / "pr-metadata.json")
+
+
+def test_issue_metadata_cannot_inject_evidence_markers_or_secrets(capture, github) -> None:
+    request = bind_issue(capture)
+    metadata = {
+        "schema_version": 1,
+        "issue": 41,
+        "revision_sha256": request["revision_sha256"],
+        "title": "Feature",
+        "outcome": "<!-- before-and-after:start --> sk-private1234567890",
+        "implementation": [],
+        "verification": [],
+        "limitations": [],
+    }
+    (capture[0] / "pr-metadata.json").write_text(json.dumps(metadata))
+    with pytest.raises(pub.PublicationError, match="unsafe text"):
+        publish(capture)
+    assert not any(call[:2] == ["git", "push"] for call in github.calls)
 
 
 @pytest.mark.parametrize("phase", ["push", "create", "edit", "view"])
@@ -453,7 +667,9 @@ def test_unacknowledged_local_media_refuses_publication(capture, github):
 
 def test_replacing_preview_preserves_unrelated_prose_byte_for_byte(capture, github):
     publish(capture)
-    prefix, suffix = "human intro  \n\n", "\n\n## Testing\n  keep trailing spaces  \n"
+    marker = github.pr["body"].splitlines()[0]
+    prefix = marker + "\nhuman intro  \n\n"
+    suffix = "\n\n## Testing\n  keep trailing spaces  \n"
     github.pr["body"] = prefix + pub.START + "\nold\n" + pub.END + suffix
     publish(capture)
     assert github.pr["body"].startswith(prefix)

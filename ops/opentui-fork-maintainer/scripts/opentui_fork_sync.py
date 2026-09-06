@@ -349,6 +349,79 @@ def _uv(env: dict[str, str]) -> str:
     return "uv"
 
 
+def _intake_approved_issue(token: str) -> dict[str, Any]:
+    """Ask the existing request owner to queue one approved issue."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RUNTIME),
+            "intake-issue",
+            "--state",
+            str(STATE_DIR),
+            "--token",
+            token,
+        ],
+        cwd=PROJECT_HOME,
+        capture_output=True,
+        text=True,
+        timeout=5 * 60,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("approved issue intake exited unsuccessfully")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("approved issue intake returned invalid output") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("status") not in {"empty", "pending", "selected"}
+        or type(value.get("selected")) is not bool
+        or value["selected"] != (value["status"] == "selected")
+    ):
+        raise RuntimeError("approved issue intake returned an invalid result")
+    if value["status"] == "selected" and (
+        type(value.get("issue")) is not int
+        or value["issue"] <= 0
+        or not isinstance(value.get("request_id"), str)
+        or len(value["request_id"]) != 64
+    ):
+        raise RuntimeError("approved issue intake omitted its selected identity")
+    if value["status"] == "pending":
+        pending = [
+            STATE_DIR / name
+            for name in ("run-request.json", "run-request.inflight.json")
+            if (STATE_DIR / name).exists()
+        ]
+        if (
+            len(pending) != 1
+            or pending[0].is_symlink()
+            or not pending[0].is_file()
+        ):
+            raise RuntimeError("approved issue intake pending result is not durable")
+    if value["status"] == "selected":
+        request_path = STATE_DIR / "run-request.json"
+        if request_path.is_symlink():
+            raise RuntimeError("approved issue selection queue identity is invalid")
+        try:
+            if request_path.stat().st_size > 100_000:
+                raise RuntimeError("approved issue selection queue is unbounded")
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("approved issue selection is not durably queued") from exc
+        request_id = hashlib.sha256(
+            json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if (
+            not isinstance(request, dict)
+            or request.get("mode") != "issue"
+            or request.get("issue") != value["issue"]
+            or request_id != value["request_id"]
+        ):
+            raise RuntimeError("approved issue selection queue identity is invalid")
+    return value
+
+
 def _read_failure_count() -> int:
     try:
         return int(FAIL_COUNT_FILE.read_text(encoding="utf-8").strip())
@@ -809,6 +882,39 @@ def main() -> int:
             (STATE_DIR / name).exists()
             for name in ("run-request.json", "run-request.inflight.json")
         )
+        if payload.get("status") == "up_to_date" and not pending_request:
+            try:
+                intake = _intake_approved_issue(run_token)
+            except Exception as exc:
+                # The request owner may have durably queued the issue before a
+                # later bookkeeping/output failure. Preserve that request and
+                # wake it; otherwise surface the API failure as a real run.
+                pending_request = any(
+                    (STATE_DIR / name).exists()
+                    for name in ("run-request.json", "run-request.inflight.json")
+                )
+                if pending_request:
+                    intake = {"status": "selected-recovery", "selected": True}
+                else:
+                    payload["status"] = "issue_intake_error"
+                    payload["issue_intake_error_type"] = type(exc).__name__
+                    payload["issue_intake_error_sha256"] = hashlib.sha256(
+                        str(exc).encode()
+                    ).hexdigest()
+                    intake = {"status": "error", "selected": False}
+            else:
+                # ``pending`` means an explicit/interrupted request won the
+                # request lock while intake was starting. It must wake this
+                # owner just like a newly selected issue. Recheck the durable
+                # files as well so a request submitted immediately after an
+                # empty scan is not knowingly turned into a no-agent tick.
+                pending_request = intake["status"] in {"pending", "selected"} or any(
+                    (STATE_DIR / name).exists()
+                    for name in ("run-request.json", "run-request.inflight.json")
+                )
+            # Full issue data stays in the request file; ingest records only a
+            # fixed-shape selection result for operational diagnosis.
+            payload["issue_intake"] = intake
         if payload.get("status") == "up_to_date" and not pending_request:
             _write_text_atomic(INGEST_FILE, json.dumps(payload, indent=2) + "\n")
             if not _release_lease(run_token):

@@ -381,6 +381,14 @@ def _request_lock(state_dir: Path) -> Iterator[None]:
 
 
 def _validate_request(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict) and value.get("mode") == "issue":
+        try:
+            validator = runpy.run_path(
+                str(Path(__file__).with_name("issue_intake.py"))
+            )["validate_issue_request"]
+            return validator(value)
+        except (RuntimeError, ValueError, KeyError, OSError) as exc:
+            raise ControlError("issue request has an invalid trusted binding") from exc
     if isinstance(value, dict) and value.get("mode") == "repair":
         if set(value) != {"mode", "pr", "base_sha", "source_sha", "instruction"}:
             raise ControlError("repair request has an invalid shape")
@@ -426,6 +434,48 @@ def submit_request(state_dir: Path, value: Any) -> dict[str, Any]:
     return {"request_id": _canonical_json_sha256(value), "status": status, "created": created}
 
 
+def intake_issue_request(
+    state_dir: Path, *, now: int | None = None
+) -> dict[str, Any]:
+    """Queue at most one approved issue without overtaking explicit work."""
+    with _request_lock(state_dir):
+        pending = [
+            state_dir / name
+            for name in ("run-request.json", "run-request.inflight.json")
+            if (state_dir / name).exists()
+        ]
+        if len(pending) > 1:
+            raise ControlError(
+                "both queued and in-flight requests exist; inspect before issue intake"
+            )
+        if pending:
+            # Explicit and interrupted requests always precede fresh issue work.
+            _read_bound_request(pending[0], state_dir, label="pending request")
+            return {"status": "pending", "selected": False}
+        api = runpy.run_path(str(Path(__file__).with_name("issue_intake.py")))
+        try:
+            value = api["select_approved_issue"](state_dir, now=now)
+        except (RuntimeError, ValueError, KeyError, OSError) as exc:
+            raise ControlError("approved issue intake failed") from exc
+        if value is None:
+            return {"status": "empty", "selected": False}
+        request = _validate_request(value)
+        _atomic_json(state_dir / "run-request.json", request)
+        try:
+            api["mark_selected"](state_dir, request, now=now)
+        except (RuntimeError, ValueError, KeyError, OSError) as exc:
+            # The request is already durable and must not be replaced.  Surface
+            # the bookkeeping failure so the wrapper wakes recovery rather than
+            # treating the issue queue as empty.
+            raise ControlError("approved issue selection bookkeeping failed") from exc
+        return {
+            "status": "selected",
+            "selected": True,
+            "issue": request["issue"],
+            "request_id": _canonical_json_sha256(request),
+        }
+
+
 def request_status(state_dir: Path, request_id: str) -> dict[str, Any]:
     """Inspect one request without dispatching, recovering or replacing work."""
     if not SHA256_RE.fullmatch(request_id):
@@ -467,7 +517,8 @@ def request_status(state_dir: Path, request_id: str) -> dict[str, Any]:
             if not isinstance(outcome, dict):
                 raise ControlError("run outcome must be an object")
             for key in ("status", "stage", "published", "candidate_sha", "needs_finalization",
-                        "request_retired", "retirement_undecided"):
+                        "request_retired", "request_deferred", "retry_after_unix",
+                        "retirement_undecided"):
                 if key in outcome:
                     entry[key] = outcome[key]
         runs.append(entry)
@@ -653,13 +704,75 @@ def _derive_run_binding(
     context = _captured_run_context(state_dir, evidence_root, token)
     if mode == "repair" and claimed_value["base_sha"] != context["base_sha"]:
         raise ControlError("repair base has moved; a new explicit request is required")
-    return {
+    binding: dict[str, Any] = {
         "mode": mode,
         "request_sha256": request_sha,
         "last_synced_upstream": last_synced,
         "captured_upstream": context["upstream_sha"],
         "captured_base": context["base_sha"],
     }
+    if mode == "issue":
+        binding["issue"] = {
+            "repository": claimed_value["repository"],
+            "number": claimed_value["issue"],
+            "revision_sha256": claimed_value["revision_sha256"],
+            "approval_event_id": claimed_value["approval"]["event_id"],
+        }
+    return binding
+
+
+def _valid_run_binding(value: Any) -> bool:
+    common = {
+        "mode",
+        "request_sha256",
+        "last_synced_upstream",
+        "captured_upstream",
+        "captured_base",
+    }
+    if not isinstance(value, dict) or value.get("mode") not in {
+        "scheduled",
+        "backport",
+        "repair",
+        "issue",
+    }:
+        return False
+    if value["mode"] != "issue":
+        return set(value) == common
+    issue = value.get("issue")
+    return (
+        set(value) == common | {"issue"}
+        and isinstance(issue, dict)
+        and set(issue)
+        == {"repository", "number", "revision_sha256", "approval_event_id"}
+        and issue.get("repository") == "alt-glitch/hermes-agent"
+        and type(issue.get("number")) is int
+        and issue["number"] > 0
+        and SHA256_RE.fullmatch(str(issue.get("revision_sha256", ""))) is not None
+        and isinstance(issue.get("approval_event_id"), str)
+        and bool(issue["approval_event_id"])
+    )
+
+
+def _revalidate_issue_request(
+    state_dir: Path, evidence_root: Path, token: str
+) -> dict[str, Any] | None:
+    """Recheck the exact issue revision and approval under this live run."""
+    binding = _derive_run_binding(state_dir, evidence_root, token)
+    if binding["mode"] != "issue":
+        return None
+    request = _read_bound_request(
+        evidence_root / "request.claimed.json",
+        evidence_root,
+        label="issue request",
+    )
+    try:
+        api = runpy.run_path(str(Path(__file__).with_name("issue_intake.py")))
+        current = api["revalidate_approved_issue"](state_dir, request)
+    except (RuntimeError, ValueError, KeyError, OSError) as exc:
+        raise ControlError("approved issue changed or could not be revalidated") from exc
+    if _canonical_json_sha256(current) != _canonical_json_sha256(request):
+        raise ControlError("approved issue changed during revalidation")
+    return current
 
 
 def _captured_run_context(state_dir: Path, evidence_root: Path, token: str) -> dict[str, Any]:
@@ -1149,18 +1262,7 @@ def validate_gate_manifest(
             "required gate evidence missing: " + ", ".join(sorted(missing))
         )
     binding = value.get("run_binding")
-    if (
-        not isinstance(binding, dict)
-        or set(binding)
-        != {
-            "mode",
-            "request_sha256",
-            "last_synced_upstream",
-            "captured_upstream",
-            "captured_base",
-        }
-        or binding.get("mode") not in {"scheduled", "backport", "repair"}
-    ):
+    if not _valid_run_binding(binding):
         raise ControlError("gate manifest run binding is invalid")
     proof = value.get("review_proof")
     if not isinstance(proof, dict) or review_log is None:
@@ -1333,10 +1435,10 @@ def ship_candidate(
     with _lease_lock(state_dir):
         lease = _lease_value(state_dir)
         _validate_lease_value(lease, token, int(time.time()))
-        if manifest["run_binding"]["mode"] == "repair" and _derive_run_binding(
+        if manifest["run_binding"]["mode"] in {"repair", "issue"} and _derive_run_binding(
             state_dir, manifest_path.parent, token
         ) != manifest["run_binding"]:
-            raise ControlError("repair request changed after verification")
+            raise ControlError("bound request changed after verification")
         # All expensive implementation and acceptance work is complete. Bound
         # the only remaining crash window before touching the remote so a
         # post-push process death can be retried after minutes, not six hours.
@@ -2117,7 +2219,7 @@ def _review_scope(
         raise ControlError(
             "scheduled review candidate must begin with a two-parent upstream merge"
         )
-    if expected_mode in {"backport", "repair"}:
+    if expected_mode in {"backport", "repair", "issue"}:
         raise ControlError(f"manual {expected_mode} review requires a linear candidate")
     if any(len(_commit_parents(repo, commit)) != 1 for commit in commits[1:]):
         raise ControlError("post-merge adaptation history must be linear")
@@ -2839,18 +2941,7 @@ def run_gate(
             "captured_upstream": None,
             "captured_base": None,
         }
-    if (
-        not isinstance(run_binding, dict)
-        or set(run_binding)
-        != {
-            "mode",
-            "request_sha256",
-            "last_synced_upstream",
-            "captured_upstream",
-            "captured_base",
-        }
-        or run_binding.get("mode") not in {"scheduled", "backport", "repair"}
-    ):
+    if not _valid_run_binding(run_binding):
         raise ControlError("gate run binding is invalid")
     node_proof = _validate_node_runtime()
     by_id = {item["id"]: item for item in checks}
@@ -3083,13 +3174,35 @@ def _validate_success_cleanup_worktree(
 
 
 def _publish_pr_evidence(
-    repo: Path, evidence_root: Path, manifest: dict[str, Any], remote: str
+    repo: Path,
+    evidence_root: Path,
+    manifest: dict[str, Any],
+    remote: str,
+    *,
+    state_dir: Path,
+    token: str,
 ) -> dict[str, Any]:
     # Load only the installed sibling control-plane module, never candidate code.
     publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
+    lease = _lease_value(state_dir)
+    _validate_lease_value(lease, token, int(time.time()))
+    try:
+        max_expires = int(lease["max_expires_unix"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ControlError("run lease has no bounded review deadline") from exc
+    # Keep ten minutes for final issue revalidation, target CAS, and durable
+    # finalization. The publisher applies its own CI-aware upper bound too.
+    review_deadline_unix = max_expires - 10 * 60
+    if review_deadline_unix <= int(time.time()):
+        raise ControlError("remaining run lease cannot safely observe PR checks")
     try:
         return publisher["publish_preview"](
-            repo, evidence_root, manifest, node=NODE26, remote=remote
+            repo,
+            evidence_root,
+            manifest,
+            node=NODE26,
+            remote=remote,
+            review_deadline_unix=review_deadline_unix,
         )
     except (RuntimeError, ValueError, KeyError, OSError) as exc:
         raise ControlError(f"PR evidence publication refused: {exc}") from exc
@@ -3151,13 +3264,26 @@ def gate_and_ship(
         repo, manifest_path, base_sha=base_sha, candidate_sha=candidate_sha,
         token=token, branch=branch,
     )
-    if run_binding["mode"] == "repair" and _derive_run_binding(
+    if run_binding["mode"] in {"repair", "issue"} and _derive_run_binding(
         state_dir, evidence_root, token
     ) != run_binding:
-        raise ControlError("repair request changed during verification")
-    proof = _publish_pr_evidence(repo, evidence_root, result, remote)
+        raise ControlError("bound request changed during verification")
+    if run_binding["mode"] == "issue":
+        _revalidate_issue_request(state_dir, evidence_root, token)
+    proof = _publish_pr_evidence(
+        repo,
+        evidence_root,
+        result,
+        remote,
+        state_dir=state_dir,
+        token=token,
+    )
     result["pr_evidence"] = proof
     _atomic_json(manifest_path, result)
+    if run_binding["mode"] == "issue":
+        # CI and review may run for hours. Recheck issue state, labels, exact
+        # content revision, and trusted approval again at the publication edge.
+        _revalidate_issue_request(state_dir, evidence_root, token)
     ship_candidate(
         repo,
         manifest_path,
@@ -3168,6 +3294,41 @@ def gate_and_ship(
         remote=remote,
         branch=branch,
     )
+    return result
+
+
+def _finalize_delivered_issue(
+    state_dir: Path,
+    evidence_root: Path,
+    journal: dict[str, Any],
+) -> dict[str, Any] | None:
+    binding = journal.get("run_binding")
+    if not isinstance(binding, dict) or binding.get("mode") != "issue":
+        return None
+    claimed = evidence_root / "request.claimed.json"
+    consumed = evidence_root / "request.consumed.json"
+    request_path = claimed if claimed.exists() else consumed
+    request = _read_bound_request(request_path, evidence_root, label="delivered issue")
+    if request.get("mode") != "issue":
+        raise ControlError("issue publication is not bound to an issue request")
+    pr_evidence = journal.get("pr_evidence")
+    if (
+        not isinstance(pr_evidence, dict)
+        or pr_evidence.get("candidate_sha") != journal.get("candidate_sha")
+        or not isinstance(pr_evidence.get("url"), str)
+    ):
+        raise ControlError("issue publication has no candidate pull request evidence")
+    try:
+        api = runpy.run_path(str(Path(__file__).with_name("issue_intake.py")))
+        result = api["finalize_delivered_issue"](
+            state_dir,
+            request,
+            candidate_sha=journal["candidate_sha"],
+            pr_url=pr_evidence["url"],
+        )
+    except (RuntimeError, ValueError, KeyError, OSError) as exc:
+        raise ControlError("delivered issue could not be finalized") from exc
+    _atomic_json(evidence_root / "issue-delivery.json", result)
     return result
 
 
@@ -3261,6 +3422,9 @@ def finalize_success(
         _atomic_json(_journal_path(state_dir), journal)
     if journal["phase"] != "finalizing":
         raise ControlError("publication journal is not finalizable")
+    issue_delivery = _finalize_delivered_issue(
+        state_dir, evidence_root, journal
+    )
     resolved_cwd = _validate_success_cleanup_worktree(
         repo,
         state_dir=state_dir,
@@ -3322,6 +3486,8 @@ def finalize_success(
         "manifest_evidence_status": manifest_evidence_status,
         "remote_head_sha": current_remote,
     }
+    if issue_delivery is not None:
+        result["issue_delivery"] = issue_delivery
     if isinstance(upstream_sha, str):
         _atomic_text(state_dir / "last_synced_upstream.sha", upstream_sha + "\n")
     _atomic_json(evidence_root / "success-finalization.json", result)
@@ -3432,12 +3598,15 @@ def finalize_failure(
     claimed = evidence_root / "request.claimed.json"
     inflight = state_dir / "run-request.inflight.json"
     request_recovered = request_retired = retirement_undecided = False
+    request_deferred = False
+    retry_after_unix: int | None = None
     with _request_lock(state_dir):
         if claimed.exists():
             if (evidence_root / "request.consumed.json").exists():
                 raise ControlError("a consumed request cannot be finalized as failed")
             claimed_value = _read_bound_request(claimed, evidence_root, label="claimed request")
             stale = evidence_root / "request.stale.json"
+            deferred = evidence_root / "request.deferred.json"
             queued = state_dir / "run-request.json"
             if not inflight.exists() and queued.exists():
                 if _read_bound_request(queued, state_dir, label="queued request") != claimed_value:
@@ -3447,12 +3616,49 @@ def finalize_failure(
                 if _read_bound_request(stale, evidence_root, label="stale request") != claimed_value:
                     raise ControlError("stale request does not match this failed run")
                 request_retired = True
+            elif not inflight.exists() and deferred.exists():
+                if _read_bound_request(
+                    deferred, evidence_root, label="deferred request"
+                ) != claimed_value:
+                    raise ControlError("deferred request does not match this failed run")
+                try:
+                    api = runpy.run_path(
+                        str(Path(__file__).with_name("issue_intake.py"))
+                    )
+                    cooldown = api["defer_issue"](
+                        state_dir,
+                        claimed_value,
+                        run_id=evidence_root.name,
+                    )
+                    retry_after_unix = cooldown["retry_after_unix"]
+                except (RuntimeError, ValueError, KeyError, OSError) as exc:
+                    raise ControlError(
+                        "deferred issue cooldown could not be verified"
+                    ) from exc
+                request_deferred = True
             else:
                 if not inflight.exists():
                     raise ControlError("failed run claim is no longer in flight")
                 if _read_bound_request(inflight, state_dir, label="in-flight request") != claimed_value:
                     raise ControlError("failed run claim does not match the in-flight request")
-                if claimed_value["mode"] == "repair":
+                if claimed_value["mode"] == "issue":
+                    try:
+                        api = runpy.run_path(
+                            str(Path(__file__).with_name("issue_intake.py"))
+                        )
+                        cooldown = api["defer_issue"](
+                            state_dir,
+                            claimed_value,
+                            run_id=evidence_root.name,
+                        )
+                        retry_after_unix = cooldown["retry_after_unix"]
+                    except (RuntimeError, ValueError, KeyError, OSError) as exc:
+                        raise ControlError(
+                            "failed issue could not enter durable cooldown"
+                        ) from exc
+                    os.replace(inflight, deferred)
+                    request_deferred = True
+                elif claimed_value["mode"] == "repair":
                     try:
                         context_token = _lease_value(state_dir).get("token")
                         if not isinstance(context_token, str):
@@ -3464,7 +3670,9 @@ def finalize_failure(
                         # Without trustworthy context, preserve authorization
                         # unchanged for a new run; never guess that it is stale.
                         retirement_undecided = True
-                if request_retired:
+                if request_deferred:
+                    pass
+                elif request_retired:
                     os.replace(inflight, stale)
                 else:
                     _recover_request_unlocked(state_dir)
@@ -3482,6 +3690,8 @@ def finalize_failure(
             "needs_finalization": False,
             "request_recovered": request_recovered,
             "request_retired": request_retired,
+            "request_deferred": request_deferred,
+            "retry_after_unix": retry_after_unix,
             "retirement_undecided": retirement_undecided,
         },
     )
@@ -3642,6 +3852,9 @@ def _parser() -> argparse.ArgumentParser:
     status = sub.add_parser("request-status")
     status.add_argument("--state", type=Path, required=True)
     status.add_argument("--request-id", required=True)
+    intake = sub.add_parser("intake-issue")
+    intake.add_argument("--state", type=Path, required=True)
+    intake.add_argument("--token", required=True)
     claim = sub.add_parser("claim-request")
     claim.add_argument("--state", type=Path, required=True)
     claim.add_argument("--evidence", type=Path, required=True)
@@ -3707,6 +3920,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "request-status":
         print(json.dumps(request_status(args.state, args.request_id)))
+        return 0
+    if args.command == "intake-issue":
+        with run_lock(args.state):
+            validate_lease(args.state, args.token)
+            result = intake_issue_request(args.state)
+        print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "claim-request":
         with run_lock(args.state):

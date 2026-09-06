@@ -23,6 +23,9 @@ BASE = "sid/opentui"
 START = "<!-- before-and-after:start -->"
 END = "<!-- before-and-after:end -->"
 ATTACHMENT = re.compile(r"https://github\.com/user-attachments/assets/[a-zA-Z0-9-]+")
+SENSITIVE_TEXT = re.compile(
+    r"(?i)(sk-[a-z0-9_-]{12,}|bearer\s+[a-z0-9._-]{12,}|api[_ -]?key\s*[=:])"
+)
 FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state"
 # Immutable GitHub App IDs, verified against this fork's live check suites.
 REQUIRED_CHECK_APPS = {"Greptile Review": 867647, "All required checks pass": 15368}
@@ -32,6 +35,8 @@ NON_CHECK_RULES = frozenset({
     "creation", "update", "deletion", "required_linear_history",
     "required_signatures", "pull_request", "non_fast_forward",
 })
+MAX_REVIEW_WAIT_SECONDS = 140 * 60
+REVIEW_POLL_SECONDS = 30
 
 
 class PublicationError(RuntimeError):
@@ -133,7 +138,252 @@ def _replace(body: str, block: str) -> str:
     return body + ("\n\n" if body else "") + block
 
 
-def _validate_pr(pr: dict[str, Any], head: str, candidate: str) -> None:
+def _canonical_sha(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _candidate_head(manifest: dict[str, Any]) -> tuple[str, str, str]:
+    """Derive retry-stable PR identity from request/base/candidate."""
+    candidate, base = manifest.get("candidate_sha"), manifest.get("base_sha")
+    if not all(
+        isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)
+        for sha in (candidate, base)
+    ):
+        raise PublicationError("invalid candidate/base identity")
+    binding = manifest.get("run_binding")
+    request_identity: str | None = None
+    if isinstance(binding, dict):
+        if binding.get("mode") == "issue" and isinstance(binding.get("issue"), dict):
+            request_identity = _canonical_sha(binding["issue"])
+        if request_identity is None:
+            request_identity = binding.get("request_sha256")
+    if not isinstance(request_identity, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", request_identity
+    ):
+        request_identity = manifest.get("lease_token_sha256")
+    if not isinstance(request_identity, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", request_identity
+    ):
+        raise PublicationError("candidate has no stable request identity")
+    identity = _canonical_sha(
+        {
+            "schema_version": 1,
+            "repository": REPOSITORY,
+            "base_branch": BASE,
+            "request_identity": request_identity,
+            "base_sha": base,
+            "candidate_sha": candidate,
+        }
+    )
+    return f"codex/opentui-maint-{identity[:24]}", request_identity, identity
+
+
+def _safe_metadata_text(value: str) -> str:
+    if (
+        START in value
+        or END in value
+        or "<!-- maintainer-" in value
+        or "/home/" in value
+        or "file:" in value.casefold()
+        or SENSITIVE_TEXT.search(value)
+        or any(ord(character) < 32 and character not in "\n\t" for character in value)
+    ):
+        raise PublicationError("issue PR metadata contains unsafe text")
+    return value
+
+
+def _issue_metadata(
+    root: Path, manifest: dict[str, Any]
+) -> tuple[str, str, dict[str, Any] | None]:
+    binding = manifest.get("run_binding")
+    if not isinstance(binding, dict) or binding.get("mode") != "issue":
+        candidate, base = manifest["candidate_sha"], manifest["base_sha"]
+        return (
+            f"chore(opentui): maintainer candidate {candidate[:12]}",
+            f"Automated OpenTUI maintenance candidate `{candidate}` from `{base}`.\n\n",
+            None,
+        )
+    request_path = root / "request.claimed.json"
+    if request_path.is_symlink() or not request_path.is_file():
+        raise PublicationError("issue candidate is missing its claimed request")
+    try:
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PublicationError("issue candidate request is invalid") from exc
+    issue_binding = binding.get("issue")
+    if (
+        not isinstance(request, dict)
+        or request.get("mode") != "issue"
+        or not isinstance(issue_binding, dict)
+        or request.get("repository") != REPOSITORY
+        or request.get("issue") != issue_binding.get("number")
+        or request.get("revision_sha256") != issue_binding.get("revision_sha256")
+        or _canonical_sha(request) != binding.get("request_sha256")
+        or not isinstance(request.get("title"), str)
+    ):
+        raise PublicationError("issue candidate request does not match its gate binding")
+    title_text = " ".join(_safe_metadata_text(request["title"]).split())
+    if not title_text:
+        raise PublicationError("issue candidate title is empty")
+    authored = {
+        "title": title_text,
+        "outcome": f"Implements approved issue #{request['issue']} at revision `{request['revision_sha256'][:12]}`.",
+        "implementation": [
+            "Built as a linear feature-only candidate from the captured fork base.",
+            "This delivery does not advance the upstream synchronization watermark.",
+        ],
+        "verification": [
+            "All seven candidate-bound code, review, terminal, and video gates passed."
+        ],
+        "limitations": [
+            "The attached image is labeled Preview unless the registered synthetic flow proves the changed interaction."
+        ],
+    }
+    metadata_path = root / "pr-metadata.json"
+    metadata_sha256: str | None = None
+    if metadata_path.exists():
+        if metadata_path.is_symlink() or metadata_path.resolve().parent != root:
+            raise PublicationError("issue PR metadata path is unsafe")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PublicationError("issue PR metadata is invalid") from exc
+        keys = {
+            "schema_version",
+            "issue",
+            "revision_sha256",
+            "title",
+            "outcome",
+            "implementation",
+            "verification",
+            "limitations",
+        }
+        lists = ("implementation", "verification", "limitations")
+        if (
+            not isinstance(metadata, dict)
+            or set(metadata) != keys
+            or metadata.get("schema_version") != 1
+            or metadata.get("issue") != request["issue"]
+            or metadata.get("revision_sha256") != request["revision_sha256"]
+            or not isinstance(metadata.get("title"), str)
+            or not 1 <= len(metadata["title"].strip()) <= 160
+            or not isinstance(metadata.get("outcome"), str)
+            or not 1 <= len(metadata["outcome"].strip()) <= 2000
+            or any(
+                not isinstance(metadata.get(key), list)
+                or len(metadata[key]) > 20
+                or not all(
+                    isinstance(item, str) and 1 <= len(item.strip()) <= 2000
+                    for item in metadata[key]
+                )
+                for key in lists
+            )
+        ):
+            raise PublicationError("issue PR metadata has an invalid bounded shape")
+        authored = {key: metadata[key] for key in authored}
+        metadata_sha256 = _hash(metadata_path)
+    _safe_metadata_text(authored["title"])
+    _safe_metadata_text(authored["outcome"])
+    for key in ("implementation", "verification", "limitations"):
+        for item in authored[key]:
+            _safe_metadata_text(item)
+    sections = [
+        authored["outcome"].strip(),
+        f"Approved issue: #{request['issue']} ({request['issue_url']})",
+    ]
+    for heading, key in (
+        ("Implementation", "implementation"),
+        ("Verification", "verification"),
+        ("Limits and follow-ups", "limitations"),
+    ):
+        values = authored[key]
+        if values:
+            sections.append(
+                f"## {heading}\n\n" + "\n".join(f"- {item.strip()}" for item in values)
+            )
+    return (
+        f"feat(opentui): {' '.join(authored['title'].split())}"[:240],
+        "\n\n".join(sections) + "\n\n",
+        {
+            "issue": request["issue"],
+            "revision_sha256": request["revision_sha256"],
+            "metadata_sha256": metadata_sha256,
+            "existing_prs": request.get("existing_prs", []),
+        },
+    )
+
+
+def _references_issue(body: Any, number: int) -> bool:
+    if not isinstance(body, str):
+        return False
+    target = rf"(?:#{number}\b|{re.escape(REPOSITORY)}#{number}\b|https://github\.com/{re.escape(REPOSITORY)}/issues/{number}\b)"
+    return (
+        re.search(
+            rf"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+{target}",
+            body,
+        )
+        is not None
+    )
+
+
+def _reconcile_issue_pr(
+    root: Path,
+    issue: dict[str, Any] | None,
+    candidate: str,
+) -> dict[str, Any] | None:
+    """Return one exact live implementing PR or refuse a duplicate."""
+    if issue is None or not issue.get("existing_prs"):
+        return None
+    expected_prs = issue["existing_prs"]
+    if not isinstance(expected_prs, list):
+        raise PublicationError("issue implementing PR evidence is invalid")
+    matches: list[dict[str, Any]] = []
+    for expected in expected_prs:
+        if not isinstance(expected, dict) or type(expected.get("number")) is not int:
+            raise PublicationError("issue implementing PR evidence is invalid")
+        pr = json.loads(
+            _run(
+                [
+                    str(GH),
+                    "pr",
+                    "view",
+                    str(expected["number"]),
+                    "--repo",
+                    REPOSITORY,
+                    "--json",
+                    FIELDS,
+                ],
+                root,
+            )
+        )
+        if (
+            not isinstance(pr, dict)
+            or pr.get("number") != expected["number"]
+            or pr.get("url") != expected.get("url")
+            or pr.get("baseRefName") != BASE
+            or pr.get("headRefName") != expected.get("head_branch")
+            or pr.get("headRefOid") != expected.get("head_sha")
+            or pr.get("state") != "OPEN"
+            or not _references_issue(pr.get("body"), issue["issue"])
+        ):
+            raise PublicationError(
+                "captured implementing PR changed; re-intake the approved issue"
+            )
+        if pr["headRefOid"] == candidate:
+            matches.append(pr)
+    if len(matches) != 1:
+        raise PublicationError(
+            "approved issue already has an open implementing PR that does not "
+            "uniquely match this candidate; refusing a duplicate PR"
+        )
+    return matches[0]
+
+
+def _validate_pr(
+    pr: dict[str, Any], head: str, candidate: str, identity: str | None = None
+) -> None:
     if (
         pr.get("headRefName") != head
         or pr.get("headRefOid") != candidate
@@ -143,6 +393,8 @@ def _validate_pr(pr: dict[str, Any], head: str, candidate: str) -> None:
         or pr.get("url") != f"https://github.com/{REPOSITORY}/pull/{pr.get('number')}"
     ):
         raise PublicationError("PR does not bind the open expected base/head candidate")
+    if identity is not None and identity not in str(pr.get("body", "")):
+        raise PublicationError("PR does not bind the expected request/base/candidate")
 
 
 def _published_block(body: str, identity: str) -> tuple[str, str] | None:
@@ -310,14 +562,66 @@ def review_status(pr: dict[str, Any], comments: list[dict[str, Any]], candidate:
     }
 
 
-def wait_for_review(root: Path, number: int, candidate: str) -> dict[str, Any]:
-    """Wait up to 30 minutes; a missing review is never an implicit approval."""
-    deadline = time.monotonic() + 1800
+def wait_for_review(
+    root: Path,
+    number: int,
+    candidate: str,
+    *,
+    deadline_unix: int | None = None,
+    max_wait_seconds: int = MAX_REVIEW_WAIT_SECONDS,
+    recovery_identity: dict[str, Any] | None = None,
+    expected_pr_evidence: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Wait within CI and owning-lease bounds; pending is never approval."""
+    if type(max_wait_seconds) is not int or max_wait_seconds <= 0:
+        raise PublicationError("PR review wait bound is invalid")
+    remaining_lease = (
+        max(0.0, float(deadline_unix) - time.time())
+        if type(deadline_unix) is int
+        else float(max_wait_seconds)
+    )
+    wait_seconds = min(float(max_wait_seconds), remaining_lease)
+    deadline = time.monotonic() + wait_seconds
     while True:
-        pr = json.loads(_run([
-            str(GH), "pr", "view", str(number), "--repo", REPOSITORY,
-            "--json", "state,headRefOid,baseRefName,mergeStateStatus,mergeable",
-        ], root))
+        fields = (
+            FIELDS + ",mergeStateStatus,mergeable"
+            if expected_pr_evidence is not None
+            else "state,headRefOid,baseRefName,mergeStateStatus,mergeable"
+        )
+        pr = json.loads(
+            _run(
+                [
+                    str(GH),
+                    "pr",
+                    "view",
+                    str(number),
+                    "--repo",
+                    REPOSITORY,
+                    "--json",
+                    fields,
+                ],
+                root,
+            )
+        )
+        if expected_pr_evidence is not None:
+            _validate_pr(
+                pr,
+                expected_pr_evidence["head_branch"],
+                candidate,
+                expected_pr_evidence["candidate_marker"],
+            )
+            current = _published_block(
+                pr["body"], expected_pr_evidence["preview_identity"]
+            )
+            if (
+                current is None
+                or hashlib.sha256(current[0].encode()).hexdigest()
+                != expected_pr_evidence["block_sha256"]
+                or current[1] != expected_pr_evidence["attachment_url"]
+            ):
+                raise PublicationError(
+                    "candidate PR attachment identity changed before publication"
+                )
         pr["statusCheckRollup"] = candidate_checks(root, candidate)
         pages = json.loads(_run([
             str(GH), "api", "--paginate", "--slurp",
@@ -327,11 +631,29 @@ def wait_for_review(root: Path, number: int, candidate: str) -> dict[str, Any]:
         proof = review_status(pr, [item for page in pages for item in page], candidate, policy)
         if proof is not None:
             _write(root / "pr-review.json", json.dumps(proof, indent=2) + "\n")
+            (root / "pr-pending.json").unlink(missing_ok=True)
             return proof
         if time.monotonic() >= deadline:
-            raise PublicationError("PR review/checks still pending; target branch was not updated")
+            pending = {
+                "schema_version": 1,
+                "status": "pending",
+                "number": number,
+                "candidate_sha": candidate,
+                "observed_unix": int(time.time()),
+                "deadline_unix": deadline_unix,
+                "max_wait_seconds": max_wait_seconds,
+                "target_updated": False,
+                "recovery": "reuse matching candidate PR and re-run current-head gates",
+            }
+            if recovery_identity is not None:
+                pending["publication_identity"] = recovery_identity
+            _write(root / "pr-pending.json", json.dumps(pending, indent=2) + "\n")
+            raise PublicationError(
+                "PR review/checks are still pending at the bounded lease-aware deadline; "
+                "candidate PR was retained for recovery and target branch was not updated"
+            )
         print(f"PR #{number}: waiting for current-head Greptile 5/5 and green checks", flush=True)
-        time.sleep(30)
+        time.sleep(min(REVIEW_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
 
 def publish_preview(
@@ -341,6 +663,7 @@ def publish_preview(
     *,
     node: Path,
     remote: str = "origin",
+    review_deadline_unix: int | None = None,
 ) -> dict[str, Any]:
     """Idempotently create the candidate PR and attach one proven synthetic PNG.
 
@@ -370,52 +693,56 @@ def publish_preview(
     }:
         raise PublicationError("refusing candidate push to an untrusted remote")
     candidate, base = manifest["candidate_sha"], manifest["base_sha"]
-    if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (candidate, base)):
-        raise PublicationError("invalid candidate/base identity")
-    run_id = hashlib.sha256(
-        (manifest["lease_token_sha256"] + base + candidate).encode()
-    ).hexdigest()[:24]
-    head = f"codex/opentui-maint-{run_id}"
-    ref = f"refs/heads/{head}"
-    existing = _run(["git", "ls-remote", destination, ref], repo).strip()
-    if existing and existing.split() != [candidate, ref]:
-        raise PublicationError("run branch already points at a different candidate")
-    if not existing:
-        _run(
-            [
-                "git",
-                "push",
-                "--porcelain",
-                f"--force-with-lease={ref}:",
-                destination,
-                f"{candidate}:{ref}",
-            ],
-            repo,
-        )
+    head, request_identity, candidate_identity = _candidate_head(manifest)
+    candidate_marker = f"<!-- maintainer-candidate:v1:{candidate_identity} -->"
+    title, body_prefix, issue = _issue_metadata(root, manifest)
     gh = [str(GH), "pr"]
     options = ["--repo", REPOSITORY]
-    prs = json.loads(
-        _run(
-            gh
-            + [
-                "list",
-                *options,
-                "--state",
-                "all",
-                "--head",
-                head,
-                "--base",
-                BASE,
-                "--json",
-                FIELDS,
-            ],
-            root,
+    reconciled = _reconcile_issue_pr(root, issue, candidate)
+    if reconciled is not None:
+        head = reconciled["headRefName"]
+        prs = [reconciled]
+    else:
+        ref = f"refs/heads/{head}"
+        existing = _run(["git", "ls-remote", destination, ref], repo).strip()
+        if existing and existing.split() != [candidate, ref]:
+            raise PublicationError("run branch already points at a different candidate")
+        if not existing:
+            _run(
+                [
+                    "git",
+                    "push",
+                    "--porcelain",
+                    f"--force-with-lease={ref}:",
+                    destination,
+                    f"{candidate}:{ref}",
+                ],
+                repo,
+            )
+        prs = json.loads(
+            _run(
+                gh
+                + [
+                    "list",
+                    *options,
+                    "--state",
+                    "all",
+                    "--head",
+                    head,
+                    "--base",
+                    BASE,
+                    "--json",
+                    FIELDS,
+                ],
+                root,
+            )
         )
-    )
-    if not prs:
+    if not prs and reconciled is None:
         body = (
-            f"Automated OpenTUI maintenance candidate `{candidate}` from `{base}`.\n\n"
-            "Preview is startup/help regression proof from the isolated synthetic profile, "
+            candidate_marker
+            + "\n"
+            + body_prefix
+            + "Preview is startup/help regression proof from the isolated synthetic profile, "
             "not a before/after claim about changed UI behavior.\n\n"
             "All required code, independent review, terminal, and video gates passed. "
             "The maintainer publishes only through its guarded target-branch CAS.\n"
@@ -431,7 +758,7 @@ def publish_preview(
                 "--head",
                 head,
                 "--title",
-                f"chore(opentui): maintainer candidate {candidate[:12]}",
+                title,
                 "--body-file",
                 str(root / "pr-body.md"),
             ],
@@ -459,6 +786,13 @@ def publish_preview(
         raise PublicationError("expected exactly one run-scoped PR")
     pr = prs[0]
     _validate_pr(pr, head, candidate)
+    marker_missing = candidate_marker not in pr["body"]
+    if marker_missing:
+        reconciled_prefix = body_prefix if reconciled is not None else ""
+        pr = {
+            **pr,
+            "body": candidate_marker + "\n" + reconciled_prefix + pr["body"],
+        }
     identity = f"<!-- maintainer-preview:{candidate}:{digest} -->"
     published = _published_block(pr["body"], identity)
     if published is None:
@@ -498,10 +832,23 @@ def publish_preview(
             ],
             root,
         )
+    elif marker_missing:
+        _write(root / "pr-body.md", pr["body"])
+        _run(
+            gh
+            + [
+                "edit",
+                str(pr["number"]),
+                *options,
+                "--body-file",
+                str(root / "pr-body.md"),
+            ],
+            root,
+        )
     pr = json.loads(
         _run(gh + ["view", str(pr["number"]), *options, "--json", FIELDS], root)
     )
-    _validate_pr(pr, head, candidate)
+    _validate_pr(pr, head, candidate, candidate_marker)
     published = _published_block(pr["body"], identity)
     if published is None:
         raise PublicationError(
@@ -524,8 +871,31 @@ def publish_preview(
         "formatter_sha256": FORMATTER_SHA256,
         "gh_version": "2.100.0",
         "scope": "synthetic-startup-help",
+        "request_identity": request_identity,
+        "candidate_identity": candidate_identity,
+        "issue": issue,
     }
     _write(root / "pr-evidence.json", json.dumps(proof, indent=2) + "\n")
-    proof["review"] = wait_for_review(root, pr["number"], candidate)
+    proof["review"] = wait_for_review(
+        root,
+        pr["number"],
+        candidate,
+        deadline_unix=review_deadline_unix,
+        recovery_identity={
+            "repository": REPOSITORY,
+            "base_branch": BASE,
+            "base_sha": base,
+            "head_branch": head,
+            "request_identity": request_identity,
+            "candidate_identity": candidate_identity,
+        },
+        expected_pr_evidence={
+            "head_branch": head,
+            "candidate_marker": candidate_marker,
+            "preview_identity": identity,
+            "block_sha256": hashlib.sha256(block.encode()).hexdigest(),
+            "attachment_url": url,
+        },
+    )
     _write(root / "pr-evidence.json", json.dumps(proof, indent=2) + "\n")
     return proof
