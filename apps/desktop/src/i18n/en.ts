@@ -2958,6 +2958,7 @@ export const en: Translations = {
   },
 
   freeTier: {
+    providerRowTitle: 'Nous · free tier',
     readyTitle: 'Hermes is ready.',
     readyCaption: 'Free · connectors included',
     begin: 'Begin',

@@ -3109,6 +3109,7 @@ export const zh: Translations = {
   // Not yet translated — English fallbacks so the free-tier surfaces stay
   // readable until a zh pass lands.
   freeTier: {
+    providerRowTitle: 'Nous · free tier',
     readyTitle: 'Hermes is ready.',
     readyCaption: 'Free · connectors included',
     begin: 'Begin',
