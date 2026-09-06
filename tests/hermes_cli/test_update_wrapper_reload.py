@@ -67,6 +67,7 @@ def test_update_keeps_both_engines_failure_reporting(
     assert failures == workspace_failures + opentui_failures
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("opentui_failure", [False, True])
 def test_current_checkout_continues_only_after_optional_opentui_skip(
     tmp_path, monkeypatch, opentui_failure

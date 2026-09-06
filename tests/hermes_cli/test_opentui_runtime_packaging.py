@@ -1750,6 +1750,7 @@ class TestMainIntegration:
 
         assert calls == ["workspaces", "opentui"]
 
+    @pytest.mark.linux_only
     @pytest.mark.parametrize("missing_prerequisite", ["node", "npm"])
     def test_update_boundary_treats_missing_optional_prerequisite_as_skip(
         self, tmp_path, monkeypatch, missing_prerequisite
@@ -1776,6 +1777,7 @@ class TestMainIntegration:
         assert update_cmd_deps._update_node_dependencies() == []
         assert (app / "dist" / "main.js").read_text() == "old bundle"
 
+    @pytest.mark.linux_only
     @pytest.mark.parametrize(
         ("refresh_ok", "workspace_failures", "expected_failures"),
         [
