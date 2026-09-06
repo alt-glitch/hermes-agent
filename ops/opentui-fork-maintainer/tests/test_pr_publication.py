@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import shutil
 import struct
 import subprocess
 from pathlib import Path
@@ -92,6 +93,7 @@ class Github:
             result = "ok"
             phase = "push"
         elif argv[:2] == [str(pub.GH), "api"]:
+            endpoint = argv[-1]
             if argv[2] == "graphql":
                 if "--paginate" in argv:
                     return json.dumps([{"data": {"repository": {"object": {
@@ -100,8 +102,16 @@ class Github:
                         }},
                     }}}}])
                 return json.dumps({"data": {"repository": {"ref": {"name": pub.BASE, "branchProtectionRule": None}}}})
-            if "/rules/branches/" in argv[-1]:
+            if "/rules/branches/" in endpoint:
                 return "[[]]"
+            # Live issue-scoped decoder edges used by the just-before-create
+            # reconciliation. The real intake decoder filters these by the
+            # closing-keyword parser, so the maintainer's own keyword-free PR is
+            # correctly ignored while a competitor's `Fixes #` PR is seen.
+            if "/timeline" in endpoint:
+                return json.dumps([[self.cross_reference()]] if self.pr else [[]])
+            if "/pulls/" in endpoint:
+                return json.dumps(self.rest_pull())
             return json.dumps([[review_comment()]])
         else:
             phase = argv[2]
@@ -137,6 +147,28 @@ class Github:
             self.fail_after = None
             raise pub.PublicationError("simulated lost acknowledgement")
         return result
+
+    def cross_reference(self):
+        return {"event": "cross-referenced", "source": {"issue": {
+            "number": self.pr["number"],
+            "pull_request": {"url": self.pr["url"]},
+            "repository_url": f"https://api.github.com/repos/{pub.REPOSITORY}",
+            "body": self.pr["body"],
+        }}}
+
+    def rest_pull(self):
+        return {
+            "number": self.pr["number"],
+            "state": "open",
+            "base": {"ref": pub.BASE},
+            "head": {
+                "sha": self.pr["headRefOid"],
+                "repo": {"full_name": pub.REPOSITORY},
+                "ref": self.pr["headRefName"],
+            },
+            "body": self.pr["body"],
+            "html_url": self.pr["url"],
+        }
 
 
 @pytest.fixture
@@ -527,6 +559,53 @@ def test_existing_implementing_pr_must_still_exactly_match_candidate(
     assert not any(
         len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
     )
+
+
+@pytest.mark.parametrize("live_head", ["a" * 40, "f" * 40])
+def test_competitor_pr_appearing_after_snapshot_is_seen_at_the_create_edge(
+    capture, github, live_head
+) -> None:
+    # Both the request and the caller's refreshed snapshot show no implementing
+    # PR; a competitor appears live only after that, and the just-before-create
+    # issue-scoped re-query must reuse or refuse it, never open a duplicate.
+    bind_issue(capture, existing_prs=[])
+    github.pr = {
+        **review_pr(),
+        "number": 77,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/77",
+        "body": "Community fix.\n\nFixes #41",
+        "headRefName": "contributor/fix-41",
+        "headRefOid": live_head,
+    }
+    if live_head == "a" * 40:
+        proof = publish(capture, issue_request=None)
+        assert proof["number"] == 77
+        assert proof["head_branch"] == "contributor/fix-41"
+        assert "Implements approved issue #41" in github.pr["body"]
+        assert "Community fix." in github.pr["body"]
+    else:
+        with pytest.raises(pub.PublicationError, match="implementing PR|duplicate PR"):
+            publish(capture, issue_request=None)
+    assert not any(call[:2] == ["git", "push"] for call in github.calls)
+    assert not any(
+        len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
+    )
+
+
+def test_issue_publication_requires_the_workflow_owner_beside_the_publisher(
+    tmp_path,
+) -> None:
+    # The publisher resolves issue policy by filesystem adjacency; without the
+    # owner beside it, it refuses instead of importing it from anywhere else.
+    lonely = tmp_path / "scripts"
+    lonely.mkdir()
+    shutil.copy(SCRIPT, lonely / SCRIPT.name)
+    spec = importlib.util.spec_from_file_location("pub_lonely", lonely / SCRIPT.name)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with pytest.raises(module.PublicationError, match="located beside the publisher"):
+        module._issue_workflow()
 
 
 def test_candidate_pr_identity_changes_with_request_base_or_candidate(capture) -> None:

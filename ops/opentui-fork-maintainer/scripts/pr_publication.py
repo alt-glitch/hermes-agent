@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -23,9 +24,6 @@ BASE = "sid/opentui"
 START = "<!-- before-and-after:start -->"
 END = "<!-- before-and-after:end -->"
 ATTACHMENT = re.compile(r"https://github\.com/user-attachments/assets/[a-zA-Z0-9-]+")
-SENSITIVE_TEXT = re.compile(
-    r"(?i)(sk-[a-z0-9_-]{12,}|bearer\s+[a-z0-9._-]{12,}|api[_ -]?key\s*[=:])"
-)
 FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state"
 # Immutable GitHub App IDs, verified against this fork's live check suites.
 REQUIRED_CHECK_APPS = {"Greptile Review": 867647, "All required checks pass": 15368}
@@ -55,6 +53,26 @@ def _run(argv: list[str], cwd: Path) -> str:
             f"publication command failed: {Path(argv[0]).name} {argv[1]}"
         )
     return result.stdout
+
+
+def _issue_workflow() -> Any:
+    """Load the approved-issue lifecycle owner strictly beside this publisher.
+
+    This module owns generic media, GitHub transport, attachment and review;
+    issue metadata, body construction and implementing-PR reconciliation belong
+    to the issue-workflow owner, which alone knows the issue decoder.  Resolving
+    it by filesystem adjacency keeps issue policy out of this transport module
+    without importing any candidate implementation code.
+    """
+    path = Path(__file__).with_name("issue_workflow.py")
+    spec = importlib.util.spec_from_file_location("_opentui_pub_issue_workflow", path)
+    if not path.is_file() or spec is None or spec.loader is None:
+        raise PublicationError(
+            "issue workflow owner could not be located beside the publisher"
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _write(path: Path, value: str) -> None:
@@ -178,221 +196,6 @@ def _candidate_head(manifest: dict[str, Any]) -> tuple[str, str, str]:
         }
     )
     return f"codex/opentui-maint-{identity[:24]}", request_identity, identity
-
-
-def _safe_metadata_text(value: str) -> str:
-    if (
-        START in value
-        or END in value
-        or "<!-- maintainer-" in value
-        or "/home/" in value
-        or "file:" in value.casefold()
-        or SENSITIVE_TEXT.search(value)
-        or any(ord(character) < 32 and character not in "\n\t" for character in value)
-    ):
-        raise PublicationError("issue PR metadata contains unsafe text")
-    return value
-
-
-def _issue_metadata(
-    root: Path,
-    manifest: dict[str, Any],
-    issue_request: dict[str, Any] | None = None,
-) -> tuple[str, str, dict[str, Any] | None]:
-    binding = manifest.get("run_binding")
-    if not isinstance(binding, dict) or binding.get("mode") != "issue":
-        candidate, base = manifest["candidate_sha"], manifest["base_sha"]
-        return (
-            f"chore(opentui): maintainer candidate {candidate[:12]}",
-            f"Automated OpenTUI maintenance candidate `{candidate}` from `{base}`.\n\n",
-            None,
-        )
-    request_path = root / "request.claimed.json"
-    if request_path.is_symlink() or not request_path.is_file():
-        raise PublicationError("issue candidate is missing its claimed request")
-    try:
-        request = json.loads(request_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise PublicationError("issue candidate request is invalid") from exc
-    issue_binding = binding.get("issue")
-    if (
-        not isinstance(request, dict)
-        or request.get("mode") != "issue"
-        or not isinstance(issue_binding, dict)
-        or request.get("repository") != REPOSITORY
-        or request.get("issue") != issue_binding.get("number")
-        or request.get("revision_sha256") != issue_binding.get("revision_sha256")
-        or _canonical_sha(request) != binding.get("request_sha256")
-        or not isinstance(request.get("title"), str)
-    ):
-        raise PublicationError("issue candidate request does not match its gate binding")
-    if issue_request is not None:
-        fixed_fields = set(request) - {"existing_prs"}
-        if (
-            not isinstance(issue_request, dict)
-            or set(issue_request) != set(request)
-            or any(issue_request.get(key) != request.get(key) for key in fixed_fields)
-            or not isinstance(issue_request.get("existing_prs"), list)
-        ):
-            raise PublicationError("refreshed issue request changed its approved binding")
-        request = {**request, "existing_prs": issue_request["existing_prs"]}
-    title_text = " ".join(_safe_metadata_text(request["title"]).split())
-    if not title_text:
-        raise PublicationError("issue candidate title is empty")
-    authored = {
-        "title": title_text,
-        "outcome": f"Implements approved issue #{request['issue']} at revision `{request['revision_sha256'][:12]}`.",
-        "implementation": [
-            "Built as a linear feature-only candidate from the captured fork base.",
-            "This delivery does not advance the upstream synchronization watermark.",
-        ],
-        "verification": [
-            "All seven candidate-bound code, review, terminal, and video gates passed."
-        ],
-        "limitations": [
-            "The attached image is labeled Preview unless the registered synthetic flow proves the changed interaction."
-        ],
-    }
-    metadata_path = root / "pr-metadata.json"
-    metadata_sha256: str | None = None
-    if metadata_path.exists():
-        if metadata_path.is_symlink() or metadata_path.resolve().parent != root:
-            raise PublicationError("issue PR metadata path is unsafe")
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise PublicationError("issue PR metadata is invalid") from exc
-        keys = {
-            "schema_version",
-            "issue",
-            "revision_sha256",
-            "title",
-            "outcome",
-            "implementation",
-            "verification",
-            "limitations",
-        }
-        lists = ("implementation", "verification", "limitations")
-        if (
-            not isinstance(metadata, dict)
-            or set(metadata) != keys
-            or metadata.get("schema_version") != 1
-            or metadata.get("issue") != request["issue"]
-            or metadata.get("revision_sha256") != request["revision_sha256"]
-            or not isinstance(metadata.get("title"), str)
-            or not 1 <= len(metadata["title"].strip()) <= 160
-            or not isinstance(metadata.get("outcome"), str)
-            or not 1 <= len(metadata["outcome"].strip()) <= 2000
-            or any(
-                not isinstance(metadata.get(key), list)
-                or len(metadata[key]) > 20
-                or not all(
-                    isinstance(item, str) and 1 <= len(item.strip()) <= 2000
-                    for item in metadata[key]
-                )
-                for key in lists
-            )
-        ):
-            raise PublicationError("issue PR metadata has an invalid bounded shape")
-        authored = {key: metadata[key] for key in authored}
-        metadata_sha256 = _hash(metadata_path)
-    _safe_metadata_text(authored["title"])
-    _safe_metadata_text(authored["outcome"])
-    for key in ("implementation", "verification", "limitations"):
-        for item in authored[key]:
-            _safe_metadata_text(item)
-    sections = [
-        authored["outcome"].strip(),
-        f"Approved issue: #{request['issue']} ({request['issue_url']})",
-    ]
-    for heading, key in (
-        ("Implementation", "implementation"),
-        ("Verification", "verification"),
-        ("Limits and follow-ups", "limitations"),
-    ):
-        values = authored[key]
-        if values:
-            sections.append(
-                f"## {heading}\n\n" + "\n".join(f"- {item.strip()}" for item in values)
-            )
-    return (
-        f"feat(opentui): {' '.join(authored['title'].split())}"[:240],
-        "\n\n".join(sections) + "\n\n",
-        {
-            "issue": request["issue"],
-            "revision_sha256": request["revision_sha256"],
-            "metadata_sha256": metadata_sha256,
-            "existing_prs": request.get("existing_prs", []),
-        },
-    )
-
-
-def _references_issue(body: Any, number: int) -> bool:
-    if not isinstance(body, str):
-        return False
-    target = rf"(?:#{number}\b|{re.escape(REPOSITORY)}#{number}\b|https://github\.com/{re.escape(REPOSITORY)}/issues/{number}\b)"
-    return (
-        re.search(
-            rf"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+{target}",
-            body,
-        )
-        is not None
-    )
-
-
-def _reconcile_issue_pr(
-    root: Path,
-    issue: dict[str, Any] | None,
-    candidate: str,
-) -> dict[str, Any] | None:
-    """Return one exact live implementing PR or refuse a duplicate."""
-    if issue is None or not issue.get("existing_prs"):
-        return None
-    expected_prs = issue["existing_prs"]
-    if not isinstance(expected_prs, list):
-        raise PublicationError("issue implementing PR evidence is invalid")
-    if len(expected_prs) != 1:
-        raise PublicationError(
-            "approved issue has ambiguous implementing PRs; refusing a duplicate PR"
-        )
-    expected = expected_prs[0]
-    if (
-        not isinstance(expected, dict)
-        or type(expected.get("number")) is not int
-        or expected.get("head_sha") != candidate
-    ):
-        raise PublicationError(
-            "approved issue has a conflicting implementing PR; refusing a duplicate PR"
-        )
-    pr = json.loads(
-        _run(
-            [
-                str(GH),
-                "pr",
-                "view",
-                str(expected["number"]),
-                "--repo",
-                REPOSITORY,
-                "--json",
-                FIELDS,
-            ],
-            root,
-        )
-    )
-    if (
-        not isinstance(pr, dict)
-        or pr.get("number") != expected["number"]
-        or pr.get("url") != expected.get("url")
-        or pr.get("baseRefName") != expected.get("base_branch")
-        or pr.get("headRefName") != expected.get("head_branch")
-        or pr.get("headRefOid") != candidate
-        or pr.get("state") != "OPEN"
-        or not _references_issue(pr.get("body"), issue["issue"])
-    ):
-        raise PublicationError(
-            "captured implementing PR changed; re-intake the approved issue"
-        )
-    return pr
 
 
 def _validate_pr(
@@ -710,10 +513,42 @@ def publish_preview(
     candidate, base = manifest["candidate_sha"], manifest["base_sha"]
     head, request_identity, candidate_identity = _candidate_head(manifest)
     candidate_marker = f"<!-- maintainer-candidate:v1:{candidate_identity} -->"
-    title, body_prefix, issue = _issue_metadata(root, manifest, issue_request)
+    binding = manifest.get("run_binding")
+    is_issue = isinstance(binding, dict) and binding.get("mode") == "issue"
+    if is_issue:
+        # Issue metadata, body construction and implementing-PR reconciliation
+        # are issue policy; this transport module delegates them to the owner.
+        workflow = _issue_workflow()
+        try:
+            title, body_prefix, issue = workflow.issue_publication_metadata(
+                root, manifest, issue_request
+            )
+        except workflow.IssueWorkflowError as exc:
+            raise PublicationError(str(exc)) from exc
+    else:
+        workflow = None
+        issue = None
+        title = f"chore(opentui): maintainer candidate {candidate[:12]}"
+        body_prefix = (
+            f"Automated OpenTUI maintenance candidate `{candidate}` from `{base}`.\n\n"
+        )
     gh = [str(GH), "pr"]
     options = ["--repo", REPOSITORY]
-    reconciled = _reconcile_issue_pr(root, issue, candidate)
+
+    def reconcile_live_issue_pr() -> dict[str, Any] | None:
+        """Re-read the live issue-scoped PR set at the publication edge."""
+        if not is_issue:
+            return None
+        try:
+            return workflow.reconcile_issue_pr(
+                issue, candidate, cwd=root, runner=_run
+            )
+        except workflow.IssueWorkflowError as exc:
+            raise PublicationError(str(exc)) from exc
+
+    # Reuse or refuse a competing implementing PR before pushing our own branch,
+    # so a PR that appeared after the caller's snapshot leaves no dangling ref.
+    reconciled = reconcile_live_issue_pr()
     if reconciled is not None:
         head = reconciled["headRefName"]
         prs = [reconciled]
@@ -752,6 +587,14 @@ def publish_preview(
                 root,
             )
         )
+    if not prs and reconciled is None:
+        # Narrow the final edge: re-read the live issue-scoped PR set once more
+        # immediately before creation, since our own push/list may have raced a
+        # competitor. GitHub offers no atomic CAS for PR creation.
+        reconciled = reconcile_live_issue_pr()
+        if reconciled is not None:
+            head = reconciled["headRefName"]
+            prs = [reconciled]
     if not prs and reconciled is None:
         body = (
             candidate_marker

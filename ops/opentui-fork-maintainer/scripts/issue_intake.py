@@ -493,6 +493,24 @@ def _existing_prs(
     return result
 
 
+def live_existing_prs(
+    number: int, cwd: Path, *, runner: Runner | None = None
+) -> list[dict[str, Any]]:
+    """Re-read only the issue-scoped open implementing PRs at the publish edge.
+
+    Reuses the same paginated timeline decode and closing-keyword filter as
+    intake so the publisher never grows a second implementing-PR parser.  The
+    approval/revision are not re-derived here; the caller owns that revalidation
+    separately, and this narrow query exists to catch a competitor PR appearing
+    after the caller's snapshot but before ``gh pr create``.
+    """
+    runner = _run if runner is None else runner
+    if type(number) is not int or number <= 0:
+        raise IssueIntakeError("issue identity is invalid for PR reconciliation")
+    timeline = _timeline(number, cwd, runner)
+    return _existing_prs(number, timeline, cwd, runner)
+
+
 def _request(
     issue: dict[str, Any],
     timeline: list[Any],
