@@ -3762,10 +3762,13 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
         rejection_reason = None if claimed else "claim_lost"
         existing_owner = None
     if claimed_job is None:
-        if rejection_reason == "active_fire_owner":
+        if rejection_reason in {"active_fire_owner", "fire_claim_held"}:
             reason = (
                 "Scheduled occurrence deferred because the job is already running under "
                 f"active fire owner {existing_owner}."
+                if rejection_reason == "active_fire_owner" else
+                "Scheduled occurrence deferred by an unexpired fire claim; "
+                "execution was not started and owner liveness is not asserted."
             )
             skip_execution(job["execution_id"], reason=reason)
             logger.info("Job '%s': %s", job["id"], reason)
@@ -3774,10 +3777,6 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
             "attempt_limit_reached": "Job exhausted its finite attempt budget before fire claim.",
             "terminal": "Job became terminal before fire claim.",
             "paused": "Job was paused or disabled before fire claim.",
-            "fire_claim_held": (
-                "Fire claim is held, but an active owner could not be proven; "
-                "execution was not started."
-            ),
             "run_claim_mismatch": "One-shot run claim changed before fire claim.",
             "run_claim_held": "One-shot run claim is held by another occurrence.",
             "local_owner_active": "Process-local owner appeared after dispatch admission.",

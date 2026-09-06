@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+import pytest
 
 from cron import executions, jobs, scheduler
 
@@ -77,14 +78,15 @@ def _release(proc: subprocess.Popen) -> None:
         proc.communicate(timeout=5)
 
 
+@pytest.mark.parametrize("heartbeat", [False, True])
 def test_live_cross_process_owner_is_durably_skipped_without_duplicate_start(
-    tmp_path,
+    tmp_path, heartbeat,
 ):
     with jobs.use_cron_store(tmp_path):
         created = jobs.create_job(
             prompt="owned elsewhere", schedule="every 5m", repeat=1
         )
-        proc, owner_claim = _claim_in_process(tmp_path, created["id"], hold=True)
+        proc, owner_claim = _claim_in_process(tmp_path, created["id"], hold=True, heartbeat=heartbeat)
         try:
             assert proc.poll() is None
             execution = executions.create_execution(created["id"], source="builtin")
@@ -97,7 +99,7 @@ def test_live_cross_process_owner_is_durably_skipped_without_duplicate_start(
             persisted = executions.get_execution(execution["id"])
             assert persisted["status"] == "skipped"
             assert persisted["started_at"] is None
-            assert "active fire owner" in persisted["error"]
+            assert ("active fire owner" if heartbeat else "unexpired fire claim") in persisted["error"]
             stored = jobs.get_job(created["id"])
             assert stored["fire_claim"]["by"] == owner_claim["by"]
             assert stored["repeat"]["completed"] == 0
