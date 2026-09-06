@@ -10,6 +10,7 @@ current title/body revision was created.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -173,7 +174,8 @@ def _state(state_dir: Path) -> dict[str, Any]:
             or not number.isdigit()
             or not isinstance(record, dict)
             or not SHA256_RE.fullmatch(str(record.get("revision_sha256", "")))
-            or record.get("status") not in {"selected", "cooldown", "delivered"}
+            or record.get("status")
+            not in {"selected", "cooldown", "delivered", "delivery_failed"}
             or type(record.get("attempts")) is not int
             or record["attempts"] < 0
             or type(record.get("updated_unix")) is not int
@@ -204,10 +206,25 @@ def _state(state_dir: Path) -> dict[str, Any]:
             )
         ):
             raise IssueIntakeError("issue intake state has an invalid delivery")
+        if record["status"] == "delivery_failed" and (
+            not SHA_RE.fullmatch(str(record.get("candidate_sha", "")))
+            or not isinstance(record.get("pr_url"), str)
+            or not re.fullmatch(
+                rf"https://github\.com/{re.escape(REPOSITORY)}/pull/[1-9][0-9]*",
+                record["pr_url"],
+            )
+            or record.get("delivery_failure_reason")
+            != "closure_compensation_unresolved"
+        ):
+            raise IssueIntakeError("issue intake state has an invalid delivery failure")
         closure_reason = record.get("closure_withheld_reason")
         if closure_reason is not None and (
             record["status"] != "delivered"
-            or closure_reason != "approved_revision_changed_or_revoked"
+            or closure_reason
+            not in {
+                "approved_revision_changed_or_revoked",
+                "later_state_transition",
+            }
         ):
             raise IssueIntakeError("issue intake state has an invalid closure result")
     return value
@@ -219,7 +236,7 @@ def _write_state(state_dir: Path, value: dict[str, Any]) -> None:
 
 ISSUE_QUERY = """query($owner:String!,$repo:String!,$number:Int!){
   repository(owner:$owner,name:$repo){issue(number:$number){
-    number url state title body createdAt lastEditedAt
+    id number url state title body createdAt lastEditedAt closedAt
     labels(first:100){nodes{name} pageInfo{hasNextPage}}
   }}
 }"""
@@ -251,6 +268,8 @@ def _issue_snapshot(number: int, cwd: Path, runner: Runner) -> dict[str, Any]:
     if (
         not isinstance(issue, dict)
         or issue.get("number") != number
+        or not isinstance(issue.get("id"), str)
+        or not issue["id"]
         or issue.get("state") not in {"OPEN", "CLOSED"}
     ):
         raise IssueIntakeError("GitHub issue could not be resolved exactly")
@@ -762,145 +781,17 @@ def defer_issue(
     return record
 
 
-def _delivery_marker(request: dict[str, Any], candidate_sha: str) -> str:
-    return (
-        f"<!-- opentui-maintainer-delivery:v1:{request['issue']}:"
-        f"{request['revision_sha256']}:{candidate_sha} -->"
-    )
+def _load_delivery_owner() -> Any:
+    path = Path(__file__).with_name("issue_delivery.py")
+    spec = importlib.util.spec_from_file_location("opentui_issue_delivery", path)
+    if spec is None or spec.loader is None:
+        raise IssueIntakeError("issue delivery owner could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def _delivery_body(
-    request: dict[str, Any], candidate_sha: str, pr_url: str
-) -> str:
-    return (
-        f"Delivered approved revision `{request['revision_sha256'][:12]}` as "
-        f"candidate `{candidate_sha}` through {pr_url}.\n\n"
-        f"{_delivery_marker(request, candidate_sha)}"
-    )
-
-
-def _mark_delivered(
-    state_dir: Path,
-    request: dict[str, Any],
-    candidate_sha: str,
-    pr_url: str,
-    now: int,
-    *,
-    closure_withheld_reason: str | None = None,
-) -> dict[str, Any]:
-    state = _state(state_dir)
-    prior = state["issues"].get(str(request["issue"]), {})
-    attempts = (
-        prior.get("attempts", 0)
-        if _same_authorization(prior, request)
-        else 0
-    )
-    record = {
-        "revision_sha256": request["revision_sha256"],
-        "approval_event_id": request["approval"]["event_id"],
-        "status": "delivered",
-        "attempts": attempts,
-        "updated_unix": now,
-        "candidate_sha": candidate_sha,
-        "pr_url": pr_url,
-    }
-    if closure_withheld_reason is not None:
-        record["closure_withheld_reason"] = closure_withheld_reason
-    state["issues"][str(request["issue"])] = record
-    _write_state(state_dir, state)
-    return record
-
-
-def _trusted_delivery_receipt(
-    comment: Any, request: dict[str, Any], body: str
-) -> bool:
-    comment_id = comment.get("id") if isinstance(comment, dict) else None
-    user = comment.get("user") if isinstance(comment, dict) else None
-    return (
-        type(comment_id) is int
-        and comment_id > 0
-        and comment.get("body") == body
-        and isinstance(user, dict)
-        and user.get("login") == REPOSITORY_OWNER
-        and comment.get("url")
-        == f"https://api.github.com/repos/{REPOSITORY}/issues/comments/{comment_id}"
-        and comment.get("issue_url")
-        == f"https://api.github.com/repos/{REPOSITORY}/issues/{request['issue']}"
-        and comment.get("html_url")
-        == f"https://github.com/{REPOSITORY}/issues/{request['issue']}#issuecomment-{comment_id}"
-    )
-
-
-def _read_delivery_receipt(
-    state_dir: Path,
-    request: dict[str, Any],
-    comment_id: int,
-    body: str,
-    runner: Runner,
-) -> dict[str, Any]:
-    comment = _json_output(
-        runner,
-        [str(GH), "api", f"repos/{REPOSITORY}/issues/comments/{comment_id}"],
-        state_dir,
-        "delivery comment readback",
-    )
-    if not _trusted_delivery_receipt(comment, request, body):
-        raise IssueIntakeError("issue delivery comment readback did not match")
-    return comment
-
-
-def _post_delivery_receipt(
-    state_dir: Path,
-    request: dict[str, Any],
-    body: str,
-    runner: Runner,
-) -> dict[str, Any]:
-    posted = _json_output(
-        runner,
-        [
-            str(GH),
-            "api",
-            f"repos/{REPOSITORY}/issues/{request['issue']}/comments",
-            "--method",
-            "POST",
-            "--raw-field",
-            f"body={body}",
-        ],
-        state_dir,
-        "delivery comment",
-    )
-    comment_id = posted.get("id") if isinstance(posted, dict) else None
-    if type(comment_id) is not int or comment_id <= 0:
-        raise IssueIntakeError("issue delivery comment was not acknowledged")
-    return _read_delivery_receipt(state_dir, request, comment_id, body, runner)
-
-
-def _withhold_closure(
-    state_dir: Path,
-    request: dict[str, Any],
-    candidate_sha: str,
-    pr_url: str,
-    now: int,
-    snapshot: dict[str, Any],
-    *,
-    receipt_reused: bool,
-) -> dict[str, Any]:
-    record = _mark_delivered(
-        state_dir,
-        request,
-        candidate_sha,
-        pr_url,
-        now,
-        closure_withheld_reason="approved_revision_changed_or_revoked",
-    )
-    already_closed = snapshot.get("state") == "CLOSED"
-    return {
-        "issue": request["issue"],
-        "closed": already_closed,
-        "already_closed": already_closed,
-        "receipt_reused": receipt_reused,
-        **record,
-    }
+_DELIVERY = _load_delivery_owner()
 
 
 def finalize_delivered_issue(
@@ -912,131 +803,31 @@ def finalize_delivered_issue(
     now: int | None = None,
     runner: Runner | None = None,
 ) -> dict[str, Any]:
-    """Close only an exactly authorized issue after its candidate was delivered."""
     runner = _run if runner is None else runner
-    now = int(time.time()) if now is None else now
-    request = validate_issue_request(request)
-    if not SHA_RE.fullmatch(candidate_sha):
-        raise IssueIntakeError("delivered issue candidate is invalid")
-    if not re.fullmatch(
-        rf"https://github\.com/{re.escape(REPOSITORY)}/pull/[1-9][0-9]*", pr_url
-    ):
-        raise IssueIntakeError("delivered issue pull request is invalid")
-    body = _delivery_body(request, candidate_sha, pr_url)
-    snapshot = _issue_snapshot(request["issue"], state_dir, runner)
-    timeline = _timeline(request["issue"], state_dir, runner)
-    try:
-        _revalidate_snapshot(
-            state_dir,
-            request,
-            snapshot,
-            timeline,
-            runner,
-            allow_closed=True,
-        )
-    except IssueAuthorizationChanged:
-        return _withhold_closure(
-            state_dir,
-            request,
-            candidate_sha,
-            pr_url,
-            now,
-            snapshot,
-            receipt_reused=False,
-        )
-    comments = _pages(
-        runner,
-        f"repos/{REPOSITORY}/issues/{request['issue']}/comments?per_page=100",
-        state_dir,
-        "issue comments",
+    io = _DELIVERY.DeliveryIO(
+        GH,
+        REPOSITORY,
+        REPOSITORY_OWNER,
+        SHA_RE,
+        IssueIntakeError,
+        IssueAuthorizationChanged,
+        validate_issue_request,
+        _issue_snapshot,
+        _timeline,
+        _revalidate_snapshot,
+        _pages,
+        _json_output,
+        _state,
+        _write_state,
+        _same_authorization,
+        _parse_time,
     )
-    receipts = [
-        comment
-        for comment in comments
-        if _trusted_delivery_receipt(comment, request, body)
-    ]
-    receipt = max(receipts, key=lambda comment: comment["id"], default=None)
-    receipt_reused = receipt is not None
-    if receipt is None:
-        receipt = _post_delivery_receipt(state_dir, request, body, runner)
-
-    # Posting a receipt is not authority to close. Re-read the exact issue and
-    # approval at the final edge so an edit or revocation leaves it open.
-    snapshot = _issue_snapshot(request["issue"], state_dir, runner)
-    timeline = _timeline(request["issue"], state_dir, runner)
-    try:
-        _revalidate_snapshot(
-            state_dir,
-            request,
-            snapshot,
-            timeline,
-            runner,
-            allow_closed=True,
-        )
-    except IssueAuthorizationChanged:
-        return _withhold_closure(
-            state_dir,
-            request,
-            candidate_sha,
-            pr_url,
-            now,
-            snapshot,
-            receipt_reused=receipt_reused,
-        )
-    if snapshot.get("state") == "CLOSED":
-        _read_delivery_receipt(state_dir, request, receipt["id"], body, runner)
-        record = _mark_delivered(state_dir, request, candidate_sha, pr_url, now)
-        return {
-            "issue": request["issue"],
-            "closed": True,
-            "already_closed": True,
-            "receipt_reused": receipt_reused,
-            **record,
-        }
-    closed = _json_output(
-        runner,
-        [
-            str(GH),
-            "api",
-            f"repos/{REPOSITORY}/issues/{request['issue']}",
-            "--method",
-            "PATCH",
-            "--field",
-            "state=closed",
-            "--field",
-            "state_reason=completed",
-        ],
+    return _DELIVERY.finalize_delivered_issue(
+        io,
         state_dir,
-        "issue closure",
+        request,
+        candidate_sha=candidate_sha,
+        pr_url=pr_url,
+        now=now,
+        runner=runner,
     )
-    if (
-        not isinstance(closed, dict)
-        or str(closed.get("state", "")).casefold() != "closed"
-    ):
-        raise IssueIntakeError("issue closure was not acknowledged")
-
-    # Mutation responses are not delivery proof. Read both durable remote
-    # objects back independently before committing local delivered state.
-    snapshot = _issue_snapshot(request["issue"], state_dir, runner)
-    if snapshot.get("state") != "CLOSED":
-        raise IssueIntakeError("issue closure readback did not match")
-    timeline = _timeline(request["issue"], state_dir, runner)
-    try:
-        _revalidate_snapshot(
-            state_dir,
-            request,
-            snapshot,
-            timeline,
-            runner,
-            allow_closed=True,
-        )
-    except IssueAuthorizationChanged as exc:
-        raise IssueIntakeError("issue changed during closure readback") from exc
-    _read_delivery_receipt(state_dir, request, receipt["id"], body, runner)
-    record = _mark_delivered(state_dir, request, candidate_sha, pr_url, now)
-    return {
-        "issue": request["issue"],
-        "closed": True,
-        "receipt_reused": receipt_reused,
-        **record,
-    }

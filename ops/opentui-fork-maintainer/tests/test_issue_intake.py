@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -12,6 +13,7 @@ SPEC = importlib.util.spec_from_file_location("issue_intake", SCRIPT)
 assert SPEC and SPEC.loader
 intake = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(intake)
+delivery = intake._DELIVERY
 
 
 def issue(
@@ -24,6 +26,7 @@ def issue(
     labels: tuple[str, ...] = ("opentui", "maintainer:ready"),
 ) -> dict[str, object]:
     return {
+        "id": f"I_{number}",
         "number": number,
         "url": f"https://github.com/alt-glitch/hermes-agent/issues/{number}",
         "state": state,
@@ -82,12 +85,101 @@ class GitHub:
         self.fail_on: str | None = None
         self.comment_readback_body: str | None = None
         self.patch_ack_only = False
+        self.before_close: Callable[[], None] | None = None
+        self.after_close: Callable[[], None] | None = None
+        self.after_reopen: Callable[[], None] | None = None
+        self.fail_reopen = False
+
+    def transition(
+        self,
+        number: int,
+        state: str,
+        *,
+        actor: str = "alt-glitch",
+        rationale: str | None = None,
+    ) -> dict[str, object]:
+        event_name = "closed" if state == "CLOSED" else "reopened"
+        event_id = 1 + max(
+            (
+                int(event["id"])
+                for events in self.timelines.values()
+                for event in events
+                if isinstance(event.get("id"), int)
+            ),
+            default=0,
+        )
+        created_at = f"2026-09-06T0{min(event_id + 2, 9)}:00:00Z"
+        self.issues[number]["state"] = state
+        self.issues[number]["closedAt"] = created_at if state == "CLOSED" else None
+        event = {
+            "id": event_id,
+            "event": event_name,
+            "actor": {"login": actor},
+            "created_at": created_at,
+        }
+        if rationale is not None:
+            event["rationale"] = rationale
+        self.timelines.setdefault(number, []).append(event)
+        return event
 
     def run(self, argv: list[str], _cwd: Path) -> str:
         self.calls.append(argv)
         route = " ".join(argv)
         if self.fail_on and self.fail_on in route:
             raise intake.IssueIntakeError("simulated API failure")
+        if "graphql" in argv and "mutation CloseIssue" in route:
+            issue_id = next(
+                value.split("=", 1)[1]
+                for value in argv
+                if value.startswith("issue=")
+            )
+            number = next(
+                number
+                for number, value in self.issues.items()
+                if value["id"] == issue_id
+            )
+            marker = next(
+                value.split("=", 1)[1]
+                for value in argv
+                if value.startswith("marker=")
+            )
+            if self.before_close is not None:
+                before_close, self.before_close = self.before_close, None
+                before_close()
+            transition = None
+            if not self.patch_ack_only and self.issues[number]["state"] != "CLOSED":
+                transition = self.transition(number, "CLOSED", rationale=marker)
+            nodes = [
+                {
+                    "__typename": "ClosedEvent",
+                    "id": f"EV_{event['id']}",
+                    "createdAt": event["created_at"],
+                    "actor": event["actor"],
+                    "intent": {"rationale": event.get("rationale")},
+                }
+                for event in self.timelines[number]
+                if event.get("event") == "closed"
+            ][-20:]
+            payload = {
+                "data": {
+                    "closeIssue": {
+                        "clientMutationId": marker,
+                        "issue": {
+                            "number": number,
+                            "state": "CLOSED",
+                            "stateReason": "COMPLETED",
+                            "closedAt": self.issues[number].get("closedAt"),
+                            "timelineItems": {"nodes": nodes},
+                        },
+                    }
+                }
+            }
+            if self.patch_ack_only:
+                payload["data"]["closeIssue"]["issue"]["closedAt"] = None
+            if self.after_close is not None:
+                after_close, self.after_close = self.after_close, None
+                after_close()
+            return json.dumps(payload)
         if "graphql" in argv:
             raw = next(value for value in argv if value.startswith("number="))
             number = int(raw.split("=", 1)[1])
@@ -149,9 +241,38 @@ class GitHub:
             return json.dumps({"id": comment_id, "body": body})
         if "--method PATCH" in route:
             number = int(route.split("/issues/", 1)[1].split(" ", 1)[0])
+            requested_state = next(
+                value.split("=", 1)[1]
+                for value in argv
+                if value.startswith("state=")
+            )
+            if requested_state == "open" and self.fail_reopen:
+                raise intake.IssueIntakeError("simulated reopen failure")
+            if requested_state == "closed" and self.before_close is not None:
+                before_close, self.before_close = self.before_close, None
+                before_close()
+            transition = None
             if not self.patch_ack_only:
-                self.issues[number]["state"] = "CLOSED"
-            return json.dumps({"state": "closed", "number": number})
+                target = "CLOSED" if requested_state == "closed" else "OPEN"
+                if self.issues[number]["state"] != target:
+                    transition = self.transition(number, target)
+            response = {
+                "state": requested_state,
+                "number": number,
+                "closed_at": self.issues[number].get("closedAt"),
+                "closed_by": {"login": "alt-glitch"},
+                "state_reason": "completed" if requested_state == "closed" else "reopened",
+                "updated_at": (
+                    transition["created_at"] if transition is not None else None
+                ),
+            }
+            if requested_state == "closed" and self.after_close is not None:
+                after_close, self.after_close = self.after_close, None
+                after_close()
+            if requested_state == "open" and self.after_reopen is not None:
+                after_reopen, self.after_reopen = self.after_reopen, None
+                after_reopen()
+            return json.dumps(response)
         raise AssertionError(f"unexpected command: {argv}")
 
 
@@ -374,7 +495,7 @@ def test_delivery_closes_only_after_exact_receipt_and_is_idempotent(
     assert request is not None
     candidate = "a" * 40
     pr_url = "https://github.com/alt-glitch/hermes-agent/pull/88"
-    body = intake._delivery_body(request, candidate, pr_url)
+    body = delivery.delivery_body(request, candidate, pr_url)
     github.comments[41] = [
         {
             "id": 7,
@@ -386,7 +507,7 @@ def test_delivery_closes_only_after_exact_receipt_and_is_idempotent(
         },
         {
             "id": 8,
-            "body": f"Untrusted prefix\n{intake._delivery_marker(request, candidate)}",
+            "body": f"Untrusted prefix\n{delivery.delivery_marker(request, candidate)}",
             "url": "https://api.github.com/repos/alt-glitch/hermes-agent/issues/comments/8",
             "issue_url": "https://api.github.com/repos/alt-glitch/hermes-agent/issues/41",
             "html_url": "https://github.com/alt-glitch/hermes-agent/issues/41#issuecomment-8",
@@ -416,12 +537,12 @@ def test_delivery_closes_only_after_exact_receipt_and_is_idempotent(
     assert len(github.comments[41]) == 3
     assert github.issues[41]["state"] == "CLOSED"
     assert any("/issues/comments/" in " ".join(call) for call in github.calls)
-    patch_index = next(
+    close_index = next(
         index
         for index, call in enumerate(github.calls)
-        if "--method PATCH" in " ".join(call)
+        if "mutation CloseIssue" in " ".join(call)
     )
-    assert any("graphql" in call for call in github.calls[patch_index + 1 :])
+    assert any("graphql" in call for call in github.calls[close_index + 1 :])
     state = json.loads((tmp_path / "issue-intake-state.json").read_text())
     assert state["issues"]["41"]["status"] == "delivered"
     assert state["issues"]["41"]["candidate_sha"] == candidate
@@ -434,7 +555,7 @@ def test_interrupted_issue_close_reuses_receipt_without_duplicate_comment(
     github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
     request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
     assert request is not None
-    github.fail_on = "--method PATCH"
+    github.fail_on = "mutation CloseIssue"
     with pytest.raises(intake.IssueIntakeError, match="failure"):
         intake.finalize_delivered_issue(
             tmp_path,
@@ -459,14 +580,25 @@ def test_interrupted_issue_close_reuses_receipt_without_duplicate_comment(
     assert github.issues[41]["state"] == "CLOSED"
 
 
-def test_auto_closed_linked_issue_gets_receipt_without_second_close(
-    tmp_path: Path,
+@pytest.mark.parametrize("authorization_changed", [False, True])
+def test_already_closed_issue_is_never_reopened(
+    tmp_path: Path, authorization_changed: bool
 ) -> None:
     current = issue(41)
-    github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
+    timeline = [labeled(1, "alt-glitch")]
+    github = GitHub([current], {41: timeline})
     request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
     assert request is not None
-    current["state"] = "CLOSED"
+    github.transition(41, "CLOSED", actor="release-captain")
+    if authorization_changed:
+        timeline.append(
+            labeled(
+                3,
+                "alt-glitch",
+                created="2026-09-06T06:00:00Z",
+                event="unlabeled",
+            )
+        )
 
     result = intake.finalize_delivered_issue(
         tmp_path,
@@ -478,8 +610,16 @@ def test_auto_closed_linked_issue_gets_receipt_without_second_close(
 
     assert result["already_closed"] is True
     assert result["receipt_reused"] is False
-    assert len(github.comments[41]) == 1
-    assert not any("--method PATCH" in " ".join(call) for call in github.calls)
+    assert len(github.comments.get(41, [])) == (0 if authorization_changed else 1)
+    if authorization_changed:
+        assert result["closure_withheld_reason"] == (
+            "approved_revision_changed_or_revoked"
+        )
+    assert not any(
+        "--method PATCH" in " ".join(call)
+        or "mutation CloseIssue" in " ".join(call)
+        for call in github.calls
+    )
 
 
 @pytest.mark.parametrize("mutation", ["renamed", "revoked"])
@@ -516,6 +656,167 @@ def test_delivered_changed_issue_is_left_open_and_fresh_approval_is_eligible(
     fresh = intake.select_approved_issue(tmp_path, now=201, runner=github.run)
     assert fresh is not None
     assert fresh["approval"]["event_id"] == "11"
+
+
+@pytest.mark.parametrize("mutation", ["edited", "revoked"])
+def test_authorization_change_at_close_edge_reopens_our_close(
+    tmp_path: Path, mutation: str
+) -> None:
+    current = issue(41)
+    timeline = [labeled(1, "alt-glitch")]
+    github = GitHub([current], {41: timeline})
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    assert request is not None
+
+    def change_authorization() -> None:
+        if mutation == "edited":
+            current["body"] = "Edited at the close edge"
+            current["lastEditedAt"] = "2026-09-06T03:00:00Z"
+        else:
+            timeline.append(
+                labeled(
+                    2,
+                    "alt-glitch",
+                    created="2026-09-06T03:00:00Z",
+                    event="unlabeled",
+                )
+            )
+
+    github.before_close = change_authorization
+    result = intake.finalize_delivered_issue(
+        tmp_path,
+        request,
+        candidate_sha="a" * 40,
+        pr_url="https://github.com/alt-glitch/hermes-agent/pull/88",
+        now=200,
+        runner=github.run,
+    )
+
+    assert result["closed"] is False
+    assert result["closure_withheld_reason"] == (
+        "approved_revision_changed_or_revoked"
+    )
+    assert current["state"] == "OPEN"
+    patch_states = [
+        value
+        for call in github.calls
+        if "--method PATCH" in " ".join(call)
+        for value in call
+        if value.startswith("state=")
+    ]
+    assert sum(
+        "mutation CloseIssue" in " ".join(call) for call in github.calls
+    ) == 1
+    assert patch_states == ["state=open"]
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "later-reclose",
+        "later-reopen",
+        "concurrent-human-close",
+        "reopen-api-failure",
+        "post-reopen-reclose",
+    ],
+)
+def test_compensation_preserves_independent_state_and_durable_failures(
+    tmp_path: Path, scenario: str
+) -> None:
+    current = issue(41)
+    timeline = [labeled(1, "alt-glitch")]
+    github = GitHub([current], {41: timeline})
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    assert request is not None
+
+    def revoke() -> None:
+        timeline.append(
+            labeled(
+                2,
+                "alt-glitch",
+                created="2026-09-06T03:00:00Z",
+                event="unlabeled",
+            )
+        )
+
+    if scenario == "concurrent-human-close":
+        def revoke_and_close() -> None:
+            revoke()
+            github.transition(41, "CLOSED", actor="release-captain")
+
+        github.before_close = revoke_and_close
+    elif scenario == "later-reopen":
+        github.after_close = lambda: github.transition(
+            41, "OPEN", actor="release-captain"
+        )
+    else:
+        github.before_close = revoke
+        if scenario == "later-reclose":
+            def independent_reclose() -> None:
+                github.transition(41, "OPEN", actor="release-captain")
+                github.transition(41, "CLOSED", actor="release-captain")
+
+            github.after_close = independent_reclose
+        elif scenario == "post-reopen-reclose":
+            github.after_reopen = lambda: github.transition(
+                41, "CLOSED", actor="release-captain"
+            )
+        else:
+            github.fail_reopen = True
+
+    if scenario == "later-reopen":
+        result = intake.finalize_delivered_issue(
+            tmp_path,
+            request,
+            candidate_sha="a" * 40,
+            pr_url="https://github.com/alt-glitch/hermes-agent/pull/88",
+            now=200,
+            runner=github.run,
+        )
+        call_count = len(github.calls)
+        retried = intake.finalize_delivered_issue(
+            tmp_path,
+            request,
+            candidate_sha="a" * 40,
+            pr_url="https://github.com/alt-glitch/hermes-agent/pull/88",
+            now=201,
+            runner=github.run,
+        )
+        assert result["closure_withheld_reason"] == "later_state_transition"
+        assert retried["closure_withheld_reason"] == "later_state_transition"
+        assert len(github.calls) == call_count
+        assert current["state"] == "OPEN"
+        assert not any("state=open" in call for call in github.calls)
+        return
+
+    with pytest.raises(intake.IssueIntakeError, match="compensation"):
+        intake.finalize_delivered_issue(
+            tmp_path,
+            request,
+            candidate_sha="a" * 40,
+            pr_url="https://github.com/alt-glitch/hermes-agent/pull/88",
+            now=200,
+            runner=github.run,
+        )
+    assert current["state"] == "CLOSED"
+    if scenario not in {"reopen-api-failure", "post-reopen-reclose"}:
+        assert not any("state=open" in call for call in github.calls)
+    state = json.loads((tmp_path / "issue-intake-state.json").read_text())
+    assert state["issues"]["41"]["delivery_failure_reason"] == (
+        "closure_compensation_unresolved"
+    )
+
+    call_count = len(github.calls)
+    with pytest.raises(intake.IssueIntakeError, match="unresolved"):
+        intake.finalize_delivered_issue(
+            tmp_path,
+            request,
+            candidate_sha="a" * 40,
+            pr_url="https://github.com/alt-glitch/hermes-agent/pull/88",
+            runner=github.run,
+        )
+    assert len(github.calls) == call_count
+    assert current["state"] == "CLOSED"
 
 
 @pytest.mark.parametrize("failure", ["api", "comment-readback", "issue-readback"])

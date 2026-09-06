@@ -62,6 +62,7 @@ RUNTIME_ASSETS = (
     Path("scripts/maintainer_runtime.py"),
     Path("scripts/pr_publication.py"),
     Path("scripts/issue_intake.py"),
+    Path("scripts/issue_delivery.py"),
     Path("scripts/worktree.sh"),
 )
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
