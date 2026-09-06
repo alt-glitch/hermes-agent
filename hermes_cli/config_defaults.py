@@ -2284,6 +2284,10 @@ DEFAULT_CONFIG = {
         # server-issued credential lifetime (raising above it has no effect). 0 disables the
         # keepalive thread.
         "keepalive_interval_seconds": 900,
+        # Nous free tier: with no other provider configured, Hermes sets up a free Nous identity on
+        # first use (inference on nous/welcome + connectors) and offers `hermes auth upgrade` to
+        # sign in. false turns the free tier off entirely: nothing is set up and nothing is used.
+        "guest": True,
     },
     # Google Vertex AI (Gemini). Auth is OAuth2 from a service-account JSON or ADC, NOT an API key;
     # the credential path lives in .env (VERTEX_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS).
@@ -2360,6 +2364,11 @@ def _base_url(name, prompt_name=None):
 OPTIONAL_ENV_VARS = {
     # ── Provider (handled in provider selection, not shown in checklists) ──
     "NOUS_BASE_URL": _base_url("Nous Portal"),
+    "HERMES_ANON_API_SECRET": _env(
+        "Shared secret for the Nous free-tier sign-up endpoints while they are in their gated "
+        "integration phase (not needed once the gate is removed)",
+        "Nous free-tier shared secret (leave empty unless given one)", password=True,
+        category="provider", advanced=True),
     "OPENROUTER_API_KEY": _env("OpenRouter API key (for vision, web scraping helpers, and MoA)",
         "OpenRouter API key", url="https://openrouter.ai/keys", password=True, tools=["vision_analyze"],
         category="provider", advanced=True),

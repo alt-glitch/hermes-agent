@@ -441,6 +441,11 @@ def _finalize_routing(agent, api_mode, credential_pool):
         if agent.provider not in _AGGREGATOR_PROVIDERS:
             agent.model = normalize_model_for_provider(agent.model, agent.provider)
 
+    # Nous model policy follows the ROUTE (the welcome host serves one model); a credential-pool
+    # swap can change the route later, so ``_swap_credential`` applies the same helper again.
+    from hermes_cli.anon_auth import pin_model_for_route
+    agent.model = pin_model_for_route(agent.provider, agent.base_url, agent.model)
+
     # Auto-upgrade to Responses for GPT-5.x-style models and direct OpenAI URLs, unless
     # api_mode was explicit, the runtime is ACP (`acp://` clients route themselves, no
     # Responses surface) or Azure OpenAI (gpt-5.x on /chat/completions only). Provider

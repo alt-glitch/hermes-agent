@@ -1341,6 +1341,10 @@ def _logged_in_oauth_active_provider() -> Optional[str]:
     """auth.json ``active_provider`` when it is a registry provider that reports logged in."""
     try:
         _maybe = _load_auth_store().get("active_provider")
+        if _maybe == "nous":
+            from hermes_cli.anon_auth import guest_enabled, has_guest
+            if has_guest() and not guest_enabled():
+                return None  # nous.guest: false — the free tier is off, so a guest is not a login
         if _maybe and _maybe in PROVIDER_REGISTRY and get_auth_status(_maybe).get("logged_in"):
             return _maybe
     except Exception as e:
@@ -1460,6 +1464,15 @@ def resolve_provider(
             return "bedrock"
     except ImportError:
         pass  # boto3 not installed
+    # Nothing configured at all: set up the Nous free tier (blocking, short timeout). Success writes
+    # ``active_provider: nous``, which the OAuth rung above then picks up on every later call;
+    # failure of this fallback is not an error and falls through to the guidance below.
+    try:
+        from hermes_cli.anon_auth import ensure_portal_identity
+        if ensure_portal_identity(blocking=True) is not None:
+            return "nous"
+    except Exception as exc:
+        logger.debug("free tier setup during provider resolution skipped: %s", exc)
     raise AuthError(
         "No inference provider configured. Run 'hermes model' to choose a "
         "provider and model, or set an API key (OPENROUTER_API_KEY, "
@@ -1598,6 +1611,21 @@ def resolve_nous_access_token(
 
         lock_timeout = max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)
         with _nous_shared_store_lock(timeout_seconds=lock_timeout):
+            from hermes_cli.anon_auth import is_guest_state, refresh_guest_state
+            if is_guest_state(state):
+                # Guest seam: the anon_ credential is the identity; a first use has no access token
+                # yet and an expired one is re-exchanged. No refresh token, no quarantine.
+                access_token = state.get("access_token")
+                if isinstance(access_token, str) and access_token and not _is_expiring(
+                        state.get("expires_at"), refresh_skew_seconds):
+                    return _memo(access_token)
+                with httpx.Client(timeout=httpx.Timeout(timeout_seconds or 15.0),
+                                  headers={"Accept": "application/json"}, verify=verify) as client:
+                    refresh_guest_state(state, client)
+                persist()
+                _write_shared_nous_state(state)
+                return _memo(state["access_token"])
+
             merged_shared = _merge_shared_nous_oauth_state(state)
             access_token = state.get("access_token")
             refresh_token = state.get("refresh_token")
@@ -2179,11 +2207,21 @@ def logout_command(args) -> None:
     if not target:
         print("No provider is currently logged in.")
         return
+    if target == "nous":
+        from hermes_cli.anon_auth import FREE_TIER_NOT_SIGNED_IN, is_guest_state
+        if is_guest_state(get_provider_auth_state("nous")):
+            # Free tier is not a login; there is nothing to log out of and nothing is cleared.
+            print(FREE_TIER_NOT_SIGNED_IN)
+            return
     should_reset_config = _should_reset_config_provider_on_logout(target)
     provider_name = get_auth_provider_display_name(target)
     if not (clear_provider_auth(target) or should_reset_config):
         print(f"No auth state found for {provider_name}.")
         return
+    if target == "nous":
+        # A profile logout must not be re-adopted from the cross-profile store on the next boot.
+        from hermes_cli.auth_nous import _clear_shared_nous_state
+        _clear_shared_nous_state("logout")
     if should_reset_config:
         _reset_config_provider()
     print(f"Logged out of {provider_name}.")
