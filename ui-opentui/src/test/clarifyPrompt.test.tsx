@@ -13,7 +13,7 @@ import { describe, expect, test } from 'vitest'
 
 import { ClarifyPrompt } from '../view/prompts/clarifyPrompt.tsx'
 import { PromptOverlay } from '../view/prompts/promptOverlay.tsx'
-import type { PromptResponseMethod } from '../boundary/promptResponses.ts'
+import type { PromptResponseDisposition, PromptResponseMethod } from '../boundary/promptResponses.ts'
 import { clarifyRevisitState, type ClarifyBatchQuestion } from '../logic/clarifyBatch.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
@@ -22,15 +22,27 @@ const LONG =
   'Just analyze for now — give me the implementation plan doc (code-path refs + line numbers, screen-by-screen), no code yet.'
 
 const theme = createSessionStore().state.theme
+const ACCEPTED = { kind: 'accepted' } as const satisfies PromptResponseDisposition
+const EXPIRED = { kind: 'terminal', reason: 'expired' } as const satisfies PromptResponseDisposition
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (cause: unknown) => void } {
+  let resolve!: (value: T) => void
+  let reject!: (cause: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, reject, resolve }
+}
 
 async function mountOverlay(
   store: ReturnType<typeof createSessionStore>,
-  onRespond: (method: PromptResponseMethod, params: Record<string, unknown>) => Promise<boolean>
+  onRespond: (method: PromptResponseMethod, params: Record<string, unknown>) => Promise<PromptResponseDisposition>
 ): Promise<RenderProbe> {
   return renderProbe(
     () => (
       <ThemeProvider theme={() => theme}>
-        <PromptOverlay store={store} onRespond={onRespond} sessionId={() => 'live-1'} />
+        <PromptOverlay store={store} onRespond={onRespond} />
       </ThemeProvider>
     ),
     { height: 24, kittyKeyboard: true, width: 60 }
@@ -62,8 +74,8 @@ describe('PromptOverlay acknowledgement ownership', () => {
     const store = createSessionStore()
     store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-1' } })
     let calls = 0
-    let resolveResponse: ((value: boolean) => void) | undefined
-    const response = new Promise<boolean>(resolve => (resolveResponse = resolve))
+    let resolveResponse: ((value: PromptResponseDisposition) => void) | undefined
+    const response = new Promise<PromptResponseDisposition>(resolve => (resolveResponse = resolve))
     const h = await mountOverlay(store, () => {
       calls += 1
       return response
@@ -77,7 +89,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
       h.keys.pressEnter()
       await h.settle()
       expect(calls).toBe(1)
-      resolveResponse?.(true)
+      resolveResponse?.(ACCEPTED)
       await expect.poll(() => store.state.prompt).toBeUndefined()
       await h.settle()
       expect(store.state.prompt).toBeUndefined()
@@ -86,22 +98,147 @@ describe('PromptOverlay acknowledgement ownership', () => {
     }
   })
 
-  test('invalid acknowledgement shows an error and allows retry', async () => {
+  test('an uncertain response stays honest, does not resend, and can be dismissed', async () => {
     const store = createSessionStore()
     store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-2' } })
     let calls = 0
-    const h = await mountOverlay(store, () => Promise.resolve(++calls > 1))
+    const h = await mountOverlay(store, () => {
+      calls += 1
+      return Promise.resolve({ kind: 'uncertain', message: 'socket closed before acknowledgement' })
+    })
     try {
       h.keys.pressEnter()
       await new Promise(resolve => setTimeout(resolve, 0))
       await h.settle()
       expect(store.state.prompt?.kind).toBe('clarify')
-      expect(h.frame()).toContain('not acknowledged')
+      expect(h.frame()).toContain('delivery not confirmed')
       h.keys.pressEnter()
-      await new Promise(resolve => setTimeout(resolve, 5))
       await h.settle()
-      expect(calls).toBe(2)
+      expect(calls).toBe(1)
+      expect(store.state.prompt?.kind).toBe('clarify')
+      h.keys.pressEscape()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await h.settle()
       expect(store.state.prompt).toBeUndefined()
+      expect(store.state.messages.at(-1)?.text).toContain('delivery was not confirmed')
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('Esc dismisses a locally stalled response without waiting for the RPC', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-stalled' } })
+    const stalled = new Promise<PromptResponseDisposition>(() => {})
+    const h = await mountOverlay(store, () => stalled)
+    try {
+      h.keys.pressEnter()
+      await h.settle()
+      expect(h.frame()).toContain('sending response')
+
+      h.keys.pressEscape()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await h.settle()
+      expect(store.state.prompt).toBeUndefined()
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('Ctrl+C dismisses an errored response without claiming cancellation was delivered', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-error' } })
+    const h = await mountOverlay(store, () => Promise.reject(new Error('transport disconnected')))
+    try {
+      h.keys.pressEnter()
+      await expect.poll(() => h.frame()).toContain('delivery not confirmed')
+
+      h.keys.pressKey('c', { ctrl: true })
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await h.settle()
+      expect(store.state.prompt).toBeUndefined()
+      expect(store.state.messages.at(-1)?.text).toContain('delivery was not confirmed')
+      expect(store.state.messages.at(-1)?.text).not.toContain('cancelled')
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('a terminal obsolete response closes the blocking prompt', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-expired' } })
+    const h = await mountOverlay(store, () => Promise.resolve(EXPIRED))
+    try {
+      h.keys.pressEnter()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await h.settle()
+      expect(store.state.prompt).toBeUndefined()
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('a terminal response remains locally closable before its deferred teardown', async () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'clarify.request',
+      payload: { question: 'Choose', choices: ['A'], request_id: 'req-terminal' }
+    })
+    const response = deferred<PromptResponseDisposition>()
+    const h = await mountOverlay(store, () => response.promise)
+    try {
+      h.keys.pressEnter()
+      await h.settle()
+      response.resolve(EXPIRED)
+      await Promise.resolve()
+      h.keys.pressKey('c', { ctrl: true })
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await h.settle()
+      expect(store.state.prompt).toBeUndefined()
+      expect(store.state.messages.at(-1)?.text).toContain('expired')
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('a stale RPC settlement cannot close a replacement prompt', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'Old?', choices: ['A'], request_id: 'req-old' } })
+    const response = deferred<PromptResponseDisposition>()
+    const h = await mountOverlay(store, () => response.promise)
+    try {
+      h.keys.pressEnter()
+      await h.settle()
+      store.apply({ type: 'clarify.request', payload: { question: 'New?', choices: ['B'], request_id: 'req-new' } })
+      await h.settle()
+      response.resolve(ACCEPTED)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await h.settle()
+      expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'req-new' })
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('approval responses carry the exact request and session identities', async () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'approval.request',
+      session_id: 'live-session',
+      payload: { command: 'echo safe', description: 'test command', request_id: 'approval-exact' }
+    })
+    const sent: Array<{ method: PromptResponseMethod; params: Record<string, unknown> }> = []
+    const h = await mountOverlay(store, (method, params) => {
+      sent.push({ method, params })
+      return Promise.resolve(ACCEPTED)
+    })
+    try {
+      h.keys.pressEnter()
+      await expect.poll(() => sent).toHaveLength(1)
+      expect(sent[0]).toEqual({
+        method: 'approval.respond',
+        params: { choice: 'once', request_id: 'approval-exact', session_id: 'live-session' }
+      })
     } finally {
       h.destroy()
     }
@@ -476,7 +613,7 @@ describe('PromptOverlay — batch clarify per-question locks', () => {
     const h = await mountOverlay(store, (method, params) => {
       expect(method).toBe('clarify.respond')
       sent.push(params)
-      return Promise.resolve(true)
+      return Promise.resolve(ACCEPTED)
     })
     try {
       // q0 (choices): Enter locks 'a' → clarify.respond {question_id: 'q0'}
@@ -507,7 +644,7 @@ describe('PromptOverlay — batch clarify per-question locks', () => {
     const sent: Record<string, unknown>[] = []
     const h = await mountOverlay(store, (_method, params) => {
       sent.push(params)
-      return Promise.resolve(true)
+      return Promise.resolve(ACCEPTED)
     })
     try {
       h.keys.pressEscape()

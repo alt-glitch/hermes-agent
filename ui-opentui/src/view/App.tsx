@@ -42,7 +42,7 @@ import { PluginsHub, type PluginOps } from './overlays/pluginsHub.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
 import { SessionOrchestrator, type SessionOrchestratorOps } from './overlays/sessionOrchestrator.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
-import type { PromptResponseMethod } from '../boundary/promptResponses.ts'
+import type { PromptResponseDisposition, PromptResponseMethod } from '../boundary/promptResponses.ts'
 import { SessionInfoProvider } from './sessionInfo.tsx'
 import { StatusBar } from './statusBar.tsx'
 import { TodoPanel } from './todoPanel.tsx'
@@ -64,7 +64,10 @@ export interface AppProps {
   /** Entry observes edit end so a queue held across turn-settle can drain. */
   readonly onQueueEditChange?: (index: number | undefined) => void
   readonly onType?: (text: string, cursor: number) => void
-  readonly onRespond?: (method: PromptResponseMethod, params: Record<string, unknown>) => Promise<boolean>
+  readonly onRespond?: (
+    method: PromptResponseMethod,
+    params: Record<string, unknown>
+  ) => Promise<PromptResponseDisposition>
   readonly onResume?: (sessionId: string) => void
   readonly onActivateSession?: (sessionId: string) => void
   readonly onNewLiveSession?: () => void
@@ -75,7 +78,6 @@ export interface AppProps {
   /** Fired after the resume picker closes WITHOUT a pick (boot path: the
    *  entry creates a fresh session when none exists yet). */
   readonly onSessionPickerClosed?: () => void
-  readonly sessionId?: () => string | undefined
   readonly history?: ComposerHistory
   readonly onImagePaste?: (hotkey?: boolean) => void | string | Promise<void | string | undefined>
   readonly onImageDetach?: (path: string) => void
@@ -101,9 +103,9 @@ export interface AppProps {
 }
 
 const NOOP = () => {}
-const NOOP_RESPOND = () => Promise.resolve(false)
+const NOOP_RESPOND = (): Promise<PromptResponseDisposition> =>
+  Promise.resolve({ kind: 'uncertain', message: 'gateway response handler is unavailable' })
 const NOOP_RESUME = () => {}
-const NO_SESSION = () => undefined
 const NOOP_JOURNEY_OPS: JourneyOps = {
   frames: () => Promise.resolve({ axis: { start: '', end: '' }, count: 0, frames: [], legend: [], summary: [] }),
   detail: () => Promise.resolve({ ok: false, message: 'unavailable' }),
@@ -272,11 +274,7 @@ export function App(props: AppProps) {
                     }
                   >
                     <Match when={blocked()}>
-                      <PromptOverlay
-                        store={props.store}
-                        onRespond={props.onRespond ?? NOOP_RESPOND}
-                        sessionId={props.sessionId ?? NO_SESSION}
-                      />
+                      <PromptOverlay store={props.store} onRespond={props.onRespond ?? NOOP_RESPOND} />
                     </Match>
                     {/* modal widget app: owns every keypress while open (the
                         composer is replaced, Picker-style); its reducer closes it. */}

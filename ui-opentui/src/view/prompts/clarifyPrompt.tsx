@@ -12,7 +12,7 @@
  * Navigation: indices 0..N-1 are the choices; index N is the inline custom
  * input. Down past the last choice lands on the input (and focuses it); Up from
  * the input returns to the list. Enter on a choice answers it; Enter in the
- * input submits the typed text. Esc/Ctrl+C cancels (empty answer). When there
+ * input submits the typed text. The parent overlay owns Esc/Ctrl+C. When there
  * are no choices the input is the only control and is focused immediately.
  * Answered via `clarify.respond {answer, request_id}` (the caller wires onAnswer).
  *
@@ -26,8 +26,8 @@
  * put the cursor back on their row; typed answers land on the input row with
  * the text staged for editing — clarifyRevisitState). A locked answer renders
  * on its own indented line under its question (muted italic "(skipped)" for an
- * empty lock). Esc/Ctrl+C cancels the WHOLE batch (respond without
- * question_id). multi_select rides the state untouched — no checkbox UX yet
+ * empty lock). PromptOverlay owns Esc/Ctrl+C for both cancellation and an
+ * uncertain local dismissal. multi_select rides the state untouched — no checkbox UX yet
  * (same deliberate gap as Ink).
  */
 import { type InputRenderable } from '@opentui/core'
@@ -46,7 +46,9 @@ export function ClarifyPrompt(props: {
   /** Batch mode: answers already locked (qid → answer). */
   answers?: Record<string, string> | undefined
   onAnswer: (answer: string) => void
-  onCancel: () => void
+  /** Standalone harnesses may own close directly; PromptOverlay omits this. */
+  onCancel?: (() => void) | undefined
+  statusHint?: string | undefined
   /** Batch mode: lock ONE question's answer (clarify.respond + question_id). */
   onQuestionAnswer?: (qid: string, answer: string) => void
 }) {
@@ -77,6 +79,9 @@ export function ClarifyPrompt(props: {
   // pre-fills it so Enter edits the earlier text instead of starting blank.
   const [staged, setStaged] = createSignal('')
   let inputRef: InputRenderable | undefined
+  const batchAnswerSignature = () =>
+    JSON.stringify(questions().map(q => [q.qid, Object.hasOwn(answers(), q.qid), answers()[q.qid]]))
+  let answerSignature = batchAnswerSignature()
 
   const onInput = () => selected() === inputIndex()
 
@@ -85,6 +90,24 @@ export function ClarifyPrompt(props: {
   createEffect(() => {
     if (onInput()) inputRef?.focus()
     else inputRef?.blur()
+  })
+
+  // A per-question RPC keeps this component mounted while the store records
+  // the accepted lock. Move to the next unanswered question when that answer
+  // map changes; older implementations got this remount implicitly by hiding
+  // the prompt during the RPC, which also surrendered Esc/Ctrl+C ownership.
+  createEffect(() => {
+    const nextSignature = batchAnswerSignature()
+    if (nextSignature === answerSignature) return
+    answerSignature = nextSignature
+    const next = questions().findIndex(q => answers()[q.qid] === undefined)
+    if (next < 0) return
+    const q = questions()[next]
+    const restored = clarifyRevisitState(q?.choices ?? [], q ? answers()[q.qid] : undefined)
+    setStaged(restored.custom)
+    setActive(next)
+    setSelected(restored.selected)
+    if (inputRef) inputRef.value = restored.custom
   })
 
   /** Route an answer: per-question lock in batch mode, plain answer otherwise. */
@@ -121,7 +144,7 @@ export function ClarifyPrompt(props: {
   }
 
   useKeyboard(key => {
-    if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+    if (props.onCancel && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {
       props.onCancel()
       return
     }
@@ -245,9 +268,10 @@ export function ClarifyPrompt(props: {
             {choiceRows()}
 
             <text fg={theme().color.muted}>
-              {onInput()
-                ? '↑↓ select · Enter send · Esc cancel'
-                : `↑↓ select · Enter choose · 1-${Math.min(choices().length, 10)} quick pick · Esc cancel`}
+              {props.statusHint ??
+                (onInput()
+                  ? '↑↓ select · Enter send · Esc/Ctrl+C send cancellation'
+                  : `↑↓ select · Enter choose · 1-${Math.min(choices().length, 10)} quick pick · Esc/Ctrl+C send cancellation`)}
             </text>
           </>
         }
@@ -298,7 +322,8 @@ export function ClarifyPrompt(props: {
         </box>
 
         <text fg={theme().color.muted}>
-          {`${answeredCount()}/${questions().length} answered · ↑↓ select · Enter ${lockVerb()} · Tab/Shift+Tab switch question · Esc cancel all`}
+          {props.statusHint ??
+            `${answeredCount()}/${questions().length} answered · ↑↓ select · Enter ${lockVerb()} · Tab/Shift+Tab switch question · Esc/Ctrl+C cancel all`}
         </text>
       </Show>
     </box>

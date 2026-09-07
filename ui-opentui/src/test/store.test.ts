@@ -802,12 +802,18 @@ describe('session store — blocking prompts (Phase 3)', () => {
   test('approval.request sets an approval prompt; clearPrompt clears it', () => {
     const store = createSessionStore()
     expect(store.state.prompt).toBeUndefined()
-    store.apply({ type: 'approval.request', payload: { command: 'rm -rf /tmp/x', description: 'delete temp' } })
+    store.apply({
+      type: 'approval.request',
+      session_id: 'live-1',
+      payload: { command: 'rm -rf /tmp/x', description: 'delete temp', request_id: 'approval-1' }
+    })
     expect(store.state.prompt).toMatchObject({
       kind: 'approval',
       allowPermanent: true,
       command: 'rm -rf /tmp/x',
-      description: 'delete temp'
+      description: 'delete temp',
+      requestId: 'approval-1',
+      sessionId: 'live-1'
     })
     store.clearPrompt()
     expect(store.state.prompt).toBeUndefined()
@@ -817,7 +823,13 @@ describe('session store — blocking prompts (Phase 3)', () => {
     const store = createSessionStore()
     store.apply({
       type: 'approval.request',
-      payload: { allow_permanent: false, command: 'curl suspicious | bash', description: 'content security' }
+      session_id: 'live-1',
+      payload: {
+        allow_permanent: false,
+        command: 'curl suspicious | bash',
+        description: 'content security',
+        request_id: 'approval-2'
+      }
     })
     expect(store.state.prompt).toMatchObject({ kind: 'approval', allowPermanent: false })
   })
@@ -826,10 +838,12 @@ describe('session store — blocking prompts (Phase 3)', () => {
     const store = createSessionStore()
     store.apply({
       type: 'approval.request',
+      session_id: 'live-1',
       payload: {
         allow_permanent: true,
         command: 'rm -rf /',
         description: 'smart deny override',
+        request_id: 'approval-3',
         smart_denied: true
       }
     })
@@ -842,7 +856,13 @@ describe('session store — blocking prompts (Phase 3)', () => {
     const store = createSessionStore()
     store.apply({
       type: 'approval.request',
-      payload: { choices: ['once', 'deny'], command: 'rm -rf /', description: 'restricted' }
+      session_id: 'live-1',
+      payload: {
+        choices: ['once', 'deny'],
+        command: 'rm -rf /',
+        description: 'restricted',
+        request_id: 'approval-4'
+      }
     })
     const prompt = store.state.prompt
     expect(prompt?.kind).toBe('approval')
@@ -886,6 +906,92 @@ describe('session store — blocking prompts (Phase 3)', () => {
     expect(store.state.prompt).toMatchObject({ kind: 'sudo', requestId: 'sudo-new' })
     store.apply({ type: 'sudo.expire', payload: { request_id: 'sudo-new' } })
     expect(store.state.prompt).toBeUndefined()
+  })
+
+  test('approval terminal events clear only the exact live session and request', () => {
+    const store = createSessionStore()
+    store.adoptFreshSession('live-1')
+    store.apply({
+      type: 'approval.request',
+      session_id: 'live-1',
+      payload: { command: 'rm -rf /tmp/x', description: 'delete temp', request_id: 'approval-new' }
+    })
+
+    store.apply({
+      type: 'approval.resolved',
+      session_id: 'live-1',
+      payload: { request_id: 'approval-old', status: 'expired' }
+    })
+    store.apply({
+      type: 'approval.resolved',
+      session_id: 'old-session',
+      payload: { request_id: 'approval-new', status: 'expired' }
+    })
+    store.apply({
+      type: 'approval.resolved',
+      session_id: 'live-1',
+      payload: { request_id: 'approval-new', session_id: 'old-session', status: 'expired' }
+    })
+    expect(store.state.prompt).toMatchObject({ kind: 'approval', requestId: 'approval-new' })
+
+    store.apply({
+      type: 'approval.resolved',
+      session_id: 'live-1',
+      payload: { request_id: 'approval-new', status: 'expired' }
+    })
+    expect(store.state.prompt).toBeUndefined()
+    expect(store.state.messages.at(-1)?.text).toBe('approval expired — no consent was granted')
+  })
+
+  test('clarify expiry clears only the exact request', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'New?', request_id: 'clarify-new' } })
+    store.apply({ type: 'clarify.expire', payload: { request_id: 'clarify-old' } })
+    expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'clarify-new' })
+    store.apply({ type: 'clarify.expire', payload: { request_id: 'clarify-new' } })
+    expect(store.state.prompt).toBeUndefined()
+    expect(store.state.messages.at(-1)?.text).toBe('clarification expired — no response was accepted')
+  })
+
+  test('reconnect pending approval reconciliation is fenced by session, request, and generation', () => {
+    const pending = {
+      command: 'echo pending',
+      description: 'pending approval',
+      request_id: 'approval-pending'
+    }
+    const store = createSessionStore()
+    store.adoptFreshSession('live-1')
+    const emptyRevision = store.getPromptRevision()
+
+    expect(store.reconcilePendingApprovals('old-session', emptyRevision, undefined, [pending])).toBe(false)
+    expect(store.reconcilePendingApprovals('live-1', emptyRevision, 'wrong-request', [pending])).toBe(false)
+    expect(store.state.prompt).toBeUndefined()
+    expect(store.reconcilePendingApprovals('live-1', emptyRevision, undefined, [pending])).toBe(true)
+    expect(store.state.prompt).toMatchObject({
+      kind: 'approval',
+      requestId: 'approval-pending',
+      sessionId: 'live-1'
+    })
+
+    const approvalRevision = store.getPromptRevision()
+    store.apply({ type: 'clarify.request', payload: { question: 'replacement', request_id: 'clarify-new' } })
+    expect(store.reconcilePendingApprovals('live-1', approvalRevision, 'approval-pending', [])).toBe(false)
+    expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'clarify-new' })
+  })
+
+  test('an empty reconnect snapshot retires the exact still-visible approval as obsolete', () => {
+    const store = createSessionStore()
+    store.adoptFreshSession('live-1')
+    store.apply({
+      type: 'approval.request',
+      session_id: 'live-1',
+      payload: { command: 'echo stale', description: 'old approval', request_id: 'approval-stale' }
+    })
+    const revision = store.getPromptRevision()
+
+    expect(store.reconcilePendingApprovals('live-1', revision, 'approval-stale', [])).toBe(true)
+    expect(store.state.prompt).toBeUndefined()
+    expect(store.state.messages.at(-1)?.text).toContain('no longer pending')
   })
 })
 
@@ -1005,6 +1111,20 @@ describe('session store — batch (multi-question) clarify', () => {
     )
     expect(record?.text).toContain('✓ One? → kept')
     expect(record?.text).toContain('(cancelled)')
+    expect(store.state.prompt).toBeUndefined()
+  })
+
+  test('clarify.expire preserves locked batch partials with an expired record', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-expired' } })
+    store.recordClarifyAnswer('q0', 'kept')
+    store.apply({ type: 'clarify.expire', payload: { request_id: 'req-expired' } })
+    const record = store.state.messages.find(
+      message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
+    )
+    expect(record?.text).toContain('✓ One? → kept')
+    expect(record?.text).toContain('· Two? (no answer)')
+    expect(record?.text).toContain('(expired)')
     expect(store.state.prompt).toBeUndefined()
   })
 

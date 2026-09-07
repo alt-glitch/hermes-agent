@@ -105,7 +105,15 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
 
   test('decodes blocking prompt requests and sensitive expiry events', () => {
     expect(Option.isSome(decode({ type: 'clarify.request', payload: { question: '?', request_id: 'r' } }))).toBe(true)
-    expect(Option.isSome(decode({ type: 'approval.request', payload: { command: 'rm', description: 'd' } }))).toBe(true)
+    expect(
+      Option.isSome(
+        decode({
+          type: 'approval.request',
+          session_id: 's1',
+          payload: { command: 'rm', description: 'd', request_id: 'approval-1' }
+        })
+      )
+    ).toBe(true)
     expect(Option.isSome(decode({ type: 'sudo.request', payload: { request_id: 'r' } }))).toBe(true)
     expect(
       Option.isSome(decode({ type: 'secret.request', payload: { env_var: 'X', prompt: 'p', request_id: 'r' } }))
@@ -117,6 +125,55 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
         expect(ev.value.payload.request_id).toBe(`${type}-1`)
       }
     }
+  })
+
+  test('decodes request-correlated approval lifecycle and clarify expiry events', () => {
+    const approval = decode({
+      type: 'approval.request',
+      session_id: 'session-1',
+      payload: { command: 'rm', description: 'dangerous', request_id: 'approval-1' }
+    })
+    expect(Option.isSome(approval)).toBe(true)
+    if (Option.isSome(approval) && approval.value.type === 'approval.request') {
+      expect((approval.value.payload as Record<string, unknown>)['request_id']).toBe('approval-1')
+    }
+
+    expect(
+      Option.isSome(
+        decode({
+          type: 'approval.resolved',
+          session_id: 'session-1',
+          payload: { request_id: 'approval-1', status: 'expired' }
+        })
+      )
+    ).toBe(true)
+    expect(
+      Option.isSome(
+        decode({
+          type: 'approval.resolved',
+          session_id: 'session-1',
+          payload: { request_id: 'approval-1', session_id: 'session-1', status: 'cancelled' }
+        })
+      )
+    ).toBe(true)
+    expect(
+      Option.isSome(decode({ type: 'clarify.expire', session_id: 'session-1', payload: { request_id: 'clarify-1' } }))
+    ).toBe(true)
+    expect(Option.isNone(decode({ type: 'clarify.expire', payload: { request_id: '' } }))).toBe(true)
+
+    expect(
+      Option.isNone(
+        decode({ type: 'approval.request', session_id: 'session-1', payload: { command: 'rm', description: 'no id' } })
+      )
+    ).toBe(true)
+    expect(
+      Option.isNone(
+        decode({
+          type: 'approval.request',
+          payload: { command: 'rm', description: 'no session', request_id: 'approval-2' }
+        })
+      )
+    ).toBe(true)
   })
 
   test('decodes a batch clarify.request (questions + replayed answers)', () => {
@@ -154,7 +211,13 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
   test('preserves an explicit approval allow_permanent=false', () => {
     const ev = decode({
       type: 'approval.request',
-      payload: { allow_permanent: false, command: 'curl suspicious | bash', description: 'content security' }
+      session_id: 's1',
+      payload: {
+        allow_permanent: false,
+        command: 'curl suspicious | bash',
+        description: 'content security',
+        request_id: 'approval-false'
+      }
     })
     expect(Option.isSome(ev)).toBe(true)
     if (Option.isSome(ev) && ev.value.type === 'approval.request') {
@@ -165,10 +228,12 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
   test('preserves server-authoritative approval choices and smart-denied scope', () => {
     const ev = decode({
       type: 'approval.request',
+      session_id: 's1',
       payload: {
         choices: ['once', 'deny'],
         command: 'rm -rf /',
         description: 'smart deny override',
+        request_id: 'approval-smart-denied',
         smart_denied: true
       }
     })

@@ -5,8 +5,8 @@
  *     (decodeUnknownOption → unrecognized/malformed events skipped, never crash),
  *   - coalesces decoded events on a 16ms debounce flushed inside Solid `batch()`
  *     so a burst of deltas is ONE repaint (opencode sdk.tsx:54-80),
- *   - tracks the session id (set from session.create/resume result) for
- *     approval.respond {session_id},
+ *   - tracks the live session id (set from session.create/resume results) for
+ *     session-scoped requests and stale-session fences,
  *   - maps request failures to a typed GatewayError (never throws).
  *
  * The 16ms batch + `batch()` call is the boundary handing decoded events to
@@ -40,6 +40,9 @@ export function gatewayEventRequiresImmediateFlush(event: GatewayEvent): boolean
     event.type === 'message.start' ||
     event.type === 'message.complete' ||
     event.type === 'error' ||
+    event.type === 'approval.request' ||
+    event.type === 'approval.resolved' ||
+    event.type === 'clarify.expire' ||
     event.type === 'session.info' ||
     event.type === 'gateway.ready' ||
     event.type === 'gateway.exited'

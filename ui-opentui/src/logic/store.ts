@@ -14,6 +14,7 @@
 import { Option } from 'effect'
 import { createStore, produce } from 'solid-js/store'
 
+import type { ApprovalRequestPayload } from '../boundary/promptResponses.ts'
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
 import type { BillingOverlayState, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { CommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
@@ -218,7 +219,8 @@ export type ConfirmRequest = string | ConfirmSpec
 
 /**
  * A BLOCKING interactive request from the agent (spec §8 #6 — unhandled = deadlock).
- * Each is answered via the matching `*.respond` RPC; Esc/Ctrl+C sends deny/empty.
+ * Each is answered via the matching `*.respond` RPC. Esc/Ctrl+C initiates a
+ * deny/empty response while idle and can dismiss locally if delivery stalls.
  */
 export type ActivePrompt =
   | {
@@ -232,11 +234,28 @@ export type ActivePrompt =
        *  replay, extended by recordClarifyAnswer as each lock is acknowledged. */
       answers?: Record<string, string>
     }
-  | { kind: 'approval'; allowPermanent: ApprovalChoicePolicy; command: string; description: string }
+  | {
+      kind: 'approval'
+      allowPermanent: ApprovalChoicePolicy
+      command: string
+      description: string
+      requestId: string
+      sessionId: string
+    }
   | { kind: 'sudo'; requestId: string }
   | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
   | { kind: 'confirm'; spec: ConfirmSpec; onConfirm: () => void }
+
+export type PromptSettlement = 'accepted' | 'cancelled' | 'expired' | 'obsolete' | 'dismissed-unconfirmed'
+
+const PROMPT_LABEL: Record<ActivePrompt['kind'], string> = {
+  approval: 'approval',
+  clarify: 'clarification',
+  confirm: 'confirmation',
+  secret: 'secret prompt',
+  sudo: 'sudo prompt'
+}
 
 /** A full-screen scrollable text viewer (long slash output: /status, /logs, …). */
 export interface PagerState {
@@ -1168,6 +1187,34 @@ export function createSessionStore(options?: SessionStoreOptions) {
     statusBarFields: null
   })
 
+  // Every blocking-prompt replacement advances this revision. Async pending
+  // snapshots and RPC settlements must present the revision they captured,
+  // so an older continuation cannot mutate a newer prompt with the same kind.
+  let promptRevision = 0
+
+  function approvalPrompt(
+    payload: ApprovalRequestPayload,
+    sessionId: string
+  ): Extract<ActivePrompt, { kind: 'approval' }> {
+    return {
+      kind: 'approval',
+      allowPermanent: approvalPolicy({
+        ...(payload.allow_permanent === undefined ? {} : { allowPermanent: payload.allow_permanent }),
+        ...(payload.choices === undefined ? {} : { choices: payload.choices }),
+        ...(payload.smart_denied === undefined ? {} : { smartDenied: payload.smart_denied })
+      }),
+      command: payload.command,
+      description: payload.description,
+      requestId: payload.request_id,
+      sessionId
+    }
+  }
+
+  function replacePrompt(next: ActivePrompt): void {
+    promptRevision += 1
+    setState('prompt', next)
+  }
+
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
   // text part doesn't remount/re-tokenize it).
   let partSeq = 0
@@ -1941,6 +1988,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     const info: SessionInfo = { startedAt: startedAtMs, ...(rawInfo ? readInfoPatch(rawInfo) : {}) }
     const capped = snapshot.length > MESSAGE_CAP ? snapshot.slice(-MESSAGE_CAP) : snapshot
     const latestTodos = todoSnapshotFromState(rawTodoState)
+    promptRevision += 1
 
     setState(
       produce(draft => {
@@ -2133,7 +2181,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
   /** Open a local Y/N confirm dialog (non-gateway; e.g. /clear). */
   function setConfirm(request: ConfirmRequest, onConfirm: () => void) {
     const spec = typeof request === 'string' ? { title: request } : request
-    setState('prompt', { kind: 'confirm', spec, onConfirm })
+    replacePrompt({ kind: 'confirm', spec, onConfirm })
   }
 
   /** Open the pager overlay (long slash output: /status, /logs, …). */
@@ -3150,8 +3198,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // are filtered; when none survive, the single-question payload fields
         // stay authoritative (backward compatibility with the plain shape).
         const batch = normalizeClarifyQuestions(event.payload.questions)
-        setState(
-          'prompt',
+        replacePrompt(
           batch.length
             ? {
                 kind: 'clarify',
@@ -3174,36 +3221,44 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'approval.request':
-        setState('prompt', {
-          kind: 'approval',
-          // Explicit choices are authoritative. smart_denied is the additive
-          // fallback for gateways that send the marker without choices; older
-          // gateways retain the historical allow_permanent-derived catalog.
-          allowPermanent: approvalPolicy({
-            ...(event.payload.allow_permanent === undefined ? {} : { allowPermanent: event.payload.allow_permanent }),
-            ...(event.payload.choices === undefined ? {} : { choices: event.payload.choices }),
-            ...(event.payload.smart_denied === undefined ? {} : { smartDenied: event.payload.smart_denied })
-          }),
-          command: event.payload.command,
-          description: event.payload.description
-        })
+        replacePrompt(approvalPrompt(event.payload, event.session_id))
+        break
+      case 'approval.resolved':
+        if (
+          (event.payload.session_id === undefined || event.payload.session_id === event.session_id) &&
+          state.sessionId === event.session_id &&
+          state.prompt?.kind === 'approval' &&
+          state.prompt.sessionId === event.session_id &&
+          state.prompt.requestId === event.payload.request_id
+        ) {
+          settlePrompt(state.prompt, event.payload.status === 'resolved' ? 'accepted' : event.payload.status)
+        }
         break
       case 'sudo.request':
-        setState('prompt', { kind: 'sudo', requestId: event.payload.request_id })
+        replacePrompt({ kind: 'sudo', requestId: event.payload.request_id })
         break
       case 'secret.request':
-        setState('prompt', {
+        replacePrompt({
           kind: 'secret',
           envVar: event.payload.env_var,
           prompt: event.payload.prompt,
           requestId: event.payload.request_id
         })
         break
+      case 'clarify.expire':
+        if (state.prompt?.kind === 'clarify' && state.prompt.requestId === event.payload.request_id) {
+          settlePrompt(state.prompt, 'expired')
+        }
+        break
       case 'sudo.expire':
-        if (state.prompt?.kind === 'sudo' && state.prompt.requestId === event.payload.request_id) clearPrompt()
+        if (state.prompt?.kind === 'sudo' && state.prompt.requestId === event.payload.request_id) {
+          settlePrompt(state.prompt, 'expired')
+        }
         break
       case 'secret.expire':
-        if (state.prompt?.kind === 'secret' && state.prompt.requestId === event.payload.request_id) clearPrompt()
+        if (state.prompt?.kind === 'secret' && state.prompt.requestId === event.payload.request_id) {
+          settlePrompt(state.prompt, 'expired')
+        }
         break
       // ── subagents (agents dashboard) — track the delegation tree by id ──
       case 'subagent.spawn_requested':
@@ -3403,9 +3458,74 @@ export function createSessionStore(options?: SessionStoreOptions) {
     onCommittedEvent?.(event)
   }
 
-  /** Clear the active blocking prompt (after it's answered/cancelled). */
-  function clearPrompt(): void {
+  /** Clear only the prompt instance the caller still owns. */
+  function clearPrompt(expected?: ActivePrompt): boolean {
+    if (expected !== undefined && state.prompt !== expected) return false
+    if (state.prompt === undefined) return false
+    promptRevision += 1
     setState('prompt', undefined)
+    return true
+  }
+
+  /**
+   * Settle one exact prompt with user-facing semantics that never turn local
+   * dismissal or transport ambiguity into a delivered answer.
+   */
+  function settlePrompt(expected: ActivePrompt, settlement: PromptSettlement): boolean {
+    if (state.prompt !== expected) return false
+    if (expected.kind === 'clarify' && expected.questions?.length && settlement !== 'accepted') {
+      const reason = settlement === 'dismissed-unconfirmed' ? 'dismissed locally — delivery not confirmed' : settlement
+      return flushAbandonedClarify(reason, expected.requestId)
+    }
+
+    const label = PROMPT_LABEL[expected.kind]
+    if (settlement === 'cancelled') {
+      pushSystem(expected.kind === 'approval' ? 'approval denied — no consent was granted' : `${label} cancelled`)
+    } else if (settlement === 'expired') {
+      pushSystem(
+        expected.kind === 'approval'
+          ? 'approval expired — no consent was granted'
+          : `${label} expired — no response was accepted`
+      )
+    } else if (settlement === 'obsolete') {
+      pushSystem(`${label} is no longer pending — this response was not accepted`)
+    } else if (settlement === 'dismissed-unconfirmed') {
+      pushSystem(`${label} dismissed locally — delivery was not confirmed; no automatic resend was attempted`)
+    }
+    return clearPrompt(expected)
+  }
+
+  function getPromptRevision(): number {
+    return promptRevision
+  }
+
+  function getPromptRequestId(): string | undefined {
+    const prompt = state.prompt
+    return prompt && 'requestId' in prompt ? prompt.requestId : undefined
+  }
+
+  /**
+   * Apply one authoritative approval.pending FIFO snapshot only if the active
+   * session and prompt generation still match the request that fetched it.
+   */
+  function reconcilePendingApprovals(
+    sessionId: string,
+    expectedRevision: number,
+    expectedRequestId: string | undefined,
+    approvals: readonly ApprovalRequestPayload[]
+  ): boolean {
+    if (state.sessionId !== sessionId || promptRevision !== expectedRevision) return false
+    const current = state.prompt
+    if (getPromptRequestId() !== expectedRequestId) return false
+    if (current !== undefined && current.kind !== 'approval') return false
+    const pending = approvals[0]
+    if (!pending) return current?.kind === 'approval' ? settlePrompt(current, 'obsolete') : true
+    if (!pending.request_id.trim()) return false
+    if (current?.kind === 'approval' && current.requestId === pending.request_id && current.sessionId === sessionId) {
+      return true
+    }
+    replacePrompt(approvalPrompt(pending, sessionId))
+    return true
   }
 
   /** Lock one batch-clarify answer locally (call AFTER its per-question
@@ -3436,13 +3556,14 @@ export function createSessionStore(options?: SessionStoreOptions) {
    *  overlay. No-op for single-question prompts and already-flushed batches.
    *  Fired by the clarify tool.complete / message.complete backstops with
    *  'timed out', and by the Esc cancel-all path with 'cancelled'. */
-  function flushAbandonedClarify(reason: string): void {
+  function flushAbandonedClarify(reason: string, expectedRequestId?: string): boolean {
     const prompt = state.prompt
-    if (prompt?.kind !== 'clarify' || !prompt.questions?.length) return
-    if (persistedAbandonedClarify.has(prompt.requestId)) return
+    if (prompt?.kind !== 'clarify' || !prompt.questions?.length) return false
+    if (expectedRequestId !== undefined && prompt.requestId !== expectedRequestId) return false
+    if (persistedAbandonedClarify.has(prompt.requestId)) return false
     persistedAbandonedClarify.add(prompt.requestId)
     pushSystem(formatAbandonedClarifyBatch(prompt.questions, prompt.answers ?? {}, reason))
-    clearPrompt()
+    return clearPrompt(prompt)
   }
 
   /** Persist the composer's in-progress draft (survives composer unmount when a
@@ -3844,6 +3965,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
     commitSnapshot,
     duplicate,
     clearPrompt,
+    settlePrompt,
+    getPromptRevision,
+    getPromptRequestId,
+    reconcilePendingApprovals,
     recordClarifyAnswer,
     flushAbandonedClarify,
     setComposerDraft,

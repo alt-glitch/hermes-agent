@@ -1,13 +1,9 @@
 /**
  * ApprovalPrompt — dangerous-command approval (spec §8 #6). Native `<select>`
- * (built-in ↑↓/j/k/Enter nav) over once/session/always/deny; a small `useKeyboard`
- * adds the Esc/Ctrl+C → deny cancel path the select doesn't cover. Answered via
- * `approval.respond {choice, session_id}`.
+ * (built-in ↑↓/j/k/Enter nav) over once/session/always/deny. PromptOverlay owns
+ * the scoped Esc/Ctrl+C lifecycle so pending/error states keep the same key owner.
  */
-import type { BoxRenderable } from '@opentui/core'
-
 import { approvalChoices, type ApprovalChoice, type ApprovalChoicePolicy } from '../../logic/approval.ts'
-import { useCloseLayer } from '../keymap.tsx'
 import { useTheme } from '../theme.tsx'
 
 const COPY: Record<ApprovalChoice, { description: string; name: string }> = {
@@ -26,20 +22,12 @@ export function ApprovalPrompt(props: {
   command: string
   description: string
   onChoose: (choice: ApprovalChoice) => void
-  onCancel: () => void
+  statusHint?: string | undefined
 }) {
   const theme = useTheme()
-  let rootRef: BoxRenderable | undefined
-  // Native select handles ↑↓/j/k/Enter over the options; the keymap owns the
-  // Esc/Ctrl+C → deny cancel path the select doesn't cover.
-  useCloseLayer(
-    () => rootRef,
-    () => props.onCancel()
-  )
 
   return (
     <box
-      ref={el => (rootRef = el)}
       style={{ borderColor: theme().color.border, flexDirection: 'column', flexShrink: 0, marginTop: 1, padding: 1 }}
       border
     >
@@ -61,7 +49,7 @@ export function ApprovalPrompt(props: {
         descriptionColor={theme().color.muted}
         style={{ height: 8, marginTop: 1 }}
       />
-      <text fg={theme().color.muted}>↑↓ select · Enter confirm · Esc/Ctrl+C deny</text>
+      <text fg={theme().color.muted}>{props.statusHint ?? '↑↓ select · Enter confirm · Esc/Ctrl+C send denial'}</text>
     </box>
   )
 }

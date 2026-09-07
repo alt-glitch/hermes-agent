@@ -6,7 +6,7 @@
  * hooks, rendering one `*` per grapheme. Cursor movement and editing mirror a
  * normal single-line input without ever placing the secret in a renderable.
  *
- * Enter submits the real buffer; Esc/Ctrl+C submits empty so the agent unblocks.
+ * Enter submits the real buffer; PromptOverlay owns scoped Esc/Ctrl+C handling.
  */
 import { useKeyboard, usePaste } from '@opentui/solid'
 import { createMemo, createSignal, Show } from 'solid-js'
@@ -74,7 +74,9 @@ export function MaskedPrompt(props: {
   label: string
   sub?: string
   onSubmit: (value: string) => void
-  onCancel: () => void
+  /** Standalone owners may provide close; PromptOverlay uses its scoped layer. */
+  onCancel?: (() => void) | undefined
+  statusHint?: string | undefined
 }) {
   const theme = useTheme()
   const [editor, setEditor] = createSignal<MaskedEditorState>({ graphemes: [], cursor: 0 })
@@ -88,7 +90,7 @@ export function MaskedPrompt(props: {
   })
 
   useKeyboard(key => {
-    if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+    if (props.onCancel && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {
       setEditor({ graphemes: [], cursor: 0 })
       props.onCancel()
       return
@@ -131,7 +133,7 @@ export function MaskedPrompt(props: {
         <text fg={theme().color.accent}>▍</text>
         <text fg={theme().color.text}>{afterCursor()}</text>
       </box>
-      <text fg={theme().color.muted}>Enter send · Esc/Ctrl+C cancel · masked</text>
+      <text fg={theme().color.muted}>{props.statusHint ?? 'Enter send · Esc/Ctrl+C send cancellation · masked'}</text>
     </box>
   )
 }

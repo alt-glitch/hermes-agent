@@ -34,7 +34,13 @@ import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } fr
 import { GatewayService, type GatewayTransport } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
-import { promptResponseAcknowledged, type PromptResponseMethod } from '../boundary/promptResponses.ts'
+import {
+  classifyPromptResponse,
+  promptTransportUncertain,
+  reconcilePendingApprovalSnapshot,
+  type PromptResponseDisposition,
+  type PromptResponseMethod
+} from '../boundary/promptResponses.ts'
 import { startMemlog } from '../boundary/memlog.ts'
 import { startMemoryMonitor } from '../boundary/memoryMonitor.ts'
 import { startProactiveGc } from '../boundary/proactiveGc.ts'
@@ -292,6 +298,25 @@ const writeActiveSession = (sid: string | undefined) => {
   }
 }
 
+/** Reconcile missed approval terminal events without blocking session resume. */
+const schedulePendingApprovalReconciliation = (
+  gateway: GatewayTransport,
+  store: SessionStore,
+  sessionId: string
+): void => {
+  void reconcilePendingApprovalSnapshot(
+    () => Effect.runPromise(gateway.request<unknown>('approval.pending', { session_id: sessionId })),
+    store,
+    sessionId
+  )
+    .then(outcome => {
+      if (outcome === 'invalid') getLog().warn('approval', 'invalid pending snapshot', { session_id: sessionId })
+    })
+    .catch(cause =>
+      getLog().warn('approval', 'pending snapshot failed', { cause: String(cause), session_id: sessionId })
+    )
+}
+
 const resumeInto = (
   gateway: GatewayTransport,
   store: SessionStore,
@@ -315,6 +340,7 @@ const resumeInto = (
       resumed: resumed.resumedId,
       sid: resumed.sessionId
     })
+    schedulePendingApprovalReconciliation(gateway, store, resumed.sessionId)
     if (resumed.previousSessionId) {
       Effect.runFork(
         gateway
@@ -3174,15 +3200,18 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       }
 
       // Blocking prompts retain UI ownership until a decoded gateway ack.
-      const respond = async (method: PromptResponseMethod, params: Record<string, unknown>): Promise<boolean> => {
+      const respond = async (
+        method: PromptResponseMethod,
+        params: Record<string, unknown>
+      ): Promise<PromptResponseDisposition> => {
         try {
           const raw = await Effect.runPromise(gateway.request(method, params))
-          const acknowledged = promptResponseAcknowledged(method, raw)
-          if (!acknowledged) getLog().warn('respond', 'invalid acknowledgement', { method })
-          return acknowledged
+          const disposition = classifyPromptResponse(method, raw)
+          if (disposition.kind === 'uncertain') getLog().warn('respond', disposition.message, { method })
+          return disposition
         } catch (cause) {
           getLog().warn('respond', 'failed', { cause: String(cause), method })
-          throw cause
+          return promptTransportUncertain(cause)
         }
       }
 
@@ -3240,7 +3269,6 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   pluginOps={pluginOps}
                   petOps={petOps}
                   onSessionPickerClosed={onSessionPickerClosed}
-                  sessionId={() => gateway.sessionId()}
                   history={history}
                   onImagePaste={onImagePaste}
                   onImageDetach={onImageDetach}

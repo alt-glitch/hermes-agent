@@ -14,6 +14,7 @@
  */
 import { Schema } from 'effect'
 
+import { ApprovalRequestPayloadSchema } from '../promptResponses.ts'
 import { SpawnTreeSubagentSchema } from './Delegation.ts'
 import { TodoStateSchema } from './TodoState.ts'
 
@@ -255,13 +256,18 @@ const ClarifyRequest = Schema.Struct({
 export type ClarifyBatchQuestionWireDecoded = typeof ClarifyBatchQuestionWire.Type
 const ApprovalRequest = Schema.Struct({
   type: Schema.Literal('approval.request'),
-  session_id: opt(Str),
+  session_id: Schema.NonEmptyString,
+  payload: ApprovalRequestPayloadSchema
+})
+const ApprovalResolved = Schema.Struct({
+  type: Schema.Literal('approval.resolved'),
+  session_id: Schema.NonEmptyString,
   payload: Schema.Struct({
-    allow_permanent: opt(Schema.Boolean),
-    choices: opt(Schema.Array(Str)),
-    command: Str,
-    description: Str,
-    smart_denied: opt(Schema.Boolean)
+    request_id: Schema.NonEmptyString,
+    // The envelope is authoritative. Some gateways also duplicate the live
+    // session id here; the reducer requires equality when that field is present.
+    session_id: opt(Schema.NonEmptyString),
+    status: Schema.Literals(['resolved', 'expired', 'cancelled'])
   })
 })
 const SudoRequest = Schema.Struct({
@@ -280,6 +286,11 @@ const SensitivePromptExpiryShape = {
 }
 const SudoExpire = Schema.Struct({ type: Schema.Literal('sudo.expire'), ...SensitivePromptExpiryShape })
 const SecretExpire = Schema.Struct({ type: Schema.Literal('secret.expire'), ...SensitivePromptExpiryShape })
+const ClarifyExpire = Schema.Struct({
+  type: Schema.Literal('clarify.expire'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ request_id: Schema.NonEmptyString })
+})
 
 // chrome / agent
 const StatusUpdate = Schema.Struct({
@@ -457,7 +468,9 @@ const SessionTurnEvents = Schema.Union([
   ToolGenerating,
   TodoUpdated,
   ClarifyRequest,
+  ClarifyExpire,
   ApprovalRequest,
+  ApprovalResolved,
   SudoRequest,
   SecretRequest,
   SudoExpire,

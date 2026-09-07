@@ -1,6 +1,7 @@
 /**
  * ConfirmPrompt — a LOCAL (non-gateway) Y/N dialog (spec §2a). Driven by a local
- * callback, not an RPC: y/Enter → confirm, n/Esc/Ctrl+C → cancel. Used by client
+ * callback, not an RPC: y/Enter → confirm, n → cancel. PromptOverlay owns the
+ * shared scoped Esc/Ctrl+C close binding. Used by client
  * slash commands like /clear and /new.
  */
 import type { BoxRenderable } from '@opentui/core'
@@ -16,7 +17,7 @@ export function ConfirmPrompt(props: { spec: ConfirmSpec; onYes: () => void; onN
   // No focusable child here (unlike the <select> prompts), so focus the dialog box
   // itself on mount — that makes the focus-within keymap layer below active.
   onMount(() => rootRef?.focus())
-  // Local Y/N dialog: y/Enter → confirm, n/Esc/Ctrl+C → cancel, scoped to the
+  // Local Y/N dialog: y/Enter → confirm, n → cancel, scoped to the
   // dialog box (focus-within) via the native keymap.
   useBindings<BoxRenderable>(() => ({
     target: () => rootRef,
@@ -37,9 +38,7 @@ export function ConfirmPrompt(props: { spec: ConfirmSpec; onYes: () => void; onN
     bindings: [
       { key: 'y', cmd: 'confirm' },
       { key: 'return', cmd: 'confirm' },
-      { key: 'n', cmd: 'cancel' },
-      { key: 'escape', cmd: 'cancel' },
-      { key: { name: 'c', ctrl: true }, cmd: 'cancel' }
+      { key: 'n', cmd: 'cancel' }
     ]
   }))
 

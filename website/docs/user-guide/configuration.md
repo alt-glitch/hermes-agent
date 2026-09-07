@@ -2704,12 +2704,16 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 
 ## Clarify
 
-Configure how long the gateway waits for a response to a clarifying question. The canonical key is `agent.clarify_timeout` (default `3600` seconds); a legacy top-level `clarify.timeout` is still honored if explicitly set:
+Configure how long the gateway waits for a response to a clarifying question. The canonical key is `agent.clarify_timeout` (default `3600` seconds). An explicitly configured legacy `clarify.timeout` takes precedence; otherwise Hermes uses `agent.clarify_timeout`:
 
 ```yaml
 agent:
   clarify_timeout: 3600        # Seconds to wait for user clarification response (0 or less = unlimited)
 ```
+
+The unlimited meaning applies only to clarification prompts. Dangerous-command approvals use the separate `approvals.timeout` setting (default `300` seconds) and always fail closed when their finite wait ends; `0` or a negative approval timeout does not enable unlimited waiting.
+
+If the TUI loses the acknowledgement for a prompt response, it keeps the prompt visible as **delivery not confirmed** and never resends automatically. Esc or Ctrl+C can dismiss that local card, but the TUI will not claim that a cancellation or denial reached the gateway.
 
 ## Context Files (SOUL.md, AGENTS.md)
 

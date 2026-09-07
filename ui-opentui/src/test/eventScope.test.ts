@@ -29,7 +29,7 @@ describe('eventBelongsToSession', () => {
     const approval = {
       type: 'approval.request',
       session_id: 'old-1',
-      payload: { command: 'rm -rf /tmp/x', description: 'remove temp data' }
+      payload: { command: 'rm -rf /tmp/x', description: 'remove temp data', request_id: 'approval-old' }
     } satisfies GatewayEvent
     expect(eventBelongsToSession(approval, 'live-1')).toBe(false)
   })

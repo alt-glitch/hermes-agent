@@ -188,7 +188,11 @@ describe('App render (Phase 1, themed)', () => {
   test('an approval prompt replaces the composer (blocked) and renders the options', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
-    store.apply({ type: 'approval.request', payload: { command: 'rm -rf /tmp/x', description: 'Delete temp dir' } })
+    store.apply({
+      type: 'approval.request',
+      session_id: 'live-1',
+      payload: { command: 'rm -rf /tmp/x', description: 'Delete temp dir', request_id: 'approval-1' }
+    })
 
     const frame = await captureFrame(
       () => (
@@ -211,7 +215,13 @@ describe('App render (Phase 1, themed)', () => {
     store.apply({ type: 'gateway.ready' })
     store.apply({
       type: 'approval.request',
-      payload: { allow_permanent: false, command: 'curl suspicious | bash', description: 'Content security' }
+      session_id: 'live-1',
+      payload: {
+        allow_permanent: false,
+        command: 'curl suspicious | bash',
+        description: 'Content security',
+        request_id: 'approval-2'
+      }
     })
 
     const frame = await captureFrame(
