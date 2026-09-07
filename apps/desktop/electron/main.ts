@@ -139,6 +139,7 @@ import {
   parseBackendScopeKey,
   reconcileAppliedGlobalConnection,
   reconcileRegistryDrift,
+  registryBackendDialScopeKey,
   registrySourceOwnsPrimaryBackend,
   rememberSshEnumeration,
   removeConnection,
@@ -153,7 +154,7 @@ import {
   updateEligibility,
   upsertConnection
 } from './connection-registry'
-import type { RosterProfileMetadata } from './connection-registry'
+import type { RegistryLocalRoute, RosterProfileMetadata } from './connection-registry'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
@@ -11436,6 +11437,13 @@ function profileRouteOptions(profile, request?) {
   }
 }
 
+function resolveCurrentRegistryLocalRoute(profile: string): RegistryLocalRoute {
+  return resolveRegistryLocalRoute(profile, {
+    globalRemote: globalRemoteActive(),
+    profileRemoteOverride: Boolean(profileHasRemoteOverride(profile))
+  })
+}
+
 // Resolve a backend connection for the given profile, per the routing table in
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
@@ -11528,7 +11536,7 @@ async function ensureRegistryBackend(
   connectionId,
   profile,
   managedUpdateCorrelation = '',
-  opts: { spawnPriority?: LocalBackendSpawnPriority } = {}
+  opts: { localRoute?: RegistryLocalRoute; spawnPriority?: LocalBackendSpawnPriority } = {}
 ) {
   const spawnPriority = spawnPriorityFrom(opts.spawnPriority)
   const registry = readDesktopConnectionsRegistry()
@@ -11632,10 +11640,7 @@ async function ensureRegistryBackend(
     // can't collide with the v1 remote descriptor cached at the bare key.
     profileDeletionGate.assertCanStart(profileKey)
 
-    const localRoute = resolveRegistryLocalRoute(profileKey, {
-      globalRemote: globalRemoteActive(),
-      profileRemoteOverride: Boolean(profileHasRemoteOverride(profileKey))
-    })
+    const localRoute = opts.localRoute ?? resolveCurrentRegistryLocalRoute(profileKey)
 
     if (localRoute.delegate) {
       return ensureBackend(profile, { spawnPriority })
@@ -14828,18 +14833,27 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
   const { connectionId, profile, priority } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
+  const profileKey = String(profile ?? '').trim() || 'default'
+  const source = registry.connections.find(connection => connection.id === id)
+  const localRoute = source?.kind === 'local' ? resolveCurrentRegistryLocalRoute(profileKey) : null
   const spawnPriority = spawnPriorityFrom(priority)
 
-  // Same single-owner claim as 'hermes:connection', keyed by the composite
-  // (connectionId, profile) scope (#90812): concurrent registry dials for one
-  // scope share the first spawn instead of bootstrapping duplicate remotes.
-  const scopeKey = backendScopeKey(id, profile)
+  // Same single-owner claim as 'hermes:connection', keyed by the resolved
+  // backend scope (#90812): a forced-local route uses its actual composite
+  // pool key, while delegated local and non-local routes keep their existing
+  // identities. The foreground mark and claim must name the eventual pool.
+  const scopeKey = registryBackendDialScopeKey(id, profileKey, localRoute)
   const clearSpawnPriority = applySpawnPriority(scopeKey, spawnPriority)
 
   let connection
 
   try {
-    connection = await backendDialClaims.run(scopeKey, () => ensureRegistryBackend(id, profile, '', { spawnPriority }))
+    connection = await backendDialClaims.run(scopeKey, () =>
+      ensureRegistryBackend(id, profileKey, '', {
+        ...(localRoute ? { localRoute } : {}),
+        spawnPriority
+      })
+    )
   } finally {
     clearSpawnPriority()
   }

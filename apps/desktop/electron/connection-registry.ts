@@ -220,6 +220,19 @@ export interface RegistryLocalRoute {
   poolKey: string
 }
 
+/**
+ * One identity for a registry dial's claim, foreground intent, and eventual
+ * pool entry. `localRoute` is the already-resolved local routing decision so
+ * callers do not reproduce its forced-local rules at the IPC boundary.
+ */
+export function registryBackendDialScopeKey(
+  connectionId: null | string | undefined,
+  profile: null | string | undefined,
+  localRoute: RegistryLocalRoute | null
+): string {
+  return localRoute?.poolKey ?? backendScopeKey(connectionId, profile)
+}
+
 export interface ResolvedConnectionSshDescriptor {
   effectiveConfigFingerprint?: string
   host?: string

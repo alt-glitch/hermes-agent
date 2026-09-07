@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 
 import { test } from 'vitest'
 
+import { registryBackendDialScopeKey, resolveRegistryLocalRoute } from './connection-registry'
 import {
   LocalBackendSlotWaitTimeoutError,
   LocalBackendSpawnCoordinator,
@@ -430,6 +431,48 @@ test('a forced-local pool cannot consume foreground intent from the ordinary pro
   }
 
   assert.equal(coordinator.activeCount, 0)
+})
+
+test('a registry forced-local foreground dial claims the pool that receives reserved capacity', async () => {
+  const coordinator = new LocalBackendSpawnCoordinator(3)
+  const route = resolveRegistryLocalRoute('default', { globalRemote: true })
+  const scopeKey = registryBackendDialScopeKey('local', 'default', route)
+  const pending = new Set([scopeKey])
+
+  const running = await Promise.all(
+    ['bg-run-1', 'bg-run-2'].map(key => coordinator.request(key, { priority: 'background' }).acquired)
+  )
+
+  const priority = takeForegroundSpawnForPool(pending, {
+    poolKey: route.poolKey,
+    profile: 'default'
+  })
+    ? 'foreground'
+    : 'background'
+
+  const forcedLocal = coordinator.request(route.poolKey, { priority })
+
+  try {
+    assert.equal(forcedLocal.queued, false, 'the user dial must take the reserved foreground slot')
+  } finally {
+    for (const release of running) {
+      release()
+    }
+
+    ;(await forcedLocal.acquired)()
+  }
+
+  assert.equal(pending.size, 0)
+  assert.equal(
+    registryBackendDialScopeKey('local', 'research', resolveRegistryLocalRoute('research')),
+    'research',
+    'ordinary local routing keeps its bare profile scope'
+  )
+  assert.equal(
+    registryBackendDialScopeKey('homelab', 'research', null),
+    'conn:homelab::research',
+    'non-local routing keeps its composite scope'
+  )
 })
 
 test('drain prefers a foreground waiter over an earlier background waiter', async () => {
