@@ -643,8 +643,12 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
     # Re-bind to the current transport: streaming must stay on the active websocket even
     # if a disconnect/fallback moved the session to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+    with _session_resume_lock:
+        if (refusal := _reattach_refusal(rid, sid, session)) is not None:
+            return refusal
+        if (t := current_transport()) is not None:
+            session["transport"] = t
+            _cancel_ws_orphan_reap(sid)
     # Claim against process-global MCP mutation before checking/setting the
     # per-session running flag. The reader thread must fail fast while a slow
     # shutdown/discovery is in progress; once admitted, the fence stays held
