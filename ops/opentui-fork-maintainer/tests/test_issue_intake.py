@@ -107,6 +107,7 @@ class GitHub:
         self.after_close: Callable[[], None] | None = None
         self.after_reopen: Callable[[], None] | None = None
         self.fail_reopen = False
+        self.close_skew = False
 
     def transition(
         self,
@@ -129,14 +130,19 @@ class GitHub:
         created_at = f"2026-09-06T0{min(event_id + 2, 9)}:00:00Z"
         self.issues[number]["state"] = state
         self.issues[number]["closedAt"] = created_at if state == "CLOSED" else None
+        self.issues[number]["stateReason"] = "COMPLETED" if state == "CLOSED" else None
+        if state == "CLOSED" and self.close_skew:
+            created_at = created_at.replace(":00Z", ":01Z")
         event = {
             "id": event_id,
+            "node_id": f"EV_{event_id}",
             "event": event_name,
             "actor": {"login": actor},
             "created_at": created_at,
         }
         if rationale is not None:
             event["rationale"] = rationale
+            event["intent"] = {"rationale": rationale}
         self.timelines.setdefault(number, []).append(event)
         return event
 
@@ -198,6 +204,20 @@ class GitHub:
                 after_close, self.after_close = self.after_close, None
                 after_close()
             return json.dumps(payload)
+        if "query CloseEvent" in route:
+            node_id = next(value.split("=", 1)[1] for value in argv if value.startswith("event="))
+            for number, events in self.timelines.items():
+                for event in events:
+                    if event.get("node_id") == node_id:
+                        return json.dumps({"data": {"node": {
+                            "__typename": "ClosedEvent",
+                            "id": node_id,
+                            "createdAt": event["created_at"],
+                            "actor": event["actor"],
+                            "intent": event.get("intent"),
+                            "closable": {"id": self.issues[number]["id"]},
+                        }}})
+            return json.dumps({"data": {"node": None}})
         if "graphql" in argv:
             raw = next(value for value in argv if value.startswith("number="))
             number = int(raw.split("=", 1)[1])
@@ -221,11 +241,14 @@ class GitHub:
         if "/issues/comments/" in route:
             comment_id = int(route.rsplit("/", 1)[1])
             comment = next(
-                comment
-                for comments in self.comments.values()
-                for comment in comments
-                if comment["id"] == comment_id
+                (comment
+                 for comments in self.comments.values()
+                 for comment in comments
+                 if comment["id"] == comment_id),
+                None,
             )
+            if comment is None:
+                raise intake.IssueIntakeError("simulated comment readback HTTP 404")
             if self.comment_readback_body is not None:
                 comment = {**comment, "body": self.comment_readback_body}
             return json.dumps(comment)
@@ -504,8 +527,9 @@ def test_revalidation_rejects_closure_and_approval_revocation(
         intake.revalidate_approved_issue(tmp_path, request, runner=github.run)
 
 
+@pytest.mark.parametrize("skew", [False, True])
 def test_delivery_closes_only_after_exact_receipt_and_is_idempotent(
-    tmp_path: Path,
+    tmp_path: Path, skew: bool,
 ) -> None:
     current = issue(41)
     github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
@@ -514,6 +538,7 @@ def test_delivery_closes_only_after_exact_receipt_and_is_idempotent(
     candidate = "a" * 40
     pr_url = "https://github.com/alt-glitch/hermes-agent/pull/88"
     body = delivery.delivery_body(request, candidate, pr_url)
+    github.close_skew = skew
     github.comments[41] = [
         {
             "id": 7,
@@ -698,8 +723,9 @@ def test_verified_compensation_survives_receipt_failure_and_retry(tmp_path):
 
 
 @pytest.mark.parametrize("mutation", ["edited", "revoked"])
+@pytest.mark.parametrize("skew", [False, True])
 def test_authorization_change_at_close_edge_reopens_our_close(
-    tmp_path: Path, mutation: str
+    tmp_path: Path, mutation: str, skew: bool
 ) -> None:
     current = issue(41)
     timeline = [labeled(1, "alt-glitch")]
@@ -722,6 +748,7 @@ def test_authorization_change_at_close_edge_reopens_our_close(
             )
 
     github.before_close = change_authorization
+    github.close_skew = skew
     result = intake.finalize_delivered_issue(
         tmp_path,
         request,
@@ -759,8 +786,9 @@ def test_authorization_change_at_close_edge_reopens_our_close(
         "post-reopen-reclose",
     ],
 )
+@pytest.mark.parametrize("skew", [False, True])
 def test_compensation_preserves_independent_state_and_durable_failures(
-    tmp_path: Path, scenario: str
+    tmp_path: Path, scenario: str, skew: bool
 ) -> None:
     current = issue(41)
     timeline = [labeled(1, "alt-glitch")]
@@ -778,6 +806,7 @@ def test_compensation_preserves_independent_state_and_durable_failures(
             )
         )
 
+    github.close_skew = skew
     if scenario == "concurrent-human-close":
         def revoke_and_close() -> None:
             revoke()
@@ -854,7 +883,10 @@ def test_compensation_preserves_independent_state_and_durable_failures(
             pr_url="https://github.com/alt-glitch/hermes-agent/pull/88",
             runner=github.run,
         )
-    assert len(github.calls) == call_count
+    assert not any(
+        "--method" in call or "mutation CloseIssue" in " ".join(call)
+        for call in github.calls[call_count:]
+    )
     assert current["state"] == "CLOSED"
 
 
@@ -886,3 +918,201 @@ def test_delivery_remote_failures_are_not_recorded_as_closure_withheld_success(
         assert json.loads(state_path.read_text())["issues"].get("41", {}).get(
             "status"
         ) != "delivered"
+
+
+@pytest.mark.parametrize("skew", [False, True])
+def test_sticky_close_failure_recovers_from_remote_identity_without_mutation(tmp_path, skew):
+    current = issue(41)
+    github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
+    github.close_skew = skew
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    kwargs = dict(candidate_sha="a" * 40, pr_url="https://github.com/alt-glitch/hermes-agent/pull/88")
+
+    def lost_ack(argv, cwd):
+        response = github.run(argv, cwd)
+        if "mutation CloseIssue" in " ".join(argv):
+            # The remote committed, but no original mutation ACK was retained.
+            raise intake.IssueIntakeError("lost mutation response")
+        return response
+
+    with pytest.raises(intake.IssueIntakeError, match="compensation"):
+        intake.finalize_delivered_issue(tmp_path, request, runner=lost_ack, **kwargs)
+    state_path = tmp_path / "issue-intake-state.json"
+    failed = json.loads(state_path.read_text(encoding="utf-8"))["issues"]["41"]
+    assert failed["status"] == "delivery_failed"
+    assert failed["delivery_failure_reason"] == "closure_compensation_unresolved"
+    assert current["state"] == "CLOSED"
+    start = len(github.calls)
+    first = intake.finalize_delivered_issue(tmp_path, request, runner=github.run, **kwargs)
+    second = intake.finalize_delivered_issue(tmp_path, request, runner=github.run, **kwargs)
+    assert first["status"] == second["status"] == "delivered"
+    assert first["recovered_close"] == second["recovered_close"]
+    assert first["recovered_close"]["event_id"] == github.timelines[41][-1]["node_id"]
+    assert len(github.comments[41]) == 1
+    assert not any(
+        "--method" in call or "mutation CloseIssue" in " ".join(call)
+        for call in github.calls[start:]
+    )
+
+
+@pytest.mark.parametrize("change", [
+    "candidate", "revision", "approval", "pr", "failure-reason",
+    "actor", "missing-intent", "intent-type", "intent-issue", "intent-revision",
+    "intent-candidate", "intent-receipt", "receipt-body", "receipt-actor", "receipt-url",
+    "node-id", "node-intent", "node-actor", "node-issue", "node-time", "missing-node",
+    "reason", "reopen", "reclose", "copied-intent", "edit", "revoke", "duplicate",
+    "edge-edit", "edge-reopen", "edge-receipt",
+])
+def test_sticky_recovery_fails_closed_on_unbound_or_changed_evidence(tmp_path, change):
+    current = issue(41)
+    github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    kwargs = dict(candidate_sha="a" * 40, pr_url="https://github.com/alt-glitch/hermes-agent/pull/88")
+    github.after_close = lambda: setattr(github, "fail_on", "graphql")
+    with pytest.raises(intake.IssueIntakeError, match="compensation"):
+        intake.finalize_delivered_issue(tmp_path, request, runner=github.run, **kwargs)
+    github.fail_on = None
+    event = github.timelines[41][-1]
+    receipt = github.comments[41][0]
+    state_path = tmp_path / "issue-intake-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    record = state["issues"]["41"]
+    record_changes = {
+        "candidate": ("candidate_sha", "a" * 39 + "b"),
+        "revision": ("revision_sha256", request["revision_sha256"][:-1]
+                     + ("0" if request["revision_sha256"][-1] != "0" else "1")),
+        "approval": ("approval_event_id", "999"),
+        "pr": ("pr_url", "https://github.com/alt-glitch/hermes-agent/pull/99"),
+        "failure-reason": ("delivery_failure_reason", "other-failure"),
+    }
+    if change in record_changes:
+        key, value = record_changes[change]
+        record[key] = value
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    elif change.startswith("intent-") and change != "intent-type":
+        parts = event["intent"]["rationale"].split(":")
+        index = {"intent-issue": 1, "intent-revision": 2, "intent-candidate": 3, "intent-receipt": 4}[change]
+        parts[index] = "999"
+        event["intent"]["rationale"] = ":".join(parts)
+    mutations = {
+        "actor": lambda: event.update(actor={"login": "release-captain"}),
+        "missing-intent": lambda: event.pop("intent"),
+        "intent-type": lambda: event.update(intent={"rationale": 42}),
+        "receipt-body": lambda: receipt.update(body=receipt["body"] + "changed"),
+        "receipt-actor": lambda: receipt.update(user={"login": "drive-by"}),
+        "receipt-url": lambda: receipt.update(issue_url="https://api.github.com/repos/other/repo/issues/41"),
+        "reason": lambda: current.update(stateReason="NOT_PLANNED"),
+        "edit": lambda: current.update(body="edited", lastEditedAt="2026-09-06T03:00:00Z"),
+        "revoke": lambda: github.timelines[41].append(labeled(50, "alt-glitch", event="unlabeled")),
+        "duplicate": lambda: github.timelines[41].append(dict(event)),
+    }
+    if change in mutations:
+        mutations[change]()
+    if change in {"reopen", "reclose", "copied-intent"}:
+        github.transition(41, "OPEN", actor="alt-glitch")
+        if change != "reopen":
+            github.transition(41, "CLOSED", actor="alt-glitch",
+                              rationale=event["intent"]["rationale"] if change == "copied-intent" else None)
+    before = state_path.read_bytes()
+    remote_state = current["state"]
+    reads = 0
+
+    def read_only(argv, cwd):
+        nonlocal reads
+        assert "--method" not in argv and "mutation CloseIssue" not in " ".join(argv)
+        value = json.loads(github.run(argv, cwd))
+        if "query CloseEvent" in " ".join(argv):
+            reads += 1
+            node_changes = {
+                "node-id": ("id", "EV_wrong"), "node-intent": ("intent", {"rationale": "wrong"}),
+                "node-actor": ("actor", {"login": "drive-by"}),
+                "node-issue": ("closable", {"id": "I_other"}),
+                "node-time": ("createdAt", "2026-09-06T01:00:00Z"),
+            }
+            if change in node_changes:
+                key, replacement = node_changes[change]
+                value["data"]["node"][key] = replacement
+            if change == "missing-node":
+                value["data"]["node"] = None
+            if reads == 1:
+                edge_changes = {
+                    "edge-edit": mutations["edit"],
+                    "edge-reopen": lambda: github.transition(41, "OPEN", actor="release-captain"),
+                    "edge-receipt": mutations["receipt-body"],
+                }
+                if change in edge_changes:
+                    edge_changes[change]()
+        return json.dumps(value)
+
+    with pytest.raises(intake.IssueIntakeError):
+        intake.finalize_delivered_issue(tmp_path, request, runner=read_only, **kwargs)
+    assert state_path.read_bytes() == before
+    assert current["state"] == ("OPEN" if change == "edge-reopen" else remote_state)
+    assert len(github.comments[41]) == 1
+
+
+def test_delayed_recovery_readback_can_retry_but_never_overwrites_later_human_state(tmp_path):
+    current = issue(41)
+    github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    kwargs = dict(candidate_sha="a" * 40, pr_url="https://github.com/alt-glitch/hermes-agent/pull/88")
+    github.after_close = lambda: setattr(github, "fail_on", "graphql")
+    with pytest.raises(intake.IssueIntakeError, match="compensation"):
+        intake.finalize_delivered_issue(tmp_path, request, runner=github.run, **kwargs)
+    github.fail_on = None
+    state_path = tmp_path / "issue-intake-state.json"
+    failed = state_path.read_bytes()
+
+    def delayed(argv, cwd):
+        assert "--method" not in argv and "mutation CloseIssue" not in " ".join(argv)
+        response = github.run(argv, cwd)
+        if "/timeline?" in " ".join(argv):
+            return json.dumps([[github.timelines[41][0]]])
+        return response
+
+    with pytest.raises(intake.IssueIntakeError, match="unresolved"):
+        intake.finalize_delivered_issue(tmp_path, request, runner=delayed, **kwargs)
+    assert state_path.read_bytes() == failed
+    result = intake.finalize_delivered_issue(tmp_path, request, runner=github.run, **kwargs)
+    assert result["status"] == "delivered"
+    delivered = state_path.read_bytes()
+    start = len(github.calls)
+    for state in ("OPEN", "CLOSED"):
+        github.transition(41, state, actor="release-captain")
+        with pytest.raises(intake.IssueIntakeError, match="unresolved"):
+            intake.finalize_delivered_issue(tmp_path, request, runner=github.run, **kwargs)
+        assert state_path.read_bytes() == delivered
+        assert current["state"] == state
+    assert not any(
+        "--method" in call or "mutation CloseIssue" in " ".join(call)
+        for call in github.calls[start:]
+    )
+
+
+@pytest.mark.parametrize("path", ["normal", "compensate", "later-open"])
+@pytest.mark.parametrize("mismatch", ["node_id", "intent", "actor"])
+def test_close_transition_ownership_requires_ack_event_identity(tmp_path, path, mismatch):
+    current = issue(41)
+    github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
+    github.close_skew = True
+    request = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+
+    def change_after_ack():
+        event = github.timelines[41][-1]
+        event[mismatch] = {
+            "node_id": "EV_other", "intent": {"rationale": "different invocation"},
+            "actor": {"login": "release-captain"},
+        }[mismatch]
+        if path == "compensate":
+            current.update(body="edited", lastEditedAt="2026-09-06T03:00:00Z")
+        if path == "later-open":
+            github.transition(41, "OPEN", actor="release-captain")
+
+    github.after_close = change_after_ack
+    with pytest.raises(intake.IssueIntakeError, match="compensation"):
+        intake.finalize_delivered_issue(
+            tmp_path, request, candidate_sha="a" * 40,
+            pr_url="https://github.com/alt-glitch/hermes-agent/pull/88", runner=github.run,
+        )
+    assert current["state"] == ("OPEN" if path == "later-open" else "CLOSED")
+    assert not any("state=open" in call for call in github.calls)

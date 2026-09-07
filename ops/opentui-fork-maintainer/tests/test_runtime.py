@@ -636,6 +636,77 @@ def test_issue_gate_is_linear_revision_bound_and_never_advances_upstream(
     assert json.loads((evidence / "request.consumed.json").read_text()) == value
 
 
+def test_published_issue_finalizer_recovers_sticky_close_without_republication(tmp_path, monkeypatch):
+    from test_issue_intake import GitHub, issue, labeled
+
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    value = claim_issue(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    monkeypatch.setattr(runtime, "_revalidate_issue_request", lambda *args, **kwargs: value)
+    monkeypatch.setattr(
+        runtime, "_publish_pr_evidence",
+        lambda *args, **kwargs: {
+            "candidate_sha": candidate,
+            "url": "https://github.com/alt-glitch/hermes-agent/pull/42",
+        },
+    )
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(repo, packet, manifest_path, state_dir=state,
+                          cwd=worktree, base_sha=base, candidate_sha=candidate, token="test-token")
+    title, body = value["title"], value["body"]
+    assert isinstance(title, str) and isinstance(body, str)
+    current = issue(41, title=title, body=body)
+    github = GitHub([current], {41: [labeled(1234, "alt-glitch")]})
+    github.close_skew = True
+    real_run_path = runtime.runpy.run_path
+
+    def missing_ack(argv, cwd):
+        response = github.run(argv, cwd)
+        if "mutation CloseIssue" in " ".join(argv):
+            # The publication is already committed; an unusable close response
+            # must leave the journal/claim recoverable, not queue publication again.
+            payload = json.loads(response)
+            payload["data"]["closeIssue"]["clientMutationId"] = "unavailable"
+            return json.dumps(payload)
+        return response
+
+    def load_with_test_transport(path):
+        api = real_run_path(path)
+        if Path(path).name == "issue_intake.py":
+            monkeypatch.setitem(api["finalize_delivered_issue"].__globals__, "_run", missing_ack)
+        return api
+
+    monkeypatch.setattr(runtime.runpy, "run_path", load_with_test_transport)
+    with pytest.raises(runtime.ControlError, match="delivered issue could not be finalized"):
+        runtime.finalize_success(repo, manifest_path, state_dir=state,
+                                 evidence_dir=evidence, cwd=worktree, token="test-token")
+    failed = json.loads((state / "issue-intake-state.json").read_text(encoding="utf-8"))["issues"]["41"]
+    assert failed["status"] == "delivery_failed"
+    assert failed["delivery_failure_reason"] == "closure_compensation_unresolved"
+    assert json.loads((state / "publish-journal.json").read_text(encoding="utf-8"))["phase"] == "finalizing"
+    assert (state / "run-request.inflight.json").exists()
+    assert worktree.exists() and remote_sha(repo) == candidate
+    call_count = len(github.calls)
+    monkeypatch.setattr(runtime, "gate_and_ship", lambda *args, **kwargs: pytest.fail("no republication"))
+    result = runtime.finalize_success(repo, manifest_path, state_dir=state,
+                                     evidence_dir=evidence, cwd=worktree, token="test-token")
+    assert result["issue_delivery"]["recovered_close"]["event_id"] == github.timelines[41][-1]["node_id"]
+    assert result["request_consumed"] is True
+    assert not worktree.exists() and remote_sha(repo) == candidate
+    assert not (state / "run-request.inflight.json").exists()
+    assert json.loads((state / "publish-journal.json").read_text(encoding="utf-8"))["phase"] == "finalized"
+    assert json.loads((evidence / "run-outcome.json").read_text(encoding="utf-8"))["status"] == "success"
+    assert runtime.finalize_success(repo, manifest_path, state_dir=state,
+                                    evidence_dir=evidence, cwd=worktree, token="test-token") == result
+    assert not any(
+        "--method" in call or "mutation CloseIssue" in " ".join(call)
+        for call in github.calls[call_count:]
+    )
+
+
 @pytest.mark.parametrize("appeared", ["before-publish", "after-ci"])
 def test_issue_pr_appearing_after_capture_refuses_duplicate_or_target_ship(
     tmp_path: Path,

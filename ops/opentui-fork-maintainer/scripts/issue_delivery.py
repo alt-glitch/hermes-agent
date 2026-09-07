@@ -4,7 +4,9 @@ GitHub does not offer a compare-and-set precondition for issue state updates.
 When authorization changes at the close edge, this module therefore reopens
 only a close that can be tied to this invocation's acknowledged mutation and
 to the newly observed close event. Ambiguous ownership is persisted as a
-failure instead of being reported as successful delivery.
+failure instead of being reported as successful delivery. Post-publication
+recovery may resolve that failure from independent durable close/receipt
+identity, but never closes or reopens an issue.
 See docs/handoffs/opentui-issue-close-api.md for the live-verified GraphQL
 rationale/intent fields; older schema snapshots omit these fields.
 """
@@ -28,6 +30,12 @@ CLOSE_ISSUE_MUTATION = """mutation CloseIssue($issue:ID!,$marker:String!){
         __typename ... on ClosedEvent{id createdAt actor{login} intent{rationale}}
       }}}
   }
+}"""
+
+CLOSE_EVENT_QUERY = """query CloseEvent($event:ID!){
+  node(id:$event){__typename ... on ClosedEvent{
+    id createdAt actor{login} intent{rationale} closable{... on Issue{id}}
+  }}
 }"""
 
 
@@ -285,7 +293,7 @@ def _new_state_events(
         observed = current.get(event_id)
         if observed is None or any(
             observed.get(key) != event.get(key)
-            for key in ("event", "created_at", "actor")
+            for key in ("event", "created_at", "actor", "node_id", "intent")
         ):
             raise io.issue_error("issue state transition history changed")
     return [event for event_id, event in current.items() if event_id not in previous]
@@ -297,7 +305,8 @@ def _close_acknowledgement(
     request: dict[str, Any],
     marker: str,
 ) -> dict[str, Any] | None:
-    payload = (value.get("data") or {}).get("closeIssue") if isinstance(value, dict) else None
+    data = value.get("data") if isinstance(value, dict) else None
+    payload = data.get("closeIssue") if isinstance(data, dict) else None
     issue = payload.get("issue") if isinstance(payload, dict) else None
     timeline = issue.get("timelineItems") if isinstance(issue, dict) else None
     nodes = timeline.get("nodes") if isinstance(timeline, dict) else None
@@ -320,13 +329,16 @@ def _close_acknowledgement(
         and event.get("__typename") == "ClosedEvent"
         and isinstance(event.get("id"), str)
         and event["id"]
-        and event.get("createdAt") == issue["closedAt"]
-        and (event.get("actor") or {}).get("login") == io.repository_owner
-        and (event.get("intent") or {}).get("rationale") == marker
+        and isinstance(event.get("createdAt"), str)
+        and isinstance(event.get("actor"), dict)
+        and event["actor"].get("login") == io.repository_owner
+        and isinstance(event.get("intent"), dict)
+        and event["intent"].get("rationale") == marker
     ]
     if len(matching) != 1:
         return None
     io.parse_time(issue["closedAt"], "closure")
+    io.parse_time(matching[0]["createdAt"], "close event")
     return {
         "number": issue["number"],
         "state": "closed",
@@ -334,7 +346,29 @@ def _close_acknowledgement(
         "closed_at": issue["closedAt"],
         "actor": matching[0]["actor"],
         "event_id": matching[0].get("id"),
+        "event_created_at": matching[0]["createdAt"],
+        "marker": marker,
     }
+
+
+def _matches_close_event(
+    io: DeliveryIO, event: dict[str, Any], closed: dict[str, Any]
+) -> bool:
+    # REST node_id and GraphQL id identify the same event. Issue.closedAt is
+    # maintained separately and can legitimately differ from event.createdAt.
+    return (
+        event.get("event") == "closed"
+        and isinstance(closed.get("event_id"), str)
+        and bool(closed["event_id"])
+        and event.get("node_id") == closed["event_id"]
+        and event.get("created_at") == closed.get("event_created_at")
+        and isinstance(event.get("actor"), dict)
+        and event["actor"].get("login") == io.repository_owner
+        and isinstance(closed.get("marker"), str)
+        and bool(closed["marker"])
+        and isinstance(event.get("intent"), dict)
+        and event["intent"].get("rationale") == closed["marker"]
+    )
 
 
 def _our_close_is_latest(
@@ -363,10 +397,8 @@ def _our_close_is_latest(
     new_events = _new_state_events(io, before_timeline, after_timeline)
     return (
         len(new_events) == 1
-        and new_events[0].get("event") == "closed"
-        and new_events[0].get("created_at") == closed_at
-        and (new_events[0].get("actor") or {}).get("login")
-        == io.repository_owner
+        and _matches_close_event(io, new_events[0], closed)
+        and _state_events(io, after_timeline)[-1] == new_events[0]
     )
 
 
@@ -379,10 +411,7 @@ def _our_close_precedes_open_state(
     new_events = _new_state_events(io, before_timeline, after_timeline)
     return (
         len(new_events) >= 2
-        and new_events[0].get("event") == "closed"
-        and new_events[0].get("created_at") == closed["closed_at"]
-        and (new_events[0].get("actor") or {}).get("login")
-        == io.repository_owner
+        and _matches_close_event(io, new_events[0], closed)
         and new_events[-1].get("event") == "reopened"
     )
 
@@ -506,16 +535,128 @@ def _compensate_owned_close(
     return result
 
 
-def _durable_failure_for_request(
+def _recover_closed_delivery(
     io: DeliveryIO,
     state_dir: Path,
     request: dict[str, Any],
-) -> bool:
+    candidate_sha: str,
+    pr_url: str,
+    now: int,
+    runner: Callable[..., str],
+) -> dict[str, Any] | None:
+    """Resolve only a still-authorized, durably owned close; never mutate GitHub.
+
+    The finalization caller already proves publication. A lost/rejected ACK is
+    not reconstructed: independent remote event and receipt observations replace
+    it as delivery evidence. Other compensation failures remain sticky.
+    """
     record = io.read_state(state_dir)["issues"].get(str(request["issue"]))
-    return (
-        io.same_authorization(record, request)
-        and record.get("status") == "delivery_failed"
+    if not isinstance(record, dict) or not (
+        record.get("status") == "delivery_failed" or "recovered_close" in record
+    ):
+        return None
+    error = "issue delivery has an unresolved closure compensation failure: "
+    if (
+        not io.same_authorization(record, request)
+        or record.get("candidate_sha") != candidate_sha
+        or record.get("pr_url") != pr_url
+        or record.get("delivery_failure_reason") != "closure_compensation_unresolved"
+    ):
+        raise io.issue_error(error + "durable request/candidate/PR binding does not match")
+
+    body = delivery_body(request, candidate_sha, pr_url)
+    prefix = (
+        f"opentui-maintainer-close:{request['issue']}:"
+        f"{request['revision_sha256'][:12]}:{candidate_sha[:12]}:"
     )
+    previous = None
+    # Two complete observations catch delayed readback and transitions at the
+    # recovery edge without granting any authority to close/reopen an issue.
+    for _ in range(2):
+        snapshot = io.issue_snapshot(request["issue"], state_dir, runner)
+        timeline = io.timeline(request["issue"], state_dir, runner)
+        try:
+            io.revalidate_snapshot(
+                state_dir, request, snapshot, timeline, runner, allow_closed=True
+            )
+        except io.authorization_changed as exc:
+            raise io.issue_error(error + "approved revision or authorization changed") from exc
+        events = _new_state_events(io, [], timeline)
+        if (
+            snapshot.get("state") != "CLOSED"
+            or snapshot.get("stateReason") != "COMPLETED"
+            or not isinstance(snapshot.get("closedAt"), str)
+            or not events
+        ):
+            raise io.issue_error(error + "completed issue and close history are required")
+        io.parse_time(snapshot["closedAt"], "closure")
+        event = events[-1]
+        intent = event.get("intent")
+        marker = intent.get("rationale") if isinstance(intent, dict) else None
+        match = (
+            re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*):[0-9a-f]{16}", marker)
+            if isinstance(marker, str) else None
+        )
+        if (
+            event.get("event") != "closed"
+            or not match
+            or not isinstance(event.get("node_id"), str)
+            or not event["node_id"]
+            or event["actor"]["login"] != io.repository_owner
+        ):
+            raise io.issue_error(error + "latest transition lacks the bound owner close intent")
+        if any(
+            isinstance(prior.get("intent"), dict)
+            and isinstance(prior["intent"].get("rationale"), str)
+            and prior["intent"]["rationale"].startswith(prefix)
+            for prior in events[:-1]
+        ):
+            raise io.issue_error(error + "multiple closes claim this delivery")
+        receipt_id = int(match[1])
+        _read_delivery_receipt(io, state_dir, request, receipt_id, body, runner)
+        value = io.json_output(
+            runner,
+            [str(io.gh), "api", "graphql", "-f", f"query={CLOSE_EVENT_QUERY}",
+             "-f", f"event={event['node_id']}"],
+            state_dir, "close event readback",
+        )
+        data = value.get("data") if isinstance(value, dict) else None
+        node = data.get("node") if isinstance(data, dict) else None
+        if (
+            not isinstance(value, dict) or value.get("errors")
+            or not isinstance(node, dict)
+            or node.get("__typename") != "ClosedEvent"
+            or node.get("id") != event["node_id"]
+            or node.get("createdAt") != event["created_at"]
+            or not isinstance(node.get("actor"), dict)
+            or node["actor"].get("login") != io.repository_owner
+            or not isinstance(node.get("intent"), dict)
+            or node["intent"].get("rationale") != marker
+            or not isinstance(node.get("closable"), dict)
+            or node["closable"].get("id") != snapshot["id"]
+        ):
+            raise io.issue_error(error + "independent close event identity/intent did not match")
+        observed = {
+            "event_id": node["id"], "rest_event_id": event["id"],
+            "event_created_at": node["createdAt"], "closed_at": snapshot["closedAt"],
+            "marker": marker, "receipt_id": receipt_id,
+        }
+        if previous is not None and previous != (events, observed):
+            raise io.issue_error(error + "close history changed during recovery")
+        if "recovered_close" in record and record["recovered_close"] != observed:
+            raise io.issue_error(error + "previously recovered close changed")
+        previous = (events, observed)
+
+    state = io.read_state(state_dir)
+    if state["issues"].get(str(request["issue"])) != record:
+        raise io.issue_error(error + "durable delivery changed during recovery")
+    assert previous is not None  # Both complete remote observations succeeded.
+    record = {**record, "status": "delivered", "recovered_close": previous[1],
+              "updated_unix": now}
+    state["issues"][str(request["issue"])] = record
+    io.write_state(state_dir, state)
+    return {"issue": request["issue"], "closed": True, "already_closed": True,
+            "receipt_reused": True, **record}
 
 
 def _preserved_transition_delivery(
@@ -564,10 +705,11 @@ def finalize_delivered_issue(
         pr_url,
     ):
         raise io.issue_error("delivered issue pull request is invalid")
-    if _durable_failure_for_request(io, state_dir, request):
-        raise io.issue_error(
-            "issue delivery has an unresolved closure compensation failure"
-        )
+    recovered = _recover_closed_delivery(
+        io, state_dir, request, candidate_sha, pr_url, now, runner
+    )
+    if recovered is not None:
+        return recovered
     preserved = _preserved_transition_delivery(
         io, state_dir, request, candidate_sha, pr_url
     )
@@ -768,6 +910,14 @@ def finalize_delivered_issue(
             after_timeline,
             runner,
         )
+    try:
+        owned = _our_close_is_latest(
+            io, request, closed, before_timeline, snapshot, after_timeline
+        )
+    except io.issue_error as exc:
+        _persist_ambiguous_failure(io, state_dir, request, candidate_sha, pr_url, now, exc)
+    if not owned:
+        _persist_ambiguous_failure(io, state_dir, request, candidate_sha, pr_url, now)
     _read_delivery_receipt(io, state_dir, request, receipt["id"], body, runner)
     record = _mark_delivered(io, state_dir, request, candidate_sha, pr_url, now)
     return {

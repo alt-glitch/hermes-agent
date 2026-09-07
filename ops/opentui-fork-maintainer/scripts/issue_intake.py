@@ -236,7 +236,7 @@ def _write_state(state_dir: Path, value: dict[str, Any]) -> None:
 
 ISSUE_QUERY = """query($owner:String!,$repo:String!,$number:Int!){
   repository(owner:$owner,name:$repo){issue(number:$number){
-    id number url state title body createdAt lastEditedAt closedAt
+    id number url state stateReason title body createdAt lastEditedAt closedAt
     labels(first:100){nodes{name} pageInfo{hasNextPage}}
   }}
 }"""
