@@ -557,6 +557,7 @@ describe('native agents dashboard parity', () => {
       await probe.settle()
       probe.keys.pressEnter()
       await probe.settle()
+      expect(probe.frame()).toContain('#1 ✓ Inspect retained')
       probe.keys.pressKey('?')
       await probe.settle()
       probe.keys.pressKey(KeyCodes.END)

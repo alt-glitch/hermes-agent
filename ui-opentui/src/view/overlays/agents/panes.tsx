@@ -245,7 +245,7 @@ export function AgentDetail(props: {
         style={{ flexGrow: 1, minHeight: 0, paddingBottom: 1, paddingRight: 1 }}
       >
         <Show when={props.showAgentHeading}>
-          <text fg={theme().color.text} wrapMode="word">
+          <text flexShrink={0} fg={theme().color.text} wrapMode="word">
             <span style={{ fg: theme().color.accent }}>#{String(props.rowNumber)} </span>
             <span style={{ fg: visual().color }}>{visual().glyph} </span>
             <b>{truncRight(agent().taskLabel || agent().goal, Math.max(8, props.width - 8))}</b>
