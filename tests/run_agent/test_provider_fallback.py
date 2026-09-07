@@ -99,6 +99,51 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=None)
         assert agent._try_activate_fallback() is False
 
+    def test_successful_activation_clears_usage_anchor_for_previous_runtime(self):
+        agent = _make_agent(
+            fallback_model={"provider": "openai", "model": "gpt-4o"},
+        )
+        anchor = {"prompt_tokens": 12_345}
+        agent._usage_anchor = anchor
+        agent._turn_base_usage_anchor = anchor
+        agent.session_id = "fallback-anchor-session"
+        agent._session_db = MagicMock()
+        agent._persist_disabled = False
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent._usage_anchor is None
+        assert agent._turn_base_usage_anchor is None
+        agent._session_db.patch_session_model_config.assert_called_once_with(
+            agent.session_id,
+            {"_usage_anchor": None},
+        )
+
+    def test_failed_activation_preserves_current_runtime_usage_anchor(self):
+        agent = _make_agent(
+            fallback_model={"provider": "unconfigured", "model": "missing"},
+        )
+        anchor = {"prompt_tokens": 12_345}
+        agent._usage_anchor = anchor
+        agent._turn_base_usage_anchor = anchor
+        agent.session_id = "failed-fallback-anchor-session"
+        agent._session_db = MagicMock()
+        agent._persist_disabled = False
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),
+        ):
+            assert agent._try_activate_fallback() is False
+
+        assert agent._usage_anchor is anchor
+        assert agent._turn_base_usage_anchor is anchor
+        agent._session_db.patch_session_model_config.assert_not_called()
+
     def test_advances_index(self):
         fbs = [
             {"provider": "openai", "model": "gpt-4o"},

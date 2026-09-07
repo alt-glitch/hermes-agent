@@ -2193,6 +2193,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         from agent.native_compaction import resolve_native_compaction_capabilities
         agent.runtime_capabilities = resolve_native_compaction_capabilities(
             model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+        # Provider-reported token counts belong to the runtime that produced them.
+        # The transcript fingerprint alone cannot detect a tokenizer/provider swap.
+        from agent.usage_anchor import set_usage_anchor
+
+        set_usage_anchor(agent, None)
         return True
     except Exception as e:
         if fb_provider == "nous":
