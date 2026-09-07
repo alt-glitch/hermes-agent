@@ -79,6 +79,17 @@ describe('handleControlEvent', () => {
     expect($sessionControlBySession.get()['routed-session']).toBe(first)
   })
 
+  it('claims late inactive-source events without repopulating switched gateway state', () => {
+    handleControlEvent(context())
+    clearAllSessionControl()
+
+    expect(handleControlEvent(context({ fromActiveSource: () => false }))).toBe(true)
+    expect($sessionControlBySession.get()).toEqual({})
+
+    expect(handleControlEvent(context())).toBe(true)
+    expect($sessionControlBySession.get()['routed-session']?.snapshot).toEqual(SNAPSHOT)
+  })
+
   it('claims an unscoped control event without creating state', () => {
     expect(handleControlEvent(context({ sessionId: null }))).toBe(true)
     expect($sessionControlBySession.get()).toEqual({})

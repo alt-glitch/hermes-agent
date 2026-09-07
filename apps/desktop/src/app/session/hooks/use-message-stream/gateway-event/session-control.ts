@@ -9,7 +9,8 @@ export function handleControlEvent(ctx: GatewayEventContext): boolean {
     return false
   }
 
-  if (!sessionId) {
+  // A socket from the previous gateway can deliver after the store was cleared.
+  if (!sessionId || !ctx.fromActiveSource()) {
     return true
   }
 
