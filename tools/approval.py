@@ -115,13 +115,59 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_lifecycle_cbs: dict[str, object] = {}  # session_key → callable(terminal_data)
+_gateway_surface_ids: dict[str, set[str]] = {}  # session_key → live UI ids that presented its prompt
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
+def register_gateway_notify(
+    session_key: str, cb, *, lifecycle_cb=None, surface_session_id: str | None = None
+) -> None:
     """Register ``cb(approval_data: dict) -> None`` for sending approval requests. The callback
-    bridges sync→async: it runs in the agent thread and must schedule the send on the loop."""
+    bridges sync→async: it runs in the agent thread and must schedule the send on the loop.
+    ``lifecycle_cb`` is a separate terminal-notification channel; request-only callbacks used by
+    messaging gateways never receive lifecycle payloads."""
     with _lock:
         _gateway_notify_cbs[session_key] = cb
+        if lifecycle_cb is None:
+            _gateway_lifecycle_cbs.pop(session_key, None)
+        else:
+            _gateway_lifecycle_cbs[session_key] = lifecycle_cb
+        if surface_session_id:
+            _gateway_surface_ids[session_key] = {str(surface_session_id)}
+        else:
+            _gateway_surface_ids.pop(session_key, None)
+
+
+def _emit_gateway_lifecycle(entries: list, status: str) -> None:
+    """Notify every UI that received each request, outside the state lock."""
+    for entry in entries:
+        for callback in entry.lifecycle_callbacks:
+            try:
+                callback({"request_id": entry.data["request_id"], "status": status})
+            except Exception:
+                logger.debug("Gateway approval lifecycle notify failed", exc_info=True)
+
+
+def _terminalize_gateway_approval(
+    session_key: str, request_id: str, status: str, *, choice: str | None = None
+) -> bool:
+    """Atomically let timeout/cancellation win only while the exact request is pending."""
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        entry = next(
+            (candidate for candidate in queue or [] if candidate.data.get("request_id") == request_id),
+            None,
+        )
+        if entry is None:
+            return False
+        queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+        entry.result = choice
+        entry.terminal_status = status
+        entry.event.set()
+    _emit_gateway_lifecycle([entry], status)
+    return True
 
 
 def unregister_gateway_notify(session_key: str) -> None:
@@ -129,9 +175,13 @@ def unregister_gateway_notify(session_key: str) -> None:
     they don't hang forever (agent run finished or interrupted)."""
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
+        _gateway_lifecycle_cbs.pop(session_key, None)
+        _gateway_surface_ids.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
-    for entry in entries:
-        entry.event.set()
+        for entry in entries:
+            entry.terminal_status = "cancelled"
+            entry.event.set()
+    _emit_gateway_lifecycle(entries, "cancelled")
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -160,12 +210,13 @@ def resolve_gateway_approval(session_key: str, choice: str,
             targets = [queue.pop(0)]
         if not queue:
             _gateway_queues.pop(session_key, None)
-
-    for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
-        entry.event.set()
+        for entry in targets:
+            entry.result = choice
+            entry.terminal_status = "resolved"
+            if reason:
+                entry.reason = reason
+            entry.event.set()
+    _emit_gateway_lifecycle(targets, "resolved")
     return len(targets)
 
 
@@ -183,6 +234,37 @@ def ack_gateway_approval(session_key: str, request_id: str) -> bool:
                 entry.acknowledged = True
                 return True
     return False
+
+
+def bind_gateway_approval_surface(
+    session_key: str, request_id: str, surface_session_id: str
+) -> bool:
+    """Record the UI id that acknowledged this exact request (including replay)."""
+    if not surface_session_id:
+        return False
+    with _lock:
+        for entry in _gateway_queues.get(session_key, []):
+            if entry.data.get("request_id") == request_id:
+                entry.surface_session_ids.add(str(surface_session_id))
+                callback = _gateway_lifecycle_cbs.get(session_key)
+                if callback is not None and all(
+                    existing is not callback for existing in entry.lifecycle_callbacks
+                ):
+                    entry.lifecycle_callbacks.append(callback)
+                return True
+    return False
+
+
+def gateway_approval_matches_surface(
+    session_key: str, request_id: str, surface_session_id: str
+) -> bool:
+    """Whether an exact pending request was presented by this stored session on this UI id."""
+    with _lock:
+        return any(
+            entry.data.get("request_id") == request_id
+            and surface_session_id in entry.surface_session_ids
+            for entry in _gateway_queues.get(session_key, [])
+        )
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -254,10 +336,12 @@ def clear_session(session_key: str) -> None:
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
-    for entry in entries:
-        # Cancel blocked waits now so the old run unwinds instead of idling until timeout.
-        entry.result = "deny"
-        entry.event.set()
+        for entry in entries:
+            # Cancel blocked waits now so the old run unwinds instead of idling until timeout.
+            entry.result = "deny"
+            entry.terminal_status = "cancelled"
+            entry.event.set()
+    _emit_gateway_lifecycle(entries, "cancelled")
     _release_permission_mode_dependents(session_key)
     # Session-persistent code kernels (local and remote) share this owner key and die at the same boundary so a
     # finished conversation cannot leak a live interpreter.

@@ -24,7 +24,10 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged")
+    __slots__ = (
+        "event", "data", "result", "reason", "acknowledged", "terminal_status",
+        "surface_session_ids", "lifecycle_callbacks",
+    )
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -32,6 +35,9 @@ class _ApprovalEntry:
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
         self.result: str | None = None  # "once"|"session"|"always"|"deny"
+        self.terminal_status: str | None = None
+        self.surface_session_ids: set[str] = set()
+        self.lifecycle_callbacks: list = []
         # Free-text reason from ``/deny <reason>`` so the agent can adapt, not just hear "denied".
         self.reason: str | None = None
 
@@ -137,15 +143,15 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
 
     entry = _ApprovalEntry(approval_data)
     with _approval._lock:
+        # Snapshot the UI identity that will receive this exact request. A later
+        # reconnect may replace the session callback, but it must not make an old
+        # UI id authoritative for a different request.
+        entry.surface_session_ids.update(
+            _approval._gateway_surface_ids.get(session_key, set())
+        )
+        if lifecycle_cb := _approval._gateway_lifecycle_cbs.get(session_key):
+            entry.lifecycle_callbacks.append(lifecycle_cb)
         _approval._gateway_queues.setdefault(session_key, []).append(entry)
-
-    def _drop_entry() -> None:
-        with _approval._lock:
-            queue = _approval._gateway_queues.get(session_key, [])
-            if entry in queue:
-                queue.remove(entry)
-            if not queue:
-                _approval._gateway_queues.pop(session_key, None)
 
     # Plugins hear about the request before the gateway does (real-time observers).
     _ctx._fire_approval_hook("pre_approval_request", **payload)
@@ -154,14 +160,27 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         notify_cb(dict(entry.data))
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
-        _drop_entry()
+        _approval._terminalize_gateway_approval(
+            session_key, entry.data["request_id"], "cancelled"
+        )
         _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
         return {"resolved": False, "choice": None, "notify_failed": True}
 
     state = _poll_event(entry.event, session_key,
                         interrupt_log="Approval wait interrupted by user signal — returning deny for session %s")
     if state == "interrupted":
-        entry.result = "deny"
-        entry.event.set()
-    _drop_entry()
-    return _finish(payload, state != "timeout", entry.result, entry.reason)
+        won = _approval._terminalize_gateway_approval(
+            session_key, entry.data["request_id"], "cancelled", choice="deny"
+        )
+    elif state == "timeout":
+        won = _approval._terminalize_gateway_approval(
+            session_key, entry.data["request_id"], "expired"
+        )
+    else:
+        won = False
+    if not won and state != "set":
+        # A resolver removed and signalled the entry while this waiter crossed its
+        # local deadline. Its lock-held terminal decision is authoritative.
+        entry.event.wait()
+    resolved = entry.terminal_status != "expired"
+    return _finish(payload, resolved, entry.result, entry.reason)

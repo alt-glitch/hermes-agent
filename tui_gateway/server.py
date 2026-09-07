@@ -680,6 +680,15 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     _emit("approval.request", sid, _approval_request_payload(data))
 
 
+def _emit_approval_lifecycle(sid: str, data: dict) -> None:
+    """Publish the request-scoped terminal state without reusing request-only callbacks."""
+    _emit(
+        "approval.resolved",
+        sid,
+        {"request_id": str(data.get("request_id") or ""), "status": str(data.get("status") or "")},
+    )
+
+
 def _status_update(sid: str, kind: str, text: str | None = None):
     if not (body := (text if text is not None else kind).strip()):
         return
@@ -914,7 +923,12 @@ def _wire_session_agent(sid: str, key: str, agent) -> bool:
     notify_registered = False
     with contextlib.suppress(Exception):
         from tools.approval import load_permanent_allowlist, register_gateway_notify
-        register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
+        register_gateway_notify(
+            key,
+            lambda data: _emit_approval_request(sid, data),
+            lifecycle_cb=lambda data: _emit_approval_lifecycle(sid, data),
+            surface_session_id=sid,
+        )
         notify_registered = True
         load_permanent_allowlist()
     _wire_callbacks(sid)

@@ -634,6 +634,12 @@ def test_approval_respond_falls_back_to_request_id_lookup(server, monkeypatch):
     )
     monkeypatch.setattr(
         approval,
+        "gateway_approval_matches_surface",
+        lambda key, request_id, sid: (key, request_id, sid)
+        == ("agent-live", "req-91684", "gone-sid"),
+    )
+    monkeypatch.setattr(
+        approval,
         "resolve_gateway_approval",
         lambda key, choice, **kwargs: calls.append((key, choice, kwargs)) or 1,
     )

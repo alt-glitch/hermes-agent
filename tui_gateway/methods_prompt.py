@@ -1224,37 +1224,69 @@ def _(rid, params: dict) -> dict:
         return err
     if not isinstance(request_id := params.get("request_id"), str) or not request_id:
         return _err(rid, 4006, "request_id required")
+
+    def acknowledge(approval):
+        acknowledged = approval.ack_gateway_approval(session["session_key"], request_id)
+        if acknowledged:
+            approval.bind_gateway_approval_surface(
+                session["session_key"], request_id, str(params.get("session_id") or "")
+            )
+        return acknowledged
+
     return _approval_reply(
-        rid, "acknowledged", lambda a: a.ack_gateway_approval(session["session_key"], request_id))
+        rid, "acknowledged", acknowledge,
+    )
 
 
 def _approval_respond_session_fallback(params: dict):
     """Durable-identity fallback for a stale live sid (re-minted after a reconnect while
-    the prompt stayed on screen): (1) the ``request_id`` against every live session's
-    pending approvals, then (2) ``session_id`` as a STORED id.  Live session or None.
+    the prompt stayed on screen). A supplied session id must be either the stored
+    conversation id owning the exact request or a UI id recorded as having received
+    that exact request. Legacy clients that omit it retain request-only lookup.
 
     See #91684.
     """
     request_id = str(params.get("request_id") or "")
+    target = str(params.get("session_id") or "")
+    if target:
+        try:
+            from tools.approval import gateway_approval_matches_surface, list_gateway_approvals
+            with _sessions_lock:
+                live = list(_sessions.items())
+            # A stored conversation id is a legitimate fallback identity, but
+            # it must own the exact request when one was supplied.
+            if (stored := _find_live_session_by_key(target)) is not None:
+                session = stored[1]
+                key = str(session.get("session_key") or "")
+                if not request_id or any(
+                    str(pending.get("request_id") or "") == request_id
+                    for pending in list_gateway_approvals(key)
+                ):
+                    return session
+                return None
+            for sid, session in live:
+                key = str(session.get("session_key") or "")
+                if key and request_id and gateway_approval_matches_surface(
+                    key, request_id, target
+                ):
+                    return session
+        except Exception:
+            logger.debug("approval.respond request_id fallback failed", exc_info=True)
+        return None
     if request_id:
         try:
             from tools.approval import list_gateway_approvals
             with _sessions_lock:
                 live = list(_sessions.items())
-            for sid, session in live:
+            for _sid, session in live:
                 key = str(session.get("session_key") or "")
                 if key and any(
                     str(pending.get("request_id") or "") == request_id
-                    for pending in list_gateway_approvals(key)):
+                    for pending in list_gateway_approvals(key)
+                ):
                     return session
         except Exception:
             logger.debug("approval.respond request_id fallback failed", exc_info=True)
-    if target := str(params.get("session_id") or ""):
-        try:
-            if (live := _find_live_session_by_key(target)) is not None:
-                return live[1]
-        except Exception:
-            logger.debug("approval.respond stored-id fallback failed", exc_info=True)
     return None
 
 

@@ -298,7 +298,12 @@ def _sync_session_key_after_compress(
                 approval.enable_session_yolo(new_session_id)
                 approval.disable_session_yolo(old_key)
         with contextlib.suppress(Exception):
-            approval.register_gateway_notify(new_session_id, lambda data: _emit_approval_request(sid, data))
+            approval.register_gateway_notify(
+                new_session_id,
+                lambda data: _emit_approval_request(sid, data),
+                lifecycle_cb=lambda data: _emit_approval_lifecycle(sid, data),
+                surface_session_id=sid,
+            )
     # Invalidate any in-flight ``_drain_queued_prompt`` claim taken under the pre-rotation key: a raced
     # drain must not dispatch on the continuation (its envelope is restored to the queue).
     session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
