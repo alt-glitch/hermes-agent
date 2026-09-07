@@ -72,8 +72,17 @@ def test_task_metadata_survives_dispatch_registry_callbacks_and_completion(monke
             handle = json.loads(registry.dispatch("delegate_task", {"tasks": tasks}, parent_agent=parent))
             assert handle["task_labels"] == ["Scan sources", None]
             assert not observations
-            assert scheduled[0]["parent_session_id"] == parent.session_id
-            result = scheduled[0]["runner"]()
+            assert all(unit["parent_session_id"] == parent.session_id for unit in scheduled)
+            unit_results = [unit["runner"]() for unit in scheduled]
+            result = {
+                "results": sorted(
+                    [entry for unit in unit_results for entry in unit["results"]],
+                    key=lambda entry: entry["task_index"],
+                ),
+                "live_transcripts": [
+                    path for unit in unit_results for path in unit.get("live_transcripts", [])
+                ],
+            }
         else:
             result = json.loads(dt.delegate_task(tasks=tasks, parent_agent=parent))
 
