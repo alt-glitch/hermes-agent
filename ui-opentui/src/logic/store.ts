@@ -268,9 +268,11 @@ const BATCH_SETTLEMENT_REASON: Partial<Record<PromptSettlement, string>> = {
   'terminal-unconfirmed': 'request no longer pending — earlier answer delivery remains unconfirmed'
 }
 
-const PROMPT_SETTLEMENT_MESSAGE: Partial<
-  Record<PromptSettlement, (kind: ActivePrompt['kind'], label: string) => string>
+const PROMPT_SETTLEMENT_MESSAGE: Record<
+  PromptSettlement,
+  ((kind: ActivePrompt['kind'], label: string) => string) | undefined
 > = {
+  accepted: undefined, // Successful answers are rendered by their existing transcript path.
   cancelled: (kind, label) => (kind === 'approval' ? 'approval denied — no consent was granted' : `${label} cancelled`),
   'dismissed-unconfirmed': (_kind, label) =>
     `${label} dismissed locally — delivery was not confirmed; no automatic resend was attempted`,
