@@ -235,6 +235,20 @@ class TestStructuredRead:
 
         assert _control(server, sid)["revision"] != before["revision"]
 
+    def test_read_and_action_expose_the_existing_session_event_sequence(self, server, session):
+        from tui_gateway.event_replay import latest_seq
+
+        sid, key, _ = session
+        server._emit("status.update", sid, {"status": "idle"})
+
+        read = _call(server, "session.control.read", session_id=sid)["result"]
+        assert read["event_seq"] == latest_seq(sid)
+
+        _save_goal(key)
+        action = _call(server, "session.control", session_id=sid, action="goal.clear")["result"]
+        assert action["event_seq"] == latest_seq(sid)
+        assert action["event_seq"] > read["event_seq"]
+
 class TestDispatcherBackedMutations:
     def test_goal_pause_resume_clear_mutate_real_persisted_state(self, server, session):
         sid, key, _ = session

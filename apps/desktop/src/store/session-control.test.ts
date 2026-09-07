@@ -364,6 +364,16 @@ describe('session-control store', () => {
     expect($sessionControlBySession.get().s1!.snapshot!.revision).toBe('action-newer')
   })
 
+  it('does not let an older sequenced event restore state cleared by a newer response', async () => {
+    const cleared = { ...FULL_SNAPSHOT, goal: null, revision: 'cleared', updated_at: 0 }
+    useGateway(vi.fn(async () => ({ control: cleared, event_seq: 12 })))
+
+    await refreshSessionControl('s1')
+    applySessionControlUpdate('s1', FULL_SNAPSHOT, 11)
+
+    expect($sessionControlBySession.get().s1!.snapshot).toEqual(cleared)
+  })
+
   it('a gateway-switch wipe drops every entry and strands in-flight responses from the old backend', async () => {
     applySessionControlSnapshot('supported', FULL_SNAPSHOT)
     const slowRead = deferred<unknown>()

@@ -291,7 +291,8 @@ import {
   LocalBackendSpawnCoordinator,
   type LocalBackendSpawnPriority,
   type LocalBackendSpawnRequest,
-  releaseLocalBackendSlotAfterExit
+  releaseLocalBackendSlotAfterExit,
+  takeForegroundSpawnForPool
 } from './pool-spawn-coordinator'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
@@ -1507,16 +1508,6 @@ function spawnPriorityFrom(value: unknown): LocalBackendSpawnPriority {
 // route, remote scope, a guard rejection) cannot leave it for a later
 // hydration spawn of the same key to pick up.
 const pendingForegroundSpawns = new Set<string>()
-
-function takeForegroundSpawn(...poolKeys: string[]): boolean {
-  let marked = false
-
-  for (const poolKey of poolKeys) {
-    marked = pendingForegroundSpawns.delete(poolKey) || marked
-  }
-
-  return marked
-}
 
 // Upgrade a pooled entry (running, spawning, or queued for a slot) to
 // foreground so a queued slot wait can take the reserved foreground slot.
@@ -12529,7 +12520,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // surfaces the "all N slots busy" reason instead of a generic boot timeout.
   // The caller stamped entry.spawnPriority from its own request; a foreground
   // dial that joined the claim before this entry existed left a mark instead.
-  if (takeForegroundSpawn(poolKey, profile)) {
+  if (takeForegroundSpawnForPool(pendingForegroundSpawns, { poolKey, profile })) {
     entry.spawnPriority = 'foreground'
   }
 

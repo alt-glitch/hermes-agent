@@ -42,6 +42,13 @@ export function isBackgroundSlotWaitTimeout(error: unknown): boolean {
   return error instanceof LocalBackendSlotWaitTimeoutError && error.silent
 }
 
+export function takeForegroundSpawnForPool(pending: Set<string>, scope: { poolKey: string; profile: string }): boolean {
+  // Foreground intent is recorded under the dial claim's exact pool scope.
+  // The bare profile can name a different backend when registry-local routing
+  // forces a child under `conn:local::<profile>`.
+  return pending.delete(scope.poolKey)
+}
+
 export async function releaseLocalBackendSlotAfterExit(
   release: ReleaseLocalBackendSlot,
   waitForExit: () => Promise<void>

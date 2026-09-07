@@ -141,6 +141,7 @@ const ERROR_LIMIT = 240
 
 const versions = new Map<string, number>()
 const eventVersions = new Map<string, number>()
+const eventFences = new Map<string, number>()
 
 export const $sessionControlBySession = atom<Record<string, SessionControlEntry>>({})
 
@@ -518,6 +519,10 @@ function isCurrent(sessionId: string, token: number): boolean {
   return currentVersion(sessionId) === token
 }
 
+function eventSequence(value: unknown): number | undefined {
+  return Number.isInteger(value) && (value as number) >= 0 ? (value as number) : undefined
+}
+
 function sameEntry(first: SessionControlEntry, second: SessionControlEntry): boolean {
   return (
     first.capability === second.capability &&
@@ -541,8 +546,17 @@ function publishEntry(sessionId: string, next: SessionControlEntry): SessionCont
   return next
 }
 
-function applyParsedSnapshot(sessionId: string, snapshot: SessionControlSnapshot): SessionControlEntry {
+function applyParsedSnapshot(
+  sessionId: string,
+  snapshot: SessionControlSnapshot,
+  eventSeq?: number
+): SessionControlEntry {
   advanceVersion(sessionId)
+
+  if (eventSeq !== undefined) {
+    eventFences.set(sessionId, eventSeq)
+  }
+
   const current = $sessionControlBySession.get()[sessionId] ?? emptyEntry()
   const nextSnapshot = current.snapshot?.revision === snapshot.revision ? current.snapshot : snapshot
 
@@ -556,18 +570,26 @@ function applyParsedSnapshot(sessionId: string, snapshot: SessionControlSnapshot
 }
 
 /** Applies a valid read/action snapshot and marks its session as supported. */
-export function applySessionControlSnapshot(sessionId: string, rawSnapshot: unknown): SessionControlEntry | undefined {
+export function applySessionControlSnapshot(
+  sessionId: string,
+  rawSnapshot: unknown,
+  rawEventSeq?: unknown
+): SessionControlEntry | undefined {
   if (!sessionId) {
     return undefined
   }
 
   const snapshot = parseSessionControlSnapshot(rawSnapshot)
 
-  return snapshot ? applyParsedSnapshot(sessionId, snapshot) : undefined
+  return snapshot ? applyParsedSnapshot(sessionId, snapshot, eventSequence(rawEventSeq)) : undefined
 }
 
 /** Applies an event update; invalid updates are deliberately a claimed no-op. */
-export function applySessionControlUpdate(sessionId: string, rawSnapshot: unknown): SessionControlEntry | undefined {
+export function applySessionControlUpdate(
+  sessionId: string,
+  rawSnapshot: unknown,
+  rawEventSeq?: unknown
+): SessionControlEntry | undefined {
   if (!sessionId) {
     return undefined
   }
@@ -580,8 +602,19 @@ export function applySessionControlUpdate(sessionId: string, rawSnapshot: unknow
 
   const current = $sessionControlBySession.get()[sessionId] ?? emptyEntry()
   const actionIsPending = current.pendingAction !== null
+  const eventSeq = eventSequence(rawEventSeq)
 
   advanceEventVersion(sessionId)
+
+  if (eventSeq !== undefined) {
+    const fence = eventFences.get(sessionId)
+
+    if (fence !== undefined && eventSeq <= fence) {
+      return current
+    }
+
+    eventFences.set(sessionId, eventSeq)
+  }
 
   if (!actionIsPending) {
     advanceVersion(sessionId)
@@ -606,6 +639,7 @@ export function clearSessionControl(sessionId: string): void {
   }
 
   advanceVersion(sessionId)
+  eventFences.delete(sessionId)
   const entries = $sessionControlBySession.get()
 
   if (!(sessionId in entries)) {
@@ -630,6 +664,7 @@ export function clearAllSessionControl(): void {
   $sessionControlBySession.set({})
   versions.clear()
   eventVersions.clear()
+  eventFences.clear()
 }
 
 function beginRead(sessionId: string, background: boolean): number {
@@ -764,6 +799,7 @@ export async function refreshSessionControl(
     }
 
     const snapshot = isRecord(response) ? parseSessionControlSnapshot(response.control) : null
+    const eventSeq = isRecord(response) ? eventSequence(response.event_seq) : undefined
 
     if (!snapshot) {
       publishFailure(sessionId, token, new Error('Invalid session.control.read response'), false)
@@ -771,7 +807,7 @@ export async function refreshSessionControl(
       return $sessionControlBySession.get()[sessionId]
     }
 
-    return applyParsedSnapshot(sessionId, snapshot)
+    return applyParsedSnapshot(sessionId, snapshot, eventSeq)
   } catch (error) {
     if (!isCurrent(sessionId, token)) {
       return $sessionControlBySession.get()[sessionId]
@@ -831,6 +867,7 @@ export async function runSessionControlAction(
 
     const snapshot = isRecord(response) ? parseSessionControlSnapshot(response.control) : null
     const dispatch = isRecord(response) ? parseSessionControlDispatch(response.dispatch) : null
+    const eventSeq = isRecord(response) ? eventSequence(response.event_seq) : undefined
 
     if (!snapshot || !dispatch) {
       const error = new Error('Invalid session.control action response')
@@ -839,7 +876,7 @@ export async function runSessionControlAction(
     }
 
     if (isCurrent(sessionId, token)) {
-      applyParsedSnapshot(sessionId, snapshot)
+      applyParsedSnapshot(sessionId, snapshot, eventSeq)
     }
 
     return dispatch

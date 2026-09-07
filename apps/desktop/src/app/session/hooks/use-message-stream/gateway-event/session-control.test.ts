@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { $sessionControlBySession, clearAllSessionControl, type SessionControlSnapshot } from '@/store/session-control'
+import {
+  $sessionControlBySession,
+  applySessionControlSnapshot,
+  clearAllSessionControl,
+  type SessionControlSnapshot
+} from '@/store/session-control'
 
 import { handleControlEvent } from './session-control'
 import type { GatewayEventContext } from './types'
@@ -44,6 +49,19 @@ describe('handleControlEvent', () => {
       'routed-session': { capability: 'supported', snapshot: { revision: 'event-revision' } }
     })
     expect($sessionControlBySession.get()['event-session']).toBeUndefined()
+  })
+
+  it('forwards the event sequence used to fence an older control update', () => {
+    const cleared = { ...SNAPSHOT, revision: 'cleared' }
+    applySessionControlSnapshot('routed-session', cleared, 12)
+
+    handleControlEvent(
+      context({
+        event: { ...context().event, seq: 11 } as GatewayEventContext['event']
+      })
+    )
+
+    expect($sessionControlBySession.get()['routed-session']?.snapshot).toEqual(cleared)
   })
 
   it('claims malformed control events without replacing the last good state', () => {

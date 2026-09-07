@@ -9,7 +9,8 @@ import { test } from 'vitest'
 import {
   LocalBackendSlotWaitTimeoutError,
   LocalBackendSpawnCoordinator,
-  releaseLocalBackendSlotAfterExit
+  releaseLocalBackendSlotAfterExit,
+  takeForegroundSpawnForPool
 } from './pool-spawn-coordinator'
 
 const deferred = () => {
@@ -389,6 +390,46 @@ test('foreground is granted the reserved slot ahead of a background hydration qu
   )
   assert.equal(coordinator.activeCount, 0)
   assert.equal(coordinator.queuedCount, 0)
+})
+
+test('a forced-local pool cannot consume foreground intent from the ordinary profile scope', async () => {
+  const coordinator = new LocalBackendSpawnCoordinator(3)
+  const pending = new Set(['default'])
+
+  const running = await Promise.all(
+    ['bg-run-1', 'bg-run-2'].map(key => coordinator.request(key, { priority: 'background' }).acquired)
+  )
+
+  const forcedLocalPriority = takeForegroundSpawnForPool(pending, {
+    poolKey: 'conn:local::default',
+    profile: 'default'
+  })
+    ? 'foreground'
+    : 'background'
+
+  const forcedLocal = coordinator.request('conn:local::default', { priority: forcedLocalPriority })
+
+  assert.equal(forcedLocal.queued, true)
+  assert.equal(pending.has('default'), true)
+
+  const ordinaryPriority = takeForegroundSpawnForPool(pending, { poolKey: 'default', profile: 'default' })
+    ? 'foreground'
+    : 'background'
+
+  const ordinary = coordinator.request('default', { priority: ordinaryPriority })
+
+  assert.equal(ordinary.queued, false)
+  assert.equal(pending.size, 0)
+
+  forcedLocal.cancel()
+  await forcedLocal.acquired.catch(() => undefined)
+  ;(await ordinary.acquired)()
+
+  for (const release of running) {
+    release()
+  }
+
+  assert.equal(coordinator.activeCount, 0)
 })
 
 test('drain prefers a foreground waiter over an earlier background waiter', async () => {

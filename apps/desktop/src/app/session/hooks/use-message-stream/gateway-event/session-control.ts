@@ -14,7 +14,7 @@ export function handleControlEvent(ctx: GatewayEventContext): boolean {
   }
 
   const control = payload && typeof payload === 'object' ? (payload as { control?: unknown }).control : undefined
-  applySessionControlUpdate(sessionId, control)
+  applySessionControlUpdate(sessionId, control, (event as { seq?: unknown }).seq)
 
   return true
 }

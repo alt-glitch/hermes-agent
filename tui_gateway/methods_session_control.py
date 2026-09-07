@@ -242,7 +242,13 @@ def _(rid, params: dict) -> dict:
     if not session_key:
         return _err(rid, 4001, "session has no stored key")
     try:
-        return _ok(rid, {"control": _snapshot_control(session_key)})
+        # Capture before the snapshot: events emitted concurrently afterward
+        # must remain eligible to update the client even if the snapshot read
+        # happens to observe their state already.
+        from tui_gateway.event_replay import latest_seq
+
+        event_seq = latest_seq(params.get("session_id") or "")
+        return _ok(rid, {"control": _snapshot_control(session_key), "event_seq": event_seq})
     except Exception as exc:
         logger.debug("session.control.read failed: %s", exc, exc_info=True)
         return _err(rid, 5031, f"session.control.read failed: {exc}")
@@ -289,6 +295,13 @@ def _(rid, params: dict) -> dict:
     if "error" in action_result:
         return action_result
 
+    # command.dispatch publishes goal/loop updates synchronously before it
+    # returns. Manager-only actions publish below; accepting that matching
+    # event is harmless and avoids fencing a concurrent later mutation.
+    from tui_gateway.event_replay import latest_seq
+
+    event_seq = latest_seq(params.get("session_id") or "")
+
     try:
         control = _snapshot_control(session_key)
     except Exception as exc:
@@ -301,7 +314,7 @@ def _(rid, params: dict) -> dict:
             _emit("session.control.update", params.get("session_id") or "", {"control": control})
         except Exception as exc:
             logger.debug("session.control.update emit failed (best-effort): %s", exc, exc_info=True)
-    return _ok(rid, {"control": control, "dispatch": _dispatch_envelope(action_result)})
+    return _ok(rid, {"control": control, "dispatch": _dispatch_envelope(action_result), "event_seq": event_seq})
 
 
 def _validate_action_args(rid, action: str, args: dict):
