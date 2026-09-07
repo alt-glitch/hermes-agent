@@ -121,29 +121,60 @@ describe('PromptOverlay acknowledgement ownership', () => {
     }
   })
 
-  test('an uncertain response stays honest, does not resend, and can be dismissed', async () => {
+  test('an uncertain response retries only after the visible manual action', async () => {
     const store = createSessionStore()
     store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-2' } })
-    let calls = 0
-    const h = await mountOverlay(store, () => {
-      calls += 1
-      return Promise.resolve({ kind: 'uncertain', message: 'socket closed before acknowledgement' })
+    const sent: Record<string, unknown>[] = []
+    const h = await mountOverlay(store, (_method, params) => {
+      sent.push(params)
+      return sent.length === 1
+        ? Promise.reject(new Error('socket closed before acknowledgement'))
+        : Promise.resolve(ACCEPTED)
     })
     try {
       h.keys.pressEnter()
-      await new Promise(resolve => setTimeout(resolve, 0))
-      await h.settle()
+      await expect.poll(() => h.frame()).toContain('delivery not confirmed')
       expect(store.state.prompt?.kind).toBe('clarify')
-      expect(h.frame()).toContain('delivery not confirmed')
+      expect(h.frame()).toContain('r retry same response')
+
+      // Repeated answer controls remain inert: uncertainty is never an
+      // automatic replay or permission to submit a newly selected answer.
       h.keys.pressEnter()
       await h.settle()
-      expect(calls).toBe(1)
+      expect(sent).toEqual([{ answer: 'A', request_id: 'req-2' }])
       expect(store.state.prompt?.kind).toBe('clarify')
-      h.keys.pressEscape()
-      await new Promise(resolve => setTimeout(resolve, 0))
-      await h.settle()
-      expect(store.state.prompt).toBeUndefined()
-      expect(store.state.messages.at(-1)?.text).toContain('delivery was not confirmed')
+
+      h.keys.pressKey('r')
+      await expect.poll(() => sent).toHaveLength(2)
+      expect(sent[1]).toEqual(sent[0])
+      await expect.poll(() => store.state.prompt).toBeUndefined()
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('a manual retry reports a terminal result without inferring whether the first delivery was accepted', async () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'clarify.request',
+      payload: { question: 'Choose', choices: ['A'], request_id: 'req-lost-ack' }
+    })
+    let calls = 0
+    const h = await mountOverlay(store, () => {
+      calls += 1
+      return Promise.resolve(calls === 1 ? { kind: 'uncertain', message: 'acknowledgement was lost' } : EXPIRED)
+    })
+    try {
+      h.keys.pressEnter()
+      await expect.poll(() => h.frame()).toContain('r retry same response')
+
+      h.keys.pressKey('r')
+      await expect.poll(() => calls).toBe(2)
+      await expect.poll(() => store.state.prompt).toBeUndefined()
+      expect(store.state.messages.at(-1)?.text).toContain(
+        'is no longer pending — earlier response delivery remains unconfirmed'
+      )
+      expect(store.state.messages.at(-1)?.text).not.toContain('no response was accepted')
     } finally {
       h.destroy()
     }
@@ -224,17 +255,34 @@ describe('PromptOverlay acknowledgement ownership', () => {
     }
   })
 
-  test('a stale RPC settlement cannot close a replacement prompt', async () => {
+  test('a retry is fenced by its presenting session and cannot close a replacement prompt', async () => {
     const store = createSessionStore()
+    store.setSessionId('session-old')
     store.apply({ type: 'clarify.request', payload: { question: 'Old?', choices: ['A'], request_id: 'req-old' } })
-    const response = deferred<PromptResponseDisposition>()
-    const h = await mountOverlay(store, () => response.promise)
+    const retry = deferred<PromptResponseDisposition>()
+    let calls = 0
+    const h = await mountOverlay(store, () => {
+      calls += 1
+      return calls === 1
+        ? Promise.resolve({ kind: 'uncertain', message: 'socket closed before acknowledgement' })
+        : retry.promise
+    })
     try {
       h.keys.pressEnter()
+      await expect.poll(() => h.frame()).toContain('r retry same response')
+
+      store.setSessionId('session-other')
+      h.keys.pressKey('r')
       await h.settle()
+      expect(calls).toBe(1)
+
+      store.setSessionId('session-old')
+      h.keys.pressKey('r')
+      await expect.poll(() => calls).toBe(2)
+      store.setSessionId('session-new')
       store.apply({ type: 'clarify.request', payload: { question: 'New?', choices: ['B'], request_id: 'req-new' } })
       await h.settle()
-      response.resolve(ACCEPTED)
+      retry.resolve(ACCEPTED)
       await new Promise(resolve => setTimeout(resolve, 0))
       await h.settle()
       expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'req-new' })
@@ -629,30 +677,40 @@ describe('PromptOverlay — batch clarify per-question locks', () => {
     type: 'clarify.request'
   } as const
 
-  test('locks answer per question; the prompt stays open until none remain', async () => {
+  test('manual retry preserves the exact batch question identity after navigation', async () => {
     const store = createSessionStore()
     store.apply(BATCH_EVENT)
     const sent: Record<string, unknown>[] = []
     const h = await mountOverlay(store, (method, params) => {
       expect(method).toBe('clarify.respond')
       sent.push(params)
-      return Promise.resolve(ACCEPTED)
+      return Promise.resolve(
+        sent.length === 1 ? { kind: 'uncertain', message: 'socket closed before acknowledgement' } : ACCEPTED
+      )
     })
     try {
-      // q0 (choices): Enter locks 'a' → clarify.respond {question_id: 'q0'}
+      // q0 (choices): Enter attempts 'a', then the user navigates to q1 while
+      // its outcome is uncertain. Manual retry must still carry q0 exactly.
       h.keys.pressEnter()
       await expect.poll(() => sent.length).toBe(1)
       expect(sent[0]).toEqual({ answer: 'a', question_id: 'q0', request_id: 'req-batch' })
-      // prompt STAYS open, the lock is mirrored locally
+      await expect.poll(() => h.frame()).toContain('r retry same response')
+      h.keys.pressTab()
+      await h.settle()
+      h.keys.pressKey('r')
+      await expect.poll(() => sent.length).toBe(2)
+      expect(sent[1]).toEqual(sent[0])
+
+      // The acknowledged q0 lock is mirrored and q1 remains open.
       expect(store.state.prompt).toMatchObject({ kind: 'clarify', answers: { q0: 'a' } })
 
-      // remounted on q1 (open-ended → the input is focused): type + Enter
+      // q1 is open-ended and receives only its own subsequent answer.
       await h.settle()
       await h.keys.typeText('freeform')
       await h.settle()
       h.keys.pressEnter()
-      await expect.poll(() => sent.length).toBe(2)
-      expect(sent[1]).toEqual({ answer: 'freeform', question_id: 'q1', request_id: 'req-batch' })
+      await expect.poll(() => sent.length).toBe(3)
+      expect(sent[2]).toEqual({ answer: 'freeform', question_id: 'q1', request_id: 'req-batch' })
       // final lock resolves the batch — the prompt closes
       await expect.poll(() => store.state.prompt).toBeUndefined()
     } finally {

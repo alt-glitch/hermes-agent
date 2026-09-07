@@ -32,3 +32,26 @@ export function useCloseLayer(target: () => BoxRenderable | undefined, onClose: 
     ]
   }))
 }
+
+/**
+ * Bind `r` to one explicitly retryable prompt response. Returning no target
+ * while disabled keeps ordinary prompt input and choice navigation untouched.
+ */
+export function usePromptRetryLayer(
+  target: () => BoxRenderable | undefined,
+  enabled: () => boolean,
+  onRetry: () => void
+): void {
+  useBindings<BoxRenderable>(() => ({
+    target: () => (enabled() ? target() : undefined),
+    commands: [
+      {
+        name: 'prompt-response.retry',
+        run() {
+          onRetry()
+        }
+      }
+    ],
+    bindings: [{ key: 'r', cmd: 'prompt-response.retry' }]
+  }))
+}

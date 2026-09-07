@@ -247,7 +247,13 @@ export type ActivePrompt =
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
   | { kind: 'confirm'; spec: ConfirmSpec; onConfirm: () => void }
 
-export type PromptSettlement = 'accepted' | 'cancelled' | 'expired' | 'obsolete' | 'dismissed-unconfirmed'
+export type PromptSettlement =
+  | 'accepted'
+  | 'cancelled'
+  | 'expired'
+  | 'obsolete'
+  | 'dismissed-unconfirmed'
+  | 'terminal-unconfirmed'
 
 const PROMPT_LABEL: Record<ActivePrompt['kind'], string> = {
   approval: 'approval',
@@ -255,6 +261,24 @@ const PROMPT_LABEL: Record<ActivePrompt['kind'], string> = {
   confirm: 'confirmation',
   secret: 'secret prompt',
   sudo: 'sudo prompt'
+}
+
+const BATCH_SETTLEMENT_REASON: Partial<Record<PromptSettlement, string>> = {
+  'dismissed-unconfirmed': 'dismissed locally — delivery not confirmed',
+  'terminal-unconfirmed': 'request no longer pending — earlier answer delivery remains unconfirmed'
+}
+
+const PROMPT_SETTLEMENT_MESSAGE: Partial<
+  Record<PromptSettlement, (kind: ActivePrompt['kind'], label: string) => string>
+> = {
+  cancelled: (kind, label) => (kind === 'approval' ? 'approval denied — no consent was granted' : `${label} cancelled`),
+  'dismissed-unconfirmed': (_kind, label) =>
+    `${label} dismissed locally — delivery was not confirmed; no automatic resend was attempted`,
+  expired: (kind, label) =>
+    kind === 'approval' ? 'approval expired — no consent was granted' : `${label} expired — no response was accepted`,
+  obsolete: (_kind, label) => `${label} is no longer pending — this response was not accepted`,
+  'terminal-unconfirmed': (_kind, label) =>
+    `${label} is no longer pending — earlier response delivery remains unconfirmed`
 }
 
 /** A full-screen scrollable text viewer (long slash output: /status, /logs, …). */
@@ -3474,24 +3498,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function settlePrompt(expected: ActivePrompt, settlement: PromptSettlement): boolean {
     if (state.prompt !== expected) return false
     if (expected.kind === 'clarify' && expected.questions?.length && settlement !== 'accepted') {
-      const reason = settlement === 'dismissed-unconfirmed' ? 'dismissed locally — delivery not confirmed' : settlement
+      const reason = BATCH_SETTLEMENT_REASON[settlement] ?? settlement
       return flushAbandonedClarify(reason, expected.requestId)
     }
 
     const label = PROMPT_LABEL[expected.kind]
-    if (settlement === 'cancelled') {
-      pushSystem(expected.kind === 'approval' ? 'approval denied — no consent was granted' : `${label} cancelled`)
-    } else if (settlement === 'expired') {
-      pushSystem(
-        expected.kind === 'approval'
-          ? 'approval expired — no consent was granted'
-          : `${label} expired — no response was accepted`
-      )
-    } else if (settlement === 'obsolete') {
-      pushSystem(`${label} is no longer pending — this response was not accepted`)
-    } else if (settlement === 'dismissed-unconfirmed') {
-      pushSystem(`${label} dismissed locally — delivery was not confirmed; no automatic resend was attempted`)
-    }
+    const message = PROMPT_SETTLEMENT_MESSAGE[settlement]?.(expected.kind, label)
+    if (message) pushSystem(message)
     return clearPrompt(expected)
   }
 

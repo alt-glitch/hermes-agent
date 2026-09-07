@@ -4,7 +4,8 @@
  *   clarify.respond {answer, request_id} · approval.respond {choice, request_id, session_id} ·
  *   sudo.respond {password, request_id} · secret.respond {value, request_id}.
  * Idle Esc/Ctrl+C sends the deny/empty reply. While delivery is pending or
- * uncertain, the same keys can dismiss locally without claiming it was received.
+ * uncertain, `r` deliberately retries that exact response while Esc/Ctrl+C
+ * dismisses locally without claiming it was received.
  *
  * `onRespond` is the entry-wired boundary callback (fires `gateway.request`); the
  * overlay also clears the store prompt so the composer returns. Narrowing is done
@@ -21,7 +22,7 @@ import {
   type PromptResponseDisposition,
   type PromptResponseMethod
 } from '../../boundary/promptResponses.ts'
-import { useCloseLayer } from '../keymap.tsx'
+import { useCloseLayer, usePromptRetryLayer } from '../keymap.tsx'
 import { ApprovalPrompt } from './approvalPrompt.tsx'
 import { ClarifyPrompt } from './clarifyPrompt.tsx'
 import { ConfirmPrompt } from './confirmPrompt.tsx'
@@ -36,11 +37,20 @@ export interface PromptOverlayProps {
 }
 
 type ResponseIntent = 'answer' | 'cancel'
+interface ResponseAttempt {
+  readonly expected: ActivePrompt
+  readonly intent: ResponseIntent
+  readonly method: PromptResponseMethod
+  readonly onAccepted: (() => boolean) | undefined
+  readonly params: Record<string, unknown>
+  readonly sessionId: string | undefined
+  readonly token: number
+}
 type ResponsePhase =
   | { readonly kind: 'idle' }
-  | { readonly intent: ResponseIntent; readonly kind: 'sending' }
-  | { readonly intent: ResponseIntent; readonly kind: 'uncertain'; readonly message: string }
-  | { readonly kind: 'terminal'; readonly reason: 'expired' | 'obsolete' }
+  | { readonly attempt: ResponseAttempt; readonly kind: 'sending'; readonly manualRetry: boolean }
+  | { readonly attempt: ResponseAttempt; readonly kind: 'uncertain'; readonly message: string }
+  | { readonly afterUncertain: boolean; readonly kind: 'terminal'; readonly reason: 'expired' | 'obsolete' }
   | { readonly kind: 'dismissing' }
 
 type GatewayPrompt = Exclude<ActivePrompt, { kind: 'confirm' }>
@@ -109,44 +119,67 @@ export function PromptOverlay(props: PromptOverlayProps) {
     })
   }
 
+  const attemptIsCurrent = (attempt: ResponseAttempt): boolean =>
+    attempt.token === generation &&
+    props.store.state.prompt === attempt.expected &&
+    props.store.state.sessionId === attempt.sessionId
+
   // Keep prompt ownership until the exact decoded disposition arrives. A
-  // terminal response closes obsolete UI; an uncertain response remains local
-  // until the user dismisses it, and is never replayed automatically.
+  // terminal response closes obsolete UI; an uncertain response retains the
+  // immutable attempt for an explicit user retry and is never replayed itself.
+  const dispatchAttempt = (attempt: ResponseAttempt, manualRetry = false): void => {
+    if (!attemptIsCurrent(attempt)) return
+    setPhase({ attempt, kind: 'sending', manualRetry })
+    void props
+      .onRespond(attempt.method, attempt.params)
+      .then(disposition => {
+        if (!attemptIsCurrent(attempt)) return
+        if (disposition.kind === 'uncertain') {
+          setPhase({ attempt, kind: 'uncertain', message: disposition.message })
+          return
+        }
+        if (disposition.kind === 'terminal') {
+          setPhase({ afterUncertain: manualRetry, kind: 'terminal', reason: disposition.reason })
+          settleSoon(attempt.expected, attempt.token, manualRetry ? 'terminal-unconfirmed' : disposition.reason)
+          return
+        }
+        if (attempt.onAccepted && !attempt.onAccepted()) {
+          setPhase({ kind: 'idle' })
+          return
+        }
+        settleSoon(attempt.expected, attempt.token, attempt.intent === 'cancel' ? 'cancelled' : 'accepted')
+      })
+      .catch(cause => {
+        if (!attemptIsCurrent(attempt)) return
+        const disposition = promptTransportUncertain(cause)
+        setPhase({ attempt, kind: 'uncertain', message: disposition.message })
+      })
+  }
+
   const respond = (
     method: PromptResponseMethod,
     params: Record<string, unknown>,
     intent: ResponseIntent = 'answer',
     onAccepted?: () => boolean
-  ) => {
+  ): void => {
     if (phase().kind !== 'idle') return
     const expected = prompt()
     if (!expected) return
-    const token = generation
-    setPhase({ kind: 'sending', intent })
-    void props
-      .onRespond(method, params)
-      .then(disposition => {
-        if (token !== generation || props.store.state.prompt !== expected) return
-        if (disposition.kind === 'uncertain') {
-          setPhase({ kind: 'uncertain', intent, message: disposition.message })
-          return
-        }
-        if (disposition.kind === 'terminal') {
-          setPhase({ kind: 'terminal', reason: disposition.reason })
-          settleSoon(expected, token, disposition.reason)
-          return
-        }
-        if (onAccepted && !onAccepted()) {
-          setPhase({ kind: 'idle' })
-          return
-        }
-        settleSoon(expected, token, intent === 'cancel' ? 'cancelled' : 'accepted')
-      })
-      .catch(cause => {
-        if (token !== generation || props.store.state.prompt !== expected) return
-        const disposition = promptTransportUncertain(cause)
-        setPhase({ kind: 'uncertain', intent, message: disposition.message })
-      })
+    dispatchAttempt({
+      expected,
+      intent,
+      method,
+      onAccepted,
+      params,
+      sessionId: props.store.state.sessionId,
+      token: generation
+    })
+  }
+
+  const retryUncertain = (): void => {
+    const current = phase()
+    if (current.kind !== 'uncertain') return
+    dispatchAttempt(current.attempt, true)
   }
 
   const cancelCurrent = (current: ActivePrompt): void => {
@@ -183,16 +216,27 @@ export function PromptOverlay(props: PromptOverlayProps) {
     () => rootRef,
     () => closeOrCancel()
   )
+  usePromptRetryLayer(
+    () => rootRef,
+    () => phase().kind === 'uncertain',
+    retryUncertain
+  )
 
   const responseHint = (): string | undefined => {
     const current = phase()
     if (current.kind === 'sending') {
-      return `sending ${current.intent === 'cancel' ? 'cancellation' : 'response'}… · Esc/Ctrl+C dismiss locally (delivery not confirmed)`
+      if (current.manualRetry) {
+        return 'retrying same response… · Esc/Ctrl+C dismiss locally (delivery not confirmed)'
+      }
+      return `sending ${current.attempt.intent === 'cancel' ? 'cancellation' : 'response'}… · Esc/Ctrl+C dismiss locally (delivery not confirmed)`
     }
     if (current.kind === 'uncertain') {
-      return 'delivery not confirmed · Esc/Ctrl+C dismiss locally · no automatic resend'
+      return `delivery not confirmed · r retry same ${current.attempt.intent === 'cancel' ? 'cancellation' : 'response'} · Esc/Ctrl+C dismiss locally · no automatic resend`
     }
     if (current.kind === 'terminal') {
+      if (current.afterUncertain) {
+        return 'request no longer pending · earlier delivery remains unconfirmed · closing…'
+      }
       return `${current.reason === 'expired' ? 'request expired' : 'request no longer pending'} · closing…`
     }
     if (current.kind === 'dismissing') return 'dismissing locally…'
