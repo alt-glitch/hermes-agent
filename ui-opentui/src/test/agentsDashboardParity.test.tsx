@@ -527,6 +527,61 @@ describe('native agents dashboard parity', () => {
     }
   })
 
+  test('detail help stays inside the dashboard height below persistent chrome', async () => {
+    const running = agent('retained', 'Inspect retained messages', {
+      trace: [{ kind: 'reply', text: 'Retained assistant message' }]
+    })
+    const completed: DashboardAgent = {
+      ...running,
+      status: 'completed',
+      durationSeconds: 12
+    }
+    const [items, setItems] = createSignal<readonly DashboardAgent[]>([running])
+    const [history, setHistory] = createSignal<SpawnHistoryState>({ snapshots: [] })
+    const probe = await renderProbe(
+      () => (
+        <ThemeProvider>
+          <box flexDirection="column" width="100%" height="100%">
+            <text flexShrink={0}>
+              Synthetic fixture chrome occupies three rows before the agents dashboard at this terminal width
+            </text>
+            <AgentsDashboard subagents={items()} history={history()} onClose={() => {}} />
+          </box>
+        </ThemeProvider>
+      ),
+      { width: 40, height: 12, kittyKeyboard: true }
+    )
+    try {
+      setHistory({ snapshots: [snapshot('retained', 'Retained run', [completed], 0)] })
+      setItems([])
+      await probe.settle()
+      probe.keys.pressEnter()
+      await probe.settle()
+      probe.keys.pressKey('?')
+      await probe.settle()
+      probe.keys.pressKey(KeyCodes.END)
+      await probe.settle()
+
+      const help = descendants(probe.renderer.root).find(item => item.id === 'agents-key-help')
+      expect(help).toHaveProperty('height', 1)
+      const lines = probe.frame().trimEnd().split('\n')
+      const markerRows = [
+        'running agents)',
+        'Last turn',
+        '← Back to agents',
+        'Replay · retained messages',
+        'Messages'
+      ].map(marker => lines.findIndex(line => line.includes(marker)))
+      expect(markerRows.every(row => row >= 0)).toBe(true)
+      expect(markerRows).toEqual([...markerRows].sort((left, right) => left - right))
+      expect(new Set(markerRows).size).toBe(markerRows.length)
+      expect(lines.find(line => line.includes('Messages'))).toMatch(/^│ Messages\s+[▀▄█]?│$/)
+      expect(lines.at(-1)).toMatch(/^└─+┘$/)
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test('legacy archived rows without a status remain completed', () => {
     expect(dashboardAgentFromRecord({ goal: 'legacy archived task', task_index: 0 })?.status).toBe('completed')
     expect(dashboardAgentFromRecord({ goal: 'future archived task', status: 'future-state' })?.status).toBe('completed')

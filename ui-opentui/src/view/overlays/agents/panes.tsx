@@ -192,6 +192,7 @@ export function AgentDetail(props: {
   readonly onReturnLive: () => void
   readonly onFocus: () => void
   readonly replay: boolean
+  readonly showAgentHeading: boolean
   readonly nowMs: number
   readonly bindScroll: (scroll: ScrollBoxRenderable) => void
   readonly node: SubagentNode<DashboardAgent>
@@ -243,11 +244,13 @@ export function AgentDetail(props: {
         onMouseDrag={props.onPauseFollow}
         style={{ flexGrow: 1, minHeight: 0, paddingBottom: 1, paddingRight: 1 }}
       >
-        <text fg={theme().color.text} wrapMode="word">
-          <span style={{ fg: theme().color.accent }}>#{String(props.rowNumber)} </span>
-          <span style={{ fg: visual().color }}>{visual().glyph} </span>
-          <b>{truncRight(agent().taskLabel || agent().goal, Math.max(8, props.width - 8))}</b>
-        </text>
+        <Show when={props.showAgentHeading}>
+          <text fg={theme().color.text} wrapMode="word">
+            <span style={{ fg: theme().color.accent }}>#{String(props.rowNumber)} </span>
+            <span style={{ fg: visual().color }}>{visual().glyph} </span>
+            <b>{truncRight(agent().taskLabel || agent().goal, Math.max(8, props.width - 8))}</b>
+          </text>
+        </Show>
 
         <AgentMessages
           agent={agent()}

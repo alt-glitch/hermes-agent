@@ -112,6 +112,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   const [actionPending, setActionPending] = createSignal(false)
   const [nowMs, setNowMs] = createSignal(Date.now())
   const [following, setFollowing] = createSignal(true)
+  const [dashboardHeight, setDashboardHeight] = createSignal(dims().height)
   const [masterHeight, setMasterHeight] = createSignal(0)
   const [sections, setSections] = createSignal<Readonly<Record<string, boolean>>>({})
   const [showKeys, setShowKeys] = createSignal(false)
@@ -147,6 +148,10 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   const showTimeline = () => dims().width >= 78 && dims().height >= 26
   const timelineRows = () => Math.min(4, rows().length)
   const listCapacity = () => Math.max(1, Math.floor((masterHeight() - 1) / 2))
+  // Terminal dimensions include chrome owned by the parent. Size help from the
+  // dashboard's settled rows, reserving its border, title, detail viewport and footer.
+  const helpHeight = () => Math.max(1, Math.min(8, dashboardHeight() - 8))
+  const visibleFlash = () => (showKeys() ? '' : flash())
   const nodesById = createMemo(() => new Map(rows().map(node => [node.item.id, node])))
   const visible = createMemo(() => dashboardWindow(rows(), selectedIndex(), listCapacity()))
   const visibleIds = createMemo(() => visible().rows.map(node => node.item.id))
@@ -505,6 +510,12 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   return (
     <box
       ref={element => (rootRef = element)}
+      onSizeChange={() => {
+        const root = rootRef
+        queueMicrotask(() => {
+          if (root !== undefined && !root.isDestroyed) setDashboardHeight(root.height)
+        })
+      }}
       focusable
       border
       style={{ borderColor: theme().color.accent, flexDirection: 'column', flexGrow: 1, minHeight: 0 }}
@@ -521,7 +532,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                     helpScroll = element
                     element.focusable = false
                   }}
-                  height={Math.max(2, Math.min(8, dims().height - 8))}
+                  height={helpHeight()}
                   flexShrink={0}
                   scrollX={false}
                 >
@@ -660,6 +671,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                         node={node()}
                         nowMs={displayNowMs()}
                         replay={replayMode()}
+                        showAgentHeading={!showKeys() || dashboardHeight() > 9}
                         following={following()}
                         onPauseFollow={() => {
                           setFollowing(false)
@@ -679,7 +691,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
             </Show>
 
             <box style={{ flexDirection: 'column', flexShrink: 0, paddingLeft: 1, paddingRight: 1 }}>
-              <Show when={flash()}>
+              <Show when={visibleFlash()}>
                 {message => (
                   <text fg={theme().color.accent} wrapMode="none">
                     {truncRight(message(), Math.max(8, dims().width - 4))}
