@@ -36,6 +36,13 @@ Do not inject every installed skill. Keep the full development archive available
 on disk without loading all its references into every run. The profile must not
 inherit personal MCP connections or conversation memory.
 
+External Codex/Claude workers do not inherit Hermes' skill catalog. Put verified
+absolute paths to the relevant `SKILL.md` files in their task packets, not just
+skill names. Resolve them under the actual isolated profile's `skills/` directory;
+do not treat absence from a worker's advertised catalog as absence from disk.
+Have the worker read each relevant entrypoint and its task-specific references;
+do not paste the whole development archive into every worker prompt.
+
 ## Execution
 
 The parent uses `gpt-6-astra` through `openai-codex` subscription auth with medium
