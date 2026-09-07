@@ -16,11 +16,13 @@ it runs. Passing tests and publication are not deployment or live issue proof.
    another profile, or deploy over an unobserved gate.
 3. Select the published candidate's `ops/opentui-fork-maintainer` assets. Inspect
    `provision_profile.py`'s plan, then reprovision only the isolated maintainer
-   while paused. It pins main/compaction to Nous/Astra with medium reasoning,
+   while paused. Require assets that pin main/compaction to Codex subscription
+   (`openai-codex` / `gpt-6-astra`) with medium reasoning,
    300000-token compression trigger, 600-second model stale allowance and
-   maintainer-only off-mode approvals. Shared Portal OAuth remains in Hermes'
-   supported resolver; only the separately authorized Gemini/OpenRouter key is
-   copied. No personal MCPs, conversations or OAuth refresh tokens are copied.
+   maintainer-only off-mode approvals. Use Hermes' supported Codex credential
+   resolver and login/import flow. Only the separately authorized Gemini/OpenRouter
+   key is copied by the provisioner. Do not copy personal MCPs or conversations,
+   manually copy OAuth refresh tokens, or rewrite the user's Codex configuration.
 4. Run the candidate's `configure.py --apply` with the current identity's
    `--hermes-home`, `--job-id` and `--runtime-home`. Do not use `--create-paused`
    for an existing installation. The deployment owner pauses, checks quiescence,
@@ -28,8 +30,8 @@ it runs. Passing tests and publication are not deployment or live issue proof.
    persisted job settings and restores prior pause state transactionally.
    Inspect/reconcile a deployment journal rather than manually replacing files.
 5. Verify the installed profile and actual job resolver both select provider
-   `nous`, model `openai/gpt-6-astra`, medium reasoning and resolver-selected
-   `chat_completions`. Verify compaction separately, video still
+   `openai-codex`, model `gpt-6-astra`, medium reasoning and resolver-selected
+   `codex_responses` (not the Codex app-server loop). Verify compaction separately, video still
    `openrouter/google/gemini-3.5-flash`, and timezone Asia/Kolkata. The existing
    job must have `0 3,9,15,21 * * *`, 18000-second inactivity allowance and no
    fallback route. Retain a real bounded tool-call receipt, not just YAML.

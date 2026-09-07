@@ -38,18 +38,21 @@ issue intake, not merely merge this specification.
 
 ## Setup and recovery requirements from actual runs
 
-The owner changed the main provider to **Nous Portal**, superseding older
-OpenRouter instructions for Astra. Preserve `openai/gpt-6-astra`, medium
-reasoning, Nous for main and compaction, the 300000-token compression trigger,
-and 600-second model stale allowance. The installed Nous resolver currently
-chooses Chat Completions for Astra. Use shared Portal OAuth resolution, not
-copied refresh tokens. Keep the approved Gemini video gate on OpenRouter.
+The owner's latest direction is **Codex subscription**, superseding the earlier
+Nous Portal and OpenRouter routes for Astra. Preserve `gpt-6-astra`, provider
+`openai-codex`, medium reasoning, the 300000-token compression trigger and
+600-second model stale allowance. Main and compaction use Hermes' normal
+`codex_responses` loop, not the optional Codex app-server runtime. Use Hermes'
+supported credential resolver and login/import flow; do not hand-copy refresh
+tokens or rewrite the user's Codex configuration. Keep the approved Gemini video
+gate on OpenRouter.
 Maintainer-only YOLO is authorized; personal MCPs and conversations stay out.
 
-Both `scripts/provision_profile.py` and `scripts/configure.py` currently pin
-OpenRouter. Correct both owners and their policy/skill references; test fresh
-setup and reprovisioning, including the actual job resolver. Do not redeploy
-these old assets over the working Nous profile before the fix is reviewed.
+Both `scripts/provision_profile.py` and `scripts/configure.py`, plus their
+policy/skill references, must retain the subscription route. Test fresh setup
+and reprovisioning, including the actual job resolver, stale endpoint/app-server
+override removal and an empty fallback chain. Do not redeploy older assets that
+would restore Nous or OpenRouter over the working Codex profile.
 
 PR #51 exposed a 30-minute publication wait shorter than its successful Python
 CI run (54 minutes). The label rerun helper also exited successfully after
