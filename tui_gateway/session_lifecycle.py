@@ -454,9 +454,13 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
-    # Human bridges run inside the turn thread. Release them before the settle
-    # join or an unlimited clarify (and every pending approval until its own
-    # deadline) consumes the entire close grace before teardown can wake it.
+    # Publish the hard interrupt before releasing a human bridge: the waiter
+    # may resume immediately and must observe cancellation before it can send
+    # another model request or invoke a captured prompt callback.
+    try:
+        _interrupt_session_turn(_lifecycle_own_sid(session), session)
+    except Exception:
+        logger.debug("failed interrupting popped session turn", exc_info=True)
     _release_session_human_waiters(session)
     run_thread = session.get("_run_thread")
     if end_reason != "tui_shutdown" and run_thread is not None and run_thread is not threading.current_thread():

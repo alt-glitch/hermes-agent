@@ -136,11 +136,13 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
     ]
 
 
-def test_session_close_releases_unlimited_clarify_wait(monkeypatch):
-    """A session-owned human wait must settle before close joins its turn."""
+def test_session_close_interrupts_before_releasing_captured_clarify_callback(monkeypatch):
+    """A detached turn cannot re-arm a captured callback or cancel another session."""
     sid, session_key = "ui-clarify", "stored-clarify"
+    other_sid = "ui-other-clarify"
     events: list[tuple[str, str, dict]] = []
     result: dict[str, str] = {}
+    other_result: dict[str, str] = {}
     monkeypatch.setattr(
         server,
         "_emit",
@@ -151,36 +153,83 @@ def test_session_close_releases_unlimited_clarify_wait(monkeypatch):
     server._pending.clear()
     server._answers.clear()
 
-    waiter = threading.Thread(
-        target=lambda: result.update(
+    class InterruptibleAgent:
+        def __init__(self):
+            self.interrupted = threading.Event()
+
+        def hard_interrupt(self):
+            self.interrupted.set()
+
+        def close(self):
+            return None
+
+    agent = InterruptibleAgent()
+    captured_clarify = lambda question: server._block(
+        "clarify.request",
+        sid,
+        {"question": question, "choices": ["Yes", "No"]},
+        timeout=None,
+    )
+
+    def run_turn():
+        result["first"] = captured_clarify("Continue?")
+        if not agent.interrupted.is_set():
+            result["second"] = captured_clarify("Continue after close?")
+
+    waiter = threading.Thread(target=run_turn)
+    other_waiter = threading.Thread(
+        target=lambda: other_result.update(
             answer=server._block(
                 "clarify.request",
-                sid,
-                {"question": "Continue?", "choices": ["Yes", "No"]},
+                other_sid,
+                {"question": "Other session?", "choices": ["Yes", "No"]},
                 timeout=None,
             )
         )
     )
     session = {
-        "agent": SimpleNamespace(close=lambda: None),
+        "agent": agent,
         "history": [],
         "history_lock": threading.Lock(),
+        "running": True,
         "session_key": session_key,
         "_run_thread": waiter,
     }
     server._sessions[sid] = session
+    server._sessions[other_sid] = {
+        "history": [],
+        "history_lock": threading.Lock(),
+        "session_key": "stored-other-clarify",
+    }
     waiter.start()
+    other_waiter.start()
     _wait_for_event(events, "clarify.request")
+    deadline = time.monotonic() + 2
+    while len([event for event in events if event[0] == "clarify.request"]) < 2:
+        if time.monotonic() >= deadline:
+            raise AssertionError("both clarification waits were not emitted")
+        time.sleep(0.001)
 
-    response = server.handle_request(
-        {"id": "close", "method": "session.close", "params": {"session_id": sid}}
-    )
-    waiter.join(timeout=1)
+    try:
+        response = server.handle_request(
+            {"id": "close", "method": "session.close", "params": {"session_id": sid}}
+        )
+        waiter.join(timeout=1)
 
-    assert response["result"] == {"closed": True}
-    assert not waiter.is_alive()
-    assert result == {"answer": ""}
-    assert server._pending == {}
+        assert response["result"] == {"closed": True}
+        assert not waiter.is_alive()
+        assert agent.interrupted.is_set()
+        assert result == {"first": ""}
+        assert [event[2]["question"] for event in events if event[:2] == ("clarify.request", sid)] == [
+            "Continue?"
+        ]
+        assert other_waiter.is_alive()
+        assert {owner for owner, _event in server._pending.values()} == {other_sid}
+    finally:
+        server._clear_pending(other_sid)
+        other_waiter.join(timeout=1)
+
+    assert other_result == {"answer": ""}
 
 
 def test_approval_fallback_requires_request_and_session_to_match():
