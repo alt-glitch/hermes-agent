@@ -85,6 +85,12 @@ def test_openai_client_rebuild_failure_rolls_back_to_original_state():
 
     original_client = agent.client
     original_kwargs = dict(agent._client_kwargs)
+    anchor = {"prompt_tokens": 12_345}
+    agent._usage_anchor = anchor
+    agent._turn_base_usage_anchor = anchor
+    agent.session_id = "failed-switch-anchor-session"
+    agent._session_db = MagicMock()
+    agent._persist_disabled = False
 
     # _create_openai_client raises mid-swap (simulates bad key / network error)
     def boom(*_a, **_kw):
@@ -111,6 +117,9 @@ def test_openai_client_rebuild_failure_rolls_back_to_original_state():
     assert agent.client is original_client
     assert agent._client_kwargs == original_kwargs
     assert agent.runtime_capabilities == {"native_compaction": False}
+    assert agent._usage_anchor is anchor
+    assert agent._turn_base_usage_anchor is anchor
+    agent._session_db.patch_session_model_config.assert_not_called()
 
 
 def test_anthropic_client_rebuild_failure_rolls_back_to_original_state():
@@ -191,6 +200,12 @@ def test_successful_switch_still_works_after_rollback_refactor():
 
     new_client = MagicMock(name="NewClient")
     agent._create_openai_client = lambda *_a, **_kw: new_client
+    anchor = {"prompt_tokens": 12_345}
+    agent._usage_anchor = anchor
+    agent._turn_base_usage_anchor = anchor
+    agent.session_id = "successful-switch-anchor-session"
+    agent._session_db = MagicMock()
+    agent._persist_disabled = False
 
     with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
         agent.switch_model(
@@ -205,3 +220,34 @@ def test_successful_switch_still_works_after_rollback_refactor():
     assert agent.provider == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client
+    assert agent._usage_anchor is None
+    assert agent._turn_base_usage_anchor is None
+    agent._session_db.patch_session_model_config.assert_called_once_with(
+        agent.session_id,
+        {"_usage_anchor": None},
+    )
+
+
+def test_noop_switch_preserves_current_runtime_usage_anchor():
+    """Refreshing an unchanged runtime must retain its still-compatible anchor."""
+    agent = _make_agent_openrouter()
+    agent._create_openai_client = lambda *_a, **_kw: MagicMock(name="RefreshedClient")
+    anchor = {"prompt_tokens": 12_345}
+    agent._usage_anchor = anchor
+    agent._turn_base_usage_anchor = anchor
+    agent.session_id = "noop-switch-anchor-session"
+    agent._session_db = MagicMock()
+    agent._persist_disabled = False
+
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        agent.switch_model(
+            new_model=agent.model,
+            new_provider=agent.provider,
+            api_key=agent.api_key,
+            base_url=agent.base_url,
+            api_mode=agent.api_mode,
+        )
+
+    assert agent._usage_anchor is anchor
+    assert agent._turn_base_usage_anchor is anchor
+    agent._session_db.patch_session_model_config.assert_not_called()

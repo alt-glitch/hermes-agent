@@ -52,6 +52,19 @@ describe('eventBelongsToSession', () => {
     expect(eventBelongsToSession(live, 'live-1')).toBe(true)
   })
 
+  test('session-control updates retain the shared stale-session fence', () => {
+    const control = {
+      type: 'session.control.update',
+      session_id: 'old-1',
+      payload: {
+        control: { goal: null, heartbeat: null, loop: null, revision: 'old-revision', updated_at: 1 }
+      }
+    } satisfies GatewayEvent
+
+    expect(eventBelongsToSession(control, 'live-1')).toBe(false)
+    expect(eventBelongsToSession({ ...control, session_id: 'live-1' }, 'live-1')).toBe(true)
+  })
+
   test('resume buffering admits target events before transport identity changes', () => {
     const target = { type: 'message.start', session_id: 'target-live' } satisfies GatewayEvent
     expect(eventMayEnterStore(target, 'old-live', false)).toBe(false)
