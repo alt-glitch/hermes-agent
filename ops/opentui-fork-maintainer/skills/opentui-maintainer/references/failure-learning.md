@@ -37,10 +37,12 @@ accumulate universal prohibitions or entire transcripts in skills.
 PR #39 advanced the fork after local gates passed, but Greptile finished nine
 minutes later with 3/5. Its upstream-imported media symlink race reproduced on
 both leaf and parent-directory swaps; passing focused tests had not covered that
-window. The publisher now observes a current-head 5/5 and completed green remote
-checks before target CAS. A pending review is not approval, and the bot's green
-check conclusion alone does not mean its confidence score is 5/5. Keep PR findings
-separate from maintainer health: the cron stayed paused while these were repaired.
+window. The original correction required current-head 5/5 and green remote checks.
+On 2026-09-07 the user disabled Greptile for cost: the score requirement is
+removed, while independent review, executed regression coverage and completed
+required CI still precede target CAS. Do not reintroduce paid review polling.
+Keep PR findings separate from maintainer health: the cron stayed paused while
+these defects were repaired.
 
 The attribution workflow also compared every PR against `main`, even when targeting
 `sid/opentui`; this falsely charged earlier fork history to the new PR. Compare

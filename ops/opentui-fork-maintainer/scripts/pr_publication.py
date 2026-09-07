@@ -26,7 +26,7 @@ END = "<!-- before-and-after:end -->"
 ATTACHMENT = re.compile(r"https://github\.com/user-attachments/assets/[a-zA-Z0-9-]+")
 FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state"
 # Immutable GitHub App IDs, verified against this fork's live check suites.
-REQUIRED_CHECK_APPS = {"Greptile Review": 867647, "All required checks pass": 15368}
+REQUIRED_CHECK_APPS = {"All required checks pass": 15368}
 REQUIRED_CONTEXTS = set(REQUIRED_CHECK_APPS)
 # These rules add no check contexts; GitHub still enforces them at merge/push.
 NON_CHECK_RULES = frozenset({
@@ -315,31 +315,22 @@ def candidate_checks(root: Path, candidate: str) -> list[dict[str, Any]]:
     return checks
 
 
-def review_status(pr: dict[str, Any], comments: list[dict[str, Any]], candidate: str, policy: dict[str, Any]) -> dict[str, Any] | None:
-    """Accept only the current candidate's bot score and completed green checks."""
+def review_status(pr: dict[str, Any], candidate: str, policy: dict[str, Any]) -> dict[str, Any] | None:
+    """Require current-head CI and GitHub policy; independent review is a local gate."""
     if pr.get("headRefOid") != candidate or pr.get("state") != "OPEN" or pr.get("baseRefName") != BASE:
         raise PublicationError("review target changed or closed before publication")
     if policy.get("base") != BASE or not isinstance(policy.get("contexts"), list):
         raise PublicationError("verified base branch check policy is required")
-    summaries = [
-        comment for comment in comments
-        if (comment.get("user") or {}).get("login") == "greptile-apps[bot]"
-        and "Confidence Score:" in comment.get("body", "")
-    ]
-    latest = max(summaries, key=lambda item: (item["updated_at"], item["id"]), default=None)
-    if latest is None:
-        return None
-    body = latest["body"]
-    reviewed = re.search(r"Last reviewed commit:.*?/commit/([0-9a-f]{40})", body)
-    if not reviewed or reviewed[1] != candidate:
-        return None
-    scores = re.findall(r"Confidence Score:\s*([0-5])/5", body)
-    if scores != ["5"]:
-        raise PublicationError("current Greptile review is not 5/5; fix findings before publication")
     checks = pr.get("statusCheckRollup") or []
     if not checks:
         return None
     for check in checks:
+        if (
+            check.get("name") == "Greptile Review"
+            and ((check.get("checkSuite") or {}).get("app") or {}).get("databaseId") == 867647
+            and "Greptile Review" not in policy["contexts"]
+        ):
+            continue
         if check.get("__typename") == "CheckRun":
             if check.get("status") != "COMPLETED":
                 return None
@@ -370,9 +361,6 @@ def review_status(pr: dict[str, Any], comments: list[dict[str, Any]], candidate:
         return None
     return {
         "candidate_sha": candidate,
-        "score": "5/5",
-        "comment_url": latest["html_url"],
-        "comment_updated_at": latest["updated_at"],
         "checks": checks,
         "required_check_policy": policy,
         "merge_state": pr["mergeStateStatus"],
@@ -440,12 +428,8 @@ def wait_for_review(
                     "candidate PR attachment identity changed before publication"
                 )
         pr["statusCheckRollup"] = candidate_checks(root, candidate)
-        pages = json.loads(_run([
-            str(GH), "api", "--paginate", "--slurp",
-            f"repos/{REPOSITORY}/issues/{number}/comments?per_page=100",
-        ], root))
         policy = required_check_policy(root)
-        proof = review_status(pr, [item for page in pages for item in page], candidate, policy)
+        proof = review_status(pr, candidate, policy)
         if proof is not None:
             _write(root / "pr-review.json", json.dumps(proof, indent=2) + "\n")
             (root / "pr-pending.json").unlink(missing_ok=True)
@@ -469,7 +453,7 @@ def wait_for_review(
                 "PR review/checks are still pending at the bounded lease-aware deadline; "
                 "candidate PR was retained for recovery and target branch was not updated"
             )
-        print(f"PR #{number}: waiting for current-head Greptile 5/5 and green checks", flush=True)
+        print(f"PR #{number}: waiting for current-head CI and GitHub merge policy", flush=True)
         time.sleep(min(REVIEW_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
 

@@ -88,8 +88,9 @@ and preserves it in a linear candidate above the captured fork base. If the
 base moved, failure finalization retires the request into `request.stale.json`
 and reports `request_retired: true`. Report it and ask for a new request against
 the new base; don't silently broaden authorization or retry that stale request.
-Every publication still requires the full gates, independent review, current
-head Greptile 5/5, required CI checks and remote compare-and-swap. Repairs do not
+Every publication still requires the full gates, independent review, current-head
+required CI checks and remote compare-and-swap. Greptile
+is disabled; do not request a paid review or wait for its score. Repairs do not
 advance the upstream-sync watermark. Runtime gates enforce source/base ancestry;
 the worker's PR lookup establishes the PR-to-source relationship. Publication
 creates a run-scoped candidate PR, so checks and reviews must cover that new
