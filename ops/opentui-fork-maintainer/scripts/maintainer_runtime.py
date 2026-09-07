@@ -319,6 +319,14 @@ def _record_run_outcome(
         **value,
     }
     evidence_path = _safe_output_path(evidence_root, "run-outcome.json")
+    if value.get("status") == "success" and evidence_path.is_file():
+        previous = evidence_path.read_text(encoding="utf-8")
+        if json.loads(previous).get("status") == "failed":
+            history = _safe_output_path(evidence_root, "run-outcome.failed.json")
+            if history.exists() and history.read_text(encoding="utf-8") != previous:
+                raise ControlError("prior failed outcome history differs")
+            if not history.exists():
+                _atomic_text(history, previous)
     _atomic_json(evidence_path, outcome)
     durable = {
         **outcome,
@@ -3520,6 +3528,7 @@ def _finalize_delivered_issue(
     state_dir: Path,
     evidence_root: Path,
     journal: dict[str, Any],
+    *, recovery_only: bool = False,
 ) -> dict[str, Any] | None:
     binding = journal.get("run_binding")
     if not isinstance(binding, dict) or binding.get("mode") != "issue":
@@ -3535,6 +3544,7 @@ def _finalize_delivered_issue(
             request,
             candidate_sha=journal["candidate_sha"],
             pr_evidence=journal.get("pr_evidence"),
+            recovery_only=recovery_only,
         )
     except workflow.IssueWorkflowError as exc:
         raise ControlError(str(exc)) from exc
@@ -3553,6 +3563,7 @@ def finalize_success(
     remote: str = REMOTE,
     branch: str = BRANCH,
     _recover_published_manifest: bool = False,
+    _recover_issue_close_only: bool = False,
 ) -> dict[str, Any]:
     """Consume any claimed request and remove a proven shipped worktree.
 
@@ -3633,7 +3644,7 @@ def finalize_success(
     if journal["phase"] != "finalizing":
         raise ControlError("publication journal is not finalizable")
     issue_delivery = _finalize_delivered_issue(
-        state_dir, evidence_root, journal
+        state_dir, evidence_root, journal, recovery_only=_recover_issue_close_only,
     )
     resolved_cwd = _validate_success_cleanup_worktree(
         repo,
@@ -3950,8 +3961,83 @@ def release_completed_lease(
     state_dir: Path, evidence_dir: Path, token: str
 ) -> dict[str, Any]:
     outcome = _bound_terminal_outcome(state_dir, evidence_dir)
+    journal = _load_publish_journal(state_dir, require_manifest_evidence=False)
+    if outcome.get("needs_finalization") is True or (
+        journal is not None and journal["phase"] in {"prepared", "published", "finalizing"}
+    ):
+        raise ControlError("unfinished publication must be reconciled before lease release")
     release_lease(state_dir, token)
     return outcome
+
+
+def _reconcile_missing_lease(
+    state_dir: Path, evidence_root: Path, token: str,
+) -> dict[str, Any]:
+    """Finish one released publication; caller holds the maintainer run lock."""
+    # Hold the claim/renew/publication fence throughout recovery. Absence is not
+    # permission for another owner to claim while remote evidence is read.
+    with _lease_lock(state_dir):
+        lease_path = state_dir / "run.lease.json"
+        if lease_path.exists() or lease_path.is_symlink():
+            raise ControlError("missing-lease recovery refuses an existing lease")
+        journal = _load_publish_journal(state_dir)
+        if (
+            journal is None
+            or journal["phase"] not in {"published", "finalizing", "finalized"}
+            or journal["evidence_dir"] != str(evidence_root)
+        ):
+            raise ControlError("missing-lease recovery requires this run's published journal")
+        manifest_path = _evidence_path(journal["manifest_path"], evidence_root, label="published manifest")
+        manifest = _load_gate(manifest_path)
+        binding = journal["run_binding"]
+        worktree_proof = manifest.get("worktree_proof")
+        if (
+            manifest.get("lease_token_sha256") != hashlib.sha256(token.encode()).hexdigest()
+            or manifest.get("base_sha") != journal["base_sha"]
+            or manifest.get("candidate_sha") != journal["candidate_sha"]
+            or manifest.get("branch") != journal["branch"]
+            or manifest.get("run_binding") != binding
+            or not _valid_run_binding(binding)
+            or binding["mode"] != "issue"
+            or not isinstance(worktree_proof, dict)
+            or worktree_proof.get("worktree") != journal["worktree"]
+            or not isinstance(journal.get("pr_evidence"), dict)
+            or manifest.get("pr_evidence") != journal.get("pr_evidence")
+        ):
+            raise ControlError("missing-lease publication identity does not match")
+        outcome = _bound_terminal_outcome(state_dir, evidence_root)
+        if journal["phase"] == "finalized" and outcome.get("status") == "success":
+            return outcome
+        if (
+            outcome.get("status") != "failed"
+            or outcome.get("stage") != "finalization"
+            or outcome.get("published") is not True
+            or outcome.get("needs_finalization") is not True
+            or outcome.get("candidate_sha") != journal["candidate_sha"]
+        ):
+            raise ControlError("missing-lease recovery requires a bound published finalization failure")
+        with _request_lock(state_dir):
+            claimed = _read_bound_request(
+                evidence_root / "request.claimed.json", evidence_root, label="released claim")
+            consumed = evidence_root / "request.consumed.json"
+            request_path = consumed if consumed.exists() else state_dir / "run-request.inflight.json"
+            request_root = evidence_root if consumed.exists() else state_dir
+            if (
+                _canonical_json_sha256(claimed) != binding["request_sha256"]
+                or _read_bound_request(request_path, request_root, label="released request") != claimed
+                or (consumed.exists() and (state_dir / "run-request.inflight.json").exists())
+                or (state_dir / "run-request.json").exists()
+            ):
+                raise ControlError("missing-lease recovery request differs from publication")
+        # finalize_success re-reads remote ancestry and the receipt-bound issue
+        # before consuming this claim. It neither validates nor creates a lease.
+        result = finalize_success(
+            Path(journal["repo"]), manifest_path, state_dir=state_dir,
+            evidence_dir=evidence_root, cwd=Path(journal["worktree"]), token=token,
+            remote=journal["remote"], branch=journal["branch"],
+            _recover_issue_close_only=True,
+        )
+        return {"status": "success", **result}
 
 
 def reconcile_run(
@@ -3960,9 +4046,12 @@ def reconcile_run(
     *,
     token: str,
     allow_expired: bool = False,
+    allow_missing_lease: bool = False,
 ) -> dict[str, Any]:
     """Deterministically close a run after its Hermes parent has exited."""
     evidence_root = Path(os.path.abspath(evidence_dir))
+    if allow_missing_lease:
+        return _reconcile_missing_lease(state_dir, evidence_root, token)
     if allow_expired:
         with _lease_lock(state_dir):
             lease = _lease_value(state_dir)
@@ -4112,7 +4201,10 @@ def _parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--state", type=Path, required=True)
     reconcile.add_argument("--evidence", type=Path, required=True)
     reconcile.add_argument("--token", required=True)
-    reconcile.add_argument("--allow-expired", action="store_true")
+    recovery_mode = reconcile.add_mutually_exclusive_group()
+    recovery_mode.add_argument("--allow-expired", action="store_true")
+    recovery_mode.add_argument("--allow-missing-lease", action="store_true",
+                              help="recover only a bound published issue finalization failure without a lease")
     publish.add_argument("--state", type=Path, required=True)
     publish.add_argument("--token", required=True)
     publish.add_argument("--packet", type=Path, required=True)
@@ -4248,6 +4340,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.evidence,
                     token=args.token,
                     allow_expired=args.allow_expired,
+                    allow_missing_lease=args.allow_missing_lease,
                 )
         except RunBusyError:
             return 75  # EX_TEMPFAIL: the watchdog must observe the existing gate.

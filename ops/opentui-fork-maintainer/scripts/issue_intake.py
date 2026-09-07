@@ -835,6 +835,7 @@ def finalize_delivered_issue(
     pr_url: str,
     now: int | None = None,
     runner: Runner | None = None,
+    recovery_only: bool = False,
 ) -> dict[str, Any]:
     runner = _run if runner is None else runner
     io = _DELIVERY.DeliveryIO(
@@ -863,4 +864,5 @@ def finalize_delivered_issue(
         pr_url=pr_url,
         now=now,
         runner=runner,
+        recovery_only=recovery_only,
     )

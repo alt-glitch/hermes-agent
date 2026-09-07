@@ -694,6 +694,7 @@ def finalize_delivered_issue(
     pr_url: str,
     now: int | None = None,
     runner: Callable[..., str],
+    recovery_only: bool = False,
 ) -> dict[str, Any]:
     """Close only an exactly authorized issue after its candidate was delivered."""
     now = int(time.time()) if now is None else now
@@ -710,6 +711,8 @@ def finalize_delivered_issue(
     )
     if recovered is not None:
         return recovered
+    if recovery_only:
+        raise io.issue_error("missing receipt-bound close failure for read-only recovery")
     preserved = _preserved_transition_delivery(
         io, state_dir, request, candidate_sha, pr_url
     )

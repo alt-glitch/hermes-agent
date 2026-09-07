@@ -181,6 +181,7 @@ def finalize_delivered(
     *,
     candidate_sha: str,
     pr_evidence: Any,
+    recovery_only: bool = False,
 ) -> dict[str, Any]:
     """Finalize a shipped issue candidate against its published pull request."""
     if request.get("mode") != "issue":
@@ -199,6 +200,7 @@ def finalize_delivered(
             request,
             candidate_sha=candidate_sha,
             pr_url=pr_evidence["url"],
+            recovery_only=recovery_only,
         )
     except (RuntimeError, ValueError, KeyError, OSError) as exc:
         raise IssueWorkflowError("delivered issue could not be finalized") from exc

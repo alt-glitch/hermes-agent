@@ -41,11 +41,38 @@ actor and intent instead; do not use a timestamp tolerance. The timestamp of
 the **same event** must still agree across APIs.
 
 After coordinator review, quiescence and provisioning, use the existing
-`maintainer_runtime.py finalize-success` (or its existing reconciler) for the
-original journal/manifest/evidence/worktree. Keep the original publication
-binding; do not create a claim, republish, rerun gates, or clear intake state.
-Inspect the current CLI help for its required arguments and let the existing
-owner supply the retained token without printing it.
+finalizer for the original journal/manifest/evidence/worktree. `finalize-success`
+requires a live lease, and `reconcile-run --allow-expired` requires an expired
+lease. Neither can recover PR83's legacy **absent lease**. For that exact state,
+the coordinator supplies the original retained token (without printing it) and
+uses the explicit missing-lease mode of the same reconciler:
+
+```sh
+/usr/bin/env PATH="/usr/bin:/bin:$PATH" uv run --no-project \
+  --python /home/daimon/.hermes/hermes-agent/venv/bin/python python \
+  /home/daimon/projects/opentui-fork-maintainer/scripts/maintainer_runtime.py \
+  reconcile-run --state /home/daimon/projects/opentui-fork-maintainer/state \
+  --evidence /home/daimon/projects/opentui-fork-maintainer/state/runs/20260907T121736Z-f2fdbb17 \
+  --token "$ORIGINAL_RUN_TOKEN" --allow-missing-lease
+```
+
+The retained token is checked against the immutable manifest digest; it does
+not recreate a lease. The CLI holds `maintainer.lock` and `run.lease.lock` through
+remote readback and finalization, refusing any existing lease, including an
+expired or different owner. It requires the matching intact published journal
+and manifest, durable failed/finalization outcome with `published=true` and
+`needs_finalization=true`, exact issue claim, and remote candidate ancestry.
+It cannot run gates, publish, post a receipt, close or reopen an issue. Missing
+sticky close evidence fails closed instead of falling back to ordinary delivery.
+
+Keep the existing queue paused until this exact run is finalized. Do not use a
+new preflight claim as recovery or manually clear intake state. Successful
+recovery preserves the original failed outcome byte-for-byte in
+`run-outcome.failed.json` before recording terminal success. Repeating the same
+command verifies durable completion without a new lease; an interrupted final
+outcome write can also be retried. Lease release now refuses unfinished
+publication even when a failed outcome exists. Missing or changed manifest,
+outcome, claim or receipt evidence requires coordinator resolution, not bypass.
 
 The delivery owner now resolves `closure_compensation_unresolved` only when
 two complete read-only observations prove the issue remains CLOSED/COMPLETED,

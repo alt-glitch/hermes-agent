@@ -636,7 +636,15 @@ def test_issue_gate_is_linear_revision_bound_and_never_advances_upstream(
     assert json.loads((evidence / "request.consumed.json").read_text()) == value
 
 
-def test_published_issue_finalizer_recovers_sticky_close_without_republication(tmp_path, monkeypatch):
+@pytest.mark.parametrize("obstruction", [
+    None, "active-lease", "different-lease", "expired-lease", "run-lock", "wrong-token", "prepared",
+    "other-evidence", "candidate", "manifest", "outcome", "unpublished",
+    "inflight", "claim", "queued", "remote", "missing-delivery-failure",
+    "interrupted-outcome", "missing-journal", "pr-evidence",
+])
+def test_published_issue_finalizer_recovers_sticky_close_without_republication(
+    tmp_path, monkeypatch, capsys, obstruction,
+):
     from test_issue_intake import GitHub, issue, labeled
 
     repo, _, base, candidate, worktree = make_repo(tmp_path)
@@ -662,8 +670,15 @@ def test_published_issue_finalizer_recovers_sticky_close_without_republication(t
     github = GitHub([current], {41: [labeled(1234, "alt-glitch")]})
     github.close_skew = True
     real_run_path = runtime.runpy.run_path
+    recovering = False
 
     def missing_ack(argv, cwd):
+        if recovering:
+            assert not (state / "run.lease.json").exists()
+            for lock_name in ("maintainer.lock", "run.lease.lock"):
+                with (state / lock_name).open("a+", encoding="utf-8") as handle:
+                    with pytest.raises(BlockingIOError):
+                        runtime.fcntl.flock(handle.fileno(), runtime.fcntl.LOCK_EX | runtime.fcntl.LOCK_NB)
         response = github.run(argv, cwd)
         if "mutation CloseIssue" in " ".join(argv):
             # The publication is already committed; an unusable close response
@@ -689,18 +704,89 @@ def test_published_issue_finalizer_recovers_sticky_close_without_republication(t
     assert json.loads((state / "publish-journal.json").read_text(encoding="utf-8"))["phase"] == "finalizing"
     assert (state / "run-request.inflight.json").exists()
     assert worktree.exists() and remote_sha(repo) == candidate
+    runtime.finalize_failure(state, evidence, stage="finalization", reason_code="finalization-failed")
+    original_failure = (evidence / "run-outcome.json").read_bytes()
+    with pytest.raises(runtime.ControlError, match="unfinished publication"):
+        runtime.main(["release-lease", "--state", str(state), "--evidence", str(evidence),
+                      "--token", "test-token"])
+    assert (state / "run.lease.json").exists()
+    # Reproduce the legacy release after a durable post-publication failure.
+    (state / "run.lease.json").unlink()
     call_count = len(github.calls)
     monkeypatch.setattr(runtime, "gate_and_ship", lambda *args, **kwargs: pytest.fail("no republication"))
-    result = runtime.finalize_success(repo, manifest_path, state_dir=state,
-                                     evidence_dir=evidence, cwd=worktree, token="test-token")
+    command = ["reconcile-run", "--state", str(state), "--evidence", str(evidence),
+               "--token", "test-token", "--allow-missing-lease"]
+    with pytest.raises(runtime.ControlError, match="run lease is missing"):
+        runtime.main(command[:-1] + ["--allow-expired"])
+    recovering = True
+    if obstruction == "run-lock":
+        with runtime.run_lock(state):
+            assert runtime.main(command) == 75
+        assert (evidence / "run-outcome.json").read_bytes() == original_failure
+        return
+    journal_path = state / "publish-journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    changed_files = {
+        "prepared": (journal_path, {**journal, "phase": "prepared"}),
+        "other-evidence": (journal_path, {**journal, "evidence_dir": str(tmp_path / "other")}),
+        "candidate": (journal_path, {**journal, "candidate_sha": base}),
+        "pr-evidence": (journal_path, {**journal, "pr_evidence": None}),
+        "inflight": (state / "run-request.inflight.json", {**value, "request_id": "unrelated"}),
+        "claim": (evidence / "request.claimed.json", {**value, "request_id": "unrelated"}),
+        "queued": (state / "run-request.json", {**value, "request_id": "unrelated"}),
+    }
+    actions = {
+        "active-lease": lambda: write_live_lease(state),
+        "different-lease": lambda: write_live_lease(state, token="other"),
+        "expired-lease": lambda: write_live_lease(state, expires_unix=1),
+        "wrong-token": lambda: command.__setitem__(command.index("--token") + 1, "wrong"),
+        "manifest": manifest_path.unlink,
+        "missing-journal": journal_path.unlink,
+        "outcome": (state / "last-run.json").unlink,
+        "unpublished": lambda: runtime._record_run_outcome(state, evidence, {
+            **json.loads(original_failure), "published": False,
+        }),
+        "remote": lambda: git(repo, "push", "--force", "origin", f"{base}:sid/opentui"),
+        "missing-delivery-failure": (state / "issue-intake-state.json").unlink,
+    }
+    if obstruction in changed_files:
+        runtime._atomic_json(*changed_files[obstruction])
+    if obstruction in actions:
+        actions[obstruction]()
+    if obstruction and obstruction != "interrupted-outcome":
+        before = {path: path.read_bytes() if path.exists() else None for path in [
+            state / "publish-journal.json", state / "run-request.inflight.json",
+            evidence / "run-outcome.json", state / "run.lease.json",
+            state / "run-request.json", evidence / "request.claimed.json",
+        ]}
+        with pytest.raises(runtime.ControlError):
+            runtime.main(command)
+        assert all((path.read_bytes() if path.exists() else None) == data for path, data in before.items())
+        assert len(github.calls) == call_count
+        assert worktree.exists()
+        assert not (evidence / "run-outcome.failed.json").exists()
+        return
+    if obstruction == "interrupted-outcome":
+        record = runtime._record_run_outcome
+        def interrupt_outcome(*args):
+            raise OSError("interrupted")
+        monkeypatch.setattr(runtime, "_record_run_outcome", interrupt_outcome)
+        with pytest.raises(OSError, match="interrupted"):
+            runtime.main(command)
+        assert (evidence / "run-outcome.json").read_bytes() == original_failure
+        monkeypatch.setattr(runtime, "_record_run_outcome", record)
+    assert runtime.main(command) == 0
+    result = json.loads(capsys.readouterr().out)
     assert result["issue_delivery"]["recovered_close"]["event_id"] == github.timelines[41][-1]["node_id"]
     assert result["request_consumed"] is True
     assert not worktree.exists() and remote_sha(repo) == candidate
     assert not (state / "run-request.inflight.json").exists()
     assert json.loads((state / "publish-journal.json").read_text(encoding="utf-8"))["phase"] == "finalized"
     assert json.loads((evidence / "run-outcome.json").read_text(encoding="utf-8"))["status"] == "success"
-    assert runtime.finalize_success(repo, manifest_path, state_dir=state,
-                                    evidence_dir=evidence, cwd=worktree, token="test-token") == result
+    assert runtime.main(command) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "success"
+    assert (evidence / "run-outcome.failed.json").read_bytes() == original_failure
+    assert not (state / "run.lease.json").exists()
     assert not any(
         "--method" in call or "mutation CloseIssue" in " ".join(call)
         for call in github.calls[call_count:]
