@@ -76,6 +76,22 @@ def _ra():
     return run_agent
 
 
+def refresh_provider_routing(agent, config: Optional[Dict[str, Any]] = None) -> None:
+    """Bind the current model's config overlay at a runtime-routing boundary."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import resolve_per_model_provider_routing
+
+        config = load_config_readonly() if config is None else config
+        routing = config.get("provider_routing") if isinstance(config, dict) else None
+        models = routing.get("models") if isinstance(routing, dict) else None
+        overlay = resolve_per_model_provider_routing(agent.model, models)
+    except Exception:
+        logger.debug("provider-routing overlay resolution failed", exc_info=True)
+        overlay = {}
+    agent._provider_routing_model_overlay = dict(overlay)
+
+
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset({
     "todo_list", "session_search", "memory", "clarify", "read_terminal", "desktop_preview",
     "drive_preview", "annotate_preview", "read_window_below", "setup_mcp", "gui_tour", "delegate_task",
@@ -892,6 +908,7 @@ def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
     agent.api_key = rt["api_key"]
     agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
     agent.request_overrides = dict(rt.get("request_overrides") or {})
+    agent._provider_routing_model_overlay = dict(rt.get("provider_routing_model_overlay") or {})
     agent._client_kwargs = dict(rt["client_kwargs"])
 
 
@@ -1804,6 +1821,7 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
     "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
+    "_provider_routing_model_overlay",
     "_credential_pool", "_credential_pool_entry_id",
 )
 _MISSING = object()
@@ -2052,6 +2070,9 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        "provider_routing_model_overlay": dict(
+            getattr(agent, "_provider_routing_model_overlay", {}) or {}
+        ),
         # Overrides must travel with the switched-to identity or a later recovery/restore resurrects
         # PRE-switch overrides from the stale init snapshot.
         # See #75091.
@@ -2163,6 +2184,7 @@ def switch_model(
         )
     except Exception as _reasoning_err:
         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+    refresh_provider_routing(agent)
     # Invalidate the cached system prompt so it rebuilds next turn.
     agent._cached_system_prompt = None
     # Publish the destination capability map only after every runtime setup above has succeeded.

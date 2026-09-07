@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
-from agent.agent_runtime_helpers import _ra
+from agent.agent_runtime_helpers import _ra, refresh_provider_routing
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
@@ -2106,6 +2106,9 @@ def _snapshot_primary_runtime(agent):
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        "provider_routing_model_overlay": dict(
+            getattr(agent, "_provider_routing_model_overlay", {}) or {}
+        ),
         # Engine state _try_activate_fallback() overwrites (getattr: plugin engines may lack them).
         "compressor_model": getattr(_cc, "model", agent.model),
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
@@ -2316,6 +2319,7 @@ def init_agent(
     _init_usage_state(agent)
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _emit_compression_summary(agent, cs)
+    refresh_provider_routing(agent, _agent_cfg)
     _snapshot_primary_runtime(agent)
 
 

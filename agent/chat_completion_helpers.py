@@ -380,18 +380,12 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
 def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     """Build the validated provider-routing object shared by request paths.
 
-    ``provider_routing.models.<id>`` overlays the flat constructor values for the CURRENT
-    ``agent.model`` (so ``/model`` switches, fallbacks, and delegated children on another
-    model each get their own pins without any surface re-plumbing the kwargs)."""
+    Runtime boundaries bind ``provider_routing.models.<id>`` for the active model; request
+    construction only combines that decision with the agent's flat constructor values."""
     flat = {"only": agent.providers_allowed, "ignore": agent.providers_ignored, "order": agent.providers_order,
         "sort": agent.provider_sort, "require_parameters": agent.provider_require_parameters,
         "data_collection": agent.provider_data_collection}
-    per_model = {}
-    with contextlib.suppress(Exception):
-        from hermes_cli.config import load_config_readonly
-        from hermes_constants import resolve_per_model_provider_routing
-        _pr = load_config_readonly().get("provider_routing")
-        per_model = resolve_per_model_provider_routing(agent.model, (_pr or {}).get("models") if isinstance(_pr, dict) else None)
+    per_model = getattr(agent, "_provider_routing_model_overlay", {}) or {}
     merged = {**flat, **{k: v for k, v in per_model.items() if k in flat}}
     merged["sort"] = _validated_openrouter_provider_sort(merged["sort"])
     merged["require_parameters"] = True if merged["require_parameters"] else None
@@ -2176,6 +2170,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
         _update_fallback_context_compressor(agent)
         _reresolve_fallback_reasoning_config(agent)
+        from agent.agent_runtime_helpers import refresh_provider_routing
+        refresh_provider_routing(agent)
         _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
