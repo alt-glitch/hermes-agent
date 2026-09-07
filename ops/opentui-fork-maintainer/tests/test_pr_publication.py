@@ -617,7 +617,7 @@ def test_issue_publication_requires_the_workflow_owner_beside_the_publisher(
         module._issue_workflow()
 
 
-def test_candidate_pr_identity_changes_with_request_base_or_candidate(capture) -> None:
+def test_candidate_pr_identity_changes_only_with_task_or_base(capture) -> None:
     bind_issue(capture)
     original = pub._candidate_head(capture[1])[0]
     changed_request = json.loads(json.dumps(capture[1]))
@@ -629,8 +629,8 @@ def test_candidate_pr_identity_changes_with_request_base_or_candidate(capture) -
     assert {
         pub._candidate_head(changed_request)[0],
         pub._candidate_head(changed_base)[0],
-        pub._candidate_head(changed_candidate)[0],
     }.isdisjoint({original})
+    assert pub._candidate_head(changed_candidate)[0] == original
 
 
 def test_issue_metadata_is_bounded_plain_data_and_preserves_preview_semantics(

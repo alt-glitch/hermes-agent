@@ -25,6 +25,7 @@ START = "<!-- before-and-after:start -->"
 END = "<!-- before-and-after:end -->"
 ATTACHMENT = re.compile(r"https://github\.com/user-attachments/assets/[a-zA-Z0-9-]+")
 FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state"
+OWNERSHIP_FIELDS = ",baseRefOid,isCrossRepository,headRepositoryOwner,headRepository"
 # Immutable GitHub App IDs, verified against this fork's live check suites.
 REQUIRED_CHECK_APPS = {"All required checks pass": 15368}
 REQUIRED_CONTEXTS = set(REQUIRED_CHECK_APPS)
@@ -163,7 +164,7 @@ def _canonical_sha(value: Any) -> str:
 
 
 def _candidate_head(manifest: dict[str, Any]) -> tuple[str, str, str]:
-    """Derive retry-stable PR identity from request/base/candidate."""
+    """The task/revision and integration base own the PR, not each fix commit."""
     candidate, base = manifest.get("candidate_sha"), manifest.get("base_sha")
     if not all(
         isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)
@@ -173,6 +174,11 @@ def _candidate_head(manifest: dict[str, Any]) -> tuple[str, str, str]:
     binding = manifest.get("run_binding")
     request_identity: str | None = None
     if isinstance(binding, dict):
+        if binding.get("mode") == "scheduled":
+            upstream = binding.get("captured_upstream")
+            if not isinstance(upstream, str) or not re.fullmatch(r"[0-9a-f]{40}", upstream):
+                raise PublicationError("scheduled task has no captured upstream")
+            request_identity = _canonical_sha({"mode": "scheduled", "upstream": upstream})
         if binding.get("mode") == "issue" and isinstance(binding.get("issue"), dict):
             request_identity = _canonical_sha(binding["issue"])
         if request_identity is None:
@@ -187,12 +193,11 @@ def _candidate_head(manifest: dict[str, Any]) -> tuple[str, str, str]:
         raise PublicationError("candidate has no stable request identity")
     identity = _canonical_sha(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "repository": REPOSITORY,
             "base_branch": BASE,
             "request_identity": request_identity,
             "base_sha": base,
-            "candidate_sha": candidate,
         }
     )
     return f"codex/opentui-maint-{identity[:24]}", request_identity, identity
@@ -389,7 +394,7 @@ def wait_for_review(
     deadline = time.monotonic() + wait_seconds
     while True:
         fields = (
-            FIELDS + ",mergeStateStatus,mergeable"
+            FIELDS + OWNERSHIP_FIELDS + ",mergeStateStatus,mergeable"
             if expected_pr_evidence is not None
             else "state,headRefOid,baseRefName,mergeStateStatus,mergeable"
         )
@@ -409,6 +414,8 @@ def wait_for_review(
             )
         )
         if expected_pr_evidence is not None:
+            if "base_sha" in expected_pr_evidence:
+                _validate_owned_base(pr, expected_pr_evidence["base_sha"])
             _validate_pr(
                 pr,
                 expected_pr_evidence["head_branch"],
@@ -455,6 +462,101 @@ def wait_for_review(
             )
         print(f"PR #{number}: waiting for current-head CI and GitHub merge policy", flush=True)
         time.sleep(min(REVIEW_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+
+
+def resume_preview(
+    root: Path, source: Path, manifest: dict[str, Any], *,
+    number: int, deadline_unix: int,
+) -> dict[str, Any]:
+    """Observe an explicitly adopted PR, without pushing, editing or uploading.
+
+    PR81 predates ownership markers. Its exception is an exact, operator-reviewed
+    manifest/packet/PR tuple, not permission to adopt arbitrary legacy PRs.
+    """
+    _, digest, dimensions = preview(source.parent, manifest)
+    proof = json.loads((source.parent / "pr-evidence.json").read_text(encoding="utf-8"))
+    head, _, identity = _candidate_head(manifest)
+    marker = f"<!-- maintainer-candidate:v1:{identity} -->"
+    legacy = (
+        number == 81
+        and _hash(source) == "46b71afc40b7d1d7d734eecf6a17fb8eca68430ee7fc8d2c74993c0b048498c6"
+        and _hash(source.parent / "gate-packet.json")
+        == "6a11d685a3c67e6f603d89604ae9f237d6a2dbbb06afa290e1d9d1fb1357e0d0"
+        and manifest["candidate_sha"] == "6f5863475a51a2e40b58402517f1bbae53e35a43"
+        and manifest["base_sha"] == "957d6c6b92ce5ef1355487b0fdac13a1c5f4836d"
+    )
+    if legacy:
+        head = "codex/opentui-maint-1cfaffead678f32bcaeccbf9"
+        marker = (
+            f"Automated OpenTUI maintenance candidate `{manifest['candidate_sha']}` "
+            f"from `{manifest['base_sha']}`."
+        )
+    expected = {
+        "repository": REPOSITORY, "base_branch": BASE,
+        "base_sha": manifest["base_sha"], "candidate_sha": manifest["candidate_sha"],
+        "head_branch": head, "number": number,
+        "url": f"https://github.com/{REPOSITORY}/pull/{number}",
+        "preview_sha256": digest, "preview_dimensions": list(dimensions),
+    }
+    if any(proof.get(key) != value for key, value in expected.items()):
+        raise PublicationError("retained PR evidence does not match explicit adoption")
+    review = wait_for_review(
+        root, number, manifest["candidate_sha"], deadline_unix=deadline_unix,
+        expected_pr_evidence={
+            "head_branch": head, "candidate_marker": marker,
+            "preview_identity": f"<!-- maintainer-preview:{manifest['candidate_sha']}:{digest} -->",
+            "block_sha256": proof["block_sha256"],
+            "attachment_url": proof["attachment_url"],
+            "base_sha": manifest["base_sha"],
+        },
+    )
+    result = {**proof, "review": review}
+    _write(root / "pr-evidence.json", json.dumps(result, indent=2) + "\n")
+    return result
+
+
+def _validate_owned_base(pr: dict[str, Any], base: str) -> None:
+    owner, repository = REPOSITORY.split("/")
+    if (
+        pr.get("baseRefOid") != base
+        or pr.get("isCrossRepository") is not False
+        or (pr.get("headRepositoryOwner") or {}).get("login") != owner
+        or (pr.get("headRepository") or {}).get("name") != repository
+    ):
+        raise PublicationError("PR base or repository ownership changed")
+
+
+def advance_owned_head(
+    repo: Path, root: Path, destination: str, manifest: dict[str, Any], expected: str,
+) -> None:
+    """CAS only a proven fast-forward on this task's already-owned open PR."""
+    if not re.fullmatch(r"[0-9a-f]{40}", expected):
+        raise PublicationError("expected PR head must be an exact SHA")
+    head, _, identity = _candidate_head(manifest)
+    marker = f"<!-- maintainer-candidate:v1:{identity} -->"
+    prs = json.loads(_run([
+        str(GH), "pr", "list", "--repo", REPOSITORY, "--state", "all",
+        "--head", head, "--json", FIELDS + OWNERSHIP_FIELDS,
+    ], root))
+    if len(prs) != 1:
+        raise PublicationError("expected exactly one owned task PR before update")
+    candidate = manifest["candidate_sha"]
+    pr = prs[0]
+    # A lost push acknowledgement may already have advanced exactly this head.
+    if pr.get("headRefOid") not in {expected, candidate}:
+        raise PublicationError("owned PR head moved unexpectedly")
+    _validate_pr(pr, head, pr["headRefOid"], marker)
+    _validate_owned_base(pr, manifest["base_sha"])
+    _run(["git", "merge-base", "--is-ancestor", expected, candidate], repo)
+    ref = f"refs/heads/{head}"
+    advertised = _run(["git", "ls-remote", destination, ref], repo).split()
+    if advertised != [pr["headRefOid"], ref]:
+        raise PublicationError("owned branch and PR disagree")
+    if pr["headRefOid"] == expected and expected != candidate:
+        _run(["git", "push", "--porcelain", f"--force-with-lease={ref}:{expected}",
+              destination, f"{candidate}:{ref}"], repo)
+    if _run(["git", "ls-remote", destination, ref], repo).split() != [candidate, ref]:
+        raise PublicationError("owned branch update was not acknowledged")
 
 
 def publish_preview(
@@ -518,6 +620,8 @@ def publish_preview(
         )
     gh = [str(GH), "pr"]
     options = ["--repo", REPOSITORY]
+    if manifest.get("expected_pr_head") is not None:
+        advance_owned_head(repo, root, destination, manifest, manifest["expected_pr_head"])
 
     def reconcile_live_issue_pr() -> dict[str, Any] | None:
         """Re-read the live issue-scoped PR set at the publication edge."""

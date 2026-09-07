@@ -25,8 +25,8 @@ authorized workflow, not expanding it or fabricating verification evidence.
 Keep orchestration context compact: save full diffs and test logs as artifacts,
 inspect relevant file ranges, and request bounded findings from workers. Do not
 paste a whole-repository diff or a full test inventory back into the parent.
-On retry, verify prior artifact hashes and candidate identity before reusing
-integration evidence; the final candidate-bound gate still runs in full. The
+On implementation retry, verify prior artifact hashes and candidate identity before reusing
+integration evidence; a changed candidate's final gate still runs in full. The
 retry handoff must identify the previously inspected candidate SHA and retained
 evidence. Once their hashes and ancestry are verified, inspect the new delta
 from that candidate rather than rereading overlapping full recovery, owner-review
@@ -117,6 +117,22 @@ authority. The versioned policy in this file is the authority.
    `origin/sid/opentui..upstream/main` range by merging upstream main and then
    adding native ports. All modes use the same runtime-recorded gates and
    remote-only leased ship.
+   A claimed `mode: resume` request is an explicit observation-only continuation
+   of a retained scheduled sync. Before any implementation, new worktree, worker
+   or gate, read its exact source_run, manifest_sha256, packet_sha256, pr,
+   base_sha and candidate_sha. Invoke the deployed `resume-publication` command
+   with this fresh wrapper token, `--source-manifest <state>/runs/<source_run>/gate.json`,
+   `--source-sha256 <manifest_sha256> --packet-sha256 <packet_sha256> --adopt-pr <pr>`,
+   `--manifest <fresh-evidence>/gate.json --repo <fork> --state <state> --token <token>`.
+   Background and observe the bounded process exactly as for gate-and-ship.
+   The runtime validates retained evidence and current authorization/CI without
+   rerunning local gates or creating another PR. It performs normal journaled
+   publication/finalization on success. Never reset the old lease or rewrite its
+   outcome. On an observation interruption retry under the same live owner; after
+   owner termination use the existing request recovery and a fresh wrapper run.
+   Changed evidence/source/base is a refusal, not permission to silently rebuild.
+   For future fix commits on a task-owned PR, use full gate-and-ship with
+   `--expected-pr-head <verified-previous-head>`; changed source requires new review.
 3. Fetch remotes, capture the exact `origin/sid/opentui` base SHA, and create a fresh detached integration worktree from that remote-tracking ref. Never develop in the daily-driver checkout. Preserve
    upstream authorship by merging or cherry-picking the real commits, then put
    fork-specific adaptations in separate commits.

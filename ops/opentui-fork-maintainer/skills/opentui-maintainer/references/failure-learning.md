@@ -32,6 +32,18 @@ were retained. These are historical facts, not current health: read
 Save evidence first, generalize only after verifying cause and repair. Don't
 accumulate universal prohibitions or entire transcripts in skills.
 
+## Publication observation versus implementation retry
+
+- Keep a terminal publication timeout distinct from a failed local gate. Use
+  `resume-publication` only with exact original candidate/base, manifest/packet
+  hashes and current authorization under a fresh existing owner. Preserve the
+  old failed outcome; record continuation provenance in the new run. PR81's
+  legacy exception is pinned explicitly, not a general adoption heuristic.
+- Confirm the test runner executed tests. A PATH-selected `env` wrapper returned
+  zero before Python ran; command-local `/usr/bin:/bin` precedence restored the
+  canonical runner without changing the user's wrapper. See the continuation
+  tests and README for the bounded command.
+
 ## Review timing correction (2026-09-05)
 
 PR #39 advanced the fork after local gates passed, but Greptile finished nine

@@ -162,6 +162,57 @@ the user's daily-driver branch, index and working files are untouched.
 
 ## Inspect a run
 
+### Continue an already-verified publication
+
+`resume-publication` is an observation-only alternative to `gate-and-ship`, not
+a gate waiver. It requires a live owner created by the existing wrapper, the
+nonblocking run lock, a different retained run with terminal `publish-refused`
+outcome, explicit original manifest/packet hashes, and an explicitly adopted PR.
+It verifies the original lease/context binding, clean exact candidate/base,
+packet commands, hashed logs and nested review/media/video artifacts, review
+diffs, current authorization, PR ownership/attachment and current GitHub policy.
+It does not invoke local gates, upload media, edit the PR or push its head branch.
+The existing target CAS, journal, request consumption and finalization follow.
+Source artifacts and the old failed outcome remain immutable; the fresh run's
+`gate.json` references them in `continuation` and records its own lease binding.
+
+For a retained scheduled sync, submit a bounded `mode: resume` request through
+`submit-request`, then dispatch the existing job. The checked-in
+`pr81-continuation-request.json` pins the explicitly authorized legacy PR81
+delivery. It queues before issue intake and is consumed only after publication.
+PR81's missing ownership marker is supported only for its pinned manifest,
+packet, candidate/base and established head branch; no arbitrary legacy PR is
+adoptable. Other resumable PRs must have the task ownership marker. Issue/manual
+continuations require the original request to be reclaimed and still authorized;
+the scheduled `resume` request is not an issue-approval substitute.
+
+After claiming, the parent invokes:
+
+```text
+uv run <runtime>/scripts/maintainer_runtime.py resume-publication --state <state> --token <fresh-token> --source-manifest <state>/runs/<original-run>/gate.json --source-sha256 <original-hash> --packet-sha256 <original-packet-hash> --adopt-pr <verified-number> --manifest <fresh-evidence>/gate.json --repo <fork>
+```
+
+An interrupted observer can retry that same command under the same still-live
+owner without renewing its deadline. After owner termination, retain the source
+reference and use a fresh wrapper-owned run. A post-CAS interruption instead uses
+the existing `finalize-success`/reconciler, never a second publication attempt.
+Missing/tampered artifacts, changed source/base or authorization fail closed.
+Do not use this path to ignore a genuine failed check or unresolved finding.
+
+Future PR identities bind task/revision and integration base, not the candidate
+hash or a scheduled owner's token. For a linear fix on an owned task PR, run the
+full `gate-and-ship` with `--expected-pr-head <exact-previous-head>`. Before a
+head update the publisher verifies the open same-repository PR, ownership marker,
+task revision/base, expected remote head and ancestry; the leased push is a
+fast-forward-only CAS, not permission to rewrite history. A new head requires
+fresh local review/evidence and current-head CI. Legacy adoption does not grant
+permission to append fixes to PR81's historical branch.
+
+For local maintainer tests, use the canonical runner with explicit `--files`,
+`-j 1 --file-retries 0`. Inspect executed counts, not its AST estimate. On this
+host put `/usr/bin:/bin` first in the command PATH: the user `env` wrapper can
+otherwise make the runner exit zero without executing tests. Do not edit it.
+
 Use `hermes -p opentui-maintainer cron list`, `cron status` and `cron runs` for
 schedule/execution state. Then inspect `state/last-run.json` and its referenced
 `state/runs/<run-id>/` evidence. A scheduler success, model summary or live worker

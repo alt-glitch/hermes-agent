@@ -398,6 +398,18 @@ def _issue_workflow() -> Any:
 
 
 def _validate_request(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict) and value.get("mode") == "resume":
+        if set(value) != {"mode", "source_run", "manifest_sha256", "packet_sha256", "pr", "base_sha", "candidate_sha"}:
+            raise ControlError("resume request has an invalid shape")
+        if not isinstance(value["source_run"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value["source_run"]):
+            raise ControlError("resume request requires a retained run name")
+        if type(value["pr"]) is not int or value["pr"] <= 0:
+            raise ControlError("resume request requires a positive PR number")
+        for key in ("manifest_sha256", "packet_sha256", "base_sha", "candidate_sha"):
+            pattern = SHA256_RE if key.endswith("sha256") else SHA_RE
+            if not isinstance(value[key], str) or not pattern.fullmatch(value[key]):
+                raise ControlError(f"resume request requires exact {key}")
+        return value
     if isinstance(value, dict) and value.get("mode") == "issue":
         try:
             return _issue_workflow().validate_issue_request(value)
@@ -704,6 +716,10 @@ def _derive_run_binding(
                 )
             mode = claimed_value["mode"]
             request_sha = _canonical_json_sha256(claimed_value)
+            if mode == "resume":
+                # Explicit observation of a retained scheduled sync is not a
+                # new implementation task. Its exact pins are checked by resume-publication.
+                mode, request_sha = "scheduled", None
         else:
             if queued.exists() or inflight.exists():
                 raise ControlError("a pending request must be claimed before gating")
@@ -1201,8 +1217,24 @@ def validate_gate_manifest(
     candidate_sha: str,
     token: str,
     branch: str = BRANCH,
+    _original_lease_digest: str | None = None,
 ) -> dict[str, Any]:
     value = _load_gate(manifest_path)
+    if "continuation" in value:
+        if _original_lease_digest is not None:
+            raise ControlError("nested evidence continuation is not supported")
+        original = validate_retained_gate(repo, value["continuation"], manifest_path.parent)
+        unchanged = set(original) - {"lease_token_sha256", "pr_evidence"}
+        if any(value.get(key) != original[key] for key in unchanged):
+            raise ControlError("continuation changed candidate-bound evidence")
+        if (
+            value.get("lease_token_sha256") != hashlib.sha256(token.encode()).hexdigest()
+            or value.get("base_sha") != base_sha
+            or value.get("candidate_sha") != candidate_sha
+            or value.get("branch") != branch
+        ):
+            raise ControlError("continuation does not bind this owner and candidate")
+        return value
     if (
         value.get("schema_version") != GATE_SCHEMA_VERSION
         or value.get("branch") != branch
@@ -1213,7 +1245,7 @@ def validate_gate_manifest(
             "gate manifest does not bind the requested base and candidate"
         )
     _validate_recorded_worktree(value.get("worktree_proof"), candidate_sha)
-    if value.get("lease_token_sha256") != hashlib.sha256(token.encode()).hexdigest():
+    if value.get("lease_token_sha256") != (_original_lease_digest or hashlib.sha256(token.encode()).hexdigest()):
         raise ControlError("gate manifest is not bound to the active run lease")
     checks = value.get("checks")
     if not isinstance(checks, list):
@@ -1444,6 +1476,14 @@ def ship_candidate(
     with _lease_lock(state_dir):
         lease = _lease_value(state_dir)
         _validate_lease_value(lease, token, int(time.time()))
+        if "continuation" in manifest:
+            claimed = manifest_path.parent / "request.claimed.json"
+            request = _read_bound_request(claimed, manifest_path.parent, label="continuation request") if claimed.exists() else None
+            if manifest["continuation"].get("authorization_sha256") != _canonical_json_sha256(request):
+                raise ControlError("continuation authorization changed before publication")
+            current = _derive_run_binding(state_dir, manifest_path.parent, token)
+            if any(current[key] != value for key, value in manifest["run_binding"].items() if key != "captured_upstream"):
+                raise ControlError("continuation task changed before publication")
         if manifest["run_binding"]["mode"] in {"repair", "issue"} and _derive_run_binding(
             state_dir, manifest_path.parent, token
         ) != manifest["run_binding"]:
@@ -3118,6 +3158,7 @@ def run_gate(
             },
         },
         "checks": recorded,
+        "packet_sha256": _file_sha256(packet_path),
     }
     _atomic_json(manifest_path, manifest)
     return manifest
@@ -3182,6 +3223,150 @@ def _validate_success_cleanup_worktree(
     return resolved_cwd
 
 
+def validate_retained_gate(
+    repo: Path, receipt: dict[str, Any], evidence_root: Path,
+) -> dict[str, Any]:
+    """Read original evidence in place; a continuation never rewrites history."""
+    source = Path(receipt["manifest_path"])
+    if (
+        source.parent == evidence_root
+        or source.parent.parent != evidence_root.parent
+        or evidence_root.parent.name != "runs"
+    ):
+        raise ControlError("continuation must reference a different retained run")
+    root = source.parent
+    for key in ("manifest", "packet", "context", "outcome", "pr"):
+        path = _evidence_path(receipt[f"{key}_path"], root, label=f"retained {key}")
+        if _file_sha256(path) != receipt[f"{key}_sha256"]:
+            raise ControlError(f"retained {key} changed")
+    context = _load_gate(Path(receipt["context_path"]))
+    outcome = _load_gate(Path(receipt["outcome_path"]))
+    if (
+        context.get("run_id") != root.name
+        or not context.get("execution_id")
+        or outcome.get("status") != "failed"
+        or outcome.get("stage") != "publish"
+        or outcome.get("reason_code") != "publish-refused"
+        or outcome.get("published") is not False
+        or outcome.get("needs_finalization") is not False
+    ):
+        raise ControlError("original run has no terminal unshipped publication failure")
+    original = _load_gate(source)
+    if (
+        original.get("base_sha") != context.get("base_sha")
+        or original.get("run_binding", {}).get("captured_upstream") != context.get("upstream_sha")
+        or not SHA256_RE.fullmatch(str(context.get("lease_token_sha256", "")))
+    ):
+        raise ControlError("original context and gate binding differ")
+    original = validate_gate_manifest(
+        repo, source, base_sha=context["base_sha"],
+        candidate_sha=original["candidate_sha"], token="",
+        _original_lease_digest=context["lease_token_sha256"],
+    )
+    if original.get("packet_sha256", receipt["packet_sha256"]) != receipt["packet_sha256"]:
+        raise ControlError("original gate packet changed")
+    packet = _load_gate(Path(receipt["packet_path"]))
+    items = packet.get("checks", [])
+    if len(items) != len(REQUIRED_GATES) or {item["id"] for item in items} != REQUIRED_GATES:
+        raise ControlError("retained gate packet is incomplete")
+    records = {check["id"]: check for check in original["checks"]}
+    for item in items:
+        _validate_gate_packet_item(item["id"], item)
+        if "argv" in item and item["argv"] != records[item["id"]]["argv"]:
+            raise ControlError("retained packet command differs from executed gate")
+    # The gate log hashes bind the nested media, reviewer and video artifacts.
+    for gate_id in ("adversarial-review", "termctrl-smoke", "video-analysis"):
+        proof = _load_gate(Path(records[gate_id]["output_path"]))
+        for key, path in proof.items():
+            if key.endswith("_path"):
+                digest = proof.get(key.removesuffix("_path") + "_sha256")
+                artifact = _evidence_path(path, root, label=key)
+                if _file_sha256(artifact) != digest:
+                    raise ControlError(f"retained {key} artifact changed")
+    review = original["review_proof"]
+    if review.get("candidate_sha") != original["candidate_sha"] or review.get("verdict") != "approved":
+        raise ControlError("retained review is not candidate-bound approval")
+    for reviewed in review["review_ranges"]:
+        diff = _canonical_range_diff(repo, reviewed["before"], reviewed["after"])
+        if hashlib.sha256(diff).hexdigest() != reviewed["diff_sha256"]:
+            raise ControlError("retained review range changed")
+    return original
+
+
+def resume_publication(
+    repo: Path, source: Path, manifest_path: Path, *, state_dir: Path,
+    token: str, source_sha256: str, packet_sha256: str, number: int,
+    remote: str = REMOTE,
+) -> dict[str, Any]:
+    """Continue exact evidence under an existing fresh owner and the run lock."""
+    validate_lease(state_dir, token)
+    root = manifest_path.parent
+    current = _derive_run_binding(state_dir, root, token)
+    if root.parent != state_dir / "runs" or manifest_path.name != "gate.json":
+        raise ControlError("continuation output must be this run's gate.json")
+    receipt: dict[str, Any] = {"number": number}
+    names = {"manifest": source.name, "packet": "gate-packet.json",
+             "context": "run-context.json", "outcome": "run-outcome.json",
+             "pr": "pr-evidence.json"}
+    for key, name in names.items():
+        path = _evidence_path(str(source.parent / name), source.parent, label=key)
+        receipt[f"{key}_path"] = str(path)
+        receipt[f"{key}_sha256"] = _file_sha256(path)
+    if receipt["manifest_sha256"] != source_sha256 or receipt["packet_sha256"] != packet_sha256:
+        raise ControlError("explicit retained manifest/packet hashes do not match")
+    original = validate_retained_gate(repo, receipt, root)
+    claimed = root / "request.claimed.json"
+    request = None
+    if claimed.exists():
+        request = _read_bound_request(claimed, root, label="continuation request")
+        if request["mode"] == "resume" and (
+            original["run_binding"]["mode"] != "scheduled"
+            or source != state_dir / "runs" / request["source_run"] / "gate.json"
+            or request["manifest_sha256"] != source_sha256
+            or request["packet_sha256"] != packet_sha256
+            or request["pr"] != number
+            or request["base_sha"] != original["base_sha"]
+            or request["candidate_sha"] != original["candidate_sha"]
+        ):
+            raise ControlError("continuation differs from the explicit resume request")
+    receipt["authorization_sha256"] = _canonical_json_sha256(request)
+    binding = original["run_binding"]
+    # New upstream arrivals do not invalidate an unchanged scheduled candidate.
+    # Requests, approval revisions, captured base and the watermark still must match.
+    if any(current[key] != value for key, value in binding.items() if key != "captured_upstream"):
+        raise ControlError("retained task authorization or base is stale")
+    if _git_status(repo, ["merge-base", "--is-ancestor", binding["captured_upstream"], current["captured_upstream"]]):
+        raise ControlError("captured upstream history changed")
+    if _remote_sha(repo, remote, BRANCH) != original["base_sha"]:
+        raise ControlError("remote base moved or candidate already delivered")
+    cwd = Path(original["worktree_proof"]["worktree"])
+    _worktree_proof(cwd, original["candidate_sha"])
+    _validate_success_cleanup_worktree(repo, state_dir=state_dir, evidence_dir=root, cwd=cwd, recorded_worktree=cwd)
+    _revalidate_issue_request(state_dir, root, token, candidate_sha=original["candidate_sha"])
+    lease = _lease_value(state_dir)
+    deadline = min(int(lease["expires_unix"]), int(lease["max_expires_unix"])) - 600
+    if deadline <= int(time.time()):
+        raise ControlError("fresh owner has insufficient observation time")
+    publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
+    # Write provenance before observation so a killed observer remains auditable.
+    result = {**original, "continuation": receipt,
+              "lease_token_sha256": hashlib.sha256(token.encode()).hexdigest()}
+    _atomic_json(manifest_path, result)
+    try:
+        proof = publisher["resume_preview"](root, source, original, number=number, deadline_unix=deadline)
+    except (RuntimeError, ValueError, KeyError, OSError) as exc:
+        raise ControlError(f"PR continuation refused: {exc}") from exc
+    validate_lease(state_dir, token)
+    if _derive_run_binding(state_dir, root, token) != current:
+        raise ControlError("task authorization changed during observation")
+    _revalidate_issue_request(state_dir, root, token, candidate_sha=original["candidate_sha"], expected_pr=proof)
+    result["pr_evidence"] = proof
+    _atomic_json(manifest_path, result)
+    ship_candidate(repo, manifest_path, state_dir=state_dir, base_sha=original["base_sha"],
+                   candidate_sha=original["candidate_sha"], token=token, remote=remote)
+    return result
+
+
 def _publish_pr_evidence(
     repo: Path,
     evidence_root: Path,
@@ -3231,9 +3416,13 @@ def gate_and_ship(
     token: str,
     remote: str = REMOTE,
     branch: str = BRANCH,
+    expected_pr_head: str | None = None,
 ) -> dict[str, Any]:
     """Run every gate and immediately publish by remote CAS in one invocation."""
     evidence_root = Path(os.path.abspath(manifest_path.parent))
+    claimed = evidence_root / "request.claimed.json"
+    if claimed.exists() and _read_bound_request(claimed, evidence_root, label="gate request")["mode"] == "resume":
+        raise ControlError("resume requests authorize observation only; use resume-publication")
     # Refuse a path that finalization cannot safely remove before doing any
     # expensive work or touching the remote.  Publication and cleanup are one
     # transaction; an invalid eventual cleanup path must never wedge it after
@@ -3285,8 +3474,10 @@ def gate_and_ship(
             state_dir,
             evidence_root,
             token,
-            candidate_sha=candidate_sha,
+            candidate_sha=expected_pr_head or candidate_sha,
         )
+    if expected_pr_head is not None:
+        result["expected_pr_head"] = expected_pr_head
     proof = _publish_pr_evidence(
         repo,
         evidence_root,
@@ -3667,7 +3858,7 @@ def finalize_failure(
                         ) from exc
                     os.replace(inflight, deferred)
                     request_deferred = True
-                elif claimed_value["mode"] == "repair":
+                elif claimed_value["mode"] in {"repair", "resume"}:
                     try:
                         context_token = _lease_value(state_dir).get("token")
                         if not isinstance(context_token, str):
@@ -3903,6 +4094,16 @@ def _parser() -> argparse.ArgumentParser:
     renew.add_argument("--state", type=Path, required=True)
     renew.add_argument("--token", required=True)
     publish = sub.add_parser("gate-and-ship")
+    resume = sub.add_parser("resume-publication")
+    resume.add_argument("--state", type=Path, required=True)
+    resume.add_argument("--token", required=True)
+    resume.add_argument("--source-manifest", type=Path, required=True)
+    resume.add_argument("--source-sha256", required=True)
+    resume.add_argument("--packet-sha256", required=True)
+    resume.add_argument("--adopt-pr", type=int, required=True)
+    resume.add_argument("--manifest", type=Path, required=True)
+    resume.add_argument("--repo", type=Path, required=True)
+    resume.add_argument("--remote", default=REMOTE)
     reconcile = sub.add_parser("reconcile-run")
     reconcile.add_argument("--state", type=Path, required=True)
     reconcile.add_argument("--evidence", type=Path, required=True)
@@ -3916,6 +4117,7 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--repo", type=Path, required=True)
     publish.add_argument("--base", required=True)
     publish.add_argument("--candidate", required=True)
+    publish.add_argument("--expected-pr-head")
     publish.add_argument("--remote", default=REMOTE)
     publish.add_argument("--branch", default=BRANCH)
     return parser
@@ -3985,6 +4187,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         renew_lease(args.state, args.token)
         return returncode
+    if args.command == "resume-publication":
+        with run_lock(args.state):
+            result = resume_publication(
+                args.repo, args.source_manifest, args.manifest, state_dir=args.state,
+                token=args.token, source_sha256=args.source_sha256,
+                packet_sha256=args.packet_sha256, number=args.adopt_pr, remote=args.remote,
+            )
+            finalize_success(
+                args.repo, args.manifest, state_dir=args.state,
+                evidence_dir=args.manifest.parent,
+                cwd=Path(result["worktree_proof"]["worktree"]),
+                token=args.token, remote=args.remote,
+            )
+            release_lease(args.state, args.token)
+        return 0
     if args.command == "gate-and-ship":
         renew_lease(args.state, args.token)
         with run_lock(args.state):
@@ -4000,6 +4217,7 @@ def main(argv: list[str] | None = None) -> int:
                 token=args.token,
                 remote=args.remote,
                 branch=args.branch,
+                expected_pr_head=args.expected_pr_head,
             )
             # Publication and deterministic cleanup are one trusted CLI
             # transaction. No release can interleave before finalization.

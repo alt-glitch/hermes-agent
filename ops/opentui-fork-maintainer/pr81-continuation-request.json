@@ -1,0 +1,9 @@
+{
+  "mode": "resume",
+  "source_run": "20260906T234652Z-128a40f7",
+  "manifest_sha256": "46b71afc40b7d1d7d734eecf6a17fb8eca68430ee7fc8d2c74993c0b048498c6",
+  "packet_sha256": "6a11d685a3c67e6f603d89604ae9f237d6a2dbbb06afa290e1d9d1fb1357e0d0",
+  "pr": 81,
+  "base_sha": "957d6c6b92ce5ef1355487b0fdac13a1c5f4836d",
+  "candidate_sha": "6f5863475a51a2e40b58402517f1bbae53e35a43"
+}
