@@ -11,6 +11,7 @@ import yaml
     ("completed-success", True, False),
     ("completed-failure", True, True),
     ("wait-complete", True, True),
+    ("wait-success", True, False),
     ("pending", False, False),
     ("missing", False, False),
     ("api-error", False, False),
@@ -35,7 +36,11 @@ list)
   esac;;
 watch) exit 1;;
 view)
-  if [ "$SCENARIO" = wait-complete ]; then printf 'completed failure'; else printf 'in_progress unknown'; fi;;
+  case "$SCENARIO" in
+  wait-complete) printf 'completed failure';;
+  wait-success) printf 'completed success';;
+  *) printf 'in_progress unknown';;
+  esac;;
 rerun) [ "$SCENARIO" != rerun-error ];;
 *) exit 2;;
 esac
