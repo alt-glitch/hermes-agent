@@ -141,8 +141,40 @@ class TestPrimaryRuntimeSnapshot:
 class TestRestorePrimaryRuntime:
     def test_noop_when_not_fallback(self):
         agent = _make_agent()
+        anchor = {"prompt_tokens": 12_345}
+        agent._usage_anchor = anchor
+        agent._turn_base_usage_anchor = anchor
         assert agent._fallback_activated is False
         assert agent._restore_primary_runtime() is False
+        assert agent._usage_anchor is anchor
+        assert agent._turn_base_usage_anchor is anchor
+
+    def test_successful_restore_clears_fallback_runtime_usage_anchor(self):
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_resolve(), None),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        anchor = {"prompt_tokens": 12_345}
+        agent._usage_anchor = anchor
+        agent._turn_base_usage_anchor = anchor
+        agent.session_id = "primary-restore-anchor-session"
+        agent._session_db = MagicMock()
+        agent._persist_disabled = False
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent._usage_anchor is None
+        assert agent._turn_base_usage_anchor is None
+        agent._session_db.patch_session_model_config.assert_called_once_with(
+            agent.session_id,
+            {"_usage_anchor": None},
+        )
 
     def test_restores_model_and_provider(self):
         agent = _make_agent(

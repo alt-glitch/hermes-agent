@@ -287,6 +287,24 @@ const StatusUpdate = Schema.Struct({
   session_id: opt(Str),
   payload: opt(Schema.Struct({ kind: opt(Str), text: opt(Str) }))
 })
+// Structured goal/loop/heartbeat snapshots are a Desktop control-card channel.
+// OpenTUI keeps control UX on the existing slash/status surfaces, but still
+// claims the event family at ingress so a supported gateway frame is never
+// misreported as an unknown protocol variant. Validate the stable envelope;
+// the unconsumed nested snapshots remain unknown rather than duplicating the
+// Desktop's control model in native state.
+const SessionControlSnapshot = Schema.Struct({
+  goal: Schema.Unknown,
+  heartbeat: Schema.Unknown,
+  loop: Schema.Unknown,
+  revision: Str,
+  updated_at: Schema.Number
+})
+const SessionControlUpdate = Schema.Struct({
+  type: Schema.Literal('session.control.update'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ control: SessionControlSnapshot })
+})
 const NotificationShow = Schema.Struct({
   type: Schema.Literal('notification.show'),
   session_id: opt(Str),
@@ -446,6 +464,7 @@ const SessionTurnEvents = Schema.Union([
 ])
 const ChromeTransportEvents = Schema.Union([
   StatusUpdate,
+  SessionControlUpdate,
   NotificationShow,
   NotificationClear,
   BillingStepUpVerification,

@@ -681,6 +681,41 @@ describe('session store — ordered parts (Phase 2b)', () => {
       'provider degraded'
     ])
   })
+
+  test('session-control snapshots do not duplicate native controls while heartbeat status stays visible', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'session.control.update',
+      session_id: 'live-1',
+      payload: {
+        control: {
+          goal: null,
+          heartbeat: {
+            created_at: 1,
+            fire_count: 3,
+            interval_seconds: 300,
+            last_fired_at: 2,
+            prompt: 'check the build',
+            status: 'active'
+          },
+          loop: null,
+          revision: 'rev-heartbeat-3',
+          updated_at: 2
+        }
+      }
+    })
+
+    expect(store.state.messages).toEqual([])
+    expect(store.state.status).toBeUndefined()
+
+    store.apply({
+      type: 'status.update',
+      session_id: 'live-1',
+      payload: { kind: 'heartbeat', text: '♥ heartbeat #3 firing…' }
+    })
+    expect(store.state.status).toBe('♥ heartbeat #3 firing…')
+    expect(store.state.messages.map(message => message.text)).toEqual(['♥ heartbeat #3 firing…'])
+  })
 })
 
 describe('session store — idle/auto compaction status (upstream 3a542bbef4d1)', () => {
