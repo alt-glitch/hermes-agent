@@ -2130,6 +2130,7 @@ def switch_model(
     # swallowed: the switch itself must still complete.
     old_norm = (old_provider or "").strip().lower()
     new_norm = (new_provider or "").strip().lower()
+    old_usage_runtime = (old_model, old_norm, agent.base_url, agent.api_mode)
     api_mode, base_url, destination_capabilities = _resolve_switch_destination(
         agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm
     )
@@ -2173,6 +2174,13 @@ def switch_model(
     _reset_stale_streak(agent)
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
     _finish_switch(agent, new_provider, old_norm, new_norm)
+    new_usage_runtime = (agent.model, new_norm, agent.base_url, agent.api_mode)
+    if old_usage_runtime != new_usage_runtime:
+        # Provider-reported usage belongs to the runtime that produced it; the transcript-only
+        # fingerprint cannot distinguish an unchanged conversation sent to a different runtime.
+        from agent.usage_anchor import set_usage_anchor
+
+        set_usage_anchor(agent, None)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
