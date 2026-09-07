@@ -249,6 +249,13 @@ class TestStructuredRead:
         assert action["event_seq"] == latest_seq(sid)
         assert action["event_seq"] > read["event_seq"]
 
+        _save_heartbeat(key)
+        manager_action = _call(
+            server, "session.control", session_id=sid, action="heartbeat.pause"
+        )["result"]
+        assert manager_action["control"]["heartbeat"]["status"] == "paused"
+        assert manager_action["event_seq"] == latest_seq(sid)
+
 class TestDispatcherBackedMutations:
     def test_goal_pause_resume_clear_mutate_real_persisted_state(self, server, session):
         sid, key, _ = session
@@ -401,7 +408,13 @@ class TestUpdatePublication:
 
     def _capture(self, server, monkeypatch):
         emitted = []
-        monkeypatch.setattr(server, "_emit", lambda event, event_sid, payload=None: emitted.append((event, event_sid, payload)))
+
+        def capture(frame):
+            params = frame.get("params") or {}
+            emitted.append((params.get("type"), params.get("session_id"), params.get("payload")))
+            return True
+
+        monkeypatch.setattr(server, "_write_json_frame", capture)
         return emitted
 
     def test_control_action_publishes_exactly_one_update_matching_the_response(self, server, session, monkeypatch):
@@ -487,3 +500,139 @@ class TestUpdatePublication:
         assert "message.complete" in order and "session.control.update" in order
         assert order.index("message.complete") < order.index("session.control.update")
         assert emitted[order.index("session.control.update")][2]["control"]["goal"]["turns_used"] == 4
+
+
+class TestUpdatePublicationOrdering:
+    """A snapshot and its event sequence form one publication boundary."""
+
+    class _ObservedRLock:
+        def __init__(self, attempted: threading.Event, observed_thread: str):
+            self._lock = threading.RLock()
+            self._attempted = attempted
+            self._observed_thread = observed_thread
+
+        def __enter__(self):
+            if threading.current_thread().name == self._observed_thread:
+                self._attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self._lock.release()
+
+    def test_concurrent_publishers_keep_snapshot_freshness_in_sequence_order(
+        self, server, session, monkeypatch
+    ):
+        """An older captured snapshot cannot publish after a newer one with a higher sequence."""
+        from tui_gateway.event_replay import events_since
+
+        sid, key, entry = session
+        _save_heartbeat(key, status="active")
+        entry["transport"] = server._DropTransport()
+
+        old_captured = threading.Event()
+        release_old = threading.Event()
+        second_attempted = threading.Event()
+        entry["_mutation_lock"] = self._ObservedRLock(second_attempted, "new-control-publisher")
+        original_snapshot = server._snapshot_control
+
+        def controlled_snapshot(session_key):
+            snapshot = original_snapshot(session_key)
+            thread_name = threading.current_thread().name
+            if thread_name == "old-control-publisher":
+                old_captured.set()
+                assert release_old.wait(5)
+            elif thread_name == "new-control-publisher":
+                second_attempted.set()
+            return snapshot
+
+        monkeypatch.setattr(server, "_snapshot_control", controlled_snapshot)
+        old = threading.Thread(
+            target=server._publish_session_control_snapshot,
+            args=(sid, entry),
+            name="old-control-publisher",
+            daemon=True,
+        )
+        new = threading.Thread(
+            target=server._publish_session_control_snapshot,
+            args=(sid, entry),
+            name="new-control-publisher",
+            daemon=True,
+        )
+
+        old.start()
+        assert old_captured.wait(5)
+        _save_heartbeat(key, status="paused")
+        new.start()
+        try:
+            assert second_attempted.wait(5)
+        finally:
+            release_old.set()
+        old.join(5)
+        new.join(5)
+        assert not old.is_alive() and not new.is_alive()
+
+        updates = [event for event in events_since(sid, 0) if event["type"] == "session.control.update"]
+        assert [event["payload"]["control"]["heartbeat"]["status"] for event in updates] == [
+            "active",
+            "paused",
+        ]
+        assert [event["seq"] for event in updates] == sorted(event["seq"] for event in updates)
+
+    def test_read_snapshot_does_not_claim_an_event_published_after_capture(
+        self, server, session, monkeypatch
+    ):
+        """A newer update stays eligible when it races after an older read snapshot."""
+        from tui_gateway.event_replay import events_since
+
+        sid, key, entry = session
+        _save_heartbeat(key, status="active")
+        entry["transport"] = server._DropTransport()
+
+        read_captured = threading.Event()
+        release_read = threading.Event()
+        publisher_attempted = threading.Event()
+        entry["_mutation_lock"] = self._ObservedRLock(publisher_attempted, "control-publisher")
+        original_snapshot = server._snapshot_control
+
+        def controlled_snapshot(session_key):
+            snapshot = original_snapshot(session_key)
+            thread_name = threading.current_thread().name
+            if thread_name == "control-reader":
+                read_captured.set()
+                assert release_read.wait(5)
+            elif thread_name == "control-publisher":
+                publisher_attempted.set()
+            return snapshot
+
+        monkeypatch.setattr(server, "_snapshot_control", controlled_snapshot)
+        response = {}
+        reader = threading.Thread(
+            target=lambda: response.update(_call(server, "session.control.read", session_id=sid)),
+            name="control-reader",
+            daemon=True,
+        )
+        publisher = threading.Thread(
+            target=server._publish_session_control_snapshot,
+            args=(sid, entry),
+            name="control-publisher",
+            daemon=True,
+        )
+
+        reader.start()
+        assert read_captured.wait(5)
+        _save_heartbeat(key, status="paused")
+        publisher.start()
+        try:
+            assert publisher_attempted.wait(5)
+        finally:
+            release_read.set()
+        reader.join(5)
+        publisher.join(5)
+        assert not reader.is_alive() and not publisher.is_alive()
+
+        result = response["result"]
+        update = next(event for event in events_since(sid, 0) if event["type"] == "session.control.update")
+        assert result["control"]["heartbeat"]["status"] == "active"
+        assert update["payload"]["control"]["heartbeat"]["status"] == "paused"
+        assert result["event_seq"] < update["seq"]

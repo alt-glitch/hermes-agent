@@ -214,7 +214,47 @@ def _goal_blocks_loop_tick(session_key: str) -> bool:
 _SESSION_CONTROL_SLASHES = frozenset({"goal", "heartbeat", "loop", "subgoal"})
 
 
-def _publish_session_control_snapshot(sid: str, session: dict | None, *, only_if_present: bool = False) -> None:
+def _prepare_session_control_publication(
+    sid: str, session: dict, session_key: str, *, only_if_present: bool = False
+) -> tuple[dict, dict | None]:
+    """Capture and sequence one control update without performing transport I/O under locks."""
+    from tui_gateway.event_replay import _stamp_event
+
+    with _session_mutation_lock(session):
+        control = _snapshot_control(session_key)
+        if only_if_present and not control["revision"]:
+            return control, None
+        frame = _event_frame("session.control.update", sid, {"control": control})
+        _stamp_event(frame)
+        return control, frame
+
+
+def _capture_session_control_at_sequence(sid: str, session: dict, session_key: str) -> tuple[dict, int]:
+    """Read a control snapshot and fence at the same control-publication boundary as publishers."""
+    from tui_gateway.event_replay import latest_seq
+
+    with _session_mutation_lock(session):
+        # Keep the sequence-before-snapshot direction: an unrelated event that
+        # stamps while persistence is read must remain eligible at the client.
+        event_seq = latest_seq(sid)
+        return _snapshot_control(session_key), event_seq
+
+
+def _deliver_session_control_frame(sid: str, frame: dict | None) -> None:
+    """Best-effort delivery after publication locks are released."""
+    if frame is None:
+        return
+    try:
+        # WSTransport may wait for its event loop; never hold the session or
+        # replay lock across that wait.
+        _write_json_frame(frame)
+    except Exception:
+        logger.debug("session.control.update delivery failed for %s", sid, exc_info=True)
+
+
+def _publish_session_control_snapshot(
+    sid: str, session: dict | None, *, only_if_present: bool = False
+) -> None:
     """Best-effort ``session.control.update`` for one live session. Also called after the post-turn hooks,
     because the goal judge and loop tick evaluation mutate persisted state AFTER ``message.complete`` — a
     client refresh keyed on that event reads the pre-judge turn count. ``only_if_present`` keeps the
@@ -223,12 +263,13 @@ def _publish_session_control_snapshot(sid: str, session: dict | None, *, only_if
         return
     try:
         with _session_profile_runtime_scope(session):
-            control = _snapshot_control(session_key)
-        if only_if_present and not control["revision"]:
-            return
-        _emit("session.control.update", sid, {"control": control})
+            _control, frame = _prepare_session_control_publication(
+                sid, session, session_key, only_if_present=only_if_present
+            )
     except Exception:
         logger.debug("session.control.update publish failed for %s", sid, exc_info=True)
+        return
+    _deliver_session_control_frame(sid, frame)
 
 
 @method("session.control.read")
@@ -242,13 +283,9 @@ def _(rid, params: dict) -> dict:
     if not session_key:
         return _err(rid, 4001, "session has no stored key")
     try:
-        # Capture before the snapshot: events emitted concurrently afterward
-        # must remain eligible to update the client even if the snapshot read
-        # happens to observe their state already.
-        from tui_gateway.event_replay import latest_seq
-
-        event_seq = latest_seq(params.get("session_id") or "")
-        return _ok(rid, {"control": _snapshot_control(session_key), "event_seq": event_seq})
+        sid = params.get("session_id") or ""
+        control, event_seq = _capture_session_control_at_sequence(sid, session, session_key)
+        return _ok(rid, {"control": control, "event_seq": event_seq})
     except Exception as exc:
         logger.debug("session.control.read failed: %s", exc, exc_info=True)
         return _err(rid, 5031, f"session.control.read failed: {exc}")
@@ -295,25 +332,21 @@ def _(rid, params: dict) -> dict:
     if "error" in action_result:
         return action_result
 
-    # command.dispatch publishes goal/loop updates synchronously before it
-    # returns. Manager-only actions publish below; accepting that matching
-    # event is harmless and avoids fencing a concurrent later mutation.
-    from tui_gateway.event_replay import latest_seq
-
-    event_seq = latest_seq(params.get("session_id") or "")
-
+    sid = params.get("session_id") or ""
     try:
-        control = _snapshot_control(session_key)
+        if action in _ACTION_COMMAND_MAP:
+            # command.dispatch published the matching update synchronously.
+            control, event_seq = _capture_session_control_at_sequence(sid, session, session_key)
+            frame = None
+        else:
+            # Manager-only actions publish the exact snapshot returned by this response.
+            control, frame = _prepare_session_control_publication(sid, session, session_key)
+            event_seq = int(frame["params"]["seq"])
     except Exception as exc:
         logger.debug("session.control snapshot after %s failed: %s", action, exc, exc_info=True)
         return _err(rid, 5031, f"session.control snapshot failed: {exc}")
 
-    # command.dispatch already published the update for goal/loop actions; manager actions publish here.
-    if action not in _ACTION_COMMAND_MAP:
-        try:
-            _emit("session.control.update", params.get("session_id") or "", {"control": control})
-        except Exception as exc:
-            logger.debug("session.control.update emit failed (best-effort): %s", exc, exc_info=True)
+    _deliver_session_control_frame(sid, frame)
     return _ok(rid, {"control": control, "dispatch": _dispatch_envelope(action_result), "event_seq": event_seq})
 
 

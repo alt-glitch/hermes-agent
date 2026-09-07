@@ -560,6 +560,16 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _write_json_frame(obj: dict) -> bool:
+    """Deliver a frame after its replay bookkeeping is complete."""
+    if obj.get("method") == "event":
+        params = obj.get("params")
+        sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
+        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
+            return t.write(obj)
+    return (current_transport() or _stdio_transport).write(obj)
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame via the most-specific transport: (1) event frames with a session id → that
     session's transport (async events reach the owner even from threads with no contextvar binding);
@@ -567,12 +577,7 @@ def write_json(obj: dict) -> bool:
     Every event frame gets a per-session monotonic ``seq`` + replay-ring entry so ``session.events.since`` can resume."""
     from tui_gateway.event_replay import _stamp_event
     _stamp_event(obj)
-    if obj.get("method") == "event":
-        params = obj.get("params")
-        sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
-    return (current_transport() or _stdio_transport).write(obj)
+    return _write_json_frame(obj)
 
 
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
