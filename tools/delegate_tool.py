@@ -301,8 +301,8 @@ def _run_single_child(
     """
     child_progress_cb = getattr(child, "tool_progress_callback", None)
     child_pool, leased_cred_id = _lease_child_credential(child)
-    # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while the
-    # child works; it stops itself once the child looks stale (see _HEARTBEAT_STALE_CYCLES_*).
+    # Heartbeat keeps the parent's _last_activity_ts moving while the child progresses; once the child looks stale it
+    # interrupts the child and stops touching the parent (see _HEARTBEAT_STALE_CYCLES_*).
     heartbeat = _start_heartbeat(child, parent_agent, task_index)
     # TUI/RPC registry entry (kill/pause/status by subagent_id); None for test
     # doubles without a stable id. Unregistered in the finally block.
