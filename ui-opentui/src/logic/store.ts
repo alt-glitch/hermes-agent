@@ -2795,6 +2795,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
         }
         break
       }
+      case 'session.control.update':
+        // The structured snapshot backs Desktop's interactive automation
+        // cards. Native controls remain /goal, /loop, /heartbeat and /subgoal;
+        // their command output plus status.update/turn events already provide
+        // the intended terminal behavior. Claim this decoded event explicitly
+        // without introducing a second session-control store or duplicate UI.
+        break
       // notification.show — background-activity notice (process/run state change,
       // credits, etc.). Renders as a distinct inline card (NOT a plain line) and
       // records lastNotification so the OSC seam can ping a blurred terminal.
