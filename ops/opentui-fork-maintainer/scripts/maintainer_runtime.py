@@ -3299,6 +3299,10 @@ def resume_publication(
     remote: str = REMOTE,
 ) -> dict[str, Any]:
     """Continue exact evidence under an existing fresh owner and the run lock."""
+    # Match the binding helpers without resolving away symlink evidence fences.
+    state_dir = Path(os.path.abspath(state_dir))
+    source = Path(os.path.abspath(source))
+    manifest_path = Path(os.path.abspath(manifest_path))
     validate_lease(state_dir, token)
     root = manifest_path.parent
     current = _derive_run_binding(state_dir, root, token)

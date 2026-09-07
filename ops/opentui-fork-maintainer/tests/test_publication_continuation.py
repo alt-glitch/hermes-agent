@@ -310,6 +310,38 @@ def test_queued_resume_uses_existing_claim_and_finalization(scheduled_request):
     assert remote_sha(f["repo"]) == f["candidate"]
 
 
+@pytest.mark.parametrize("relative_flags", [("--state", "--source-manifest"), ("--manifest",)])
+@pytest.mark.parametrize("fault", [None, "foreign-owner", "media", "foreign-output"])
+def test_mixed_command_paths_preserve_continuation_fences(scheduled_request, monkeypatch, relative_flags, fault):
+    f, request = scheduled_request
+    monkeypatch.chdir(f["state"].parent)
+    args = list(f["args"])
+    for flag in relative_flags:
+        index = args.index(flag) + 1
+        args[index] = str(Path(args[index]).relative_to(Path.cwd()))
+    if fault == "foreign-owner":
+        lease = runtime._load_gate(f["state"] / "run.lease.json")
+        lease["token"] = "foreign"
+        write_json(f["state"] / "run.lease.json", lease)
+    elif fault == "media":
+        (f["old"] / "termctrl-verified/accepted.png").write_bytes(b"tampered")
+    elif fault == "foreign-output":
+        args[args.index("--manifest") + 1] = "state/runs/foreign/gate.json"
+    before = {str(p): p.read_bytes() for p in f["old"].rglob("*") if p.is_file()}
+    if fault is None:
+        assert runtime.main(args) == 0
+        assert remote_sha(f["repo"]) == f["candidate"]
+        assert runtime._load_gate(f["fresh"] / "request.consumed.json") == request
+    else:
+        with pytest.raises(runtime.ControlError):
+            runtime.main(args)
+        assert remote_sha(f["repo"]) == f["base"]
+        assert f["calls"] == []
+        assert not (f["state"] / "publish-journal.json").exists()
+        assert not f["output"].exists()
+    assert {str(p): p.read_bytes() for p in f["old"].rglob("*") if p.is_file()} == before
+
+
 @pytest.mark.parametrize("when", ["before", "during"])
 def test_queued_resume_pins_cannot_be_changed(scheduled_request, monkeypatch, when):
     f, request = scheduled_request

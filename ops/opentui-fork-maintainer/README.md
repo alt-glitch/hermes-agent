@@ -186,6 +186,12 @@ adoptable. Other resumable PRs must have the task ownership marker. Issue/manual
 continuations require the original request to be reclaimed and still authorized;
 the scheduled `resume` request is not an issue-approval substitute.
 
+The explicit request is the recommended deterministic dispatch path. An already
+authorized scheduled owner with no queued/in-flight request may also continue a
+retained scheduled failure directly, provided the same base/watermark binding,
+explicit manifest/packet pins, PR adoption and all evidence checks still pass.
+This does not authorize a new candidate or bypass a pending task.
+
 After claiming, the parent invokes:
 
 ```text
