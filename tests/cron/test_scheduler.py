@@ -918,14 +918,15 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         class FakeFuture:
+            def __init__(self):
+                self._done = False
+
             def done(self):
-                return False
+                return self._done
 
             def result(self):
+                self._done = True
                 return {"final_response": "ok"}
-
-            def done(self):
-                return True  # run_job's finally asks the real Future; this one has already returned
 
         fake_future = FakeFuture()
         fake_pool = MagicMock()
