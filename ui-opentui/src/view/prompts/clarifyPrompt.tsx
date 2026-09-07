@@ -30,7 +30,7 @@
  * uncertain local dismissal. multi_select rides the state untouched — no checkbox UX yet
  * (same deliberate gap as Ink).
  */
-import { type InputRenderable } from '@opentui/core'
+import { type BoxRenderable, type InputRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, Show } from 'solid-js'
 
@@ -78,6 +78,7 @@ export function ClarifyPrompt(props: {
   // Text staged into the (re)mounted input — revisiting a typed batch answer
   // pre-fills it so Enter edits the earlier text instead of starting blank.
   const [staged, setStaged] = createSignal('')
+  let rootRef: BoxRenderable | undefined
   let inputRef: InputRenderable | undefined
   const batchAnswerSignature = () =>
     JSON.stringify(questions().map(q => [q.qid, Object.hasOwn(answers(), q.qid), answers()[q.qid]]))
@@ -89,7 +90,9 @@ export function ClarifyPrompt(props: {
   // keystrokes type into it (and leave the list while a choice is selected).
   createEffect(() => {
     if (onInput()) inputRef?.focus()
-    else inputRef?.blur()
+    // Keep focus inside the overlay's close-key layer when returning to choices.
+    // A bare blur leaves no focused descendant, disabling Esc and Ctrl+C.
+    else if (inputRef?.focused) rootRef?.focus()
   })
 
   // A per-question RPC keeps this component mounted while the store records
@@ -249,6 +252,7 @@ export function ClarifyPrompt(props: {
 
   return (
     <box
+      ref={el => (rootRef = el)}
       style={{ borderColor: theme().color.border, flexDirection: 'column', flexShrink: 0, marginTop: 1, padding: 1 }}
       border
     >

@@ -70,6 +70,29 @@ async function mount(
 }
 
 describe('PromptOverlay acknowledgement ownership', () => {
+  test.each(['escape', 'ctrl-c'] as const)('retains %s cancellation after leaving custom input', async key => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-focus' } })
+    const replies: Record<string, unknown>[] = []
+    const h = await mountOverlay(store, (_method, params) => {
+      replies.push(params)
+      return Promise.resolve(ACCEPTED)
+    })
+    try {
+      h.keys.pressArrow('down')
+      await h.settle()
+      h.keys.pressArrow('up')
+      await h.settle()
+      if (key === 'escape') h.keys.pressEscape()
+      else h.keys.pressKey('c', { ctrl: true })
+      await h.settle()
+      expect(replies).toEqual([expect.objectContaining({ request_id: 'req-focus', answer: '' })])
+      await expect.poll(() => store.state.prompt).toBeUndefined()
+    } finally {
+      h.destroy()
+    }
+  })
+
   test('stays mounted while pending and prevents duplicate submit', async () => {
     const store = createSessionStore()
     store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-1' } })
