@@ -252,6 +252,38 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     expect(Option.isSome(decode({ type: 'review.summary' }))).toBe(true)
   })
 
+  test('claims the structured session-control event envelope and rejects malformed snapshots', () => {
+    const event = decode({
+      type: 'session.control.update',
+      session_id: 'live-1',
+      payload: {
+        control: {
+          goal: { status: 'active', title: 'ship it' },
+          heartbeat: null,
+          loop: null,
+          revision: 'rev-1',
+          updated_at: 42
+        }
+      }
+    })
+    expect(Option.isSome(event)).toBe(true)
+    if (Option.isSome(event) && event.value.type === 'session.control.update') {
+      expect(event.value.session_id).toBe('live-1')
+      expect(event.value.payload.control.revision).toBe('rev-1')
+      expect(event.value.payload.control.heartbeat).toBeNull()
+    }
+
+    expect(
+      Option.isNone(
+        decode({
+          type: 'session.control.update',
+          session_id: 'live-1',
+          payload: { control: { goal: null, heartbeat: null, loop: null, updated_at: 42 } }
+        })
+      )
+    ).toBe(true)
+  })
+
   test('decodes the session.title live push (upstream f726090d489d) — sid scope + DB-key payload', () => {
     const ev = decode({
       type: 'session.title',
