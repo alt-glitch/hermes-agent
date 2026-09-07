@@ -210,6 +210,31 @@ describe('session-control store', () => {
     expect(refreshLegacyGoal).not.toHaveBeenCalled()
   })
 
+  it('leaves reconciliation and public state unchanged when an event is rejected by its fence', async () => {
+    applySessionControlSnapshot('s1', FULL_SNAPSHOT, 12)
+    const response = deferred<unknown>()
+    useGateway(vi.fn(() => response.promise))
+
+    const action = runSessionControlAction('s1', 'goal.pause')
+    const entriesBeforeEvent = $sessionControlBySession.get()
+    const entryBeforeEvent = entriesBeforeEvent.s1!
+
+    expect(applySessionControlUpdate('s1', { ...FULL_SNAPSHOT, revision: 'older-event' }, 11)).toBe(entryBeforeEvent)
+    expect($sessionControlBySession.get()).toBe(entriesBeforeEvent)
+
+    response.reject(new JsonRpcGatewayError('method not found', { code: -32601 }))
+
+    await expect(action).rejects.toThrow('method not found')
+    expect($sessionControlBySession.get().s1).toMatchObject({
+      capability: 'unsupported',
+      error: null,
+      loading: false,
+      pendingAction: null,
+      snapshot: { revision: FULL_SNAPSHOT.revision }
+    })
+    expect(refreshLegacyGoal).toHaveBeenCalledTimes(1)
+  })
+
   it('does not let a stale method-not-found response disturb a newer action', async () => {
     applySessionControlSnapshot('s1', FULL_SNAPSHOT)
     const olderResponse = deferred<unknown>()
@@ -374,7 +399,7 @@ describe('session-control store', () => {
     expect($sessionControlBySession.get().s1!.snapshot).toEqual(cleared)
   })
 
-  it('a gateway-switch wipe drops every entry and strands in-flight responses from the old backend', async () => {
+  it('a gateway-switch wipe strands old responses even when the new backend reuses a session id', async () => {
     applySessionControlSnapshot('supported', FULL_SNAPSHOT)
     const slowRead = deferred<unknown>()
     const slowAction = deferred<unknown>()
@@ -386,6 +411,10 @@ describe('session-control store', () => {
     clearAllSessionControl()
     expect($sessionControlBySession.get()).toEqual({})
 
+    const currentRead = deferred<unknown>()
+    useGateway(vi.fn(() => currentRead.promise))
+    const readFromCurrentBackend = refreshSessionControl('probing')
+
     slowRead.resolve({ control: FULL_SNAPSHOT })
     slowAction.resolve({
       control: { ...FULL_SNAPSHOT, revision: 'stale-action' },
@@ -394,7 +423,15 @@ describe('session-control store', () => {
     await read
     await action
 
-    expect($sessionControlBySession.get()).toEqual({})
+    expect($sessionControlBySession.get()).toMatchObject({
+      probing: { capability: 'unknown', loading: true, pendingAction: null, snapshot: null }
+    })
+    expect($sessionControlBySession.get().supported).toBeUndefined()
+
+    currentRead.resolve({ control: { ...FULL_SNAPSHOT, revision: 'current-backend' } })
+    await readFromCurrentBackend
+
+    expect($sessionControlBySession.get().probing!.snapshot!.revision).toBe('current-backend')
   })
 
   it('does not let a late read repopulate a cleared session', async () => {
