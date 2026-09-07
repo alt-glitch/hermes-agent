@@ -209,6 +209,13 @@ def _build_child_agent(
         depth=max(0, child_depth - 1),  # 0 = first-level child for the UI
         model=model or getattr(parent_agent, "model", None), toolsets=child_toolsets, session_ref=child_session_ref,
     )
+
+    def _relay_child_interim(text: str, *, already_streamed: bool = False) -> None:
+        # The child's ordinary stream already reaches subagent.text through _ChildRun.relay_text.
+        # already_streamed is a settlement acknowledgment; relaying it would duplicate the branch transcript.
+        if text and not already_streamed:
+            _safe_progress(child_progress_cb, "subagent.text", preview=text)
+
     rt = _resolve_child_runtime(
         parent_agent, delegation_cfg, parent_api_key, model=model, override_provider=override_provider,
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
@@ -238,6 +245,7 @@ def _build_child_agent(
                     (lambda text: _safe_progress(child_progress_cb, "subagent.reasoning", preview=text) if text else None)
                     if child_progress_cb else None
                 ),
+                interim_assistant_callback=_relay_child_interim if child_progress_cb else None,
                 session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent

@@ -35,10 +35,16 @@ def test_task_metadata_survives_dispatch_registry_callbacks_and_completion(monke
 
         child._stream_callback = stream_callback
         live = next(r for r in records.list_active_subagents() if r["subagent_id"] == child._subagent_id)
-        observations.append((child._subagent_id, live, child.ephemeral_system_prompt))
+        observations.append((child, live, child.ephemeral_system_prompt))
         child.thinking_callback("Working...")
         for chunk in ("Compare", " ", "paths"):
             child._fire_reasoning_delta(chunk)
+        child._fire_streamed_codex_commentary("AGENTS42_MIDTASK")
+        child._fire_streamed_codex_commentary("AGENTS42_MIDTASK")
+        child._fire_stream_delta("Draft before tool")
+        interim = {"role": "assistant", "content": "Draft before tool"}
+        child._emit_interim_assistant_message(interim)
+        child._emit_interim_assistant_message(interim)
         for chunk in ("Answer", "\n", "  body"):
             stream_callback(chunk)
         # Post-stream response intake must not repeat the assembled reasoning.
@@ -93,7 +99,8 @@ def test_task_metadata_survives_dispatch_registry_callbacks_and_completion(monke
             expected["Inspect parser edge cases"] = "Check edge cases"
             assert "error" not in nested_results[0], nested_results[0]
             assert nested_results[0]["results"][0]["task_label"] == "Check edge cases"
-        for child_id, live, prompt in observations:
+        for child, live, prompt in observations:
+            child_id = child._subagent_id
             label = expected.get(live["goal"])
             assert live.get("task_label") == label
             branch = [e for e in events if e.get("subagent_id") == child_id]
@@ -103,7 +110,16 @@ def test_task_metadata_survives_dispatch_registry_callbacks_and_completion(monke
             assert all(e.get("parent_id") == live["parent_id"] for e in branch)
             assert next(e for e in branch if e["event"] == "subagent.start")["started_at"] == live["started_at"]
             assert [e["preview"] for e in branch if e["event"] == "subagent.reasoning"] == ["Compare", " ", "paths"]
-            assert [e["preview"] for e in branch if e["event"] == "subagent.text"] == ["Answer", "\n", "  body"]
+            text_events = [e for e in branch if e["event"] == "subagent.text"]
+            assert [(e["preview"], e.get("already_streamed")) for e in text_events] == [
+                ("AGENTS42_MIDTASK", None),
+                ("Draft before tool", None),
+                ("Answer", None),
+                ("\n", None),
+                ("  body", None),
+            ]
+            assert sum(e["event"] == "subagent.complete" for e in branch) == 1
+            assert not any(e["preview"] == "Answer\n  body" for e in text_events)
             assert [e["preview"] for e in branch if e["event"] == "subagent.thinking"] == ["Working...", "Answer"]
             assert records.get_subagent_attribution(child_id).get("task_label") == label
             assert label is None or label not in prompt  # display metadata never changes the child prompt
@@ -114,6 +130,10 @@ def test_task_metadata_survives_dispatch_registry_callbacks_and_completion(monke
         assert not records.list_active_subagents()
         assert tasks == original_tasks
         assert dt.DELEGATE_TASK_SCHEMA == schema_before
+        event_count = len(events)
+        for child, _, _ in observations:
+            child._fire_streamed_codex_commentary("Late after completion")
+        assert len(events) == event_count
     finally:
         parent.close()
 
