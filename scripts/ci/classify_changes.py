@@ -23,6 +23,7 @@ Lanes:
 * ``uv_lock``     — ``uv lock --check``. Re-resolves the whole graph against
   PyPI, so a diff that touches neither ``pyproject.toml`` nor ``uv.lock``
   must not run it.
+* ``opentui``     — isolated Node 26.3 install, native checks, and build.
 * ``npm_lock``    — semantic package-lock.json diff PR comment.
 * ``installer``   — PowerShell installer tests (Windows runner).
 * ``desktop_updater`` — the Windows desktop-update hand-off script and the
@@ -67,6 +68,7 @@ import subprocess
 import sys
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
+_OPENTUI = ("ui-opentui/", "tui_gateway/")
 # Shipped page outside those packages, exercised by the desktop Electron suite.
 _FRONTEND_FILES = {"scripts/desktop-update/ui.html"}
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
@@ -75,7 +77,7 @@ _NIX_PATHS = ("nix/",) # nix files
 _NIX_FILES = {"flake.nix", "flake.lock"} # base nix files
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
-_PY_SKIP = ("docs/", "website/") + _FRONTEND
+_PY_SKIP = ("docs/", "website/", "ui-opentui/") + _FRONTEND
 # Published artifacts that live under website/ but that Python asserts about.
 # The OAuth Client ID Metadata Document is cross-checked against the pinned
 # callback ports in tools/mcp_oauth.py, so editing it alone must still run the
@@ -198,6 +200,10 @@ def _is_rust(p: str) -> bool:
     )
 
 
+def _is_opentui(p: str) -> bool:
+    return p.startswith(_OPENTUI) and not _is_docs(p)
+
+
 def _is_ci_review(p: str) -> bool:
     if p in _CI_REVIEW_FILES or p.startswith(_CI_REVIEW_PATHS):
         return True
@@ -220,6 +226,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         f.startswith(_FRONTEND) or f in _ROOT_NPM or f in _FRONTEND_FILES
         for f in files
     )
+    opentui = any(_is_opentui(f) for f in files)
     deps = any(f == "pyproject.toml" for f in files)
     npm_lock = any(f.split("/")[-1] == "package-lock.json" for f in files)
     docker_meta = any(f.startswith(_DOCKER_META) for f in files)
@@ -227,9 +234,10 @@ def classify(files: list[str]) -> dict[str, bool]:
     ret = {
         "python": python,
         "python_prod": python_prod,
-        "docker": docker_meta or python_prod or frontend,
+        "docker": docker_meta or python_prod or frontend or opentui,
         "docker_meta": docker_meta,
         "frontend": frontend,
+        "opentui": opentui,
         "site": any(f.startswith(_SITE) for f in files),
         "scan": any(_is_scan(f) for f in files),
         "deps": deps,
@@ -248,6 +256,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["docker"] = True
         ret["docker_meta"] = True
         ret["frontend"] = True
+        ret["opentui"] = True
         ret["site"] = True
         ret["scan"] = True
         ret["deps"] = True

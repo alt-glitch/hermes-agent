@@ -5,9 +5,11 @@ name: Label rerun
 # label) and GitHub reruns the dependent ``all-checks-pass`` gate.
 #
 # ``gh run rerun`` only works on a completed run. Thus this waits when the
-# run is still in progress. Python CI permits 90 minutes; observation must not
-# report success before a rerun was submitted. Re-run this helper to recover a
-# timed-out observation; do not restart an active CI run.
+# run is still in progress. A completed successful run needs no recovery and
+# exits without asking GitHub to rerun an empty failed-job set. Python CI
+# permits 90 minutes; observation must not report success before a needed
+# rerun was submitted. Re-run this helper to recover a timed-out observation;
+# do not restart an active CI run.
 #
 # The review comment updates without help. The poller in
 # ci-review-comment.yml watches the CI run through the API. It gets the
@@ -46,22 +48,17 @@ jobs:
             --commit "$HEAD_SHA" \
             --workflow ci.yaml \
             --limit 1 \
-            --json databaseId,status \
-            --jq '.[0] | select(. != null) | "\(.databaseId) \(.status)"')
+            --json databaseId,status,conclusion \
+            --jq '.[0] | select(. != null) | "\(.databaseId) \(.status) \(.conclusion // "unknown")"')
 
           if [ -z "$RUN_INFO" ]; then
             echo "CI run not yet available; rerun this helper after CI starts."
             exit 1
           fi
 
-          # Split "RUN_ID STATUS" into two vars. Read STATUS from RUN_INFO,
-          # not from the truncated RUN_ID. Both values came from the same
-          # var before, which made STATUS the run id. Thus the wait branch
-          # always ran.
-          RUN_ID="${RUN_INFO%% *}"
-          STATUS="${RUN_INFO##* }"
+          read -r RUN_ID STATUS CONCLUSION <<< "$RUN_INFO"
 
-          echo "Latest CI run: $RUN_ID (status: $STATUS)"
+          echo "Latest CI run: $RUN_ID (status: $STATUS, conclusion: $CONCLUSION)"
 
           # If the run is still in progress, wait for it to finish.
           # gh run rerun only works on completed runs — if we try while it's
@@ -75,13 +72,22 @@ jobs:
             timeout 6000 gh run watch "$RUN_ID" --repo "$REPO" --interval 15 || true
 
             # Verify it's actually completed now.
-            STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo "unknown")
+            FINAL_INFO=$(gh run view "$RUN_ID" \
+              --repo "$REPO" \
+              --json status,conclusion \
+              --jq '"\(.status) \(.conclusion // "unknown")"' 2>/dev/null || true)
+            read -r STATUS CONCLUSION <<< "${FINAL_INFO:-unknown unknown}"
             if [ "$STATUS" != "completed" ]; then
               echo "Run is still $STATUS; recovery pending. Rerun this helper, not the active CI run."
               exit 1
             fi
           fi
 
-          echo "Run completed. Rerunning all failed jobs..."
+          if [ "$CONCLUSION" = "success" ]; then
+            echo "Run already succeeded; no failed jobs need recovery."
+            exit 0
+          fi
+
+          echo "Run completed with conclusion $CONCLUSION. Rerunning all failed jobs..."
           gh run rerun "$RUN_ID" --repo "$REPO" --failed
           echo "Done. GitHub will rerun review-labels and all dependent jobs."

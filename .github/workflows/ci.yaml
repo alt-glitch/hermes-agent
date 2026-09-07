@@ -43,6 +43,7 @@ jobs:
       python: ${{ steps.classify.outputs.python }}
       python_prod: ${{ steps.classify.outputs.python_prod }}
       frontend: ${{ steps.classify.outputs.frontend }}
+      opentui: ${{ steps.classify.outputs.opentui }}
       site: ${{ steps.classify.outputs.site }}
       scan: ${{ steps.classify.outputs.scan }}
       deps: ${{ steps.classify.outputs.deps }}
@@ -104,6 +105,12 @@ jobs:
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
     uses: ./.github/workflows/js-tests.yml
+
+  opentui-tests:
+    name: Native OpenTUI checks
+    needs: detect
+    if: needs.detect.outputs.opentui == 'true'
+    uses: ./.github/workflows/opentui-tests.yml
 
   installer-tests:
     name: Installer tests
@@ -237,6 +244,7 @@ jobs:
       - tests-os
       - lint
       - js-tests
+      - opentui-tests
       - installer-tests
       - rust-tests
       - e2e-desktop

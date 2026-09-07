@@ -32,6 +32,7 @@ DEFAULT = {
     "python": True,
     "python_prod": True,
     "frontend": True,
+    "opentui": True,
     "docker": True,
     "docker_meta": True,
     "nix": True,
@@ -48,7 +49,7 @@ DEFAULT = {
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, opentui=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -60,9 +61,10 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
     return {
         "python": python,
         "python_prod": _python_prod,
-        "docker": (docker_meta or _product) if docker is None else docker,
+        "docker": (docker_meta or _product or opentui) if docker is None else docker,
         "nix": _product if nix is None else nix,
         "frontend": frontend,
+        "opentui": opentui,
         "docker_meta": docker_meta,
         "site": site,
         "scan": scan,
@@ -280,6 +282,24 @@ def test_classify(files, expected):
     assert classify(files) == expected
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "ui-opentui/src/view/App.tsx",
+        "ui-opentui/src/test/render.test.tsx",
+        "ui-opentui/package.json",
+        "ui-opentui/package-lock.json",
+        "tui_gateway/server.py",
+    ],
+)
+def test_native_opentui_inputs_select_native_checks(path):
+    assert classify([path]).get("opentui", False)
+
+
+def test_unrelated_docs_do_not_select_native_opentui_checks():
+    assert not classify(["docs/guide.md"]).get("opentui", False)
+
+
 _REPO = Path(__file__).resolve().parents[2]
 
 
@@ -316,6 +336,29 @@ def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
 
     assert referenced, "found no detect-gated jobs — the walk is broken, not the wiring"
     assert referenced - declared == set(), "job(s) gate on an output detect never declares"
+
+
+def test_native_opentui_job_runs_the_isolated_package_gate():
+    ci = _yaml(".github/workflows/ci.yaml")
+    native = ci["jobs"]["opentui-tests"]
+    assert native["if"] == "needs.detect.outputs.opentui == 'true'"
+    assert "opentui-tests" in ci["jobs"]["all-checks-pass"]["needs"]
+
+    workflow = _yaml(".github/workflows/opentui-tests.yml")
+    assert workflow["permissions"] == {"contents": "read"}
+    job = workflow["jobs"]["check"]
+    assert job["defaults"]["run"]["working-directory"] == "ui-opentui"
+
+    setup_node = next(
+        step for step in job["steps"] if step.get("uses", "").startswith("actions/setup-node@")
+    )
+    assert setup_node["with"]["node-version"] == "26.3.0"
+    assert setup_node["with"]["cache-dependency-path"] == "ui-opentui/package-lock.json"
+
+    commands = "\n".join(step.get("run", "") for step in job["steps"])
+    assert "npm ci" in commands
+    assert "npm run check" in commands
+    assert "npm run build" in commands
 
 
 def _iter_if_expressions(job: object):

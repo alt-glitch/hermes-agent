@@ -8,7 +8,8 @@ import yaml
 
 
 @pytest.mark.parametrize("scenario,success,rerun", [
-    ("complete", True, True),
+    ("completed-success", True, False),
+    ("completed-failure", True, True),
     ("wait-complete", True, True),
     ("pending", False, False),
     ("missing", False, False),
@@ -26,12 +27,15 @@ list)
   case "$SCENARIO" in
   api-error) exit 1;;
   missing) exit 0;;
-  complete|rerun-error) printf '123 completed';;
+  completed-success)
+    if [[ "$*" == *conclusion* ]]; then printf '123 completed success'; else printf '123 completed'; fi;;
+  completed-failure|rerun-error)
+    if [[ "$*" == *conclusion* ]]; then printf '123 completed failure'; else printf '123 completed'; fi;;
   *) printf '123 in_progress';;
   esac;;
 watch) exit 1;;
 view)
-  if [ "$SCENARIO" = wait-complete ]; then printf completed; else printf in_progress; fi;;
+  if [ "$SCENARIO" = wait-complete ]; then printf 'completed failure'; else printf 'in_progress unknown'; fi;;
 rerun) [ "$SCENARIO" != rerun-error ];;
 *) exit 2;;
 esac
@@ -46,3 +50,5 @@ esac
     assert ("run rerun 123" in calls.read_text()) is rerun
     if scenario == "pending":
         assert "recovery pending" in result.stdout
+    if scenario == "completed-success":
+        assert "already succeeded" in result.stdout

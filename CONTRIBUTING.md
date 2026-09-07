@@ -210,6 +210,18 @@ scripts/run_tests.sh
 pytest tests/ -v
 ```
 
+Native OpenTUI changes use their own Node 26.3 package and lockfile rather than
+the root npm workspaces. GitHub selects this gate for `ui-opentui/` and shared
+`tui_gateway/` source changes. Run the same isolated sequence locally:
+
+```bash
+cd ui-opentui
+unset NODE_ENV
+npm ci
+npm run check
+npm run build
+```
+
 ---
 
 ## Project Structure
