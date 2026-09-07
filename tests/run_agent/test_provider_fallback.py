@@ -99,6 +99,51 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=None)
         assert agent._try_activate_fallback() is False
 
+    def test_successful_activation_clears_usage_anchor_for_previous_runtime(self):
+        agent = _make_agent(
+            fallback_model={"provider": "openai", "model": "gpt-4o"},
+        )
+        anchor = {"prompt_tokens": 12_345}
+        agent._usage_anchor = anchor
+        agent._turn_base_usage_anchor = anchor
+        agent.session_id = "fallback-anchor-session"
+        agent._session_db = MagicMock()
+        agent._persist_disabled = False
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent._usage_anchor is None
+        assert agent._turn_base_usage_anchor is None
+        agent._session_db.patch_session_model_config.assert_called_once_with(
+            agent.session_id,
+            {"_usage_anchor": None},
+        )
+
+    def test_failed_activation_preserves_current_runtime_usage_anchor(self):
+        agent = _make_agent(
+            fallback_model={"provider": "unconfigured", "model": "missing"},
+        )
+        anchor = {"prompt_tokens": 12_345}
+        agent._usage_anchor = anchor
+        agent._turn_base_usage_anchor = anchor
+        agent.session_id = "failed-fallback-anchor-session"
+        agent._session_db = MagicMock()
+        agent._persist_disabled = False
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),
+        ):
+            assert agent._try_activate_fallback() is False
+
+        assert agent._usage_anchor is anchor
+        assert agent._turn_base_usage_anchor is anchor
+        agent._session_db.patch_session_model_config.assert_not_called()
+
     def test_advances_index(self):
         fbs = [
             {"provider": "openai", "model": "gpt-4o"},
@@ -215,13 +260,16 @@ class TestFallbackChainAdvancement:
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
 
 
-    def test_nous_anthropic_fallback_uses_the_messages_wire(self):
-        """Portal Claude fallbacks must not stay on chat_completions.
+    def test_nous_anthropic_fallback_uses_the_messages_wire(self, monkeypatch):
+        """Portal Claude fallbacks must not stay on chat_completions when the native wire is selected.
 
         ``resolve_provider_client`` still returns an OpenAI client for Nous;
         activation has to re-derive api_mode from the model and rebuild the
-        Anthropic client — otherwise the turn POSTs /chat/completions.
+        Anthropic client — otherwise the turn POSTs /chat/completions. The wire
+        is opt-in since 2026-09-06 (``nous.anthropic_wire``, see ``nous_api_mode``).
         """
+        from hermes_cli import providers as _providers
+        monkeypatch.setattr(_providers, "_nous_anthropic_wire", lambda: "native")
         portal = "https://inference-api.nousresearch.com/v1"
         fbs = [
             {

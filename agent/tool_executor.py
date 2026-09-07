@@ -567,6 +567,15 @@ def _set_worker_activity_callback(agent) -> None:
         set_activity_callback(agent._touch_activity)
 
 
+# Tools whose call blocks on a long-running operation that supervises its own liveness: no generic activity
+# heartbeat or sequential deadline. ``delegate_task`` in a nested orchestrator blocks for the whole batch by
+# design (children carry progress-aware heartbeats that interrupt stalls, plus the optional
+# ``delegation.child_timeout_seconds``). Under the 420 s deadline every real batch "timed out" while its
+# children ran on as orphans, and the orchestrator spent the following hours polling transcripts (measured:
+# 332 timeouts, ~$4k of orchestrator turns in one run).
+_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task"})
+
+
 # Must stay far below the gateway turn-inactivity timeout (default 1800s) so a silent tool never looks idle.
 _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S = 30.0
 
@@ -588,7 +597,9 @@ def _run_tool_activity_heartbeat(
 
 
 def _run_with_activity_heartbeat(agent, function_name: str, fn):
-    """Run ``fn()`` under the activity heartbeat; covers both executor paths."""
+    """Run ``fn()`` under the generic activity heartbeat; self-supervised tools own theirs."""
+    if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS:
+        return fn()
     stop = threading.Event()
     thread = threading.Thread(
         # Keep the gateway turn-inactivity watchdog from abandoning a turn whose tool call runs silently for
@@ -794,7 +805,8 @@ def _poll_sequential_future(agent, future, function_name: str, deadline: float |
     """Wait for the worker in interrupt-poll slices, extending the deadline by human approval
     wait; returns ``("done", result)``, ``("timeout", None)`` or ``("interrupted", None)``.
     A disabled deadline still polls: this loop is what makes a non-cooperative tool
-    interruptible, so no deadline must not mean no interrupt checks."""
+    interruptible, so no deadline must not mean no interrupt checks. Self-supervised tools
+    own their activity heartbeat; duplicating it here would mask their stale signal."""
     _last_heartbeat = 0
     while True:
         wait_slice = _SEQUENTIAL_INTERRUPT_POLL_SECONDS
@@ -809,7 +821,10 @@ def _poll_sequential_future(agent, future, function_name: str, deadline: float |
             if agent._interrupt_requested:
                 return "interrupted", None
             elapsed = int(time.monotonic() - started)
-            if elapsed - _last_heartbeat >= 30:
+            if (
+                function_name not in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS
+                and elapsed - _last_heartbeat >= 30
+            ):
                 _last_heartbeat = elapsed
                 agent._touch_activity(f"sequential tool running ({elapsed}s): {function_name}")
 
@@ -829,7 +844,7 @@ def _run_sequential_tool_execution_middleware(
     """Run one sequential call on a worker thread under the concurrent executor's deadline.
     Interactive tools (``clarify``) own their wait via ``agent.clarify_timeout``; the
     generic deadline would report ``tool_timeout`` while the prompt is still live."""
-    timeout_s = _resolve_sequential_tool_timeout()
+    timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
     if function_name in _NEVER_PARALLEL_TOOLS:

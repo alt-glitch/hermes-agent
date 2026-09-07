@@ -1178,6 +1178,10 @@ def restore_primary_runtime(agent) -> bool:
         # Undo the fallback's identity rewrite so the prompt is byte-identical to the stored copy
         # again (prefix cache match).
         rewrite_prompt_model_identity(agent, rt["model"], rt["provider"])
+        # The fallback's provider-reported token count is not valid for the restored runtime.
+        from agent.usage_anchor import set_usage_anchor
+
+        set_usage_anchor(agent, None)
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
