@@ -203,7 +203,7 @@ def _dump_subagent_timeout_diagnostic(
 # ── Per-run helpers ──────────────────────────────────────────────────────────
 
 class _Heartbeat:
-    """One child's parent-activity heartbeat on the shared periodic scheduler thread
+    """One child's progress monitor and parent-activity heartbeat on the shared scheduler
     (``agent.periodic_scheduler``) — not one daemon thread per child. NOT started at construction:
     the caller calls ``start()`` inside its ``try`` so a failed schedule (OS thread exhaustion on
     first use) leaves ``handle`` None and ``stop()`` is a no-op."""
@@ -251,11 +251,14 @@ class _Heartbeat:
             else:
                 last_seen["stale"] += 1
             if last_seen["stale"] >= (_HEARTBEAT_STALE_CYCLES_IN_TOOL if child_tool else _HEARTBEAT_STALE_CYCLES_IDLE):
+                reason = f"Subagent stopped after making no progress for {last_seen['stale']} heartbeat cycles"
                 logger.warning(
-                    "Subagent %d appears stale (no progress for %d heartbeat cycles, tool=%s) — stopping heartbeat",
+                    "Subagent %d appears stale (no progress for %d heartbeat cycles, tool=%s) — "
+                    "interrupting child and stopping heartbeat",
                     task_index, last_seen["stale"], child_tool or "<none>",
                 )
-                return False  # stop touching parent, let gateway timeout fire
+                _signal_child_stop(child, reason)
+                return False
             if child_tool:
                 desc = f"delegate_task: subagent running {child_tool} (iteration {child_iter}/{child_max})"
             elif child_summary.get("last_activity_desc", ""):
