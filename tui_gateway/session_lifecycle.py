@@ -385,16 +385,6 @@ def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
         logger.debug("session.reclaimed broadcast failed", exc_info=True)
 
 
-def _release_session_human_waiters(session: dict) -> None:
-    """Wake waits owned by a session before its turn thread is joined."""
-    if sid := str(session.get("_sid") or ""):
-        _clear_pending(sid)
-    with contextlib.suppress(Exception):
-        from tools.approval import unregister_gateway_notify
-        if key := session.get("session_key"):
-            unregister_gateway_notify(key)
-
-
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister notifier, close agent (``session.close`` + WS reaper). The
     slash-worker is closed in ``_finalize_session`` (the single chokepoint), NOT here. Idempotent via ``_finalized``."""
@@ -402,7 +392,12 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
         return
     _finalize_session(session, end_reason=end_reason)
     _announce_session_reclaimed(session, end_reason)
-    _release_session_human_waiters(session)
+    if sid := str(session.get("_sid") or ""):
+        _clear_pending(sid)
+    with contextlib.suppress(Exception):
+        from tools.approval import unregister_gateway_notify
+        if key := session.get("session_key"):
+            unregister_gateway_notify(key)
     with contextlib.suppress(Exception):
         if hasattr(agent := session.get("agent"), "close"):
             agent.close()
@@ -461,7 +456,8 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
         _interrupt_session_turn(_lifecycle_own_sid(session), session)
     except Exception:
         logger.debug("failed interrupting popped session turn", exc_info=True)
-    _release_session_human_waiters(session)
+    # The interrupt contract releases pending human waits before this join.
+    # Notifier removal remains owned by _teardown_session, exactly once.
     run_thread = session.get("_run_thread")
     if end_reason != "tui_shutdown" and run_thread is not None and run_thread is not threading.current_thread():
         try:
@@ -511,8 +507,11 @@ def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None =
         run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
-        session["queued_prompt"] = None
-        session.pop("queued_prompts", None)
+        # Closing finalization must report a terminal result for every accepted
+        # queued input. Keep those IDs until its existing settlement path runs.
+        if not session.get("_closing"):
+            session["queued_prompt"] = None
+            session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     if not use_compute_host:
         if should_interrupt:
