@@ -3422,6 +3422,95 @@ def _publish_pr_evidence(
         raise ControlError(f"PR evidence publication refused: {exc}") from exc
 
 
+def publish_task_draft(
+    repo: Path,
+    evidence_root: Path,
+    *,
+    state_dir: Path,
+    cwd: Path,
+    base_sha: str,
+    candidate_sha: str,
+    token: str,
+    remote: str = REMOTE,
+    branch: str = BRANCH,
+    expected_pr_head: str | None = None,
+) -> dict[str, Any]:
+    """Expose one clean committed candidate as the task's non-authoritative draft."""
+    validate_lease(state_dir, token)
+    evidence_root = Path(os.path.abspath(evidence_root))
+    claimed = evidence_root / "request.claimed.json"
+    if (
+        claimed.exists()
+        and _read_bound_request(claimed, evidence_root, label="draft request")["mode"]
+        == "resume"
+    ):
+        raise ControlError("resume requests cannot create or update a draft PR")
+    if branch != BRANCH:
+        raise ControlError("draft publication only supports the OpenTUI fork branch")
+    run_binding = _derive_run_binding(state_dir, evidence_root, token)
+    if run_binding["captured_base"] != base_sha:
+        raise ControlError("draft base does not match captured fork snapshot")
+    _worktree_proof(cwd, candidate_sha)
+    _review_scope(
+        repo,
+        base_sha,
+        candidate_sha,
+        expected_mode=run_binding["mode"],
+        last_synced_upstream=run_binding["last_synced_upstream"],
+        captured_upstream=run_binding["captured_upstream"],
+    )
+    if run_binding["mode"] == "repair":
+        request = _read_bound_request(claimed, evidence_root, label="repair request")
+        if (
+            _git_status(cwd, ["merge-base", "--is-ancestor", base_sha, request["source_sha"]])
+            or _git_status(cwd, ["merge-base", "--is-ancestor", request["source_sha"], candidate_sha])
+        ):
+            raise ControlError(
+                "repair draft must retain the requested PR source above its captured base"
+            )
+    issue_request = None
+    if run_binding["mode"] == "issue":
+        issue_request = _revalidate_issue_request(
+            state_dir,
+            evidence_root,
+            token,
+            candidate_sha=expected_pr_head or candidate_sha,
+        )
+    manifest = {
+        "branch": branch,
+        "base_sha": base_sha,
+        "candidate_sha": candidate_sha,
+        "lease_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+        "run_binding": run_binding,
+    }
+    if expected_pr_head is not None:
+        manifest["expected_pr_head"] = expected_pr_head
+    publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
+    try:
+        proof = publisher["publish_draft"](
+            repo,
+            evidence_root,
+            manifest,
+            pending_gates=[
+                *sorted(REQUIRED_GATES),
+                "current-head CI and GitHub publication policy",
+            ],
+            remote=remote,
+            issue_request=issue_request,
+        )
+    except (RuntimeError, ValueError, KeyError, OSError) as exc:
+        raise ControlError(f"task draft publication refused: {exc}") from exc
+    if run_binding["mode"] == "issue":
+        _revalidate_issue_request(
+            state_dir,
+            evidence_root,
+            token,
+            candidate_sha=candidate_sha,
+            expected_pr=proof,
+        )
+    return proof
+
+
 def gate_and_ship(
     repo: Path,
     packet_path: Path,
@@ -4195,6 +4284,17 @@ def _parser() -> argparse.ArgumentParser:
     renew.add_argument("--state", type=Path, required=True)
     renew.add_argument("--token", required=True)
     publish = sub.add_parser("gate-and-ship")
+    draft = sub.add_parser("publish-draft")
+    draft.add_argument("--state", type=Path, required=True)
+    draft.add_argument("--evidence", type=Path, required=True)
+    draft.add_argument("--token", required=True)
+    draft.add_argument("--cwd", type=Path, required=True)
+    draft.add_argument("--repo", type=Path, required=True)
+    draft.add_argument("--base", required=True)
+    draft.add_argument("--candidate", required=True)
+    draft.add_argument("--expected-pr-head")
+    draft.add_argument("--remote", default=REMOTE)
+    draft.add_argument("--branch", default=BRANCH)
     resume = sub.add_parser("resume-publication")
     resume.add_argument("--state", type=Path, required=True)
     resume.add_argument("--token", required=True)
@@ -4305,6 +4405,22 @@ def main(argv: list[str] | None = None) -> int:
                 token=args.token, remote=args.remote,
             )
             release_lease(args.state, args.token)
+        return 0
+    if args.command == "publish-draft":
+        renew_lease(args.state, args.token)
+        with run_lock(args.state):
+            publish_task_draft(
+                args.repo,
+                args.evidence,
+                state_dir=args.state,
+                cwd=args.cwd,
+                base_sha=args.base,
+                candidate_sha=args.candidate,
+                token=args.token,
+                remote=args.remote,
+                branch=args.branch,
+                expected_pr_head=args.expected_pr_head,
+            )
         return 0
     if args.command == "gate-and-ship":
         renew_lease(args.state, args.token)

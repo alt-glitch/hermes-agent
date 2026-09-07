@@ -32,7 +32,10 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # PR fields this owner reads when reconciling an existing implementing PR.  The
 # generic publisher owns its own media/attachment queries; this set only proves
 # the reused PR still binds the exact candidate head, base and issue reference.
-PR_FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state"
+PR_FIELDS = (
+    "number,url,body,headRefName,headRefOid,baseRefName,state,isDraft,"
+    "baseRefOid,isCrossRepository,headRepositoryOwner,headRepository"
+)
 # Publication control tokens that untrusted issue-derived text must never carry,
 # so an approved issue cannot forge maintainer evidence markers or leak paths.
 BEFORE_AFTER_START = "<!-- before-and-after:start -->"
@@ -246,6 +249,8 @@ def issue_publication_metadata(
     root: Path,
     manifest: dict[str, Any],
     issue_request: dict[str, Any] | None = None,
+    *,
+    verification_complete: bool = True,
 ) -> tuple[str, str, dict[str, Any]]:
     """Build the issue-authored PR title, body prefix and evidence for a PR.
 
@@ -350,6 +355,10 @@ def issue_publication_metadata(
             raise IssueWorkflowError("issue PR metadata has an invalid bounded shape")
         authored = {key: metadata[key] for key in authored}
         metadata_sha256 = _hash(metadata_path)
+    if not verification_complete:
+        authored["verification"] = [
+            "Candidate-bound verification is in progress; see the managed Prepared, Passed and Pending status below."
+        ]
     _safe_metadata_text(authored["title"])
     _safe_metadata_text(authored["outcome"])
     for key in ("implementation", "verification", "limitations"):

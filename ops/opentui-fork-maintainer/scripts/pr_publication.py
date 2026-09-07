@@ -24,8 +24,10 @@ BASE = "sid/opentui"
 START = "<!-- before-and-after:start -->"
 END = "<!-- before-and-after:end -->"
 ATTACHMENT = re.compile(r"https://github\.com/user-attachments/assets/[a-zA-Z0-9-]+")
-FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state"
+FIELDS = "number,url,body,headRefName,headRefOid,baseRefName,state,isDraft"
 OWNERSHIP_FIELDS = ",baseRefOid,isCrossRepository,headRepositoryOwner,headRepository"
+STATUS_START = "<!-- maintainer-evidence-status:start -->"
+STATUS_END = "<!-- maintainer-evidence-status:end -->"
 # Immutable GitHub App IDs, verified against this fork's live check suites.
 REQUIRED_CHECK_APPS = {"All required checks pass": 15368}
 REQUIRED_CONTEXTS = set(REQUIRED_CHECK_APPS)
@@ -155,6 +157,56 @@ def _replace(body: str, block: str) -> str:
     if old is not None:
         return body.replace(old, block, 1)
     return body + ("\n\n" if body else "") + block
+
+
+def _status_block(
+    candidate: str,
+    *,
+    passed: list[str],
+    pending: list[str],
+) -> str:
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", candidate)
+        or not passed
+        or not pending
+        or any(
+            not isinstance(item, str) or not item.strip() or len(item) > 500
+            for item in [*passed, *pending]
+        )
+    ):
+        raise PublicationError("PR evidence status has an invalid bounded shape")
+    sections = [
+        STATUS_START,
+        "## Prepared",
+        f"- Task-owned candidate `{candidate}` is committed and bound to this PR.",
+        "",
+        "## Passed",
+        *(f"- {item.strip()}" for item in passed),
+        "",
+        "## Pending",
+        *(f"- {item.strip()}" for item in pending),
+        "",
+        "PR visibility or readiness is not release authorization; target publication still uses the guarded CAS.",
+        STATUS_END,
+    ]
+    return "\n".join(sections)
+
+
+def _replace_status(body: str, block: str) -> str:
+    if STATUS_START not in body and STATUS_END not in body:
+        if START in body:
+            position = body.index(START)
+            return body[:position] + block + "\n\n" + body[position:]
+        return body + ("\n\n" if body else "") + block
+    if (
+        body.count(STATUS_START) != 1
+        or body.count(STATUS_END) != 1
+        or body.index(STATUS_END) < body.index(STATUS_START)
+    ):
+        raise PublicationError("PR contains ambiguous evidence status markers")
+    before = body[: body.index(STATUS_START)]
+    after = body[body.index(STATUS_END) + len(STATUS_END) :]
+    return before + block + after
 
 
 def _canonical_sha(value: Any) -> str:
@@ -320,6 +372,284 @@ def candidate_checks(root: Path, candidate: str) -> list[dict[str, Any]]:
     return checks
 
 
+def _api_pages(root: Path, endpoint: str, *, object_key: str | None = None) -> list[Any]:
+    try:
+        pages = json.loads(
+            _run(
+                [str(GH), "api", "--paginate", "--slurp", endpoint],
+                root,
+            )
+        )
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise PublicationError("PR review evidence could not be decoded") from exc
+    if not isinstance(pages, list):
+        raise PublicationError("PR review evidence pagination is invalid")
+    values: list[Any] = []
+    for page in pages:
+        if object_key is not None:
+            if not isinstance(page, dict) or not isinstance(page.get(object_key), list):
+                raise PublicationError("PR review evidence page is invalid")
+            page = page[object_key]
+        if not isinstance(page, list):
+            raise PublicationError("PR review evidence page is invalid")
+        values.extend(page)
+    return values
+
+
+def _bounded_remote_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return "".join(
+        character
+        for character in value[:8_000]
+        if ord(character) >= 32 or character in "\n\t"
+    )
+
+
+def _actor(value: Any) -> str | None:
+    login = (value.get("login") or value.get("slug")) if isinstance(value, dict) else None
+    return login if isinstance(login, str) and login else None
+
+
+def _review_item(
+    surface: str,
+    value: dict[str, Any],
+    *,
+    head: str | None = None,
+    body: str = "",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    identifier = value.get("id")
+    if not isinstance(identifier, (int, str)) or isinstance(identifier, bool):
+        raise PublicationError(f"{surface} review evidence has no stable id")
+    key = f"{surface}:{identifier}" + (f":{head}" if head is not None else "")
+    item = {
+        "key": key,
+        "surface": surface,
+        "id": identifier,
+        "head_sha": head,
+        "actor": _actor(value.get("user") or value.get("creator")),
+        "created_at": value.get("created_at") or value.get("submitted_at"),
+        "updated_at": value.get("updated_at"),
+        "url": value.get("html_url") or value.get("details_url") or value.get("target_url"),
+        "body": _bounded_remote_text(body),
+    }
+    if extra:
+        item.update(extra)
+    item["requires_disposition"] = (
+        bool(item["body"])
+        or surface in {"failed_checks", "failed_statuses"}
+        or (
+            surface == "formal_reviews"
+            and str(item.get("state", "")).casefold() == "changes_requested"
+        )
+    )
+    item["evidence_sha256"] = _canonical_sha(item)
+    return item
+
+
+def collect_review_surfaces(
+    root: Path,
+    number: int,
+    candidate: str,
+    *,
+    observed_heads: list[str] | None = None,
+) -> dict[str, Any]:
+    """Collect untrusted PR findings and all failed attempts as bounded evidence."""
+    heads = observed_heads or [candidate]
+    if (
+        type(number) is not int
+        or number <= 0
+        or not re.fullmatch(r"[0-9a-f]{40}", candidate)
+        or not heads
+        or any(not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head) for head in heads)
+    ):
+        raise PublicationError("PR review collection identity is invalid")
+    prefix = f"repos/{REPOSITORY}"
+    surfaces: dict[str, list[dict[str, Any]]] = {
+        "issue_comments": [],
+        "inline_comments": [],
+        "formal_reviews": [],
+        "failed_checks": [],
+        "failed_statuses": [],
+    }
+    for value in _api_pages(
+        root, f"{prefix}/issues/{number}/comments?per_page=100"
+    ):
+        if not isinstance(value, dict):
+            raise PublicationError("issue comment review evidence is invalid")
+        surfaces["issue_comments"].append(
+            _review_item("issue_comments", value, body=value.get("body", ""))
+        )
+    for value in _api_pages(
+        root, f"{prefix}/pulls/{number}/comments?per_page=100"
+    ):
+        if not isinstance(value, dict):
+            raise PublicationError("inline comment review evidence is invalid")
+        surfaces["inline_comments"].append(
+            _review_item(
+                "inline_comments",
+                value,
+                body=value.get("body", ""),
+                extra={
+                    "path": value.get("path"),
+                    "line": value.get("line") or value.get("original_line"),
+                    "commit_id": value.get("commit_id"),
+                },
+            )
+        )
+    for value in _api_pages(
+        root, f"{prefix}/pulls/{number}/reviews?per_page=100"
+    ):
+        if not isinstance(value, dict):
+            raise PublicationError("formal review evidence is invalid")
+        surfaces["formal_reviews"].append(
+            _review_item(
+                "formal_reviews",
+                value,
+                body=value.get("body", ""),
+                extra={
+                    "state": value.get("state"),
+                    "commit_id": value.get("commit_id"),
+                },
+            )
+        )
+    for head in dict.fromkeys(heads):
+        check_runs = _api_pages(
+            root,
+            f"{prefix}/commits/{head}/check-runs?filter=all&per_page=100",
+            object_key="check_runs",
+        )
+        for value in check_runs:
+            if not isinstance(value, dict):
+                raise PublicationError("failed check evidence is invalid")
+            conclusion = value.get("conclusion")
+            if conclusion is None or str(conclusion).casefold() in {
+                "success",
+                "skipped",
+                "neutral",
+            }:
+                continue
+            output = value.get("output") if isinstance(value.get("output"), dict) else {}
+            surfaces["failed_checks"].append(
+                _review_item(
+                    "failed_checks",
+                    value,
+                    head=head,
+                    body="\n".join(
+                        part
+                        for part in (
+                            _bounded_remote_text(output.get("title")),
+                            _bounded_remote_text(output.get("summary")),
+                            _bounded_remote_text(output.get("text")),
+                        )
+                        if part
+                    ),
+                    extra={
+                        "name": value.get("name"),
+                        "status": value.get("status"),
+                        "conclusion": conclusion,
+                        "started_at": value.get("started_at"),
+                        "completed_at": value.get("completed_at"),
+                        "app": _actor(value.get("app")),
+                    },
+                )
+            )
+        for value in _api_pages(
+            root, f"{prefix}/commits/{head}/statuses?per_page=100"
+        ):
+            if not isinstance(value, dict):
+                raise PublicationError("failed status evidence is invalid")
+            state = str(value.get("state", "")).casefold()
+            if state in {"", "success", "pending", "expected"}:
+                continue
+            surfaces["failed_statuses"].append(
+                _review_item(
+                    "failed_statuses",
+                    value,
+                    head=head,
+                    body=value.get("description", ""),
+                    extra={"context": value.get("context"), "state": value.get("state")},
+                )
+            )
+    for values in surfaces.values():
+        unique = {item["key"]: item for item in values}
+        values[:] = [unique[key] for key in sorted(unique)]
+    identity = {
+        "repository": REPOSITORY,
+        "number": number,
+        "candidate_sha": candidate,
+        "observed_heads": list(dict.fromkeys(heads)),
+        "surfaces": surfaces,
+    }
+    result = {
+        "schema_version": 1,
+        **identity,
+        "observed_unix": int(time.time()),
+        "observations_sha256": _canonical_sha(identity),
+    }
+    _write(root / "pr-review-surfaces.json", json.dumps(result, indent=2) + "\n")
+    return result
+
+
+def require_review_disposition(root: Path, observations: dict[str, Any]) -> str | None:
+    required = {
+        item["key"]: item
+        for values in observations["surfaces"].values()
+        for item in values
+        if item["requires_disposition"]
+    }
+    if not required:
+        return None
+    path = root / "pr-review-disposition.json"
+    if path.is_symlink() or not path.is_file():
+        raise PublicationError(
+            "PR review findings require parent disposition in pr-review-disposition.json"
+        )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PublicationError("PR review disposition is invalid") from exc
+    items = value.get("dispositions") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema_version",
+            "repository",
+            "number",
+            "candidate_sha",
+            "observations_sha256",
+            "dispositions",
+        }
+        or value.get("schema_version") != 1
+        or value.get("repository") != REPOSITORY
+        or value.get("number") != observations["number"]
+        or value.get("candidate_sha") != observations["candidate_sha"]
+        or value.get("observations_sha256") != observations["observations_sha256"]
+        or not isinstance(items, list)
+    ):
+        raise PublicationError("PR review disposition does not bind current evidence")
+    by_key: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"key", "evidence_sha256", "decision", "evidence"}
+            or item.get("key") in by_key
+            or item.get("key") not in required
+            or item.get("evidence_sha256")
+            != required[item["key"]]["evidence_sha256"]
+            or item.get("decision") not in {"resolved", "refuted", "irrelevant"}
+            or not isinstance(item.get("evidence"), str)
+            or not 1 <= len(item["evidence"].strip()) <= 2_000
+        ):
+            raise PublicationError("PR review disposition item is invalid")
+        by_key[item["key"]] = item
+    if set(by_key) != set(required):
+        raise PublicationError("PR review disposition is incomplete")
+    return _hash(path)
+
+
 def review_status(pr: dict[str, Any], candidate: str, policy: dict[str, Any]) -> dict[str, Any] | None:
     """Require current-head CI and GitHub policy; independent review is a local gate."""
     if pr.get("headRefOid") != candidate or pr.get("state") != "OPEN" or pr.get("baseRefName") != BASE:
@@ -329,6 +659,7 @@ def review_status(pr: dict[str, Any], candidate: str, policy: dict[str, Any]) ->
     checks = pr.get("statusCheckRollup") or []
     if not checks:
         return None
+    pending = False
     for check in checks:
         if (
             check.get("name") == "Greptile Review"
@@ -338,12 +669,14 @@ def review_status(pr: dict[str, Any], candidate: str, policy: dict[str, Any]) ->
             continue
         if check.get("__typename") == "CheckRun":
             if check.get("status") != "COMPLETED":
-                return None
+                pending = True
+                continue
             if check.get("conclusion") not in {"SUCCESS", "SKIPPED", "NEUTRAL"}:
                 raise PublicationError(f"PR check failed: {check.get('name', 'unknown')}")
         elif check.get("__typename") == "StatusContext":
             if check.get("state") in {"PENDING", "EXPECTED"}:
-                return None
+                pending = True
+                continue
             if check.get("state") != "SUCCESS":
                 raise PublicationError(f"PR status failed: {check.get('context', 'unknown')}")
         else:
@@ -352,14 +685,20 @@ def review_status(pr: dict[str, Any], candidate: str, policy: dict[str, Any]) ->
     for context in set(policy["contexts"]) | REQUIRED_CONTEXTS:
         matches = [check for check in checks if (check.get("name") or check.get("context")) == context]
         if not matches:
-            return None
+            pending = True
+            continue
         for check in matches:
             if context in app_ids:
                 app_id = ((check.get("checkSuite") or {}).get("app") or {}).get("databaseId")
                 if check.get("__typename") != "CheckRun" or app_id != app_ids[context]:
                     raise PublicationError(f"untrusted producer for required check: {context}")
             if check.get("__typename") == "CheckRun" and check.get("conclusion") != "SUCCESS":
-                raise PublicationError(f"required check did not succeed: {context}")
+                if check.get("status") != "COMPLETED":
+                    pending = True
+                else:
+                    raise PublicationError(f"required check did not succeed: {context}")
+    if pending:
+        return None
     # GitHub additionally enforces source-app bindings, required reviews and
     # up-to-date rules; a rollup of green jobs alone is not that decision.
     if pr.get("mergeStateStatus") != "CLEAN" or pr.get("mergeable") != "MERGEABLE":
@@ -381,6 +720,7 @@ def wait_for_review(
     max_wait_seconds: int = MAX_REVIEW_WAIT_SECONDS,
     recovery_identity: dict[str, Any] | None = None,
     expected_pr_evidence: dict[str, str] | None = None,
+    observed_heads: list[str] | None = None,
 ) -> dict[str, Any]:
     """Wait within CI and owning-lease bounds; pending is never approval."""
     if type(max_wait_seconds) is not int or max_wait_seconds <= 0:
@@ -436,8 +776,20 @@ def wait_for_review(
                 )
         pr["statusCheckRollup"] = candidate_checks(root, candidate)
         policy = required_check_policy(root)
+        observations = collect_review_surfaces(
+            root,
+            number,
+            candidate,
+            observed_heads=observed_heads,
+        )
         proof = review_status(pr, candidate, policy)
         if proof is not None:
+            disposition_sha256 = require_review_disposition(root, observations)
+            proof = {
+                **proof,
+                "review_surfaces_sha256": observations["observations_sha256"],
+                "review_disposition_sha256": disposition_sha256,
+            }
             _write(root / "pr-review.json", json.dumps(proof, indent=2) + "\n")
             (root / "pr-pending.json").unlink(missing_ok=True)
             return proof
@@ -509,6 +861,7 @@ def resume_preview(
             "attachment_url": proof["attachment_url"],
             "base_sha": manifest["base_sha"],
         },
+        observed_heads=[manifest["candidate_sha"]],
     )
     result = {**proof, "review": review}
     _write(root / "pr-evidence.json", json.dumps(result, indent=2) + "\n")
@@ -526,8 +879,108 @@ def _validate_owned_base(pr: dict[str, Any], base: str) -> None:
         raise PublicationError("PR base or repository ownership changed")
 
 
+def _publication_destination(repo: Path, remote: str) -> str:
+    destination = _run(
+        ["git", "remote", "get-url", "--push", "--all", remote], repo
+    ).strip()
+    if destination not in {
+        f"https://github.com/{REPOSITORY}.git",
+        f"git@github.com:{REPOSITORY}.git",
+        f"https://github.com/{REPOSITORY}",
+    }:
+        raise PublicationError("refusing candidate push to an untrusted remote")
+    return destination
+
+
+def _publication_metadata(
+    root: Path,
+    manifest: dict[str, Any],
+    issue_request: dict[str, Any] | None,
+    *,
+    verification_complete: bool,
+) -> tuple[str, str, dict[str, Any] | None, Any | None]:
+    candidate, base = manifest["candidate_sha"], manifest["base_sha"]
+    binding = manifest.get("run_binding")
+    if isinstance(binding, dict) and binding.get("mode") == "issue":
+        workflow = _issue_workflow()
+        try:
+            title, body_prefix, issue = workflow.issue_publication_metadata(
+                root,
+                manifest,
+                issue_request,
+                verification_complete=verification_complete,
+            )
+        except workflow.IssueWorkflowError as exc:
+            raise PublicationError(str(exc)) from exc
+        return title, body_prefix, issue, workflow
+    return (
+        f"chore(opentui): maintainer candidate {candidate[:12]}",
+        f"Automated OpenTUI maintenance candidate `{candidate}` from `{base}`.\n\n",
+        None,
+        None,
+    )
+
+
+def _reconcile_live_issue_pr(
+    workflow: Any | None,
+    issue: dict[str, Any] | None,
+    candidate: str,
+    *,
+    root: Path,
+) -> dict[str, Any] | None:
+    if workflow is None:
+        return None
+    try:
+        return workflow.reconcile_issue_pr(issue, candidate, cwd=root, runner=_run)
+    except workflow.IssueWorkflowError as exc:
+        raise PublicationError(str(exc)) from exc
+
+
+def _ensure_owned_draft(
+    root: Path,
+    pr: dict[str, Any],
+    head: str,
+    candidate: str,
+    base: str,
+    marker: str | None,
+) -> dict[str, Any]:
+    """Move a proven task PR back to draft before exposing an unverified fix."""
+    if pr.get("isDraft") is True:
+        return pr
+    options = ["--repo", REPOSITORY]
+    _run(
+        [str(GH), "pr", "ready", str(pr["number"]), *options, "--undo"],
+        root,
+    )
+    updated = json.loads(
+        _run(
+            [
+                str(GH),
+                "pr",
+                "view",
+                str(pr["number"]),
+                *options,
+                "--json",
+                FIELDS + OWNERSHIP_FIELDS,
+            ],
+            root,
+        )
+    )
+    _validate_pr(updated, head, candidate, marker)
+    _validate_owned_base(updated, base)
+    if updated.get("isDraft") is not True:
+        raise PublicationError("task PR did not return to draft before fix publication")
+    return updated
+
+
 def advance_owned_head(
-    repo: Path, root: Path, destination: str, manifest: dict[str, Any], expected: str,
+    repo: Path,
+    root: Path,
+    destination: str,
+    manifest: dict[str, Any],
+    expected: str,
+    *,
+    as_draft: bool = False,
 ) -> None:
     """CAS only a proven fast-forward on this task's already-owned open PR."""
     if not re.fullmatch(r"[0-9a-f]{40}", expected):
@@ -547,6 +1000,22 @@ def advance_owned_head(
         raise PublicationError("owned PR head moved unexpectedly")
     _validate_pr(pr, head, pr["headRefOid"], marker)
     _validate_owned_base(pr, manifest["base_sha"])
+    observations = collect_review_surfaces(
+        root,
+        pr["number"],
+        candidate,
+        observed_heads=[expected],
+    )
+    require_review_disposition(root, observations)
+    if as_draft:
+        pr = _ensure_owned_draft(
+            root,
+            pr,
+            head,
+            pr["headRefOid"],
+            manifest["base_sha"],
+            marker,
+        )
     _run(["git", "merge-base", "--is-ancestor", expected, candidate], repo)
     ref = f"refs/heads/{head}"
     advertised = _run(["git", "ls-remote", destination, ref], repo).split()
@@ -559,84 +1028,47 @@ def advance_owned_head(
         raise PublicationError("owned branch update was not acknowledged")
 
 
-def publish_preview(
+def publish_draft(
     repo: Path,
     root: Path,
     manifest: dict[str, Any],
     *,
-    node: Path,
+    pending_gates: list[str],
     remote: str = "origin",
-    review_deadline_unix: int | None = None,
     issue_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Idempotently create the candidate PR and attach one proven synthetic PNG.
-
-    The create-only head branch is separate from sid/opentui. The caller alone
-    owns the target-ref CAS, after this function returns verified evidence.
-    """
+    """Create or reconcile the task's one honest pre-verification draft PR."""
     root = root.resolve()
-    png, digest, dimensions = preview(root, manifest)
     if manifest.get("branch") != BASE:
-        raise PublicationError("PR publication only supports the OpenTUI fork branch")
-    version = _run([str(GH), "--version"], root)
-    if not version.startswith("gh version 2.100.0 "):
-        raise PublicationError(
-            "publication requires the verified gh 2.100.0 attachment CLI"
-        )
-    if not FORMATTER.is_file() or _hash(FORMATTER) != FORMATTER_SHA256:
-        raise PublicationError(
-            "installed before-and-after formatter changed; revalidate it"
-        )
-    destination = _run(
-        ["git", "remote", "get-url", "--push", "--all", remote], repo
-    ).strip()
-    if destination not in {
-        f"https://github.com/{REPOSITORY}.git",
-        f"git@github.com:{REPOSITORY}.git",
-        f"https://github.com/{REPOSITORY}",
-    }:
-        raise PublicationError("refusing candidate push to an untrusted remote")
+        raise PublicationError("draft publication only supports the OpenTUI fork branch")
     candidate, base = manifest["candidate_sha"], manifest["base_sha"]
     head, request_identity, candidate_identity = _candidate_head(manifest)
     candidate_marker = f"<!-- maintainer-candidate:v1:{candidate_identity} -->"
-    binding = manifest.get("run_binding")
-    is_issue = isinstance(binding, dict) and binding.get("mode") == "issue"
-    if is_issue:
-        # Issue metadata, body construction and implementing-PR reconciliation
-        # are issue policy; this transport module delegates them to the owner.
-        workflow = _issue_workflow()
-        try:
-            title, body_prefix, issue = workflow.issue_publication_metadata(
-                root, manifest, issue_request
-            )
-        except workflow.IssueWorkflowError as exc:
-            raise PublicationError(str(exc)) from exc
-    else:
-        workflow = None
-        issue = None
-        title = f"chore(opentui): maintainer candidate {candidate[:12]}"
-        body_prefix = (
-            f"Automated OpenTUI maintenance candidate `{candidate}` from `{base}`.\n\n"
-        )
+    destination = _publication_destination(repo, remote)
+    title, body_prefix, issue, workflow = _publication_metadata(
+        root,
+        manifest,
+        issue_request,
+        verification_complete=False,
+    )
+    status = _status_block(
+        candidate,
+        passed=["Task/base identity and publication ownership checks passed."],
+        pending=pending_gates,
+    )
     gh = [str(GH), "pr"]
     options = ["--repo", REPOSITORY]
     if manifest.get("expected_pr_head") is not None:
-        advance_owned_head(repo, root, destination, manifest, manifest["expected_pr_head"])
+        advance_owned_head(
+            repo,
+            root,
+            destination,
+            manifest,
+            manifest["expected_pr_head"],
+            as_draft=True,
+        )
 
-    def reconcile_live_issue_pr() -> dict[str, Any] | None:
-        """Re-read the live issue-scoped PR set at the publication edge."""
-        if not is_issue:
-            return None
-        try:
-            return workflow.reconcile_issue_pr(
-                issue, candidate, cwd=root, runner=_run
-            )
-        except workflow.IssueWorkflowError as exc:
-            raise PublicationError(str(exc)) from exc
-
-    # Reuse or refuse a competing implementing PR before pushing our own branch,
-    # so a PR that appeared after the caller's snapshot leaves no dangling ref.
-    reconciled = reconcile_live_issue_pr()
+    reconciled = _reconcile_live_issue_pr(workflow, issue, candidate, root=root)
     if reconciled is not None:
         head = reconciled["headRefName"]
         prs = [reconciled]
@@ -670,35 +1102,25 @@ def publish_preview(
                     "--base",
                     BASE,
                     "--json",
-                    FIELDS,
+                    FIELDS + OWNERSHIP_FIELDS,
                 ],
                 root,
             )
         )
     if not prs and reconciled is None:
-        # Narrow the final edge: re-read the live issue-scoped PR set once more
-        # immediately before creation, since our own push/list may have raced a
-        # competitor. GitHub offers no atomic CAS for PR creation.
-        reconciled = reconcile_live_issue_pr()
+        reconciled = _reconcile_live_issue_pr(workflow, issue, candidate, root=root)
         if reconciled is not None:
             head = reconciled["headRefName"]
             prs = [reconciled]
     if not prs and reconciled is None:
-        body = (
-            candidate_marker
-            + "\n"
-            + body_prefix
-            + "Preview is startup/help regression proof from the isolated synthetic profile, "
-            "not a before/after claim about changed UI behavior.\n\n"
-            "All required code, independent review, terminal, and video gates passed. "
-            "The maintainer publishes only through its guarded target-branch CAS.\n"
-        )
+        body = candidate_marker + "\n" + body_prefix + status + "\n"
         _write(root / "pr-body.md", body)
         _run(
             gh
             + [
                 "create",
                 *options,
+                "--draft",
                 "--base",
                 BASE,
                 "--head",
@@ -723,7 +1145,217 @@ def publish_preview(
                     "--base",
                     BASE,
                     "--json",
-                    FIELDS,
+                    FIELDS + OWNERSHIP_FIELDS,
+                ],
+                root,
+            )
+        )
+    if len(prs) != 1:
+        raise PublicationError("expected exactly one task-owned draft PR")
+    pr = prs[0]
+    _validate_pr(pr, head, candidate)
+    _validate_owned_base(pr, base)
+    if pr.get("isDraft") is not True:
+        observations = collect_review_surfaces(root, pr["number"], candidate)
+        require_review_disposition(root, observations)
+        marker = candidate_marker if candidate_marker in str(pr.get("body", "")) else None
+        pr = _ensure_owned_draft(root, pr, head, candidate, base, marker)
+    body = pr["body"]
+    if candidate_marker not in body:
+        body = candidate_marker + "\n" + (body_prefix if reconciled is not None else "") + body
+    body = _replace_status(body, status)
+    if body != pr["body"]:
+        _write(root / "pr-body.md", body)
+        _run(
+            gh
+            + [
+                "edit",
+                str(pr["number"]),
+                *options,
+                "--body-file",
+                str(root / "pr-body.md"),
+            ],
+            root,
+        )
+    pr = json.loads(
+        _run(
+            gh
+            + [
+                "view",
+                str(pr["number"]),
+                *options,
+                "--json",
+                FIELDS + OWNERSHIP_FIELDS,
+            ],
+            root,
+        )
+    )
+    _validate_pr(pr, head, candidate, candidate_marker)
+    _validate_owned_base(pr, base)
+    if pr.get("isDraft") is not True or _replace_status(pr["body"], status) != pr["body"]:
+        raise PublicationError("task draft state was not acknowledged")
+    proof = {
+        "schema_version": 1,
+        "status": "draft",
+        "repository": REPOSITORY,
+        "base_branch": BASE,
+        "base_sha": base,
+        "candidate_sha": candidate,
+        "head_branch": head,
+        "number": pr["number"],
+        "url": pr["url"],
+        "request_identity": request_identity,
+        "candidate_identity": candidate_identity,
+        "passed": ["Task/base identity and publication ownership checks passed"],
+        "pending": pending_gates,
+        "issue": issue,
+    }
+    _write(root / "pr-draft.json", json.dumps(proof, indent=2) + "\n")
+    return proof
+
+
+def publish_preview(
+    repo: Path,
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    node: Path,
+    remote: str = "origin",
+    review_deadline_unix: int | None = None,
+    issue_request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Idempotently create the candidate PR and attach one proven synthetic PNG.
+
+    The create-only head branch is separate from sid/opentui. The caller alone
+    owns the target-ref CAS, after this function returns verified evidence.
+    """
+    root = root.resolve()
+    png, digest, dimensions = preview(root, manifest)
+    if manifest.get("branch") != BASE:
+        raise PublicationError("PR publication only supports the OpenTUI fork branch")
+    version = _run([str(GH), "--version"], root)
+    if not version.startswith("gh version 2.100.0 "):
+        raise PublicationError(
+            "publication requires the verified gh 2.100.0 attachment CLI"
+        )
+    if not FORMATTER.is_file() or _hash(FORMATTER) != FORMATTER_SHA256:
+        raise PublicationError(
+            "installed before-and-after formatter changed; revalidate it"
+        )
+    destination = _publication_destination(repo, remote)
+    candidate, base = manifest["candidate_sha"], manifest["base_sha"]
+    head, request_identity, candidate_identity = _candidate_head(manifest)
+    candidate_marker = f"<!-- maintainer-candidate:v1:{candidate_identity} -->"
+    title, body_prefix, issue, workflow = _publication_metadata(
+        root,
+        manifest,
+        issue_request,
+        verification_complete=True,
+    )
+    verified_status = _status_block(
+        candidate,
+        passed=[
+            "All candidate-bound local gates passed, including independent review and native evidence."
+        ],
+        pending=[
+            "Current-head CI and GitHub publication policy must pass before the guarded target update."
+        ],
+    )
+    gh = [str(GH), "pr"]
+    options = ["--repo", REPOSITORY]
+    if manifest.get("expected_pr_head") is not None:
+        advance_owned_head(repo, root, destination, manifest, manifest["expected_pr_head"])
+
+    # Reuse or refuse a competing implementing PR before pushing our own branch,
+    # so a PR that appeared after the caller's snapshot leaves no dangling ref.
+    reconciled = _reconcile_live_issue_pr(workflow, issue, candidate, root=root)
+    if reconciled is not None:
+        head = reconciled["headRefName"]
+        prs = [reconciled]
+    else:
+        ref = f"refs/heads/{head}"
+        existing = _run(["git", "ls-remote", destination, ref], repo).strip()
+        if existing and existing.split() != [candidate, ref]:
+            raise PublicationError("run branch already points at a different candidate")
+        if not existing:
+            _run(
+                [
+                    "git",
+                    "push",
+                    "--porcelain",
+                    f"--force-with-lease={ref}:",
+                    destination,
+                    f"{candidate}:{ref}",
+                ],
+                repo,
+            )
+        prs = json.loads(
+            _run(
+                gh
+                + [
+                    "list",
+                    *options,
+                    "--state",
+                    "all",
+                    "--head",
+                    head,
+                    "--base",
+                    BASE,
+                    "--json",
+                    FIELDS + OWNERSHIP_FIELDS,
+                ],
+                root,
+            )
+        )
+    if not prs and reconciled is None:
+        # Narrow the final edge: re-read the live issue-scoped PR set once more
+        # immediately before creation, since our own push/list may have raced a
+        # competitor. GitHub offers no atomic CAS for PR creation.
+        reconciled = _reconcile_live_issue_pr(workflow, issue, candidate, root=root)
+        if reconciled is not None:
+            head = reconciled["headRefName"]
+            prs = [reconciled]
+    if not prs and reconciled is None:
+        body = (
+            candidate_marker
+            + "\n"
+            + body_prefix
+            + verified_status
+            + "\n\nPreview is startup/help regression proof from the isolated synthetic profile, "
+            "not a before/after claim about changed UI behavior.\n"
+        )
+        _write(root / "pr-body.md", body)
+        _run(
+            gh
+            + [
+                "create",
+                *options,
+                "--draft",
+                "--base",
+                BASE,
+                "--head",
+                head,
+                "--title",
+                title,
+                "--body-file",
+                str(root / "pr-body.md"),
+            ],
+            root,
+        )
+        prs = json.loads(
+            _run(
+                gh
+                + [
+                    "list",
+                    *options,
+                    "--state",
+                    "all",
+                    "--head",
+                    head,
+                    "--base",
+                    BASE,
+                    "--json",
+                    FIELDS + OWNERSHIP_FIELDS,
                 ],
                 root,
             )
@@ -732,6 +1364,7 @@ def publish_preview(
         raise PublicationError("expected exactly one run-scoped PR")
     pr = prs[0]
     _validate_pr(pr, head, candidate)
+    _validate_owned_base(pr, base)
     marker_missing = candidate_marker not in pr["body"]
     if marker_missing:
         reconciled_prefix = body_prefix if reconciled is not None else ""
@@ -739,6 +1372,7 @@ def publish_preview(
             **pr,
             "body": candidate_marker + "\n" + reconciled_prefix + pr["body"],
         }
+    pr = {**pr, "body": _replace_status(pr["body"], verified_status)}
     identity = f"<!-- maintainer-preview:{candidate}:{digest} -->"
     published = _published_block(pr["body"], identity)
     if published is None:
@@ -778,7 +1412,7 @@ def publish_preview(
             ],
             root,
         )
-    elif marker_missing:
+    elif marker_missing or pr["body"] != prs[0]["body"]:
         _write(root / "pr-body.md", pr["body"])
         _run(
             gh
@@ -792,15 +1426,45 @@ def publish_preview(
             root,
         )
     pr = json.loads(
-        _run(gh + ["view", str(pr["number"]), *options, "--json", FIELDS], root)
+        _run(
+            gh
+            + [
+                "view",
+                str(pr["number"]),
+                *options,
+                "--json",
+                FIELDS + OWNERSHIP_FIELDS,
+            ],
+            root,
+        )
     )
     _validate_pr(pr, head, candidate, candidate_marker)
+    _validate_owned_base(pr, base)
     published = _published_block(pr["body"], identity)
     if published is None:
         raise PublicationError(
             "PR attachment was not acknowledged; refusing target publication"
         )
     block, url = published
+    if pr.get("isDraft") is True:
+        _run(gh + ["ready", str(pr["number"]), *options], root)
+        pr = json.loads(
+            _run(
+                gh
+                + [
+                    "view",
+                    str(pr["number"]),
+                    *options,
+                    "--json",
+                    FIELDS + OWNERSHIP_FIELDS,
+                ],
+                root,
+            )
+        )
+        _validate_pr(pr, head, candidate, candidate_marker)
+        _validate_owned_base(pr, base)
+        if pr.get("isDraft") is not False:
+            raise PublicationError("candidate PR did not leave draft state after local gates")
     proof = {
         "schema_version": 1,
         "repository": REPOSITORY,
@@ -841,7 +1505,20 @@ def publish_preview(
             "preview_identity": identity,
             "block_sha256": hashlib.sha256(block.encode()).hexdigest(),
             "attachment_url": url,
+            "base_sha": base,
         },
+        observed_heads=list(
+            dict.fromkeys(
+                [
+                    *(
+                        [manifest["expected_pr_head"]]
+                        if manifest.get("expected_pr_head") is not None
+                        else []
+                    ),
+                    candidate,
+                ]
+            )
+        ),
     )
     _write(root / "pr-evidence.json", json.dumps(proof, indent=2) + "\n")
     return proof

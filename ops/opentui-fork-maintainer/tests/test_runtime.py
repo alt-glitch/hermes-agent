@@ -424,6 +424,108 @@ def test_gate_cli_finalizes_and_releases_before_return(
     assert not (state / "run.lease.json").exists()
 
 
+def test_publish_draft_cli_exposes_clean_candidate_without_running_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    request = claim_issue(state, evidence, base, candidate)
+    monkeypatch.setattr(
+        runtime,
+        "_revalidate_issue_request",
+        lambda *_args, **_kwargs: request,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "run_gate",
+        lambda *_args, **_kwargs: pytest.fail("draft publication must not run gates"),
+    )
+    observed: dict[str, object] = {}
+    real_run_path = runtime.runpy.run_path
+
+    def load_owner(path: str):
+        if path.endswith("pr_publication.py"):
+            return {
+                "publish_draft": lambda *args, **kwargs: observed.update(
+                    {"args": args, "kwargs": kwargs}
+                )
+                or {
+                    "candidate_sha": candidate,
+                    "number": 42,
+                    "url": "https://github.com/alt-glitch/hermes-agent/pull/42",
+                    "base_branch": runtime.BRANCH,
+                    "head_branch": "task-owned",
+                }
+            }
+        return real_run_path(path)
+
+    monkeypatch.setattr(runtime.runpy, "run_path", load_owner)
+    assert runtime.main(
+        [
+            "publish-draft",
+            "--state",
+            str(state),
+            "--evidence",
+            str(evidence),
+            "--token",
+            "test-token",
+            "--cwd",
+            str(worktree),
+            "--repo",
+            str(repo),
+            "--base",
+            base,
+            "--candidate",
+            candidate,
+        ]
+    ) == 0
+    assert observed["kwargs"]["pending_gates"] == [
+        *sorted(runtime.REQUIRED_GATES),
+        "current-head CI and GitHub publication policy",
+    ]
+    assert (state / "run.lease.json").exists()
+
+
+def test_diverged_retained_issue_draft_is_refused_without_topology_waiver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, _, retained_head, worktree = make_repo(tmp_path)
+    (repo / "base-advance").write_text("new fork base\n", encoding="utf-8")
+    git(repo, "add", "base-advance")
+    git(repo, "commit", "-m", "advance fork base")
+    current_base = git(repo, "rev-parse", "HEAD")
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    request = claim_issue(state, evidence, current_base, current_base)
+    request["existing_prs"] = [issue_pr(retained_head)]
+    for path in (
+        state / "run-request.inflight.json",
+        evidence / "request.claimed.json",
+    ):
+        path.write_text(json.dumps(request), encoding="utf-8")
+    real_run_path = runtime.runpy.run_path
+
+    def refuse_publisher(path: str):
+        if path.endswith("pr_publication.py"):
+            pytest.fail("diverged draft must be refused before publication")
+        return real_run_path(path)
+
+    monkeypatch.setattr(runtime.runpy, "run_path", refuse_publisher)
+
+    with pytest.raises(runtime.ControlError, match="descendant"):
+        runtime.publish_task_draft(
+            repo,
+            evidence,
+            state_dir=state,
+            cwd=worktree,
+            base_sha=current_base,
+            candidate_sha=retained_head,
+            token="test-token",
+            expected_pr_head=retained_head,
+        )
+
+
 def test_run_packet_is_fixed_argv_and_lease_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -144,6 +144,30 @@ score. Independent review, native verification and configured GitHub branch
 requirements remain mandatory. A branch rule that still requires Greptile must
 be resolved explicitly, not silently bypassed.
 
+After the first clean task implementation commit, `publish-draft` pushes the
+stable task/base-owned branch and creates one draft PR before focused, native,
+review and visual verification finish. Its managed body separates Prepared,
+Passed and Pending evidence; it never uses the all-gates-passed wording for an
+early draft. A later `gate-and-ship` attaches verified Preview evidence, updates
+that same body and marks the same PR ready before observing current-head CI.
+Linear fix commits use `--expected-pr-head` on both commands. The publisher
+checks the same-repository owner, exact base/head, task marker, remote ref and
+ancestry before any update. If failed CI left the task PR ready, the early
+publication command returns that proven PR to draft before advancing its fix
+head. An exact compatible existing issue draft can be adopted; a diverged
+retained draft is refused without rewriting or topology waiver.
+
+Every owned-head update and final review observation collects
+`pr-review-surfaces.json`: general PR comments, inline review comments, formal
+reviews, and all failed CheckRun and status attempts for the relevant heads.
+Bodies are bounded untrusted evidence, never authorization. If any item requires
+attention, the parent writes `pr-review-disposition.json` with the exact
+candidate and observation hash plus one `resolved`, `refuted` or `irrelevant`
+decision and evidence note per item key/hash. Missing, partial, stale or tampered
+dispositions block the update or target delivery even when the latest CI rollup
+is green. Editing or adding a comment changes the observation hash and requires
+a fresh disposition; detailed output stays in the run evidence directory.
+
 PNG and MP4 exports use the same explicit `DejaVu Sans Mono` family, installed
 on the maintainer host. Verify it with `fc-match 'DejaVu Sans Mono'` when moving
 the runtime: a platform font-list fallback can make captures much thinner than

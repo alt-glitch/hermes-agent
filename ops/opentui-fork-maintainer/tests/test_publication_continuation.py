@@ -81,13 +81,19 @@ def retained(tmp_path, monkeypatch):
     write_json(old / "pr-evidence.json", proof)
     pr = {"number": 42, "url": proof["url"], "body": f"<!-- maintainer-candidate:v1:{identity} -->\n" + block,
           "headRefName": head, "headRefOid": candidate, "baseRefName": pub.BASE, "baseRefOid": base,
-          "state": "OPEN", "isCrossRepository": False, "headRepositoryOwner": {"login": "alt-glitch"},
+          "state": "OPEN", "isDraft": False, "isCrossRepository": False,
+          "headRepositoryOwner": {"login": "alt-glitch"},
           "headRepository": {"name": "hermes-agent"}, "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE"}
     calls = []
     def github(argv, _cwd):
         calls.append(argv)
         if argv[:3] == [str(pub.GH), "pr", "view"]:
             return json.dumps(pr)
+        if argv[:2] == [str(pub.GH), "api"]:
+            endpoint = argv[-1]
+            if "/check-runs?" in endpoint:
+                return json.dumps([{"total_count": 0, "check_runs": []}])
+            return json.dumps([[]])
         pytest.fail(f"unexpected external write or call: {argv}")
     monkeypatch.setattr(pub, "_run", github)
     monkeypatch.setattr(pub, "candidate_checks", lambda *_: green_checks())
@@ -115,7 +121,8 @@ def test_continuation_delivers_once_without_rewriting_original(retained):
     assert {str(p): p.read_bytes() for p in f["old"].rglob("*") if p.is_file()} == before
     with pytest.raises(runtime.ControlError, match="lease"):
         runtime.main(f["args"])
-    assert len(f["calls"]) == 1
+    assert sum(call[:3] == [str(pub.GH), "pr", "view"] for call in f["calls"]) == 1
+    assert all(call[1] in {"pr", "api"} for call in f["calls"])
 
 
 @pytest.mark.parametrize("fault", ["foreign-owner", "live-lock", "candidate", "base", "packet", "gate-log", "missing-log", "media", "context", "authorization", "already-delivered"])
@@ -193,22 +200,42 @@ def test_owned_task_fix_is_fast_forward_and_retry_stable(retained, monkeypatch):
     updated = {**original, "candidate_sha": fixed, "lease_token_sha256": "9" * 64}
     assert pub._candidate_head(updated) == pub._candidate_head(original)
     real_run = pub._run
-    pushes = []
+    writes = []
     def transport(argv, cwd):
         if argv[0] == "git":
             if argv[1] == "push":
-                pushes.append(argv)
+                writes.append("push")
             result = runtime._git(cwd, argv[1:])
             if argv[1] == "push":
                 f["pr"]["headRefOid"] = fixed
             return result
         if argv[:3] == [str(pub.GH), "pr", "list"]:
             return json.dumps([f["pr"]])
+        if argv[:3] == [str(pub.GH), "pr", "ready"]:
+            assert "--undo" in argv
+            writes.append("draft")
+            f["pr"]["isDraft"] = True
+            return ""
         return real_run(argv, cwd)
     monkeypatch.setattr(pub, "_run", transport)
-    pub.advance_owned_head(f["repo"], f["fresh"], str(f["remote"]), updated, f["candidate"])
-    pub.advance_owned_head(f["repo"], f["fresh"], str(f["remote"]), updated, f["candidate"])
-    assert len(pushes) == 1
+    pub.advance_owned_head(
+        f["repo"],
+        f["fresh"],
+        str(f["remote"]),
+        updated,
+        f["candidate"],
+        as_draft=True,
+    )
+    pub.advance_owned_head(
+        f["repo"],
+        f["fresh"],
+        str(f["remote"]),
+        updated,
+        f["candidate"],
+        as_draft=True,
+    )
+    assert writes == ["draft", "push"]
+    assert f["pr"]["isDraft"] is True
     assert git(f["repo"], "ls-remote", "origin", f"refs/heads/{head}").split()[0] == fixed
     with pytest.raises(runtime.ControlError):
         runtime.main(f["args"])
@@ -240,6 +267,10 @@ def test_owned_task_update_refuses_lost_ownership(retained, monkeypatch, fault):
         if argv[0] == "git":
             assert argv[1] != "push", "rejected task must not write the remote"
             return runtime._git(cwd, argv[1:])
+        if argv[:2] == [str(pub.GH), "api"]:
+            if "/check-runs?" in argv[-1]:
+                return json.dumps([{"total_count": 0, "check_runs": []}])
+            return json.dumps([[]])
         assert argv[:3] == [str(pub.GH), "pr", "list"]
         return json.dumps([f["pr"]])
     monkeypatch.setattr(pub, "_run", transport)
