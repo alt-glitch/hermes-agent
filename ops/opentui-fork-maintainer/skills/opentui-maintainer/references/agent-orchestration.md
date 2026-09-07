@@ -27,6 +27,13 @@ Reconcile an existing implementing PR rather than duplicating it. Publication
 and post-terminal deployment proof remain separate. An inspection request never
 authorizes applying labels or dispatching work.
 
+Editing an already-ready issue invalidates its old approval even if the label
+remains visible. After an authorized edit, re-read the final scope, remove and
+reapply `maintainer:ready`, then verify the trusted label event is newer than the
+title/body revision. Do not refresh approval on a claimed revision under a live
+worker; coordinate its existing authorization boundary. Use the issue/timeline
+API for readback, not an eventually consistent search result alone.
+
 ## Repair an existing PR
 
 1. Inspect the requested PR with the authenticated GitHub client. Require an
