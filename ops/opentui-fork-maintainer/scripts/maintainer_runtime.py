@@ -320,8 +320,14 @@ def _record_run_outcome(
     }
     evidence_path = _safe_output_path(evidence_root, "run-outcome.json")
     if value.get("status") == "success" and evidence_path.is_file():
-        previous = evidence_path.read_text(encoding="utf-8")
-        if json.loads(previous).get("status") == "failed":
+        try:
+            previous = evidence_path.read_text(encoding="utf-8")
+            prior_outcome = json.loads(previous)
+        except (OSError, ValueError) as exc:
+            raise ControlError("prior run outcome is invalid") from exc
+        if not isinstance(prior_outcome, dict):
+            raise ControlError("prior run outcome is not an object")
+        if prior_outcome.get("status") == "failed":
             history = _safe_output_path(evidence_root, "run-outcome.failed.json")
             if history.exists() and history.read_text(encoding="utf-8") != previous:
                 raise ControlError("prior failed outcome history differs")
@@ -3963,7 +3969,9 @@ def release_completed_lease(
     outcome = _bound_terminal_outcome(state_dir, evidence_dir)
     journal = _load_publish_journal(state_dir, require_manifest_evidence=False)
     if outcome.get("needs_finalization") is True or (
-        journal is not None and journal["phase"] in {"prepared", "published", "finalizing"}
+        journal is not None
+        and Path(journal["evidence_dir"]).resolve() == evidence_dir.resolve()
+        and journal["phase"] in {"prepared", "published", "finalizing"}
     ):
         raise ControlError("unfinished publication must be reconciled before lease release")
     release_lease(state_dir, token)

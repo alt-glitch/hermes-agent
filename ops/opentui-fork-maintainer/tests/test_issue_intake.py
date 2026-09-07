@@ -1045,10 +1045,53 @@ def test_sticky_recovery_fails_closed_on_unbound_or_changed_evidence(tmp_path, c
         return json.dumps(value)
 
     with pytest.raises(intake.IssueIntakeError):
-        intake.finalize_delivered_issue(tmp_path, request, runner=read_only, **kwargs)
+        intake.finalize_delivered_issue(
+            tmp_path, request, runner=read_only,
+            recovery_only=change in {"revision", "approval"}, **kwargs,
+        )
     assert state_path.read_bytes() == before
     assert current["state"] == ("OPEN" if change == "edge-reopen" else remote_state)
     assert len(github.comments[41]) == 1
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+@pytest.mark.parametrize("edit_revision", [False, True])
+def test_new_authorization_delivery_is_not_poisoned_by_old_close(tmp_path, recovered, edit_revision):
+    current = issue(41)
+    github = GitHub([current], {41: [labeled(1, "alt-glitch")]})
+    original = intake.select_approved_issue(tmp_path, now=100, runner=github.run)
+    old_delivery = dict(candidate_sha="a" * 40, pr_url="https://github.com/alt-glitch/hermes-agent/pull/88")
+    github.after_close = lambda: setattr(github, "fail_on", "graphql")
+    with pytest.raises(intake.IssueIntakeError, match="compensation"):
+        intake.finalize_delivered_issue(tmp_path, original, runner=github.run, **old_delivery)
+    github.fail_on = github.after_close = None
+    if recovered:
+        intake.finalize_delivered_issue(tmp_path, original, runner=github.run, **old_delivery)
+    github.transition(41, "OPEN")
+    if edit_revision:
+        current.update(body="New approved behavior.", lastEditedAt="2026-09-06T06:00:00Z")
+    github.timelines[41].extend([
+        labeled(4, "alt-glitch", event="unlabeled", created="2026-09-06T06:00:00Z"),
+        labeled(5, "alt-glitch", created="2026-09-06T07:00:00Z"),
+    ])
+    request = intake.select_approved_issue(tmp_path, now=200, runner=github.run)
+    assert request is not None and request["approval"] != original["approval"]
+    assert (request["revision_sha256"] != original["revision_sha256"]) is edit_revision
+    state_path = tmp_path / "issue-intake-state.json"
+    prior = state_path.read_bytes()
+    new_delivery = dict(candidate_sha="b" * 40, pr_url="https://github.com/alt-glitch/hermes-agent/pull/99")
+    start = len(github.calls)
+    with pytest.raises(intake.IssueIntakeError):
+        intake.finalize_delivered_issue(tmp_path, request, runner=github.run, recovery_only=True, **new_delivery)
+    assert state_path.read_bytes() == prior and len(github.calls) == start
+    result = intake.finalize_delivered_issue(tmp_path, request, runner=github.run, **new_delivery)
+    assert result["status"] == "delivered" and current["state"] == "CLOSED"
+    record = json.loads(state_path.read_text(encoding="utf-8"))["issues"]["41"]
+    assert record["candidate_sha"] == new_delivery["candidate_sha"]
+    assert record["revision_sha256"] == request["revision_sha256"]
+    assert record["approval_event_id"] == request["approval"]["event_id"]
+    assert "recovered_close" not in record
+    assert len(github.comments[41]) == 2
 
 
 def test_delayed_recovery_readback_can_retry_but_never_overwrites_later_human_state(tmp_path):

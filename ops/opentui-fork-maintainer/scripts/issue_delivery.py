@@ -556,9 +556,12 @@ def _recover_closed_delivery(
     ):
         return None
     error = "issue delivery has an unresolved closure compensation failure: "
+    # A new approval is independently eligible; an older close is neither its
+    # recovery evidence nor a sticky failure for that new authorization.
+    if not io.same_authorization(record, request):
+        return None
     if (
-        not io.same_authorization(record, request)
-        or record.get("candidate_sha") != candidate_sha
+        record.get("candidate_sha") != candidate_sha
         or record.get("pr_url") != pr_url
         or record.get("delivery_failure_reason") != "closure_compensation_unresolved"
     ):

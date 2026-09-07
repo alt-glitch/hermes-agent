@@ -263,6 +263,55 @@ def write_publish_journal(
     return path
 
 
+@pytest.mark.parametrize("command", ["release-lease", "reconcile-run"])
+def test_foreign_journal_does_not_trap_failed_owner_lease(tmp_path, command):
+    state = tmp_path / "state"
+    evidence = state / "runs" / "failed-owner"
+    evidence.mkdir(parents=True)
+    lease_path = state / "run.lease.json"
+    runtime._atomic_json(lease_path, {
+        "token": "test-token", "expires_unix": 1,
+        "run_id": evidence.name, "evidence_dir": str(evidence),
+    })
+    runtime._record_run_outcome(state, evidence, {
+        "status": "failed", "stage": "external", "published": False,
+        "needs_finalization": False,
+    })
+    journal = write_publish_journal(state, evidence, phase="finalizing")
+    own_journal = journal.read_bytes()
+    with pytest.raises(runtime.ControlError, match="unfinished publication"):
+        runtime.main(["release-lease", "--state", str(state), "--evidence", str(evidence),
+                      "--token", "test-token"])
+    assert lease_path.exists() and journal.read_bytes() == own_journal
+    journal = write_publish_journal(state, state / "runs" / "published-owner", phase="finalizing")
+    journal_bytes = journal.read_bytes()
+    outcome_bytes = (evidence / "run-outcome.json").read_bytes()
+    argv = [command, "--state", str(state), "--evidence", str(evidence), "--token", "test-token"]
+    if command == "reconcile-run":
+        argv.append("--allow-expired")
+    wrong_owner = list(argv)
+    wrong_owner[wrong_owner.index("--token") + 1] = "wrong-token"
+    with pytest.raises(runtime.ControlError, match="token"):
+        runtime.main(wrong_owner)
+    assert lease_path.exists()
+    assert runtime.main(argv) == 0
+    assert not lease_path.exists()
+    assert journal.read_bytes() == journal_bytes
+    assert (evidence / "run-outcome.json").read_bytes() == outcome_bytes
+
+
+@pytest.mark.parametrize("previous", ["{", "[]", "null", '"failed"'])
+def test_malformed_prior_outcome_fails_with_control_error(tmp_path, previous):
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    evidence.mkdir()
+    outcome = evidence / "run-outcome.json"
+    outcome.write_text(previous, encoding="utf-8")
+    with pytest.raises(runtime.ControlError, match="outcome"):
+        runtime._record_run_outcome(state, evidence, {"status": "success"})
+    assert outcome.read_text(encoding="utf-8") == previous
+    assert not (state / "last-run.json").exists()
+
+
 def claim_backport(state: Path, evidence: Path, base: str, upstream: str) -> None:
     (state / "run-request.json").write_text(
         json.dumps({"mode": "backport", "commits": ["abcdef1"]}),
