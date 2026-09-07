@@ -191,12 +191,12 @@ describe('session-control store', () => {
   })
 
   it('does not let a method-not-found action response downgrade a newer event snapshot', async () => {
-    applySessionControlSnapshot('s1', FULL_SNAPSHOT)
+    applySessionControlSnapshot('s1', FULL_SNAPSHOT, 18)
     const response = deferred<unknown>()
     useGateway(vi.fn(() => response.promise))
 
     const action = runSessionControlAction('s1', 'goal.pause')
-    applySessionControlUpdate('s1', { ...FULL_SNAPSHOT, revision: 'event-newer' })
+    applySessionControlUpdate('s1', { ...FULL_SNAPSHOT, revision: 'event-newer' }, 20)
     response.reject(new JsonRpcGatewayError('method not found', { code: -32601 }))
 
     await expect(action).rejects.toThrow('method not found')
@@ -490,7 +490,50 @@ describe('session-control store', () => {
     })
   })
 
-  it('applies an authoritative action response after an intermediate event', async () => {
+  it.each([
+    ['older', 19, 'action-older', 'event-newer', 20],
+    ['equal', 20, 'action-equal', 'action-equal', 20],
+    ['newer', 21, 'action-newer', 'action-newer', 21],
+    ['legacy unsequenced', undefined, 'action-unsequenced', 'action-unsequenced', 20]
+  ] as const)(
+    'settles a pending action while reconciling the %s response against a sequenced event',
+    async (_ordering, responseSeq, responseRevision, expectedRevision, expectedFence) => {
+      const response = deferred<unknown>()
+      useGateway(vi.fn(() => response.promise))
+
+      const action = runSessionControlAction('s1', 'goal.pause')
+      expect($sessionControlBySession.get().s1).toMatchObject({ loading: true, pendingAction: 'goal.pause' })
+
+      applySessionControlUpdate('s1', { ...FULL_SNAPSHOT, revision: 'event-newer' }, 20)
+      expect($sessionControlBySession.get().s1).toMatchObject({
+        loading: true,
+        pendingAction: 'goal.pause',
+        snapshot: { revision: 'event-newer' }
+      })
+
+      response.resolve({
+        control: { ...FULL_SNAPSHOT, revision: responseRevision },
+        dispatch: { display: null, message: null, notice: null, output: 'paused', type: 'exec' },
+        ...(responseSeq === undefined ? {} : { event_seq: responseSeq })
+      })
+
+      await expect(action).resolves.toMatchObject({ output: 'paused', type: 'exec' })
+      expect($sessionControlBySession.get().s1).toMatchObject({
+        error: null,
+        loading: false,
+        pendingAction: null,
+        snapshot: { revision: expectedRevision }
+      })
+
+      const settled = $sessionControlBySession.get().s1!
+      expect(applySessionControlUpdate('s1', { ...FULL_SNAPSHOT, revision: 'duplicate-event' }, expectedFence)).toBe(
+        settled
+      )
+      expect($sessionControlBySession.get().s1).toBe(settled)
+    }
+  )
+
+  it('applies an authoritative legacy action response after an unsequenced event', async () => {
     const slow = deferred<unknown>()
     useGateway(vi.fn(() => slow.promise))
 

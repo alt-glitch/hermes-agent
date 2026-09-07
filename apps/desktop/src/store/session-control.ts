@@ -5,12 +5,12 @@ import { refreshSessionGoal } from './goals'
 import { isSessionGone, isSessionGoneForBackgroundPolling, markSessionGone } from './runtime-gone'
 import {
   acceptSessionControlEvent,
+  acceptSessionControlSnapshot,
   advanceSessionControlRequest,
   clearAllSessionControlReconciliation,
   clearSessionControlReconciliation,
   currentSessionControlEventVersion,
   isCurrentSessionControlRequest,
-  recordSessionControlSnapshot,
   type SessionControlRequestToken
 } from './session-control-reconciliation'
 import {
@@ -180,10 +180,10 @@ function applyParsedSnapshot(
   snapshot: SessionControlSnapshot,
   eventSeq?: number
 ): SessionControlEntry {
-  recordSessionControlSnapshot(sessionId, eventSeq)
+  const applySnapshot = acceptSessionControlSnapshot(sessionId, eventSeq)
 
   const current = $sessionControlBySession.get()[sessionId] ?? emptyEntry()
-  const nextSnapshot = current.snapshot?.revision === snapshot.revision ? current.snapshot : snapshot
+  const nextSnapshot = !applySnapshot || current.snapshot?.revision === snapshot.revision ? current.snapshot : snapshot
 
   return publishEntry(sessionId, {
     capability: 'supported',

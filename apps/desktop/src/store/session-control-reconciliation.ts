@@ -63,13 +63,25 @@ export function acceptSessionControlEvent(sessionId: string, eventSeq: number | 
   return true
 }
 
-export function recordSessionControlSnapshot(sessionId: string, eventSeq: number | undefined): void {
+/**
+ * Settles a snapshot request, returning false when its sequence predates an accepted event.
+ * Equal sequences remain eligible because the backend captures its sequence before the snapshot.
+ */
+export function acceptSessionControlSnapshot(sessionId: string, eventSeq: number | undefined): boolean {
   const reconciliation = reconciliationFor(sessionId)
   reconciliation.requestVersion += 1
 
-  if (eventSeq !== undefined) {
-    reconciliation.eventFence = eventSeq
+  if (eventSeq === undefined) {
+    return true
   }
+
+  if (reconciliation.eventFence !== undefined && eventSeq < reconciliation.eventFence) {
+    return false
+  }
+
+  reconciliation.eventFence = eventSeq
+
+  return true
 }
 
 export function clearSessionControlReconciliation(sessionId: string): void {
