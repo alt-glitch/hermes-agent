@@ -599,16 +599,15 @@ def _resume_live_unpersisted(ctx: _Resume, live_sid: str, live: dict) -> dict:
     sentinel-parked the record) or it fires against this client."""
     if ctx.owns_db:
         _release_db(ctx.db)
-    live["last_active"] = time.time()
-    if (transport := current_transport()) is not None:
-        # This resume reattaches the live record. A lazy session (no state.db row yet — every fresh Bot
-        # Chat) that was sentinel-parked by a WS drop MUST be rebound here, or it keeps the drop sentinel
-        # and the armed orphan-reap Timer fires against a client that is attached right now — the
-        # unpersisted sibling of the storm-killer paths (#91276).
-        with live.setdefault("history_lock", threading.Lock()):
-            live["transport"] = transport
-            live.setdefault("viewers", {})[transport] = time.time()
-    _cancel_ws_orphan_reap(live_sid)
+    with _session_resume_lock:
+        if (refusal := _reattach_refusal(ctx.rid, live_sid, live)) is not None:
+            return refusal
+        live["last_active"] = time.time()
+        if (transport := current_transport()) is not None:
+            with live.setdefault("history_lock", threading.Lock()):
+                _rebind_live_transport(live_sid, live, transport)
+        else:
+            _cancel_ws_orphan_reap(live_sid)
     history = live.get("history") or []
     return _ok(ctx.rid, _attach_todo_state({
         "session_id": live_sid, "stored_session_id": str(live.get("session_key") or ""),
@@ -711,11 +710,9 @@ def _resume_reuse_live(ctx: _Resume, sid: str, session: dict) -> dict:
 
 
 def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
-    """Reuse while the caller holds the non-reentrant resume lock."""
-    if _sessions.get(sid) is not session:
-        return _err(ctx.rid, 4007, "session no longer live; retry resume")
-    if session.get("_client_gone_interrupt_requested"):
-        return _err(ctx.rid, 4009, "session disconnect interrupt settling")
+    """Reuse with _session_resume_lock already held (including the eager double-check)."""
+    if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
+        return refusal
     _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
     payload = _live_session_payload(sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
                                     transport=current_transport() or _stdio_transport,
@@ -973,8 +970,16 @@ def _(rid, params: dict) -> dict:
 @_session_method("session.activate")
 def _(rid, params: dict, session: dict) -> dict:
     """Attach the frontend to a live TUI session without closing the previously focused one."""
+    sid = str(params.get("session_id") or "")
+    # Only the rebind is atomic with grace expiry; the payload (a DB history read unless
+    # ``omit_messages``) must not hold the process-wide resume lock.
+    with _session_resume_lock:
+        if (refusal := _reattach_refusal(rid, sid, session)) is not None:
+            return refusal
+        with session["history_lock"]:
+            _rebind_live_transport(sid, session, current_transport() or _stdio_transport)
     return _ok(rid, _live_session_payload(
-        str(params.get("session_id") or ""), session, touch=True, transport=current_transport() or _stdio_transport,
+        sid, session, touch=True,
         omit_messages=is_truthy_value(params.get("omit_messages", False)),
         include_tool_output=_flag(params, "with_tool_output"),
         include_ui_chrome=is_truthy_value(params.get("with_ui_chrome", params.get("with_tool_output", False)))))
@@ -1230,11 +1235,16 @@ def _(rid, params: dict, session: dict) -> dict:
             "model": _metadata_mirror(session).get("model", "")})
     with session["history_lock"]:
         history = list(session.get("history", []))
+    # Bind the session context: on the RPC thread the session cwd is unset, so the prompt build
+    # inside would key its workspace pin on the backend's cwd and overwrite the session's pin.
+    tokens = _set_session_context(session["session_key"])
     try:
         from agent.context_breakdown import compute_session_context_breakdown
         return _ok(rid, compute_session_context_breakdown(agent, history))
     except Exception as exc:
         return _err(rid, 5000, f"Could not compute context breakdown: {exc}")
+    finally:
+        _clear_session_context(tokens)
 
 
 # ── pet ──────────────────────────────────────────────────────────────
