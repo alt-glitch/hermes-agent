@@ -92,7 +92,15 @@ export function stripToolEnvelope(raw: string): string {
       const code = obj.exit_code
       if (typeof err === 'string' && err) out += `\n[error] ${err}`
       else if (typeof code === 'number' && code !== 0) out += `\n[exit ${code}]`
-      return normalizeOutput(out)
+      out = normalizeOutput(out)
+      if (obj.status === 'yielded_to_background') {
+        // This records a handoff, not the process's current state (also used on resume).
+        const session = typeof obj.session_id === 'string' && obj.session_id.trim() ? ` · ${obj.session_id}` : ''
+        const pid =
+          typeof obj.pid === 'number' && Number.isSafeInteger(obj.pid) && obj.pid > 0 ? ` · PID ${obj.pid}` : ''
+        out += `${out && !out.endsWith('\n') ? '\n' : ''}[moved to background${session}${pid}]`
+      }
+      return out
     }
   } catch {
     // not parseable as a whole — maybe a tail-capped envelope fragment
