@@ -385,6 +385,16 @@ def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
         logger.debug("session.reclaimed broadcast failed", exc_info=True)
 
 
+def _release_session_human_waiters(session: dict) -> None:
+    """Wake waits owned by a session before its turn thread is joined."""
+    if sid := str(session.get("_sid") or ""):
+        _clear_pending(sid)
+    with contextlib.suppress(Exception):
+        from tools.approval import unregister_gateway_notify
+        if key := session.get("session_key"):
+            unregister_gateway_notify(key)
+
+
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister notifier, close agent (``session.close`` + WS reaper). The
     slash-worker is closed in ``_finalize_session`` (the single chokepoint), NOT here. Idempotent via ``_finalized``."""
@@ -392,10 +402,7 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
         return
     _finalize_session(session, end_reason=end_reason)
     _announce_session_reclaimed(session, end_reason)
-    with contextlib.suppress(Exception):
-        from tools.approval import unregister_gateway_notify
-        if key := session.get("session_key"):
-            unregister_gateway_notify(key)
+    _release_session_human_waiters(session)
     with contextlib.suppress(Exception):
         if hasattr(agent := session.get("agent"), "close"):
             agent.close()
@@ -447,6 +454,10 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
+    # Human bridges run inside the turn thread. Release them before the settle
+    # join or an unlimited clarify (and every pending approval until its own
+    # deadline) consumes the entire close grace before teardown can wake it.
+    _release_session_human_waiters(session)
     run_thread = session.get("_run_thread")
     if end_reason != "tui_shutdown" and run_thread is not None and run_thread is not threading.current_thread():
         try:

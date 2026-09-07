@@ -136,6 +136,53 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
     ]
 
 
+def test_session_close_releases_unlimited_clarify_wait(monkeypatch):
+    """A session-owned human wait must settle before close joins its turn."""
+    sid, session_key = "ui-clarify", "stored-clarify"
+    events: list[tuple[str, str, dict]] = []
+    result: dict[str, str] = {}
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda kind, owner, payload=None: events.append((kind, owner, payload or {})),
+    )
+    monkeypatch.setattr(server, "_TURN_SETTLE_BEFORE_CLOSE_SECONDS", 0.05)
+    monkeypatch.setattr(server, "_finalize_session", lambda *_args, **_kwargs: None)
+    server._pending.clear()
+    server._answers.clear()
+
+    waiter = threading.Thread(
+        target=lambda: result.update(
+            answer=server._block(
+                "clarify.request",
+                sid,
+                {"question": "Continue?", "choices": ["Yes", "No"]},
+                timeout=None,
+            )
+        )
+    )
+    session = {
+        "agent": SimpleNamespace(close=lambda: None),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "session_key": session_key,
+        "_run_thread": waiter,
+    }
+    server._sessions[sid] = session
+    waiter.start()
+    _wait_for_event(events, "clarify.request")
+
+    response = server.handle_request(
+        {"id": "close", "method": "session.close", "params": {"session_id": sid}}
+    )
+    waiter.join(timeout=1)
+
+    assert response["result"] == {"closed": True}
+    assert not waiter.is_alive()
+    assert result == {"answer": ""}
+    assert server._pending == {}
+
+
 def test_approval_fallback_requires_request_and_session_to_match():
     approval.register_gateway_notify(
         "stored-a", lambda _data: None, surface_session_id="stale-ui-a"
