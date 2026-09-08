@@ -106,6 +106,8 @@ class Github:
             return "gh version 2.100.0 (2026-09-03)\n"
         if argv[:3] == ["git", "remote", "get-url"]:
             return self.destination + "\n"
+        if argv[:2] == ["git", "merge-base"]:
+            return ""
         if argv[:2] == ["git", "ls-remote"]:
             return self.ref or ""
         if argv[:2] == ["git", "push"]:
@@ -627,6 +629,46 @@ def test_task_draft_is_honest_and_becomes_the_same_verified_pr(capture, github):
         len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
     ) == 1
     assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
+
+
+def test_owner_preflight_discovers_unchanged_draft_but_allows_first_publication(
+    capture, github
+) -> None:
+    bind_issue(capture)
+    trusted_destination = github.destination
+    github.destination = "https://example.invalid/untrusted.git"
+    with pytest.raises(pub.PublicationError, match="untrusted remote"):
+        pub.preflight_task_owner(capture[0].parent, capture[0], capture[1])
+    github.destination = trusted_destination
+    assert pub.preflight_task_owner(
+        capture[0].parent, capture[0], capture[1]
+    ) is None
+
+    draft = pub.publish_draft(
+        capture[0].parent,
+        capture[0],
+        capture[1],
+        pending_gates=["candidate verification"],
+    )
+    github.issue_comments = [
+        {
+            "id": 101,
+            "user": {"login": "reviewer-a"},
+            "body": "Resolve this finding before expensive candidate gates.",
+            "created_at": "2026-09-07T10:00:00Z",
+            "updated_at": "2026-09-07T10:00:00Z",
+            "html_url": "https://example.invalid/general",
+        }
+    ]
+
+    with pytest.raises(pub.PublicationError, match="parent disposition"):
+        pub.preflight_task_owner(capture[0].parent, capture[0], capture[1])
+
+    observations = json.loads(
+        (capture[0] / "pr-owner-preflight-surfaces.json").read_text(encoding="utf-8")
+    )
+    assert observations["number"] == draft["number"]
+    assert observations["candidate_sha"] == capture[1]["candidate_sha"]
 
 
 def test_compatible_existing_issue_draft_is_adopted_without_replacement(

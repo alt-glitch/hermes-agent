@@ -966,6 +966,7 @@ def test_issue_pr_appearing_after_capture_refuses_duplicate_or_target_ship(
     issue_api["revalidate_approved_issue"] = (
         lambda _state, _request: next(observations)
     )
+    issue_api["preflight_task_owner"] = lambda *args, **kwargs: None
     monkeypatch.setattr(
         runtime.runpy,
         "run_path",
@@ -1588,6 +1589,7 @@ def install_success_mocks(
     stable_after_send: bool = True,
 ) -> None:
     real_run = subprocess.run
+    real_run_path = runtime.runpy.run_path
     mutated = False
     sent = False
 
@@ -1642,6 +1644,14 @@ def install_success_mocks(
         return subprocess.CompletedProcess(argv, 0, output, b"")
 
     monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+
+    def fake_run_path(path: str, *args: object, **kwargs: object):
+        loaded = real_run_path(path, *args, **kwargs)
+        if Path(path).name == "pr_publication.py":
+            loaded["preflight_task_owner"] = lambda *args, **kwargs: None
+        return loaded
+
+    monkeypatch.setattr(runtime.runpy, "run_path", fake_run_path)
     monkeypatch.setattr(runtime.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(runtime, "_run_termctrl", fake_termctrl)
     monkeypatch.setattr(runtime, "_run_reviewer", fake_reviewer)
@@ -1779,6 +1789,56 @@ def test_video_only_retry_reuses_intact_source_gates_and_recaptures(
         token="fresh-token",
     )["review_proof"]["verdict"] == "approved"
     assert {str(path): path.read_bytes() for path in old.rglob("*") if path.is_file()} == retained
+
+
+def test_video_only_retry_refuses_same_attempt_directory_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    packet, _ = make_gate_packet(attempt, gate_worktree, base, candidate)
+    packet.rename(attempt / "gate-packet.json")
+    install_success_mocks(monkeypatch)
+    monkeypatch.setattr(
+        runtime,
+        "_invoke_video_analyze",
+        lambda _path: json.dumps({"success": True, "analysis": "VERDICT: FAIL"}),
+    )
+    source = attempt / "gate.json"
+    runtime.run_gate(
+        attempt / "gate-packet.json",
+        source,
+        cwd=gate_worktree,
+        branch="sid/opentui",
+        base_sha=base,
+        candidate_sha=candidate,
+        token="old-token",
+    )
+    retained = {
+        str(path.relative_to(attempt)): path.read_bytes()
+        for path in attempt.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(runtime.ControlError, match="attempt directories"):
+        runtime.run_gate(
+            attempt / "gate-packet.json",
+            attempt / "retry-gate.json",
+            cwd=gate_worktree,
+            branch="sid/opentui",
+            base_sha=base,
+            candidate_sha=candidate,
+            token="fresh-token",
+            reuse_manifest_path=source,
+            reuse_manifest_sha256=runtime._file_sha256(source),
+        )
+
+    assert {
+        str(path.relative_to(attempt)): path.read_bytes()
+        for path in attempt.rglob("*")
+        if path.is_file()
+    } == retained
 
 
 @pytest.mark.parametrize(
@@ -3038,6 +3098,67 @@ def test_owned_head_preflight_precedes_expensive_gate_execution(
 
     assert events == ["preflight", "gate"]
     assert result["owner_preflight"] == {"proof_sha256": "1" * 64}
+
+
+def test_unchanged_owner_preflight_without_expected_head_precedes_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    events: list[str] = []
+    owner_exists = True
+    real_gate = runtime.run_gate
+
+    def discover(*args: object, **kwargs: object) -> dict[str, object] | None:
+        events.append("preflight")
+        if owner_exists:
+            raise RuntimeError("parent disposition is required")
+        return None
+
+    def ordered_gate(*args: object, **kwargs: object) -> dict[str, object]:
+        assert events == ["preflight"]
+        events.append("gate")
+        return real_gate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runtime.runpy,
+        "run_path",
+        lambda _path: {"preflight_task_owner": discover},
+    )
+    monkeypatch.setattr(runtime, "run_gate", ordered_gate)
+
+    with pytest.raises(runtime.ControlError, match="parent disposition"):
+        runtime.gate_and_ship(
+            repo,
+            packet,
+            evidence / "gate.json",
+            state_dir=state,
+            cwd=gate_worktree,
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+        )
+    assert events == ["preflight"]
+
+    events.clear()
+    owner_exists = False
+    result = runtime.gate_and_ship(
+        repo,
+        packet,
+        evidence / "gate.json",
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+
+    assert events == ["preflight", "gate"]
+    assert "owner_preflight" not in result
 
 
 def test_gate_and_ship_rejects_arbitrary_cleanup_path_before_publish(

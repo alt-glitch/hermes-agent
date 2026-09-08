@@ -1048,7 +1048,9 @@ def _owned_head(
     destination: str,
     manifest: dict[str, Any],
     expected: str,
-) -> tuple[dict[str, Any], str, str]:
+    *,
+    allow_missing: bool = False,
+) -> tuple[dict[str, Any], str, str] | None:
     if not re.fullmatch(r"[0-9a-f]{40}", expected):
         raise PublicationError("expected PR head must be an exact SHA")
     head, _, identity = _candidate_head(manifest)
@@ -1087,6 +1089,8 @@ def _owned_head(
         if adopted is not None:
             head = adopted["headRefName"]
             prs = [adopted]
+    if prs == [] and allow_missing:
+        return None
     if not isinstance(prs, list) or len(prs) != 1:
         raise PublicationError("expected exactly one owned task PR before update")
     candidate = manifest["candidate_sha"]
@@ -1109,11 +1113,17 @@ def preflight_owned_head(
     expected: str,
     *,
     remote: str = "origin",
-) -> dict[str, Any]:
+    allow_missing: bool = False,
+) -> dict[str, Any] | None:
     """Consume prior-head ownership, findings and failed CI before local gates."""
     root = Path(os.path.abspath(root))
     destination = _publication_destination(repo, remote)
-    pr, head, _ = _owned_head(root, destination, manifest, expected)
+    owned = _owned_head(
+        root, destination, manifest, expected, allow_missing=allow_missing
+    )
+    if owned is None:
+        return None
+    pr, head, _ = owned
     candidate = manifest["candidate_sha"]
     _run(["git", "merge-base", "--is-ancestor", expected, candidate], repo)
     observed_heads = list(dict.fromkeys([expected, pr["headRefOid"]]))
@@ -1156,6 +1166,27 @@ def preflight_owned_head(
     }
     _write(root / "pr-owner-preflight.json", json.dumps(proof, indent=2) + "\n")
     return proof
+
+
+def preflight_task_owner(
+    repo: Path,
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    remote: str = "origin",
+) -> dict[str, Any] | None:
+    """Preflight an unchanged task PR, or permit a genuine first publication."""
+    candidate = manifest.get("candidate_sha")
+    if not isinstance(candidate, str):
+        raise PublicationError("invalid candidate/base identity")
+    return preflight_owned_head(
+        repo,
+        root,
+        manifest,
+        candidate,
+        remote=remote,
+        allow_missing=True,
+    )
 
 
 def advance_owned_head(

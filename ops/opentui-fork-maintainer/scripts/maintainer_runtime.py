@@ -3103,6 +3103,13 @@ def run_gate(
 ) -> dict[str, Any]:
     """Execute candidate-bound gates and atomically record their real results."""
     evidence_root = Path(os.path.abspath(manifest_path.parent))
+    if (reuse_manifest_path is None) != (reuse_manifest_sha256 is None):
+        raise ControlError("visual retry requires both source manifest and SHA-256")
+    if reuse_manifest_path is not None and (
+        Path(os.path.abspath(reuse_manifest_path)).parent.resolve(strict=False)
+        == evidence_root.resolve(strict=False)
+    ):
+        raise ControlError("visual retry requires distinct attempt directories")
     manifest_path = _safe_output_path(evidence_root, manifest_path.name)
     packet_path = _evidence_path(str(packet_path), evidence_root, label="gate packet")
     try:
@@ -3138,8 +3145,6 @@ def run_gate(
         }
     if not _valid_run_binding(run_binding):
         raise ControlError("gate run binding is invalid")
-    if (reuse_manifest_path is None) != (reuse_manifest_sha256 is None):
-        raise ControlError("visual retry requires both source manifest and SHA-256")
     retry_source = None
     if reuse_manifest_path is not None and reuse_manifest_sha256 is not None:
         if Path(os.path.abspath(reuse_manifest_path)) == manifest_path:
@@ -3748,16 +3753,15 @@ def gate_and_ship(
             token,
             candidate_sha=expected_pr_head or candidate_sha,
         )
-    owner_preflight = None
-    if expected_pr_head is not None:
-        publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
-        preflight_manifest = {
-            "branch": branch,
-            "base_sha": base_sha,
-            "candidate_sha": candidate_sha,
-            "run_binding": run_binding,
-        }
-        try:
+    publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
+    preflight_manifest = {
+        "branch": branch,
+        "base_sha": base_sha,
+        "candidate_sha": candidate_sha,
+        "run_binding": run_binding,
+    }
+    try:
+        if expected_pr_head is not None:
             owner_preflight = publisher["preflight_owned_head"](
                 repo,
                 evidence_root,
@@ -3765,8 +3769,15 @@ def gate_and_ship(
                 expected_pr_head,
                 remote=remote,
             )
-        except (RuntimeError, ValueError, KeyError, OSError) as exc:
-            raise ControlError(f"owned PR preflight refused: {exc}") from exc
+        else:
+            owner_preflight = publisher["preflight_task_owner"](
+                repo,
+                evidence_root,
+                preflight_manifest,
+                remote=remote,
+            )
+    except (RuntimeError, ValueError, KeyError, OSError) as exc:
+        raise ControlError(f"owned PR preflight refused: {exc}") from exc
     result = run_gate(
         packet_path,
         manifest_path,
