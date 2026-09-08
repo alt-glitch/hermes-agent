@@ -340,8 +340,13 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
     stamped: list = []
 
     class _LegacyDB:
+        def latest_message_row_id(self, session_id, **kwargs):
+            assert session_id == "session-key"
+            assert kwargs == {"role": "user", "require_text": False}
+            return 7
+
         def set_latest_matching_message_display_kind(self, session_id, **kwargs):
-            stamped.append((session_id, kwargs["display_kind"]))
+            stamped.append((session_id, kwargs["display_kind"], kwargs["after_row_id"]))
             return True
 
     def _run(message, conversation_history=None, stream_callback=None, **_kwargs):
@@ -360,7 +365,7 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
         display_kind="auto_continue",
     )
 
-    assert stamped == [("session-key", "auto_continue")]
+    assert stamped == [("session-key", "auto_continue", 7)]
 
 
 # ── Scheduling decision ────────────────────────────────────────────────

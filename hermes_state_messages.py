@@ -314,21 +314,39 @@ class SessionMessagesMixin:
             return inserted
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
-    def set_latest_matching_message_display_kind(self, session_id: str, *, role: str, content: str,
-                                                 display_kind: str,
-                                                 display_metadata: Optional[Dict[str, Any]] = None) -> bool:
-        """Stamp presentation metadata on this turn's freshly persisted row (newest active row by content,
-        right after the serial turn flushed); the model still sees ``role``/``content`` unchanged, so
-        producer provenance survives without classifying by content at render time."""
-        if not session_id or not content or not display_kind:
+    def set_message_display_kind(self, session_id: str, message_row_id: int, *, role: str,
+                                 content: str, display_kind: str,
+                                 display_metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Stamp presentation metadata on one exact active transcript row."""
+        if (
+            not session_id or not isinstance(message_row_id, int) or isinstance(message_row_id, bool)
+            or not content or not display_kind
+        ):
             return False
         def _do(conn):
-            row = conn.execute("SELECT id FROM messages WHERE session_id = ? AND role = ? "
-                "AND content = ? AND active = 1 ORDER BY id DESC LIMIT 1",
-                (session_id, role, self._encode_content(content))).fetchone()
+            updated = conn.execute(
+                "UPDATE messages SET display_kind = ?, display_metadata = ? "
+                "WHERE id = ? AND session_id = ? AND role = ? AND content = ? AND active = 1",
+                (_scrub_surrogates(display_kind), self._encode_display_metadata(display_metadata),
+                 message_row_id, session_id, role, self._encode_content(content)))
+            return updated.rowcount == 1
+        return self._execute_write(_do)
+
+    def set_latest_matching_message_display_kind(self, session_id: str, *, role: str, content: str,
+                                                 display_kind: str, after_row_id: int,
+                                                 display_metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Stamp an older agent's row only when it was inserted after its invocation boundary."""
+        if not session_id or not content or not display_kind or after_row_id < 0:
+            return False
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND role = ? AND content = ? "
+                "AND active = 1 AND id > ? ORDER BY id DESC LIMIT 1",
+                (session_id, role, self._encode_content(content), after_row_id)).fetchone()
             if row is None:
                 return False
-            conn.execute("UPDATE messages SET display_kind = ?, display_metadata = ? WHERE id = ?",
+            conn.execute(
+                "UPDATE messages SET display_kind = ?, display_metadata = ? WHERE id = ?",
                 (_scrub_surrogates(display_kind), self._encode_display_metadata(display_metadata), row[0]))
             return True
         return self._execute_write(_do)

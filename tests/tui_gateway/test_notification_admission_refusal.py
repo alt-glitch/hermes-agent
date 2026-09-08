@@ -1,15 +1,19 @@
-"""Notification delivery is acknowledged only when a prompt turn is admitted."""
+"""Notification delivery is acknowledged only when its admitted turn is retained."""
 
+import contextlib
+import io
 import queue
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from hermes_state import SessionDB
+from run_agent import AIAgent
 from tools import async_delegation
 from tools.process_registry import process_registry
+from tools.process_registry_notifications import format_process_notification
 from tui_gateway import server
 
 
@@ -18,6 +22,45 @@ def session(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(server, "_emit", Mock())
     return {"session_key": "notification-admission", "running": False, "history_lock": threading.RLock()}
+
+
+def _stop_response(text="synthetic response"):
+    message = SimpleNamespace(
+        content=text, reasoning_content=None, reasoning=None, tool_calls=None,
+    )
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def _real_agent(db, session_id):
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test/model",
+            enabled_toolsets=[],
+            disabled_toolsets=[],
+            quiet_mode=True,
+            skip_memory=True,
+            skip_context_files=True,
+            session_db=db,
+            session_id=session_id,
+        )
+    agent._session_db_created = True
+    agent._cached_system_prompt = "SYSTEM"
+    agent._skip_mcp_refresh = True
+    agent._use_prompt_caching = False
+    agent._disable_streaming = True
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.client = Mock()
+    agent.client.chat.completions.create.return_value = _stop_response()
+    return agent
 
 
 @pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
@@ -66,7 +109,7 @@ def test_event_receipt_and_retry_follow_actual_admission(monkeypatch, session, e
 
 @pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
 def test_admitted_event_retries_after_history_failure_without_a_second_card(
-    monkeypatch, session, event_type,
+    monkeypatch, tmp_path, session, event_type,
 ):
     event = {
         "type": event_type, "session_id": "synthetic-process", "delegation_id": "synthetic-delegation",
@@ -78,45 +121,134 @@ def test_admitted_event_retries_after_history_failure_without_a_second_card(
     monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: "delivery-claim")
     monkeypatch.setattr(async_delegation, "complete_event_delivery", Mock())
     monkeypatch.setattr(async_delegation, "release_event_delivery", release)
-    session.update({
-        "agent": SimpleNamespace(interim_assistant_callback=None, session_id=session["session_key"]),
-        "attached_images": [], "history": [], "history_version": 0,
-    })
+    db = SessionDB(db_path=tmp_path / f"{event_type}.db")
+    db.create_session(session["session_key"], source="tui", model="test/model")
+    agent = _real_agent(db, session["session_key"])
+    session.update({"agent": agent, "attached_images": [], "history": [], "history_version": 0})
     monkeypatch.setattr(server, "_sessions", {"live-notification": session})
     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: None)
     monkeypatch.setattr(server, "_record_turn_marker", lambda *_: "")
 
-    def fail_preparation(*_args, **_kwargs):
-        raise RuntimeError("synthetic preparation failure")
+    preparation_attempts = 0
 
-    monkeypatch.setattr(server, "_prepare_turn_input", fail_preparation)
+    def prepare(_sid, owned_session, st, text, _images):
+        nonlocal preparation_attempts
+        preparation_attempts += 1
+        if preparation_attempts == 1:
+            raise RuntimeError("synthetic preparation failure")
+        st.history = list(owned_session["history"])
+        st.history_version = owned_session["history_version"]
+        return text, text, 80, None
+
+    monkeypatch.setattr(server, "_prepare_turn_input", prepare)
     monkeypatch.setattr(server, "_recover_turn_exception", lambda *_: None)
     monkeypatch.setattr(server, "_finish_turn", lambda *_: None)
     monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_: None)
     monkeypatch.setattr(server, "_run_post_turn_followups", lambda *_: None)
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_complete_turn_payload", lambda *_: ({}, "", "complete"))
+    monkeypatch.setattr(server, "_goal_followup_after_turn", lambda *_: None)
+    monkeypatch.setattr(server, "_settle_loop_claim", lambda *_: None)
+    monkeypatch.setattr(server, "_after_complete_turn", lambda *_: None)
+    monkeypatch.setattr(server, "_publish_session_control_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_start_usage_ticker",
+        lambda *_: (SimpleNamespace(set=lambda: None), SimpleNamespace(join=lambda: None)),
+    )
+    monkeypatch.setattr("agent.turn_context._maybe_title_session_at_turn_start", lambda *_: None)
 
     emitted = set()
     assert server._notif_handle_event(
-        "live-notification", session, event, emitted, registry, lambda _event: "synthetic result", [],
+        "live-notification", session, event, emitted, registry, format_process_notification, [],
     ) is True
     session["_run_thread"].join(2)
     assert not session["_run_thread"].is_alive()
 
     assert release.call_args.args == (event, "delivery-claim")
     assert registry.completion_queue.get_nowait() is event
-    assert server._notif_handle_event(
-        "live-notification", session, event, emitted, registry, lambda _event: "synthetic result", [],
-    ) is True
-    session["_run_thread"].join(2)
-    assert not session["_run_thread"].is_alive()
-    assert release.call_count == 2
-    assert registry.completion_queue.get_nowait() is event
-    cards = [call for call in server._emit.call_args_list if call.args[0] == "notification.show"]
-    assert len(cards) == 1
     assert "display_notification" not in server._notification_turn_display(
         event, "synthetic result", "live-notification")
     assert "display_notification" in server._notification_turn_display(
         event, "synthetic result", "resumed-notification")
+    assert server._notif_handle_event(
+        "live-notification", session, event, emitted, registry, format_process_notification, [],
+    ) is True
+    session["_run_thread"].join(2)
+    assert not session["_run_thread"].is_alive()
+    assert release.call_count == 1
+    assert registry.completion_queue.empty()
+    cards = [call for call in server._emit.call_args_list if call.args[0] == "notification.show"]
+    assert len(cards) == 1
+    assert agent.client.chat.completions.create.call_count == 1
+    rows = db.get_messages_as_conversation(session["session_key"])
+    synthetic_rows = [row for row in rows if row.get("role") == "user"]
+    assert len(synthetic_rows) == 1
+    assert synthetic_rows[0]["display_kind"] == (
+        "async_delegation_complete" if event_type == "async_delegation" else "process_complete"
+    )
+    cold_messages = server._history_to_messages(rows, include_ui_chrome=True)
+    assert [message["role"] for message in cold_messages].count("notification") == 1
+    agent.close()
+    db.close()
+
+
+def test_preflight_refusal_cannot_stamp_an_older_identical_row(
+    monkeypatch, tmp_path, session,
+):
+    """A no-row preflight result cannot borrow durability from an earlier turn."""
+    from agent.turn_context import PreflightCompressionTimedOut
+
+    text = "identical completion payload"
+    db = SessionDB(db_path=tmp_path / "ownership.db")
+    db.create_session(session["session_key"], source="tui", model="test/model")
+    db.append_message(session["session_key"], "user", text)
+    history = db.get_messages_as_conversation(session["session_key"])
+    agent = _real_agent(db, session["session_key"])
+
+    with patch(
+        "agent.turn_context_compaction.run_turn_start_compaction",
+        side_effect=PreflightCompressionTimedOut("fixture preflight timeout"),
+    ):
+        result = agent.run_conversation(
+            text,
+            conversation_history=history,
+            persist_user_display_kind="process_complete",
+            persist_user_display_metadata={"kind": "process.complete", "text": "job done"},
+        )
+
+    assert agent.client.chat.completions.create.call_count == 0
+    assert result["turn_exit_reason"] == "context_compression_timeout"
+    st = server._TurnRun(agent, None, None, True)
+    st.history = list(history)
+    st.history_version = 0
+    st.invocation_started = True
+    st.result = result
+    session.update({"agent": agent, "history": list(history), "history_version": 0})
+
+    _, outcome = server._absorb_turn_result(
+        "live-notification",
+        session,
+        st,
+        text,
+        "process_complete",
+        {"kind": "process.complete", "text": "job done"},
+    )
+    event = {
+        "type": "completion", "session_id": "synthetic-process",
+        "command": "echo synthetic", "exit_code": 0,
+    }
+    retry_queue = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", retry_queue)
+    server._settle_notification_delivery("live-notification", event, "", outcome)
+
+    [older_row] = db.get_messages_as_conversation(session["session_key"])
+    assert older_row.get("display_kind") is None
+    assert outcome.delivery_succeeded is False
+    assert outcome.invocation_started is False
+    assert retry_queue.get_nowait() is event
+    agent.close()
+    db.close()
 
 
 @pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
@@ -138,7 +270,7 @@ def test_invoked_notification_settles_without_replaying_for_display_repair(
     monkeypatch.setattr(async_delegation, "drop_completion_delivery", drop)
 
     class ControlledHistory:
-        def set_latest_matching_message_display_kind(self, *_args, **_kwargs):
+        def set_message_display_kind(self, *_args, **_kwargs):
             if history_case == "exception":
                 raise RuntimeError("synthetic persistence failure")
             return False
@@ -170,12 +302,14 @@ def test_invoked_notification_settles_without_replaying_for_display_repair(
             from agent.turn_context import PreflightCompressionTimedOut
             st.result = _preflight_timeout_result(agent, PreflightCompressionTimedOut("fixture timeout"), st.history)
             return
-        if db is not None:
-            db.append_message(session["session_key"], "user", prompt)
+        row_id = db.append_message(session["session_key"], "user", prompt) if db is not None else None
         missing = history_case == "missing"
         agent._persist_user_message_idx = None if missing else 0
         st.result = {
-            "messages": ([{"role": "user", "content": prompt}] if not missing else [])
+            "messages": ([{
+                "role": "user", "content": prompt,
+                **({"_row_id": row_id or 1} if history is not None else {}),
+            }] if not missing else [])
             + [{"role": "assistant", "content": "synthetic response"}],
             "final_response": "synthetic response",
         }

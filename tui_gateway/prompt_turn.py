@@ -584,6 +584,7 @@ class _TurnRun:
     marker_key: str = ""
     receipt_attempted: bool = False
     invocation_started: bool = False
+    display_row_boundary: tuple[str, int] | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -719,6 +720,16 @@ def _invoke_agent(
     if display_kind and "persist_user_display_kind" in run_params:
         run_kwargs["persist_user_display_kind"] = display_kind
         run_kwargs["persist_user_display_metadata"] = display_metadata
+    if display_kind:
+        db = getattr(agent, "_session_db", None)
+        current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
+        latest_row_id = getattr(db, "latest_message_row_id", None)
+        if current_session_id and callable(latest_row_id):
+            try:
+                boundary = latest_row_id(current_session_id, role="user", require_text=False)
+                st.display_row_boundary = (current_session_id, boundary or 0)
+            except Exception:
+                logger.debug("failed to capture synthetic display row boundary", exc_info=True)
     # Live-rename hook: auto-titling fires inside the turn prologue.
     agent._on_session_title = lambda title, _source: _emit_title_refresh(sid, title)
     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
@@ -741,17 +752,6 @@ def _absorb_turn_result(
     persistence_failed = False
     synthetic_message = None
     if display_kind and isinstance(text, str):
-        # Post-turn fallback stamp of a synthesized turn's display kind (DB row + result).
-        db = getattr(agent, "_session_db", None)
-        current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
-        if db is not None:
-            try:
-                display_persisted = bool(db.set_latest_matching_message_display_kind(
-                    current_session_id, role="user", content=text, display_kind=display_kind,
-                    display_metadata=display_metadata))
-            except Exception:
-                logger.debug("failed to stamp synthetic display kind", exc_info=True)
-            persistence_failed = not display_persisted
         if isinstance(result, dict) and isinstance(result.get("messages"), list):
             messages = result["messages"]
             current_idx = getattr(agent, "_persist_user_message_idx", None)
@@ -766,11 +766,33 @@ def _absorb_turn_result(
                 if isinstance(message, dict)
                 and message.get("role") == "user"
                 and message.get("content") == text
+                and all(message is not previous for previous in st.history)
             ), None)
-            if synthetic_message is not None:
-                synthetic_message["display_kind"] = display_kind
-                if display_metadata:
-                    synthetic_message["display_metadata"] = display_metadata
+        # New agents return the inserted row id. Older agents that omit it may use the
+        # row boundary captured immediately before this serial invocation. Neither path
+        # can borrow an identical row from an earlier turn.
+        db = getattr(agent, "_session_db", None)
+        current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
+        if db is not None and current_session_id:
+            row_id = synthetic_message.get("_row_id") if synthetic_message is not None else None
+            exact_setter = getattr(db, "set_message_display_kind", None)
+            boundary = st.display_row_boundary
+            try:
+                if isinstance(row_id, int) and not isinstance(row_id, bool) and callable(exact_setter):
+                    display_persisted = bool(exact_setter(
+                        current_session_id, row_id, role="user", content=text,
+                        display_kind=display_kind, display_metadata=display_metadata))
+                elif boundary is not None and boundary[0] == current_session_id:
+                    display_persisted = bool(db.set_latest_matching_message_display_kind(
+                        current_session_id, role="user", content=text, display_kind=display_kind,
+                        after_row_id=boundary[1], display_metadata=display_metadata))
+            except Exception:
+                logger.debug("failed to stamp synthetic display kind", exc_info=True)
+            persistence_failed = not display_persisted
+        if synthetic_message is not None:
+            synthetic_message["display_kind"] = display_kind
+            if display_metadata:
+                synthetic_message["display_metadata"] = display_metadata
     if "moa_one_shot_restore" in session:
         # Undo a /moa one-shot through the switch path: resetting model_override alone
         # would leave the live client pinned to MoA after the in-place switch_model().
