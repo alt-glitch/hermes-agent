@@ -242,8 +242,9 @@ def test_owned_task_fix_is_fast_forward_and_retry_stable(retained, monkeypatch):
     assert remote_sha(f["repo"]) == f["base"]
 
 
+@pytest.mark.parametrize("as_draft", [False, True])
 @pytest.mark.parametrize("fault", ["foreign", "closed", "retargeted", "base", "remote", "revision", "rewind"])
-def test_owned_task_update_refuses_lost_ownership(retained, monkeypatch, fault):
+def test_owned_task_update_refuses_lost_ownership(retained, monkeypatch, fault, as_draft):
     f = retained
     original = runtime._load_gate(f["source"])
     head = f["pr"]["headRefName"]
@@ -275,7 +276,7 @@ def test_owned_task_update_refuses_lost_ownership(retained, monkeypatch, fault):
         return json.dumps([f["pr"]])
     monkeypatch.setattr(pub, "_run", transport)
     with pytest.raises((pub.PublicationError, runtime.ControlError)):
-        pub.advance_owned_head(f["repo"], f["fresh"], str(f["remote"]), updated, f["candidate"])
+        pub.advance_owned_head(f["repo"], f["fresh"], str(f["remote"]), updated, f["candidate"], as_draft=as_draft)
 
 
 def test_scheduled_identity_survives_owner_and_fix_changes():

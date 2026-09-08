@@ -1007,6 +1007,12 @@ def advance_owned_head(
         observed_heads=[expected],
     )
     require_review_disposition(root, observations)
+    # Refused updates must not even change the PR's draft state.
+    _run(["git", "merge-base", "--is-ancestor", expected, candidate], repo)
+    ref = f"refs/heads/{head}"
+    advertised = _run(["git", "ls-remote", destination, ref], repo).split()
+    if advertised != [pr["headRefOid"], ref]:
+        raise PublicationError("owned branch and PR disagree")
     if as_draft:
         pr = _ensure_owned_draft(
             root,
@@ -1016,11 +1022,6 @@ def advance_owned_head(
             manifest["base_sha"],
             marker,
         )
-    _run(["git", "merge-base", "--is-ancestor", expected, candidate], repo)
-    ref = f"refs/heads/{head}"
-    advertised = _run(["git", "ls-remote", destination, ref], repo).split()
-    if advertised != [pr["headRefOid"], ref]:
-        raise PublicationError("owned branch and PR disagree")
     if pr["headRefOid"] == expected and expected != candidate:
         _run(["git", "push", "--porcelain", f"--force-with-lease={ref}:{expected}",
               destination, f"{candidate}:{ref}"], repo)
