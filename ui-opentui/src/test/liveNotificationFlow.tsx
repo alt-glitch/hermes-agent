@@ -571,6 +571,16 @@ async function main(): Promise<void> {
     const largeId = processId(fixture.state, 'large')
     const cancelId = processId(fixture.state, 'cancel')
 
+    // message.complete seals the response before the turn's finally releases admission.
+    // Wait for the subsequent authoritative idle event, not an optimistic client phase.
+    const spawnCompleteIndex = events.findIndex(
+      event => event.type === 'message.complete' && eventHas(event, 'FIXTURE_SPAWNED_ALL')
+    )
+    await waitUntil('spawn admission released', () =>
+      events
+        .slice(spawnCompleteIndex + 1)
+        .some(event => event.type === 'session.info' && event.payload.running === false)
+    )
     const hold = await submit(runtime, gateway, liveStore, liveSessionId, HOLD_REQUEST)
     assert.equal(hold.status, 'streaming')
     await fixture.state.holdStarted.promise

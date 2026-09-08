@@ -125,9 +125,11 @@ def _notif_release_turn(session: dict) -> None:
 
 
 def _notif_claim_turn(session: dict) -> bool:
-    """Claim the idle session (running=True) under history_lock; False if a turn is live."""
+    """Claim idle work only after accepted user input, under the same admission lock."""
     with _mcp_reload_admission_lock, session["history_lock"]:
-        if session.get("running") or session.get("_closing") or session.get("_finalized"):
+        # The preceding turn clears running before its queued-user drain executes.
+        # A waking poller must not steal that gap from an already accepted prompt.
+        if session.get("running") or session.get("queued_prompt") or session.get("_closing") or session.get("_finalized"):
             return False
         session["running"] = True
         session["_turn_cancel_requested"] = False

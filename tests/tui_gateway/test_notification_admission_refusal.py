@@ -64,6 +64,29 @@ def _real_agent(db, session_id):
 
 
 @pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
+def test_idle_notification_waits_for_accepted_user_prompt(monkeypatch, session, event_type):
+    """The poller can wake after running clears but before the queued-user drain."""
+    event = {
+        "type": event_type, "session_id": "synthetic-process", "delegation_id": "synthetic-delegation",
+        "origin_ui_session_id": "live-notification", "command": "echo synthetic", "exit_code": 0,
+    }
+    pending = {"text": "accepted user input", "images": []}
+    session["queued_prompt"] = pending
+    registry = SimpleNamespace(completion_queue=queue.Queue(), is_completion_consumed=lambda _sid: False)
+    submit = Mock(return_value=True)
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: "delivery-claim")
+
+    assert server._notif_handle_event(
+        "live-notification", session, event, set(), registry, lambda _event: "synthetic result", [],
+    ) is False
+    submit.assert_not_called()
+    assert registry.completion_queue.get_nowait() is event
+    assert session["queued_prompt"] is pending
+    assert session["running"] is False
+
+
+@pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
 @pytest.mark.parametrize("outcome", [False, True, "exception"])
 def test_event_receipt_and_retry_follow_actual_admission(monkeypatch, session, event_type, outcome):
     event = {
