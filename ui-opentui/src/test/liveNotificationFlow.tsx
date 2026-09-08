@@ -360,9 +360,13 @@ async function startFixture(home: string, paths: Record<ProcKind, { ready: strin
   }
 }
 
-async function waitUntil(label: string, predicate: () => boolean, timeoutMs = READY_TIMEOUT_MS): Promise<void> {
+async function waitUntil(
+  label: string,
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = READY_TIMEOUT_MS
+): Promise<void> {
   const deadline = Date.now() + timeoutMs
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`)
     await new Promise(resolveWait => setTimeout(resolveWait, 25))
   }
@@ -429,7 +433,16 @@ async function proveNativeDisclosure(
     { height: 90, kittyKeyboard: true, width: 140 }
   )
   try {
-    const collapsed = await probe.waitForFrame(frame => frame.includes(successId))
+    // Markdown initialization uses a worker; render-pass counts are not a
+    // wall-clock readiness boundary for the asynchronously painted text.
+    let collapsed = ''
+    await waitUntil('settled native assistant chronology', async () => {
+      await probe.settle()
+      collapsed = probe.frame()
+      return collapsed.includes(successId) && collapsed.includes(QUEUED_RESPONSE) && collapsed.includes('· ready')
+    })
+    assert(collapsed.indexOf(QUEUED_INPUT) < collapsed.indexOf(QUEUED_RESPONSE), 'visible queued exchange is reversed')
+    assert(collapsed.indexOf(QUEUED_RESPONSE) < collapsed.indexOf('◆'), 'visible completion overtook queued response')
     assert(!collapsed.includes(SUCCESS_DETAIL), 'completion detail flooded the default native frame')
     if (evidenceDir) {
       await writeFile(
@@ -659,11 +672,18 @@ async function main(): Promise<void> {
       'process_manage log did not return the full retained output'
     )
 
+    // Closing removes the registered live session: resume must load SessionDB,
+    // rather than reattaching to the same in-memory conversation.
+    await runtime.runPromise(gateway.request('session.close', { session_id: liveSessionId }))
     const freshStore = createSessionStore()
+    const readyEvent = events.find(event => event.type === 'gateway.ready')
+    assert(readyEvent, 'transport readiness was not observed')
+    freshStore.apply(readyEvent)
     activeStore = freshStore
     const resumed = await runtime.runPromise(
       resumeSession(gateway, freshStore, { cols: 140, targetSessionId: created.resumeId })
     )
+    assert.notEqual(resumed.sessionId, created.sessionId, 'resume reused the closed live session')
     liveSessionId = resumed.sessionId
     const rows = freshStore.state.messages
     const queuedUserIndex = rows.findIndex(row => row.role === 'user' && row.text === QUEUED_INPUT)
