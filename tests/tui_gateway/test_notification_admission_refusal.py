@@ -120,7 +120,7 @@ def test_admitted_event_retries_after_history_failure_without_a_second_card(
 
 
 @pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
-@pytest.mark.parametrize("history_case", ["no_db", "success", "missing", False, "exception"])
+@pytest.mark.parametrize("history_case", ["no_db", "success", "missing", "preflight", False, "exception"])
 def test_invoked_notification_settles_without_replaying_for_display_repair(
     monkeypatch, tmp_path, session, event_type, history_case,
 ):
@@ -165,6 +165,11 @@ def test_invoked_notification_settles_without_replaying_for_display_repair(
 
     def invoke(_sid, _session, st, prompt, *_args):
         st.invocation_started = True
+        if history_case == "preflight":
+            from agent.conversation_loop import _preflight_timeout_result
+            from agent.turn_context import PreflightCompressionTimedOut
+            st.result = _preflight_timeout_result(agent, PreflightCompressionTimedOut("fixture timeout"), st.history)
+            return
         if db is not None:
             db.append_message(session["session_key"], "user", prompt)
         missing = history_case == "missing"
@@ -210,6 +215,11 @@ def test_invoked_notification_settles_without_replaying_for_display_repair(
             assert session["history"][0]["display_kind"] == (
                 "async_delegation_complete" if event_type == "async_delegation" else "process_complete"
             )
+    elif history_case == "preflight":
+        complete.assert_not_called()
+        drop.assert_not_called()
+        release.assert_called_once_with(event, claim)
+        assert registry.completion_queue.get_nowait() is event
     else:
         complete.assert_not_called()
         release.assert_not_called()
@@ -218,6 +228,8 @@ def test_invoked_notification_settles_without_replaying_for_display_repair(
                     if call.args[0] == "status.update" and call.args[2].get("kind") == "warn"]
         assert len(warnings) == 1
         assert "could not be saved" in warnings[0]
+        assert "Automatic delivery stopped" in warnings[0]
+        assert "reached the model" not in warnings[0]  # Agent entry may fail in preflight, before a provider call.
         if event_type == "async_delegation":
             drop.assert_called_once_with("synthetic-delegation", claim)
             assert "delegate_task(action='list')" in warnings[0]

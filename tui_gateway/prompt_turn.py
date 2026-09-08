@@ -811,10 +811,18 @@ def _absorb_turn_result(
     history_retained = synthetic_message is not None and status_note is None
     if display_kind and not display_persisted and not history_retained:
         persistence_failed = True
+    # This typed result is returned before any provider call and deliberately
+    # omits the new user row. Keep its delivery retryable, like preparation refusal.
+    preflight_refused = (
+        isinstance(result, dict)
+        and result.get("turn_exit_reason") == "context_compression_timeout"
+        and not history_retained
+        and not display_persisted
+    )
     return status_note, _HistoryCommitOutcome(
         display_persisted=display_persisted,
         history_retained=history_retained,
-        invocation_started=st.invocation_started,
+        invocation_started=st.invocation_started and not preflight_refused,
         persistence_failed=persistence_failed,
     )
 

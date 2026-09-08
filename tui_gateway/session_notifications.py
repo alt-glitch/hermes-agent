@@ -455,12 +455,12 @@ def _notification_history_failure_text(evt: dict) -> str:
     """Honest live recovery guidance when an invoked notification turn could not retain its card."""
     if evt.get("type") == "async_delegation":
         return (
-            "Background delegation result reached the model, but its transcript card could not be saved. "
+            "Background delegation transcript card could not be saved. Automatic delivery stopped to avoid repeated model calls. "
             "The completion remains recorded; inspect it with delegate_task(action='list')."
         )
     session_id = str(evt.get("session_id") or "")
     return (
-        "Background process result reached the model, but its transcript card could not be saved. "
+        "Background process transcript card could not be saved. Automatic delivery stopped to avoid repeated model calls. "
         f"Recover the retained output with process_manage(action='log', session_id='{session_id}')."
     )
 
