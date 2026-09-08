@@ -1221,6 +1221,87 @@ def _ensure_owned_draft(
     return updated
 
 
+def _retained_draft_adoption(
+    root: Path,
+    manifest: dict[str, Any],
+    expected: str,
+    issue: dict[str, Any],
+    workflow: Any,
+    marker: str,
+) -> dict[str, Any] | None:
+    path = root / "pr-draft.json"
+    if path.is_symlink():
+        raise PublicationError("retained task draft path is unsafe")
+    if not path.exists():
+        return None
+    try:
+        draft = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PublicationError("retained task draft is invalid") from exc
+    _, request_identity, candidate_identity = _candidate_head(manifest)
+    binding_issue = manifest["run_binding"]["issue"]
+    draft_issue = draft.get("issue") if isinstance(draft, dict) else None
+    adoptions = draft_issue.get("existing_prs") if isinstance(draft_issue, dict) else None
+    adoption = adoptions[0] if isinstance(adoptions, list) and len(adoptions) == 1 else None
+    if (
+        not isinstance(draft, dict)
+        or set(draft) != {
+            "schema_version", "status", "repository", "base_branch", "base_sha",
+            "candidate_sha", "head_branch", "number", "url", "request_identity",
+            "candidate_identity", "passed", "pending", "issue",
+        }
+        or draft.get("schema_version") != 1
+        or draft.get("status") != "draft"
+        or draft.get("repository") != REPOSITORY
+        or draft.get("base_branch") != BASE
+        or draft.get("base_sha") != manifest["base_sha"]
+        or draft.get("candidate_sha") != expected
+        or draft.get("request_identity") != request_identity
+        or draft.get("candidate_identity") != candidate_identity
+        or draft.get("passed") != ["Task/base identity and publication ownership checks passed"]
+        or not isinstance(draft.get("pending"), list)
+        or not draft["pending"]
+        or not all(isinstance(item, str) and item for item in draft["pending"])
+        or not isinstance(draft_issue, dict)
+        or set(draft_issue) != {"issue", "revision_sha256", "metadata_sha256", "existing_prs"}
+        or draft_issue.get("issue") != binding_issue["number"]
+        or draft_issue.get("revision_sha256") != binding_issue["revision_sha256"]
+        or draft_issue.get("metadata_sha256") != issue.get("metadata_sha256")
+        or not isinstance(adoption, dict)
+        or set(adoption) != {
+            "number", "url", "base_branch", "head_branch", "head_sha", "head_repository",
+        }
+        or type(draft.get("number")) is not int
+        or draft["number"] <= 0
+        or draft.get("url") != f"https://github.com/{REPOSITORY}/pull/{draft['number']}"
+        or not isinstance(draft.get("head_branch"), str)
+        or not draft["head_branch"]
+        or adoption.get("number") != draft["number"]
+        or adoption.get("url") != draft["url"]
+        or adoption.get("base_branch") != BASE
+        or adoption.get("head_branch") != draft["head_branch"]
+        or adoption.get("head_sha") != expected
+        or adoption.get("head_repository") != REPOSITORY
+    ):
+        raise PublicationError("retained task draft does not bind the expected owner/head")
+    try:
+        live = _reconcile_live_issue_pr(workflow, issue, expected, root=root)
+    except PublicationError:
+        live = _reconcile_live_issue_pr(
+            workflow, issue, manifest["candidate_sha"], root=root
+        )
+    if (
+        live is None
+        or live.get("number") != draft["number"]
+        or live.get("url") != draft["url"]
+        or live.get("headRefName") != draft["head_branch"]
+    ):
+        raise PublicationError("live issue PR does not match the retained task draft")
+    _validate_pr(live, draft["head_branch"], live["headRefOid"], marker)
+    _validate_owned_base(live, manifest["base_sha"])
+    return live
+
+
 def _owned_head(
     root: Path,
     destination: str,
@@ -1239,54 +1320,46 @@ def _owned_head(
     ], root))
     binding = manifest.get("run_binding")
     candidate = manifest["candidate_sha"]
-    if isinstance(binding, dict) and binding.get("mode") == "issue":
-        # The claimed request is hash-bound to the gate manifest. Its captured
-        # PR is the adoption authority; issue links are discovery evidence only.
-        _, _, issue, _ = _publication_metadata(
+    if prs == [] and isinstance(binding, dict) and binding.get("mode") == "issue":
+        # Adopted drafts keep their contributor branch through follow-up fixes.
+        _, _, issue, workflow = _publication_metadata(
             root, manifest, None, verification_complete=False
         )
-        adoptions = issue.get("existing_prs") if isinstance(issue, dict) else None
-        if not isinstance(adoptions, list):
-            raise PublicationError("bound PR adoption evidence is malformed")
-        if len(adoptions) > 1:
-            raise PublicationError("bound PR adoption evidence is ambiguous")
-        if adoptions:
-            adoption = adoptions[0]
-            fields = {
-                "number", "url", "base_branch", "head_branch", "head_sha", "head_repository",
-            }
-            if (
-                not isinstance(adoption, dict)
-                or set(adoption) != fields
-                or type(adoption.get("number")) is not int
-                or adoption["number"] <= 0
-                or adoption.get("url")
-                != f"https://github.com/{REPOSITORY}/pull/{adoption.get('number')}"
-                or adoption.get("base_branch") != BASE
-                or not isinstance(adoption.get("head_branch"), str)
-                or not adoption["head_branch"]
-                or adoption.get("head_sha") != expected
-                or adoption.get("head_repository") != REPOSITORY
-            ):
-                raise PublicationError("bound PR adoption evidence is invalid")
-            try:
-                adopted = json.loads(_run([
-                    str(GH), "pr", "view", str(adoption["number"]),
-                    "--repo", REPOSITORY, "--json", FIELDS + OWNERSHIP_FIELDS,
-                ], root))
-            except (json.JSONDecodeError, TypeError) as exc:
-                raise PublicationError("bound adopted PR response is invalid") from exc
-            if (
-                not isinstance(adopted, dict)
-                or adopted.get("number") != adoption["number"]
-                or adopted.get("url") != adoption["url"]
-                or adopted.get("headRefOid") not in {expected, candidate}
-            ):
-                raise PublicationError("bound adopted PR changed unexpectedly")
-            head = adoption["head_branch"]
-            _validate_pr(adopted, head, adopted["headRefOid"], marker)
-            _validate_owned_base(adopted, manifest["base_sha"])
+        try:
+            adopted = _reconcile_live_issue_pr(workflow, issue, expected, root=root)
+        except PublicationError:
+            # A lost push reply may already have advanced exactly this candidate.
+            adopted = _reconcile_live_issue_pr(workflow, issue, candidate, root=root)
+        if adopted is not None:
+            head = adopted["headRefName"]
             prs = [adopted]
+    elif (
+        isinstance(prs, list)
+        and len(prs) == 1
+        and isinstance(prs[0], dict)
+        and prs[0].get("state") == "CLOSED"
+        and re.fullmatch(r"[0-9a-f]{40}", str(prs[0].get("headRefOid", "")))
+        and isinstance(binding, dict)
+        and binding.get("mode") == "issue"
+    ):
+        closed = {**prs[0], "state": "OPEN"}
+        try:
+            _validate_pr(closed, head, closed["headRefOid"], marker)
+            _validate_owned_base(closed, manifest["base_sha"])
+        except PublicationError:
+            closed_owned = False
+        else:
+            closed_owned = True
+        if closed_owned:
+            _, _, issue, workflow = _publication_metadata(
+                root, manifest, None, verification_complete=False
+            )
+            adopted = _retained_draft_adoption(
+                root, manifest, expected, issue, workflow, marker
+            )
+            if adopted is not None:
+                head = adopted["headRefName"]
+                prs = [adopted]
     if prs == [] and allow_missing:
         return None
     if not isinstance(prs, list) or len(prs) != 1:

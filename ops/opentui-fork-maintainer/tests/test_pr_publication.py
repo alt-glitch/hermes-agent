@@ -95,6 +95,7 @@ class Github:
         self.statuses = {}
         self.action_jobs = {}
         self.action_logs = {}
+        self.issue_prs = None
 
     def run(self, argv, cwd):
         self.calls.append(argv)
@@ -154,9 +155,18 @@ class Github:
             # closing-keyword parser, so the maintainer's own keyword-free PR is
             # correctly ignored while a competitor's `Fixes #` PR is seen.
             if "/timeline" in endpoint:
-                return json.dumps([[self.cross_reference()]] if self.pr else [[]])
+                related = self.issue_prs
+                if related is None:
+                    related = [self.pr] if self.pr else []
+                return json.dumps([[self.cross_reference(pr) for pr in related]])
             if "/pulls/" in endpoint:
-                return json.dumps(self.rest_pull())
+                number = int(endpoint.rsplit("/", 1)[1])
+                related = self.issue_prs
+                if related is None:
+                    related = [self.pr] if self.pr else []
+                return json.dumps(
+                    self.rest_pull(next(pr for pr in related if pr["number"] == number))
+                )
             pytest.fail(f"unexpected GitHub API request: {endpoint}")
         else:
             phase = argv[2]
@@ -201,26 +211,30 @@ class Github:
             raise pub.PublicationError("simulated lost acknowledgement")
         return result
 
-    def cross_reference(self):
+    def cross_reference(self, pr=None):
+        pr = self.pr if pr is None else pr
         return {"event": "cross-referenced", "source": {"issue": {
-            "number": self.pr["number"],
-            "pull_request": {"url": self.pr["url"]},
+            "number": pr["number"],
+            "pull_request": {"url": pr["url"]},
             "repository_url": f"https://api.github.com/repos/{pub.REPOSITORY}",
-            "body": self.pr["body"],
+            "body": pr["body"],
         }}}
 
-    def rest_pull(self):
+    def rest_pull(self, pr=None):
+        pr = self.pr if pr is None else pr
+        owner = (pr.get("headRepositoryOwner") or {}).get("login", "alt-glitch")
+        repository = (pr.get("headRepository") or {}).get("name", "hermes-agent")
         return {
-            "number": self.pr["number"],
+            "number": pr["number"],
             "state": "open",
             "base": {"ref": pub.BASE},
             "head": {
-                "sha": self.pr["headRefOid"],
-                "repo": {"full_name": pub.REPOSITORY},
-                "ref": self.pr["headRefName"],
+                "sha": pr["headRefOid"],
+                "repo": {"full_name": f"{owner}/{repository}"},
+                "ref": pr["headRefName"],
             },
-            "body": self.pr["body"],
-            "html_url": self.pr["url"],
+            "body": pr["body"],
+            "html_url": pr["url"],
         }
 
 
@@ -341,7 +355,9 @@ def remote_head(remote: Path, head: str) -> str:
     ).stdout.split()[0]
 
 
-def closed_canonical_transport(github, closed_duplicate: dict, candidate: str):
+def closed_canonical_transport(
+    github, closed_duplicate: dict, candidate: str, *, lose_push_reply: list[bool] | None = None
+):
     simulated_github = github.run
 
     def transport(argv, cwd):
@@ -352,6 +368,8 @@ def closed_canonical_transport(github, closed_duplicate: dict, candidate: str):
             )
             if argv[1] == "push":
                 github.pr["headRefOid"] = candidate
+                if lose_push_reply and lose_push_reply.pop(0):
+                    raise pub.PublicationError("simulated lost acknowledgement")
             return result.stdout
         if argv[:3] == [str(pub.GH), "pr", "list"]:
             github.calls.append(argv)
@@ -361,6 +379,42 @@ def closed_canonical_transport(github, closed_duplicate: dict, candidate: str):
         return simulated_github(argv, cwd)
 
     return transport
+
+
+def publisher_adopts_after_empty_capture(capture, github, repo: Path, expected: str):
+    request = bind_issue(capture)
+    adopted = {
+        "number": 91,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
+        "base_branch": pub.BASE,
+        "head_branch": "contributor/approved-41",
+        "head_sha": expected,
+        "head_repository": pub.REPOSITORY,
+    }
+    capture[1]["candidate_sha"] = expected
+    github.ref = f"{expected}\trefs/heads/{adopted['head_branch']}"
+    github.pr = {
+        **review_pr(),
+        "number": adopted["number"],
+        "url": adopted["url"],
+        "body": "Contributor context.\n\nFixes #41",
+        "headRefName": adopted["head_branch"],
+        "headRefOid": expected,
+        "baseRefOid": capture[1]["base_sha"],
+        "isDraft": True,
+    }
+    proof = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["candidate verification"],
+        issue_request={**request, "existing_prs": [adopted]},
+    )
+    assert json.loads(
+        (capture[0] / "request.claimed.json").read_text(encoding="utf-8")
+    )["existing_prs"] == []
+    assert proof["issue"]["existing_prs"] == [adopted]
+    return request, adopted, proof
 
 
 def write_review_disposition(root: Path, observations: dict) -> None:
@@ -899,122 +953,178 @@ def test_compatible_existing_issue_draft_is_adopted_without_replacement(
     assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
 
 
-def test_bound_adopted_head_advances_when_closed_canonical_duplicate_exists(
+def test_publisher_adoption_after_empty_capture_advances_sequential_real_git_heads(
     capture, github, monkeypatch, tmp_path
 ) -> None:
     adopted_head = "contributor/approved-41"
     repo, remote, expected, candidate = prepare_owned_head_graph(
         tmp_path, capture, adopted_head
     )
-    adopted = {
-        "number": 91,
-        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
-        "base_branch": pub.BASE,
-        "head_branch": adopted_head,
-        "head_sha": expected,
-        "head_repository": pub.REPOSITORY,
-    }
-    bind_issue(capture, existing_prs=[adopted])
-    marker = f"<!-- maintainer-candidate:v1:{pub._candidate_head(capture[1])[2]} -->"
-    github.pr = {
-        **review_pr(),
-        "number": 91,
-        "url": adopted["url"],
-        "body": marker + "\n\nFixes #41",
-        "headRefName": adopted_head,
-        "headRefOid": expected,
-        "baseRefOid": capture[1]["base_sha"],
-        "isDraft": True,
-    }
-    canonical_head = pub._candidate_head(capture[1])[0]
+    request, adopted, first = publisher_adopts_after_empty_capture(
+        capture, github, repo, expected
+    )
+    marker = f"<!-- maintainer-candidate:v1:{first['candidate_identity']} -->"
     closed_duplicate = {
         **github.pr,
         "number": 92,
         "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
-        "headRefName": canonical_head,
+        "headRefName": pub._candidate_head(capture[1])[0],
+        "headRefOid": expected,
+        "body": marker,
         "state": "CLOSED",
     }
+    monkeypatch.setattr(pub, "_publication_destination", lambda _repo, _remote: str(remote))
     monkeypatch.setattr(
         pub, "_run", closed_canonical_transport(github, closed_duplicate, candidate)
     )
-    pub.advance_owned_head(
+    capture[1].update(candidate_sha=candidate, expected_pr_head=expected)
+    adopted["head_sha"] = candidate
+
+    second = pub.publish_draft(
         repo,
         capture[0],
-        str(remote),
         capture[1],
-        expected,
-        as_draft=True,
+        pending_gates=["new-head checks"],
+        issue_request={**request, "existing_prs": [adopted]},
+    )
+
+    source = repo / "candidate.txt"
+    source.write_text("base\nowned head\ncorrection\nsecond correction\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-am", "second correction"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    latest = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    capture[1].update(candidate_sha=latest, expected_pr_head=candidate)
+    adopted["head_sha"] = latest
+    monkeypatch.setattr(
+        pub, "_run", closed_canonical_transport(github, closed_duplicate, latest)
+    )
+    third = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["latest-head checks"],
+        issue_request={**request, "existing_prs": [adopted]},
+    )
+
+    claimed = json.loads(
+        (capture[0] / "request.claimed.json").read_text(encoding="utf-8")
+    )
+    assert claimed["existing_prs"] == []
+    assert first["candidate_sha"] == expected
+    assert second["candidate_sha"] == candidate
+    assert third["candidate_sha"] == latest
+    assert third["number"] == first["number"] == 91
+    assert third["head_branch"] == first["head_branch"] == adopted_head
+    assert remote_head(remote, adopted_head) == latest
+    assert closed_duplicate["headRefOid"] == expected
+    pushes = [call for call in github.calls if call[:2] == ["git", "push"]]
+    assert [call[-1] for call in pushes] == [
+        f"{candidate}:refs/heads/{adopted_head}",
+        f"{latest}:refs/heads/{adopted_head}",
+    ]
+    assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
+
+
+def test_empty_capture_adoption_retry_after_lost_push_reply_is_idempotent(
+    capture, github, monkeypatch, tmp_path
+) -> None:
+    adopted_head = "contributor/approved-41"
+    repo, remote, expected, candidate = prepare_owned_head_graph(
+        tmp_path, capture, adopted_head
+    )
+    _, _, receipt = publisher_adopts_after_empty_capture(capture, github, repo, expected)
+    closed_duplicate = {
+        **github.pr,
+        "number": 92,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
+        "headRefName": pub._candidate_head(capture[1])[0],
+        "headRefOid": expected,
+        "body": f"<!-- maintainer-candidate:v1:{receipt['candidate_identity']} -->",
+        "state": "CLOSED",
+    }
+    lost = [True]
+    monkeypatch.setattr(
+        pub,
+        "_run",
+        closed_canonical_transport(
+            github, closed_duplicate, candidate, lose_push_reply=lost
+        ),
+    )
+    capture[1].update(candidate_sha=candidate, expected_pr_head=expected)
+
+    with pytest.raises(pub.PublicationError, match="lost acknowledgement"):
+        pub.advance_owned_head(
+            repo, capture[0], str(remote), capture[1], expected, as_draft=True
+        )
+    pub.advance_owned_head(
+        repo, capture[0], str(remote), capture[1], expected, as_draft=True
     )
 
     assert remote_head(remote, adopted_head) == candidate
-    assert github.pr["number"] == 91
-    assert github.pr["headRefOid"] == candidate
-    pushes = [call for call in github.calls if call[:2] == ["git", "push"]]
-    assert len(pushes) == 1
-    assert f"--force-with-lease=refs/heads/{adopted_head}:{expected}" in pushes[0]
-    assert pushes[0][-1] == f"{candidate}:refs/heads/{adopted_head}"
-    assert not any(call[1:3] in (["pr", "create"], ["pr", "ready"]) for call in github.calls)
+    assert json.loads(
+        (capture[0] / "pr-draft.json").read_text(encoding="utf-8")
+    )["candidate_sha"] == expected
+    assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
 
 
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
-        ("changed-request", "does not match its gate binding"),
-        ("foreign-adoption", "bound PR adoption evidence is invalid"),
-        ("malformed-adoption", "bound PR adoption evidence is invalid"),
-        ("symlinked-request", "missing its claimed request"),
-        ("ambiguous-adoption", "bound PR adoption evidence is ambiguous"),
-        ("changed-live-head", "bound adopted PR changed unexpectedly"),
+        ("malformed-receipt", "retained task draft is invalid"),
+        ("symlinked-receipt", "retained task draft path is unsafe"),
+        ("changed-receipt", "retained task draft does not bind"),
+        ("absent-receipt", "open expected base/head"),
+        ("foreign-canonical", "open expected base/head"),
+        ("changed-live-head", "conflicting implementing PR"),
         ("changed-live-base", "repository ownership changed"),
         ("foreign-live-owner", "repository ownership changed"),
         ("missing-live-marker", "expected request/base/candidate"),
-        ("unbound-closed-canonical", "open expected base/head"),
+        ("ambiguous-live-identity", "ambiguous implementing PRs"),
     ],
 )
-def test_invalid_or_unbound_adoption_refuses_before_remote_mutation(
+def test_unproven_empty_capture_adoption_refuses_before_remote_mutation(
     capture, github, monkeypatch, tmp_path, failure, message
 ) -> None:
     adopted_head = "contributor/approved-41"
     repo, remote, expected, candidate = prepare_owned_head_graph(
         tmp_path, capture, adopted_head
     )
-    adopted = {
-        "number": 91,
-        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
-        "base_branch": pub.BASE,
-        "head_branch": adopted_head,
-        "head_sha": expected,
-        "head_repository": pub.REPOSITORY,
-    }
-    if failure == "foreign-adoption":
-        adopted["head_repository"] = "someone-else/hermes-agent"
-    elif failure == "malformed-adoption":
-        adopted.pop("url")
-    adoptions = [] if failure == "unbound-closed-canonical" else [adopted]
-    if failure == "ambiguous-adoption":
-        adoptions.append({**adopted, "number": 93, "url": adopted["url"].replace("91", "93")})
-    bind_issue(capture, existing_prs=adoptions)
-    request_path = capture[0] / "request.claimed.json"
-    if failure == "changed-request":
-        request = json.loads(request_path.read_text(encoding="utf-8"))
-        request["existing_prs"][0]["head_branch"] = "changed/after-approval"
-        request_path.write_text(json.dumps(request), encoding="utf-8")
-    elif failure == "symlinked-request":
-        target = capture[0] / "untrusted-request.json"
-        target.write_text(request_path.read_text(encoding="utf-8"), encoding="utf-8")
-        request_path.unlink()
-        request_path.symlink_to(target)
-    marker = f"<!-- maintainer-candidate:v1:{pub._candidate_head(capture[1])[2]} -->"
-    github.pr = {
-        **review_pr(),
-        "number": 91,
-        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
-        "body": marker + "\n\nFixes #41",
-        "headRefName": adopted_head,
+    _, _, receipt = publisher_adopts_after_empty_capture(capture, github, repo, expected)
+    receipt_path = capture[0] / "pr-draft.json"
+    marker = f"<!-- maintainer-candidate:v1:{receipt['candidate_identity']} -->"
+    closed_duplicate = {
+        **github.pr,
+        "number": 92,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
+        "headRefName": pub._candidate_head(capture[1])[0],
         "headRefOid": expected,
-        "baseRefOid": capture[1]["base_sha"],
-        "isDraft": True,
+        "body": marker,
+        "state": "CLOSED",
     }
+    if failure == "malformed-receipt":
+        receipt_path.write_text("{", encoding="utf-8")
+    elif failure == "symlinked-receipt":
+        target = capture[0] / "untrusted-draft.json"
+        receipt_path.replace(target)
+        receipt_path.symlink_to(target)
+    elif failure == "changed-receipt":
+        changed = json.loads(receipt_path.read_text(encoding="utf-8"))
+        changed["candidate_identity"] = "f" * 64
+        receipt_path.write_text(json.dumps(changed), encoding="utf-8")
+    elif failure == "absent-receipt":
+        receipt_path.unlink()
+    elif failure == "foreign-canonical":
+        closed_duplicate["headRepositoryOwner"] = {"login": "someone-else"}
     if failure == "changed-live-head":
         github.pr["headRefOid"] = "f" * 40
     elif failure == "changed-live-base":
@@ -1023,18 +1133,18 @@ def test_invalid_or_unbound_adoption_refuses_before_remote_mutation(
         github.pr["headRepositoryOwner"] = {"login": "someone-else"}
     elif failure == "missing-live-marker":
         github.pr["body"] = "Fixes #41"
-    canonical_head = pub._candidate_head(capture[1])[0]
-    closed_duplicate = {
-        **github.pr,
-        "number": 92,
-        "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
-        "headRefName": canonical_head,
-        "headRefOid": expected,
-        "state": "CLOSED",
-    }
+    elif failure == "ambiguous-live-identity":
+        other = {
+            **github.pr,
+            "number": 93,
+            "url": f"https://github.com/{pub.REPOSITORY}/pull/93",
+            "headRefName": "other/approved-41",
+        }
+        github.issue_prs = [github.pr, other]
     monkeypatch.setattr(
         pub, "_run", closed_canonical_transport(github, closed_duplicate, candidate)
     )
+    capture[1].update(candidate_sha=candidate, expected_pr_head=expected)
 
     with pytest.raises(pub.PublicationError, match=message):
         pub.advance_owned_head(
