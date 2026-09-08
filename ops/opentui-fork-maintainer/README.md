@@ -254,11 +254,17 @@ uv run <runtime>/scripts/maintainer_runtime.py resume-publication --state <state
 ```
 
 An interrupted observer can retry that same command under the same still-live
-owner without renewing its deadline. After owner termination, retain the source
-reference and use a fresh wrapper-owned run. A post-CAS interruption instead uses
-the existing `finalize-success`/reconciler, never a second publication attempt.
-Missing/tampered artifacts, changed source/base or authorization fail closed.
-Do not use this path to ignore a genuine failed check or unresolved finding.
+owner without renewing its deadline. A fresh wrapper owner continuing a terminal
+prior owner also reuses its authenticated recovery attempt after observation is
+interrupted. If a fresh local check log from that attempt is missing or changed,
+only that eligible local check is recovered into another attempt: an intact
+original is copied again, otherwise its exact packet command is rerun. Changed
+review, visual, source, packet, request, worktree, or ownership evidence refuses
+the retry. Earlier sources and attempts remain immutable. After owner termination,
+retain the source reference and use a fresh wrapper-owned run. A post-CAS
+interruption instead uses the existing `finalize-success`/reconciler, never a
+second publication attempt. Do not use this path to ignore a genuine failed
+check or unresolved finding.
 
 Future PR identities bind task/revision and integration base, not the candidate
 hash or a scheduled owner's token. For a linear fix on an owned task PR, run the

@@ -145,9 +145,14 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    continuation. The same command also supports the still-live owner; it archives
    an in-place source manifest before recording the fresh attempt. It performs
    normal journaled publication/finalization on success. Never reset the old
-   lease or rewrite its outcome. On an observation interruption, retry under
-   the same live owner. After owner termination, use the existing request
-   recovery and a fresh wrapper run.
+   lease or rewrite its outcome. On an observation interruption, retry the exact
+   command under the same live owner. A fresh wrapper owner continuing a terminal
+   prior owner likewise reuses its authenticated recovery attempt; only a
+   missing or changed eligible local check creates another immutable attempt,
+   copying its intact original or rerunning its exact packet command when the
+   original is unusable. Changed review, visual, source, packet, request,
+   worktree, or owner evidence refuses reuse. After owner termination, use the
+   existing request recovery and a fresh wrapper run.
    Changed evidence/source/base is a refusal, not permission to silently rebuild.
    For future fix commits on a task-owned PR, use full gate-and-ship with
    `--expected-pr-head <verified-previous-head>`; changed source requires new review.

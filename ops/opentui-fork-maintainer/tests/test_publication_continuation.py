@@ -296,7 +296,7 @@ def test_recovery_rechecks_authorization_inside_ship_lock(retained, monkeypatch)
     monkeypatch.setattr(runtime, "ship_candidate", revoke_before_ship)
 
     with pytest.raises(
-        runtime.ControlError, match="publication recovery task changed"
+        runtime.ControlError, match="publication request authorization changed"
     ):
         runtime.main(f["args"])
 
@@ -360,6 +360,179 @@ def test_interrupted_observation_reuses_evidence_and_keeps_deadline(retained, mo
     monkeypatch.setattr(pub, "wait_for_review", observe)
     assert runtime.main(f["args"]) == 0
     assert remote_sha(f["repo"]) == f["candidate"]
+
+
+@pytest.mark.parametrize("regenerated", [False, True])
+@pytest.mark.parametrize("mutation", ["changed", "removed"])
+@pytest.mark.parametrize("window", ["observation", "ship-lock"])
+@pytest.mark.parametrize("owner", ["live-owner", "terminal-prior-owner"])
+def test_scheduled_resume_request_identity_is_bound_across_recovery(
+    scheduled_request, monkeypatch, regenerated, mutation, window, owner
+):
+    f, request = scheduled_request
+    owner_root = f["fresh"]
+    if owner == "live-owner":
+        owner_root = f["old"]
+        (f["fresh"] / "request.claimed.json").replace(
+            owner_root / "request.claimed.json"
+        )
+        write_json(
+            f["state"] / "run.lease.json",
+            {
+                "token": "test-token",
+                "expires_unix": 4_000_000_000,
+                "max_expires_unix": 4_000_000_000,
+                "run_id": owner_root.name,
+                "evidence_dir": str(owner_root),
+                "captured_base": f["base"],
+                "captured_upstream": f["base"],
+                "run_context_sha256": runtime._file_sha256(
+                    owner_root / "run-context.json"
+                ),
+            },
+        )
+        f["args"][f["args"].index("--token") + 1] = "test-token"
+        f["args"][f["args"].index("--manifest") + 1] = str(f["source"])
+    if regenerated:
+        (f["old"] / "gate-logs/focused-contracts.log").write_text(
+            "interrupted local evidence\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_execute_recovery_gate",
+            lambda _gate_id, _argv, output, _cwd: output.write_text(
+                "1 passed in 0.01s\n", encoding="utf-8"
+            ),
+        )
+
+    def mutate_request():
+        paths = (
+            owner_root / "request.claimed.json",
+            f["state"] / "run-request.inflight.json",
+        )
+        if mutation == "removed":
+            for path in paths:
+                path.unlink()
+        else:
+            for path in paths:
+                write_json(path, {**request, "pr": 81})
+
+    if window == "observation":
+        monkeypatch.setattr(
+            pub,
+            "candidate_checks",
+            lambda *_args: mutate_request() or green_checks(),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "ship_candidate",
+            lambda *_args, **_kwargs: pytest.fail(
+                "changed request reached the final ship boundary"
+            ),
+        )
+    else:
+        real_ship = runtime.ship_candidate
+
+        def mutate_inside_ship(*args, **kwargs):
+            mutate_request()
+            return real_ship(*args, **kwargs)
+
+        monkeypatch.setattr(runtime, "ship_candidate", mutate_inside_ship)
+
+    with pytest.raises(runtime.ControlError, match="authorization|request"):
+        runtime.main(f["args"])
+
+    assert remote_sha(f["repo"]) == f["base"]
+    assert not (owner_root / "request.consumed.json").exists()
+
+
+@pytest.mark.parametrize(
+    "fresh_fault",
+    [
+        "none",
+        "local-changed",
+        "local-missing",
+        "copied-local-changed",
+        "review-changed",
+        "visual-missing",
+        "source-changed",
+    ],
+)
+def test_terminal_recovery_retry_reuses_only_authenticated_fresh_evidence(
+    retained, monkeypatch, fresh_fault
+):
+    f = retained
+    (f["old"] / "gate-logs/focused-contracts.log").write_text(
+        "interrupted local evidence\n", encoding="utf-8"
+    )
+    (f["old"] / "gate-logs/opentui-check.log").write_text(
+        "interrupted second local evidence\n", encoding="utf-8"
+    )
+    original_bytes = {
+        str(path): path.read_bytes()
+        for path in f["old"].rglob("*")
+        if path.is_file()
+    }
+    executions = []
+
+    def execute(gate_id, _argv, output, _cwd):
+        executions.append(gate_id)
+        output.write_text("1 passed in 0.01s\n", encoding="utf-8")
+
+    monkeypatch.setattr(runtime, "_execute_recovery_gate", execute)
+    original_wait = pub.wait_for_review
+    monkeypatch.setattr(
+        pub,
+        "wait_for_review",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            pub.PublicationError("observation interrupted")
+        ),
+    )
+    with pytest.raises(runtime.ControlError, match="observation interrupted"):
+        runtime.main(f["args"])
+
+    first = runtime._load_gate(f["output"])
+    first_attempt = Path(first["publication_recovery"]["attempt_dir"])
+    targets = {
+        "local-changed": first_attempt / "focused-contracts.log",
+        "local-missing": first_attempt / "focused-contracts.log",
+        "copied-local-changed": first_attempt / "opentui-install.log",
+        "review-changed": first_attempt / "adversarial-review.log",
+        "visual-missing": first_attempt / "termctrl-smoke.log",
+        "source-changed": f["source"],
+    }
+    if fresh_fault.endswith("changed"):
+        targets[fresh_fault].write_text("changed fresh evidence\n", encoding="utf-8")
+    elif fresh_fault.endswith("missing"):
+        targets[fresh_fault].unlink()
+
+    monkeypatch.setattr(pub, "wait_for_review", original_wait)
+    if fresh_fault.startswith(("review", "visual", "source")):
+        with pytest.raises(
+            runtime.ControlError, match="evidence|recovery|review|manifest"
+        ):
+            runtime.main(f["args"])
+        assert executions == ["focused-contracts", "opentui-check"]
+        assert len(list(first_attempt.parent.glob("attempt-*"))) == 1
+        if fresh_fault == "source-changed":
+            assert f["source"].read_text(encoding="utf-8") == "changed fresh evidence\n"
+            f["source"].write_bytes(original_bytes[str(f["source"])])
+    else:
+        assert runtime.main(f["args"]) == 0
+        expected = 2 if "local" in fresh_fault else 1
+        assert executions == ["focused-contracts", "opentui-check"] + (
+            ["focused-contracts"] if fresh_fault.startswith("local") else []
+        )
+        attempts = list(first_attempt.parent.glob("attempt-*"))
+        assert len(attempts) == expected
+        assert first_attempt in attempts
+        assert "continuation" not in runtime._load_gate(f["output"])
+
+    assert {
+        str(path): path.read_bytes()
+        for path in f["old"].rglob("*")
+        if path.is_file()
+    } == original_bytes
 
 
 def test_owned_task_fix_is_fast_forward_and_retry_stable(retained, monkeypatch):
