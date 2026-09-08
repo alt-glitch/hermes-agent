@@ -366,7 +366,7 @@ def issue_publication_metadata(
             _safe_metadata_text(item)
     sections = [
         authored["outcome"].strip(),
-        f"Approved issue: #{request['issue']} ({request['issue_url']})",
+        f"Fixes #{request['issue']} ({request['issue_url']})",
     ]
     for heading, key in (
         ("Implementation", "implementation"),

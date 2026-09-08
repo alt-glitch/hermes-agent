@@ -1143,7 +1143,39 @@ def test_recovered_issue_reuses_candidate_pr_across_distinct_leases(
         len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
     ) == 1
     assert github.pr["body"].startswith("<!-- maintainer-candidate:v1:")
-    assert "Approved issue: #41" in github.pr["body"]
+    # Round-trip the exact generated body through real issue-scoped discovery.
+    # A descriptive link alone is not an implementing-PR reference.
+    intake = pub._issue_workflow()._issue_intake()
+
+    def discover(argv, _cwd):
+        endpoint = argv[-1]
+        if "/timeline" in endpoint:
+            return json.dumps([[{
+                "event": "cross-referenced",
+                "source": {"issue": {
+                    "number": first["number"],
+                    "pull_request": {},
+                    "repository_url": f"https://api.github.com/repos/{pub.REPOSITORY}",
+                    "body": github.pr["body"],
+                }},
+            }]])
+        assert endpoint == f"repos/{pub.REPOSITORY}/pulls/{first['number']}"
+        return json.dumps({
+            "number": first["number"],
+            "state": "open",
+            "body": github.pr["body"],
+            "html_url": first["url"],
+            "base": {"ref": pub.BASE},
+            "head": {
+                "ref": first_head,
+                "sha": second["candidate_sha"],
+                "repo": {"full_name": pub.REPOSITORY},
+            },
+        })
+
+    discovered = intake["live_existing_prs"](41, capture[0], runner=discover)
+    assert [item["number"] for item in discovered] == [first["number"]]
+    assert discovered[0]["head_sha"] == second["candidate_sha"]
     assert github.pr["body"].count("https://github.com/user-attachments/assets/") == 1
 
 
