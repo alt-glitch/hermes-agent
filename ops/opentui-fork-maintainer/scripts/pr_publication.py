@@ -1667,6 +1667,17 @@ def publish_draft(
     _validate_owned_base(pr, base)
     if pr.get("isDraft") is not True or _replace_status(pr["body"], status) != pr["body"]:
         raise PublicationError("task draft state was not acknowledged")
+    if issue is not None and reconciled is not None:
+        # Intake observed the old head before our push. Bind the adopted receipt
+        # to this verified readback so the next linear fix sees its actual owner.
+        issue = {**issue, "existing_prs": [{
+            "number": pr["number"],
+            "url": pr["url"],
+            "base_branch": pr["baseRefName"],
+            "head_branch": pr["headRefName"],
+            "head_sha": pr["headRefOid"],
+            "head_repository": REPOSITORY,
+        }]}
     proof = {
         "schema_version": 1,
         "status": "draft",

@@ -978,7 +978,8 @@ def test_publisher_adoption_after_empty_capture_advances_sequential_real_git_hea
         pub, "_run", closed_canonical_transport(github, closed_duplicate, candidate)
     )
     capture[1].update(candidate_sha=candidate, expected_pr_head=expected)
-    adopted["head_sha"] = candidate
+    # The runtime captures issue observations before advancing the remote head.
+    adopted["head_sha"] = expected
 
     second = pub.publish_draft(
         repo,
@@ -1004,7 +1005,7 @@ def test_publisher_adoption_after_empty_capture_advances_sequential_real_git_hea
         text=True,
     ).stdout.strip()
     capture[1].update(candidate_sha=latest, expected_pr_head=candidate)
-    adopted["head_sha"] = latest
+    adopted["head_sha"] = candidate
     monkeypatch.setattr(
         pub, "_run", closed_canonical_transport(github, closed_duplicate, latest)
     )
@@ -1023,6 +1024,8 @@ def test_publisher_adoption_after_empty_capture_advances_sequential_real_git_hea
     assert first["candidate_sha"] == expected
     assert second["candidate_sha"] == candidate
     assert third["candidate_sha"] == latest
+    for receipt in (first, second, third):
+        assert receipt["issue"]["existing_prs"][0]["head_sha"] == receipt["candidate_sha"]
     assert third["number"] == first["number"] == 91
     assert third["head_branch"] == first["head_branch"] == adopted_head
     assert remote_head(remote, adopted_head) == latest
