@@ -208,12 +208,18 @@ def yield_to_background_handler(
     if env_type != "local":
         return None
 
+    from tools.terminal_tool import get_session_cwd
+    starting_recorded_cwd = get_session_cwd(session_key)
+
     def _finalize_output(result: dict) -> None:
         """Run the local environment's normal marker cleanup after the adopted drain."""
         env._update_cwd(result)
         if record_cwd and result.get("cwd_observed"):
-            from tools.terminal_tool import record_session_cwd
-            record_session_cwd(session_key, result.get("cwd") or getattr(env, "cwd", None))
+            from tools.terminal_tool import record_session_cwd_if_unchanged
+            record_session_cwd_if_unchanged(
+                session_key, starting_recorded_cwd,
+                result.get("cwd") or getattr(env, "cwd", None),
+            )
 
     def _handler(proc, output_so_far: str) -> dict:
         from tools.process_registry import process_registry

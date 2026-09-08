@@ -717,18 +717,19 @@ def _invoke_agent(
 
 def _absorb_turn_result(
     sid: str, session: dict, st: _TurnRun, text: Any, display_kind: str | None, display_metadata
-) -> str | None:
-    """Stamp, restore /moa, commit history, re-sync the session key; returns the history warning."""
+) -> tuple[str | None, bool]:
+    """Stamp and commit history; return its warning and synthetic-row durability."""
     result, agent = st.result, st.agent
+    display_persisted = display_kind is None
     if display_kind and isinstance(text, str):
         # Post-turn fallback stamp of a synthesized turn's display kind (DB row + result).
         db = getattr(agent, "_session_db", None)
         current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
         if db is not None:
             try:
-                db.set_latest_matching_message_display_kind(
+                display_persisted = bool(db.set_latest_matching_message_display_kind(
                     current_session_id, role="user", content=text, display_kind=display_kind,
-                    display_metadata=display_metadata)
+                    display_metadata=display_metadata))
             except Exception:
                 logger.debug("failed to stamp synthetic display kind", exc_info=True)
         if isinstance(result, dict) and isinstance(result.get("messages"), list):
@@ -775,7 +776,7 @@ def _absorb_turn_result(
         # Fix for #20001.
         _sync_session_key_after_compress(
             sid, session, clear_pending_title=False, restart_slash_worker=True)
-    return status_note
+    return status_note, display_persisted
 
 
 def _complete_turn_payload(
@@ -1012,16 +1013,16 @@ def _run_prompt_submit(
         st.marker_key = _record_turn_marker(session, text)
         goal_followup = None
         loop_claim_settled = False
-        history_committed = False
+        history_commit_reported = False
         try:
             prompt, run_message, cols, streamer = _prepare_turn_input(sid, session, st, text, images)
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata)
-            status_note = _absorb_turn_result(
+            status_note, history_committed = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
-            history_committed = True
-            _report_history_commit(history_commit_callback, True)
+            _report_history_commit(history_commit_callback, history_committed)
+            history_commit_reported = True
             payload, raw, status = _complete_turn_payload(sid, session, st, status_note, cols)
             _emit("message.complete", sid, payload)
             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
@@ -1071,7 +1072,7 @@ def _run_prompt_submit(
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
         _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
-        if not history_committed:
+        if not history_commit_reported:
             _report_history_commit(history_commit_callback, False)
     run_thread = threading.Thread(target=run, daemon=True)
     with _sessions_lock:

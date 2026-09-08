@@ -1178,12 +1178,17 @@ class ProcessRegistry:
         """Move a session from running to finished.
         Idempotent: kill_process() and the reader thread can both call this; only
         the FIRST move enqueues the completion notification, so no duplicates."""
-        with self._lock:
-            was_running = self._running.pop(session.id, None) is not None
+        # The session lock is the finalization/read fence.  Publish the object in
+        # ``_finished`` while holding it, then release the registry lock before
+        # invoking environment cleanup: unrelated process lookups must not wait on
+        # CWD-marker parsing, while readers of this session wait in ``get()``.
+        with session._lock:
+            with self._lock:
+                was_running = self._running.pop(session.id, None) is not None
+                self._finished[session.id] = session
             if was_running and session._output_finalizer is not None:
                 finalizer, session._output_finalizer = session._output_finalizer, None
-                with session._lock:
-                    result = {"output": session.output_buffer}
+                result = {"output": session.output_buffer}
                 try:
                     finalizer(result)
                 except Exception:
@@ -1192,14 +1197,9 @@ class ProcessRegistry:
                     # before its completion event/checkpoint is published.
                     logger.exception("Process output finalizer failed for %s", session.id)
                 finally:
-                    with session._lock:
-                        # Apply any cleanup completed before a later bookkeeping
-                        # failure, then preserve the registry's retention contract.
-                        session.output_buffer = str(result.get("output") or "")[-session.max_output_chars:]
-            # Public lookup paths hold this same lock. Publish the terminal
-            # marker only after the environment finalizer has removed any
-            # private transport bookkeeping from retained output.
-            self._finished[session.id] = session
+                    # Apply any cleanup completed before a later bookkeeping
+                    # failure, then preserve the registry's retention contract.
+                    session.output_buffer = str(result.get("output") or "")[-session.max_output_chars:]
         session._completion_event.set()
         self._write_checkpoint()
         if was_running and session.notify_on_complete:
@@ -1431,7 +1431,14 @@ class ProcessRegistry:
         short hashes); ambiguous or too-short prefixes resolve to None, never a guess."""
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
-        return self._refresh_detached_session(session if session is not None else self._resolve_prefix(session_id))
+        session = session if session is not None else self._resolve_prefix(session_id)
+        if session is not None:
+            # A finishing session is already addressable so exact/prefix lookup
+            # remains stable, but its environment-private output is not readable
+            # until the per-session finalizer releases this fence.
+            with session._lock:
+                pass
+        return self._refresh_detached_session(session)
 
     def _resolve_prefix(self, session_id: str) -> Optional[ProcessSession]:
         """Resolve a unique session-ID prefix (a bare hex tail is normalized to
@@ -1822,30 +1829,31 @@ class ProcessRegistry:
             ]
         result = []
         for s in all_sessions:
-            entry = {
-                "session_id": s.id,
-                "command": s.command[:200],
-                "cwd": s.cwd,
-                "pid": s.pid,
-                "owner_task_id": s.owner_task_id or s.task_id,
-                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(s.started_at)),
-                "uptime_seconds": int(time.time() - s.started_at),
-                "status": "exited" if s.exited else "running",
-                "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
-            }
-            # Flag processes surfaced only because they share the gateway session (not the current task) —
-            # these are the long-lived background processes a user may have forgotten about (#29177).
-            if task_id and session_key and s.task_id != task_id and s.session_key == session_key:
-                entry["session_scoped"] = True
-            # Trigger metadata for goal-loop judges (a watcher may never exit).
-            if s.watch_patterns and not s._watch_disabled:
-                entry.update(watch_patterns=list(s.watch_patterns), watch_hit=s._watch_hits > 0)
-            if s.notify_on_complete:
-                entry["notify_on_complete"] = True
-            if s.exited:
-                entry["exit_code"] = s.exit_code
-            if s.detached:
-                entry["detached"] = True
+            with s._lock:
+                entry = {
+                    "session_id": s.id,
+                    "command": s.command[:200],
+                    "cwd": s.cwd,
+                    "pid": s.pid,
+                    "owner_task_id": s.owner_task_id or s.task_id,
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(s.started_at)),
+                    "uptime_seconds": int(time.time() - s.started_at),
+                    "status": "exited" if s.exited else "running",
+                    "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
+                }
+                # Flag processes surfaced only because they share the gateway session (not the current task) —
+                # these are the long-lived background processes a user may have forgotten about (#29177).
+                if task_id and session_key and s.task_id != task_id and s.session_key == session_key:
+                    entry["session_scoped"] = True
+                # Trigger metadata for goal-loop judges (a watcher may never exit).
+                if s.watch_patterns and not s._watch_disabled:
+                    entry.update(watch_patterns=list(s.watch_patterns), watch_hit=s._watch_hits > 0)
+                if s.notify_on_complete:
+                    entry["notify_on_complete"] = True
+                if s.exited:
+                    entry["exit_code"] = s.exit_code
+                if s.detached:
+                    entry["detached"] = True
             result.append(entry)
         return result
 

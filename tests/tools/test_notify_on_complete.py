@@ -159,6 +159,35 @@ class TestCompletionQueue:
         mover.start()
         assert finalizer_started.wait(2)
 
+        # Finalizing one process must not hold the registry-wide lookup lock.
+        other = _make_session(sid="proc_unrelated", output="other", exited=True, exit_code=0)
+        registry._finished[other.id] = other
+        unrelated_done = threading.Event()
+        unrelated_result = {}
+
+        def read_unrelated():
+            unrelated_result.update(registry.read_log(other.id))
+            unrelated_done.set()
+
+        unrelated_reader = threading.Thread(target=read_unrelated)
+        unrelated_reader.start()
+        assert unrelated_done.wait(2)
+        unrelated_reader.join(2)
+        assert unrelated_result["output"] == "other"
+
+        append_entered = threading.Event()
+        append_done = threading.Event()
+
+        def append_tail():
+            append_entered.set()
+            registry._ingest_output(s, "\nTAIL")
+            append_done.set()
+
+        appender = threading.Thread(target=append_tail)
+        appender.start()
+        assert append_entered.wait(2)
+        assert not append_done.wait(0.05)
+
         entered = {name: threading.Event() for name in ("poll", "log", "kill")}
         results = {}
 
@@ -178,14 +207,17 @@ class TestCompletionQueue:
 
         release_finalizer.set()
         mover.join(2)
+        appender.join(2)
         for reader in readers:
             reader.join(2)
         assert not mover.is_alive()
+        assert not appender.is_alive()
         assert all(not reader.is_alive() for reader in readers)
         assert "PRIVATE-MARKER" not in json.dumps(results)
-        assert results["poll"]["output_preview"] == "retained"
-        assert results["log"]["output"] == "retained"
-        assert results["kill"]["output"] == "retained"
+        assert results["poll"]["output_preview"].startswith("retained")
+        assert results["log"]["output"].startswith("retained")
+        assert results["kill"]["output"].startswith("retained")
+        assert registry.read_log(s.id)["output"] == "retained\nTAIL"
 
     def test_kill_returns_environment_finalized_output(self, registry, monkeypatch):
         """An explicit kill observes the same cleaned buffer as log/notification consumers."""

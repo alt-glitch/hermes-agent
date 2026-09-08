@@ -7,6 +7,8 @@ use the legacy env.cwd ladder; these tests pin the invariants the later
 read-side flip will rely on.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 import tools.terminal_tool as tt
@@ -93,6 +95,49 @@ class TestPostCommandDualWrite:
         result = self._run(monkeypatch, "sess-a", FakeEnv())
         assert result["exit_code"] == 0
         assert tt.get_session_cwd("sess-a") is None
+
+
+@pytest.mark.parametrize("newer_foreground_update", [False, True])
+def test_yielded_finalizer_keeps_cwd_ownership_and_cleans_output(
+    tmp_path, monkeypatch, newer_foreground_update,
+):
+    from tools.process_registry import ProcessSession, process_registry
+    from tools.terminal_tool_background import yield_to_background_handler
+
+    start = tmp_path / "start"
+    observed = tmp_path / "observed"
+    newer = tmp_path / "newer"
+    for path in (start, observed, newer):
+        path.mkdir()
+
+    key = "yielded-cwd-owner"
+    tt.record_session_cwd(key, str(start))
+    captured = {}
+
+    class Cleanup:
+        cwd = str(observed)
+
+        def _update_cwd(self, result):
+            result.update(output="cleaned", cwd=str(observed), cwd_observed=True)
+
+    def adopt(_proc, **kwargs):
+        captured.update(kwargs)
+        return ProcessSession(id="proc_yielded_cwd", command="fixture")
+
+    monkeypatch.setattr(process_registry, "adopt_local", adopt)
+    handler = yield_to_background_handler(
+        command="fixture", env_type="local", cwd=str(start),
+        effective_task_id=key, task_id=key, session_key=key, env=Cleanup(),
+    )
+    handler(SimpleNamespace(pid=12345), "PRIVATE-MARKER")
+    if newer_foreground_update:
+        tt.record_session_cwd(key, str(newer))
+
+    result = {"output": "PRIVATE-MARKER"}
+    captured["output_finalizer"](result)
+
+    assert result["output"] == "cleaned"
+    assert tt.get_session_cwd(key) == str(newer if newer_foreground_update else observed)
 
 
 class TestFileToolsReadTheRecord:

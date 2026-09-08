@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from hermes_state import SessionDB
 from tools import async_delegation
 from tools.process_registry import process_registry
 from tui_gateway import server
@@ -116,6 +117,91 @@ def test_admitted_event_retries_after_history_failure_without_a_second_card(
         event, "synthetic result", "live-notification")
     assert "display_notification" in server._notification_turn_display(
         event, "synthetic result", "resumed-notification")
+
+
+@pytest.mark.parametrize("stamp_outcome", ["success", False, "exception"])
+def test_history_receipt_requires_a_durable_synthetic_row(
+    monkeypatch, tmp_path, session, stamp_outcome,
+):
+    event = {
+        "type": "completion", "session_id": "synthetic-process",
+        "origin_ui_session_id": "live-notification", "command": "echo synthetic", "exit_code": 0,
+    }
+    registry = SimpleNamespace(completion_queue=queue.Queue(), is_completion_consumed=lambda _sid: False)
+    monkeypatch.setattr(process_registry, "completion_queue", registry.completion_queue)
+    complete, release = Mock(), Mock()
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: "delivery-claim")
+    monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", release)
+
+    class ControlledHistory:
+        def set_latest_matching_message_display_kind(self, *_args, **_kwargs):
+            if stamp_outcome == "exception":
+                raise RuntimeError("synthetic persistence failure")
+            return False
+
+    db = None
+    history = ControlledHistory()
+    if stamp_outcome == "success":
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(session["session_key"], source="tui", model="fixture-model")
+        history = db
+    agent = SimpleNamespace(
+        interim_assistant_callback=None, session_id=session["session_key"], _session_db=history,
+    )
+    session.update({"agent": agent, "attached_images": [], "history": [], "history_version": 0})
+    monkeypatch.setattr(server, "_sessions", {"live-notification": session})
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: None)
+    monkeypatch.setattr(server, "_record_turn_marker", lambda *_: "")
+
+    def prepare(_sid, owned_session, st, text, _images):
+        st.history = list(owned_session["history"])
+        st.history_version = owned_session["history_version"]
+        return text, text, 80, None
+
+    def invoke(_sid, _session, st, prompt, *_args):
+        if db is not None:
+            db.append_message(session["session_key"], "user", prompt)
+        st.result = {
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "synthetic response"},
+            ],
+            "final_response": "synthetic response",
+        }
+
+    monkeypatch.setattr(server, "_prepare_turn_input", prepare)
+    monkeypatch.setattr(server, "_invoke_agent", invoke)
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_complete_turn_payload", lambda *_: ({}, "", "complete"))
+    monkeypatch.setattr(server, "_goal_followup_after_turn", lambda *_: None)
+    monkeypatch.setattr(server, "_settle_loop_claim", lambda *_: None)
+    monkeypatch.setattr(server, "_after_complete_turn", lambda *_: None)
+    monkeypatch.setattr(server, "_publish_session_control_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_finish_turn", lambda *_: None)
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_: None)
+    monkeypatch.setattr(server, "_run_post_turn_followups", lambda *_: None)
+
+    emitted = set()
+    assert server._notif_handle_event(
+        "live-notification", session, event, emitted, registry, lambda _event: "synthetic result", [],
+    ) is True
+    session["_run_thread"].join(2)
+    assert not session["_run_thread"].is_alive()
+
+    if db is not None:
+        complete.assert_called_once_with(event, "delivery-claim")
+        release.assert_not_called()
+        assert registry.completion_queue.empty()
+        [persisted] = db.get_messages_as_conversation(session["session_key"])
+        assert persisted["display_kind"] == "process_complete"
+        db.close()
+    else:
+        assert release.call_count == 1
+        assert release.call_args.args == (event, "delivery-claim")
+        complete.assert_not_called()
+        assert registry.completion_queue.get_nowait() is event
+        assert registry.completion_queue.empty()
 
 
 @pytest.mark.parametrize("outcome", [False, "exception"])

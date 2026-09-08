@@ -259,6 +259,26 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
             _session_cwd[key] = cwd
 
 
+def record_session_cwd_if_unchanged(
+    session_key: Optional[str], expected_cwd: Optional[str], cwd: Optional[str],
+) -> bool:
+    """Record an observed cwd only while the command still owns the session's cwd.
+
+    A yielded command completes after later foreground commands are allowed to run.
+    Comparing and writing under the existing store lock prevents that older result
+    from overwriting the later command's cwd.  ``None`` is a real expected state so
+    a recordless, uncontested command may establish the first record.
+    """
+    if not isinstance(cwd, str) or not cwd.strip():
+        return False
+    key = str(session_key or "default")
+    with _session_cwd_lock:
+        if _session_cwd.get(key) != expected_cwd:
+            return False
+        _session_cwd[key] = cwd
+        return True
+
+
 def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
     """Recorded cwd for *session_key*, or None. No fallback chain on purpose:
     callers decide what an absent record means. None/empty keys read ``"default"``."""
