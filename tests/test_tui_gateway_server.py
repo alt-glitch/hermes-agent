@@ -21270,20 +21270,36 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     """Distinct watch matches from one process emit; exact replay is deduped."""
     import queue as _queue_mod
 
+    from tools import async_delegation
     from tools.process_registry import process_registry
 
     turns = []
     emitted = []
+    history_commits = []
+    acknowledged = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, *, history_commit_callback):
         turns.append(text)
+        outcome = server._HistoryCommitOutcome(
+            display_persisted=True,
+            history_retained=False,
+            invocation_started=True,
+        )
+        history_commits.append(outcome)
+        history_commit_callback(outcome)
         with session["history_lock"]:
             session["running"] = False
+        return True
 
     sess = _session()
     server._sessions["sid_watch_dedup"] = sess
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
     monkeypatch.setattr(server, "_run_prompt_submit", _fake_run_prompt_submit)
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_event_delivery",
+        lambda event, claim: acknowledged.append((event, claim)),
+    )
 
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
@@ -21311,6 +21327,15 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         assert "READY on port 8000" in status_text
         assert "READY on port 9000" in status_text
         assert len(turns) == 3
+        assert len(history_commits) == 3
+        assert all(outcome.delivery_succeeded for outcome in history_commits)
+        assert len(acknowledged) == 3
+        assert all(claim == "" for _, claim in acknowledged)
+        assert [event["output"] for event, _ in acknowledged] == [
+            "READY on port 8000",
+            "READY on port 9000",
+            "READY on port 8000",
+        ]
     finally:
         server._sessions.pop("sid_watch_dedup", None)
         while not process_registry.completion_queue.empty():
