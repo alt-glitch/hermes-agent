@@ -3641,7 +3641,8 @@ def validate_retained_gate(
     ):
         raise ControlError("continuation must reference a different retained run")
     root = source.parent
-    for key in ("manifest", "packet", "context", "outcome", "pr"):
+    publication_key = _publication_receipt_key(receipt)
+    for key in ("manifest", "packet", "context", "outcome", publication_key):
         path = _evidence_path(receipt[f"{key}_path"], root, label=f"retained {key}")
         if _file_sha256(path) != receipt[f"{key}_sha256"]:
             raise ControlError(f"retained {key} changed")
@@ -3699,6 +3700,21 @@ def validate_retained_gate(
     return original
 
 
+def _publication_receipt_key(receipt: dict[str, Any]) -> str:
+    """Select one authenticated publisher artifact; absence is never approval."""
+    present = []
+    for key in ("pr", "draft"):
+        fields = {f"{key}_path", f"{key}_sha256"}
+        overlap = fields & set(receipt)
+        if overlap and overlap != fields:
+            raise ControlError("publication recovery evidence binding is invalid")
+        if overlap:
+            present.append(key)
+    if len(present) != 1:
+        raise ControlError("publication recovery evidence binding is invalid")
+    return present[0]
+
+
 def _publication_recovery_source(
     repo: Path,
     receipt: dict[str, Any],
@@ -3716,7 +3732,8 @@ def _publication_recovery_source(
         or (owner == "live-owner") != (source_root == evidence_root)
     ):
         raise ControlError("publication recovery source directory is unsafe")
-    for key in ("manifest", "packet", "context", "pr"):
+    publication_key = _publication_receipt_key(receipt)
+    for key in ("manifest", "packet", "context", publication_key):
         path = _evidence_path(receipt[f"{key}_path"], source_root, label=f"recovery {key}")
         if _file_sha256(path) != receipt[f"{key}_sha256"]:
             raise ControlError(f"publication recovery {key} changed")
@@ -4090,8 +4107,16 @@ def resume_publication(
             "manifest": safe_source,
             "packet": safe_packet,
             "context": source_root / "run-context.json",
-            "pr": source_root / "pr-evidence.json",
         }
+        pr_path = source_root / "pr-evidence.json"
+        # A present-but-invalid PR artifact must be refused, not reclassified as
+        # an eligible missing artifact. Only genuine absence selects the draft.
+        publication_key = (
+            "pr" if pr_path.exists() or pr_path.is_symlink() else "draft"
+        )
+        paths[publication_key] = source_root / (
+            "pr-evidence.json" if publication_key == "pr" else "pr-draft.json"
+        )
         if source_root != root:
             paths["outcome"] = source_root / "run-outcome.json"
         for key, candidate_path in paths.items():
@@ -4113,14 +4138,17 @@ def resume_publication(
             ).parent
             archived_manifest = _safe_output_path(archive_root, "gate.json")
             archived_packet = _safe_output_path(archive_root, "gate-packet.json")
-            archived_pr = _safe_output_path(archive_root, "pr-evidence.json")
+            archived_publication = _safe_output_path(
+                archive_root,
+                "pr-evidence.json" if publication_key == "pr" else "pr-draft.json",
+            )
             for original_path, archived_path, expected in (
                 (source, archived_manifest, source_sha256),
                 (packet, archived_packet, packet_sha256),
                 (
-                    Path(receipt["pr_path"]),
-                    archived_pr,
-                    receipt["pr_sha256"],
+                    Path(receipt[f"{publication_key}_path"]),
+                    archived_publication,
+                    receipt[f"{publication_key}_sha256"],
                 ),
             ):
                 if archived_path.exists():
@@ -4133,8 +4161,14 @@ def resume_publication(
                 manifest_sha256=_file_sha256(archived_manifest),
                 packet_path=str(archived_packet),
                 packet_sha256=_file_sha256(archived_packet),
-                pr_path=str(archived_pr),
-                pr_sha256=_file_sha256(archived_pr),
+            )
+            receipt.update(
+                {
+                    f"{publication_key}_path": str(archived_publication),
+                    f"{publication_key}_sha256": _file_sha256(
+                        archived_publication
+                    ),
+                }
             )
         retry_manifest = None
         if source != manifest_path and manifest_path.exists():
@@ -4258,7 +4292,9 @@ def resume_publication(
         cwd=cwd,
         recorded_worktree=Path(cleanup_ownership["worktree"]),
     )
-    _revalidate_issue_request(state_dir, root, token, candidate_sha=original["candidate_sha"])
+    issue_request = _revalidate_issue_request(
+        state_dir, root, token, candidate_sha=original["candidate_sha"]
+    )
     publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
     # Write provenance before observation so a killed observer remains auditable.
     if recovered:
@@ -4272,12 +4308,19 @@ def resume_publication(
         }
         _atomic_json(manifest_path, result)
     try:
+        publication_key = _publication_receipt_key(receipt)
         proof = publisher["resume_preview"](
             root,
             source,
             preview_manifest,
             number=number,
             deadline_unix=deadline,
+            publication_source=Path(receipt[f"{publication_key}_path"]),
+            publication_sha256=receipt[f"{publication_key}_sha256"],
+            repo=repo,
+            node=NODE26,
+            remote=remote,
+            issue_request=issue_request,
         )
     except (RuntimeError, ValueError, KeyError, OSError) as exc:
         raise ControlError(f"PR continuation refused: {exc}") from exc

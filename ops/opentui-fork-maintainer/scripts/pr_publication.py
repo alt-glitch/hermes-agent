@@ -903,15 +903,23 @@ def wait_for_review(
 def resume_preview(
     root: Path, source: Path, manifest: dict[str, Any], *,
     number: int, deadline_unix: int,
+    publication_source: Path | None = None,
+    publication_sha256: str | None = None,
+    repo: Path | None = None,
+    node: Path | None = None,
+    remote: str = "origin",
+    issue_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Observe an explicitly adopted PR, without pushing, editing or uploading.
+    """Resume an explicitly adopted PR without pushing its head or creating a PR.
+
+    Bound PR evidence is observation-only. Bound draft evidence re-enters the
+    existing publisher to finish its interrupted attachment and ready boundary.
 
     PR81 predates ownership markers. Its exception is an exact, operator-reviewed
     manifest/packet/PR tuple, not permission to adopt arbitrary legacy PRs.
     """
     manifest_root = root if "publication_recovery" in manifest else source.parent
     _, digest, dimensions = preview(manifest_root, manifest)
-    proof = json.loads((source.parent / "pr-evidence.json").read_text(encoding="utf-8"))
     head, _, identity = _candidate_head(manifest)
     marker = f"<!-- maintainer-candidate:v1:{identity} -->"
     legacy = (
@@ -927,6 +935,79 @@ def resume_preview(
         marker = (
             f"Automated OpenTUI maintenance candidate `{manifest['candidate_sha']}` "
             f"from `{manifest['base_sha']}`."
+        )
+    publication_path = publication_source or source.parent / "pr-evidence.json"
+    if (
+        publication_path.is_symlink()
+        or not publication_path.is_file()
+        or not publication_path.resolve().is_relative_to(source.parent.resolve())
+        or publication_path.name not in {"pr-evidence.json", "pr-draft.json"}
+        or (
+            publication_sha256 is not None
+            and _hash(publication_path) != publication_sha256
+        )
+    ):
+        raise PublicationError("retained publication evidence changed")
+    try:
+        publication = json.loads(publication_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PublicationError("retained publication evidence is invalid") from exc
+    if publication_path.name == "pr-evidence.json":
+        proof = publication
+    else:
+        _, request_identity, candidate_identity = _candidate_head(manifest)
+        expected_draft = {
+            "schema_version": 1,
+            "status": "draft",
+            "repository": REPOSITORY,
+            "base_branch": BASE,
+            "base_sha": manifest["base_sha"],
+            "candidate_sha": manifest["candidate_sha"],
+            "head_branch": head,
+            "number": number,
+            "url": f"https://github.com/{REPOSITORY}/pull/{number}",
+            "request_identity": request_identity,
+            "candidate_identity": candidate_identity,
+        }
+        if (
+            not isinstance(publication, dict)
+            or any(publication.get(key) != value for key, value in expected_draft.items())
+            or not isinstance(publication.get("passed"), list)
+            or not isinstance(publication.get("pending"), list)
+            or not publication["pending"]
+        ):
+            raise PublicationError("retained draft evidence does not match explicit adoption")
+        pr = json.loads(
+            _run(
+                [
+                    str(GH),
+                    "pr",
+                    "view",
+                    str(number),
+                    "--repo",
+                    REPOSITORY,
+                    "--json",
+                    FIELDS + OWNERSHIP_FIELDS,
+                ],
+                root,
+            )
+        )
+        _validate_pr(pr, head, manifest["candidate_sha"], marker)
+        _validate_owned_base(pr, manifest["base_sha"])
+        if repo is None or node is None:
+            raise PublicationError(
+                "missing draft recovery requires the existing publisher"
+            )
+        return publish_preview(
+            repo,
+            root,
+            manifest,
+            node=node,
+            remote=remote,
+            review_deadline_unix=deadline_unix,
+            issue_request=issue_request,
+            _existing_draft=publication,
+            _preview_root=manifest_root,
         )
     expected = {
         "repository": REPOSITORY, "base_branch": BASE,
@@ -1441,6 +1522,8 @@ def publish_preview(
     remote: str = "origin",
     review_deadline_unix: int | None = None,
     issue_request: dict[str, Any] | None = None,
+    _existing_draft: dict[str, Any] | None = None,
+    _preview_root: Path | None = None,
 ) -> dict[str, Any]:
     """Idempotently create the candidate PR and attach one proven synthetic PNG.
 
@@ -1448,7 +1531,7 @@ def publish_preview(
     owns the target-ref CAS, after this function returns verified evidence.
     """
     root = root.resolve()
-    png, digest, dimensions = preview(root, manifest)
+    png, digest, dimensions = preview(_preview_root or root, manifest)
     if manifest.get("branch") != BASE:
         raise PublicationError("PR publication only supports the OpenTUI fork branch")
     version = _run([str(GH), "--version"], root)
@@ -1460,7 +1543,9 @@ def publish_preview(
         raise PublicationError(
             "installed before-and-after formatter changed; revalidate it"
         )
-    destination = _publication_destination(repo, remote)
+    destination = (
+        None if _existing_draft is not None else _publication_destination(repo, remote)
+    )
     candidate, base = manifest["candidate_sha"], manifest["base_sha"]
     head, request_identity, candidate_identity = _candidate_head(manifest)
     candidate_marker = f"<!-- maintainer-candidate:v1:{candidate_identity} -->"
@@ -1481,16 +1566,42 @@ def publish_preview(
     )
     gh = [str(GH), "pr"]
     options = ["--repo", REPOSITORY]
+    if _existing_draft is not None and manifest.get("expected_pr_head") is not None:
+        raise PublicationError("existing-draft recovery cannot advance a PR head")
     if manifest.get("expected_pr_head") is not None:
+        assert destination is not None
         advance_owned_head(repo, root, destination, manifest, manifest["expected_pr_head"])
 
     # Reuse or refuse a competing implementing PR before pushing our own branch,
     # so a PR that appeared after the caller's snapshot leaves no dangling ref.
-    reconciled = _reconcile_live_issue_pr(workflow, issue, candidate, root=root)
-    if reconciled is not None:
+    reconciled = None
+    if _existing_draft is not None:
+        head = _existing_draft["head_branch"]
+        prs = [
+            json.loads(
+                _run(
+                    gh
+                    + [
+                        "view",
+                        str(_existing_draft["number"]),
+                        *options,
+                        "--json",
+                        FIELDS + OWNERSHIP_FIELDS,
+                    ],
+                    root,
+                )
+            )
+        ]
+        reconciled = prs[0]
+    else:
+        reconciled = _reconcile_live_issue_pr(
+            workflow, issue, candidate, root=root
+        )
+    if _existing_draft is None and reconciled is not None:
         head = reconciled["headRefName"]
         prs = [reconciled]
-    else:
+    elif _existing_draft is None:
+        assert destination is not None
         ref = f"refs/heads/{head}"
         existing = _run(["git", "ls-remote", destination, ref], repo).strip()
         if existing and existing.split() != [candidate, ref]:
@@ -1592,13 +1703,40 @@ def publish_preview(
         }
     pr = {**pr, "body": _replace_status(pr["body"], verified_status)}
     identity = f"<!-- maintainer-preview:{candidate}:{digest} -->"
-    published = _published_block(pr["body"], identity)
+    # A draft receipt does not authenticate any attachment URL already in the
+    # live body. Republish the hash-bound source through the verified formatter.
+    published = (
+        None
+        if _existing_draft is not None
+        else _published_block(pr["body"], identity)
+    )
     if published is None:
+        upload_png = png
+        if not png.is_relative_to(root):
+            folder = root / "termctrl-verified"
+            if folder.is_symlink():
+                raise PublicationError("publication state must not be a symlink")
+            folder.mkdir(exist_ok=True)
+            upload_png = folder / "accepted.png"
+            if upload_png.is_symlink():
+                raise PublicationError("publication state must not be a symlink")
+            if upload_png.exists() and _hash(upload_png) != digest:
+                raise PublicationError("staged Preview evidence changed")
+            if not upload_png.exists():
+                fd, name = tempfile.mkstemp(dir=folder, prefix=".preview-")
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(png.read_bytes())
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(name, upload_png)
+                finally:
+                    Path(name).unlink(missing_ok=True)
         formatter = [
             str(node),
             str(FORMATTER),
             "--after",
-            str(png),
+            str(upload_png),
             "--label",
             "Synthetic startup/help regression proof",
         ]
@@ -1616,7 +1754,7 @@ def publish_preview(
         block = block.replace(START, START + "\n" + identity, 1)
         _write(root / "pr-body.md", _replace(pr["body"], block))
         # Revalidate bytes immediately before the upload boundary.
-        preview(root, manifest)
+        preview(_preview_root or root, manifest)
         _run(
             gh
             + [

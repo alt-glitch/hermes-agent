@@ -236,6 +236,16 @@ worktree against its original evidence directory; the fresh owner's evidence
 directory never substitutes for that owner, and sibling paths, symlinks, dirty
 or branch-attached worktrees remain refused.
 
+If publication stopped after the exact task draft and all local gates passed but
+before `pr-evidence.json` was written, genuine absence of that file may instead
+bind the retained `pr-draft.json`. The publisher reconstructs the missing local
+evidence only after matching the draft's request/base/candidate/PR identity to the
+live owned head. It republishes the Preview from the hash-bound retained source
+through the verified formatter, then observes dispositions and current-head CI.
+A present but invalid PR evidence file, a changed draft or source artifact,
+pending/failed CI, or a missing disposition still refuses publication; none of
+these absences counts as approval.
+
 For a retained scheduled sync, submit a bounded `mode: resume` request through
 `submit-request`, then dispatch the existing job. The checked-in
 `pr81-continuation-request.json` pins the explicitly authorized legacy PR81

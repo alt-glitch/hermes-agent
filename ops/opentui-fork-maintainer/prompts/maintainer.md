@@ -157,6 +157,13 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    its recovery manifest and publication journal; finalization validates cleanup
    against that original owner, never the fresh run root. Sibling paths,
    symlinks, dirty worktrees and branch-attached worktrees remain refusals.
+   When the publisher stopped after the exact task draft and local gates but
+   before writing `pr-evidence.json`, the continuation may bind the task-owned
+   `pr-draft.json` only if PR evidence is genuinely absent. The existing publisher
+   must re-prove the live draft's request/base/head/marker, republish the Preview
+   from its hash-bound retained source, then observe dispositions and current-head
+   CI normally. Missing draft, source artifact, disposition, or CI is never
+   approval; a present invalid PR evidence file is not eligible for this fallback.
    Changed evidence/source/base is a refusal, not permission to silently rebuild.
    For future fix commits on a task-owned PR, use full gate-and-ship with
    `--expected-pr-head <verified-previous-head>`; changed source requires new review.
