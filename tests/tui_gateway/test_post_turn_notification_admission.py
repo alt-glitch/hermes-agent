@@ -66,3 +66,29 @@ def test_post_turn_completion_is_admitted_or_requeued(monkeypatch, tmp_path, ref
     assert len(cards) == 1
     assert cards[0]["detail"] == accepted[0][0]
     assert process_registry.completion_queue.empty()
+
+
+def test_post_turn_receipt_keeps_its_event_after_drain_advances(monkeypatch):
+    """Async commit of the first event must not acknowledge the requeued next event."""
+    from tools import async_delegation
+
+    session = {"session_key": "stored", "history_lock": threading.RLock(), "running": False}
+    first = {"type": "completion", "session_id": "first", "command": "first"}
+    second = {"type": "completion", "session_id": "second", "command": "second"}
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_: False)
+    monkeypatch.setattr(process_registry, "completion_queue", queue.Queue())
+    monkeypatch.setattr(process_registry, "drain_notifications", lambda **_: [(first, "first"), (second, "second")])
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: "first-claim")
+    completed, callbacks = [], []
+    monkeypatch.setattr(async_delegation, "complete_event_delivery", lambda event, claim: completed.append((event, claim)))
+
+    def submit(*_args, **kwargs):
+        callbacks.append(kwargs["history_commit_callback"])
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    server._run_post_turn_followups("turn", "live", session, {}, None)
+    assert process_registry.completion_queue.get_nowait() is second
+    assert not completed
+    callbacks[0](True)
+    assert completed == [(first, "first-claim")]

@@ -552,7 +552,7 @@ def _run_post_turn_followups(
 
             _dispatch_followup_turn(
                 rid, sid, session, synth, "completion notification dispatch",
-                on_done=lambda: complete_event_delivery(_evt, _claim),
+                on_done=lambda evt=_evt, claim=_claim: complete_event_delivery(evt, claim),
                 on_error=retry_delivery, submit_kwargs=submit_kwargs)
     except Exception as _drain_exc:
         _hook_failure("completion queue drain", _drain_exc)
