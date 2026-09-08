@@ -3752,7 +3752,8 @@ def _publication_observation_artifact(
         "source_packet_sha256": receipt.get("packet_sha256"),
         "source_draft_sha256": receipt.get("draft_sha256"),
         "authorization_sha256": receipt.get("authorization_sha256"),
-        "run_binding_sha256": _canonical_json_sha256(manifest.get("run_binding")),
+        # The retained manifest may predate this owner's captured upstream tip.
+        "run_binding_sha256": receipt.get("run_binding_sha256"),
         "number": number,
         "base_sha": manifest.get("base_sha"),
         "candidate_sha": manifest.get("candidate_sha"),

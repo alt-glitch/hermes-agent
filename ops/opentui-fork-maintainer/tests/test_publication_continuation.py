@@ -362,12 +362,22 @@ def test_draft_recovery_refuses_marker_removed_between_views(retained, monkeypat
     )
 
 
-@pytest.mark.parametrize("owner", ["live-owner", "terminal-prior-owner"])
+@pytest.mark.parametrize("owner", ["live-owner", "terminal-prior-owner", "terminal-prior-owner-new-upstream"])
 @pytest.mark.parametrize("regenerate_local", [False, True])
 def test_missing_publication_evidence_retry_keeps_review_media_and_upload(
     retained, monkeypatch, owner, regenerate_local
 ):
     f = retained
+    if owner == "terminal-prior-owner-new-upstream":
+        # A fresh wrapper can observe new upstream without changing reviewed source.
+        context_path = f["fresh"] / "run-context.json"
+        context = runtime._load_gate(context_path)
+        context["upstream_sha"] = f["candidate"]
+        write_json(context_path, context)
+        lease_path = f["state"] / "run.lease.json"
+        lease = runtime._load_gate(lease_path)
+        lease.update(captured_upstream=f["candidate"], run_context_sha256=runtime._file_sha256(context_path))
+        write_json(lease_path, lease)
     remove_publication_evidence(f)
     args = f["args"]
     evidence_root = f["fresh"]
