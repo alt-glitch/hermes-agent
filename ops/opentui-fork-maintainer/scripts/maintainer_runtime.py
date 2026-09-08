@@ -1682,11 +1682,27 @@ def ship_candidate(
     with _lease_lock(state_dir):
         lease = _lease_value(state_dir)
         _validate_lease_value(lease, token, int(time.time()))
-        if "continuation" in manifest or "publication_recovery" in manifest:
-            _validate_publication_authorization(
+        continuation = (
+            "continuation" in manifest or "publication_recovery" in manifest
+        )
+        if continuation:
+            current_binding, _ = _validate_publication_authorization(
                 manifest, state_dir, manifest_path.parent, token
             )
-        if manifest["run_binding"]["mode"] in {"repair", "issue"} and _derive_run_binding(
+            if _git_status(
+                repo,
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    manifest["run_binding"]["captured_upstream"],
+                    current_binding["captured_upstream"],
+                ],
+            ):
+                raise ControlError("captured upstream history changed")
+        elif manifest["run_binding"]["mode"] in {
+            "repair",
+            "issue",
+        } and _derive_run_binding(
             state_dir, manifest_path.parent, token
         ) != manifest["run_binding"]:
             raise ControlError("bound request changed after verification")

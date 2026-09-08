@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from test_issue_intake import GitHub as IssueGitHub
+from test_issue_intake import intake, issue, labeled
 from test_pr_publication import (
     bind_issue,
     capture,
@@ -65,6 +67,147 @@ def remove_publication_evidence(f):
         f"<!-- maintainer-preview:{f['candidate']}:",
         f"<!-- maintainer-preview:{'f' * 40}:",
     )
+
+
+def bind_continuation_request(f, request):
+    for path in (
+        f["old"] / "request.claimed.json",
+        f["fresh"] / "request.claimed.json",
+        f["state"] / "run-request.inflight.json",
+    ):
+        write_json(path, request)
+    value = runtime._load_gate(f["source"])
+    binding = {
+        "mode": request["mode"],
+        "request_sha256": runtime._canonical_json_sha256(request),
+        "last_synced_upstream": None,
+        "captured_upstream": f["base"],
+        "captured_base": f["base"],
+    }
+    if request["mode"] == "issue":
+        binding["issue"] = {
+            "repository": request["repository"],
+            "number": request["issue"],
+            "revision_sha256": request["revision_sha256"],
+            "approval_event_id": request["approval"]["event_id"],
+        }
+    value["run_binding"] = binding
+    write_json(f["source"], value)
+    f["args"][f["args"].index("--source-sha256") + 1] = runtime._file_sha256(
+        f["source"]
+    )
+    head, _, identity = pub._candidate_head(value)
+    preview = f["pr"]["body"].split("\n", 1)[1]
+    f["pr"].update(
+        body=f"<!-- maintainer-candidate:v1:{identity} -->\n{preview}",
+        headRefName=head,
+    )
+    proof_path = f["old"] / "pr-evidence.json"
+    proof = runtime._load_gate(proof_path)
+    proof["head_branch"] = head
+    write_json(proof_path, proof)
+
+
+def use_live_owner(f):
+    write_json(
+        f["state"] / "run.lease.json",
+        {
+            "token": "test-token",
+            "expires_unix": 4_000_000_000,
+            "max_expires_unix": 4_000_000_000,
+            "run_id": f["old"].name,
+            "evidence_dir": str(f["old"]),
+            "captured_base": f["base"],
+            "captured_upstream": f["base"],
+            "run_context_sha256": runtime._file_sha256(
+                f["old"] / "run-context.json"
+            ),
+        },
+    )
+    return [
+        "resume-publication",
+        "--repo",
+        str(f["repo"]),
+        "--state",
+        str(f["state"]),
+        "--token",
+        "test-token",
+        "--source-manifest",
+        str(f["source"]),
+        "--source-sha256",
+        runtime._file_sha256(f["source"]),
+        "--packet-sha256",
+        runtime._file_sha256(f["old"] / "gate-packet.json"),
+        "--source-packet",
+        str(f["old"] / "gate-packet.json"),
+        "--adopt-pr",
+        "42",
+        "--manifest",
+        str(f["source"]),
+    ]
+
+
+def advance_owner_upstream(f, owner_root, token, upstream):
+    context_path = owner_root / "run-context.json"
+    context = runtime._load_gate(context_path)
+    context["upstream_sha"] = upstream
+    write_json(context_path, context)
+    lease_path = f["state"] / "run.lease.json"
+    lease = runtime._load_gate(lease_path)
+    lease.update(
+        captured_upstream=upstream,
+        run_context_sha256=runtime._file_sha256(context_path),
+    )
+    assert lease["token"] == token
+    write_json(lease_path, lease)
+
+
+def change_upstream_inside_ship(f, monkeypatch, owner_root, token, upstream):
+    real_ship = runtime.ship_candidate
+    real_validate = runtime._validate_lease_value
+    armed = False
+
+    def ship(*args, **kwargs):
+        nonlocal armed
+        armed = True
+        return real_ship(*args, **kwargs)
+
+    def validate(lease, candidate_token, now):
+        nonlocal armed
+        real_validate(lease, candidate_token, now)
+        if not armed:
+            return
+        armed = False
+        context_path = owner_root / "run-context.json"
+        context = runtime._load_gate(context_path)
+        context["upstream_sha"] = upstream
+        write_json(context_path, context)
+        lease.update(
+            captured_upstream=upstream,
+            run_context_sha256=runtime._file_sha256(context_path),
+        )
+        assert lease["token"] == token
+        write_json(f["state"] / "run.lease.json", lease)
+
+    monkeypatch.setattr(runtime, "ship_candidate", ship)
+    monkeypatch.setattr(runtime, "_validate_lease_value", validate)
+
+
+def bind_live_issue_approval(f, monkeypatch):
+    current = issue(41, title="Readable approved feature")
+    issue_github = IssueGitHub(
+        [current], {41: [labeled(1, "alt-glitch")]}
+    )
+    request = intake.select_approved_issue(
+        f["state"], now=100, runner=issue_github.run
+    )
+    assert request is not None
+    workflow = runtime._issue_workflow()
+    monkeypatch.setattr(workflow, "_issue_intake", lambda: intake.__dict__)
+    monkeypatch.setattr(intake, "_run", issue_github.run)
+    monkeypatch.setattr(runtime, "_issue_workflow", lambda: workflow)
+    bind_continuation_request(f, request)
+    return request, issue_github
 
 
 @pytest.fixture
@@ -793,6 +936,140 @@ def test_recovery_rechecks_authorization_inside_ship_lock(retained, monkeypatch)
         runtime.main(f["args"])
 
     assert remote_sha(f["repo"]) == f["base"]
+    assert not (f["state"] / "publish-journal.json").exists()
+
+
+@pytest.mark.parametrize("mode", ["repair", "issue"])
+@pytest.mark.parametrize("owner", ["live-owner", "terminal-prior-owner"])
+def test_unchanged_task_continuation_accepts_descendant_upstream_at_ship_lock(
+    retained, monkeypatch, mode, owner
+):
+    f = retained
+    issue_github = None
+    if mode == "issue":
+        _, issue_github = bind_live_issue_approval(f, monkeypatch)
+    else:
+        bind_continuation_request(
+            f,
+            {
+                "mode": "repair",
+                "pr": 40,
+                "base_sha": f["base"],
+                "source_sha": f["candidate"],
+                "instruction": "Repair the retained publication runtime.",
+            },
+        )
+
+    args = f["args"]
+    if owner == "terminal-prior-owner":
+        advance_owner_upstream(f, f["fresh"], "fresh-token", f["candidate"])
+    else:
+        args = use_live_owner(f)
+        change_upstream_inside_ship(
+            f, monkeypatch, f["old"], "test-token", f["candidate"]
+        )
+
+    assert runtime.main(args) == 0
+    assert remote_sha(f["repo"]) == f["candidate"]
+    assert runtime._load_gate(f["state"] / "publish-journal.json")[
+        "phase"
+    ] == "finalized"
+    if issue_github is not None:
+        routes = [" ".join(call) for call in issue_github.calls]
+        assert sum("graphql" in route for route in routes) >= 3
+        assert sum("/timeline?" in route for route in routes) >= 3
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "changed-request",
+        "revoked-approval",
+        "stale-fork-base",
+        "changed-candidate",
+        "invalid-provenance",
+        "ordinary-non-continuation",
+    ],
+)
+def test_continuation_ship_lock_refuses_changed_authority_and_provenance(
+    retained, monkeypatch, fault
+):
+    f = retained
+    issue_github = None
+    if fault == "revoked-approval":
+        _, issue_github = bind_live_issue_approval(f, monkeypatch)
+    else:
+        request = {
+            "mode": "repair",
+            "pr": 40,
+            "base_sha": f["base"],
+            "source_sha": f["candidate"],
+            "instruction": "Repair the retained publication runtime.",
+        }
+        bind_continuation_request(f, request)
+
+    if fault == "ordinary-non-continuation":
+        use_live_owner(f)
+        advance_owner_upstream(f, f["old"], "test-token", f["candidate"])
+        with pytest.raises(runtime.ControlError, match="bound request changed"):
+            runtime.ship_candidate(
+                f["repo"],
+                f["source"],
+                state_dir=f["state"],
+                base_sha=f["base"],
+                candidate_sha=f["candidate"],
+                token="test-token",
+            )
+        assert remote_sha(f["repo"]) == f["base"]
+        assert not (f["state"] / "publish-journal.json").exists()
+        return
+
+    args = f["args"]
+    advance_owner_upstream(f, f["fresh"], "fresh-token", f["candidate"])
+    expected_error = None
+    if fault == "changed-request":
+        changed = {
+            **request,
+            "instruction": "A different authenticated repair request.",
+        }
+        for path in (
+            f["fresh"] / "request.claimed.json",
+            f["state"] / "run-request.inflight.json",
+        ):
+            write_json(path, changed)
+    elif fault == "revoked-approval":
+        assert issue_github is not None
+        issue_github.timelines[41].append(
+            labeled(2, "alt-glitch", event="unlabeled")
+        )
+    elif fault == "stale-fork-base":
+        git(
+            f["repo"],
+            "push",
+            "origin",
+            f"{f['candidate']}:refs/heads/{runtime.BRANCH}",
+        )
+    elif fault == "changed-candidate":
+        (f["cwd"] / "file").write_text("unreviewed candidate\n", encoding="utf-8")
+        git(f["cwd"], "commit", "-am", "unreviewed candidate")
+    else:
+        unrelated = git(
+            f["repo"],
+            "commit-tree",
+            git(f["repo"], "rev-parse", f"{f['base']}^{{tree}}"),
+            "-m",
+            "unrelated upstream",
+        )
+        args = use_live_owner(f)
+        change_upstream_inside_ship(
+            f, monkeypatch, f["old"], "test-token", unrelated
+        )
+        expected_error = "captured upstream history changed"
+
+    before = remote_sha(f["repo"])
+    with pytest.raises(runtime.ControlError, match=expected_error):
+        runtime.main(args)
+    assert remote_sha(f["repo"]) == before
     assert not (f["state"] / "publish-journal.json").exists()
 
 
