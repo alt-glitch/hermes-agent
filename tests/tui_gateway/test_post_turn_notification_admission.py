@@ -42,6 +42,7 @@ def test_post_turn_completion_is_admitted_or_requeued(monkeypatch, tmp_path, ref
         )
         if admitted is not None:
             accepted.append((text, kwargs))
+            kwargs["history_commit_callback"](True)
         return admitted is not None
 
     if refusal == "ownership":

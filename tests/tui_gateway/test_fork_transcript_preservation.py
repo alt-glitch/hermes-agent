@@ -31,9 +31,12 @@ def test_notification_dispatch_has_one_start_and_retains_model_detail(monkeypatc
 
     def submit(rid, sid, owned_session, text, **kwargs):
         submissions.append((owned_session, text, kwargs))
-        return server._admit_prompt_turn(
+        admitted = server._admit_prompt_turn(
             sid, owned_session, text, None, None, [], kwargs.get("display_notification")
         ) is not None
+        if admitted:
+            kwargs["history_commit_callback"](True)
+        return admitted
 
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
     server._notif_dispatch_event("s1", session, event, detail)

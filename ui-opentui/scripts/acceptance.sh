@@ -10,7 +10,9 @@
 #      node:child_process client, asserts gateway.ready + create→close→create
 #      live-SID tracking.
 #      (Skipped if no Hermes venv resolves — CI parity.)
-#   4. selection/markdown smoke in a real tmux TTY — asserts the native <markdown>
+#   4. deterministic local OpenAI-wire notification flow — real gateway, agent,
+#      process registry, renderer, persistence, and cold resume (not a live provider).
+#   5. selection/markdown smoke in a real tmux TTY — asserts the native <markdown>
 #      (Tree-sitter) PAINTS under node --experimental-ffi, native programmatic
 #      selection extracts the rendered highlighted text, and the `/copy` source
 #      helper preserves the full Markdown source. Mouse routing is covered by
@@ -29,7 +31,7 @@ ok()   { echo "  ✅ $1"; pass=$((pass+1)); }
 bad()  { echo "  ❌ $1"; fail=$((fail+1)); }
 note() { echo "  ⏭  $1"; skip=$((skip+1)); }
 
-echo "== [1/4] runtime: Node >= 26.3, Bun-free =="
+echo "== [1/5] runtime: Node >= 26.3, Bun-free =="
 NODE_V="$(node -p 'process.versions.node' 2>/dev/null || echo 0.0.0)"
 node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>26||(a===26&&b>=3)?0:1)' \
   && ok "node $NODE_V (>= 26.3)" || bad "node $NODE_V is below the 26.3 node:ffi floor"
@@ -39,11 +41,11 @@ else
   ok "no bun on PATH — single-runtime host"
 fi
 
-echo "== [2/4] check: prettier + tsc + eslint + vitest =="
+echo "== [2/5] check: prettier + tsc + eslint + vitest =="
 if bash scripts/check.sh >/tmp/accept-check.log 2>&1; then ok "check green ($(grep -c 'passed' /tmp/accept-check.log >/dev/null 2>&1; grep -oE '[0-9]+ passed' /tmp/accept-check.log | tail -1))"
 else bad "check failed — see /tmp/accept-check.log"; tail -20 /tmp/accept-check.log; fi
 
-echo "== [3/4] live-gateway transport smoke (real Python gateway, no Bun) =="
+echo "== [3/5] live-gateway transport smoke (real Python gateway, no Bun) =="
 if [ -n "${HERMES_PYTHON_SRC_ROOT:-}" ] || [ -x "../.venv/bin/python" ]; then
   rm -rf .accept && node scripts/build.mjs src/test/liveGateway.smoke.ts .accept >/dev/null 2>&1
   OUT="$(node --experimental-ffi --no-warnings .accept/liveGateway.smoke.js 2>&1)"
@@ -53,7 +55,17 @@ else
   note "no HERMES_PYTHON_SRC_ROOT / venv — gateway smoke skipped"
 fi
 
-echo "== [4/4] selection/markdown smoke in a real tmux TTY (tree-sitter under FFI) =="
+echo "== [4/5] deterministic local-wire notification flow (not a live provider) =="
+if [ -n "${HERMES_NOTIFICATION_PYTHON:-${HERMES_PYTHON:-}}" ] || [ -x "../.venv/bin/python" ]; then
+  rm -rf .accept && node scripts/build.mjs src/test/liveNotificationFlow.tsx .accept >/dev/null 2>&1
+  OUT="$(HERMES_NOTIFICATION_PYTHON="${HERMES_NOTIFICATION_PYTHON:-${HERMES_PYTHON:-}}" node --experimental-ffi --no-warnings .accept/liveNotificationFlow.js 2>&1)"
+  echo "$OUT" | grep -q "^PASS" && ok "$(echo "$OUT" | grep '^PASS')" || { bad "notification flow failed"; echo "$OUT" | tail -40; }
+  rm -rf .accept
+else
+  note "no HERMES_NOTIFICATION_PYTHON / venv — notification flow skipped"
+fi
+
+echo "== [5/5] selection/markdown smoke in a real tmux TTY (tree-sitter under FFI) =="
 if command -v tmux >/dev/null 2>&1; then
   rm -rf .accept && node scripts/build.mjs src/test/selectionCopy.smoke.tsx .accept >/dev/null 2>&1
   rm -f /tmp/accept-sel.json

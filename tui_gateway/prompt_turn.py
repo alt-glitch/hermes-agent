@@ -20,6 +20,16 @@ def _hook_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
+def _report_history_commit(callback, committed: bool) -> None:
+    """Settle an admitted synthetic source without turning receipt I/O into a turn failure."""
+    if callback is None:
+        return
+    try:
+        callback(committed)
+    except Exception as exc:
+        _hook_failure("history commit callback", exc)
+
+
 def _is_successful_goal_turn(result: Any, status: str, raw: Any) -> bool:
     """Whether a turn produced a real response the goal judge can use."""
     return bool(
@@ -467,20 +477,24 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
 
 def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str, *,
                             on_done=None, on_error=None, submit_kwargs=None) -> None:
-    """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
-    release ``running``."""
+    """Chain one follow-up turn (caller set ``running``); completion hooks follow
+    the asynchronous history commit, while refusal is reported synchronously."""
     try:
-        dispatched = _run_prompt_submit(rid, sid, session, prompt, **(submit_kwargs or {}))
+        kwargs = dict(submit_kwargs or {})
+        if on_done is not None or on_error is not None:
+            kwargs["history_commit_callback"] = lambda committed: (
+                on_done() if committed and on_done is not None
+                else on_error(True) if not committed and on_error is not None
+                else None)
+        dispatched = _run_prompt_submit(rid, sid, session, prompt, **kwargs)
         if dispatched is False:
             if on_error is not None:
-                on_error()
+                on_error(False)
             _notif_release_turn(session)
             return
-        if on_done is not None:
-            on_done()
     except Exception as exc:
         if on_error is not None:
-            on_error()
+            on_error(False)
         _hook_failure(what, exc)
         with session["history_lock"]:
             session["running"] = False
@@ -524,9 +538,15 @@ def _run_post_turn_followups(
             if _claim is None:
                 _notif_release_turn(session)
                 continue
-            submit_kwargs = _notification_turn_display(_evt, synth)
+            submit_kwargs = _notification_turn_display(_evt, synth, sid)
 
-            def retry_delivery(evt=_evt, claim=_claim):
+            card_pending = submit_kwargs.get("display_notification") is not None
+            if card_pending:
+                _evt["_tui_notification_shown_for"] = sid
+
+            def retry_delivery(admitted, evt=_evt, claim=_claim, had_card=card_pending):
+                if not admitted and had_card:
+                    evt.pop("_tui_notification_shown_for", None)
                 release_event_delivery(evt, claim)
                 process_registry.completion_queue.put(evt)
 
@@ -958,7 +978,8 @@ def _run_prompt_submit(
     client_submission_ids: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    loop_claim_id: str = "") -> bool:
+    loop_claim_id: str = "",
+    history_commit_callback: Callable[[bool], None] | None = None) -> bool:
     client_submission_ids = list(client_submission_ids or [])
     admitted = _admit_prompt_turn(
         sid, session, text, image_paths, queued_prompt_generation,
@@ -991,6 +1012,7 @@ def _run_prompt_submit(
         st.marker_key = _record_turn_marker(session, text)
         goal_followup = None
         loop_claim_settled = False
+        history_committed = False
         try:
             prompt, run_message, cols, streamer = _prepare_turn_input(sid, session, st, text, images)
             _invoke_agent(
@@ -998,6 +1020,8 @@ def _run_prompt_submit(
                 display_metadata)
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
+            history_committed = True
+            _report_history_commit(history_commit_callback, True)
             payload, raw, status = _complete_turn_payload(sid, session, st, status_note, cols)
             _emit("message.complete", sid, payload)
             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
@@ -1047,6 +1071,8 @@ def _run_prompt_submit(
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
         _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
+        if not history_committed:
+            _report_history_commit(history_commit_callback, False)
     run_thread = threading.Thread(target=run, daemon=True)
     with _sessions_lock:
         registered = _sessions.get(sid)

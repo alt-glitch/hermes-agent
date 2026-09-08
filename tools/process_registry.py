@@ -1180,23 +1180,26 @@ class ProcessRegistry:
         the FIRST move enqueues the completion notification, so no duplicates."""
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
-            self._finished[session.id] = session
-        if was_running and session._output_finalizer is not None:
-            finalizer, session._output_finalizer = session._output_finalizer, None
-            with session._lock:
-                result = {"output": session.output_buffer}
-            try:
-                finalizer(result)
-            except Exception:
-                # Output cleanup is presentation bookkeeping.  A broken CWD
-                # recorder must not strand the authoritative process outcome
-                # before its completion event/checkpoint is published.
-                logger.exception("Process output finalizer failed for %s", session.id)
-            finally:
+            if was_running and session._output_finalizer is not None:
+                finalizer, session._output_finalizer = session._output_finalizer, None
                 with session._lock:
-                    # Apply any cleanup completed before a later bookkeeping
-                    # failure, then preserve the registry's retention contract.
-                    session.output_buffer = str(result.get("output") or "")[-session.max_output_chars:]
+                    result = {"output": session.output_buffer}
+                try:
+                    finalizer(result)
+                except Exception:
+                    # Output cleanup is presentation bookkeeping.  A broken CWD
+                    # recorder must not strand the authoritative process outcome
+                    # before its completion event/checkpoint is published.
+                    logger.exception("Process output finalizer failed for %s", session.id)
+                finally:
+                    with session._lock:
+                        # Apply any cleanup completed before a later bookkeeping
+                        # failure, then preserve the registry's retention contract.
+                        session.output_buffer = str(result.get("output") or "")[-session.max_output_chars:]
+            # Public lookup paths hold this same lock. Publish the terminal
+            # marker only after the environment finalizer has removed any
+            # private transport bookkeeping from retained output.
+            self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
         if was_running and session.notify_on_complete:

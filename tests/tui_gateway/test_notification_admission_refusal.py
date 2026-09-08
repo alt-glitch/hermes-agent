@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from tools import async_delegation
+from tools.process_registry import process_registry
 from tui_gateway import server
 
 
@@ -26,21 +27,31 @@ def test_event_receipt_and_retry_follow_actual_admission(monkeypatch, session, e
         "origin_ui_session_id": "live-notification", "command": "echo synthetic", "exit_code": 0,
     }
     registry = SimpleNamespace(completion_queue=queue.Queue(), is_completion_consumed=lambda _sid: False)
+    monkeypatch.setattr(process_registry, "completion_queue", registry.completion_queue)
     complete, release = Mock(), Mock()
     monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: "delivery-claim")
     monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
     monkeypatch.setattr(async_delegation, "release_event_delivery", release)
-    submit = Mock(return_value=outcome, side_effect=RuntimeError("synthetic refusal") if outcome == "exception" else None)
+    callbacks = []
+
+    def submit(*_args, **kwargs):
+        callbacks.append(kwargs.get("history_commit_callback"))
+        if outcome == "exception":
+            raise RuntimeError("synthetic refusal")
+        return outcome
+
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
 
     keep_draining = server._notif_handle_event(
         "live-notification", session, event, set(), registry, lambda _event: "synthetic result", [],
     )
 
-    submit.assert_called_once()
+    assert len(callbacks) == 1
     if outcome is True:
         assert keep_draining is True
         assert registry.completion_queue.empty()
+        complete.assert_not_called()
+        callbacks[0](True)
         complete.assert_called_once_with(event, "delivery-claim")
         release.assert_not_called()
     else:
@@ -50,6 +61,61 @@ def test_event_receipt_and_retry_follow_actual_admission(monkeypatch, session, e
         assert registry.completion_queue.empty()
         release.assert_called_once_with(event, "delivery-claim")
         complete.assert_not_called()
+
+
+@pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
+def test_admitted_event_retries_after_history_failure_without_a_second_card(
+    monkeypatch, session, event_type,
+):
+    event = {
+        "type": event_type, "session_id": "synthetic-process", "delegation_id": "synthetic-delegation",
+        "origin_ui_session_id": "live-notification", "command": "echo synthetic", "exit_code": 0,
+    }
+    registry = SimpleNamespace(completion_queue=queue.Queue(), is_completion_consumed=lambda _sid: False)
+    monkeypatch.setattr(process_registry, "completion_queue", registry.completion_queue)
+    release = Mock()
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: "delivery-claim")
+    monkeypatch.setattr(async_delegation, "complete_event_delivery", Mock())
+    monkeypatch.setattr(async_delegation, "release_event_delivery", release)
+    session.update({
+        "agent": SimpleNamespace(interim_assistant_callback=None, session_id=session["session_key"]),
+        "attached_images": [], "history": [], "history_version": 0,
+    })
+    monkeypatch.setattr(server, "_sessions", {"live-notification": session})
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: None)
+    monkeypatch.setattr(server, "_record_turn_marker", lambda *_: "")
+
+    def fail_preparation(*_args, **_kwargs):
+        raise RuntimeError("synthetic preparation failure")
+
+    monkeypatch.setattr(server, "_prepare_turn_input", fail_preparation)
+    monkeypatch.setattr(server, "_recover_turn_exception", lambda *_: None)
+    monkeypatch.setattr(server, "_finish_turn", lambda *_: None)
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_: None)
+    monkeypatch.setattr(server, "_run_post_turn_followups", lambda *_: None)
+
+    emitted = set()
+    assert server._notif_handle_event(
+        "live-notification", session, event, emitted, registry, lambda _event: "synthetic result", [],
+    ) is True
+    session["_run_thread"].join(2)
+    assert not session["_run_thread"].is_alive()
+
+    assert release.call_args.args == (event, "delivery-claim")
+    assert registry.completion_queue.get_nowait() is event
+    assert server._notif_handle_event(
+        "live-notification", session, event, emitted, registry, lambda _event: "synthetic result", [],
+    ) is True
+    session["_run_thread"].join(2)
+    assert not session["_run_thread"].is_alive()
+    assert release.call_count == 2
+    assert registry.completion_queue.get_nowait() is event
+    cards = [call for call in server._emit.call_args_list if call.args[0] == "notification.show"]
+    assert len(cards) == 1
+    assert "display_notification" not in server._notification_turn_display(
+        event, "synthetic result", "live-notification")
+    assert "display_notification" in server._notification_turn_display(
+        event, "synthetic result", "resumed-notification")
 
 
 @pytest.mark.parametrize("outcome", [False, "exception"])

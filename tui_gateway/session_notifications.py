@@ -420,23 +420,39 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
 
 
 def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
-    """Dispatch a claimed turn; False leaves the event eligible for retry."""
+    """Dispatch a claimed turn; acknowledge only after its history commit."""
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
+    from tools.process_registry import process_registry
     if (claim := claim_event_delivery(evt, "tui-poller")) is None:
         _notif_release_turn(session)
         return True  # Another consumer owns the event; do not create a retry duplicate.
-    kwargs = _notification_turn_display(evt, text)
+    kwargs = _notification_turn_display(evt, text, sid)
+
+    def settle_delivery(committed: bool) -> None:
+        if committed:
+            complete_event_delivery(evt, claim)
+            return
+        release_event_delivery(evt, claim)
+        process_registry.completion_queue.put(evt)
+
+    card_pending = kwargs.get("display_notification") is not None
+    if card_pending:
+        evt["_tui_notification_shown_for"] = sid
+    kwargs["history_commit_callback"] = settle_delivery
     try:
         admitted = _notif_submit(
             f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
         _notif_release_turn(session)
+        if card_pending:
+            evt.pop("_tui_notification_shown_for", None)
         release_event_delivery(evt, claim)
         return False
     if admitted is False:
+        if card_pending:
+            evt.pop("_tui_notification_shown_for", None)
         release_event_delivery(evt, claim)
         return False
-    complete_event_delivery(evt, claim)
     return True
 
 
@@ -702,20 +718,23 @@ def _process_completion_display_metadata(evt: dict) -> dict:
     return _process_completion_notice(evt, "")
 
 
-def _notification_turn_display(evt: dict, detail: str) -> dict:
+def _notification_turn_display(evt: dict, detail: str, sid: str = "") -> dict:
     """Persist and publish completion chrome at the turn's admission boundary."""
+    already_shown = bool(sid) and evt.get("_tui_notification_shown_for") == sid
     if evt.get("type") == "async_delegation":
         return {
             "display_kind": "async_delegation_complete",
             "display_metadata": _async_delegation_display_metadata(evt),
-            "display_notification": _async_delegation_notice(evt, detail),
+            **({} if already_shown else {
+                "display_notification": _async_delegation_notice(evt, detail)}),
         }
     if evt.get("type", "completion") == "completion":
         notice = _process_completion_notice(evt, detail)
         return {
             "display_kind": "process_complete",
             "display_metadata": _process_completion_display_metadata(evt),
-            "display_notification": notice,
+            **({} if already_shown else {
+                "display_notification": notice}),
         }
     return {}
 

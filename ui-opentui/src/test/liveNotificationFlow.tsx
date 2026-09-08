@@ -9,7 +9,7 @@
  * Controlled seam: a local HTTP server supplies deterministic OpenAI-compatible
  * streaming responses. It is a protocol fixture, NOT a live-model check.
  *
- * Build and run explicitly (not part of the unit suite):
+ * Invoked by scripts/acceptance.sh; it may also be built and run directly:
  *   node scripts/build.mjs src/test/liveNotificationFlow.tsx .accept
  *   node --experimental-ffi --no-warnings .accept/liveNotificationFlow.js
  */

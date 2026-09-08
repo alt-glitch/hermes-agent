@@ -10,6 +10,7 @@ Covers:
 
 import json
 import os
+import threading
 import time
 import pytest
 from unittest.mock import MagicMock, patch
@@ -138,6 +139,53 @@ class TestCompletionQueue:
         assert registry.read_log(s.id)["output"] == "useful result"
         assert registry.completion_queue.get_nowait()["output"] == "useful result"
         assert "Process output finalizer failed" in caplog.text
+
+    def test_finished_output_is_not_visible_until_finalizer_completes(self, registry, monkeypatch):
+        """Every public completed-process read observes the finalized buffer."""
+        s = _make_session(output="retained\nPRIVATE-MARKER", exit_code=0)
+        s.exited = True
+        finalizer_started = threading.Event()
+        release_finalizer = threading.Event()
+
+        def blocking_cleanup(result):
+            finalizer_started.set()
+            assert release_finalizer.wait(2)
+            result["output"] = result["output"].replace("\nPRIVATE-MARKER", "")
+
+        s._output_finalizer = blocking_cleanup
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        mover = threading.Thread(target=registry._move_to_finished, args=(s,))
+        mover.start()
+        assert finalizer_started.wait(2)
+
+        entered = {name: threading.Event() for name in ("poll", "log", "kill")}
+        results = {}
+
+        def observe(name, action):
+            entered[name].set()
+            results[name] = action(s.id)
+
+        readers = [
+            threading.Thread(target=observe, args=("poll", registry.poll)),
+            threading.Thread(target=observe, args=("log", registry.read_log)),
+            threading.Thread(target=observe, args=("kill", registry.kill_process)),
+        ]
+        for reader in readers:
+            reader.start()
+        assert all(ready.wait(2) for ready in entered.values())
+        assert all(reader.is_alive() for reader in readers)
+
+        release_finalizer.set()
+        mover.join(2)
+        for reader in readers:
+            reader.join(2)
+        assert not mover.is_alive()
+        assert all(not reader.is_alive() for reader in readers)
+        assert "PRIVATE-MARKER" not in json.dumps(results)
+        assert results["poll"]["output_preview"] == "retained"
+        assert results["log"]["output"] == "retained"
+        assert results["kill"]["output"] == "retained"
 
     def test_kill_returns_environment_finalized_output(self, registry, monkeypatch):
         """An explicit kill observes the same cleaned buffer as log/notification consumers."""
