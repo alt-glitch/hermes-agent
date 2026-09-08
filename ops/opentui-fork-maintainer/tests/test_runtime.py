@@ -765,7 +765,7 @@ def test_issue_gate_is_linear_revision_bound_and_never_advances_upstream(
         "approval_event_id": "1234",
     }
     assert result["review_proof"]["review_mode"] == "linear-candidate"
-    assert revalidations == ["approved", "approved"]
+    assert revalidations == ["approved", "approved", "approved"]
     assert remote_sha(repo) == candidate
 
     finalized = runtime.finalize_success(
@@ -1693,6 +1693,169 @@ def test_run_gate_records_candidate_bound_success(
     )
     assert (gate.parent / "termctrl-verified" / "accepted.png").is_file()
     assert (gate.parent / "video-analysis.raw.json").is_file()
+
+
+def test_video_only_retry_reuses_intact_source_gates_and_recaptures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    old, fresh = tmp_path / "old-attempt", tmp_path / "fresh-attempt"
+    old.mkdir()
+    fresh.mkdir()
+    source_packet, _ = make_gate_packet(old, gate_worktree, base, candidate)
+    source_packet.rename(old / "gate-packet.json")
+    install_success_mocks(monkeypatch)
+    monkeypatch.setattr(
+        runtime,
+        "_invoke_video_analyze",
+        lambda _path: json.dumps(
+            {"success": True, "analysis": "The visual claim is wrong.\nVERDICT: FAIL"}
+        ),
+    )
+    source = old / "gate.json"
+    first = runtime.run_gate(
+        old / "gate-packet.json",
+        source,
+        cwd=gate_worktree,
+        branch="sid/opentui",
+        base_sha=base,
+        candidate_sha=candidate,
+        token="old-token",
+    )
+    assert first["checks"][-1]["status"] == "failed"
+    retained = {str(path): path.read_bytes() for path in old.rglob("*") if path.is_file()}
+    packet = fresh / "gate-packet.json"
+    packet.write_bytes((old / "gate-packet.json").read_bytes())
+    install_success_mocks(monkeypatch)
+    code_runner = runtime.subprocess.run
+
+    def fresh_only(argv: list[str], *args: object, **kwargs: object):
+        if argv and (argv[0] == "uv" or argv[0] == str(runtime.NPM26)):
+            pytest.fail("successful deterministic gates must not rerun")
+        return code_runner(argv, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.subprocess, "run", fresh_only)
+    monkeypatch.setattr(
+        runtime,
+        "run_adversarial_review",
+        lambda *args, **kwargs: pytest.fail("successful source review must not rerun"),
+    )
+    calls: list[str] = []
+    real_termctrl = runtime.verify_termctrl_drive
+    real_video = runtime.verify_video_request
+
+    def recapture(*args: object, **kwargs: object):
+        calls.append("termctrl-smoke")
+        return real_termctrl(*args, **kwargs)
+
+    def reanalyze(*args: object, **kwargs: object):
+        calls.append("video-analysis")
+        return real_video(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "verify_termctrl_drive", recapture)
+    monkeypatch.setattr(runtime, "verify_video_request", reanalyze)
+    result = runtime.run_gate(
+        packet,
+        fresh / "gate.json",
+        cwd=gate_worktree,
+        branch="sid/opentui",
+        base_sha=base,
+        candidate_sha=candidate,
+        token="fresh-token",
+        reuse_manifest_path=source,
+        reuse_manifest_sha256=runtime._file_sha256(source),
+    )
+
+    assert calls == ["termctrl-smoke", "video-analysis"]
+    assert result["visual_retry"]["reused_gates"] == list(
+        runtime.VISUAL_RETRY_REUSED_GATES
+    )
+    assert all(check["status"] == "passed" for check in result["checks"])
+    assert runtime.validate_gate_manifest(
+        repo,
+        fresh / "gate.json",
+        base_sha=base,
+        candidate_sha=candidate,
+        token="fresh-token",
+    )["review_proof"]["verdict"] == "approved"
+    assert {str(path): path.read_bytes() for path in old.rglob("*") if path.is_file()} == retained
+
+
+@pytest.mark.parametrize(
+    "fault", ["source", "source-symlink", "base", "authorization", "packet", "gate-log"]
+)
+def test_video_only_retry_refuses_changed_evidence_or_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    old, fresh = tmp_path / "old-attempt", tmp_path / "fresh-attempt"
+    old.mkdir()
+    fresh.mkdir()
+    packet, _ = make_gate_packet(old, gate_worktree, base, candidate)
+    packet.rename(old / "gate-packet.json")
+    install_success_mocks(monkeypatch)
+    monkeypatch.setattr(
+        runtime,
+        "_invoke_video_analyze",
+        lambda _path: json.dumps({"success": True, "analysis": "VERDICT: FAIL"}),
+    )
+    source = old / "gate.json"
+    runtime.run_gate(
+        old / "gate-packet.json",
+        source,
+        cwd=gate_worktree,
+        branch="sid/opentui",
+        base_sha=base,
+        candidate_sha=candidate,
+        token="old-token",
+    )
+    source_sha256 = runtime._file_sha256(source)
+    current_packet = fresh / "gate-packet.json"
+    current_packet.write_bytes((old / "gate-packet.json").read_bytes())
+    current_base = base
+    run_binding = {
+        "mode": "backport",
+        "request_sha256": None,
+        "last_synced_upstream": None,
+        "captured_upstream": None,
+        "captured_base": None,
+    }
+    if fault == "source":
+        source.write_text(source.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    elif fault == "source-symlink":
+        outside = tmp_path / "outside-gate.json"
+        outside.write_bytes(source.read_bytes())
+        source.unlink()
+        source.symlink_to(outside)
+    elif fault == "base":
+        current_base = candidate
+    elif fault == "authorization":
+        run_binding["request_sha256"] = "0" * 64
+    elif fault == "packet":
+        value = json.loads(current_packet.read_text(encoding="utf-8"))
+        value["checks"][1]["argv"].append("tests/other.py")
+        current_packet.write_text(json.dumps(value), encoding="utf-8")
+    elif fault == "gate-log":
+        (old / "gate-logs/opentui-check.log").write_text("tampered", encoding="utf-8")
+    monkeypatch.setattr(
+        runtime,
+        "_validate_node_runtime",
+        lambda: pytest.fail("changed retry evidence must fail before gate execution"),
+    )
+
+    with pytest.raises(runtime.ControlError, match="visual retry"):
+        runtime.run_gate(
+            current_packet,
+            fresh / "gate.json",
+            cwd=gate_worktree,
+            branch="sid/opentui",
+            base_sha=current_base,
+            candidate_sha=candidate,
+            token="fresh-token",
+            run_binding=run_binding,
+            reuse_manifest_path=source,
+            reuse_manifest_sha256=source_sha256,
+        )
 
 
 def test_termctrl_uses_dependency_complete_fork_python_and_exact_candidate(
@@ -2813,6 +2976,68 @@ def test_finalize_success_consumes_request_and_removes_proven_worktree(
         ]
         == candidate
     )
+
+
+def test_owned_head_preflight_precedes_expensive_gate_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state, evidence = tmp_path / "state", tmp_path / "evidence"
+    write_live_lease(state)
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    events: list[str] = []
+    disposition_ready = False
+    real_gate = runtime.run_gate
+
+    def preflight(*args: object, **kwargs: object) -> dict[str, object]:
+        events.append("preflight")
+        if not disposition_ready:
+            raise RuntimeError("parent disposition is required")
+        return {"proof_sha256": "1" * 64}
+
+    def ordered_gate(*args: object, **kwargs: object) -> dict[str, object]:
+        assert events == ["preflight"]
+        events.append("gate")
+        return real_gate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runtime.runpy,
+        "run_path",
+        lambda _path: {"preflight_owned_head": preflight},
+    )
+    monkeypatch.setattr(runtime, "run_gate", ordered_gate)
+
+    with pytest.raises(runtime.ControlError, match="parent disposition"):
+        runtime.gate_and_ship(
+            repo,
+            packet,
+            evidence / "gate.json",
+            state_dir=state,
+            cwd=gate_worktree,
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+            expected_pr_head=base,
+        )
+    assert events == ["preflight"]
+    events.clear()
+    disposition_ready = True
+    result = runtime.gate_and_ship(
+        repo,
+        packet,
+        evidence / "gate.json",
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+        expected_pr_head=base,
+    )
+
+    assert events == ["preflight", "gate"]
+    assert result["owner_preflight"] == {"proof_sha256": "1" * 64}
 
 
 def test_gate_and_ship_rejects_arbitrary_cleanup_path_before_publish(

@@ -19,6 +19,7 @@ import json
 import os
 import re
 import runpy
+import shutil
 import signal
 import subprocess
 import sys
@@ -108,6 +109,7 @@ REVIEW_PREREQUISITE_GATES = (
     "opentui-check",
     "opentui-build",
 )
+VISUAL_RETRY_REUSED_GATES = (*REVIEW_PREREQUISITE_GATES, "adversarial-review")
 VIDEO_RESULT_PREFIX = b"HERMES_VIDEO_RESULT_B64="
 VIDEO_PROMPT = (
     "Review this Hermes OpenTUI acceptance recording. Ground each finding in a "
@@ -2958,6 +2960,134 @@ def _validate_gate_packet_item(gate_id: str, item: Any) -> None:
     _validate_code_command(gate_id, argv)
 
 
+def _validated_visual_retry_source(
+    repo: Path,
+    source_path: Path,
+    source_sha256: str,
+    packet_path: Path,
+    *,
+    branch: str,
+    base_sha: str,
+    candidate_sha: str,
+    run_binding: dict[str, Any],
+) -> dict[str, Any]:
+    """Authenticate the one supported partial-gate retry: fresh native/video."""
+    source = Path(os.path.abspath(source_path))
+    if (
+        source.is_symlink()
+        or source.resolve(strict=False) != source
+        or not source.is_file()
+        or not SHA256_RE.fullmatch(source_sha256)
+        or _file_sha256(source) != source_sha256
+    ):
+        raise ControlError("visual retry source is missing, linked, or changed")
+    value = _load_gate(source)
+    if (
+        value.get("schema_version") != GATE_SCHEMA_VERSION
+        or value.get("branch") != branch
+        or value.get("base_sha") != base_sha
+        or value.get("candidate_sha") != candidate_sha
+        or value.get("run_binding") != run_binding
+        or not SHA256_RE.fullmatch(str(value.get("lease_token_sha256", "")))
+    ):
+        raise ControlError("visual retry source differs from this candidate or authorization")
+    _validate_recorded_worktree(value.get("worktree_proof"), candidate_sha)
+    source_packet = _evidence_path(
+        str(source.parent / "gate-packet.json"), source.parent, label="visual retry packet"
+    )
+    packet_sha256 = _file_sha256(packet_path)
+    if (
+        value.get("packet_sha256") != packet_sha256
+        or _file_sha256(source_packet) != packet_sha256
+    ):
+        raise ControlError("visual retry packet differs from the executed gate")
+    packet = _load_gate(source_packet)
+    packet_checks = packet.get("checks") if set(packet) == {"checks"} else None
+    checks = value.get("checks")
+    order = (*VISUAL_RETRY_REUSED_GATES, "termctrl-smoke", "video-analysis")
+    if (
+        not isinstance(packet_checks, list)
+        or not isinstance(checks, list)
+        or [item.get("id") for item in packet_checks if isinstance(item, dict)]
+        != list(order)
+        or [item.get("id") for item in checks if isinstance(item, dict)] != list(order)
+    ):
+        raise ControlError("visual retry source has incomplete or reordered gates")
+    source_logs = Path(os.path.abspath(source.parent / "gate-logs"))
+    for packet_item, check in zip(packet_checks, checks, strict=True):
+        gate_id = packet_item["id"]
+        _validate_gate_packet_item(gate_id, packet_item)
+        if not isinstance(check, dict) or set(check) != {
+            "id", "argv", "exit_code", "status", "output_path", "output_sha256"
+        }:
+            raise ControlError("visual retry gate evidence has an invalid shape")
+        if (
+            check["id"] != gate_id
+            or not isinstance(check["argv"], list)
+            or not check["argv"]
+            or not all(isinstance(value, str) for value in check["argv"])
+        ):
+            raise ControlError("visual retry gate command evidence is invalid")
+        if "argv" in packet_item and packet_item["argv"] != check["argv"]:
+            raise ControlError("visual retry command differs from the retained packet")
+        output = _evidence_path(
+            check["output_path"], source.parent, label=f"retained {gate_id} output"
+        )
+        if (
+            output.parent != source_logs
+            or output.name != f"{gate_id}.log"
+            or not SHA256_RE.fullmatch(str(check.get("output_sha256", "")))
+            or _file_sha256(output) != check["output_sha256"]
+        ):
+            raise ControlError("visual retry gate output changed")
+    records = {check["id"]: check for check in checks}
+    if any(
+        records[gate_id]["status"] != "passed"
+        or records[gate_id]["exit_code"] != 0
+        for gate_id in (*VISUAL_RETRY_REUSED_GATES, "termctrl-smoke")
+    ) or not (
+        records["video-analysis"]["status"] == "failed"
+        and records["video-analysis"]["exit_code"] != 0
+    ):
+        raise ControlError("visual retry requires a retained video-only failure")
+    review = value.get("review_proof")
+    review_log = _load_gate(Path(records["adversarial-review"]["output_path"]))
+    expected_mode = "upstream-merge" if run_binding["mode"] == "scheduled" else "linear-candidate"
+    if (
+        not isinstance(review, dict)
+        or review != review_log
+        or review.get("candidate_sha") != candidate_sha
+        or review.get("review_mode") != expected_mode
+        or review.get("verdict") != "approved"
+        or review.get("argv") != records["adversarial-review"]["argv"]
+        or review.get("verified_gate_evidence")
+        != _verified_review_gate_evidence(source.parent, checks[:4])
+    ):
+        raise ControlError("visual retry source review is not intact approval")
+    review_ranges = review.get("review_ranges")
+    if not isinstance(review_ranges, list) or not review_ranges:
+        raise ControlError("visual retry source review has no authenticated range")
+    for reviewed in review_ranges:
+        if (
+            not isinstance(reviewed, dict)
+            or not SHA_RE.fullmatch(str(reviewed.get("before", "")))
+            or not SHA_RE.fullmatch(str(reviewed.get("after", "")))
+            or not SHA256_RE.fullmatch(str(reviewed.get("diff_sha256", "")))
+            or hashlib.sha256(
+                _canonical_range_diff(repo, reviewed.get("before"), reviewed.get("after"))
+            ).hexdigest()
+            != reviewed.get("diff_sha256")
+        ):
+            raise ControlError("visual retry reviewed range changed")
+    for key in ("stdout", "stderr"):
+        artifact = _evidence_path(
+            review.get(f"{key}_path"), source.parent, label=f"retained review {key}"
+        )
+        if _file_sha256(artifact) != review.get(f"{key}_sha256"):
+            raise ControlError("visual retry review artifact changed")
+    return value
+
+
 def run_gate(
     packet_path: Path,
     manifest_path: Path,
@@ -2968,6 +3098,8 @@ def run_gate(
     candidate_sha: str,
     token: str,
     run_binding: dict[str, Any] | None = None,
+    reuse_manifest_path: Path | None = None,
+    reuse_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Execute candidate-bound gates and atomically record their real results."""
     evidence_root = Path(os.path.abspath(manifest_path.parent))
@@ -3006,6 +3138,22 @@ def run_gate(
         }
     if not _valid_run_binding(run_binding):
         raise ControlError("gate run binding is invalid")
+    if (reuse_manifest_path is None) != (reuse_manifest_sha256 is None):
+        raise ControlError("visual retry requires both source manifest and SHA-256")
+    retry_source = None
+    if reuse_manifest_path is not None and reuse_manifest_sha256 is not None:
+        if Path(os.path.abspath(reuse_manifest_path)) == manifest_path:
+            raise ControlError("visual retry must preserve its prior manifest separately")
+        retry_source = _validated_visual_retry_source(
+            cwd,
+            reuse_manifest_path,
+            reuse_manifest_sha256,
+            packet_path,
+            branch=branch,
+            base_sha=base_sha,
+            candidate_sha=candidate_sha,
+            run_binding=run_binding,
+        )
     node_proof = _validate_node_runtime()
     by_id = {item["id"]: item for item in checks}
     order = (
@@ -3025,6 +3173,34 @@ def run_gate(
         item = by_id[gate_id]
         output_path = _safe_output_path(evidence_root, "gate-logs", f"{gate_id}.log")
         output_path.unlink(missing_ok=True)
+        if retry_source is not None and gate_id in VISUAL_RETRY_REUSED_GATES:
+            source_record = next(
+                check for check in retry_source["checks"] if check["id"] == gate_id
+            )
+            if gate_id == "adversarial-review":
+                review_evidence = dict(retry_source["review_proof"])
+                review_dir = _safe_output_path(
+                    evidence_root, "review-verified", "placeholder"
+                ).parent
+                for key in ("stdout", "stderr"):
+                    source_artifact = Path(review_evidence[f"{key}_path"])
+                    target = _safe_output_path(review_dir, f"{key}.txt")
+                    shutil.copyfile(source_artifact, target)
+                    review_evidence[f"{key}_path"] = str(target)
+                    review_evidence[f"{key}_sha256"] = _file_sha256(target)
+                output_path.write_text(
+                    json.dumps(review_evidence, sort_keys=True) + "\n", encoding="utf-8"
+                )
+            else:
+                shutil.copyfile(Path(source_record["output_path"]), output_path)
+            recorded.append(
+                {
+                    **source_record,
+                    "output_path": str(output_path),
+                    "output_sha256": _file_sha256(output_path),
+                }
+            )
+            continue
         if failed_gate is not None:
             if gate_id in {"termctrl-smoke", "video-analysis", "adversarial-review"}:
                 argv = ["runtime-verifier", gate_id]
@@ -3174,6 +3350,14 @@ def run_gate(
         "checks": recorded,
         "packet_sha256": _file_sha256(packet_path),
     }
+    if retry_source is not None:
+        manifest["visual_retry"] = {
+            "source_manifest": str(Path(os.path.abspath(reuse_manifest_path))),
+            "source_sha256": reuse_manifest_sha256,
+            "reused_gates": list(VISUAL_RETRY_REUSED_GATES),
+            "fresh_gates": ["termctrl-smoke", "video-analysis"],
+            "authorization_sha256": _canonical_json_sha256(run_binding),
+        }
     _atomic_json(manifest_path, manifest)
     return manifest
 
@@ -3524,6 +3708,8 @@ def gate_and_ship(
     remote: str = REMOTE,
     branch: str = BRANCH,
     expected_pr_head: str | None = None,
+    reuse_manifest_path: Path | None = None,
+    reuse_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Run every gate and immediately publish by remote CAS in one invocation."""
     evidence_root = Path(os.path.abspath(manifest_path.parent))
@@ -3554,6 +3740,33 @@ def gate_and_ship(
             or _git_status(cwd, ["merge-base", "--is-ancestor", source, candidate_sha])
         ):
             raise ControlError("repair candidate must retain the requested PR source above its captured base")
+    issue_request = None
+    if run_binding["mode"] == "issue":
+        issue_request = _revalidate_issue_request(
+            state_dir,
+            evidence_root,
+            token,
+            candidate_sha=expected_pr_head or candidate_sha,
+        )
+    owner_preflight = None
+    if expected_pr_head is not None:
+        publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
+        preflight_manifest = {
+            "branch": branch,
+            "base_sha": base_sha,
+            "candidate_sha": candidate_sha,
+            "run_binding": run_binding,
+        }
+        try:
+            owner_preflight = publisher["preflight_owned_head"](
+                repo,
+                evidence_root,
+                preflight_manifest,
+                expected_pr_head,
+                remote=remote,
+            )
+        except (RuntimeError, ValueError, KeyError, OSError) as exc:
+            raise ControlError(f"owned PR preflight refused: {exc}") from exc
     result = run_gate(
         packet_path,
         manifest_path,
@@ -3563,7 +3776,12 @@ def gate_and_ship(
         candidate_sha=candidate_sha,
         token=token,
         run_binding=run_binding,
+        reuse_manifest_path=reuse_manifest_path,
+        reuse_manifest_sha256=reuse_manifest_sha256,
     )
+    if owner_preflight is not None:
+        result["owner_preflight"] = owner_preflight
+        _atomic_json(manifest_path, result)
     failed = [item["id"] for item in result["checks"] if item["status"] != "passed"]
     if failed:
         raise ControlError("candidate gates failed: " + ", ".join(failed))
@@ -3575,7 +3793,6 @@ def gate_and_ship(
         state_dir, evidence_root, token
     ) != run_binding:
         raise ControlError("bound request changed during verification")
-    issue_request = None
     if run_binding["mode"] == "issue":
         issue_request = _revalidate_issue_request(
             state_dir,
@@ -4322,6 +4539,8 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--base", required=True)
     publish.add_argument("--candidate", required=True)
     publish.add_argument("--expected-pr-head")
+    publish.add_argument("--reuse-manifest", type=Path)
+    publish.add_argument("--reuse-sha256")
     publish.add_argument("--remote", default=REMOTE)
     publish.add_argument("--branch", default=BRANCH)
     return parser
@@ -4438,6 +4657,8 @@ def main(argv: list[str] | None = None) -> int:
                 remote=args.remote,
                 branch=args.branch,
                 expected_pr_head=args.expected_pr_head,
+                reuse_manifest_path=args.reuse_manifest,
+                reuse_manifest_sha256=args.reuse_sha256,
             )
             # Publication and deterministic cleanup are one trusted CLI
             # transaction. No release can interleave before finalization.

@@ -93,6 +93,8 @@ class Github:
         self.formal_reviews = []
         self.check_runs = {}
         self.statuses = {}
+        self.action_jobs = {}
+        self.action_logs = {}
 
     def run(self, argv, cwd):
         self.calls.append(argv)
@@ -138,6 +140,11 @@ class Github:
             if "/commits/" in endpoint and "/statuses?" in endpoint:
                 head = endpoint.split("/commits/", 1)[1].split("/", 1)[0]
                 return json.dumps([self.statuses.get(head, [])])
+            if "/actions/jobs/" in endpoint:
+                job_id = int(endpoint.split("/actions/jobs/", 1)[1].split("/", 1)[0])
+                if endpoint.endswith("/logs"):
+                    return self.action_logs[job_id]
+                return json.dumps(self.action_jobs[job_id])
             # Live issue-scoped decoder edges used by the just-before-create
             # reconciliation. The real intake decoder filters these by the
             # closing-keyword parser, so the maintainer's own keyword-free PR is
@@ -750,7 +757,7 @@ def test_all_review_surfaces_and_original_failures_need_parent_disposition(
             "name": "Python tests",
             "status": "completed",
             "conclusion": "failure",
-            "details_url": "https://example.invalid/check/401",
+            "details_url": f"https://github.com/{pub.REPOSITORY}/actions/runs/701/job/801",
             "started_at": "2026-09-07T09:00:00Z",
             "completed_at": "2026-09-07T09:30:00Z",
             "app": {"slug": "github-actions"},
@@ -761,6 +768,18 @@ def test_all_review_surfaces_and_original_failures_need_parent_disposition(
             },
         }
     ]
+    github.action_jobs[801] = {
+        "id": 801,
+        "run_id": 701,
+        "run_attempt": 1,
+        "head_sha": "a" * 40,
+        "name": "Python tests",
+        "check_run_url": f"https://api.github.com/repos/{pub.REPOSITORY}/check-runs/401",
+    }
+    github.action_logs[801] = (
+        "2026-09-07T09:29:59Z FAILED test_publication_contract\n"
+        "2026-09-07T09:30:00Z 1 failed, 46057 passed\n"
+    )
     github.statuses["a" * 40] = [
         {
             "id": 501,
@@ -793,6 +812,13 @@ def test_all_review_surfaces_and_original_failures_need_parent_disposition(
         "One test failed"
     )
     assert observations["surfaces"]["failed_checks"][0]["app"] == "github-actions"
+    failed_attempt = observations["surfaces"]["failed_checks"][0]
+    assert failed_attempt["workflow_run_id"] == 701
+    assert failed_attempt["workflow_job_id"] == 801
+    assert failed_attempt["workflow_attempt"] == 1
+    log = Path(failed_attempt["log_path"])
+    assert log.read_text(encoding="utf-8").endswith("1 failed, 46057 passed\n")
+    assert failed_attempt["log_sha256"] == digest(log)
     write_review_disposition(capture[0], observations)
     disposition = json.loads(
         (capture[0] / "pr-review-disposition.json").read_text(encoding="utf-8")

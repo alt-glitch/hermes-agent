@@ -38,6 +38,10 @@ NON_CHECK_RULES = frozenset({
 })
 MAX_REVIEW_WAIT_SECONDS = 140 * 60
 REVIEW_POLL_SECONDS = 30
+MAX_FAILED_JOB_LOG_BYTES = 32 * 1024 * 1024
+ACTION_JOB_URL = re.compile(
+    rf"^https://github\.com/{re.escape(REPOSITORY)}/actions/runs/([1-9][0-9]*)/job/([1-9][0-9]*)/?$"
+)
 
 
 class PublicationError(RuntimeError):
@@ -448,14 +452,68 @@ def _review_item(
     return item
 
 
+def _failed_action_attempt(
+    root: Path,
+    value: dict[str, Any],
+    head: str,
+) -> dict[str, Any]:
+    """Retain the actual failed Actions job log, not only its often-empty summary."""
+    if _actor(value.get("app")) != "github-actions":
+        return {}
+    match = ACTION_JOB_URL.fullmatch(str(value.get("details_url", "")))
+    if match is None:
+        raise PublicationError("failed GitHub Actions check has no exact job identity")
+    run_id, job_id = (int(part) for part in match.groups())
+    endpoint = f"repos/{REPOSITORY}/actions/jobs/{job_id}"
+    try:
+        job = json.loads(_run([str(GH), "api", endpoint], root))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise PublicationError("failed GitHub Actions job metadata is invalid") from exc
+    check_id = value.get("id")
+    attempt = job.get("run_attempt") if isinstance(job, dict) else None
+    if (
+        not isinstance(job, dict)
+        or job.get("id") != job_id
+        or job.get("run_id") != run_id
+        or job.get("head_sha") != head
+        or type(attempt) is not int
+        or attempt <= 0
+        or str(job.get("check_run_url", "")).rsplit("/", 1)[-1]
+        != str(check_id)
+    ):
+        raise PublicationError("failed GitHub Actions job does not bind the check attempt")
+    log = _run([str(GH), "api", endpoint + "/logs"], root)
+    size = len(log.encode("utf-8"))
+    if not log or size > MAX_FAILED_JOB_LOG_BYTES:
+        raise PublicationError("failed GitHub Actions job log is empty or exceeds its bound")
+    identity = _canonical_sha(
+        {"head": head, "check": check_id, "run": run_id, "job": job_id, "attempt": attempt}
+    )
+    path = root / f"pr-ci-attempt-{identity[:20]}.log"
+    _write(path, log)
+    return {
+        "workflow_run_id": run_id,
+        "workflow_job_id": job_id,
+        "workflow_attempt": attempt,
+        "workflow_job_name": job.get("name"),
+        "log_path": str(path),
+        "log_sha256": _hash(path),
+        "log_bytes": size,
+    }
+
+
 def collect_review_surfaces(
     root: Path,
     number: int,
     candidate: str,
     *,
     observed_heads: list[str] | None = None,
+    artifact_name: str = "pr-review-surfaces.json",
 ) -> dict[str, Any]:
     """Collect untrusted PR findings and all failed attempts as bounded evidence."""
+    root = Path(os.path.abspath(root))
+    if root.is_symlink() or not re.fullmatch(r"pr-[a-z0-9-]+\.json", artifact_name):
+        raise PublicationError("PR review evidence destination is unsafe")
     heads = observed_heads or [candidate]
     if (
         type(number) is not int
@@ -552,6 +610,7 @@ def collect_review_surfaces(
                         "started_at": value.get("started_at"),
                         "completed_at": value.get("completed_at"),
                         "app": _actor(value.get("app")),
+                        **_failed_action_attempt(root, value, head),
                     },
                 )
             )
@@ -588,11 +647,16 @@ def collect_review_surfaces(
         "observed_unix": int(time.time()),
         "observations_sha256": _canonical_sha(identity),
     }
-    _write(root / "pr-review-surfaces.json", json.dumps(result, indent=2) + "\n")
+    _write(root / artifact_name, json.dumps(result, indent=2) + "\n")
     return result
 
 
-def require_review_disposition(root: Path, observations: dict[str, Any]) -> str | None:
+def require_review_disposition(
+    root: Path,
+    observations: dict[str, Any],
+    *,
+    snapshot_name: str | None = None,
+) -> str | None:
     required = {
         item["key"]: item
         for values in observations["surfaces"].values()
@@ -647,7 +711,12 @@ def require_review_disposition(root: Path, observations: dict[str, Any]) -> str 
         by_key[item["key"]] = item
     if set(by_key) != set(required):
         raise PublicationError("PR review disposition is incomplete")
-    return _hash(path)
+    digest = _hash(path)
+    if snapshot_name is not None:
+        if not re.fullmatch(r"pr-[a-z0-9-]+\.json", snapshot_name):
+            raise PublicationError("PR review disposition snapshot is unsafe")
+        _write(root / snapshot_name, path.read_text(encoding="utf-8"))
+    return digest
 
 
 def review_status(pr: dict[str, Any], candidate: str, policy: dict[str, Any]) -> dict[str, Any] | None:
@@ -973,6 +1042,121 @@ def _ensure_owned_draft(
     return updated
 
 
+def _owned_head(
+    root: Path,
+    destination: str,
+    manifest: dict[str, Any],
+    expected: str,
+) -> tuple[dict[str, Any], str, str]:
+    if not re.fullmatch(r"[0-9a-f]{40}", expected):
+        raise PublicationError("expected PR head must be an exact SHA")
+    head, _, identity = _candidate_head(manifest)
+    marker = f"<!-- maintainer-candidate:v1:{identity} -->"
+    prs = json.loads(
+        _run(
+            [
+                str(GH),
+                "pr",
+                "list",
+                "--repo",
+                REPOSITORY,
+                "--state",
+                "all",
+                "--head",
+                head,
+                "--json",
+                FIELDS + OWNERSHIP_FIELDS,
+            ],
+            root,
+        )
+    )
+    binding = manifest.get("run_binding")
+    if prs == [] and isinstance(binding, dict) and binding.get("mode") == "issue":
+        # Adopted drafts keep their contributor branch through follow-up fixes.
+        _, _, issue, workflow = _publication_metadata(
+            root, manifest, None, verification_complete=False
+        )
+        try:
+            adopted = _reconcile_live_issue_pr(workflow, issue, expected, root=root)
+        except PublicationError:
+            # A lost push reply may already have advanced exactly this candidate.
+            adopted = _reconcile_live_issue_pr(
+                workflow, issue, manifest["candidate_sha"], root=root
+            )
+        if adopted is not None:
+            head = adopted["headRefName"]
+            prs = [adopted]
+    if not isinstance(prs, list) or len(prs) != 1:
+        raise PublicationError("expected exactly one owned task PR before update")
+    candidate = manifest["candidate_sha"]
+    pr = prs[0]
+    if not isinstance(pr, dict) or pr.get("headRefOid") not in {expected, candidate}:
+        raise PublicationError("owned PR head moved unexpectedly")
+    _validate_pr(pr, head, pr["headRefOid"], marker)
+    _validate_owned_base(pr, manifest["base_sha"])
+    ref = f"refs/heads/{head}"
+    advertised = _run(["git", "ls-remote", destination, ref], root).split()
+    if advertised != [pr["headRefOid"], ref]:
+        raise PublicationError("owned branch and PR disagree")
+    return pr, head, marker
+
+
+def preflight_owned_head(
+    repo: Path,
+    root: Path,
+    manifest: dict[str, Any],
+    expected: str,
+    *,
+    remote: str = "origin",
+) -> dict[str, Any]:
+    """Consume prior-head ownership, findings and failed CI before local gates."""
+    root = Path(os.path.abspath(root))
+    destination = _publication_destination(repo, remote)
+    pr, head, _ = _owned_head(root, destination, manifest, expected)
+    candidate = manifest["candidate_sha"]
+    _run(["git", "merge-base", "--is-ancestor", expected, candidate], repo)
+    observed_heads = list(dict.fromkeys([expected, pr["headRefOid"]]))
+    observations = collect_review_surfaces(
+        root,
+        pr["number"],
+        candidate,
+        observed_heads=observed_heads,
+        artifact_name="pr-owner-preflight-surfaces.json",
+    )
+    disposition_sha256 = require_review_disposition(
+        root,
+        observations,
+        snapshot_name="pr-owner-preflight-disposition.json",
+    )
+    surfaces_path = root / "pr-owner-preflight-surfaces.json"
+    disposition_path = root / "pr-owner-preflight-disposition.json"
+    identity = {
+        "repository": REPOSITORY,
+        "base_branch": BASE,
+        "base_sha": manifest["base_sha"],
+        "candidate_sha": candidate,
+        "expected_previous_head": expected,
+        "observed_pr_head": pr["headRefOid"],
+        "head_branch": head,
+        "number": pr["number"],
+        "url": pr["url"],
+        "observed_heads": observed_heads,
+        "review_surfaces_sha256": observations["observations_sha256"],
+        "review_surfaces_artifact_sha256": _hash(surfaces_path),
+        "review_disposition_sha256": disposition_sha256,
+        "review_disposition_artifact_sha256": (
+            _hash(disposition_path) if disposition_sha256 is not None else None
+        ),
+    }
+    proof = {
+        "schema_version": 1,
+        **identity,
+        "proof_sha256": _canonical_sha(identity),
+    }
+    _write(root / "pr-owner-preflight.json", json.dumps(proof, indent=2) + "\n")
+    return proof
+
+
 def advance_owned_head(
     repo: Path,
     root: Path,
@@ -983,42 +1167,8 @@ def advance_owned_head(
     as_draft: bool = False,
 ) -> None:
     """CAS only a proven fast-forward on this task's already-owned open PR."""
-    if not re.fullmatch(r"[0-9a-f]{40}", expected):
-        raise PublicationError("expected PR head must be an exact SHA")
-    head, _, identity = _candidate_head(manifest)
-    marker = f"<!-- maintainer-candidate:v1:{identity} -->"
-    prs = json.loads(_run([
-        str(GH), "pr", "list", "--repo", REPOSITORY, "--state", "all",
-        "--head", head, "--json", FIELDS + OWNERSHIP_FIELDS,
-    ], root))
-    binding = manifest.get("run_binding")
-    if not prs and isinstance(binding, dict) and binding.get("mode") == "issue":
-        # An approved draft may have retained the contributor's branch name.
-        # Discover it through the existing issue owner, then require our adopted
-        # task marker and every ordinary expected-head/ancestry check below.
-        _, _, issue, workflow = _publication_metadata(
-            root, manifest, None, verification_complete=False
-        )
-        try:
-            adopted = _reconcile_live_issue_pr(workflow, issue, expected, root=root)
-        except PublicationError:
-            # An acknowledged head may already be current after a lost reply.
-            # Both lookups enforce the same issue ownership, never a newer head.
-            adopted = _reconcile_live_issue_pr(
-                workflow, issue, manifest["candidate_sha"], root=root
-            )
-        if adopted is not None:
-            head = adopted["headRefName"]
-            prs = [adopted]
-    if len(prs) != 1:
-        raise PublicationError("expected exactly one owned task PR before update")
+    pr, head, marker = _owned_head(root, destination, manifest, expected)
     candidate = manifest["candidate_sha"]
-    pr = prs[0]
-    # A lost push acknowledgement may already have advanced exactly this head.
-    if pr.get("headRefOid") not in {expected, candidate}:
-        raise PublicationError("owned PR head moved unexpectedly")
-    _validate_pr(pr, head, pr["headRefOid"], marker)
-    _validate_owned_base(pr, manifest["base_sha"])
     observations = collect_review_surfaces(
         root,
         pr["number"],
@@ -1041,6 +1191,7 @@ def advance_owned_head(
             manifest["base_sha"],
             marker,
         )
+
     if pr["headRefOid"] == expected and expected != candidate:
         _run(["git", "push", "--porcelain", f"--force-with-lease={ref}:{expected}",
               destination, f"{candidate}:{ref}"], repo)
