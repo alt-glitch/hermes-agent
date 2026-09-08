@@ -620,7 +620,7 @@ def test_task_draft_is_honest_and_becomes_the_same_verified_pr(capture, github):
 
 
 def test_compatible_existing_issue_draft_is_adopted_without_replacement(
-    capture, github
+    capture, github, monkeypatch
 ):
     existing = {
         "number": 42,
@@ -655,6 +655,39 @@ def test_compatible_existing_issue_draft_is_adopted_without_replacement(
     assert not any(
         len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
     )
+
+    old = capture[1]["candidate_sha"]
+    fixed = "c" * 40
+    github.ref = old + "\trefs/heads/" + existing["head_branch"]
+    transport = github.run
+
+    def routed_transport(argv, cwd):
+        if argv[:3] == [str(pub.GH), "pr", "list"] and "--head" in argv:
+            if argv[argv.index("--head") + 1] != github.pr["headRefName"]:
+                return "[]"
+        if argv[:2] == ["git", "merge-base"]:
+            assert argv[2:] == ["--is-ancestor", old, fixed]
+            return ""  # Graph refusal itself is covered by the real-Git suite.
+        result = transport(argv, cwd)
+        if argv[:2] == ["git", "push"]:
+            github.pr["headRefOid"] = fixed
+        return result
+
+    monkeypatch.setattr(pub, "_run", routed_transport)
+    capture[1]["candidate_sha"] = fixed
+    capture[1]["expected_pr_head"] = old
+    updated = pub.publish_draft(
+        capture[0].parent, capture[0], capture[1], pending_gates=["new-head checks"]
+    )
+    assert updated["number"] == proof["number"]
+    assert updated["head_branch"] == existing["head_branch"]
+    assert github.pr["headRefOid"] == fixed
+    retried = pub.publish_draft(
+        capture[0].parent, capture[0], capture[1], pending_gates=["new-head checks"]
+    )
+    assert retried["number"] == proof["number"]
+    assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
+    assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
 
 
 def test_all_review_surfaces_and_original_failures_need_parent_disposition(

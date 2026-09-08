@@ -987,6 +987,25 @@ def advance_owned_head(
         str(GH), "pr", "list", "--repo", REPOSITORY, "--state", "all",
         "--head", head, "--json", FIELDS + OWNERSHIP_FIELDS,
     ], root))
+    binding = manifest.get("run_binding")
+    if not prs and isinstance(binding, dict) and binding.get("mode") == "issue":
+        # An approved draft may have retained the contributor's branch name.
+        # Discover it through the existing issue owner, then require our adopted
+        # task marker and every ordinary expected-head/ancestry check below.
+        _, _, issue, workflow = _publication_metadata(
+            root, manifest, None, verification_complete=False
+        )
+        try:
+            adopted = _reconcile_live_issue_pr(workflow, issue, expected, root=root)
+        except PublicationError:
+            # An acknowledged head may already be current after a lost reply.
+            # Both lookups enforce the same issue ownership, never a newer head.
+            adopted = _reconcile_live_issue_pr(
+                workflow, issue, manifest["candidate_sha"], root=root
+            )
+        if adopted is not None:
+            head = adopted["headRefName"]
+            prs = [adopted]
     if len(prs) != 1:
         raise PublicationError("expected exactly one owned task PR before update")
     candidate = manifest["candidate_sha"]
