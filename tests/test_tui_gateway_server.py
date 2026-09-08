@@ -8283,11 +8283,23 @@ def test_notification_poller_delivers_owned_events(
     sess = _session(session_key="session-a")
     server._sessions["sid_a"] = sess
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
-    monkeypatch.setattr(
-        server,
-        "_run_prompt_submit",
-        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
-    )
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: None)
+
+    def submit(_rid, _sid, _session, text, **kwargs):
+        admitted = server._admit_prompt_turn(
+            _sid,
+            _session,
+            text,
+            None,
+            None,
+            [],
+            kwargs.get("display_notification"),
+        )
+        if admitted is not None:
+            delivered.append(text)
+        return admitted is not None
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()

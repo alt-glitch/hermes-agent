@@ -21,7 +21,8 @@ def test_post_turn_completion_is_admitted_or_requeued(monkeypatch, tmp_path, ref
         "_turn_cancel_requested": refusal == "previous_stop",
     }
     monkeypatch.setattr(server, "_sessions", {sid: session})
-    monkeypatch.setattr(server, "_emit", lambda *_: None)
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
     monkeypatch.setattr(server, "_get_usage", lambda _: {})
     monkeypatch.setattr(process_registry, "completion_queue", queue.Queue())
     event = {
@@ -32,13 +33,15 @@ def test_post_turn_completion_is_admitted_or_requeued(monkeypatch, tmp_path, ref
     process_registry.completion_queue.put(event)
     attempts, accepted = [], []
 
-    def submit(_rid, live_sid, owned_session, text, **_kwargs):
+    def submit(_rid, live_sid, owned_session, text, **kwargs):
         attempts.append(text)
         if refusal == "exception" and len(attempts) == 1:
             raise RuntimeError("synthetic dispatch failure")
-        admitted = server._admit_prompt_turn(live_sid, owned_session, text, None, None, [])
+        admitted = server._admit_prompt_turn(
+            live_sid, owned_session, text, None, None, [], kwargs.get("display_notification")
+        )
         if admitted is not None:
-            accepted.append(text)
+            accepted.append((text, kwargs))
         return admitted is not None
 
     if refusal == "ownership":
@@ -55,5 +58,10 @@ def test_post_turn_completion_is_admitted_or_requeued(monkeypatch, tmp_path, ref
         server._run_post_turn_followups("retry", sid, session, {}, None)
 
     assert len(accepted) == 1
-    assert "synthetic result" in accepted[0]
+    assert "synthetic result" in accepted[0][0]
+    assert accepted[0][1]["display_kind"] == "process_complete"
+    assert accepted[0][1]["display_metadata"]["kind"] == "process.complete"
+    cards = [args[2] for args in emitted if args[0] == "notification.show"]
+    assert len(cards) == 1
+    assert cards[0]["detail"] == accepted[0][0]
     assert process_registry.completion_queue.empty()

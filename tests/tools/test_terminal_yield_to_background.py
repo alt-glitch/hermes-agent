@@ -11,6 +11,7 @@ import os
 import shlex
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,13 @@ from tools.process_registry import process_registry
 from tools.terminal_tool import terminal_tool
 
 pytestmark = pytest.mark.linux_only
+
+
+def _wait_for_path(path: Path, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists() and time.monotonic() < deadline:
+        threading.Event().wait(0.02)
+    assert path.exists(), f"timed out waiting for subprocess readiness: {path}"
 
 
 class _Agent(InterruptControlMixin):
@@ -97,23 +105,35 @@ def test_natural_yield_completion_uses_environment_marker_cleanup(tmp_path, monk
     target = tmp_path / "changed cwd"
     target.mkdir()
     session_key = "yield-marker-cleanup"
+    ready = tmp_path / "command-ready"
+    release = tmp_path / "command-release"
     agent = _Agent()
     res = {}
 
     def worker():
         with agent._tool_worker_threads_lock:
             agent._tool_worker_threads.add(threading.current_thread().ident)
-        command = f"echo started; sleep 1; cd {shlex.quote(str(target))}; echo finished"
+        command = (
+            f"echo started; touch {shlex.quote(str(ready))}; "
+            f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.05; done; "
+            f"cd {shlex.quote(str(target))}; echo finished"
+        )
         res["result"] = json.loads(terminal_tool(command, task_id=session_key, timeout=15))
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
-    time.sleep(0.25)
-    assert agent.redirect("continue while it runs") is True
-    t.join(timeout=10)
-    assert not t.is_alive()
+    _wait_for_path(ready)
+    try:
+        assert agent.redirect("continue while it runs") is True
+        t.join(timeout=10)
+        assert not t.is_alive()
+    finally:
+        if t.is_alive():
+            release.touch(exist_ok=True)
+            t.join(timeout=5)
     result = res["result"]
     assert result["status"] == "yielded_to_background"
+    release.touch()
 
     try:
         evt = process_registry.completion_queue.get(timeout=10)
@@ -124,4 +144,5 @@ def test_natural_yield_completion_uses_environment_marker_cleanup(tmp_path, monk
         assert "__HERMES_CWD_" not in evt["output"]
         assert get_session_cwd(session_key) == str(target)
     finally:
+        release.touch(exist_ok=True)
         clear_session_cwd(session_key)

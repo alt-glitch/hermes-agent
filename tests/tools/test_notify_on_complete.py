@@ -117,6 +117,42 @@ class TestCompletionQueue:
         assert "final 2,000 of 5,000 retained characters" in rendered
         assert f"process(action='log', session_id='{s.id}')" in rendered
 
+    def test_output_finalizer_failure_keeps_completion_authoritative(self, registry, caplog):
+        """Cleanup bookkeeping cannot suppress the exit checkpoint or notification."""
+        s = _make_session(notify_on_complete=True, output="useful result\nPRIVATE-MARKER", exit_code=0)
+        s.exited = True
+
+        def partially_failing_cleanup(result):
+            result["output"] = result["output"].replace("\nPRIVATE-MARKER", "")
+            raise RuntimeError("cwd bookkeeping failed")
+
+        s._output_finalizer = partially_failing_cleanup
+        registry._running[s.id] = s
+        checkpoints = []
+
+        with patch.object(registry, "_write_checkpoint", lambda: checkpoints.append(True)):
+            registry._move_to_finished(s)
+
+        assert s._completion_event.is_set()
+        assert checkpoints == [True]
+        assert registry.read_log(s.id)["output"] == "useful result"
+        assert registry.completion_queue.get_nowait()["output"] == "useful result"
+        assert "Process output finalizer failed" in caplog.text
+
+    def test_kill_returns_environment_finalized_output(self, registry, monkeypatch):
+        """An explicit kill observes the same cleaned buffer as log/notification consumers."""
+        s = _make_session(notify_on_complete=False, output="useful\nPRIVATE-MARKER")
+        s._output_finalizer = lambda result: result.update(output=result["output"].replace("\nPRIVATE-MARKER", ""))
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_signal_kill", lambda *_args: None)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        assert result["output"] == "useful"
+        assert registry.read_log(s.id)["output"] == "useful"
+
     def test_multiple_completions_queued(self, registry):
         """Multiple notify processes all push to the same queue."""
         for i in range(3):

@@ -97,6 +97,7 @@ def _refuse_prompt_turn_locked(sid: str, session: dict, message: str, submission
 def _admit_prompt_turn(
     sid: str, session: dict, text: Any, image_paths: list[str] | None,
     queued_prompt_generation: int | None, client_submission_ids: list[str],
+    display_notification: dict | None = None,
 ) -> tuple[list[str], Any] | None:
     """Fence ownership and publish message.start atomically against close and interrupt."""
     if session.get("_closing") or _session_is_detached(sid, session):
@@ -193,6 +194,12 @@ def _admit_prompt_turn(
             turn_start_submission_ids = list(
                 session["_active_client_submission_ids"]
             )
+            # Completion chrome belongs at the same admitted boundary as its
+            # synthetic turn.  Publishing it here (after every refusal fence,
+            # before message.start) preserves transcript chronology and means
+            # a requeued event cannot leave a speculative duplicate card.
+            if display_notification is not None:
+                _emit("notification.show", sid, display_notification)
             if turn_start_submission_ids:
                 _emit(
                     "message.start",
@@ -459,11 +466,11 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
 
 
 def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str, *,
-                            on_done=None, on_error=None) -> None:
+                            on_done=None, on_error=None, submit_kwargs=None) -> None:
     """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
     release ``running``."""
     try:
-        dispatched = _run_prompt_submit(rid, sid, session, prompt)
+        dispatched = _run_prompt_submit(rid, sid, session, prompt, **(submit_kwargs or {}))
         if dispatched is False:
             if on_error is not None:
                 on_error()
@@ -517,7 +524,7 @@ def _run_post_turn_followups(
             if _claim is None:
                 _notif_release_turn(session)
                 continue
-            _emit_process_completion_card(sid, _evt, synth)
+            submit_kwargs = _notification_turn_display(_evt, synth)
 
             def retry_delivery(evt=_evt, claim=_claim):
                 release_event_delivery(evt, claim)
@@ -526,7 +533,7 @@ def _run_post_turn_followups(
             _dispatch_followup_turn(
                 rid, sid, session, synth, "completion notification dispatch",
                 on_done=lambda: complete_event_delivery(_evt, _claim),
-                on_error=retry_delivery)
+                on_error=retry_delivery, submit_kwargs=submit_kwargs)
     except Exception as _drain_exc:
         _hook_failure("completion queue drain", _drain_exc)
 
@@ -946,13 +953,16 @@ def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
 
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
-    display_metadata: dict | None = None, image_paths: list[str] | None = None,
+    display_metadata: dict | None = None, display_notification: dict | None = None,
+    image_paths: list[str] | None = None,
     client_submission_ids: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     loop_claim_id: str = "") -> bool:
     client_submission_ids = list(client_submission_ids or [])
-    admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation, client_submission_ids)
+    admitted = _admit_prompt_turn(
+        sid, session, text, image_paths, queued_prompt_generation,
+        client_submission_ids, display_notification)
     if admitted is None:
         return False
     images, agent = admitted

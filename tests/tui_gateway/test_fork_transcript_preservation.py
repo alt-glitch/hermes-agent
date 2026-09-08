@@ -12,7 +12,10 @@ from tui_gateway import server
 @pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
 def test_notification_dispatch_has_one_start_and_retains_model_detail(monkeypatch, event_type):
     events, submissions, settled = [], [], []
-    session = {"running": True, "history_lock": threading.RLock()}
+    session = {
+        "running": True, "history_lock": threading.RLock(), "agent": object(),
+        "attached_images": [],
+    }
     event = {
         "type": event_type, "session_id": "proc-test", "command": "echo done", "exit_code": 0,
         "delegation_id": "deleg-test", "status": "completed",
@@ -20,18 +23,22 @@ def test_notification_dispatch_has_one_start_and_retains_model_detail(monkeypatc
     detail = "Full synthetic result retained for the model"
     claim = object()
     monkeypatch.setattr(server, "_emit", lambda kind, sid, payload=None: events.append((kind, payload)))
+    monkeypatch.setattr(server, "_session_is_detached", lambda *_: False)
+    monkeypatch.setattr(server, "_session_registry_matches", lambda *_: True)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: None)
     monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: claim)
     monkeypatch.setattr(async_delegation, "complete_event_delivery", lambda *args: settled.append(args))
 
     def submit(rid, sid, owned_session, text, **kwargs):
-        server._emit("message.start", sid)
         submissions.append((owned_session, text, kwargs))
+        return server._admit_prompt_turn(
+            sid, owned_session, text, None, None, [], kwargs.get("display_notification")
+        ) is not None
 
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
     server._notif_dispatch_event("s1", session, event, detail)
 
-    expected = ["notification.show", "message.start"] if event_type == "async_delegation" else ["message.start"]
-    assert [kind for kind, _ in events] == expected
+    assert [kind for kind, _ in events] == ["notification.show", "message.start"]
     assert submissions[0][:2] == (session, detail)
     assert settled == [(event, claim)]
     if event_type == "async_delegation":
@@ -60,18 +67,17 @@ def test_busy_process_completion_emits_one_expandable_card_without_raw_status(mo
         "s1", session, event, emitted, registry,
         lambda _event: "FULL MODEL DETAIL", None,
     ) is True
-    assert [kind for kind, _ in events] == ["notification.show", "status.update"]
-    card, status = events[0][1], events[1][1]
-    assert card["detail"] == "FULL MODEL DETAIL"
-    assert card["always_visible"] is True
-    assert status == {"kind": "status", "text": card["text"]}
+    assert [kind for kind, _ in events] == ["status.update"]
+    status = events[0][1]
+    assert status["kind"] == "status"
+    assert status["text"].endswith("· proc-test")
     assert registry.completion_queue.get_nowait() == event
 
     assert server._notif_handle_event(
         "s1", session, event, emitted, registry,
         lambda _event: "FULL MODEL DETAIL", None,
     ) is True
-    assert len(events) == 2
+    assert len(events) == 1
 
 
 def test_native_history_projection_preserves_upstream_metadata_and_raw_history():

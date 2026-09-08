@@ -1185,8 +1185,18 @@ class ProcessRegistry:
             finalizer, session._output_finalizer = session._output_finalizer, None
             with session._lock:
                 result = {"output": session.output_buffer}
+            try:
                 finalizer(result)
-                session.output_buffer = str(result.get("output") or "")[-session.max_output_chars:]
+            except Exception:
+                # Output cleanup is presentation bookkeeping.  A broken CWD
+                # recorder must not strand the authoritative process outcome
+                # before its completion event/checkpoint is published.
+                logger.exception("Process output finalizer failed for %s", session.id)
+            finally:
+                with session._lock:
+                    # Apply any cleanup completed before a later bookkeeping
+                    # failure, then preserve the registry's retention contract.
+                    session.output_buffer = str(result.get("output") or "")[-session.max_output_chars:]
         session._completion_event.set()
         self._write_checkpoint()
         if was_running and session.notify_on_complete:
@@ -1648,10 +1658,10 @@ class ProcessRegistry:
             # descendants reparented inside the cgroup.
             if session.systemd_unit:
                 _stop_systemd_unit(session.systemd_unit)
-            # Capture output, mark consumed, THEN expose ``exited`` to watcher tasks —
-            # closes the delayed-notification race without losing the transcript.
+            # Mark consumed before exposing ``exited`` to watcher tasks, then
+            # finalize before taking the returned snapshot.  Yielded commands
+            # may still carry their environment's private CWD marker here.
             with session._lock:
-                output = _output_tail(session, 2000)
                 if consume_output:
                     self._completion_consumed.add(session_id)
                 session.exited = True
@@ -1660,6 +1670,8 @@ class ProcessRegistry:
                 session.termination_source = source
             self._move_to_finished(session)
             self._write_checkpoint()
+            with session._lock:
+                output = _output_tail(session, 2000)
             return {
                 "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source, "output": output}

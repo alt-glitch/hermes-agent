@@ -425,21 +425,8 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     if (claim := claim_event_delivery(evt, "tui-poller")) is None:
         _notif_release_turn(session)
         return True  # Another consumer owns the event; do not create a retry duplicate.
-    if evt.get("type") == "async_delegation":
-        kwargs = {
-            "display_kind": "async_delegation_complete",
-            "display_metadata": _async_delegation_display_metadata(evt),
-        }
-    elif evt.get("type", "completion") == "completion":
-        kwargs = {
-            "display_kind": "process_complete",
-            "display_metadata": _process_completion_display_metadata(evt),
-        }
-    else:
-        kwargs = {}
+    kwargs = _notification_turn_display(evt, text)
     try:
-        if evt.get("type") == "async_delegation":
-            _emit_process_completion_card(sid, evt, text)
         admitted = _notif_submit(
             f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
@@ -492,7 +479,6 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred) -> 
             _emit("status.update", sid, {"kind": "status", "text": notice["text"]})
         elif evt_type == "completion":
             notice = _process_completion_notice(evt, text)
-            _emit_process_completion_card(sid, evt, text)
             _emit("status.update", sid, {"kind": "status", "text": notice["text"]})
         else:
             _emit("status.update", sid, {"kind": "process", "text": text})
@@ -714,6 +700,24 @@ def _process_completion_notice(evt: dict, detail: str) -> dict:
 def _process_completion_display_metadata(evt: dict) -> dict:
     """Persist the compact card fields; the full prompt already persists as the row content."""
     return _process_completion_notice(evt, "")
+
+
+def _notification_turn_display(evt: dict, detail: str) -> dict:
+    """Persist and publish completion chrome at the turn's admission boundary."""
+    if evt.get("type") == "async_delegation":
+        return {
+            "display_kind": "async_delegation_complete",
+            "display_metadata": _async_delegation_display_metadata(evt),
+            "display_notification": _async_delegation_notice(evt, detail),
+        }
+    if evt.get("type", "completion") == "completion":
+        notice = _process_completion_notice(evt, detail)
+        return {
+            "display_kind": "process_complete",
+            "display_metadata": _process_completion_display_metadata(evt),
+            "display_notification": notice,
+        }
+    return {}
 
 
 def _emit_process_completion_card(
