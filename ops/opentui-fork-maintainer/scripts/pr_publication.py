@@ -1692,7 +1692,10 @@ def publish_preview(
     if len(prs) != 1:
         raise PublicationError("expected exactly one run-scoped PR")
     pr = prs[0]
-    _validate_pr(pr, head, candidate)
+    # Recovery already proved ownership; a removed marker is not a new adoption.
+    _validate_pr(
+        pr, head, candidate, candidate_marker if _existing_draft is not None else None
+    )
     _validate_owned_base(pr, base)
     marker_missing = candidate_marker not in pr["body"]
     if marker_missing:

@@ -317,6 +317,51 @@ def test_continuation_creates_missing_publication_evidence_and_delivers(
     assert not f["cwd"].exists()
 
 
+@pytest.mark.parametrize("damage", ["invalid-json", "wrong-candidate", "symlink"])
+def test_present_invalid_publication_evidence_cannot_fall_back_to_draft(
+    retained, damage
+):
+    f = retained
+    valid_proof = runtime._load_gate(f["old"] / "pr-evidence.json")
+    remove_publication_evidence(f)
+    path = f["old"] / "pr-evidence.json"
+    if damage == "invalid-json":
+        path.write_text("not json\n", encoding="utf-8")
+    elif damage == "wrong-candidate":
+        write_json(path, {**valid_proof, "candidate_sha": "0" * 40})
+    else:
+        path.symlink_to(f["old"] / "pr-draft.json")
+    before = retained_artifacts(f["old"])
+    with pytest.raises(runtime.ControlError):
+        runtime.main(f["args"])
+    assert remote_sha(f["repo"]) == f["base"]
+    assert not f["calls"]
+    assert retained_artifacts(f["old"]) == before
+
+
+def test_draft_recovery_refuses_marker_removed_between_views(retained, monkeypatch):
+    f = retained
+    remove_publication_evidence(f)
+    transport = pub._run
+    views = 0
+
+    def remove_marker(argv, cwd):
+        nonlocal views
+        if argv[:3] == [str(pub.GH), "pr", "view"]:
+            views += 1
+            if views == 2:
+                f["pr"]["body"] = "Ownership withdrawn during recovery."
+        return transport(argv, cwd)
+
+    monkeypatch.setattr(pub, "_run", remove_marker)
+    with pytest.raises(runtime.ControlError, match="PR does not bind"):
+        runtime.main(f["args"])
+    assert remote_sha(f["repo"]) == f["base"]
+    assert not any(
+        call[:3] == [str(pub.GH), "pr", "edit"] for call in f["calls"]
+    )
+
+
 def test_missing_publication_evidence_retry_keeps_review_and_media(
     retained, monkeypatch
 ):

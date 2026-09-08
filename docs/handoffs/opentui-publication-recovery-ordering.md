@@ -27,11 +27,14 @@ The coordinator-controlled sequence is:
    detached `integration` worktree. Its missing `pr-evidence.json` is recoverable
    only through the hash-bound `pr-draft.json`, exact live owner/base/head/marker,
    and republished hash-bound source Preview. Pending or failed CI still refuses.
-3. After PR90 finalizes, `sid/opentui` is exactly the issue41 prerequisite.
-   Reclaim issue41 with the new captured base and adopt the same draft and exact
-   candidate. Refresh its task/base marker and run fresh candidate-bound review,
-   local gates, native/visual evidence and current-head CI before guarded
-   publication.
+3. After PR90 finalizes at `58e83efe5e395f3d4481717b2954d2dd4e9bc13c`, reconcile
+   ancestry on the same PR91 before release. PR91 retains the older PR90
+   prerequisite and is not yet descended from this newer PR90 head. Do not
+   treat exact-head adoption alone as sufficient, replace the PR, or waive
+   ancestry checks. Preserve both heads and use the separately authorized
+   same-PR reconciliation step. Changed source/base then requires fresh
+   candidate-bound review, local gates, native/visual evidence and current-head
+   CI before guarded publication.
 
 PR90's retained review covers only PR90. It is reused unchanged for metadata
 recovery and is never rerun solely to recreate publisher state. Any review
