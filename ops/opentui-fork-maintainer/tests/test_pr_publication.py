@@ -988,6 +988,15 @@ def test_publisher_adoption_after_empty_capture_advances_sequential_real_git_hea
         pending_gates=["new-head checks"],
         issue_request={**request, "existing_prs": [adopted]},
     )
+    retried = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["new-head checks"],
+        issue_request={**request, "existing_prs": [adopted]},
+    )
+    assert retried["candidate_sha"] == second["candidate_sha"]
+    assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
 
     source = repo / "candidate.txt"
     source.write_text("base\nowned head\ncorrection\nsecond correction\n", encoding="utf-8")

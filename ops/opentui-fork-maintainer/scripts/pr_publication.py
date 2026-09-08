@@ -1255,7 +1255,7 @@ def _retained_draft_adoption(
         or draft.get("repository") != REPOSITORY
         or draft.get("base_branch") != BASE
         or draft.get("base_sha") != manifest["base_sha"]
-        or draft.get("candidate_sha") != expected
+        or draft.get("candidate_sha") not in (expected, manifest["candidate_sha"])
         or draft.get("request_identity") != request_identity
         or draft.get("candidate_identity") != candidate_identity
         or draft.get("passed") != ["Task/base identity and publication ownership checks passed"]
@@ -1280,7 +1280,7 @@ def _retained_draft_adoption(
         or adoption.get("url") != draft["url"]
         or adoption.get("base_branch") != BASE
         or adoption.get("head_branch") != draft["head_branch"]
-        or adoption.get("head_sha") != expected
+        or adoption.get("head_sha") != draft["candidate_sha"]
         or adoption.get("head_repository") != REPOSITORY
     ):
         raise PublicationError("retained task draft does not bind the expected owner/head")
