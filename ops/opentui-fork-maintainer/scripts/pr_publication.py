@@ -482,7 +482,8 @@ def _failed_action_attempt(
         != str(check_id)
     ):
         raise PublicationError("failed GitHub Actions job does not bind the check attempt")
-    log = _run([str(GH), "api", endpoint + "/logs"], root)
+    # CI logs contain ANSI; retain them as untrusted files, never terminal output.
+    log = _run([str(GH), "api", "--allow-escape-sequences", endpoint + "/logs"], root)
     size = len(log.encode("utf-8"))
     if not log or size > MAX_FAILED_JOB_LOG_BYTES:
         raise PublicationError("failed GitHub Actions job log is empty or exceeds its bound")

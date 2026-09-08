@@ -143,6 +143,7 @@ class Github:
             if "/actions/jobs/" in endpoint:
                 job_id = int(endpoint.split("/actions/jobs/", 1)[1].split("/", 1)[0])
                 if endpoint.endswith("/logs"):
+                    assert "--allow-escape-sequences" in argv
                     return self.action_logs[job_id]
                 return json.dumps(self.action_jobs[job_id])
             # Live issue-scoped decoder edges used by the just-before-create
