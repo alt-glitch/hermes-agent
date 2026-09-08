@@ -396,14 +396,10 @@ def _api_pages(root: Path, endpoint: str, *, object_key: str | None = None) -> l
     return values
 
 
-def _bounded_remote_text(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return "".join(
-        character
-        for character in value[:8_000]
-        if ord(character) >= 32 or character in "\n\t"
-    )
+def _remote_text(value: Any) -> str:
+    # Evidence must retain the whole source; any display excerpt is separate.
+    # In particular, a changed tail must invalidate a prior disposition.
+    return value if isinstance(value, str) else ""
 
 
 def _actor(value: Any) -> str | None:
@@ -432,7 +428,7 @@ def _review_item(
         "created_at": value.get("created_at") or value.get("submitted_at"),
         "updated_at": value.get("updated_at"),
         "url": value.get("html_url") or value.get("details_url") or value.get("target_url"),
-        "body": _bounded_remote_text(body),
+        "body": _remote_text(body),
     }
     if extra:
         item.update(extra)
@@ -539,9 +535,9 @@ def collect_review_surfaces(
                     body="\n".join(
                         part
                         for part in (
-                            _bounded_remote_text(output.get("title")),
-                            _bounded_remote_text(output.get("summary")),
-                            _bounded_remote_text(output.get("text")),
+                            _remote_text(output.get("title")),
+                            _remote_text(output.get("summary")),
+                            _remote_text(output.get("text")),
                         )
                         if part
                     ),

@@ -160,7 +160,7 @@ retained draft is refused without rewriting or topology waiver.
 Every owned-head update and final review observation collects
 `pr-review-surfaces.json`: general PR comments, inline review comments, formal
 reviews, and all failed CheckRun and status attempts for the relevant heads.
-Bodies are bounded untrusted evidence, never authorization. If any item requires
+Bodies are retained completely as untrusted evidence, never authorization. If any item requires
 attention, the parent writes `pr-review-disposition.json` with the exact
 candidate and observation hash plus one `resolved`, `refuted` or `irrelevant`
 decision and evidence note per item key/hash. Missing, partial, stale or tampered

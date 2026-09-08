@@ -22,6 +22,18 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@pytest.mark.parametrize("surface", ["issue_comments", "inline_comments", "formal_reviews"])
+def test_review_evidence_preserves_complete_body_and_tail_identity(surface):
+    value = {"id": 89, "user": {"login": "reviewer"}}
+    prefix = "ordinary context\n" * 500
+    body = prefix + "BLOCKING: unresolved acceptance beyond display limit"
+    first = pub._review_item(surface, value, body=body)
+    changed = pub._review_item(surface, value, body=prefix + "different tail")
+    assert first["body"] == body
+    assert first["evidence_sha256"] != changed["evidence_sha256"]
+    assert first["requires_disposition"] is True
+
+
 @pytest.fixture
 def capture(tmp_path: Path):
     root = tmp_path / "evidence"
