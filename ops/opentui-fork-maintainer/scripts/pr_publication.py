@@ -399,7 +399,11 @@ def _api_pages(root: Path, endpoint: str, *, object_key: str | None = None) -> l
 def _remote_text(value: Any) -> str:
     # Evidence must retain the whole source; any display excerpt is separate.
     # In particular, a changed tail must invalidate a prior disposition.
-    return value if isinstance(value, str) else ""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise PublicationError("remote review text has an invalid shape")
+    return value
 
 
 def _actor(value: Any) -> str | None:

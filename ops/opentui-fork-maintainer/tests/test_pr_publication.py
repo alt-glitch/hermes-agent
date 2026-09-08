@@ -32,6 +32,8 @@ def test_review_evidence_preserves_complete_body_and_tail_identity(surface):
     assert first["body"] == body
     assert first["evidence_sha256"] != changed["evidence_sha256"]
     assert first["requires_disposition"] is True
+    with pytest.raises(pub.PublicationError, match="invalid shape"):
+        pub._review_item(surface, value, body={"unexpected": "finding"})
 
 
 @pytest.fixture
