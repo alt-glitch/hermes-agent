@@ -280,6 +280,89 @@ def bind_issue(
     return request
 
 
+def prepare_owned_head_graph(tmp_path: Path, capture, head: str):
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "maintainer@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "OpenTUI Maintainer"], cwd=repo, check=True
+    )
+    source = repo / "candidate.txt"
+    source.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", source.name], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    source.write_text("base\nowned head\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-am", "owned head"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    expected = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", str(remote), f"{expected}:refs/heads/{head}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    source.write_text("base\nowned head\ncorrection\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-am", "correction"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    candidate = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    capture[1].update(base_sha=base, candidate_sha=candidate)
+    return repo, remote, expected, candidate
+
+
+def remote_head(remote: Path, head: str) -> str:
+    return subprocess.run(
+        ["git", "ls-remote", str(remote), f"refs/heads/{head}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[0]
+
+
+def closed_canonical_transport(github, closed_duplicate: dict, candidate: str):
+    simulated_github = github.run
+
+    def transport(argv, cwd):
+        if argv[0] == "git":
+            github.calls.append(argv)
+            result = subprocess.run(
+                argv, cwd=cwd, check=True, capture_output=True, text=True
+            )
+            if argv[1] == "push":
+                github.pr["headRefOid"] = candidate
+            return result.stdout
+        if argv[:3] == [str(pub.GH), "pr", "list"]:
+            github.calls.append(argv)
+            assert argv[argv.index("--head") + 1] == closed_duplicate["headRefName"]
+            assert argv[argv.index("--state") + 1] == "all"
+            return json.dumps([closed_duplicate])
+        return simulated_github(argv, cwd)
+
+    return transport
+
+
 def write_review_disposition(root: Path, observations: dict) -> None:
     required = [
         item
@@ -814,6 +897,153 @@ def test_compatible_existing_issue_draft_is_adopted_without_replacement(
     assert retried["number"] == proof["number"]
     assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
     assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
+
+
+def test_bound_adopted_head_advances_when_closed_canonical_duplicate_exists(
+    capture, github, monkeypatch, tmp_path
+) -> None:
+    adopted_head = "contributor/approved-41"
+    repo, remote, expected, candidate = prepare_owned_head_graph(
+        tmp_path, capture, adopted_head
+    )
+    adopted = {
+        "number": 91,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
+        "base_branch": pub.BASE,
+        "head_branch": adopted_head,
+        "head_sha": expected,
+        "head_repository": pub.REPOSITORY,
+    }
+    bind_issue(capture, existing_prs=[adopted])
+    marker = f"<!-- maintainer-candidate:v1:{pub._candidate_head(capture[1])[2]} -->"
+    github.pr = {
+        **review_pr(),
+        "number": 91,
+        "url": adopted["url"],
+        "body": marker + "\n\nFixes #41",
+        "headRefName": adopted_head,
+        "headRefOid": expected,
+        "baseRefOid": capture[1]["base_sha"],
+        "isDraft": True,
+    }
+    canonical_head = pub._candidate_head(capture[1])[0]
+    closed_duplicate = {
+        **github.pr,
+        "number": 92,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
+        "headRefName": canonical_head,
+        "state": "CLOSED",
+    }
+    monkeypatch.setattr(
+        pub, "_run", closed_canonical_transport(github, closed_duplicate, candidate)
+    )
+    pub.advance_owned_head(
+        repo,
+        capture[0],
+        str(remote),
+        capture[1],
+        expected,
+        as_draft=True,
+    )
+
+    assert remote_head(remote, adopted_head) == candidate
+    assert github.pr["number"] == 91
+    assert github.pr["headRefOid"] == candidate
+    pushes = [call for call in github.calls if call[:2] == ["git", "push"]]
+    assert len(pushes) == 1
+    assert f"--force-with-lease=refs/heads/{adopted_head}:{expected}" in pushes[0]
+    assert pushes[0][-1] == f"{candidate}:refs/heads/{adopted_head}"
+    assert not any(call[1:3] in (["pr", "create"], ["pr", "ready"]) for call in github.calls)
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("changed-request", "does not match its gate binding"),
+        ("foreign-adoption", "bound PR adoption evidence is invalid"),
+        ("malformed-adoption", "bound PR adoption evidence is invalid"),
+        ("symlinked-request", "missing its claimed request"),
+        ("ambiguous-adoption", "bound PR adoption evidence is ambiguous"),
+        ("changed-live-head", "bound adopted PR changed unexpectedly"),
+        ("changed-live-base", "repository ownership changed"),
+        ("foreign-live-owner", "repository ownership changed"),
+        ("missing-live-marker", "expected request/base/candidate"),
+        ("unbound-closed-canonical", "open expected base/head"),
+    ],
+)
+def test_invalid_or_unbound_adoption_refuses_before_remote_mutation(
+    capture, github, monkeypatch, tmp_path, failure, message
+) -> None:
+    adopted_head = "contributor/approved-41"
+    repo, remote, expected, candidate = prepare_owned_head_graph(
+        tmp_path, capture, adopted_head
+    )
+    adopted = {
+        "number": 91,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
+        "base_branch": pub.BASE,
+        "head_branch": adopted_head,
+        "head_sha": expected,
+        "head_repository": pub.REPOSITORY,
+    }
+    if failure == "foreign-adoption":
+        adopted["head_repository"] = "someone-else/hermes-agent"
+    elif failure == "malformed-adoption":
+        adopted.pop("url")
+    adoptions = [] if failure == "unbound-closed-canonical" else [adopted]
+    if failure == "ambiguous-adoption":
+        adoptions.append({**adopted, "number": 93, "url": adopted["url"].replace("91", "93")})
+    bind_issue(capture, existing_prs=adoptions)
+    request_path = capture[0] / "request.claimed.json"
+    if failure == "changed-request":
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        request["existing_prs"][0]["head_branch"] = "changed/after-approval"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+    elif failure == "symlinked-request":
+        target = capture[0] / "untrusted-request.json"
+        target.write_text(request_path.read_text(encoding="utf-8"), encoding="utf-8")
+        request_path.unlink()
+        request_path.symlink_to(target)
+    marker = f"<!-- maintainer-candidate:v1:{pub._candidate_head(capture[1])[2]} -->"
+    github.pr = {
+        **review_pr(),
+        "number": 91,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
+        "body": marker + "\n\nFixes #41",
+        "headRefName": adopted_head,
+        "headRefOid": expected,
+        "baseRefOid": capture[1]["base_sha"],
+        "isDraft": True,
+    }
+    if failure == "changed-live-head":
+        github.pr["headRefOid"] = "f" * 40
+    elif failure == "changed-live-base":
+        github.pr["baseRefOid"] = "f" * 40
+    elif failure == "foreign-live-owner":
+        github.pr["headRepositoryOwner"] = {"login": "someone-else"}
+    elif failure == "missing-live-marker":
+        github.pr["body"] = "Fixes #41"
+    canonical_head = pub._candidate_head(capture[1])[0]
+    closed_duplicate = {
+        **github.pr,
+        "number": 92,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
+        "headRefName": canonical_head,
+        "headRefOid": expected,
+        "state": "CLOSED",
+    }
+    monkeypatch.setattr(
+        pub, "_run", closed_canonical_transport(github, closed_duplicate, candidate)
+    )
+
+    with pytest.raises(pub.PublicationError, match=message):
+        pub.advance_owned_head(
+            repo, capture[0], str(remote), capture[1], expected, as_draft=True
+        )
+
+    assert remote_head(remote, adopted_head) == expected
+    assert not any(call[:2] == ["git", "push"] for call in github.calls)
+    assert not any(call[1:3] in (["pr", "create"], ["pr", "ready"]) for call in github.calls)
 
 
 def test_fix_cycle_reuses_unchanged_item_disposition_across_head_snapshots(

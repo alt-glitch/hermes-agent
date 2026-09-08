@@ -1233,45 +1233,64 @@ def _owned_head(
         raise PublicationError("expected PR head must be an exact SHA")
     head, _, identity = _candidate_head(manifest)
     marker = f"<!-- maintainer-candidate:v1:{identity} -->"
-    prs = json.loads(
-        _run(
-            [
-                str(GH),
-                "pr",
-                "list",
-                "--repo",
-                REPOSITORY,
-                "--state",
-                "all",
-                "--head",
-                head,
-                "--json",
-                FIELDS + OWNERSHIP_FIELDS,
-            ],
-            root,
-        )
-    )
+    prs = json.loads(_run([
+        str(GH), "pr", "list", "--repo", REPOSITORY, "--state", "all",
+        "--head", head, "--json", FIELDS + OWNERSHIP_FIELDS,
+    ], root))
     binding = manifest.get("run_binding")
-    if prs == [] and isinstance(binding, dict) and binding.get("mode") == "issue":
-        # Adopted drafts keep their contributor branch through follow-up fixes.
-        _, _, issue, workflow = _publication_metadata(
+    candidate = manifest["candidate_sha"]
+    if isinstance(binding, dict) and binding.get("mode") == "issue":
+        # The claimed request is hash-bound to the gate manifest. Its captured
+        # PR is the adoption authority; issue links are discovery evidence only.
+        _, _, issue, _ = _publication_metadata(
             root, manifest, None, verification_complete=False
         )
-        try:
-            adopted = _reconcile_live_issue_pr(workflow, issue, expected, root=root)
-        except PublicationError:
-            # A lost push reply may already have advanced exactly this candidate.
-            adopted = _reconcile_live_issue_pr(
-                workflow, issue, manifest["candidate_sha"], root=root
-            )
-        if adopted is not None:
-            head = adopted["headRefName"]
+        adoptions = issue.get("existing_prs") if isinstance(issue, dict) else None
+        if not isinstance(adoptions, list):
+            raise PublicationError("bound PR adoption evidence is malformed")
+        if len(adoptions) > 1:
+            raise PublicationError("bound PR adoption evidence is ambiguous")
+        if adoptions:
+            adoption = adoptions[0]
+            fields = {
+                "number", "url", "base_branch", "head_branch", "head_sha", "head_repository",
+            }
+            if (
+                not isinstance(adoption, dict)
+                or set(adoption) != fields
+                or type(adoption.get("number")) is not int
+                or adoption["number"] <= 0
+                or adoption.get("url")
+                != f"https://github.com/{REPOSITORY}/pull/{adoption.get('number')}"
+                or adoption.get("base_branch") != BASE
+                or not isinstance(adoption.get("head_branch"), str)
+                or not adoption["head_branch"]
+                or adoption.get("head_sha") != expected
+                or adoption.get("head_repository") != REPOSITORY
+            ):
+                raise PublicationError("bound PR adoption evidence is invalid")
+            try:
+                adopted = json.loads(_run([
+                    str(GH), "pr", "view", str(adoption["number"]),
+                    "--repo", REPOSITORY, "--json", FIELDS + OWNERSHIP_FIELDS,
+                ], root))
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise PublicationError("bound adopted PR response is invalid") from exc
+            if (
+                not isinstance(adopted, dict)
+                or adopted.get("number") != adoption["number"]
+                or adopted.get("url") != adoption["url"]
+                or adopted.get("headRefOid") not in {expected, candidate}
+            ):
+                raise PublicationError("bound adopted PR changed unexpectedly")
+            head = adoption["head_branch"]
+            _validate_pr(adopted, head, adopted["headRefOid"], marker)
+            _validate_owned_base(adopted, manifest["base_sha"])
             prs = [adopted]
     if prs == [] and allow_missing:
         return None
     if not isinstance(prs, list) or len(prs) != 1:
         raise PublicationError("expected exactly one owned task PR before update")
-    candidate = manifest["candidate_sha"]
     pr = prs[0]
     if not isinstance(pr, dict) or pr.get("headRefOid") not in {expected, candidate}:
         raise PublicationError("owned PR head moved unexpectedly")
