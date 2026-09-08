@@ -421,19 +421,14 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
 
 def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
     """Dispatch a claimed turn; acknowledge only after its history commit."""
-    from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
-    from tools.process_registry import process_registry
+    from tools.async_delegation import claim_event_delivery, release_event_delivery
     if (claim := claim_event_delivery(evt, "tui-poller")) is None:
         _notif_release_turn(session)
         return True  # Another consumer owns the event; do not create a retry duplicate.
     kwargs = _notification_turn_display(evt, text, sid)
 
-    def settle_delivery(committed: bool) -> None:
-        if committed:
-            complete_event_delivery(evt, claim)
-            return
-        release_event_delivery(evt, claim)
-        process_registry.completion_queue.put(evt)
+    def settle_delivery(outcome: _HistoryCommitOutcome) -> None:
+        _settle_notification_delivery(sid, evt, claim, outcome)
 
     card_pending = kwargs.get("display_notification") is not None
     if card_pending:
@@ -454,6 +449,42 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
         release_event_delivery(evt, claim)
         return False
     return True
+
+
+def _notification_history_failure_text(evt: dict) -> str:
+    """Honest live recovery guidance when an invoked notification turn could not retain its card."""
+    if evt.get("type") == "async_delegation":
+        return (
+            "Background delegation result reached the model, but its transcript card could not be saved. "
+            "The completion remains recorded; inspect it with delegate_task(action='list')."
+        )
+    session_id = str(evt.get("session_id") or "")
+    return (
+        "Background process result reached the model, but its transcript card could not be saved. "
+        f"Recover the retained output with process_manage(action='log', session_id='{session_id}')."
+    )
+
+
+def _settle_notification_delivery(
+    sid: str, evt: dict, claim: str, outcome: _HistoryCommitOutcome,
+) -> None:
+    """Retry only before model invocation; later persistence failures terminate honestly."""
+    from tools.async_delegation import (
+        complete_event_delivery, drop_completion_delivery, release_event_delivery)
+    from tools.process_registry import process_registry
+
+    if outcome.delivery_succeeded:
+        complete_event_delivery(evt, claim)
+        return
+    if not outcome.invocation_started:
+        release_event_delivery(evt, claim)
+        process_registry.completion_queue.put(evt)
+        return
+    if claim and evt.get("type") == "async_delegation":
+        delegation_id = str(evt.get("delegation_id") or "")
+        if delegation_id and not drop_completion_delivery(delegation_id, claim):
+            logger.warning("Could not mark delegation %s delivery as dropped after transcript failure", delegation_id)
+    _emit("status.update", sid, {"kind": "warn", "text": _notification_history_failure_text(evt)})
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred) -> bool:

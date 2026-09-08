@@ -52,7 +52,7 @@ def test_event_receipt_and_retry_follow_actual_admission(monkeypatch, session, e
         assert keep_draining is True
         assert registry.completion_queue.empty()
         complete.assert_not_called()
-        callbacks[0](True)
+        callbacks[0](server._HistoryCommitOutcome(True, True, True))
         complete.assert_called_once_with(event, "delivery-claim")
         release.assert_not_called()
     else:
@@ -119,35 +119,39 @@ def test_admitted_event_retries_after_history_failure_without_a_second_card(
         event, "synthetic result", "resumed-notification")
 
 
-@pytest.mark.parametrize("stamp_outcome", ["success", False, "exception"])
-def test_history_receipt_requires_a_durable_synthetic_row(
-    monkeypatch, tmp_path, session, stamp_outcome,
+@pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
+@pytest.mark.parametrize("history_case", ["no_db", "success", "missing", False, "exception"])
+def test_invoked_notification_settles_without_replaying_for_display_repair(
+    monkeypatch, tmp_path, session, event_type, history_case,
 ):
     event = {
-        "type": "completion", "session_id": "synthetic-process",
+        "type": event_type, "session_id": "synthetic-process", "delegation_id": "synthetic-delegation",
         "origin_ui_session_id": "live-notification", "command": "echo synthetic", "exit_code": 0,
     }
     registry = SimpleNamespace(completion_queue=queue.Queue(), is_completion_consumed=lambda _sid: False)
     monkeypatch.setattr(process_registry, "completion_queue", registry.completion_queue)
-    complete, release = Mock(), Mock()
-    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: "delivery-claim")
+    complete, release, drop = Mock(), Mock(), Mock(return_value=True)
+    claim = "delivery-claim" if event_type == "async_delegation" else ""
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: claim)
     monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
     monkeypatch.setattr(async_delegation, "release_event_delivery", release)
+    monkeypatch.setattr(async_delegation, "drop_completion_delivery", drop)
 
     class ControlledHistory:
         def set_latest_matching_message_display_kind(self, *_args, **_kwargs):
-            if stamp_outcome == "exception":
+            if history_case == "exception":
                 raise RuntimeError("synthetic persistence failure")
             return False
 
     db = None
-    history = ControlledHistory()
-    if stamp_outcome == "success":
+    history = None if history_case in {"no_db", "missing"} else ControlledHistory()
+    if history_case == "success":
         db = SessionDB(db_path=tmp_path / "state.db")
         db.create_session(session["session_key"], source="tui", model="fixture-model")
         history = db
     agent = SimpleNamespace(
         interim_assistant_callback=None, session_id=session["session_key"], _session_db=history,
+        _persist_user_message_idx=None,
     )
     session.update({"agent": agent, "attached_images": [], "history": [], "history_version": 0})
     monkeypatch.setattr(server, "_sessions", {"live-notification": session})
@@ -160,13 +164,14 @@ def test_history_receipt_requires_a_durable_synthetic_row(
         return text, text, 80, None
 
     def invoke(_sid, _session, st, prompt, *_args):
+        st.invocation_started = True
         if db is not None:
             db.append_message(session["session_key"], "user", prompt)
+        missing = history_case == "missing"
+        agent._persist_user_message_idx = None if missing else 0
         st.result = {
-            "messages": [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": "synthetic response"},
-            ],
+            "messages": ([{"role": "user", "content": prompt}] if not missing else [])
+            + [{"role": "assistant", "content": "synthetic response"}],
             "final_response": "synthetic response",
         }
 
@@ -189,19 +194,38 @@ def test_history_receipt_requires_a_durable_synthetic_row(
     session["_run_thread"].join(2)
     assert not session["_run_thread"].is_alive()
 
-    if db is not None:
-        complete.assert_called_once_with(event, "delivery-claim")
+    cards = [call for call in server._emit.call_args_list if call.args[0] == "notification.show"]
+    assert len(cards) == 1
+    if history_case in {"no_db", "success"}:
+        complete.assert_called_once_with(event, claim)
+        release.assert_not_called()
+        drop.assert_not_called()
+        assert registry.completion_queue.empty()
+        if db is not None:
+            [persisted] = db.get_messages_as_conversation(session["session_key"])
+            assert persisted["display_kind"] == (
+                "async_delegation_complete" if event_type == "async_delegation" else "process_complete"
+            )
+        else:
+            assert session["history"][0]["display_kind"] == (
+                "async_delegation_complete" if event_type == "async_delegation" else "process_complete"
+            )
+    else:
+        complete.assert_not_called()
         release.assert_not_called()
         assert registry.completion_queue.empty()
-        [persisted] = db.get_messages_as_conversation(session["session_key"])
-        assert persisted["display_kind"] == "process_complete"
+        warnings = [call.args[2]["text"] for call in server._emit.call_args_list
+                    if call.args[0] == "status.update" and call.args[2].get("kind") == "warn"]
+        assert len(warnings) == 1
+        assert "could not be saved" in warnings[0]
+        if event_type == "async_delegation":
+            drop.assert_called_once_with("synthetic-delegation", claim)
+            assert "delegate_task(action='list')" in warnings[0]
+        else:
+            drop.assert_not_called()
+            assert "process_manage(action='log'" in warnings[0]
+    if db is not None:
         db.close()
-    else:
-        assert release.call_count == 1
-        assert release.call_args.args == (event, "delivery-claim")
-        complete.assert_not_called()
-        assert registry.completion_queue.get_nowait() is event
-        assert registry.completion_queue.empty()
 
 
 @pytest.mark.parametrize("outcome", [False, "exception"])

@@ -20,12 +20,12 @@ def _hook_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _report_history_commit(callback, committed: bool) -> None:
+def _report_history_commit(callback, outcome: "_HistoryCommitOutcome") -> None:
     """Settle an admitted synthetic source without turning receipt I/O into a turn failure."""
     if callback is None:
         return
     try:
-        callback(committed)
+        callback(outcome)
     except Exception as exc:
         _hook_failure("history commit callback", exc)
 
@@ -482,10 +482,11 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
     try:
         kwargs = dict(submit_kwargs or {})
         if on_done is not None or on_error is not None:
-            kwargs["history_commit_callback"] = lambda committed: (
-                on_done() if committed and on_done is not None
-                else on_error(True) if not committed and on_error is not None
+            kwargs.setdefault("history_commit_callback", lambda outcome: (
+                on_done() if outcome.delivery_succeeded and on_done is not None
+                else on_error(True) if not outcome.delivery_succeeded and on_error is not None
                 else None)
+            )
         dispatched = _run_prompt_submit(rid, sid, session, prompt, **kwargs)
         if dispatched is False:
             if on_error is not None:
@@ -532,13 +533,16 @@ def _run_post_turn_followups(
                     break
                 session["running"] = True
                 session["_turn_cancel_requested"] = False
-            from tools.async_delegation import (
-                claim_event_delivery, complete_event_delivery, release_event_delivery)
+            from tools.async_delegation import claim_event_delivery, release_event_delivery
             _claim = claim_event_delivery(_evt, "tui-post-turn")
             if _claim is None:
                 _notif_release_turn(session)
                 continue
             submit_kwargs = _notification_turn_display(_evt, synth, sid)
+            submit_kwargs["history_commit_callback"] = (
+                lambda outcome, evt=_evt, claim=_claim:
+                _settle_notification_delivery(sid, evt, claim, outcome)
+            )
 
             card_pending = submit_kwargs.get("display_notification") is not None
             if card_pending:
@@ -552,7 +556,6 @@ def _run_post_turn_followups(
 
             _dispatch_followup_turn(
                 rid, sid, session, synth, "completion notification dispatch",
-                on_done=lambda evt=_evt, claim=_claim: complete_event_delivery(evt, claim),
                 on_error=retry_delivery, submit_kwargs=submit_kwargs)
     except Exception as _drain_exc:
         _hook_failure("completion queue drain", _drain_exc)
@@ -581,6 +584,20 @@ class _TurnRun:
     marker_key: str = ""
     receipt_attempted: bool = False
     invocation_started: bool = False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _HistoryCommitOutcome:
+    """What survived one admitted turn; durability and degraded retention stay distinct."""
+
+    display_persisted: bool
+    history_retained: bool
+    invocation_started: bool
+    persistence_failed: bool = False
+
+    @property
+    def delivery_succeeded(self) -> bool:
+        return self.display_persisted or (self.history_retained and not self.persistence_failed)
 
 
 def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
@@ -717,10 +734,12 @@ def _invoke_agent(
 
 def _absorb_turn_result(
     sid: str, session: dict, st: _TurnRun, text: Any, display_kind: str | None, display_metadata
-) -> tuple[str | None, bool]:
-    """Stamp and commit history; return its warning and synthetic-row durability."""
+) -> tuple[str | None, _HistoryCommitOutcome]:
+    """Stamp and commit history without conflating DB durability with retained degraded history."""
     result, agent = st.result, st.agent
     display_persisted = display_kind is None
+    persistence_failed = False
+    synthetic_message = None
     if display_kind and isinstance(text, str):
         # Post-turn fallback stamp of a synthesized turn's display kind (DB row + result).
         db = getattr(agent, "_session_db", None)
@@ -732,13 +751,26 @@ def _absorb_turn_result(
                     display_metadata=display_metadata))
             except Exception:
                 logger.debug("failed to stamp synthetic display kind", exc_info=True)
+            persistence_failed = not display_persisted
         if isinstance(result, dict) and isinstance(result.get("messages"), list):
-            for message in reversed(result["messages"]):
-                if message.get("role") == "user" and message.get("content") == text:
-                    message["display_kind"] = display_kind
-                    if display_metadata:
-                        message["display_metadata"] = display_metadata
-                    break
+            messages = result["messages"]
+            current_idx = getattr(agent, "_persist_user_message_idx", None)
+            candidates = (
+                [messages[current_idx]]
+                if isinstance(current_idx, int) and 0 <= current_idx < len(messages)
+                else messages[len(st.history):] if messages[:len(st.history)] == st.history
+                else []
+            )
+            synthetic_message = next((
+                message for message in reversed(candidates)
+                if isinstance(message, dict)
+                and message.get("role") == "user"
+                and message.get("content") == text
+            ), None)
+            if synthetic_message is not None:
+                synthetic_message["display_kind"] = display_kind
+                if display_metadata:
+                    synthetic_message["display_metadata"] = display_metadata
     if "moa_one_shot_restore" in session:
         # Undo a /moa one-shot through the switch path: resetting model_override alone
         # would leave the live client pinned to MoA after the in-place switch_model().
@@ -776,7 +808,15 @@ def _absorb_turn_result(
         # Fix for #20001.
         _sync_session_key_after_compress(
             sid, session, clear_pending_title=False, restart_slash_worker=True)
-    return status_note, display_persisted
+    history_retained = synthetic_message is not None and status_note is None
+    if display_kind and not display_persisted and not history_retained:
+        persistence_failed = True
+    return status_note, _HistoryCommitOutcome(
+        display_persisted=display_persisted,
+        history_retained=history_retained,
+        invocation_started=st.invocation_started,
+        persistence_failed=persistence_failed,
+    )
 
 
 def _complete_turn_payload(
@@ -980,7 +1020,7 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     loop_claim_id: str = "",
-    history_commit_callback: Callable[[bool], None] | None = None) -> bool:
+    history_commit_callback: Callable[[_HistoryCommitOutcome], None] | None = None) -> bool:
     client_submission_ids = list(client_submission_ids or [])
     admitted = _admit_prompt_turn(
         sid, session, text, image_paths, queued_prompt_generation,
@@ -1019,9 +1059,9 @@ def _run_prompt_submit(
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata)
-            status_note, history_committed = _absorb_turn_result(
+            status_note, history_outcome = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
-            _report_history_commit(history_commit_callback, history_committed)
+            _report_history_commit(history_commit_callback, history_outcome)
             history_commit_reported = True
             payload, raw, status = _complete_turn_payload(sid, session, st, status_note, cols)
             _emit("message.complete", sid, payload)
@@ -1073,7 +1113,11 @@ def _run_prompt_submit(
             _emit_settled_session_info(sid, session, st.agent)
         _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
         if not history_commit_reported:
-            _report_history_commit(history_commit_callback, False)
+            _report_history_commit(history_commit_callback, _HistoryCommitOutcome(
+                display_persisted=False,
+                history_retained=False,
+                invocation_started=st.invocation_started,
+            ))
     run_thread = threading.Thread(target=run, daemon=True)
     with _sessions_lock:
         registered = _sessions.get(sid)

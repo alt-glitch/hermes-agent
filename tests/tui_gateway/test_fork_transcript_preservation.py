@@ -35,7 +35,7 @@ def test_notification_dispatch_has_one_start_and_retains_model_detail(monkeypatc
             sid, owned_session, text, None, None, [], kwargs.get("display_notification")
         ) is not None
         if admitted:
-            kwargs["history_commit_callback"](True)
+            kwargs["history_commit_callback"](server._HistoryCommitOutcome(True, True, True))
         return admitted
 
     monkeypatch.setattr(server, "_run_prompt_submit", submit)

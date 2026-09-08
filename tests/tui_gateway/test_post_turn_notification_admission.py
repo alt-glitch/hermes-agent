@@ -42,7 +42,7 @@ def test_post_turn_completion_is_admitted_or_requeued(monkeypatch, tmp_path, ref
         )
         if admitted is not None:
             accepted.append((text, kwargs))
-            kwargs["history_commit_callback"](True)
+            kwargs["history_commit_callback"](server._HistoryCommitOutcome(True, True, True))
         return admitted is not None
 
     if refusal == "ownership":
@@ -90,5 +90,5 @@ def test_post_turn_receipt_keeps_its_event_after_drain_advances(monkeypatch):
     server._run_post_turn_followups("turn", "live", session, {}, None)
     assert process_registry.completion_queue.get_nowait() is second
     assert not completed
-    callbacks[0](True)
+    callbacks[0](server._HistoryCommitOutcome(True, True, True))
     assert completed == [(first, "first-claim")]
