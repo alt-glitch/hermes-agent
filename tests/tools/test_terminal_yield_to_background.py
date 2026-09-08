@@ -8,6 +8,7 @@ notify-on-complete background session and returns immediately, without killing i
 """
 import json
 import os
+import shlex
 import threading
 import time
 
@@ -86,3 +87,41 @@ def test_yield_request_without_steer_leaves_foreground_wait_alone():
     finally:
         interrupt_mod.consume_yield(threading.current_thread().ident)
         env.cleanup()
+
+
+def test_natural_yield_completion_uses_environment_marker_cleanup(tmp_path, monkeypatch):
+    """The registry's adopted drain must finish the exact local-wrapper cleanup path."""
+    from tools.terminal_tool import clear_session_cwd, get_session_cwd
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    target = tmp_path / "changed cwd"
+    target.mkdir()
+    session_key = "yield-marker-cleanup"
+    agent = _Agent()
+    res = {}
+
+    def worker():
+        with agent._tool_worker_threads_lock:
+            agent._tool_worker_threads.add(threading.current_thread().ident)
+        command = f"echo started; sleep 1; cd {shlex.quote(str(target))}; echo finished"
+        res["result"] = json.loads(terminal_tool(command, task_id=session_key, timeout=15))
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    time.sleep(0.25)
+    assert agent.redirect("continue while it runs") is True
+    t.join(timeout=10)
+    assert not t.is_alive()
+    result = res["result"]
+    assert result["status"] == "yielded_to_background"
+
+    try:
+        evt = process_registry.completion_queue.get(timeout=10)
+        assert evt["session_id"] == result["session_id"]
+        logged = process_registry.read_log(result["session_id"])
+        assert "started" in logged["output"] and "finished" in logged["output"]
+        assert "__HERMES_CWD_" not in logged["output"]
+        assert "__HERMES_CWD_" not in evt["output"]
+        assert get_session_cwd(session_key) == str(target)
+    finally:
+        clear_session_cwd(session_key)

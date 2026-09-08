@@ -425,10 +425,21 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     if (claim := claim_event_delivery(evt, "tui-poller")) is None:
         _notif_release_turn(session)
         return True  # Another consumer owns the event; do not create a retry duplicate.
-    kwargs = ({"display_kind": "async_delegation_complete", "display_metadata": _async_delegation_display_metadata(evt)}
-              if evt.get("type") == "async_delegation" else {})
+    if evt.get("type") == "async_delegation":
+        kwargs = {
+            "display_kind": "async_delegation_complete",
+            "display_metadata": _async_delegation_display_metadata(evt),
+        }
+    elif evt.get("type", "completion") == "completion":
+        kwargs = {
+            "display_kind": "process_complete",
+            "display_metadata": _process_completion_display_metadata(evt),
+        }
+    else:
+        kwargs = {}
     try:
-        _emit_process_completion_card(sid, evt, text)
+        if evt.get("type") == "async_delegation":
+            _emit_process_completion_card(sid, evt, text)
         admitted = _notif_submit(
             f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
@@ -478,6 +489,10 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred) -> 
     if dedup_key not in emitted:
         if is_delegation:
             notice = _async_delegation_notice(evt, text)
+            _emit("status.update", sid, {"kind": "status", "text": notice["text"]})
+        elif evt_type == "completion":
+            notice = _process_completion_notice(evt, text)
+            _emit_process_completion_card(sid, evt, text)
             _emit("status.update", sid, {"kind": "status", "text": notice["text"]})
         else:
             _emit("status.update", sid, {"kind": "process", "text": text})
@@ -660,6 +675,47 @@ def _async_delegation_notice_from_text(detail: str) -> dict | None:
     return _async_delegation_notice(evt, detail)
 
 
+def _process_completion_state(evt: dict) -> tuple[str, str]:
+    """Compact process outcome label and notification level."""
+    reason = str(evt.get("completion_reason") or "exited")
+    if reason == "killed":
+        return "terminated", "warn"
+    if reason == "lost":
+        return "backend lost", "warn"
+    if reason == "failed_start":
+        return "failed to start", "warn"
+    code = evt.get("exit_code")
+    if code == 0:
+        return "completed", "success"
+    if code is None:
+        return "finished", "info"
+    return f"exited {code}", "warn"
+
+
+def _process_completion_notice(evt: dict, detail: str) -> dict:
+    """Compact ordinary-process chrome with its full model-facing detail behind disclosure."""
+    session_id = str(evt.get("session_id") or "process")
+    command = " ".join(str(evt.get("command") or "process").strip().split())
+    if len(command) > 60:
+        command = command[:59] + "…"
+    state, level = _process_completion_state(evt)
+    notice = {
+        "always_visible": True,
+        "key": f"proc:{session_id}",
+        "kind": "process.complete",
+        "level": level,
+        "text": f"{command} · {state} · {session_id}",
+    }
+    if detail:
+        notice["detail"] = detail
+    return notice
+
+
+def _process_completion_display_metadata(evt: dict) -> dict:
+    """Persist the compact card fields; the full prompt already persists as the row content."""
+    return _process_completion_notice(evt, "")
+
+
 def _emit_process_completion_card(
     sid: str, evt: dict, detail: str | None = None
 ) -> None:
@@ -675,25 +731,7 @@ def _emit_process_completion_card(
         return
     if evt_type != "completion":
         return
-    cmd = str(evt.get("command") or "process").strip().replace("\n", " ")
-    if len(cmd) > 60:
-        cmd = cmd[:59] + "…"
-    code = evt.get("exit_code")
-    if code is None:
-        text, level = f"{cmd} finished", "info"
-    else:
-        text = f"{cmd} exited {code}"
-        level = "info" if code == 0 else "warn"
-    _emit(
-        "notification.show",
-        sid,
-        {
-            "text": text,
-            "kind": "process.complete",
-            "level": level,
-            "key": f"proc:{evt.get('session_id', '')}",
-        },
-    )
+    _emit("notification.show", sid, _process_completion_notice(evt, detail or ""))
 
 
 _desktop_ui_wired = False

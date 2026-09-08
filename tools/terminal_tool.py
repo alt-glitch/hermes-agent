@@ -1082,7 +1082,8 @@ def _run_foreground(
             result = env.execute(
                 command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
+                                task_id=task_id, session_key=session_key, env=env,
+                                record_cwd=workdir is None),
             )
             break
         except Exception as e:

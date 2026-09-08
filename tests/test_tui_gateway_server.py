@@ -8070,7 +8070,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, **_kwargs):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
 
@@ -8179,7 +8179,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -8286,7 +8286,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -8312,8 +8312,12 @@ def test_notification_poller_delivers_owned_events(
 
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
-        assert status_calls[0][2]["kind"] == "process"
+        assert status_calls[0][2]["kind"] == "status"
         assert len(delivered) == 1
+        card_calls = [a for a in emitted if a[0] == "notification.show"]
+        assert len(card_calls) == 1
+        assert card_calls[0][2]["kind"] == "process.complete"
+        assert card_calls[0][2]["detail"] == delivered[0]
         assert "proc_mine" in delivered[0]
     finally:
         server._sessions.pop("sid_a", None)
@@ -20990,13 +20994,18 @@ def test_notification_poller_delivers_completion(monkeypatch):
     try:
         server._notification_poller_loop(stop, "sid_poll", sess)
 
-        # Should have emitted a status.update with kind=process
+        # The concise status remains non-transcript chrome, while the complete
+        # model prompt is available from the expandable process card.
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) >= 1
-        assert status_calls[0][2]["kind"] == "process"
+        assert status_calls[0][2]["kind"] == "status"
+        assert len(turns) == 1
+        card_calls = [a for a in emitted if a[0] == "notification.show"]
+        assert len(card_calls) == 1
+        assert card_calls[0][2]["kind"] == "process.complete"
+        assert card_calls[0][2]["detail"] == turns[0]
 
         # Should have triggered an agent turn
-        assert len(turns) == 1
         assert "[IMPORTANT: Background process proc_poller_test completed normally" in turns[0]
     finally:
         server._sessions.pop("sid_poll", None)
@@ -22057,25 +22066,29 @@ class TestProcessCompletionCard:
         monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload)))
         return emitted
 
-    def test_completion_exit_zero_is_an_info_card(self, monkeypatch):
+    def test_completion_exit_zero_is_an_expandable_success_card(self, monkeypatch):
         emitted = self._capture(monkeypatch)
+        detail = "FULL MODEL DETAIL"
         server._emit_process_completion_card(
-            "s1", {"type": "completion", "session_id": "proc_1", "command": "sleep 20 && echo hi", "exit_code": 0}
+            "s1", {"type": "completion", "session_id": "proc_1", "command": "sleep 20 && echo hi", "exit_code": 0},
+            detail,
         )
         assert len(emitted) == 1
         event, sid, payload = emitted[0]
         assert event == "notification.show"
         assert sid == "s1"
-        assert payload["text"] == "sleep 20 && echo hi exited 0"
-        assert payload["level"] == "info"
+        assert payload["text"] == "sleep 20 && echo hi · completed · proc_1"
+        assert payload["level"] == "success"
         assert payload["kind"] == "process.complete"
         assert payload["key"] == "proc:proc_1"
+        assert payload["always_visible"] is True
+        assert payload["detail"] == detail
 
     def test_nonzero_exit_is_a_warn_card(self, monkeypatch):
         emitted = self._capture(monkeypatch)
         server._emit_process_completion_card("s1", {"type": "completion", "command": "build", "exit_code": 1, "session_id": "p2"})
         assert emitted[0][2]["level"] == "warn"
-        assert emitted[0][2]["text"] == "build exited 1"
+        assert emitted[0][2]["text"] == "build · exited 1 · p2"
 
     def test_watch_match_is_not_carded(self, monkeypatch):
         emitted = self._capture(monkeypatch)
@@ -22091,7 +22104,16 @@ class TestProcessCompletionCard:
     def test_missing_exit_code_says_finished(self, monkeypatch):
         emitted = self._capture(monkeypatch)
         server._emit_process_completion_card("s1", {"type": "completion", "command": "daemon", "session_id": "p4"})
-        assert emitted[0][2]["text"] == "daemon finished"
+        assert emitted[0][2]["text"] == "daemon · finished · p4"
+
+    def test_killed_completion_says_terminated(self, monkeypatch):
+        emitted = self._capture(monkeypatch)
+        server._emit_process_completion_card(
+            "s1", {"type": "completion", "command": "sleep 20", "exit_code": -15,
+                   "completion_reason": "killed", "session_id": "p5"},
+        )
+        assert emitted[0][2]["text"] == "sleep 20 · terminated · p5"
+        assert emitted[0][2]["level"] == "warn"
 
     def test_async_delegation_is_compact_with_full_disclosure(self, monkeypatch):
         emitted = self._capture(monkeypatch)

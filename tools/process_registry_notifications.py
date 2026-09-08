@@ -266,7 +266,7 @@ def format_process_notification(evt: dict) -> "str | None":
             f"{attribution}Command: {_cmd}\nMatched output:\n{evt.get('output', '')}"
             + (f"\n({_sup} earlier matches were suppressed by rate limit)" if _sup else "") + "]")
     _exit = evt.get("exit_code", "?")
-    _out = evt.get("output", "")
+    _out = str(evt.get("output") or "")
     _signal = ", SIGTERM" if _exit in {-15, 143, "-15", "143"} else ""
     # A subagent-owned process's full output belongs in the child's transcript, not as
     # a raw wall in the parent — trim hard but keep enough tail to recognise failures.
@@ -275,6 +275,14 @@ def format_process_notification(evt: dict) -> "str | None":
             "...(output trimmed — subagent-owned process; see the "
             "delegation's live transcript for full output)\n"
             + _out[-600:])
+    retrieval = ""
+    if evt.get("output_truncated") and not _attribution:
+        retained = evt.get("output_retained_chars")
+        retained_label = f"{retained:,}" if isinstance(retained, int) else "more"
+        retrieval = (
+            f"[Showing the final {len(_out):,} of {retained_label} retained characters. "
+            f"Retrieve the retained output with process(action='log', session_id='{_sid}').]\n"
+        )
     return (
         f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
-        f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+        f"{attribution}Command: {_cmd}\nOutput:\n{retrieval}{_out}]")

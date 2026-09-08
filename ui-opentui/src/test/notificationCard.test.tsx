@@ -51,10 +51,10 @@ describe('notification store wiring', () => {
     store.apply({
       type: 'notification.show',
       payload: {
-        id: 'deleg:test',
-        kind: 'async delegation',
+        id: 'proc:test',
+        kind: 'process.complete',
         level: 'success',
-        text: 'deleg_test · 2 agents · all done · 2s',
+        text: 'build · completed · proc_test',
         detail: 'FULL_DETAIL_SENTINEL',
         always_visible: true
       }

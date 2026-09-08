@@ -26,7 +26,7 @@ _IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -349,6 +349,11 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
+    # Yielded foreground commands still carry the environment wrapper's CWD
+    # marker. The registry owns their final drain, so it must hand the complete
+    # output back to that wrapper's cleanup exactly once before persistence and
+    # notification. Runtime-only: callbacks cannot survive checkpoint recovery.
+    _output_finalizer: Optional[Callable[[dict], None]] = field(default=None, repr=False)
 
     def append_output(self, text: str) -> None:
         """Append to the rolling output buffer under the session lock, keeping the tail."""
@@ -893,7 +898,9 @@ class ProcessRegistry:
     def adopt_local(
         self, proc: subprocess.Popen, *, command: str, cwd: Optional[str], task_id: str = "",
         session_key: str = "", owner_task_id: str = "", output_so_far: str = "",
-        notify_on_complete: bool = True) -> ProcessSession:
+        notify_on_complete: bool = True,
+        output_finalizer: Optional[Callable[[dict], None]] = None,
+    ) -> ProcessSession:
         """Take over a still-running foreground Popen as a tracked background session
         (yield-to-background: the user sent a message while the command was running).
         The caller has stopped its own drain thread; the registry's reader continues from
@@ -904,6 +911,7 @@ class ProcessRegistry:
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
         session.notify_on_complete = notify_on_complete
+        session._output_finalizer = output_finalizer
         if output_so_far:
             session.append_output(output_so_far)
         self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
@@ -1173,9 +1181,16 @@ class ProcessRegistry:
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+        if was_running and session._output_finalizer is not None:
+            finalizer, session._output_finalizer = session._output_finalizer, None
+            with session._lock:
+                result = {"output": session.output_buffer}
+                finalizer(result)
+                session.output_buffer = str(result.get("output") or "")[-session.max_output_chars:]
         session._completion_event.set()
         self._write_checkpoint()
         if was_running and session.notify_on_complete:
+            retained_output = _output_tail(session, session.max_output_chars)
             notification = {
                 "type": "completion",
                 "session_id": session.id,
@@ -1184,7 +1199,9 @@ class ProcessRegistry:
                 "owner_task_id": session.owner_task_id or session.task_id,
                 "command": session.command,
                 **self._exit_fields(session),
-                "output": _output_tail(session, 2000),
+                "output": retained_output[-2000:],
+                "output_truncated": len(retained_output) > 2000,
+                "output_retained_chars": len(retained_output),
                 # Stable producer identity across checkpoint recovery (unlike a
                 # consumer-observed completion timestamp).
                 "started_at": session.started_at,

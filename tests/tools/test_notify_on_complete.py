@@ -94,7 +94,7 @@ class TestCompletionQueue:
 
 
     def test_output_truncated_to_2000(self, registry):
-        """Long output is truncated to last 2000 chars."""
+        """The completion excerpt is bounded and truthfully points at retained output."""
         long_output = "x" * 5000
         s = _make_session(
             notify_on_complete=True,
@@ -108,6 +108,14 @@ class TestCompletionQueue:
 
         completion = registry.completion_queue.get_nowait()
         assert len(completion["output"]) == 2000
+        assert completion["output_truncated"] is True
+        assert completion["output_retained_chars"] == 5000
+
+        from tools.process_registry_notifications import format_process_notification
+        rendered = format_process_notification(completion)
+        assert rendered is not None
+        assert "final 2,000 of 5,000 retained characters" in rendered
+        assert f"process(action='log', session_id='{s.id}')" in rendered
 
     def test_multiple_completions_queued(self, registry):
         """Multiple notify processes all push to the same queue."""

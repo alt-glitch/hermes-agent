@@ -32,7 +32,7 @@ def test_post_turn_completion_is_admitted_or_requeued(monkeypatch, tmp_path, ref
     process_registry.completion_queue.put(event)
     attempts, accepted = [], []
 
-    def submit(_rid, live_sid, owned_session, text):
+    def submit(_rid, live_sid, owned_session, text, **_kwargs):
         attempts.append(text)
         if refusal == "exception" and len(attempts) == 1:
             raise RuntimeError("synthetic dispatch failure")

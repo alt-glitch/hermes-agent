@@ -167,6 +167,19 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     return "auto_continue" if role == "user" and text.lstrip().startswith(_AUTO_CONTINUE_NOTE_PREFIX) else None
 
 
+def _process_completion_notification(metadata: Any, detail: str) -> dict | None:
+    """Restore a typed ordinary-process card from its persisted display metadata."""
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("text"), str):
+        return None
+    notification = {
+        key: metadata[key]
+        for key in ("always_visible", "key", "kind", "level", "text")
+        if key in metadata
+    }
+    notification["detail"] = detail
+    return notification
+
+
 _HISTORY_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items")
 _HISTORY_ROLES = frozenset({"user", "assistant", "tool", "system"})
 
@@ -215,6 +228,12 @@ def _history_to_messages(
             continue
         # Display projection only: the full reinjection remains in persisted/model history.
         if (include_ui_chrome or include_tool_output) and role == "user":
+            if m.get("display_kind") == "process_complete":
+                notification = _process_completion_notification(m.get("display_metadata"), content_text)
+                if notification is not None:
+                    messages.append({"role": "notification", "text": notification["text"],
+                                     "notification": notification})
+                    continue
             notification = _async_delegation_notice_from_text(content_text)
             if notification is not None:
                 messages.append({"role": "notification", "text": notification["text"], "notification": notification})

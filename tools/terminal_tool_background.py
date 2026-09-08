@@ -198,7 +198,7 @@ _YIELDED_NOTE = (
 
 def yield_to_background_handler(
     *, command: str, env_type: str, cwd: Optional[str], effective_task_id: str,
-    task_id: Optional[str], session_key: str,
+    task_id: Optional[str], session_key: str, env=None, record_cwd: bool = True,
 ):
     """Build the ``yield_handler`` a foreground ``env.execute`` calls when the tool thread is
     asked to yield (a user message arrived mid-command). Local backend only: the live Popen
@@ -208,12 +208,19 @@ def yield_to_background_handler(
     if env_type != "local":
         return None
 
+    def _finalize_output(result: dict) -> None:
+        """Run the local environment's normal marker cleanup after the adopted drain."""
+        env._update_cwd(result)
+        if record_cwd and result.get("cwd_observed"):
+            from tools.terminal_tool import record_session_cwd
+            record_session_cwd(session_key, result.get("cwd") or getattr(env, "cwd", None))
+
     def _handler(proc, output_so_far: str) -> dict:
         from tools.process_registry import process_registry
         session = process_registry.adopt_local(
             proc, command=command, cwd=cwd, task_id=effective_task_id,
             owner_task_id=task_id or effective_task_id, session_key=session_key,
-            output_so_far=output_so_far)
+            output_so_far=output_so_far, output_finalizer=_finalize_output)
         _stamp_routing_if_gateway(process_registry, session, session_key)
         logger.info("foreground command yielded to background as %s (pid %s)", session.id, session.pid)
         return {
