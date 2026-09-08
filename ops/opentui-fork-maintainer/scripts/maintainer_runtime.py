@@ -2995,14 +2995,12 @@ def _validated_visual_retry_source(
     source_packet = _evidence_path(
         str(source.parent / "gate-packet.json"), source.parent, label="visual retry packet"
     )
-    packet_sha256 = _file_sha256(packet_path)
-    if (
-        value.get("packet_sha256") != packet_sha256
-        or _file_sha256(source_packet) != packet_sha256
-    ):
-        raise ControlError("visual retry packet differs from the executed gate")
+    if value.get("packet_sha256") != _file_sha256(source_packet):
+        raise ControlError("visual retry retained packet changed")
     packet = _load_gate(source_packet)
+    current_packet = _load_gate(packet_path)
     packet_checks = packet.get("checks") if set(packet) == {"checks"} else None
+    current_checks = current_packet.get("checks") if set(current_packet) == {"checks"} else None
     checks = value.get("checks")
     order = (*VISUAL_RETRY_REUSED_GATES, "termctrl-smoke", "video-analysis")
     if (
@@ -3013,6 +3011,18 @@ def _validated_visual_retry_source(
         or [item.get("id") for item in checks if isinstance(item, dict)] != list(order)
     ):
         raise ControlError("visual retry source has incomplete or reordered gates")
+    # Only the freshly executed visual drive may change; source checks and their
+    # independent reviewer remain identical to the authenticated prior packet.
+    if (
+        not isinstance(current_checks, list)
+        or len(current_checks) != len(order)
+        or [item.get("id") for item in current_checks if isinstance(item, dict)] != list(order)
+        or current_checks[:len(VISUAL_RETRY_REUSED_GATES)]
+        != packet_checks[:len(VISUAL_RETRY_REUSED_GATES)]
+    ):
+        raise ControlError("visual retry source check packet changed")
+    for current_item in current_checks:
+        _validate_gate_packet_item(current_item["id"], current_item)
     source_logs = Path(os.path.abspath(source.parent / "gate-logs"))
     for packet_item, check in zip(packet_checks, checks, strict=True):
         gate_id = packet_item["id"]

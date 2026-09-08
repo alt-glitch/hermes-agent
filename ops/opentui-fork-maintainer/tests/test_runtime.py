@@ -1705,8 +1705,9 @@ def test_run_gate_records_candidate_bound_success(
     assert (gate.parent / "video-analysis.raw.json").is_file()
 
 
+@pytest.mark.parametrize("changed_capture", [False, True])
 def test_video_only_retry_reuses_intact_source_gates_and_recaptures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_capture: bool
 ) -> None:
     repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
     old, fresh = tmp_path / "old-attempt", tmp_path / "fresh-attempt"
@@ -1736,6 +1737,10 @@ def test_video_only_retry_reuses_intact_source_gates_and_recaptures(
     retained = {str(path): path.read_bytes() for path in old.rglob("*") if path.is_file()}
     packet = fresh / "gate-packet.json"
     packet.write_bytes((old / "gate-packet.json").read_bytes())
+    if changed_capture:
+        updated = json.loads(packet.read_text(encoding="utf-8"))
+        updated["checks"][-2]["drive"]["cols"] = 120
+        packet.write_text(json.dumps(updated), encoding="utf-8")
     install_success_mocks(monkeypatch)
     code_runner = runtime.subprocess.run
 
@@ -1756,6 +1761,9 @@ def test_video_only_retry_reuses_intact_source_gates_and_recaptures(
 
     def recapture(*args: object, **kwargs: object):
         calls.append("termctrl-smoke")
+        if changed_capture:
+            assert isinstance(args[0], dict)
+            assert args[0]["cols"] == 120
         return real_termctrl(*args, **kwargs)
 
     def reanalyze(*args: object, **kwargs: object):

@@ -157,6 +157,13 @@ publication command returns that proven PR to draft before advancing its fix
 head. An exact compatible existing issue draft can be adopted; a diverged
 retained draft is refused without rewriting or topology waiver.
 
+Every existing task owner is checked before expensive local gates, including an
+unchanged early draft when `--expected-pr-head` is omitted. A genuinely absent
+PR permits first publication; malformed or mismatched ownership does not.
+Preflight retains `pr-owner-preflight-surfaces.json` and the matching parent
+disposition. GitHub Actions failures also retain the original job log bound to
+its run, job, attempt and check identity; ANSI bytes remain untrusted file data.
+
 Every owned-head update and final review observation collects
 `pr-review-surfaces.json`: general PR comments, inline review comments, formal
 reviews, and all failed CheckRun and status attempts for the relevant heads.
@@ -167,6 +174,17 @@ decision and evidence note per item key/hash. Missing, partial, stale or tampere
 dispositions block the update or target delivery even when the latest CI rollup
 is green. Editing or adding a comment changes the observation hash and requires
 a fresh disposition; detailed output stays in the run evidence directory.
+
+For a diagnosed video-only failure on unchanged source, `gate-and-ship` accepts
+`--reuse-manifest <prior-attempt>/gate.json --reuse-sha256 <exact-SHA256>`.
+Use a distinct attempt directory for the new packet, manifest and outputs: even
+a different manifest filename in the old directory is refused before mutation.
+The prior manifest, packet, code output and approved review artifacts must remain
+intact and bound to this exact candidate/base/authorization. Source-check commands
+and reviewer configuration must match; only the fresh native drive may change
+(e.g. a diagnosed terminal-width recapture). Native capture and video analysis
+always execute again. This is not a generic cache or permission to reuse evidence
+for changed source, to suppress real visual failures, or to skip current-head CI.
 
 PNG and MP4 exports use the same explicit `DejaVu Sans Mono` family, installed
 on the maintainer host. Verify it with `fc-match 'DejaVu Sans Mono'` when moving
