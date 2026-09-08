@@ -697,7 +697,7 @@ def require_review_disposition(
     ):
         raise PublicationError("PR review disposition does not bind current evidence")
     by_key: dict[str, dict[str, Any]] = {}
-    for item in items:
+    for index, item in enumerate(items):
         key = item.get("key") if isinstance(item, dict) else None
         evidence_sha256 = (
             item.get("evidence_sha256") if isinstance(item, dict) else None
@@ -710,18 +710,22 @@ def require_review_disposition(
             or key in by_key
             or not isinstance(evidence_sha256, str)
             or not re.fullmatch(r"[0-9a-f]{64}", evidence_sha256)
-            or (
-                key in required
-                and evidence_sha256 != required[key]["evidence_sha256"]
-            )
             or item.get("decision") not in {"resolved", "refuted", "irrelevant"}
             or not isinstance(item.get("evidence"), str)
             or not 1 <= len(item["evidence"].strip()) <= 2_000
         ):
-            raise PublicationError("PR review disposition item is invalid")
+            item_key = key if isinstance(key, str) and key else f"index {index}"
+            raise PublicationError(
+                f"PR review disposition item is invalid (malformed: {item_key})"
+            )
+        if key in required and evidence_sha256 != required[key]["evidence_sha256"]:
+            raise PublicationError(
+                f"PR review disposition item is invalid (stale: {key})"
+            )
         by_key[key] = item
     if not set(required).issubset(by_key):
-        raise PublicationError("PR review disposition is incomplete")
+        missing = ", ".join(sorted(set(required) - set(by_key)))
+        raise PublicationError(f"PR review disposition is incomplete (missing: {missing})")
     digest = _hash(path)
     if snapshot_name is not None:
         if not re.fullmatch(r"pr-[a-z0-9-]+\.json", snapshot_name):
@@ -863,8 +867,8 @@ def wait_for_review(
             observed_heads=observed_heads,
         )
         proof = review_status(pr, candidate, policy)
+        disposition_sha256 = require_review_disposition(root, observations)
         if proof is not None:
-            disposition_sha256 = require_review_disposition(root, observations)
             proof = {
                 **proof,
                 "review_surfaces_sha256": observations["observations_sha256"],
@@ -905,7 +909,8 @@ def resume_preview(
     PR81 predates ownership markers. Its exception is an exact, operator-reviewed
     manifest/packet/PR tuple, not permission to adopt arbitrary legacy PRs.
     """
-    _, digest, dimensions = preview(source.parent, manifest)
+    manifest_root = root if "publication_recovery" in manifest else source.parent
+    _, digest, dimensions = preview(manifest_root, manifest)
     proof = json.loads((source.parent / "pr-evidence.json").read_text(encoding="utf-8"))
     head, _, identity = _candidate_head(manifest)
     marker = f"<!-- maintainer-candidate:v1:{identity} -->"

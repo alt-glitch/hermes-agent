@@ -552,6 +552,79 @@ def test_review_timeout_keeps_target_untouched(capture, github, monkeypatch):
     assert json.loads((root / "pr-pending.json").read_text())["status"] == "pending"
 
 
+def test_pending_ci_returns_edited_required_finding_before_timeout(
+    capture, github, monkeypatch
+):
+    root, _, _ = capture
+    github.pr = review_pr()
+    github.pr["statusCheckRollup"][1].update(
+        status="IN_PROGRESS", conclusion=None
+    )
+    github.issue_comments = [
+        {
+            "id": 101,
+            "user": {"login": "github-actions"},
+            "body": "Initial CI metadata.",
+            "created_at": "2026-09-08T10:00:00Z",
+            "updated_at": "2026-09-08T10:00:00Z",
+            "html_url": "https://example.invalid/general",
+        }
+    ]
+    observations = pub.collect_review_surfaces(root, 42, "a" * 40)
+    write_review_disposition(root, observations)
+    github.issue_comments[0].update(
+        body="Edited metadata now requires a fresh parent disposition.",
+        updated_at="2026-09-08T10:05:00Z",
+    )
+    monkeypatch.setattr(
+        pub.time,
+        "sleep",
+        lambda _seconds: pytest.fail("edited finding must return before another CI poll"),
+    )
+
+    with pytest.raises(
+        pub.PublicationError, match=r"stale.*issue_comments:101"
+    ):
+        pub.wait_for_review(root, 42, "a" * 40, max_wait_seconds=1800)
+
+    assert not (root / "pr-review.json").exists()
+
+
+def test_review_disposition_diagnostics_name_stale_and_malformed_items(capture):
+    root, _, _ = capture
+    observations = {
+        "number": 42,
+        "candidate_sha": "a" * 40,
+        "observations_sha256": "b" * 64,
+        "surfaces": {
+            "issue_comments": [
+                    {
+                        "key": "issue_comments:101",
+                        "evidence_sha256": "c" * 64,
+                        "requires_disposition": True,
+                        "body": "A required finding.",
+                    }
+            ]
+        },
+    }
+    write_review_disposition(root, observations)
+    path = root / "pr-review-disposition.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["dispositions"][0]["evidence_sha256"] = "d" * 64
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(
+        pub.PublicationError, match=r"stale.*issue_comments:101"
+    ):
+        pub.require_review_disposition(root, observations)
+
+    value["dispositions"][0] = {"key": "issue_comments:101"}
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(
+        pub.PublicationError, match=r"malformed.*issue_comments:101"
+    ):
+        pub.require_review_disposition(root, observations)
+
+
 def test_review_wait_can_outlive_old_thirty_minute_limit(
     capture, github, monkeypatch
 ) -> None:

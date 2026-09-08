@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,29 @@ def retained(tmp_path, monkeypatch):
     review = {**value["review_proof"], "candidate_sha": candidate, "verdict": "approved",
               "review_ranges": [{"before": base, "after": candidate,
                                  "diff_sha256": hashlib.sha256(runtime._canonical_range_diff(repo, base, candidate)).hexdigest()}]}
+    review["verified_gate_evidence"] = [
+        {
+            "id": gate_id,
+            "exit_code": 0,
+            "status": "passed",
+            "output_sha256": next(
+                check["output_sha256"]
+                for check in value["checks"]
+                if check["id"] == gate_id
+            ),
+            "command_sha256": hashlib.sha256(
+                json.dumps(
+                    next(
+                        check["argv"]
+                        for check in value["checks"]
+                        if check["id"] == gate_id
+                    ),
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+        }
+        for gate_id in runtime.REVIEW_PREREQUISITE_GATES
+    ]
     value["review_proof"] = review
     folder = old / "termctrl-verified"
     folder.mkdir()
@@ -125,7 +149,162 @@ def test_continuation_delivers_once_without_rewriting_original(retained):
     assert all(call[1] in {"pr", "api"} for call in f["calls"])
 
 
-@pytest.mark.parametrize("fault", ["foreign-owner", "live-lock", "candidate", "base", "packet", "gate-log", "missing-log", "media", "context", "authorization", "already-delivered"])
+@pytest.mark.parametrize("damage", ["changed", "missing"])
+def test_continuation_regenerates_only_unusable_local_checks(
+    retained, monkeypatch, damage
+):
+    f = retained
+    changed = {"focused-contracts", "opentui-check", "opentui-build"}
+    for gate_id in changed:
+        path = f["old"] / "gate-logs" / f"{gate_id}.log"
+        if damage == "missing":
+            path.unlink()
+        else:
+            path.write_text(
+                f"interrupted duplicate {gate_id}\n", encoding="utf-8"
+            )
+    before = {
+        str(path): path.read_bytes()
+        for path in f["old"].rglob("*")
+        if path.is_file()
+    }
+    real_run = runtime.subprocess.run
+    executed = []
+
+    def local_checks(argv, *args, **kwargs):
+        if argv and (argv[0] == "uv" or argv[0] == str(runtime.NPM26)):
+            executed.append(argv)
+            output = kwargs.get("stdout")
+            if hasattr(output, "write"):
+                output.write(
+                    b"1 passed in 0.01s\n" if argv[0] == "uv" else b"completed\n"
+                )
+            return subprocess.CompletedProcess(argv, 0)
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.subprocess, "run", local_checks)
+    monkeypatch.setattr(
+        runtime,
+        "run_adversarial_review",
+        lambda *args, **kwargs: pytest.fail("valid independent review ran twice"),
+    )
+    args = [
+        *f["args"],
+        "--source-packet",
+        str(f["old"] / "gate-packet.json"),
+    ]
+
+    assert runtime.main(args) == 0
+
+    recovered = runtime._load_gate(f["output"])
+    assert set(recovered["publication_recovery"]["regenerated_gates"]) == changed
+    assert "adversarial-review" in recovered["publication_recovery"]["reused_gates"]
+    assert len(executed) == 3
+    assert {
+        str(path): path.read_bytes()
+        for path in f["old"].rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_live_owner_continuation_archives_source_before_fresh_attempt(
+    retained, monkeypatch
+):
+    f = retained
+    context = runtime._load_gate(f["old"] / "run-context.json")
+    write_json(
+        f["state"] / "run.lease.json",
+        {
+            "token": "test-token",
+            "expires_unix": 4_000_000_000,
+            "max_expires_unix": 4_000_000_000,
+            "run_id": f["old"].name,
+            "evidence_dir": str(f["old"]),
+            "captured_base": f["base"],
+            "captured_upstream": f["base"],
+            "run_context_sha256": runtime._file_sha256(
+                f["old"] / "run-context.json"
+            ),
+        },
+    )
+    source_bytes = f["source"].read_bytes()
+    args = [
+        "resume-publication",
+        "--repo",
+        str(f["repo"]),
+        "--state",
+        str(f["state"]),
+        "--token",
+        "test-token",
+        "--source-manifest",
+        str(f["source"]),
+        "--source-sha256",
+        runtime._file_sha256(f["source"]),
+        "--packet-sha256",
+        runtime._file_sha256(f["old"] / "gate-packet.json"),
+        "--source-packet",
+        str(f["old"] / "gate-packet.json"),
+        "--adopt-pr",
+        "42",
+        "--manifest",
+        str(f["source"]),
+    ]
+
+    observe = pub.wait_for_review
+    monkeypatch.setattr(
+        pub,
+        "wait_for_review",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            pub.PublicationError("API observation interrupted")
+        ),
+    )
+    with pytest.raises(runtime.ControlError, match="API observation interrupted"):
+        runtime.main(args)
+
+    recovered = runtime._load_gate(f["source"])
+    archived = Path(recovered["publication_recovery"]["manifest_path"])
+    assert archived != f["source"]
+    assert archived.read_bytes() == source_bytes
+    assert recovered["publication_recovery"]["source_owner"] == "live-owner"
+    monkeypatch.setattr(pub, "wait_for_review", observe)
+    assert runtime.main(args) == 0
+
+
+def test_recovery_rechecks_authorization_inside_ship_lock(retained, monkeypatch):
+    f = retained
+    damaged = f["old"] / "gate-logs/focused-contracts.log"
+    damaged.write_text("interrupted duplicate\n", encoding="utf-8")
+    real_run = runtime.subprocess.run
+
+    def local_check(argv, *args, **kwargs):
+        if argv and argv[0] == "uv":
+            output = kwargs.get("stdout")
+            if hasattr(output, "write"):
+                output.write(b"1 passed in 0.01s\n")
+            return subprocess.CompletedProcess(argv, 0)
+        return real_run(argv, *args, **kwargs)
+
+    real_ship = runtime.ship_candidate
+
+    def revoke_before_ship(*args, **kwargs):
+        revoked = {"mode": "backport", "commits": [f["base"]]}
+        write_json(f["state"] / "run-request.inflight.json", revoked)
+        write_json(f["fresh"] / "request.claimed.json", revoked)
+        return real_ship(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.subprocess, "run", local_check)
+    monkeypatch.setattr(runtime, "ship_candidate", revoke_before_ship)
+
+    with pytest.raises(
+        runtime.ControlError, match="publication recovery task changed"
+    ):
+        runtime.main(f["args"])
+
+    assert remote_sha(f["repo"]) == f["base"]
+    assert not (f["state"] / "publish-journal.json").exists()
+
+
+@pytest.mark.parametrize("fault", ["foreign-owner", "live-lock", "candidate", "base", "packet", "media", "context", "authorization", "already-delivered"])
 def test_continuation_refuses_real_state_and_artifact_changes(retained, fault):
     f = retained
     if fault == "foreign-owner":
@@ -143,12 +322,6 @@ def test_continuation_refuses_real_state_and_artifact_changes(retained, fault):
         git(f["repo"], "push", "origin", f"{f['candidate']}:refs/heads/sid/opentui")
     elif fault == "packet":
         (f["old"] / "gate-packet.json").write_text("{}", encoding="utf-8")
-    elif fault in {"gate-log", "missing-log"}:
-        log = f["old"] / "gate-logs/opentui-check.log"
-        if fault == "missing-log":
-            log.unlink()
-        else:
-            log.write_text("tampered", encoding="utf-8")
     elif fault == "media":
         (f["old"] / "termctrl-verified/accepted.png").write_bytes(b"changed")
     elif fault == "context":

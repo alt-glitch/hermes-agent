@@ -209,17 +209,27 @@ the user's daily-driver branch, index and working files are untouched.
 
 ### Continue an already-verified publication
 
-`resume-publication` is an observation-only alternative to `gate-and-ship`, not
-a gate waiver. It requires a live owner created by the existing wrapper, the
-nonblocking run lock, a different retained run with terminal `publish-refused`
-outcome, explicit original manifest/packet hashes, and an explicitly adopted PR.
+`resume-publication` is the publication-continuation alternative to
+`gate-and-ship`, not a gate waiver. It requires a live owner created by the
+existing wrapper, the nonblocking run lock, a completed source manifest,
+explicit original manifest/packet hashes, and an explicitly adopted PR. The
+source may belong to that still-live owner or to a different retained run with a
+terminal `publish-refused` outcome.
 It verifies the original lease/context binding, clean exact candidate/base,
 packet commands, hashed logs and nested review/media/video artifacts, review
 diffs, current authorization, PR ownership/attachment and current GitHub policy.
-It does not invoke local gates, upload media, edit the PR or push its head branch.
+It does not upload media, edit the PR or push its head branch. Intact checks are
+reused. A missing or changed completed local install, focused-test, check, or
+build log is rerun from the exact source packet into
+`gate-logs/publication-recovery/` under a fresh attempt. Candidate-bound
+independent review, termctrl recording, native frames and video analysis are
+never rerun for metadata-only recovery and must remain hash-valid; uncertain
+review or visual evidence refuses reuse.
 The existing target CAS, journal, request consumption and finalization follow.
-Source artifacts and the old failed outcome remain immutable; the fresh run's
-`gate.json` references them in `continuation` and records its own lease binding.
+Prior-run source artifacts and the old failed outcome remain immutable. For a
+live owner, the original manifest, packet, and PR evidence are first retained in
+an immutable archive. The resulting `gate.json` records both the recovery
+provenance and its current lease binding.
 
 For a retained scheduled sync, submit a bounded `mode: resume` request through
 `submit-request`, then dispatch the existing job. The checked-in
@@ -240,7 +250,7 @@ This does not authorize a new candidate or bypass a pending task.
 After claiming, the parent invokes:
 
 ```text
-uv run <runtime>/scripts/maintainer_runtime.py resume-publication --state <state> --token <fresh-token> --source-manifest <state>/runs/<original-run>/gate.json --source-sha256 <original-hash> --packet-sha256 <original-packet-hash> --adopt-pr <verified-number> --manifest <fresh-evidence>/gate.json --repo <fork>
+uv run <runtime>/scripts/maintainer_runtime.py resume-publication --state <state> --token <token> --source-manifest <completed-gate.json> --source-sha256 <original-hash> --source-packet <original-gate-packet.json> --packet-sha256 <original-packet-hash> --adopt-pr <verified-number> --manifest <owner-evidence>/gate.json --repo <fork>
 ```
 
 An interrupted observer can retry that same command under the same still-live

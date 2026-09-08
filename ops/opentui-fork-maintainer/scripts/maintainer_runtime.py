@@ -1251,6 +1251,25 @@ def validate_gate_manifest(
         ):
             raise ControlError("continuation does not bind this owner and candidate")
         return value
+    if "publication_recovery" in value:
+        recovery = value["publication_recovery"]
+        if not isinstance(recovery, dict):
+            raise ControlError("publication recovery provenance is invalid")
+        original, _, reused, regenerated = _publication_recovery_source(
+            repo, recovery, manifest_path.parent
+        )
+        if (
+            value.get("base_sha") != original.get("base_sha")
+            or value.get("candidate_sha") != original.get("candidate_sha")
+            or value.get("branch") != original.get("branch")
+            or value.get("review_proof") != original.get("review_proof")
+            or value.get("packet_sha256") != original.get("packet_sha256")
+            or recovery.get("reused_gates") != reused
+            or recovery.get("regenerated_gates") != regenerated
+            or recovery.get("authorization_sha256")
+            != _canonical_json_sha256(value.get("run_binding"))
+        ):
+            raise ControlError("publication recovery changed candidate-bound evidence")
     if (
         value.get("schema_version") != GATE_SCHEMA_VERSION
         or value.get("branch") != branch
@@ -1500,6 +1519,14 @@ def ship_candidate(
             current = _derive_run_binding(state_dir, manifest_path.parent, token)
             if any(current[key] != value for key, value in manifest["run_binding"].items() if key != "captured_upstream"):
                 raise ControlError("continuation task changed before publication")
+        if "publication_recovery" in manifest:
+            current = _derive_run_binding(state_dir, manifest_path.parent, token)
+            if any(
+                current[key] != value
+                for key, value in manifest["run_binding"].items()
+                if key != "captured_upstream"
+            ):
+                raise ControlError("publication recovery task changed before publication")
         if manifest["run_binding"]["mode"] in {"repair", "issue"} and _derive_run_binding(
             state_dir, manifest_path.parent, token
         ) != manifest["run_binding"]:
@@ -3506,10 +3533,281 @@ def validate_retained_gate(
     return original
 
 
+def _publication_recovery_source(
+    repo: Path,
+    receipt: dict[str, Any],
+    evidence_root: Path,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[str], list[str]]:
+    """Validate completed source evidence and classify only local log loss."""
+    source_root = Path(receipt["source_evidence_dir"])
+    if source_root.resolve(strict=False) != source_root or source_root.is_symlink():
+        raise ControlError("publication recovery source directory is unsafe")
+    for key in ("manifest", "packet", "context", "pr"):
+        path = _evidence_path(receipt[f"{key}_path"], source_root, label=f"recovery {key}")
+        if _file_sha256(path) != receipt[f"{key}_sha256"]:
+            raise ControlError(f"publication recovery {key} changed")
+    owner = receipt.get("source_owner")
+    context = _load_gate(Path(receipt["context_path"]))
+    if owner == "terminal-prior-owner":
+        outcome = _evidence_path(
+            receipt.get("outcome_path"), source_root, label="recovery outcome"
+        )
+        if _file_sha256(outcome) != receipt.get("outcome_sha256"):
+            raise ControlError("publication recovery outcome changed")
+        outcome_value = _load_gate(outcome)
+        if (
+            outcome_value.get("status") != "failed"
+            or outcome_value.get("stage") != "publish"
+            or outcome_value.get("reason_code") != "publish-refused"
+            or outcome_value.get("published") is not False
+            or outcome_value.get("needs_finalization") is not False
+        ):
+            raise ControlError("prior owner has no terminal unshipped publication failure")
+    elif owner != "live-owner":
+        raise ControlError("publication recovery owner class is invalid")
+    original = _load_gate(Path(receipt["manifest_path"]))
+    packet = _load_gate(Path(receipt["packet_path"]))
+    items = packet.get("checks") if set(packet) == {"checks"} else None
+    checks = original.get("checks")
+    if (
+        original.get("schema_version") != GATE_SCHEMA_VERSION
+        or original.get("branch") != BRANCH
+        or original.get("base_sha") != context.get("base_sha")
+        or original.get("run_binding", {}).get("captured_upstream")
+        != context.get("upstream_sha")
+        or original.get("lease_token_sha256") != context.get("lease_token_sha256")
+        or not _valid_run_binding(original.get("run_binding"))
+        or not isinstance(items, list)
+        or not isinstance(checks, list)
+        or len(items) != len(REQUIRED_GATES)
+        or {item.get("id") for item in items if isinstance(item, dict)} != REQUIRED_GATES
+        or len(checks) != len(REQUIRED_GATES)
+    ):
+        raise ControlError("publication recovery source binding is invalid")
+    if original.get("packet_sha256") != receipt["packet_sha256"]:
+        raise ControlError("publication recovery packet differs from executed gate")
+    _validate_recorded_worktree(original.get("worktree_proof"), original["candidate_sha"])
+    records = {
+        check.get("id"): check for check in checks if isinstance(check, dict)
+    }
+    if set(records) != REQUIRED_GATES:
+        raise ControlError("publication recovery gate records are incomplete")
+    by_id = {item["id"]: item for item in items}
+    for gate_id in REQUIRED_GATES:
+        item, record = by_id[gate_id], records[gate_id]
+        _validate_gate_packet_item(gate_id, item)
+        if (
+            set(record)
+            != {"id", "argv", "exit_code", "status", "output_path", "output_sha256"}
+            or record["status"] != "passed"
+            or record["exit_code"] != 0
+            or ("argv" in item and item["argv"] != record["argv"])
+        ):
+            raise ControlError(f"publication recovery source gate is not reusable: {gate_id}")
+    reused: list[str] = []
+    regenerated: list[str] = []
+    for gate_id in REVIEW_PREREQUISITE_GATES:
+        record = records[gate_id]
+        try:
+            output = _evidence_path(
+                record["output_path"], source_root, label=f"source {gate_id} output"
+            )
+            intact = _file_sha256(output) == record["output_sha256"]
+        except ControlError:
+            intact = False
+        (reused if intact else regenerated).append(gate_id)
+    review = original.get("review_proof")
+    for gate_id in ("adversarial-review", "termctrl-smoke", "video-analysis"):
+        record = records[gate_id]
+        output = _evidence_path(
+            record["output_path"], source_root, label=f"retained {gate_id} output"
+        )
+        if _file_sha256(output) != record["output_sha256"]:
+            raise ControlError(f"retained {gate_id} evidence changed; refusing reuse")
+        proof = _load_gate(output)
+        if gate_id == "adversarial-review" and proof != review:
+            raise ControlError("retained independent review proof changed")
+        for key, path in proof.items():
+            if key.endswith("_path"):
+                artifact = _evidence_path(path, source_root, label=f"retained {key}")
+                if _file_sha256(artifact) != proof.get(
+                    key.removesuffix("_path") + "_sha256"
+                ):
+                    raise ControlError(f"retained {key} artifact changed")
+        reused.append(gate_id)
+    if (
+        not isinstance(review, dict)
+        or review.get("candidate_sha") != original["candidate_sha"]
+        or review.get("verdict") != "approved"
+        or review.get("review_mode")
+        != (
+            "upstream-merge"
+            if original["run_binding"]["mode"] == "scheduled"
+            else "linear-candidate"
+        )
+    ):
+        raise ControlError("retained independent review is not candidate-bound approval")
+    verified_checks = []
+    for gate_id in REVIEW_PREREQUISITE_GATES:
+        record = records[gate_id]
+        verified_checks.append(
+            {
+                "id": gate_id,
+                "exit_code": 0,
+                "status": "passed",
+                "output_sha256": record["output_sha256"],
+                "command_sha256": hashlib.sha256(
+                    json.dumps(record["argv"], separators=(",", ":")).encode()
+                ).hexdigest(),
+            }
+        )
+    if review.get("verified_gate_evidence") != verified_checks:
+        raise ControlError("retained independent review gate identity changed")
+    review_ranges = review.get("review_ranges")
+    if not isinstance(review_ranges, list) or not review_ranges:
+        raise ControlError("retained independent review has no authenticated range")
+    for reviewed in review_ranges:
+        if (
+            not isinstance(reviewed, dict)
+            or not SHA_RE.fullmatch(str(reviewed.get("before", "")))
+            or not SHA_RE.fullmatch(str(reviewed.get("after", "")))
+            or not SHA256_RE.fullmatch(str(reviewed.get("diff_sha256", "")))
+        ):
+            raise ControlError("retained independent review range is invalid")
+        diff = _canonical_range_diff(repo, reviewed["before"], reviewed["after"])
+        if hashlib.sha256(diff).hexdigest() != reviewed.get("diff_sha256"):
+            raise ControlError("retained independent review range changed")
+    return original, records, reused, regenerated
+
+
+def _execute_recovery_gate(
+    gate_id: str, argv: list[str], output_path: Path, cwd: Path
+) -> None:
+    node_focused = gate_id == "focused-contracts" and argv[0] == str(NODE26)
+    node_proof = (
+        _validate_node_runtime()
+        if gate_id.startswith("opentui-") or node_focused
+        else None
+    )
+    gate_env = {**os.environ, "PATH": CONTROLLED_PATH} if node_proof else None
+    command_cwd = cwd / "ui-opentui" if node_focused else cwd
+    with output_path.open("wb") as output:
+        if gate_id == "opentui-install":
+            output.write((json.dumps(node_proof, sort_keys=True) + "\n").encode())
+        result = subprocess.run(
+            argv,
+            cwd=command_cwd,
+            shell=False,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            timeout=1800,
+            env=gate_env,
+        )
+    if result.returncode != 0:
+        raise ControlError(f"publication recovery gate failed: {gate_id}")
+    if gate_id == "focused-contracts" and not _focused_output_proves_execution(
+        argv, output_path.read_text(encoding="utf-8", errors="replace")
+    ):
+        raise ControlError("publication recovery focused check executed no tests")
+
+
+def _recover_completed_gate(
+    repo: Path,
+    receipt: dict[str, Any],
+    manifest_path: Path,
+    *,
+    token: str,
+    current_binding: dict[str, Any],
+) -> dict[str, Any]:
+    root = manifest_path.parent
+    original, records, reused, regenerated = _publication_recovery_source(
+        repo, receipt, root
+    )
+    binding = original["run_binding"]
+    if any(
+        current_binding[key] != value
+        for key, value in binding.items()
+        if key != "captured_upstream"
+    ):
+        raise ControlError("retained task authorization or base is stale")
+    if _git_status(
+        repo,
+        [
+            "merge-base",
+            "--is-ancestor",
+            binding["captured_upstream"],
+            current_binding["captured_upstream"],
+        ],
+    ):
+        raise ControlError("captured upstream history changed")
+    cwd = Path(original["worktree_proof"]["worktree"])
+    before = _worktree_proof(cwd, original["candidate_sha"])
+    attempt = _safe_output_path(
+        root,
+        "gate-logs",
+        "publication-recovery",
+        f"attempt-{time.time_ns()}",
+        "placeholder",
+    ).parent
+    recorded: list[dict[str, Any]] = []
+    for gate_id in (
+        "opentui-install",
+        "focused-contracts",
+        "opentui-check",
+        "opentui-build",
+        "adversarial-review",
+        "termctrl-smoke",
+        "video-analysis",
+    ):
+        record = records[gate_id]
+        output = _safe_output_path(attempt, f"{gate_id}.log")
+        if gate_id in regenerated:
+            _execute_recovery_gate(gate_id, record["argv"], output, cwd)
+        else:
+            shutil.copyfile(Path(record["output_path"]), output)
+        recorded.append(
+            {
+                **record,
+                "output_path": str(output),
+                "output_sha256": _file_sha256(output),
+            }
+        )
+    after = _worktree_proof(cwd, original["candidate_sha"])
+    if before["tree_sha"] != after["tree_sha"]:
+        raise ControlError("publication recovery changed the candidate worktree")
+    recovery = {
+        **receipt,
+        "reused_gates": reused,
+        "regenerated_gates": regenerated,
+        "authorization_sha256": _canonical_json_sha256(current_binding),
+        "attempt_dir": str(attempt),
+    }
+    result = {
+        **original,
+        "lease_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+        "run_binding": current_binding,
+        "checks": recorded,
+        "worktree_proof": {
+            "worktree": before["worktree"],
+            "before": {
+                key: before[key]
+                for key in ("head_sha", "tree_sha", "status_porcelain")
+            },
+            "after": {
+                key: after[key]
+                for key in ("head_sha", "tree_sha", "status_porcelain")
+            },
+        },
+        "publication_recovery": recovery,
+    }
+    _atomic_json(manifest_path, result)
+    return result
+
+
 def resume_publication(
     repo: Path, source: Path, manifest_path: Path, *, state_dir: Path,
     token: str, source_sha256: str, packet_sha256: str, number: int,
-    remote: str = REMOTE,
+    remote: str = REMOTE, source_packet: Path | None = None,
 ) -> dict[str, Any]:
     """Continue exact evidence under an existing fresh owner and the run lock."""
     # Match the binding helpers without resolving away symlink evidence fences.
@@ -3521,17 +3819,105 @@ def resume_publication(
     current = _derive_run_binding(state_dir, root, token)
     if root.parent != state_dir / "runs" or manifest_path.name != "gate.json":
         raise ControlError("continuation output must be this run's gate.json")
-    receipt: dict[str, Any] = {"number": number}
-    names = {"manifest": source.name, "packet": "gate-packet.json",
-             "context": "run-context.json", "outcome": "run-outcome.json",
-             "pr": "pr-evidence.json"}
-    for key, name in names.items():
-        path = _evidence_path(str(source.parent / name), source.parent, label=key)
-        receipt[f"{key}_path"] = str(path)
-        receipt[f"{key}_sha256"] = _file_sha256(path)
-    if receipt["manifest_sha256"] != source_sha256 or receipt["packet_sha256"] != packet_sha256:
-        raise ControlError("explicit retained manifest/packet hashes do not match")
-    original = validate_retained_gate(repo, receipt, root)
+    source_root = source.parent
+    packet = Path(os.path.abspath(source_packet or source_root / "gate-packet.json"))
+    safe_source = _evidence_path(str(source), source_root, label="manifest")
+    safe_packet = _evidence_path(str(packet), source_root, label="packet")
+    preview_manifest = _load_gate(safe_source)
+    prior_recovery = preview_manifest.get("publication_recovery")
+    recovered = (
+        source == manifest_path
+        and isinstance(prior_recovery, dict)
+        and prior_recovery.get("source_owner") == "live-owner"
+    )
+    if recovered:
+        receipt = dict(prior_recovery)
+        if (
+            receipt.get("number") != number
+            or receipt.get("source_evidence_dir") != str(root)
+            or receipt.get("manifest_sha256") != source_sha256
+            or receipt.get("packet_sha256") != packet_sha256
+            or _file_sha256(safe_packet) != packet_sha256
+        ):
+            raise ControlError("live-owner recovery retry differs from its retained source")
+        original = validate_gate_manifest(
+            repo,
+            manifest_path,
+            base_sha=preview_manifest.get("base_sha"),
+            candidate_sha=preview_manifest.get("candidate_sha"),
+            token=token,
+        )
+    else:
+        receipt = {
+            "number": number,
+            "source_evidence_dir": str(source_root),
+            "source_owner": (
+                "live-owner" if source_root == root else "terminal-prior-owner"
+            ),
+        }
+        paths = {
+            "manifest": safe_source,
+            "packet": safe_packet,
+            "context": source_root / "run-context.json",
+            "pr": source_root / "pr-evidence.json",
+        }
+        if source_root != root:
+            paths["outcome"] = source_root / "run-outcome.json"
+        for key, candidate_path in paths.items():
+            path = _evidence_path(str(candidate_path), source_root, label=key)
+            receipt[f"{key}_path"] = str(path)
+            receipt[f"{key}_sha256"] = _file_sha256(path)
+        if (
+            receipt["manifest_sha256"] != source_sha256
+            or receipt["packet_sha256"] != packet_sha256
+        ):
+            raise ControlError("explicit retained manifest/packet hashes do not match")
+        if source == manifest_path:
+            archive_root = _safe_output_path(
+                root,
+                "publication-recovery",
+                "retained-sources",
+                source_sha256,
+                "placeholder",
+            ).parent
+            archived_manifest = _safe_output_path(archive_root, "gate.json")
+            archived_packet = _safe_output_path(archive_root, "gate-packet.json")
+            archived_pr = _safe_output_path(archive_root, "pr-evidence.json")
+            for original_path, archived_path, expected in (
+                (source, archived_manifest, source_sha256),
+                (packet, archived_packet, packet_sha256),
+                (
+                    Path(receipt["pr_path"]),
+                    archived_pr,
+                    receipt["pr_sha256"],
+                ),
+            ):
+                if archived_path.exists():
+                    if _file_sha256(archived_path) != expected:
+                        raise ControlError("retained live-owner source archive changed")
+                else:
+                    shutil.copyfile(original_path, archived_path)
+            receipt.update(
+                manifest_path=str(archived_manifest),
+                manifest_sha256=_file_sha256(archived_manifest),
+                packet_path=str(archived_packet),
+                packet_sha256=_file_sha256(archived_packet),
+                pr_path=str(archived_pr),
+                pr_sha256=_file_sha256(archived_pr),
+            )
+        try:
+            if receipt["source_owner"] == "live-owner":
+                raise ControlError("live owner requires a fresh evidence attempt")
+            original = validate_retained_gate(repo, receipt, root)
+        except ControlError:
+            original = _recover_completed_gate(
+                repo,
+                receipt,
+                manifest_path,
+                token=token,
+                current_binding=current,
+            )
+            recovered = True
     claimed = root / "request.claimed.json"
     request = None
     if claimed.exists():
@@ -3566,11 +3952,23 @@ def resume_publication(
         raise ControlError("fresh owner has insufficient observation time")
     publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
     # Write provenance before observation so a killed observer remains auditable.
-    result = {**original, "continuation": receipt,
-              "lease_token_sha256": hashlib.sha256(token.encode()).hexdigest()}
-    _atomic_json(manifest_path, result)
+    if recovered:
+        result = original
+    else:
+        result = {
+            **original,
+            "continuation": receipt,
+            "lease_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+        }
+        _atomic_json(manifest_path, result)
     try:
-        proof = publisher["resume_preview"](root, source, original, number=number, deadline_unix=deadline)
+        proof = publisher["resume_preview"](
+            root,
+            source,
+            preview_manifest,
+            number=number,
+            deadline_unix=deadline,
+        )
     except (RuntimeError, ValueError, KeyError, OSError) as exc:
         raise ControlError(f"PR continuation refused: {exc}") from exc
     validate_lease(state_dir, token)
@@ -4539,6 +4937,7 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--source-manifest", type=Path, required=True)
     resume.add_argument("--source-sha256", required=True)
     resume.add_argument("--packet-sha256", required=True)
+    resume.add_argument("--source-packet", type=Path)
     resume.add_argument("--adopt-pr", type=int, required=True)
     resume.add_argument("--manifest", type=Path, required=True)
     resume.add_argument("--repo", type=Path, required=True)
@@ -4636,7 +5035,8 @@ def main(argv: list[str] | None = None) -> int:
             result = resume_publication(
                 args.repo, args.source_manifest, args.manifest, state_dir=args.state,
                 token=args.token, source_sha256=args.source_sha256,
-                packet_sha256=args.packet_sha256, number=args.adopt_pr, remote=args.remote,
+                packet_sha256=args.packet_sha256, number=args.adopt_pr,
+                remote=args.remote, source_packet=args.source_packet,
             )
             finalize_success(
                 args.repo, args.manifest, state_dir=args.state,
