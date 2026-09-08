@@ -12,7 +12,14 @@ from pathlib import Path
 
 import pytest
 
-from test_pr_publication import green_checks, pub
+from test_pr_publication import (
+    bind_issue,
+    capture,
+    github,
+    green_checks,
+    pub,
+    review_pr,
+)
 from test_runtime import git, make_gate_packet, make_repo, manifest, remote_sha, runtime
 
 
@@ -20,12 +27,23 @@ def write_json(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
+def retained_artifacts(root):
+    worktree = root / "integration"
+    return {
+        str(path): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_relative_to(worktree)
+    }
+
+
 @pytest.fixture
 def retained(tmp_path, monkeypatch):
-    repo, remote, base, candidate, cwd = make_repo(tmp_path)
     state = tmp_path / "state"
     old, fresh = state / "runs/old", state / "runs/fresh"
-    old.mkdir(parents=True)
+    repo, remote, base, candidate, cwd = make_repo(
+        tmp_path, worktree_name="state/runs/old/integration"
+    )
+    old.mkdir(parents=True, exist_ok=True)
     fresh.mkdir()
     source, output = old / "gate.json", fresh / "gate.json"
     manifest(source, cwd, base, candidate)
@@ -135,14 +153,25 @@ def retained(tmp_path, monkeypatch):
 
 def test_continuation_delivers_once_without_rewriting_original(retained):
     f = retained
-    before = {str(p): p.read_bytes() for p in f["old"].rglob("*") if p.is_file()}
+    before = retained_artifacts(f["old"])
     assert runtime.main(f["args"]) == 0
     assert remote_sha(f["repo"]) == f["candidate"]
     assert runtime._load_gate(f["fresh"] / "run-outcome.json")["published"] is True
-    assert runtime._load_gate(f["state"] / "publish-journal.json")["phase"] == "finalized"
+    recovered = runtime._load_gate(f["output"])
+    journal = runtime._load_gate(f["state"] / "publish-journal.json")
+    cleanup = {
+        "evidence_dir": str(f["old"]),
+        "worktree": str(f["cwd"]),
+    }
+    assert recovered["cleanup_ownership"] == cleanup
+    assert journal["cleanup_ownership"] == cleanup
+    assert journal["cleanup_ownership_sha256"] == runtime._canonical_json_sha256(
+        cleanup
+    )
+    assert journal["phase"] == "finalized"
     assert not f["cwd"].exists()
     assert not (f["state"] / "run.lease.json").exists()
-    assert {str(p): p.read_bytes() for p in f["old"].rglob("*") if p.is_file()} == before
+    assert retained_artifacts(f["old"]) == before
     with pytest.raises(runtime.ControlError, match="lease"):
         runtime.main(f["args"])
     assert sum(call[:3] == [str(pub.GH), "pr", "view"] for call in f["calls"]) == 1
@@ -163,11 +192,7 @@ def test_continuation_regenerates_only_unusable_local_checks(
             path.write_text(
                 f"interrupted duplicate {gate_id}\n", encoding="utf-8"
             )
-    before = {
-        str(path): path.read_bytes()
-        for path in f["old"].rglob("*")
-        if path.is_file()
-    }
+    before = retained_artifacts(f["old"])
     real_run = runtime.subprocess.run
     executed = []
 
@@ -200,11 +225,7 @@ def test_continuation_regenerates_only_unusable_local_checks(
     assert set(recovered["publication_recovery"]["regenerated_gates"]) == changed
     assert "adversarial-review" in recovered["publication_recovery"]["reused_gates"]
     assert len(executed) == 3
-    assert {
-        str(path): path.read_bytes()
-        for path in f["old"].rglob("*")
-        if path.is_file()
-    } == before
+    assert retained_artifacts(f["old"]) == before
 
 
 def test_live_owner_continuation_archives_source_before_fresh_attempt(
@@ -304,7 +325,23 @@ def test_recovery_rechecks_authorization_inside_ship_lock(retained, monkeypatch)
     assert not (f["state"] / "publish-journal.json").exists()
 
 
-@pytest.mark.parametrize("fault", ["foreign-owner", "live-lock", "candidate", "base", "packet", "media", "context", "authorization", "already-delivered"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "foreign-owner",
+        "live-lock",
+        "candidate",
+        "dirty",
+        "branch-attached",
+        "arbitrary-sibling",
+        "base",
+        "packet",
+        "media",
+        "context",
+        "authorization",
+        "already-delivered",
+    ],
+)
 def test_continuation_refuses_real_state_and_artifact_changes(retained, fault):
     f = retained
     if fault == "foreign-owner":
@@ -318,6 +355,19 @@ def test_continuation_refuses_real_state_and_artifact_changes(retained, fault):
     elif fault == "candidate":
         (f["cwd"] / "file").write_text("changed\n", encoding="utf-8")
         git(f["cwd"], "commit", "-am", "unreviewed fix")
+    elif fault == "dirty":
+        (f["cwd"] / "untracked").write_text("dirty\n", encoding="utf-8")
+    elif fault == "branch-attached":
+        git(f["cwd"], "switch", "-c", "unexpected-owner")
+    elif fault == "arbitrary-sibling":
+        sibling = f["old"] / "integration-sibling"
+        git(f["repo"], "worktree", "add", "--detach", str(sibling), f["candidate"])
+        value = runtime._load_gate(f["source"])
+        value["worktree_proof"]["worktree"] = str(sibling)
+        write_json(f["source"], value)
+        f["args"][f["args"].index("--source-sha256") + 1] = runtime._file_sha256(
+            f["source"]
+        )
     elif fault in {"base", "already-delivered"}:
         git(f["repo"], "push", "origin", f"{f['candidate']}:refs/heads/sid/opentui")
     elif fault == "packet":
@@ -335,6 +385,79 @@ def test_continuation_refuses_real_state_and_artifact_changes(retained, fault):
     assert not (f["fresh"] / "run-outcome.json").exists()
     assert not (f["state"] / "publish-journal.json").exists()
     assert f["calls"] == []
+
+
+def test_post_push_recovery_uses_authenticated_original_cleanup_owner(
+    retained, monkeypatch
+):
+    f = retained
+    finalize = runtime.finalize_success
+    monkeypatch.setattr(
+        runtime,
+        "finalize_success",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("simulated crash after publication")
+        ),
+    )
+
+    with pytest.raises(OSError, match="simulated crash after publication"):
+        runtime.main(f["args"])
+
+    journal = runtime._load_gate(f["state"] / "publish-journal.json")
+    assert journal["phase"] == "published"
+    assert journal["cleanup_ownership"] == {
+        "evidence_dir": str(f["old"]),
+        "worktree": str(f["cwd"]),
+    }
+    assert remote_sha(f["repo"]) == f["candidate"]
+    assert f["cwd"].exists()
+
+    monkeypatch.setattr(runtime, "finalize_success", finalize)
+    result = runtime.reconcile_run(
+        f["state"], f["fresh"], token="fresh-token"
+    )
+    assert result["status"] == "success"
+    assert not f["cwd"].exists()
+
+
+@pytest.mark.parametrize("tamper", ["manifest", "journal", "journal-and-digest"])
+def test_cleanup_ownership_metadata_cannot_be_changed(
+    retained, monkeypatch, tamper
+):
+    f = retained
+    finalize = runtime.finalize_success
+    monkeypatch.setattr(
+        runtime,
+        "finalize_success",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("simulated crash after publication")
+        ),
+    )
+    with pytest.raises(OSError, match="simulated crash after publication"):
+        runtime.main(f["args"])
+
+    replacement = {
+        "evidence_dir": str(f["fresh"]),
+        "worktree": str(f["cwd"]),
+    }
+    if tamper == "manifest":
+        recovered = runtime._load_gate(f["output"])
+        recovered["cleanup_ownership"] = replacement
+        write_json(f["output"], recovered)
+    else:
+        journal_path = f["state"] / "publish-journal.json"
+        journal = runtime._load_gate(journal_path)
+        journal["cleanup_ownership"] = replacement
+        if tamper == "journal-and-digest":
+            journal["cleanup_ownership_sha256"] = runtime._canonical_json_sha256(
+                replacement
+            )
+        write_json(journal_path, journal)
+
+    monkeypatch.setattr(runtime, "finalize_success", finalize)
+    with pytest.raises(runtime.ControlError, match="manifest evidence|cleanup ownership"):
+        runtime.reconcile_run(f["state"], f["fresh"], token="fresh-token")
+    assert f["cwd"].exists()
 
 
 @pytest.mark.parametrize("field,value", [("state", "CLOSED"), ("baseRefName", "main"), ("baseRefOid", "0" * 40), ("headRefOid", "0" * 40), ("headRefName", "foreign"), ("number", 81), ("isCrossRepository", True), ("body", "foreign ownership")])
@@ -456,6 +579,7 @@ def test_scheduled_resume_request_identity_is_bound_across_recovery(
         "review-changed",
         "visual-missing",
         "source-changed",
+        "cleanup-changed",
     ],
 )
 def test_terminal_recovery_retry_reuses_only_authenticated_fresh_evidence(
@@ -468,11 +592,7 @@ def test_terminal_recovery_retry_reuses_only_authenticated_fresh_evidence(
     (f["old"] / "gate-logs/opentui-check.log").write_text(
         "interrupted second local evidence\n", encoding="utf-8"
     )
-    original_bytes = {
-        str(path): path.read_bytes()
-        for path in f["old"].rglob("*")
-        if path.is_file()
-    }
+    original_bytes = retained_artifacts(f["old"])
     executions = []
 
     def execute(gate_id, _argv, output, _cwd):
@@ -501,15 +621,19 @@ def test_terminal_recovery_retry_reuses_only_authenticated_fresh_evidence(
         "visual-missing": first_attempt / "termctrl-smoke.log",
         "source-changed": f["source"],
     }
-    if fresh_fault.endswith("changed"):
+    if fresh_fault == "cleanup-changed":
+        first["cleanup_ownership"]["evidence_dir"] = str(f["fresh"])
+        write_json(f["output"], first)
+    elif fresh_fault.endswith("changed"):
         targets[fresh_fault].write_text("changed fresh evidence\n", encoding="utf-8")
     elif fresh_fault.endswith("missing"):
         targets[fresh_fault].unlink()
 
     monkeypatch.setattr(pub, "wait_for_review", original_wait)
-    if fresh_fault.startswith(("review", "visual", "source")):
+    if fresh_fault.startswith(("review", "visual", "source", "cleanup")):
         with pytest.raises(
-            runtime.ControlError, match="evidence|recovery|review|manifest"
+            runtime.ControlError,
+            match="evidence|recovery|review|manifest|cleanup ownership",
         ):
             runtime.main(f["args"])
         assert executions == ["focused-contracts", "opentui-check"]
@@ -528,11 +652,7 @@ def test_terminal_recovery_retry_reuses_only_authenticated_fresh_evidence(
         assert first_attempt in attempts
         assert "continuation" not in runtime._load_gate(f["output"])
 
-    assert {
-        str(path): path.read_bytes()
-        for path in f["old"].rglob("*")
-        if path.is_file()
-    } == original_bytes
+    assert retained_artifacts(f["old"]) == original_bytes
 
 
 def test_owned_task_fix_is_fast_forward_and_retry_stable(retained, monkeypatch):
@@ -586,6 +706,68 @@ def test_owned_task_fix_is_fast_forward_and_retry_stable(retained, monkeypatch):
     with pytest.raises(runtime.ControlError):
         runtime.main(f["args"])
     assert remote_sha(f["repo"]) == f["base"]
+
+
+def test_stacked_issue_draft_is_adopted_after_exact_prerequisite_base_advance(
+    capture, github, monkeypatch
+):
+    root, draft_manifest, _ = capture
+    repo, _, base, prerequisite, worktree = make_repo(root.parent)
+    (worktree / "file").write_text("issue 41\n", encoding="utf-8")
+    git(worktree, "commit", "-am", "issue 41")
+    candidate = git(worktree, "rev-parse", "HEAD")
+    assert git(repo, "merge-base", "--is-ancestor", prerequisite, candidate) == ""
+
+    draft_manifest.update(base_sha=base, candidate_sha=candidate)
+    existing = {
+        "number": 42,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/42",
+        "base_branch": pub.BASE,
+        "head_branch": "feature/approved-41",
+        "head_sha": candidate,
+        "head_repository": pub.REPOSITORY,
+    }
+    bind_issue(capture, existing_prs=[existing])
+    github.pr = {
+        **review_pr(),
+        "number": 42,
+        "url": existing["url"],
+        "body": "Contributor context.\n\nFixes #41",
+        "headRefName": existing["head_branch"],
+        "headRefOid": candidate,
+        "baseRefOid": base,
+        "isDraft": True,
+    }
+    transport = github.run
+
+    def real_ancestry(argv, cwd):
+        if argv[:2] == ["git", "merge-base"]:
+            return runtime._git(repo, argv[1:])
+        return transport(argv, cwd)
+
+    monkeypatch.setattr(pub, "_run", real_ancestry)
+    first = pub.publish_draft(
+        repo, root, draft_manifest, pending_gates=["candidate verification"]
+    )
+    first_marker = pub._candidate_head(draft_manifest)[2]
+
+    draft_manifest["base_sha"] = prerequisite
+    draft_manifest["run_binding"]["captured_base"] = prerequisite
+    github.pr["baseRefOid"] = prerequisite
+    second = pub.publish_draft(
+        repo, root, draft_manifest, pending_gates=["new-base candidate review"]
+    )
+    second_marker = pub._candidate_head(draft_manifest)[2]
+
+    assert first["number"] == second["number"] == 42
+    assert first["head_branch"] == second["head_branch"] == existing["head_branch"]
+    assert github.pr["headRefOid"] == candidate
+    assert first_marker != second_marker
+    assert second_marker in github.pr["body"]
+    assert not any(call[:2] == ["git", "push"] for call in github.calls)
+    assert not any(
+        len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
+    )
 
 
 @pytest.mark.parametrize("as_draft", [False, True])
@@ -705,7 +887,7 @@ def test_mixed_command_paths_preserve_continuation_fences(scheduled_request, mon
         (f["old"] / "termctrl-verified/accepted.png").write_bytes(b"tampered")
     elif fault == "foreign-output":
         args[args.index("--manifest") + 1] = "state/runs/foreign/gate.json"
-    before = {str(p): p.read_bytes() for p in f["old"].rglob("*") if p.is_file()}
+    before = retained_artifacts(f["old"])
     if fault is None:
         assert runtime.main(args) == 0
         assert remote_sha(f["repo"]) == f["candidate"]
@@ -717,7 +899,7 @@ def test_mixed_command_paths_preserve_continuation_fences(scheduled_request, mon
         assert f["calls"] == []
         assert not (f["state"] / "publish-journal.json").exists()
         assert not f["output"].exists()
-    assert {str(p): p.read_bytes() for p in f["old"].rglob("*") if p.is_file()} == before
+    assert retained_artifacts(f["old"]) == before
 
 
 @pytest.mark.parametrize("when", ["before", "during"])

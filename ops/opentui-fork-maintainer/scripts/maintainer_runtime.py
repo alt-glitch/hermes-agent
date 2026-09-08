@@ -1109,6 +1109,45 @@ def _worktree_proof(worktree: Path, candidate_sha: str) -> dict[str, str]:
     }
 
 
+def _cleanup_ownership(
+    evidence_dir: Path, worktree: Path
+) -> dict[str, str]:
+    return {
+        "evidence_dir": str(Path(os.path.abspath(evidence_dir))),
+        "worktree": str(Path(os.path.abspath(worktree))),
+    }
+
+
+def _manifest_cleanup_ownership(
+    manifest: dict[str, Any], evidence_dir: Path, *, required: bool = False
+) -> dict[str, str]:
+    proof = manifest.get("worktree_proof")
+    if not isinstance(proof, dict) or not isinstance(proof.get("worktree"), str):
+        raise ControlError("cleanup ownership has no candidate worktree proof")
+    provenance = manifest.get("continuation") or manifest.get(
+        "publication_recovery"
+    )
+    owner_evidence = evidence_dir
+    if provenance is not None:
+        if not isinstance(provenance, dict) or not isinstance(
+            provenance.get("source_evidence_dir"), str
+        ):
+            raise ControlError("cleanup ownership has no original evidence owner")
+        owner_evidence = Path(provenance["source_evidence_dir"])
+        required = True
+    expected = _cleanup_ownership(owner_evidence, Path(proof["worktree"]))
+    recorded = manifest.get("cleanup_ownership")
+    if recorded is None and not required:
+        return expected
+    if (
+        not isinstance(recorded, dict)
+        or set(recorded) != {"evidence_dir", "worktree"}
+        or recorded != expected
+    ):
+        raise ControlError("cleanup ownership changed from its authenticated owner")
+    return expected
+
+
 def _validate_recorded_worktree(value: Any, candidate_sha: str) -> Path:
     if not isinstance(value, dict) or set(value) != {
         "worktree",
@@ -1305,6 +1344,7 @@ def validate_gate_manifest(
             or value.get("branch") != branch
         ):
             raise ControlError("continuation does not bind this owner and candidate")
+        _manifest_cleanup_ownership(value, manifest_path.parent, required=True)
         return value
     if "publication_recovery" in value:
         recovery = value["publication_recovery"]
@@ -1329,6 +1369,7 @@ def validate_gate_manifest(
             )
         ):
             raise ControlError("publication recovery changed candidate-bound evidence")
+        _manifest_cleanup_ownership(value, manifest_path.parent, required=True)
         recovery_root = Path(
             os.path.abspath(manifest_path.parent / "gate-logs/publication-recovery")
         )
@@ -1352,6 +1393,8 @@ def validate_gate_manifest(
             "gate manifest does not bind the requested base and candidate"
         )
     _validate_recorded_worktree(value.get("worktree_proof"), candidate_sha)
+    if "cleanup_ownership" in value:
+        _manifest_cleanup_ownership(value, manifest_path.parent)
     if value.get("lease_token_sha256") != (_original_lease_digest or hashlib.sha256(token.encode()).hexdigest()):
         raise ControlError("gate manifest is not bound to the active run lease")
     checks = value.get("checks")
@@ -1572,6 +1615,20 @@ def _load_publish_journal(
         or not SHA_RE.fullmatch(str(value.get("candidate_sha", "")))
     ):
         raise ControlError("publish journal has an invalid shape")
+    cleanup = value.get("cleanup_ownership")
+    cleanup_sha256 = value.get("cleanup_ownership_sha256")
+    if cleanup is not None or cleanup_sha256 is not None:
+        if (
+            not isinstance(cleanup, dict)
+            or set(cleanup) != {"evidence_dir", "worktree"}
+            or not all(
+                isinstance(cleanup.get(key), str) and cleanup[key]
+                for key in ("evidence_dir", "worktree")
+            )
+            or cleanup_sha256 != _canonical_json_sha256(cleanup)
+            or cleanup["worktree"] != value["worktree"]
+        ):
+            raise ControlError("publish journal cleanup ownership is invalid")
     if require_manifest_evidence and not _publish_journal_manifest_is_intact(value):
         raise ControlError("publish journal manifest evidence changed")
     return value
@@ -1579,7 +1636,7 @@ def _load_publish_journal(
 
 def _publication_identity(value: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(
-        value[key]
+        value.get(key)
         for key in (
             "repo",
             "remote",
@@ -1589,6 +1646,7 @@ def _publication_identity(value: dict[str, Any]) -> tuple[Any, ...]:
             "manifest_path",
             "manifest_sha256",
             "evidence_dir",
+            "cleanup_ownership_sha256",
         )
     )
 
@@ -1612,6 +1670,9 @@ def ship_candidate(
         candidate_sha=candidate_sha,
         token=token,
         branch=branch,
+    )
+    cleanup_ownership = _manifest_cleanup_ownership(
+        manifest, manifest_path.parent
     )
     if _git_status(repo, ["merge-base", "--is-ancestor", base_sha, candidate_sha]) != 0:
         raise ControlError("candidate is not a fast-forward of the captured base")
@@ -1646,6 +1707,10 @@ def ship_candidate(
             "manifest_sha256": _file_sha256(manifest_path),
             "evidence_dir": str(manifest_path.parent.resolve()),
             "worktree": manifest["worktree_proof"]["worktree"],
+            "cleanup_ownership": cleanup_ownership,
+            "cleanup_ownership_sha256": _canonical_json_sha256(
+                cleanup_ownership
+            ),
             "upstream_sha": manifest["review_proof"].get("upstream_sha"),
             "run_binding": manifest["run_binding"],
             "pr_evidence": manifest.get("pr_evidence"),
@@ -3487,6 +3552,7 @@ def run_gate(
                 for key in ("head_sha", "tree_sha", "status_porcelain")
             },
         },
+        "cleanup_ownership": _cleanup_ownership(evidence_root, cwd),
         "checks": recorded,
         "packet_sha256": _file_sha256(packet_path),
     }
@@ -3521,6 +3587,7 @@ def _validate_success_cleanup_worktree(
     """
     resolved_repo = repo.resolve()
     resolved_state = state_dir.resolve()
+    lexical_evidence = Path(os.path.abspath(evidence_dir))
     evidence_root = evidence_dir.resolve()
     lexical_cwd = Path(os.path.abspath(cwd))
     resolved_cwd = cwd.resolve()
@@ -3546,7 +3613,8 @@ def _validate_success_cleanup_worktree(
         and resolved_cwd.name == "integration"
     )
     if (
-        resolved_cwd != recorded_cwd
+        lexical_evidence != evidence_root
+        or resolved_cwd != recorded_cwd
         or lexical_cwd != resolved_cwd
         or resolved_cwd == resolved_repo
         or not (
@@ -3935,6 +4003,9 @@ def _recover_completed_gate(
                 for key in ("head_sha", "tree_sha", "status_porcelain")
             },
         },
+        "cleanup_ownership": _cleanup_ownership(
+            Path(receipt["source_evidence_dir"]), Path(before["worktree"])
+        ),
         "publication_recovery": recovery,
     }
     _atomic_json(manifest_path, result)
@@ -4174,17 +4245,30 @@ def resume_publication(
         raise ControlError("remote base moved or candidate already delivered")
     cwd = Path(original["worktree_proof"]["worktree"])
     _worktree_proof(cwd, original["candidate_sha"])
-    _validate_success_cleanup_worktree(repo, state_dir=state_dir, evidence_dir=root, cwd=cwd, recorded_worktree=cwd)
+    cleanup_ownership = _cleanup_ownership(
+        Path(receipt["source_evidence_dir"]), cwd
+    )
+    recorded_cleanup = original.get("cleanup_ownership")
+    if recorded_cleanup is not None and recorded_cleanup != cleanup_ownership:
+        raise ControlError("cleanup ownership changed from its authenticated owner")
+    _validate_success_cleanup_worktree(
+        repo,
+        state_dir=state_dir,
+        evidence_dir=Path(cleanup_ownership["evidence_dir"]),
+        cwd=cwd,
+        recorded_worktree=Path(cleanup_ownership["worktree"]),
+    )
     _revalidate_issue_request(state_dir, root, token, candidate_sha=original["candidate_sha"])
     publisher = runpy.run_path(str(Path(__file__).with_name("pr_publication.py")))
     # Write provenance before observation so a killed observer remains auditable.
     if recovered:
-        result = original
+        result = {**original, "cleanup_ownership": cleanup_ownership}
     else:
         result = {
             **original,
             "continuation": receipt,
             "lease_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+            "cleanup_ownership": cleanup_ownership,
         }
         _atomic_json(manifest_path, result)
     try:
@@ -4551,6 +4635,29 @@ def finalize_success(
         or journal["branch"] != branch
     ):
         raise ControlError("publication journal does not match success finalization")
+    cleanup_ownership = journal.get("cleanup_ownership")
+    if cleanup_ownership is None:
+        cleanup_ownership = _cleanup_ownership(
+            evidence_root, Path(journal["worktree"])
+        )
+    elif _publish_journal_manifest_is_intact(journal):
+        bound_cleanup = _manifest_cleanup_ownership(
+            _load_gate(manifest_path), evidence_root
+        )
+        if cleanup_ownership != bound_cleanup:
+            raise ControlError(
+                "publication journal cleanup ownership changed from the manifest"
+            )
+    elif manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            changed_manifest = _load_gate(manifest_path)
+        except ControlError:
+            changed_manifest = {}
+        changed_cleanup = changed_manifest.get("cleanup_ownership")
+        if changed_cleanup is not None and changed_cleanup != cleanup_ownership:
+            raise ControlError(
+                "changed manifest carries different cleanup ownership"
+            )
     base_sha = journal["base_sha"]
     candidate_sha = journal["candidate_sha"]
     if journal["phase"] == "finalized":
@@ -4599,15 +4706,15 @@ def finalize_success(
         _atomic_json(_journal_path(state_dir), journal)
     if journal["phase"] != "finalizing":
         raise ControlError("publication journal is not finalizable")
-    issue_delivery = _finalize_delivered_issue(
-        state_dir, evidence_root, journal, recovery_only=_recover_issue_close_only,
-    )
     resolved_cwd = _validate_success_cleanup_worktree(
         repo,
         state_dir=state_dir,
-        evidence_dir=evidence_root,
+        evidence_dir=Path(cleanup_ownership["evidence_dir"]),
         cwd=cwd,
-        recorded_worktree=Path(journal["worktree"]),
+        recorded_worktree=Path(cleanup_ownership["worktree"]),
+    )
+    issue_delivery = _finalize_delivered_issue(
+        state_dir, evidence_root, journal, recovery_only=_recover_issue_close_only,
     )
 
     claimed = evidence_root / "request.claimed.json"

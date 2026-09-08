@@ -152,7 +152,11 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    copying its intact original or rerunning its exact packet command when the
    original is unusable. Changed review, visual, source, packet, request,
    worktree, or owner evidence refuses reuse. After owner termination, use the
-   existing request recovery and a fresh wrapper run.
+   existing request recovery and a fresh wrapper run. A prior-owner continuation
+   carries the authenticated source evidence directory and exact worktree into
+   its recovery manifest and publication journal; finalization validates cleanup
+   against that original owner, never the fresh run root. Sibling paths,
+   symlinks, dirty worktrees and branch-attached worktrees remain refusals.
    Changed evidence/source/base is a refusal, not permission to silently rebuild.
    For future fix commits on a task-owned PR, use full gate-and-ship with
    `--expected-pr-head <verified-previous-head>`; changed source requires new review.
@@ -206,6 +210,11 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    advancing an unverified fix, but refuses a closed, foreign, retargeted or
    diverged draft. In particular, do not rewrite, replace or waive the topology
    of a retained draft whose head is not descended from the captured base.
+   A stacked issue draft whose exact head descends from a prerequisite may be
+   reclaimed after `sid/opentui` advances exactly to that prerequisite. Adopt
+   the same draft and refresh its task/base identity; do not force-push or create
+   a replacement. The new base and any changed code require fresh review, gates,
+   native evidence and current-head CI.
 8. For each user-visible category, run focused unit/contract tests and a real
    terminal smoke inline. After integration, run one category-wide adversarial
    review and the complete OpenTUI gate. The parent records command, exit code,

@@ -229,7 +229,12 @@ The existing target CAS, journal, request consumption and finalization follow.
 Prior-run source artifacts and the old failed outcome remain immutable. For a
 live owner, the original manifest, packet, and PR evidence are first retained in
 an immutable archive. The resulting `gate.json` records both the recovery
-provenance and its current lease binding.
+provenance and its current lease binding. Recovery also carries the authenticated
+source run's cleanup ownership into the fresh manifest and publication journal.
+Pre-publication and finalization checks re-prove that exact clean detached
+worktree against its original evidence directory; the fresh owner's evidence
+directory never substitutes for that owner, and sibling paths, symlinks, dirty
+or branch-attached worktrees remain refused.
 
 For a retained scheduled sync, submit a bounded `mode: resume` request through
 `submit-request`, then dispatch the existing job. The checked-in
@@ -274,6 +279,13 @@ task revision/base, expected remote head and ancestry; the leased push is a
 fast-forward-only CAS, not permission to rewrite history. A new head requires
 fresh local review/evidence and current-head CI. Legacy adoption does not grant
 permission to append fixes to PR81's historical branch.
+
+A stacked issue draft may keep the same exact candidate when the target advances
+exactly to its prerequisite. The next owner reclaims the same issue revision at
+that new captured base and adopts the same open draft; the publisher refreshes
+the task/base marker without replacing the PR, rewriting its head or weakening
+ancestry. The changed base and any changed control-plane code still require new
+candidate-bound review, gates and current-head CI.
 
 For local maintainer tests, use the canonical runner with explicit `--files`,
 `-j 1 --file-retries 0`. Inspect executed counts, not its AST estimate. On this
