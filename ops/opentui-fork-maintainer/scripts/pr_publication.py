@@ -900,15 +900,96 @@ def wait_for_review(
         time.sleep(min(REVIEW_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
 
+def _validate_resume_pr_evidence(
+    proof: Any,
+    manifest: dict[str, Any],
+    *,
+    number: int,
+    digest: str,
+    dimensions: tuple[int, int],
+    head: str,
+) -> dict[str, Any]:
+    expected = {
+        "repository": REPOSITORY,
+        "base_branch": BASE,
+        "base_sha": manifest["base_sha"],
+        "candidate_sha": manifest["candidate_sha"],
+        "head_branch": head,
+        "number": number,
+        "url": f"https://github.com/{REPOSITORY}/pull/{number}",
+        "preview_sha256": digest,
+        "preview_dimensions": list(dimensions),
+    }
+    if (
+        not isinstance(proof, dict)
+        or any(proof.get(key) != value for key, value in expected.items())
+        or not re.fullmatch(r"[0-9a-f]{64}", str(proof.get("block_sha256", "")))
+        or ATTACHMENT.fullmatch(str(proof.get("attachment_url", ""))) is None
+    ):
+        raise PublicationError(
+            "retained PR evidence does not match explicit adoption"
+        )
+    return proof
+
+
+def _bind_current_publication_attempt(
+    root: Path, manifest: dict[str, Any], proof: dict[str, Any]
+) -> None:
+    """Bind the publisher-written proof before entering interruptible observation."""
+    provenance = [
+        key
+        for key in ("continuation", "publication_recovery")
+        if isinstance(manifest.get(key), dict)
+    ]
+    if not provenance:
+        return
+    if len(provenance) != 1:
+        raise PublicationError("publication recovery provenance is ambiguous")
+    provenance_key = provenance[0]
+    receipt = manifest[provenance_key]
+    if "draft_path" not in receipt or "draft_sha256" not in receipt:
+        return
+    if "pr_path" in receipt or "pr_sha256" in receipt:
+        raise PublicationError("publication recovery evidence binding is ambiguous")
+    evidence = root / "pr-evidence.json"
+    evidence_sha256 = _hash(evidence)
+    required_hashes = {
+        "source_manifest_sha256": receipt.get("manifest_sha256"),
+        "source_packet_sha256": receipt.get("packet_sha256"),
+        "source_draft_sha256": receipt.get("draft_sha256"),
+        "authorization_sha256": receipt.get("authorization_sha256"),
+        "run_binding_sha256": receipt.get("run_binding_sha256"),
+    }
+    if not all(
+        isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+        for value in required_hashes.values()
+    ):
+        raise PublicationError("publication recovery identity is incomplete")
+    manifest["publication_attempt"] = {
+        "schema_version": 1,
+        "evidence_path": str(evidence),
+        "evidence_sha256": evidence_sha256,
+        "provenance": provenance_key,
+        "source_owner": receipt.get("source_owner"),
+        **required_hashes,
+        "number": proof["number"],
+        "base_sha": proof["base_sha"],
+        "candidate_sha": proof["candidate_sha"],
+    }
+    _write(root / "gate.json", json.dumps(manifest, indent=2) + "\n")
+
+
 def resume_preview(
     root: Path, source: Path, manifest: dict[str, Any], *,
     number: int, deadline_unix: int,
     publication_source: Path | None = None,
     publication_sha256: str | None = None,
+    publication_root: Path | None = None,
     repo: Path | None = None,
     node: Path | None = None,
     remote: str = "origin",
     issue_request: dict[str, Any] | None = None,
+    _attempt_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resume an explicitly adopted PR without pushing its head or creating a PR.
 
@@ -937,10 +1018,11 @@ def resume_preview(
             f"from `{manifest['base_sha']}`."
         )
     publication_path = publication_source or source.parent / "pr-evidence.json"
+    publication_evidence_root = (publication_root or source.parent).resolve()
     if (
         publication_path.is_symlink()
         or not publication_path.is_file()
-        or not publication_path.resolve().is_relative_to(source.parent.resolve())
+        or not publication_path.resolve().is_relative_to(publication_evidence_root)
         or publication_path.name not in {"pr-evidence.json", "pr-draft.json"}
         or (
             publication_sha256 is not None
@@ -1008,16 +1090,16 @@ def resume_preview(
             issue_request=issue_request,
             _existing_draft=publication,
             _preview_root=manifest_root,
+            _attempt_manifest=_attempt_manifest,
         )
-    expected = {
-        "repository": REPOSITORY, "base_branch": BASE,
-        "base_sha": manifest["base_sha"], "candidate_sha": manifest["candidate_sha"],
-        "head_branch": head, "number": number,
-        "url": f"https://github.com/{REPOSITORY}/pull/{number}",
-        "preview_sha256": digest, "preview_dimensions": list(dimensions),
-    }
-    if any(proof.get(key) != value for key, value in expected.items()):
-        raise PublicationError("retained PR evidence does not match explicit adoption")
+    proof = _validate_resume_pr_evidence(
+        proof,
+        manifest,
+        number=number,
+        digest=digest,
+        dimensions=dimensions,
+        head=head,
+    )
     review = wait_for_review(
         root, number, manifest["candidate_sha"], deadline_unix=deadline_unix,
         expected_pr_evidence={
@@ -1524,6 +1606,7 @@ def publish_preview(
     issue_request: dict[str, Any] | None = None,
     _existing_draft: dict[str, Any] | None = None,
     _preview_root: Path | None = None,
+    _attempt_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Idempotently create the candidate PR and attach one proven synthetic PNG.
 
@@ -1845,6 +1928,9 @@ def publish_preview(
         "issue": issue,
     }
     _write(root / "pr-evidence.json", json.dumps(proof, indent=2) + "\n")
+    _bind_current_publication_attempt(
+        root, _attempt_manifest or manifest, proof
+    )
     proof["review"] = wait_for_review(
         root,
         pr["number"],

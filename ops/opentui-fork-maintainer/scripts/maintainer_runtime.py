@@ -3715,6 +3715,64 @@ def _publication_receipt_key(receipt: dict[str, Any]) -> str:
     return present[0]
 
 
+def _publication_observation_artifact(
+    manifest: dict[str, Any],
+    receipt: dict[str, Any],
+    root: Path,
+    *,
+    number: int,
+) -> tuple[Path, str, bool]:
+    """Select only a manifest-bound current attempt for observation-only retry."""
+    publication_key = _publication_receipt_key(receipt)
+    attempt = manifest.get("publication_attempt")
+    current_path = root / "pr-evidence.json"
+    if attempt is None:
+        if publication_key == "draft" and (
+            current_path.exists() or current_path.is_symlink()
+        ):
+            raise ControlError(
+                "current-attempt PR evidence is present without a manifest binding"
+            )
+        return (
+            Path(receipt[f"{publication_key}_path"]),
+            receipt[f"{publication_key}_sha256"],
+            False,
+        )
+    provenance = (
+        "publication_recovery"
+        if isinstance(manifest.get("publication_recovery"), dict)
+        else "continuation"
+    )
+    expected = {
+        "schema_version": 1,
+        "evidence_path": str(current_path),
+        "provenance": provenance,
+        "source_owner": receipt.get("source_owner"),
+        "source_manifest_sha256": receipt.get("manifest_sha256"),
+        "source_packet_sha256": receipt.get("packet_sha256"),
+        "source_draft_sha256": receipt.get("draft_sha256"),
+        "authorization_sha256": receipt.get("authorization_sha256"),
+        "run_binding_sha256": _canonical_json_sha256(manifest.get("run_binding")),
+        "number": number,
+        "base_sha": manifest.get("base_sha"),
+        "candidate_sha": manifest.get("candidate_sha"),
+    }
+    if (
+        publication_key != "draft"
+        or not isinstance(attempt, dict)
+        or set(attempt) != {*expected, "evidence_sha256"}
+        or any(attempt.get(key) != value for key, value in expected.items())
+        or not SHA256_RE.fullmatch(str(attempt.get("evidence_sha256", "")))
+    ):
+        raise ControlError("current-attempt publication binding is invalid")
+    evidence = _evidence_path(
+        attempt["evidence_path"], root, label="current-attempt PR evidence"
+    )
+    if evidence != current_path or _file_sha256(evidence) != attempt["evidence_sha256"]:
+        raise ControlError("current-attempt PR evidence changed")
+    return evidence, attempt["evidence_sha256"], True
+
+
 def _publication_recovery_source(
     repo: Path,
     receipt: dict[str, Any],
@@ -4182,7 +4240,42 @@ def resume_publication(
             if isinstance(retry_manifest, dict)
             else None
         )
-        if (
+        retry_attempt_present = (
+            isinstance(retry_manifest, dict)
+            and "publication_attempt" in retry_manifest
+        )
+        if retry_attempt_present:
+            retry_provenance = (
+                retry_manifest.get("publication_recovery")
+                if isinstance(retry_manifest.get("publication_recovery"), dict)
+                else retry_manifest.get("continuation")
+            )
+            if not isinstance(retry_provenance, dict):
+                raise ControlError("current-attempt publication provenance is invalid")
+            if any(
+                retry_provenance.get(key) != value
+                for key, value in receipt.items()
+            ):
+                raise ControlError(
+                    "publication retry differs from its retained source"
+                )
+            if (
+                retry_provenance.get("authorization_sha256")
+                != authorization_sha256
+                or retry_provenance.get("run_binding_sha256")
+                != _canonical_json_sha256(current)
+            ):
+                raise ControlError("publication request authorization changed")
+            original = validate_gate_manifest(
+                repo,
+                manifest_path,
+                base_sha=retry_manifest.get("base_sha"),
+                candidate_sha=retry_manifest.get("candidate_sha"),
+                token=token,
+            )
+            receipt = dict(retry_provenance)
+            recovered = True
+        elif (
             isinstance(retry_recovery, dict)
             and retry_recovery.get("source_owner") == "terminal-prior-owner"
         ):
@@ -4268,6 +4361,7 @@ def resume_publication(
                 )
                 recovered = True
     receipt["authorization_sha256"] = _canonical_json_sha256(request)
+    receipt["run_binding_sha256"] = _canonical_json_sha256(current)
     binding = original["run_binding"]
     # New upstream arrivals do not invalidate an unchanged scheduled candidate.
     # Requests, approval revisions, captured base and the watermark still must match.
@@ -4308,25 +4402,32 @@ def resume_publication(
         }
         _atomic_json(manifest_path, result)
     try:
-        publication_key = _publication_receipt_key(receipt)
+        publication_source, publication_sha256, observation_only = (
+            _publication_observation_artifact(
+                result, receipt, root, number=number
+            )
+        )
         proof = publisher["resume_preview"](
             root,
             source,
             preview_manifest,
             number=number,
             deadline_unix=deadline,
-            publication_source=Path(receipt[f"{publication_key}_path"]),
-            publication_sha256=receipt[f"{publication_key}_sha256"],
+            publication_source=publication_source,
+            publication_sha256=publication_sha256,
+            publication_root=root if observation_only else None,
             repo=repo,
             node=NODE26,
             remote=remote,
             issue_request=issue_request,
+            _attempt_manifest=result,
         )
     except (RuntimeError, ValueError, KeyError, OSError) as exc:
         raise ControlError(f"PR continuation refused: {exc}") from exc
     validate_lease(state_dir, token)
     _validate_publication_authorization(result, state_dir, root, token)
     _revalidate_issue_request(state_dir, root, token, candidate_sha=original["candidate_sha"], expected_pr=proof)
+    result.pop("publication_attempt", None)
     result["pr_evidence"] = proof
     _atomic_json(manifest_path, result)
     ship_candidate(repo, manifest_path, state_dir=state_dir, base_sha=original["base_sha"],

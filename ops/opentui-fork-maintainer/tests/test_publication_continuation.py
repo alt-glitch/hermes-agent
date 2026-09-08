@@ -362,11 +362,68 @@ def test_draft_recovery_refuses_marker_removed_between_views(retained, monkeypat
     )
 
 
-def test_missing_publication_evidence_retry_keeps_review_and_media(
-    retained, monkeypatch
+@pytest.mark.parametrize("owner", ["live-owner", "terminal-prior-owner"])
+@pytest.mark.parametrize("regenerate_local", [False, True])
+def test_missing_publication_evidence_retry_keeps_review_media_and_upload(
+    retained, monkeypatch, owner, regenerate_local
 ):
     f = retained
     remove_publication_evidence(f)
+    args = f["args"]
+    evidence_root = f["fresh"]
+    if owner == "live-owner":
+        f["pr"]["body"] = f["pr"]["body"].replace(
+            f"<!-- maintainer-preview:{'f' * 40}:",
+            f"<!-- maintainer-preview:{f['candidate']}:",
+        )
+        write_json(
+            f["state"] / "run.lease.json",
+            {
+                "token": "test-token",
+                "expires_unix": 4_000_000_000,
+                "max_expires_unix": 4_000_000_000,
+                "run_id": f["old"].name,
+                "evidence_dir": str(f["old"]),
+                "captured_base": f["base"],
+                "captured_upstream": f["base"],
+                "run_context_sha256": runtime._file_sha256(
+                    f["old"] / "run-context.json"
+                ),
+            },
+        )
+        args = [
+            "resume-publication",
+            "--repo",
+            str(f["repo"]),
+            "--state",
+            str(f["state"]),
+            "--token",
+            "test-token",
+            "--source-manifest",
+            str(f["source"]),
+            "--source-sha256",
+            runtime._file_sha256(f["source"]),
+            "--packet-sha256",
+            runtime._file_sha256(f["old"] / "gate-packet.json"),
+            "--source-packet",
+            str(f["old"] / "gate-packet.json"),
+            "--adopt-pr",
+            "42",
+            "--manifest",
+            str(f["source"]),
+        ]
+        evidence_root = f["old"]
+    executions = []
+    if regenerate_local:
+        (f["old"] / "gate-logs/focused-contracts.log").write_text(
+            "interrupted local evidence\n", encoding="utf-8"
+        )
+
+        def execute(gate_id, _argv, output, _cwd):
+            executions.append(gate_id)
+            output.write_text("1 passed in 0.01s\n", encoding="utf-8")
+
+        monkeypatch.setattr(runtime, "_execute_recovery_gate", execute)
     retained_proof = {
         gate_id: (f["old"] / "gate-logs" / f"{gate_id}.log").read_bytes()
         for gate_id in ("adversarial-review", "termctrl-smoke", "video-analysis")
@@ -381,17 +438,84 @@ def test_missing_publication_evidence_retry_keeps_review_and_media(
     )
 
     with pytest.raises(runtime.ControlError, match="API observation interrupted"):
-        runtime.main(f["args"])
+        runtime.main(args)
 
     assert remote_sha(f["repo"]) == f["base"]
-    assert (f["fresh"] / "pr-evidence.json").is_file()
+    proof_path = evidence_root / "pr-evidence.json"
+    assert proof_path.is_file()
+    first = runtime._load_gate(evidence_root / "gate.json")
+    attempt = first["publication_attempt"]
+    assert attempt["evidence_path"] == str(proof_path)
+    assert attempt["evidence_sha256"] == runtime._file_sha256(proof_path)
+
+    def uploads():
+        return sum(
+            call[:3] == [str(pub.GH), "pr", "edit"] and "--attach" in call
+            for call in f["calls"]
+        )
+
+    assert uploads() == 1
+    assert executions == (["focused-contracts"] if regenerate_local else [])
     monkeypatch.setattr(pub, "wait_for_review", observe)
-    assert runtime.main(f["args"]) == 0
+    assert runtime.main(args) == 0
     assert remote_sha(f["repo"]) == f["candidate"]
+    assert uploads() == 1
+    assert executions == (["focused-contracts"] if regenerate_local else [])
+    assert "publication_attempt" not in runtime._load_gate(
+        evidence_root / "gate.json"
+    )
+    with pytest.raises(runtime.ControlError, match="lease"):
+        runtime.main(args)
+    assert uploads() == 1
     assert retained_proof == {
         gate_id: (f["old"] / "gate-logs" / f"{gate_id}.log").read_bytes()
         for gate_id in retained_proof
     }
+
+
+@pytest.mark.parametrize("mutation", ["proof", "body", "head", "authorization"])
+def test_missing_publication_retry_refuses_changed_attempt_or_live_pr(
+    retained, monkeypatch, mutation
+):
+    f = retained
+    remove_publication_evidence(f)
+    observe = pub.wait_for_review
+    monkeypatch.setattr(
+        pub,
+        "wait_for_review",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            pub.PublicationError("API observation interrupted")
+        ),
+    )
+    with pytest.raises(runtime.ControlError, match="API observation interrupted"):
+        runtime.main(f["args"])
+
+    if mutation == "proof":
+        proof_path = f["fresh"] / "pr-evidence.json"
+        proof = runtime._load_gate(proof_path)
+        proof["review"] = {"candidate_sha": f["candidate"], "approved": True}
+        write_json(proof_path, proof)
+    elif mutation == "body":
+        f["pr"]["body"] = "publication ownership removed"
+    elif mutation == "head":
+        f["pr"]["headRefOid"] = f["base"]
+    else:
+        changed = {"mode": "backport", "commits": [f["base"]]}
+        write_json(f["fresh"] / "request.claimed.json", changed)
+        write_json(f["state"] / "run-request.inflight.json", changed)
+
+    monkeypatch.setattr(pub, "wait_for_review", observe)
+    with pytest.raises(
+        runtime.ControlError, match="publication|PR continuation|authorization"
+    ):
+        runtime.main(f["args"])
+
+    assert remote_sha(f["repo"]) == f["base"]
+    assert not (f["state"] / "publish-journal.json").exists()
+    assert sum(
+        call[:3] == [str(pub.GH), "pr", "edit"] and "--attach" in call
+        for call in f["calls"]
+    ) == 1
 
 
 @pytest.mark.parametrize("ci_state", ["failed", "pending"])
@@ -428,6 +552,19 @@ def test_missing_publication_evidence_does_not_approve_non_green_ci(
     assert not (f["state"] / "publish-journal.json").exists()
     proof = runtime._load_gate(f["fresh"] / "pr-evidence.json")
     assert "review" not in proof
+    assert "publication_attempt" in runtime._load_gate(f["fresh"] / "gate.json")
+    assert sum(
+        call[:3] == [str(pub.GH), "pr", "edit"] and "--attach" in call
+        for call in f["calls"]
+    ) == 1
+
+    monkeypatch.setattr(pub, "candidate_checks", lambda *_args: green_checks())
+    assert runtime.main(f["args"]) == 0
+    assert remote_sha(f["repo"]) == f["candidate"]
+    assert sum(
+        call[:3] == [str(pub.GH), "pr", "edit"] and "--attach" in call
+        for call in f["calls"]
+    ) == 1
 
 
 @pytest.mark.parametrize(
