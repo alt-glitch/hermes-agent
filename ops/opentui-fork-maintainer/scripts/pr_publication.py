@@ -691,26 +691,36 @@ def require_review_disposition(
         or value.get("repository") != REPOSITORY
         or value.get("number") != observations["number"]
         or value.get("candidate_sha") != observations["candidate_sha"]
-        or value.get("observations_sha256") != observations["observations_sha256"]
+        or not isinstance(value.get("observations_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["observations_sha256"])
         or not isinstance(items, list)
     ):
         raise PublicationError("PR review disposition does not bind current evidence")
     by_key: dict[str, dict[str, Any]] = {}
     for item in items:
+        key = item.get("key") if isinstance(item, dict) else None
+        evidence_sha256 = (
+            item.get("evidence_sha256") if isinstance(item, dict) else None
+        )
         if (
             not isinstance(item, dict)
             or set(item) != {"key", "evidence_sha256", "decision", "evidence"}
-            or item.get("key") in by_key
-            or item.get("key") not in required
-            or item.get("evidence_sha256")
-            != required[item["key"]]["evidence_sha256"]
+            or not isinstance(key, str)
+            or not key
+            or key in by_key
+            or not isinstance(evidence_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", evidence_sha256)
+            or (
+                key in required
+                and evidence_sha256 != required[key]["evidence_sha256"]
+            )
             or item.get("decision") not in {"resolved", "refuted", "irrelevant"}
             or not isinstance(item.get("evidence"), str)
             or not 1 <= len(item["evidence"].strip()) <= 2_000
         ):
             raise PublicationError("PR review disposition item is invalid")
-        by_key[item["key"]] = item
-    if set(by_key) != set(required):
+        by_key[key] = item
+    if not set(required).issubset(by_key):
         raise PublicationError("PR review disposition is incomplete")
     digest = _hash(path)
     if snapshot_name is not None:

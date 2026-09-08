@@ -169,11 +169,14 @@ Every owned-head update and final review observation collects
 reviews, and all failed CheckRun and status attempts for the relevant heads.
 Bodies are retained completely as untrusted evidence, never authorization. If any item requires
 attention, the parent writes `pr-review-disposition.json` with the exact
-candidate and observation hash plus one `resolved`, `refuted` or `irrelevant`
-decision and evidence note per item key/hash. Missing, partial, stale or tampered
-dispositions block the update or target delivery even when the latest CI rollup
-is green. Editing or adding a comment changes the observation hash and requires
-a fresh disposition; detailed output stays in the run evidence directory.
+candidate plus one `resolved`, `refuted` or `irrelevant` decision and evidence
+note per item key/hash. Its observation hash records the snapshot the parent
+inspected; dispositions may be reused by later observation snapshots for the
+same candidate only when every currently required key has the identical evidence
+hash. Historical entries remain in the file as an auditable superset. Missing,
+edited, new, duplicate, malformed or tampered items block the update or target
+delivery even when the latest CI rollup is green; disposition text never grants
+publication authority. Detailed output stays in the run evidence directory.
 
 For a diagnosed video-only failure on unchanged source, `gate-and-ship` accepts
 `--reuse-manifest <prior-attempt>/gate.json --reuse-sha256 <exact-SHA256>`.

@@ -120,7 +120,8 @@ class Github:
             if argv[2] == "graphql":
                 if "--paginate" in argv:
                     return json.dumps([{"data": {"repository": {"object": {
-                        "oid": "a" * 40, "statusCheckRollup": {"contexts": {
+                        "oid": self.pr["headRefOid"],
+                        "statusCheckRollup": {"contexts": {
                             "nodes": self.pr["statusCheckRollup"],
                         }},
                     }}}}])
@@ -742,6 +743,165 @@ def test_compatible_existing_issue_draft_is_adopted_without_replacement(
     assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
 
 
+def test_fix_cycle_reuses_unchanged_item_disposition_across_head_snapshots(
+    capture, github, monkeypatch
+) -> None:
+    bind_issue(capture)
+    draft = pub.publish_draft(
+        capture[0].parent,
+        capture[0],
+        capture[1],
+        pending_gates=["candidate verification"],
+    )
+    github.issue_comments = [
+        {
+            "id": 101,
+            "user": {"login": "github-actions"},
+            "body": "Automated review found a release-blocking defect.",
+            "created_at": "2026-09-07T10:00:00Z",
+            "updated_at": "2026-09-07T10:00:00Z",
+            "html_url": "https://example.invalid/general",
+        }
+    ]
+    expected = capture[1]["candidate_sha"]
+    candidate = "c" * 40
+    github.ref = expected + "\trefs/heads/" + draft["head_branch"]
+    transport = github.run
+
+    def routed_transport(argv, cwd):
+        result = transport(argv, cwd)
+        if argv[:2] == ["git", "push"]:
+            github.pr["headRefOid"] = candidate
+        return result
+
+    monkeypatch.setattr(pub, "_run", routed_transport)
+    capture[1]["candidate_sha"] = candidate
+    capture[1]["expected_pr_head"] = expected
+
+    with pytest.raises(pub.PublicationError, match="parent disposition"):
+        publish(capture)
+    pre_advance = json.loads(
+        (capture[0] / "pr-review-surfaces.json").read_text(encoding="utf-8")
+    )
+    assert pre_advance["observed_heads"] == [expected]
+    write_review_disposition(capture[0], pre_advance)
+    disposition_sha256 = digest(capture[0] / "pr-review-disposition.json")
+
+    proof = publish(capture)
+
+    final = json.loads(
+        (capture[0] / "pr-review-surfaces.json").read_text(encoding="utf-8")
+    )
+    assert final["observed_heads"] == [expected, candidate]
+    assert final["observations_sha256"] != pre_advance["observations_sha256"]
+    assert proof["review"]["review_disposition_sha256"] == disposition_sha256
+    assert github.pr["headRefOid"] == candidate
+    disposition_path = capture[0] / "pr-review-disposition.json"
+    disposition = json.loads(disposition_path.read_text(encoding="utf-8"))
+    disposition["dispositions"].append(disposition["dispositions"][0])
+    disposition_path.write_text(json.dumps(disposition), encoding="utf-8")
+    with pytest.raises(pub.PublicationError, match="disposition item is invalid"):
+        pub.require_review_disposition(capture[0], final)
+
+
+def test_fix_cycle_refuses_later_bot_edit_and_resumes_same_candidate(
+    capture, github, monkeypatch
+) -> None:
+    bind_issue(capture)
+    draft = pub.publish_draft(
+        capture[0].parent,
+        capture[0],
+        capture[1],
+        pending_gates=["candidate verification"],
+    )
+    github.issue_comments = [
+        {
+            "id": 101,
+            "user": {"login": "github-actions"},
+            "body": "Automated review is pending a fix.",
+            "created_at": "2026-09-07T10:00:00Z",
+            "updated_at": "2026-09-07T10:00:00Z",
+            "html_url": "https://example.invalid/general",
+        }
+    ]
+    expected = capture[1]["candidate_sha"]
+    candidate = "c" * 40
+    github.ref = expected + "\trefs/heads/" + draft["head_branch"]
+    transport = github.run
+    edit_after_push = True
+
+    def routed_transport(argv, cwd):
+        nonlocal edit_after_push
+        result = transport(argv, cwd)
+        if argv[:2] == ["git", "push"]:
+            github.pr["headRefOid"] = candidate
+            if edit_after_push:
+                edit_after_push = False
+                github.issue_comments[0].update(
+                    body="Automated review found a new defect in the fix.",
+                    updated_at="2026-09-07T10:05:00Z",
+                )
+                github.statuses[candidate] = [
+                    {
+                        "id": 501,
+                        "context": "historical candidate attempt",
+                        "state": "failure",
+                        "description": "The first candidate attempt failed.",
+                        "creator": {"login": "github-actions"},
+                        "target_url": "https://example.invalid/status/501",
+                        "created_at": "2026-09-07T10:04:00Z",
+                        "updated_at": "2026-09-07T10:04:00Z",
+                    }
+                ]
+        return result
+
+    monkeypatch.setattr(pub, "_run", routed_transport)
+    capture[1]["candidate_sha"] = candidate
+    capture[1]["expected_pr_head"] = expected
+
+    with pytest.raises(pub.PublicationError, match="parent disposition"):
+        publish(capture)
+    first = json.loads(
+        (capture[0] / "pr-review-surfaces.json").read_text(encoding="utf-8")
+    )
+    write_review_disposition(capture[0], first)
+
+    with pytest.raises(pub.PublicationError, match="disposition item is invalid"):
+        publish(capture)
+
+    retained = json.loads(
+        (capture[0] / "pr-evidence.json").read_text(encoding="utf-8")
+    )
+    assert retained["candidate_sha"] == candidate
+    assert "review" not in retained
+    assert github.pr["headRefOid"] == candidate
+    later = json.loads(
+        (capture[0] / "pr-review-surfaces.json").read_text(encoding="utf-8")
+    )
+    assert later["observed_heads"] == [expected, candidate]
+    assert sum(len(items) for items in later["surfaces"].values()) == 2
+    write_review_disposition(capture[0], later)
+    disposition_sha256 = digest(capture[0] / "pr-review-disposition.json")
+
+    proof = publish(capture)
+
+    assert proof["number"] == draft["number"]
+    assert proof["review"]["review_disposition_sha256"] == disposition_sha256
+    retained_disposition = json.loads(
+        (capture[0] / "pr-review-disposition.json").read_text(encoding="utf-8")
+    )
+    assert retained_disposition["observations_sha256"] == later["observations_sha256"]
+    assert len(retained_disposition["dispositions"]) == 2
+    final = json.loads(
+        (capture[0] / "pr-review-surfaces.json").read_text(encoding="utf-8")
+    )
+    assert final["surfaces"]["failed_statuses"] == later["surfaces"]["failed_statuses"]
+    assert sum(call[:2] == ["git", "push"] for call in github.calls) == 2
+    assert sum(
+        len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
+    ) == 1
+
+
 def test_all_review_surfaces_and_original_failures_need_parent_disposition(
     capture, github
 ):
@@ -872,7 +1032,7 @@ def test_all_review_surfaces_and_original_failures_need_parent_disposition(
         "Please fix the retry report and add a behavioral contract before delivery."
     )
     github.issue_comments[0]["updated_at"] = "2026-09-07T10:05:00Z"
-    with pytest.raises(pub.PublicationError, match="does not bind current evidence"):
+    with pytest.raises(pub.PublicationError, match="disposition item is invalid"):
         publish(capture)
     observations = json.loads(
         (capture[0] / "pr-review-surfaces.json").read_text(encoding="utf-8")
