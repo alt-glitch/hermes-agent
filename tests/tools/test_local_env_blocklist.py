@@ -8,6 +8,7 @@ See: https://github.com/NousResearch/hermes-agent/issues/1002
 See: https://github.com/NousResearch/hermes-agent/issues/1264
 """
 
+import io
 import os
 import subprocess
 import sys
@@ -945,7 +946,7 @@ class TestPythonpathSelectiveStrip:
         assert "/home/user/my-lib" in entries
 
     @pytest.mark.parametrize("same_env", [True, False])
-    def test_execute_code_composition_strips_inherited_hermes_entries(self, same_env):
+    def test_execute_code_composition_strips_inherited_hermes_entries(self, same_env, request):
         """Integration: execute_code's real spawn path composes a clean PYTHONPATH.
 
         Seeds a contaminated inherited PYTHONPATH (Hermes repo root + Hermes
@@ -962,6 +963,9 @@ class TestPythonpathSelectiveStrip:
         """
         import tools.code_execution_tool as cet
         from tools.code_execution_tool import execute_code
+        from tools.code_kernel import shutdown_all_kernels
+
+        request.addfinalizer(shutdown_all_kernels)
 
         def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
             return '{"output": "mock", "exit_code": 0}'
@@ -976,8 +980,9 @@ class TestPythonpathSelectiveStrip:
             captured["env"] = kwargs.get("env", {})
             captured["staging"] = os.path.dirname(cmd[1])
             proc = MagicMock()
-            proc.stdout.read.return_value = b""
-            proc.stderr.read.return_value = b""
+            proc.stdin = io.BytesIO()
+            proc.stdout = io.BytesIO()
+            proc.stderr = io.BytesIO()
             proc.wait.return_value = 0
             proc.returncode = 0
             proc.poll.return_value = 0
