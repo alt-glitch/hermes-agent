@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -1876,7 +1877,14 @@ def install_success_mocks(
                 visible += b"Available Commands\n"
             return subprocess.CompletedProcess(argv, 0, visible, b"")
         if "--out" in argv:
-            Path(argv[argv.index("--out") + 1]).write_bytes(argv[0].encode())
+            output = Path(argv[argv.index("--out") + 1])
+            if argv[0] == "save" and "png" in argv:
+                output.write_bytes(
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                    + struct.pack(">II", 1200, 800)
+                )
+            else:
+                output.write_bytes(argv[0].encode())
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     def fake_reviewer(

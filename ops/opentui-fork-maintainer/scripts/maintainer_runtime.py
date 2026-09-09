@@ -876,6 +876,25 @@ def _valid_run_binding(value: Any) -> bool:
     return _issue_workflow().valid_issue_binding(value, common)
 
 
+def _run_context_matches_captured_upstream(
+    run_binding: Any, context: dict[str, Any]
+) -> bool:
+    """Match normal owners exactly and the pinned retained sync by its grant."""
+    if not isinstance(run_binding, dict):
+        return False
+    captured = run_binding.get("captured_upstream")
+    wrapper_upstream = context.get("upstream_sha")
+    if captured == wrapper_upstream:
+        return True
+    retained = run_binding.get("retained_sync")
+    return (
+        run_binding.get("mode") == "repair"
+        and SHA_RE.fullmatch(str(wrapper_upstream)) is not None
+        and _retained_sync().valid_binding(retained)
+        and captured == retained["upstream_sha"]
+    )
+
+
 def _retained_pr_reconciliation(
     run_binding: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -2628,13 +2647,6 @@ def _review_scope(
                 "retained sync repair does not preserve its authenticated "
                 "source and repair history"
             )
-        return {
-            "mode": "retained-sync-repair",
-            "ranges": [("candidate", base_sha, candidate_sha)],
-            "upstream_sha": retained_sync["upstream_sha"],
-            "merge_commit": first,
-            "synthetic_merge_tree": None,
-        }
     upstream_sha = parents[1]
     if expected_mode == "scheduled":
         if not isinstance(captured_upstream, str) or not SHA_RE.fullmatch(
@@ -2673,7 +2685,11 @@ def _review_scope(
             )
     synthetic_tree = _synthetic_merge_tree(repo, base_sha, upstream_sha)
     return {
-        "mode": "upstream-merge",
+        "mode": (
+            "retained-sync-repair"
+            if retained_sync is not None
+            else "upstream-merge"
+        ),
         "ranges": [
             ("conflict-resolution", synthetic_tree, first),
             ("post-merge-adaptation", first, candidate_sha),
@@ -2931,15 +2947,24 @@ def run_adversarial_review(
     stdout_parts: list[bytes] = []
     stderr_parts: list[bytes] = []
     prompt_hashes: list[str] = []
-    review_boundary = (
-        "The bounded input covers the complete captured-base-to-candidate diff; no retained PR history is excluded as trusted upstream.\n"
-        if scope["mode"] in {
-            "linear-candidate",
-            "retained-pr-reconciliation",
-            "retained-sync-repair",
-        }
-        else "Trusted upstream commits are not reproduced here. The runtime proved the exact merge topology and derived the conflict-resolution baseline with git merge-tree.\n"
-    )
+    if scope["mode"] == "retained-sync-repair":
+        review_boundary = (
+            "Trusted upstream commits are not reproduced here. The runtime re-proved "
+            "the authenticated scheduled merge against canonical upstream, derived "
+            "its conflict-resolution baseline with git merge-tree, and included every "
+            "linear post-merge change through the repair candidate.\n"
+        )
+    elif scope["mode"] in {"linear-candidate", "retained-pr-reconciliation"}:
+        review_boundary = (
+            "The bounded input covers the complete captured-base-to-candidate diff; "
+            "no retained PR history is excluded as trusted upstream.\n"
+        )
+    else:
+        review_boundary = (
+            "Trusted upstream commits are not reproduced here. The runtime proved the "
+            "exact merge topology and derived the conflict-resolution baseline with "
+            "git merge-tree.\n"
+        )
     for index, chunk in enumerate(chunks, start=1):
         prompt = (
             (
@@ -2985,7 +3010,7 @@ def run_adversarial_review(
     range_guidance = (
         "Ranges and chunks are ordered and together cover the complete captured-base-to-candidate diff. A later slice may repair an earlier finding.\n"
         if scope["mode"] in {"linear-candidate", "retained-pr-reconciliation"}
-        else "Ranges and chunks are ordered. The conflict-resolution range compares a synthetic conflicted merge tree to the resolved merge commit: lines prefixed '-' are removed from the resolved candidate and MUST NOT be reported as retained conflict markers or live code. A later fork-adaptation slice may repair an earlier finding.\n"
+        else "Ranges and chunks are ordered. The conflict-resolution range compares a synthetic conflicted merge tree to the resolved merge commit: lines prefixed '-' are removed from the resolved candidate and MUST NOT be reported as retained conflict markers or live code. The post-merge range includes every linear change after that merge through the candidate, including retained adaptations and later repairs; a later slice may repair an earlier finding.\n"
     )
     synthesis = (
         "Issue the final release verdict for the complete ordered fork sync delta.\n"
@@ -3838,7 +3863,9 @@ def validate_retained_gate(
     original = _load_gate(source)
     if (
         original.get("base_sha") != context.get("base_sha")
-        or original.get("run_binding", {}).get("captured_upstream") != context.get("upstream_sha")
+        or not _run_context_matches_captured_upstream(
+            original.get("run_binding"), context
+        )
         or not SHA256_RE.fullmatch(str(context.get("lease_token_sha256", "")))
     ):
         raise ControlError("original context and gate binding differ")
@@ -4005,8 +4032,9 @@ def _publication_recovery_source(
         original.get("schema_version") != GATE_SCHEMA_VERSION
         or original.get("branch") != BRANCH
         or original.get("base_sha") != context.get("base_sha")
-        or original.get("run_binding", {}).get("captured_upstream")
-        != context.get("upstream_sha")
+        or not _run_context_matches_captured_upstream(
+            original.get("run_binding"), context
+        )
         or original.get("lease_token_sha256") != context.get("lease_token_sha256")
         or not _valid_run_binding(original.get("run_binding"))
         or not isinstance(items, list)

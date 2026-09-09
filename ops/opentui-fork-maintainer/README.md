@@ -344,12 +344,18 @@ The request is rejected unless the historical files still hash and describe
 the exact terminal unpublished scheduled owner, PR branch, base, source merge,
 upstream and prior watermark. The fresh candidate must contain source head
 `a4ba79d9` and retained local repair `b14ab20f` on the preserved first-parent
-chain with no additional merge. Publication reuses PR95 through the normal
-expected-head preflight, runs all candidate-bound gates anew, waits for required
-current-head CI, then advances the target under the existing ship lock. The old
-run outcome and lease evidence remain read-only. Do not submit this request or
-deploy from an active maintainer parent; the coordinator owns the paused,
-reviewed cutover.
+chain with no additional merge. Its review rechecks that the pinned upstream is
+still canonical, compares the synthetic merge tree with the preserved merge,
+then covers every linear post-merge adaptation and repair through the candidate;
+the trusted upstream history itself is not expanded into the reviewer prompt.
+Publication reuses PR95 through the normal expected-head preflight, runs all
+candidate-bound gates anew, waits for required current-head CI, then advances
+the target under the existing ship lock. A same-owner observation retry may
+have a newer wrapper-captured upstream, but the repair binding remains the exact
+authenticated upstream pin and every request/evidence hash and current lease is
+revalidated. The old run outcome and lease evidence remain read-only. Do not
+submit this request or deploy from an active maintainer parent; the coordinator
+owns the paused, reviewed cutover.
 
 A stacked issue draft may keep the same exact candidate when the target advances
 exactly to its prerequisite. The next owner reclaims the same issue revision at

@@ -37,7 +37,11 @@ to edit historical evidence or substitute another run.
    target is still `e55bce4`. Verify `b14ab20f` is a first-parent-linear
    descendant of `a4ba79d9`; incorporate the reviewed validator commit as a
    further linear repair rather than rebuilding the upstream merge.
-6. Publish only through the existing `gate-and-ship` caller with PR95's exact
+6. Require the retained review boundary to re-prove `9e6c4100` on canonical
+   upstream, review the synthetic merge-tree-to-`40e6b5d5` conflict-resolution
+   delta, then every linear post-merge change through the candidate. Do not
+   expand canonical upstream history into the reviewer input.
+7. Publish only through the existing `gate-and-ship` caller with PR95's exact
    current head as `--expected-pr-head`. All candidate gates, independent
    review, media and current-head required CI must be fresh.
 
