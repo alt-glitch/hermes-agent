@@ -370,6 +370,59 @@ def test_continuation_delivers_once_without_rewriting_original(retained):
     assert all(call[1] in {"pr", "api"} for call in f["calls"])
 
 
+def test_recovery_copy_swap_is_refused_at_final_ship_boundary(retained, monkeypatch):
+    f = retained
+    (f["old"] / "gate-logs/focused-contracts.log").write_text(
+        "interrupted local evidence\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_execute_recovery_gate",
+        lambda _gate_id, _argv, output, _cwd: output.write_text(
+            "1 passed in 0.01s\n", encoding="utf-8"
+        ),
+    )
+    source = f["old"] / "gate-logs/opentui-install.log"
+    source_hash = next(
+        check["output_sha256"]
+        for check in runtime._load_gate(f["source"])["checks"]
+        if check["id"] == "opentui-install"
+    )
+    real_copyfile = runtime.shutil.copyfile
+
+    def swap_during_copy(src, dst):
+        if Path(src) == source and Path(dst).name == "opentui-install.log":
+            Path(dst).write_text("swapped after source validation\n", encoding="utf-8")
+            return str(dst)
+        return real_copyfile(src, dst)
+
+    monkeypatch.setattr(runtime.shutil, "copyfile", swap_during_copy)
+    real_ship = runtime.ship_candidate
+    ship_calls = []
+
+    def ship(*args, **kwargs):
+        ship_calls.append(True)
+        return real_ship(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "ship_candidate", ship)
+
+    with pytest.raises(
+        runtime.ControlError, match="publication recovery changed reused gate evidence"
+    ):
+        runtime.main(f["args"])
+
+    recovered = runtime._load_gate(f["output"])
+    copied = next(
+        check
+        for check in recovered["checks"]
+        if check["id"] == "opentui-install"
+    )
+    assert copied["output_sha256"] != source_hash
+    assert ship_calls == [True]
+    assert remote_sha(f["repo"]) == f["base"]
+    assert not (f["state"] / "publish-journal.json").exists()
+
+
 @pytest.mark.parametrize("owner", ["live-owner", "terminal-prior-owner"])
 def test_continuation_creates_missing_publication_evidence_and_delivers(
     retained, owner

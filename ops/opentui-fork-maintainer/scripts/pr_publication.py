@@ -1345,7 +1345,9 @@ def _ensure_owned_draft(
 
 
 def _retained_draft_adoption(
+    repo: Path,
     root: Path,
+    destination: str,
     manifest: dict[str, Any],
     expected: str,
     issue: dict[str, Any],
@@ -1421,8 +1423,8 @@ def _retained_draft_adoption(
     ):
         raise PublicationError("live issue PR does not match the retained task draft")
     _validate_pr(live, draft["head_branch"], live["headRefOid"], marker)
-    _validate_owned_base(live, manifest["base_sha"])
     _validate_retained_pr_owner(live, manifest)
+    _validate_publication_base(repo, root, destination, live, manifest)
     return live
 
 
@@ -1480,7 +1482,7 @@ def _owned_head(
                 root, manifest, None, verification_complete=False
             )
             adopted = _retained_draft_adoption(
-                root, manifest, expected, issue, workflow, marker
+                repo, root, destination, manifest, expected, issue, workflow, marker
             )
             if adopted is not None:
                 head = adopted["headRefName"]

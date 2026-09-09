@@ -261,7 +261,8 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    The runtime hashes one canonical binary diff stream per range, splits that
    exact stream only at complete patch boundaries below the reviewer limit,
    requires every chunk to end in `VERDICT: APPROVED` with no
-   `BLOCKER:`, and preserves stdout/stderr and hashes. Never re-expand the
+   `BLOCKER:`, and preserves stdout/stderr and hashes. An approval must not
+   emit the `BLOCKER:` token at all; `BLOCKER: none` is malformed. Never re-expand the
    complete trusted-upstream history into a reviewer prompt.
    For `termctrl-smoke`, provide only bounded dimensions, one to eight
    send/wait actions, and nonempty accepted-frame `required_text`; do not

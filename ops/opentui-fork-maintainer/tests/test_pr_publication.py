@@ -1471,6 +1471,107 @@ def test_empty_capture_adoption_retry_after_lost_push_reply_is_idempotent(
     assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
 
 
+def test_saved_retained_adoption_accepts_ancestral_pr_base_after_closed_duplicate(
+    capture, github, monkeypatch, tmp_path
+) -> None:
+    head = "contributor/approved-41"
+    repo, remote, old_base, _, retained_head, _, candidate = (
+        prepare_retained_reconciliation_graph(tmp_path, capture, head)
+    )
+    retained = {
+        "number": 91,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
+        "base_branch": pub.BASE,
+        "head_branch": head,
+        "head_sha": retained_head,
+        "head_repository": pub.REPOSITORY,
+    }
+    request = bind_issue(capture, existing_prs=[retained])
+    marker = f"<!-- maintainer-candidate:v1:{pub._candidate_head(capture[1])[2]} -->"
+    github.pr = {
+        **review_pr(),
+        "number": 91,
+        "url": retained["url"],
+        "body": marker + "\nContributor context.\n\nFixes #41",
+        "headRefName": head,
+        "headRefOid": retained_head,
+        "baseRefOid": old_base,
+        "isDraft": True,
+    }
+    simulated_github = github.run
+
+    def initial_transport(argv, cwd):
+        if argv[0] == "git":
+            github.calls.append(argv)
+            result = subprocess.run(
+                argv, cwd=cwd, check=True, capture_output=True, text=True
+            )
+            if argv[1] == "push":
+                github.pr["headRefOid"] = argv[-1].split(":", 1)[0]
+            return result.stdout
+        if argv[:3] == [str(pub.GH), "pr", "list"]:
+            github.calls.append(argv)
+            return "[]"
+        return simulated_github(argv, cwd)
+
+    monkeypatch.setattr(pub, "_publication_destination", lambda *_args: str(remote))
+    monkeypatch.setattr(pub, "_run", initial_transport)
+    capture[1].update(candidate_sha=candidate, expected_pr_head=retained_head)
+    first = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["new-head checks"],
+        issue_request=request,
+    )
+    assert first["number"] == 91
+    assert github.pr["baseRefOid"] == old_base
+
+    (repo / "followup.txt").write_text("second linear fix\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-am", "second linear followup"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    latest = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    current = {**retained, "head_sha": candidate}
+    request = bind_issue(capture, existing_prs=[current])
+    capture[1].update(candidate_sha=latest, expected_pr_head=candidate)
+    closed_duplicate = {
+        **github.pr,
+        "number": 92,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
+        "headRefName": pub._candidate_head(capture[1])[0],
+        "baseRefOid": capture[1]["base_sha"],
+        "body": marker,
+        "state": "CLOSED",
+    }
+    monkeypatch.setattr(
+        pub, "_run", closed_canonical_transport(github, closed_duplicate, latest)
+    )
+
+    updated = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["latest-head checks"],
+        issue_request=request,
+    )
+
+    assert updated["number"] == 91
+    assert github.pr["headRefOid"] == latest
+    assert github.pr["baseRefOid"] == old_base
+    assert remote_head(remote, head) == latest
+    assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
+
+
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
