@@ -98,34 +98,89 @@ describe('session store — theming / dedup / hydrate (Phase 1)', () => {
   })
 })
 
-describe('session store — correlated steer notices', () => {
-  test('removes only the steer acknowledged by message.complete', () => {
+describe('session store — correlated steer boundaries', () => {
+  test('settles only the acknowledged steer status and retains both user inputs', () => {
     const store = createSessionStore()
-    store.pushPendingSteer('steer-a', 'steer queued: a')
-    store.pushPendingSteer('steer-b', 'steer queued: b')
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'before steers' } })
+    store.pushPendingSteer('steer-a', 'steer a')
+    store.pushPendingSteer('steer-b', 'steer b')
+    store.setPendingSteerState('steer-a', 'accepted')
+    store.setPendingSteerState('steer-b', 'accepted')
 
     store.apply({ type: 'message.complete', payload: { client_submission_ids: ['steer-a'] } })
 
-    expect(store.state.messages.map(message => message.text)).toEqual(['steer queued: b'])
+    const corrections = store.state.messages[0]?.parts?.filter(part => part.type === 'correction') ?? []
+    expect(corrections.map(part => part.text)).toEqual(['steer a', 'steer b'])
+    expect(corrections[0]).not.toHaveProperty('steerState')
+    expect(corrections[0]).not.toHaveProperty('steerSubmissionId')
+    expect(corrections[1]).toMatchObject({ steerState: 'accepted', steerSubmissionId: 'steer-b' })
   })
 
-  test('removes promoted steers on correlated message.start and terminal errors', () => {
+  test('a correlated start wins the RPC-response race without removing the user row', () => {
     const store = createSessionStore()
-    store.pushPendingSteer('promoted', 'steer queued: promoted')
+    store.pushPendingSteer('promoted', 'steer promoted before its ack')
     store.apply({ type: 'message.start', payload: { client_submission_ids: ['promoted'] } })
-    expect(store.state.messages.some(message => message.steerSubmissionId === 'promoted')).toBe(false)
+    store.setPendingSteerState('promoted', 'accepted')
 
-    store.pushPendingSteer('failed', 'steer queued: failed')
-    store.apply({ type: 'error', payload: { client_submission_ids: ['failed'], message: 'turn failed' } })
-    expect(store.state.messages.some(message => message.steerSubmissionId === 'failed')).toBe(false)
-    expect(store.state.messages.at(-1)?.text).toBe('error: turn failed')
+    expect(store.state.messages[0]).toMatchObject({ role: 'user', text: 'steer promoted before its ack' })
+    expect(store.state.messages[0]).not.toHaveProperty('steerState')
+    expect(store.state.messages[0]).not.toHaveProperty('steerSubmissionId')
+    expect(store.state.messages[1]).toMatchObject({ role: 'assistant', streaming: true })
   })
 
-  test('does not resurrect a notice when completion wins the RPC-response race', () => {
+  test('rejection removes exactly its optimistic boundary before queue fallback', () => {
     const store = createSessionStore()
-    store.apply({ type: 'message.complete', payload: { client_submission_ids: ['fast-steer'] } })
-    store.pushPendingSteer('fast-steer', 'must not appear')
-    expect(store.state.messages).toEqual([])
+    store.apply({ type: 'message.start' })
+    const first = store.pushPendingSteer('first', 'first steer')
+    store.pushPendingSteer('second', 'second steer')
+    store.setPendingSteerState('first', 'rejected')
+
+    expect(store.removeClientMessage(first)).toBe(true)
+    expect(store.state.messages[0]?.parts?.filter(part => part.type === 'correction')).toMatchObject([
+      { steerState: 'pending', steerSubmissionId: 'second', text: 'second steer' }
+    ])
+  })
+
+  test('session reset drops pending steer state and correlation history', () => {
+    const store = createSessionStore()
+    store.pushPendingSteer('reused-after-reset', 'old session steer')
+    store.apply({ type: 'message.complete', payload: { client_submission_ids: ['reused-after-reset'] } })
+    store.clearTranscript()
+
+    store.pushPendingSteer('reused-after-reset', 'new session steer')
+    store.setPendingSteerState('reused-after-reset', 'accepted')
+    expect(store.state.messages).toMatchObject([
+      { role: 'user', steerState: 'accepted', steerSubmissionId: 'reused-after-reset', text: 'new session steer' }
+    ])
+
+    store.commitSnapshot([{ role: 'user', text: 'resumed session' }])
+    expect(store.state.messages).toEqual([{ role: 'user', text: 'resumed session' }])
+  })
+
+  test('disconnect and successful cancellation retire wait status without deleting steer text', () => {
+    const disconnected = createSessionStore()
+    disconnected.apply({ type: 'message.start' })
+    disconnected.apply({ type: 'message.delta', payload: { text: 'partial reply' } })
+    disconnected.pushPendingSteer('disconnect-steer', 'survive disconnect')
+    disconnected.setPendingSteerState('disconnect-steer', 'accepted')
+    disconnected.apply({ type: 'gateway.exited' })
+
+    const disconnectedCorrection = disconnected.state.messages
+      .flatMap(message => message.parts ?? [])
+      .find(part => part.type === 'correction')
+    expect(disconnectedCorrection).toMatchObject({ type: 'correction', text: 'survive disconnect' })
+    expect(disconnectedCorrection).not.toHaveProperty('steerState')
+    expect(disconnectedCorrection).not.toHaveProperty('steerSubmissionId')
+
+    const cancelled = createSessionStore()
+    cancelled.apply({ type: 'message.start' })
+    cancelled.pushPendingSteer('cancelled-steer', 'survive cancellation')
+    cancelled.settleAllPendingSteers()
+    const cancelledCorrection = cancelled.state.messages[0]?.parts?.find(part => part.type === 'correction')
+    expect(cancelledCorrection).toMatchObject({ type: 'correction', text: 'survive cancellation' })
+    expect(cancelledCorrection).not.toHaveProperty('steerState')
+    expect(cancelledCorrection).not.toHaveProperty('steerSubmissionId')
   })
 })
 

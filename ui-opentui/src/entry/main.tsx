@@ -155,7 +155,6 @@ import {
 } from '../logic/busyQueue.ts'
 import { coordinatePromptLiveSession } from '../logic/promptLiveSession.ts'
 import {
-  acceptedSteerNotice,
   advancePreStartCancellationFence,
   classifyBusyPromptSubmitResponse,
   createAutomaticQueueDrainGate,
@@ -252,6 +251,7 @@ interface PendingCorrection {
 }
 
 interface PendingSteerRequest {
+  readonly clientMessageId: string
   readonly front: boolean
   outcome?: SessionSteerDisposition
   readonly resolve: (delivery: SteerDelivery) => void
@@ -1217,6 +1217,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           gateway.request('session.interrupt', { session_id: sid }).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
+                store.settleAllPendingSteers()
                 // An interrupt during deferred agent construction has no
                 // message.start and no server session.info settlement. The
                 // successful interrupt response is the user's explicit cancel
@@ -1710,9 +1711,11 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           for (const request of steerRetentionOrder(needsRetention)) {
             const retained = enqueueClientPrompt(request.text, request.front)
             if (!retained) {
+              store.setPendingSteerState(request.submissionId, 'retained')
               deliveries.set(request, 'retained')
               continue
             }
+            store.removeClientMessage(request.clientMessageId)
             if (request.outcome === 'uncertain') {
               automaticQueueDrain.halt()
               deliveries.set(request, 'uncertain')
@@ -1725,9 +1728,6 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           for (const request of settled) {
             const delivery = request.outcome === 'accepted' ? 'accepted' : (deliveries.get(request) ?? 'retained')
             if (delivery === 'fallback') shouldDrain = true
-            if (delivery === 'accepted') {
-              store.pushPendingSteer(request.submissionId, acceptedSteerNotice(request.text))
-            }
             request.resolve(delivery)
           }
           if (shouldDrain && automaticQueueDrain.canDrain() && !isTurnBusy()) {
@@ -1736,8 +1736,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         }
 
         const submissionId = randomUUID()
+        const clientMessageId = store.pushPendingSteer(submissionId, text)
         return new Promise<SteerDelivery>(resolve => {
-          pendingSteers.set(sequence, { front, resolve, submissionId, text })
+          pendingSteers.set(sequence, { clientMessageId, front, resolve, submissionId, text })
           void Effect.runPromise(
             gateway
               .request<unknown>('session.steer', {
@@ -1756,12 +1757,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               const request = pendingSteers.get(sequence)
               if (!request) return
               request.outcome = outcome
+              store.setPendingSteerState(request.submissionId, outcome)
               drainSettledSteers()
             },
             () => {
               const request = pendingSteers.get(sequence)
               if (!request) return
               request.outcome = 'uncertain'
+              store.setPendingSteerState(request.submissionId, 'uncertain')
               drainSettledSteers()
             }
           )

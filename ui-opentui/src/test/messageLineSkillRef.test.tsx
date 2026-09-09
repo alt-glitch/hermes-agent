@@ -11,6 +11,7 @@ import { describe, expect, test } from 'vitest'
 
 import { createSessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
+import { steerStateLabel } from '../view/messageLine.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
@@ -132,6 +133,30 @@ describe('live interrupt correction ordering (native frame)', () => {
       expect(before).toBeGreaterThanOrEqual(0)
       expect(correction).toBeGreaterThan(before)
       expect(after).toBeGreaterThan(correction)
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('shows pending then accepted steer feedback without moving its response boundary', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'BEFORE_STEER' } })
+    store.pushPendingSteer('steer-frame', 'USER_STEER')
+
+    const probe = await mountApp(store)
+    try {
+      await probe.waitForFrame(frame => frame.includes(steerStateLabel('pending')))
+      expect(probe.frame()).toContain('USER_STEER')
+
+      store.setPendingSteerState('steer-frame', 'accepted')
+      store.apply({ type: 'message.delta', payload: { text: 'AFTER_STEER' } })
+      await probe.waitForFrame(frame => frame.includes(steerStateLabel('accepted')) && frame.includes('AFTER_STEER'))
+
+      const frame = probe.frame()
+      expect(frame.indexOf('USER_STEER')).toBeGreaterThan(frame.indexOf('BEFORE_STEER'))
+      expect(frame.indexOf('AFTER_STEER')).toBeGreaterThan(frame.indexOf('USER_STEER'))
     } finally {
       probe.destroy()
     }

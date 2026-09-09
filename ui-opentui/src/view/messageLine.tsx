@@ -35,7 +35,7 @@ import { For, Match, Show, Switch } from 'solid-js'
 import { copyBlock } from '../logic/blockCopy.ts'
 import { splitComposerHighlights, type ComposerHighlight } from '../logic/composerHighlights.ts'
 import { collapseHiddenPartsBy, hiddenRunLabel, sectionMode } from '../logic/details.ts'
-import type { Message, Part } from '../logic/store.ts'
+import type { Message, Part, SteerState } from '../logic/store.ts'
 import type { ThemeColors } from '../logic/theme.ts'
 import { useDisplay } from './display.tsx'
 import { Markdown } from './markdown.tsx'
@@ -77,6 +77,19 @@ export function glyphColor(role: Message['role'], latest: boolean, color: ThemeC
  */
 export function bodyColor(role: Message['role'], color: ThemeColors): string {
   return role === 'assistant' ? color.text : color.muted
+}
+
+/** Truthful client-side steer status. The user's text renders separately, so
+ * this chrome never repeats or rewrites the submitted content. */
+export function steerStateLabel(state: SteerState): string {
+  const labels: Record<SteerState, string> = {
+    accepted: 'steer accepted — waiting for next tool boundary',
+    pending: 'steer pending — awaiting gateway acceptance',
+    rejected: 'steer rejected — retaining for the next turn',
+    retained: 'steer fallback queue full — copy this retained input to retry',
+    uncertain: 'steer delivery uncertain — retaining for explicit retry'
+  }
+  return labels[state]
 }
 
 /**
@@ -266,6 +279,13 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                               )}
                             </For>
                           </text>
+                          <Show when={m().steerState}>
+                            {steerState => (
+                              <text selectable={false}>
+                                <span style={{ fg: theme().color.muted }}>{steerStateLabel(steerState())}</span>
+                              </text>
+                            )}
+                          </Show>
                           <Show when={m().role !== 'system' && m().text.trim() && !display().compact}>
                             <CopyChip source={() => m().text} />
                           </Show>
@@ -354,6 +374,15 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
                                   </For>
                                 </text>
                               </box>
+                              <Show when={correction().steerState}>
+                                {steerState => (
+                                  <box style={{ marginLeft: GUTTER }}>
+                                    <text selectable={false}>
+                                      <span style={{ fg: theme().color.muted }}>{steerStateLabel(steerState())}</span>
+                                    </text>
+                                  </box>
+                                )}
+                              </Show>
                               <Show when={!display().compact}>
                                 <box style={{ marginLeft: GUTTER }}>
                                   <CopyChip source={() => correction().text} />

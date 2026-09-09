@@ -148,9 +148,14 @@ export interface CorrectionPart {
   type: 'correction'
   id: string
   clientId?: string
+  /** Direct-steer correlation and truthful client-side delivery state. */
+  steerSubmissionId?: string
+  steerState?: SteerState
   text: string
   timestamp?: number
 }
+
+export type SteerState = 'pending' | 'accepted' | 'rejected' | 'uncertain' | 'retained'
 
 /** One ordered piece of an assistant turn (§7). */
 export type Part =
@@ -166,9 +171,11 @@ export interface Message {
    * the gateway and lets the submission lease remove exactly that row when a
    * pre-start rejection proves it was never committed to session history. */
   clientId?: string
-  /** Correlates a local pending-steer notice with the gateway event that proves
-   * the steer was consumed, promoted into a turn, or terminally failed. */
+  /** Correlates a direct-steer boundary with the gateway event that proves the
+   * steer was consumed, promoted into a turn, or terminally failed. */
   steerSubmissionId?: string
+  /** Direct-steer delivery state rendered beside the user-authored input. */
+  steerState?: SteerState
   /** Visible client-only activity that never enters gateway/SQLite history. */
   localOnly?: 'shell'
   /** Flat body for user/system rows (and settled/resumed assistant rows). */
@@ -1630,15 +1637,63 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return removed
   }
 
-  /** Push a pending direct-steer notice. Unlike ordinary slash output, this is
-   * removed only by an authoritative gateway correlation id. */
-  function pushPendingSteer(clientSubmissionId: string, text: string) {
-    if (settledSteerSubmissionIds.has(clientSubmissionId)) return
-    const clean = stripAnsi(text)
+  /** Insert a direct steer at its actual arrival boundary before starting the
+   * RPC. The text is user content, not a system notice: later assistant deltas
+   * must remain below it. An authoritative correlation settles only the local
+   * status chrome and deliberately retains the input boundary. */
+  function pushPendingSteer(clientSubmissionId: string, text: string): string {
+    const clientId = nextClientMessageId()
+    const timestamp = Math.floor(Date.now() / 1000)
     setState(
       produce(draft => {
-        draft.messages.push({ role: 'system', steerSubmissionId: clientSubmissionId, text: clean })
-        capMessages(draft)
+        const live = liveAssistant(draft, true)
+        if (live) {
+          ;(live.parts ??= []).push({
+            type: 'correction',
+            id: nextId(),
+            clientId,
+            steerSubmissionId: clientSubmissionId,
+            steerState: 'pending',
+            text,
+            timestamp
+          })
+        } else {
+          draft.messages.push({
+            clientId,
+            role: 'user',
+            steerSubmissionId: clientSubmissionId,
+            steerState: 'pending',
+            text,
+            timestamp
+          })
+          capMessages(draft)
+        }
+      })
+    )
+    return clientId
+  }
+
+  /** Update only the matching still-unsettled steer. A lifecycle event may win
+   * the RPC-response race; settled ids make every late response a no-op. */
+  function setPendingSteerState(clientSubmissionId: string, steerState: SteerState): void {
+    if (settledSteerSubmissionIds.has(clientSubmissionId)) return
+    setState(
+      produce(draft => {
+        for (let messageIndex = draft.messages.length - 1; messageIndex >= 0; messageIndex--) {
+          const message = draft.messages[messageIndex]
+          if (!message) continue
+          if (message.steerSubmissionId === clientSubmissionId) {
+            message.steerState = steerState
+            return
+          }
+          const part = message.parts?.find(
+            candidate => candidate.type === 'correction' && candidate.steerSubmissionId === clientSubmissionId
+          )
+          if (part?.type === 'correction') {
+            part.steerState = steerState
+            return
+          }
+        }
       })
     )
   }
@@ -1652,11 +1707,36 @@ export function createSessionStore(options?: SessionStoreOptions) {
         if (!oldest.done) settledSteerSubmissionIds.delete(oldest.value)
       }
     }
-    const settled = new Set(clientSubmissionIds)
     setState(
-      'messages',
-      state.messages.filter(message => !message.steerSubmissionId || !settled.has(message.steerSubmissionId))
+      produce(draft => {
+        const settled = new Set(clientSubmissionIds)
+        for (const message of draft.messages) {
+          if (message.steerSubmissionId && settled.has(message.steerSubmissionId)) {
+            delete message.steerSubmissionId
+            delete message.steerState
+          }
+          for (const part of message.parts ?? []) {
+            if (part.type !== 'correction' || !part.steerSubmissionId || !settled.has(part.steerSubmissionId)) continue
+            delete part.steerSubmissionId
+            delete part.steerState
+          }
+        }
+      })
     )
+  }
+
+  /** A successful hard interrupt or dead gateway is terminal for every local
+   * wait label even when the transport cannot emit per-steer correlations.
+   * Keep each authored boundary; only retire its delivery chrome. */
+  function settleAllPendingSteers(): void {
+    const ids: string[] = []
+    for (const message of state.messages) {
+      if (message.steerSubmissionId) ids.push(message.steerSubmissionId)
+      for (const part of message.parts ?? []) {
+        if (part.type === 'correction' && part.steerSubmissionId) ids.push(part.steerSubmissionId)
+      }
+    }
+    settlePendingSteers(ids)
   }
 
   /** Push a system line (slash output, errors, notices). */
@@ -1952,6 +2032,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('latestTodos', undefined)
     // Drop the dedup history too — a fresh transcript should re-process any id.
     applied.clear()
+    settledSteerSubmissionIds.clear()
     // A chrome notice must not survive a transcript reset (new session context).
     clearNoticeState()
     // Nor may a compaction pause: the latch belongs to the discarded context.
@@ -2006,6 +2087,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     if (noticeTimer) clearTimeout(noticeTimer)
     noticeTimer = undefined
     applied.clear()
+    settledSteerSubmissionIds.clear()
     buffering = null
     // A live activate/resume can attach after message.start already fired.
     // The snapshot must arm the server-confirmed-idle queue-drain latch.
@@ -3374,6 +3456,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
       // spinner (no message.complete will ever arrive for the lost reply), tell
       // the user their in-flight reply was lost, and show a recovering status.
       case 'gateway.exited': {
+        settleAllPendingSteers()
         clearStatusRestoreTimer()
         lastStatusNote = ''
         // Only an actually-open turn owns an exit archive. A post-complete
@@ -3670,6 +3753,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
   /** Replace history with the resume snapshot, then replay events buffered meanwhile. */
   function commitSnapshot(snapshot: Message[]): void {
     archiveAndClearSubagents(false)
+    settledSteerSubmissionIds.clear()
     agentsTurnArchived = true
     // Resume replaces session context — a prior session's notice/timer must not
     // bleed in; mirrors Ink reset(). Deliberate tradeoff: a same-session
@@ -3872,6 +3956,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     pushSkill,
     removeClientMessage,
     pushPendingSteer,
+    setPendingSteerState,
+    settleAllPendingSteers,
     pushSystem,
     pushNotification,
     showNotice,
