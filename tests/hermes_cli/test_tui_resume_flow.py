@@ -478,6 +478,7 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "prompt": "hello",
         "model": "gpt-test",
         "provider": "openai",
+        "resume": None,
         "toolsets": None,
         "skills": None,
         "usage_file": "usage.json",
