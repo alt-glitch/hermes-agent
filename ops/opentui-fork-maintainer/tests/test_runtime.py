@@ -535,7 +535,7 @@ def test_publish_draft_cli_exposes_clean_candidate_without_running_gates(
 def test_retained_issue_reconciliation_is_exact_current_and_fully_reviewed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo, _, base, retained_head, merge_commit, candidate, worktree = (
+    repo, remote, base, retained_head, merge_commit, candidate, worktree = (
         make_retained_reconciliation_repo(tmp_path)
     )
     state, evidence = tmp_path / "state", tmp_path / "evidence"
@@ -627,6 +627,12 @@ def test_retained_issue_reconciliation_is_exact_current_and_fully_reviewed(
             expected_mode="issue",
             issue_binding=binding["issue"],
         )
+    assert git(
+        repo, "ls-remote", str(remote), f"refs/heads/{runtime.BRANCH}"
+    ).split()[0] == base
+    assert git(repo, "ls-remote", str(remote), "refs/heads/retained-pr").split()[
+        0
+    ] == retained_head
     hidden_merge = commit_tree(candidate, base)
     with pytest.raises(runtime.ControlError, match="history must be linear"):
         runtime._review_scope(
@@ -678,6 +684,34 @@ def test_retained_issue_reconciliation_is_exact_current_and_fully_reviewed(
         runtime._revalidate_issue_request(
             state, evidence, "test-token", candidate_sha=retained_head
         )
+    publisher_loaded = False
+    real_run_path = runtime.runpy.run_path
+
+    def refuse_publisher(_path: str) -> dict[str, object]:
+        nonlocal publisher_loaded
+        publisher_loaded = True
+        return {}
+
+    monkeypatch.setattr(runtime.runpy, "run_path", refuse_publisher)
+    with pytest.raises(runtime.ControlError, match="changed during revalidation"):
+        runtime.publish_task_draft(
+            repo,
+            evidence,
+            state_dir=state,
+            cwd=worktree,
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+            expected_pr_head=retained_head,
+        )
+    assert publisher_loaded is False
+    assert git(
+        repo, "ls-remote", str(remote), f"refs/heads/{runtime.BRANCH}"
+    ).split()[0] == base
+    assert git(repo, "ls-remote", str(remote), "refs/heads/retained-pr").split()[
+        0
+    ] == retained_head
+    monkeypatch.setattr(runtime.runpy, "run_path", real_run_path)
     current["approval"] = request["approval"]
 
     (worktree / "followup").write_text("dirty\n", encoding="utf-8")

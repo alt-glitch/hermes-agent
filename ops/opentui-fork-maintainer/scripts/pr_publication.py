@@ -236,7 +236,9 @@ def _candidate_head(manifest: dict[str, Any]) -> tuple[str, str, str]:
                 raise PublicationError("scheduled task has no captured upstream")
             request_identity = _canonical_sha({"mode": "scheduled", "upstream": upstream})
         if binding.get("mode") == "issue" and isinstance(binding.get("issue"), dict):
-            request_identity = _canonical_sha(binding["issue"])
+            request_identity = _canonical_sha(
+                _issue_workflow().publication_issue_identity(binding["issue"])
+            )
         if request_identity is None:
             request_identity = binding.get("request_sha256")
     if not isinstance(request_identity, str) or not re.fullmatch(
@@ -839,7 +841,11 @@ def wait_for_review(
         )
         if expected_pr_evidence is not None:
             if "base_sha" in expected_pr_evidence:
-                _validate_owned_base(pr, expected_pr_evidence["base_sha"])
+                retained_snapshot = expected_pr_evidence.get("base_ref_oid")
+                if retained_snapshot is None:
+                    _validate_owned_base(pr, expected_pr_evidence["base_sha"])
+                else:
+                    _validate_owned_base_snapshot(pr, retained_snapshot)
             _validate_pr(
                 pr,
                 expected_pr_evidence["head_branch"],
@@ -1080,12 +1086,16 @@ def resume_preview(
             )
         )
         _validate_pr(pr, head, manifest["candidate_sha"], marker)
-        _validate_owned_base(pr, manifest["base_sha"])
         _validate_retained_pr_owner(pr, manifest)
         if repo is None or node is None:
             raise PublicationError(
                 "missing draft recovery requires the existing publisher"
             )
+        if retained is None:
+            _validate_owned_base(pr, manifest["base_sha"])
+        else:
+            destination = _publication_destination(repo, remote)
+            _validate_publication_base(repo, root, destination, pr, manifest)
         return publish_preview(
             repo,
             root,
@@ -1122,15 +1132,52 @@ def resume_preview(
     return result
 
 
-def _validate_owned_base(pr: dict[str, Any], base: str) -> None:
+def _validate_owned_base_snapshot(pr: dict[str, Any], snapshot: str) -> None:
     owner, repository = REPOSITORY.split("/")
     if (
-        pr.get("baseRefOid") != base
+        pr.get("baseRefOid") != snapshot
         or pr.get("isCrossRepository") is not False
         or (pr.get("headRepositoryOwner") or {}).get("login") != owner
         or (pr.get("headRepository") or {}).get("name") != repository
     ):
         raise PublicationError("PR base or repository ownership changed")
+
+
+def _validate_owned_base(pr: dict[str, Any], base: str) -> None:
+    _validate_owned_base_snapshot(pr, base)
+
+
+def _validate_publication_base(
+    repo: Path,
+    root: Path,
+    destination: str,
+    pr: dict[str, Any],
+    manifest: dict[str, Any],
+) -> str:
+    """Bind a retained PR's historical base snapshot to the exact live target."""
+    base = manifest["base_sha"]
+    retained = _retained_pr_reconciliation(manifest)
+    if retained is None:
+        _validate_owned_base(pr, base)
+        return base
+    snapshot = pr.get("baseRefOid")
+    if not isinstance(snapshot, str) or not re.fullmatch(r"[0-9a-f]{40}", snapshot):
+        raise PublicationError("PR base or repository ownership changed")
+    _validate_owned_base_snapshot(pr, snapshot)
+    target_ref = f"refs/heads/{BASE}"
+    if _run(["git", "ls-remote", destination, target_ref], root).split() != [
+        base,
+        target_ref,
+    ]:
+        raise PublicationError("publication target moved from the captured fork base")
+    if snapshot != base:
+        try:
+            _run(["git", "merge-base", "--is-ancestor", snapshot, base], repo)
+        except PublicationError as exc:
+            raise PublicationError(
+                "retained PR base snapshot is not an ancestor of the captured fork base"
+            ) from exc
+    return snapshot
 
 
 def _publication_destination(repo: Path, remote: str) -> str:
@@ -1240,11 +1287,13 @@ def _reconcile_live_issue_pr(
 
 
 def _ensure_owned_draft(
+    repo: Path,
     root: Path,
+    destination: str,
+    manifest: dict[str, Any],
     pr: dict[str, Any],
     head: str,
     candidate: str,
-    base: str,
     marker: str | None,
 ) -> dict[str, Any]:
     """Move a proven task PR back to draft before exposing an unverified fix."""
@@ -1270,7 +1319,8 @@ def _ensure_owned_draft(
         )
     )
     _validate_pr(updated, head, candidate, marker)
-    _validate_owned_base(updated, base)
+    _validate_retained_pr_owner(updated, manifest)
+    _validate_publication_base(repo, root, destination, updated, manifest)
     if updated.get("isDraft") is not True:
         raise PublicationError("task PR did not return to draft before fix publication")
     return updated
@@ -1359,13 +1409,14 @@ def _retained_draft_adoption(
 
 
 def _owned_head(
+    repo: Path,
     root: Path,
     destination: str,
     manifest: dict[str, Any],
     expected: str,
     *,
     allow_missing: bool = False,
-) -> tuple[dict[str, Any], str, str] | None:
+) -> tuple[dict[str, Any], str, str, bool] | None:
     if not re.fullmatch(r"[0-9a-f]{40}", expected):
         raise PublicationError("expected PR head must be an exact SHA")
     head, _, identity = _candidate_head(manifest)
@@ -1423,14 +1474,94 @@ def _owned_head(
     pr = prs[0]
     if not isinstance(pr, dict) or pr.get("headRefOid") not in {expected, candidate}:
         raise PublicationError("owned PR head moved unexpectedly")
-    _validate_pr(pr, head, pr["headRefOid"], marker)
-    _validate_owned_base(pr, manifest["base_sha"])
     _validate_retained_pr_owner(pr, manifest)
+    retained = _retained_pr_reconciliation(manifest)
+    marker_refresh = marker not in str(pr.get("body", ""))
+    if marker_refresh:
+        if (
+            retained is None
+            or pr.get("headRefOid") != expected
+            or retained["head_sha"] != expected
+        ):
+            _validate_pr(pr, head, pr["headRefOid"], marker)
+        _validate_pr(pr, head, expected)
+    else:
+        _validate_pr(pr, head, pr["headRefOid"], marker)
+    _validate_publication_base(repo, root, destination, pr, manifest)
     ref = f"refs/heads/{head}"
     advertised = _run(["git", "ls-remote", destination, ref], root).split()
     if advertised != [pr["headRefOid"], ref]:
         raise PublicationError("owned branch and PR disagree")
-    return pr, head, marker
+    return pr, head, marker, marker_refresh
+
+
+def _refresh_retained_owner_marker(
+    repo: Path,
+    root: Path,
+    destination: str,
+    manifest: dict[str, Any],
+    pr: dict[str, Any],
+    head: str,
+    expected: str,
+    marker: str,
+) -> dict[str, Any]:
+    """Authenticate and record this run's marker before advancing a retained PR."""
+    options = ["--repo", REPOSITORY]
+    current = json.loads(
+        _run(
+            [
+                str(GH),
+                "pr",
+                "view",
+                str(pr["number"]),
+                *options,
+                "--json",
+                FIELDS + OWNERSHIP_FIELDS,
+            ],
+            root,
+        )
+    )
+    _validate_pr(current, head, expected)
+    _validate_retained_pr_owner(current, manifest)
+    _validate_publication_base(repo, root, destination, current, manifest)
+    ref = f"refs/heads/{head}"
+    if _run(["git", "ls-remote", destination, ref], root).split() != [expected, ref]:
+        raise PublicationError("owned branch and PR disagree")
+    body = str(current.get("body", ""))
+    if marker not in body:
+        _write(root / "pr-body.md", marker + "\n" + body)
+        _run(
+            [
+                str(GH),
+                "pr",
+                "edit",
+                str(pr["number"]),
+                *options,
+                "--body-file",
+                str(root / "pr-body.md"),
+            ],
+            root,
+        )
+    updated = json.loads(
+        _run(
+            [
+                str(GH),
+                "pr",
+                "view",
+                str(pr["number"]),
+                *options,
+                "--json",
+                FIELDS + OWNERSHIP_FIELDS,
+            ],
+            root,
+        )
+    )
+    _validate_pr(updated, head, expected, marker)
+    _validate_retained_pr_owner(updated, manifest)
+    _validate_publication_base(repo, root, destination, updated, manifest)
+    if _run(["git", "ls-remote", destination, ref], root).split() != [expected, ref]:
+        raise PublicationError("owned branch and PR disagree")
+    return updated
 
 
 def preflight_owned_head(
@@ -1446,11 +1577,11 @@ def preflight_owned_head(
     root = Path(os.path.abspath(root))
     destination = _publication_destination(repo, remote)
     owned = _owned_head(
-        root, destination, manifest, expected, allow_missing=allow_missing
+        repo, root, destination, manifest, expected, allow_missing=allow_missing
     )
     if owned is None:
         return None
-    pr, head, _ = owned
+    pr, head, _, _ = owned
     candidate = manifest["candidate_sha"]
     _validate_retained_update_ancestry(repo, manifest, expected)
     _run(["git", "merge-base", "--is-ancestor", expected, candidate], repo)
@@ -1527,7 +1658,9 @@ def advance_owned_head(
     as_draft: bool = False,
 ) -> None:
     """CAS only a proven fast-forward on this task's already-owned open PR."""
-    pr, head, marker = _owned_head(root, destination, manifest, expected)
+    pr, head, marker, marker_refresh = _owned_head(
+        repo, root, destination, manifest, expected
+    )
     candidate = manifest["candidate_sha"]
     _validate_retained_update_ancestry(repo, manifest, expected)
     observations = collect_review_surfaces(
@@ -1543,21 +1676,46 @@ def advance_owned_head(
     advertised = _run(["git", "ls-remote", destination, ref], repo).split()
     if advertised != [pr["headRefOid"], ref]:
         raise PublicationError("owned branch and PR disagree")
+    if marker_refresh:
+        pr = _refresh_retained_owner_marker(
+            repo, root, destination, manifest, pr, head, expected, marker
+        )
     if as_draft:
         pr = _ensure_owned_draft(
+            repo,
             root,
+            destination,
+            manifest,
             pr,
             head,
             pr["headRefOid"],
-            manifest["base_sha"],
             marker,
         )
 
     if pr["headRefOid"] == expected and expected != candidate:
+        _validate_publication_base(repo, root, destination, pr, manifest)
         _run(["git", "push", "--porcelain", f"--force-with-lease={ref}:{expected}",
               destination, f"{candidate}:{ref}"], repo)
     if _run(["git", "ls-remote", destination, ref], repo).split() != [candidate, ref]:
         raise PublicationError("owned branch update was not acknowledged")
+    updated = json.loads(
+        _run(
+            [
+                str(GH),
+                "pr",
+                "view",
+                str(pr["number"]),
+                "--repo",
+                REPOSITORY,
+                "--json",
+                FIELDS + OWNERSHIP_FIELDS,
+            ],
+            root,
+        )
+    )
+    _validate_pr(updated, head, candidate, marker)
+    _validate_retained_pr_owner(updated, manifest)
+    _validate_publication_base(repo, root, destination, updated, manifest)
 
 
 def publish_draft(
@@ -1686,13 +1844,15 @@ def publish_draft(
         raise PublicationError("expected exactly one task-owned draft PR")
     pr = prs[0]
     _validate_pr(pr, head, candidate)
-    _validate_owned_base(pr, base)
     _validate_retained_pr_owner(pr, manifest)
+    _validate_publication_base(repo, root, destination, pr, manifest)
     if pr.get("isDraft") is not True:
         observations = collect_review_surfaces(root, pr["number"], candidate)
         require_review_disposition(root, observations)
         marker = candidate_marker if candidate_marker in str(pr.get("body", "")) else None
-        pr = _ensure_owned_draft(root, pr, head, candidate, base, marker)
+        pr = _ensure_owned_draft(
+            repo, root, destination, manifest, pr, head, candidate, marker
+        )
     body = pr["body"]
     if candidate_marker not in body:
         body = candidate_marker + "\n" + (body_prefix if reconciled is not None else "") + body
@@ -1724,8 +1884,8 @@ def publish_draft(
         )
     )
     _validate_pr(pr, head, candidate, candidate_marker)
-    _validate_owned_base(pr, base)
     _validate_retained_pr_owner(pr, manifest)
+    _validate_publication_base(repo, root, destination, pr, manifest)
     if pr.get("isDraft") is not True or _replace_status(pr["body"], status) != pr["body"]:
         raise PublicationError("task draft state was not acknowledged")
     if issue is not None and reconciled is not None:
@@ -1791,7 +1951,10 @@ def publish_preview(
             "installed before-and-after formatter changed; revalidate it"
         )
     destination = (
-        None if _existing_draft is not None else _publication_destination(repo, remote)
+        None
+        if _existing_draft is not None
+        and _retained_pr_reconciliation(manifest) is None
+        else _publication_destination(repo, remote)
     )
     candidate, base = manifest["candidate_sha"], manifest["base_sha"]
     head, request_identity, candidate_identity = _candidate_head(manifest)
@@ -1943,8 +2106,11 @@ def publish_preview(
     _validate_pr(
         pr, head, candidate, candidate_marker if _existing_draft is not None else None
     )
-    _validate_owned_base(pr, base)
     _validate_retained_pr_owner(pr, manifest)
+    if destination is None:
+        _validate_owned_base(pr, base)
+    else:
+        _validate_publication_base(repo, root, destination, pr, manifest)
     marker_missing = candidate_marker not in pr["body"]
     if marker_missing:
         reconciled_prefix = body_prefix if reconciled is not None else ""
@@ -2046,8 +2212,11 @@ def publish_preview(
         )
     )
     _validate_pr(pr, head, candidate, candidate_marker)
-    _validate_owned_base(pr, base)
     _validate_retained_pr_owner(pr, manifest)
+    if destination is None:
+        _validate_owned_base(pr, base)
+    else:
+        _validate_publication_base(repo, root, destination, pr, manifest)
     published = _published_block(pr["body"], identity)
     if published is None:
         raise PublicationError(
@@ -2070,8 +2239,11 @@ def publish_preview(
             )
         )
         _validate_pr(pr, head, candidate, candidate_marker)
-        _validate_owned_base(pr, base)
         _validate_retained_pr_owner(pr, manifest)
+        if destination is None:
+            _validate_owned_base(pr, base)
+        else:
+            _validate_publication_base(repo, root, destination, pr, manifest)
         if pr.get("isDraft") is not False:
             raise PublicationError("candidate PR did not leave draft state after local gates")
     proof = {
@@ -2118,6 +2290,11 @@ def publish_preview(
             "block_sha256": hashlib.sha256(block.encode()).hexdigest(),
             "attachment_url": url,
             "base_sha": base,
+            **(
+                {"base_ref_oid": pr["baseRefOid"]}
+                if _retained_pr_reconciliation(manifest) is not None
+                else {}
+            ),
         },
         observed_heads=list(
             dict.fromkeys(

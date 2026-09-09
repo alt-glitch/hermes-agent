@@ -341,6 +341,107 @@ def prepare_owned_head_graph(tmp_path: Path, capture, head: str):
     return repo, remote, expected, candidate
 
 
+def prepare_retained_reconciliation_graph(tmp_path: Path, capture, head: str):
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    for key, value in (
+        ("user.email", "maintainer@example.invalid"),
+        ("user.name", "OpenTUI Maintainer"),
+    ):
+        subprocess.run(["git", "config", key, value], cwd=repo, check=True)
+    (repo / "common.txt").write_text("common\n", encoding="utf-8")
+    subprocess.run(["git", "add", "common.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "common"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    snapshot = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-b", "retained", snapshot], cwd=repo, check=True)
+    (repo / "retained.txt").write_text("retained implementation\n", encoding="utf-8")
+    subprocess.run(["git", "add", "retained.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "retained implementation"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    retained = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-b", pub.BASE, snapshot], cwd=repo, check=True)
+    (repo / "base.txt").write_text("current fork base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "base.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "advance fork base"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", str(remote), f"{base}:refs/heads/{pub.BASE}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", str(remote), f"{retained}:refs/heads/{head}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", retained, "-m", "reconcile retained PR"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    merge_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "followup.txt").write_text("linear fix\n", encoding="utf-8")
+    subprocess.run(["git", "add", "followup.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "linear followup"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    candidate = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    capture[1].update(base_sha=base, candidate_sha=candidate)
+    return repo, remote, snapshot, base, retained, merge_commit, candidate
+
+
 def remote_head(remote: Path, head: str) -> str:
     return subprocess.run(
         ["git", "ls-remote", str(remote), f"refs/heads/{head}"],
@@ -1046,9 +1147,16 @@ def test_retained_reconciliation_advances_only_the_captured_same_pr(
     capture, github, monkeypatch, tmp_path
 ) -> None:
     head = "contributor/approved-41"
-    repo, remote, retained_head, candidate = prepare_owned_head_graph(
-        tmp_path, capture, head
+    repo, remote, old_base, base, retained_head, merge_commit, candidate = (
+        prepare_retained_reconciliation_graph(tmp_path, capture, head)
     )
+    assert subprocess.run(
+        ["git", "rev-list", "--parents", "-n", "1", merge_commit],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split() == [merge_commit, base, retained_head]
     retained = {
         "number": 91,
         "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
@@ -1060,15 +1168,18 @@ def test_retained_reconciliation_advances_only_the_captured_same_pr(
     request = bind_issue(capture, existing_prs=[retained])
     assert capture[1]["run_binding"]["issue"]["retained_pr"] == retained
     marker = f"<!-- maintainer-candidate:v1:{pub._candidate_head(capture[1])[2]} -->"
-    github.ref = f"{retained_head}\trefs/heads/{head}"
     github.pr = {
         **review_pr(),
         "number": 91,
         "url": retained["url"],
-        "body": f"{marker}\nContributor context.\n\nFixes #41",
+        "body": (
+            "<!-- maintainer-candidate:v1:"
+            + "0" * 64
+            + " -->\nContributor context.\n\nFixes #41"
+        ),
         "headRefName": head,
         "headRefOid": retained_head,
-        "baseRefOid": capture[1]["base_sha"],
+        "baseRefOid": old_base,
         "isDraft": True,
     }
     simulated_github = github.run
@@ -1076,9 +1187,12 @@ def test_retained_reconciliation_advances_only_the_captured_same_pr(
     def transport(argv, cwd):
         if argv[0] == "git":
             github.calls.append(argv)
-            result = subprocess.run(
-                argv, cwd=cwd, check=True, capture_output=True, text=True
-            )
+            try:
+                result = subprocess.run(
+                    argv, cwd=cwd, check=True, capture_output=True, text=True
+                )
+            except subprocess.CalledProcessError as exc:
+                raise pub.PublicationError(exc.stderr) from exc
             if argv[1] == "push":
                 github.pr["headRefOid"] = argv[-1].split(":", 1)[0]
             return result.stdout
@@ -1091,20 +1205,42 @@ def test_retained_reconciliation_advances_only_the_captured_same_pr(
     monkeypatch.setattr(pub, "_run", transport)
     capture[1].update(candidate_sha=candidate, expected_pr_head=retained_head)
     current = {**request, "existing_prs": [dict(retained)]}
-    second = pub.publish_draft(
+    first = pub.publish_draft(
         repo,
         capture[0],
         capture[1],
         pending_gates=["new-head checks"],
         issue_request=current,
     )
+    assert first["number"] == 91
+    assert github.pr["body"].startswith(marker)
+    first_edit = next(
+        index
+        for index, call in enumerate(github.calls)
+        if call[1:3] == ["pr", "edit"]
+    )
+    first_push = next(
+        index for index, call in enumerate(github.calls) if call[:2] == ["git", "push"]
+    )
+    assert first_edit < first_push
+    assert remote_head(remote, head) == candidate
 
-    source = repo / "candidate.txt"
-    source.write_text(
-        "base\nowned head\ncorrection\nsecond correction\n", encoding="utf-8"
+    subprocess.run(
+        ["git", "checkout", "--detach", base],
+        cwd=repo,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
-        ["git", "commit", "-am", "second correction"],
+        ["git", "merge", "--no-ff", candidate, "-m", "reconcile fresh owner"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    (repo / "second-followup.txt").write_text("second linear fix\n", encoding="utf-8")
+    subprocess.run(["git", "add", "second-followup.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "second linear followup"],
         cwd=repo,
         check=True,
         capture_output=True,
@@ -1116,29 +1252,80 @@ def test_retained_reconciliation_advances_only_the_captured_same_pr(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    capture[1].update(candidate_sha=latest, expected_pr_head=candidate)
-    current["existing_prs"][0]["head_sha"] = candidate
-    third = pub.publish_draft(
-        repo,
-        capture[0],
-        capture[1],
-        pending_gates=["latest-head checks"],
-        issue_request=current,
+    fresh_root = tmp_path / "fresh-evidence"
+    fresh_root.mkdir()
+    shutil.copytree(
+        capture[0] / "termctrl-verified", fresh_root / "termctrl-verified"
     )
-    assert second["number"] == third["number"] == 91
-    assert second["head_branch"] == third["head_branch"] == head
+    fresh_proof = json.loads(json.dumps(capture[2]))
+    fresh_proof["png_path"] = str(fresh_root / "termctrl-verified" / "accepted.png")
+    fresh_proof["text_path"] = str(fresh_root / "termctrl-verified" / "accepted.txt")
+    fresh_log = fresh_root / "termctrl.log"
+    fresh_log.write_text(json.dumps(fresh_proof), encoding="utf-8")
+    fresh_retained = {**retained, "head_sha": candidate}
+    fresh_request = {**request, "existing_prs": [fresh_retained]}
+    (fresh_root / "request.claimed.json").write_text(
+        json.dumps(fresh_request), encoding="utf-8"
+    )
+    fresh_manifest = json.loads(json.dumps(capture[1]))
+    fresh_manifest.update(candidate_sha=latest, expected_pr_head=candidate)
+    fresh_manifest["checks"][0].update(
+        output_path=str(fresh_log), output_sha256=digest(fresh_log)
+    )
+    fresh_manifest["run_binding"]["request_sha256"] = pub._canonical_sha(fresh_request)
+    fresh_manifest["run_binding"]["issue"] = (
+        pub._issue_workflow().binding_issue_fields(fresh_request)
+    )
+    assert pub._candidate_head(fresh_manifest)[2] == pub._candidate_head(capture[1])[2]
+    second = pub.publish_draft(
+        repo,
+        fresh_root,
+        fresh_manifest,
+        pending_gates=["latest-head checks"],
+        issue_request=fresh_request,
+    )
+    assert first["number"] == second["number"] == 91
+    assert first["head_branch"] == second["head_branch"] == head
     assert remote_head(remote, head) == latest
     assert [call[-1] for call in github.calls if call[:2] == ["git", "push"]] == [
         f"{candidate}:refs/heads/{head}",
         f"{latest}:refs/heads/{head}",
     ]
-
-    source.write_text(
-        "base\nowned head\ncorrection\nsecond correction\nthird correction\n",
-        encoding="utf-8",
+    verified = pub.publish_preview(
+        repo,
+        fresh_root,
+        fresh_manifest,
+        node=NODE,
+        issue_request=fresh_request,
     )
+    assert verified["number"] == 91
+    assert verified["candidate_sha"] == latest
+    assert verified["review"]["candidate_sha"] == latest
+    assert github.pr["isDraft"] is False
+    continuation_manifest = json.loads(json.dumps(fresh_manifest))
+    continuation_manifest.pop("expected_pr_head")
+    continued = pub.publish_preview(
+        repo,
+        fresh_root,
+        continuation_manifest,
+        node=NODE,
+        issue_request=fresh_request,
+        _existing_draft=second,
+        _preview_root=fresh_root,
+    )
+    assert continued["number"] == 91
+    assert sum(call[:2] == ["git", "push"] for call in github.calls) == 2
+
     subprocess.run(
-        ["git", "commit", "-am", "third correction"],
+        ["git", "checkout", "--detach", base],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    (repo / "unrelated.txt").write_text("drops retained ancestry\n", encoding="utf-8")
+    subprocess.run(["git", "add", "unrelated.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "unrelated candidate"],
         cwd=repo,
         check=True,
         capture_output=True,
@@ -1150,13 +1337,32 @@ def test_retained_reconciliation_advances_only_the_captured_same_pr(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    capture[1].update(candidate_sha=next_candidate, expected_pr_head=latest)
-    current["existing_prs"][0]["head_sha"] = latest
+    refusal_manifest = json.loads(json.dumps(fresh_manifest))
+    refusal_manifest.update(candidate_sha=next_candidate, expected_pr_head=latest)
+    refusal_request = {**request, "existing_prs": [{**retained, "head_sha": latest}]}
+    refusal_manifest["run_binding"]["issue"] = (
+        pub._issue_workflow().binding_issue_fields(refusal_request)
+    )
+    before = len(github.calls)
+    with pytest.raises(pub.PublicationError):
+        pub.publish_draft(
+            repo,
+            fresh_root,
+            refusal_manifest,
+            pending_gates=["must not publish"],
+            issue_request=refusal_request,
+        )
+    assert remote_head(remote, head) == latest
+    assert not any(
+        call[:2] == ["git", "push"] or call[1:3] in (["pr", "edit"], ["pr", "ready"])
+        for call in github.calls[before:]
+    )
+
     live = json.loads(json.dumps(github.pr))
     faults = (
         ("number", 87, "approved retained implementing PR"),
         ("headRefOid", "f" * 40, "conflicting implementing PR"),
-        ("baseRefOid", "f" * 40, "repository ownership changed"),
+        ("baseRefOid", "f" * 40, "base snapshot"),
         ("headRepositoryOwner", {"login": "someone-else"}, "repository ownership changed"),
     )
     for field, value, message in faults:
@@ -1164,15 +1370,42 @@ def test_retained_reconciliation_advances_only_the_captured_same_pr(
         github.pr[field] = value
         if field == "number":
             github.pr["url"] = f"https://github.com/{pub.REPOSITORY}/pull/{value}"
+        before = len(github.calls)
         with pytest.raises(pub.PublicationError, match=message):
             pub.publish_draft(
                 repo,
-                capture[0],
-                capture[1],
+                fresh_root,
+                refusal_manifest,
                 pending_gates=["must not publish"],
-                issue_request=current,
+                issue_request=refusal_request,
             )
         assert remote_head(remote, head) == latest
+        assert not any(
+            call[:2] == ["git", "push"]
+            or call[1:3] in (["pr", "edit"], ["pr", "ready"])
+            for call in github.calls[before:]
+        )
+    github.pr = live
+    subprocess.run(
+        ["git", "push", "--force", str(remote), f"{latest}:refs/heads/{pub.BASE}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    before = len(github.calls)
+    with pytest.raises(pub.PublicationError, match="publication target moved"):
+        pub.publish_draft(
+            repo,
+            fresh_root,
+            refusal_manifest,
+            pending_gates=["must not publish"],
+            issue_request=refusal_request,
+        )
+    assert remote_head(remote, head) == latest
+    assert not any(
+        call[:2] == ["git", "push"] or call[1:3] in (["pr", "edit"], ["pr", "ready"])
+        for call in github.calls[before:]
+    )
     assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
 
 

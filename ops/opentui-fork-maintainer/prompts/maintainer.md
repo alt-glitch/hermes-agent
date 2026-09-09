@@ -318,6 +318,12 @@ fork base and second parent equal to the exact captured implementing PR head,
 followed only by linear fixes. Trusted current issue approval, repository/PR
 ownership, both input heads and all publication safeguards still apply. No
 unrelated upstream merge, replacement PR, force-push or watermark advance.
+GitHub's PR base OID is a historical snapshot: it may predate the captured
+target only when Git proves it is an ancestor, while the actual remote target
+must still equal the captured base before every publisher mutation. A fresh
+owner authenticates the current issue, PR owner/branch/head and source before
+writing its current marker, then requires the exact marker/head/base readback
+before advancing that same branch.
 
 If the installed runtime cannot validate this topology, implement the narrow
 support OFFLINE through a bounded worker in an isolated worktree based on the

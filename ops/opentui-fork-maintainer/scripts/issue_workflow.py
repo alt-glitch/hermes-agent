@@ -55,6 +55,7 @@ RETAINED_PR_FIELDS = {
     "head_sha",
     "head_repository",
 }
+RETAINED_PR_IDENTITY_FIELDS = RETAINED_PR_FIELDS - {"head_sha"}
 
 
 class IssueWorkflowError(RuntimeError):
@@ -106,6 +107,20 @@ def binding_issue_fields(claimed_value: dict[str, Any]) -> dict[str, Any]:
     if retained is not None:
         result["retained_pr"] = retained
     return result
+
+
+def publication_issue_identity(value: dict[str, Any]) -> dict[str, Any]:
+    """Project immutable task ownership without its captured head observation."""
+    identity = {
+        key: value[key]
+        for key in ("repository", "number", "revision_sha256", "approval_event_id")
+    }
+    retained = retained_pr_reconciliation(value)
+    if retained is not None:
+        identity["retained_pr"] = {
+            key: retained[key] for key in RETAINED_PR_IDENTITY_FIELDS
+        }
+    return identity
 
 
 def retained_pr_reconciliation(value: Any) -> dict[str, Any] | None:

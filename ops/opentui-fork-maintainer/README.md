@@ -163,7 +163,10 @@ head. An exact compatible existing issue draft can be adopted; a diverged
 retained draft is otherwise refused without rewriting or topology waiver. The
 narrow approved reconciliation keeps the captured PR number and branch, checks
 its current head and issue authorization at each publication edge, and rejects
-replacement PRs or dropped ancestry.
+replacement PRs or dropped ancestry. Its GitHub base OID may be an older
+snapshot only when that commit is an ancestor of the exact captured and live
+target; the publisher authenticates and reads back the current ownership marker
+before it advances the same PR branch.
 
 Every existing task owner is checked before expensive local gates, including an
 unchanged early draft when `--expected-pr-head` is omitted. A genuinely absent
