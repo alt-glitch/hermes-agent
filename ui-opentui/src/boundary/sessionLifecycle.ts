@@ -99,6 +99,23 @@ export const createSession = Effect.fn('SessionLifecycle.create')(function* (
   } satisfies CreatedSession
 })
 
+/** Create and commit a fresh session without dropping input authored while the
+ * RPC was in flight. Capture at the commit boundary: the composer is usable
+ * before gateway readiness, so a snapshot taken before the yield would still
+ * lose the user's newest bytes. Initial-prompt submission remains caller-owned
+ * and therefore cannot race ahead of session adoption here. */
+export const createAndAdoptSession = Effect.fn('SessionLifecycle.createAndAdopt')(function* (
+  gateway: GatewayTransport,
+  store: SessionStore,
+  options: CreateSessionOptions
+) {
+  const created = yield* createSession(gateway, options)
+  const preservedDraft = store.state.composerDraft
+  store.adoptFreshSession(created.sessionId, created.info, created.resumeId, created.todoState)
+  if (preservedDraft) store.replaceComposerDraft(preservedDraft)
+  return created
+})
+
 export const replaceSession = Effect.fn('SessionLifecycle.replace')(function* (
   gateway: GatewayTransport,
   options: ReplaceSessionOptions

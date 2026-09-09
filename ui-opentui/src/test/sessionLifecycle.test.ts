@@ -1,11 +1,12 @@
 import { assert, describe, it } from '@effect/vitest'
-import { Cause, Effect, Exit } from 'effect'
+import { Cause, Deferred, Effect, Exit, Fiber } from 'effect'
 
 import { GatewayError } from '../boundary/errors.ts'
 import type { GatewayTransport } from '../boundary/gateway/GatewayService.ts'
 import {
   activateSession,
   branchSession,
+  createAndAdoptSession,
   replaceSession,
   resumeSession,
   SessionProtocolError
@@ -37,6 +38,66 @@ function fakeGateway(
 }
 
 const rpcFailure = (method: string) => new GatewayError({ message: `${method} failed`, method, reason: 'rpc-error' })
+
+describe('createAndAdoptSession', () => {
+  it.effect('commits the new owner before returning and preserves the latest in-flight draft', () => {
+    const store = createSessionStore()
+    const fake = fakeGateway((method, params) =>
+      Effect.sync(() => {
+        assert.strictEqual(method, 'session.create')
+        assert.deepStrictEqual(params, { cols: 101, cwd: '/work' })
+        store.setComposerDraft('typed while session.create was in flight')
+        return {
+          info: { model: 'new-model' },
+          session_id: 'new-live',
+          stored_session_id: 'persisted-new'
+        }
+      })
+    )
+
+    return Effect.gen(function* () {
+      const created = yield* createAndAdoptSession(fake.service, store, { cols: 101, cwd: '/work' })
+      assert.deepStrictEqual(
+        fake.calls.map(call => call.method),
+        ['session.create']
+      )
+      assert.strictEqual(created.sessionId, 'new-live')
+      assert.strictEqual(store.state.sessionId, 'new-live')
+      assert.strictEqual(store.state.resumeId, 'persisted-new')
+      assert.strictEqual(store.state.info.model, 'new-model')
+      assert.strictEqual(store.state.composerDraft, 'typed while session.create was in flight')
+      assert.deepStrictEqual(store.state.messages, [])
+    })
+  })
+
+  it.effect('cancellation leaves the prior owner and latest draft untouched', () =>
+    Effect.gen(function* () {
+      const store = createSessionStore()
+      store.adoptFreshSession('old-live', {}, 'persisted-old')
+      store.setComposerDraft('draft before create')
+      const requested = yield* Deferred.make<void>()
+      const fake = fakeGateway(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(requested, undefined)
+          return yield* Effect.never
+        })
+      )
+
+      const fiber = yield* Effect.forkChild(createAndAdoptSession(fake.service, store, { cols: 80, cwd: undefined }))
+      yield* Deferred.await(requested)
+      store.setComposerDraft('latest draft before cancellation')
+      yield* Fiber.interrupt(fiber)
+
+      assert.strictEqual(store.state.sessionId, 'old-live')
+      assert.strictEqual(store.state.resumeId, 'persisted-old')
+      assert.strictEqual(store.state.composerDraft, 'latest draft before cancellation')
+      assert.deepStrictEqual(
+        fake.calls.map(call => call.method),
+        ['session.create']
+      )
+    })
+  )
+})
 
 describe('replaceSession', () => {
   it.effect('runs setup → close → detach → create with the explicit launch cwd', () => {

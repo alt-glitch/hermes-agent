@@ -69,6 +69,7 @@ import {
   activateSession,
   branchSession,
   createSession,
+  createAndAdoptSession,
   replaceSession,
   resumeSession
 } from '../boundary/sessionLifecycle.ts'
@@ -522,7 +523,7 @@ const createFreshSession = (
   submitInitial?: (text: string) => boolean
 ) =>
   Effect.gen(function* () {
-    const created = yield* createSession(gateway, {
+    const created = yield* createAndAdoptSession(gateway, store, {
       cols: input.cols,
       // The launch directory IS the workspace choice in a terminal (you cd'd
       // here) — passing it makes the gateway treat it as explicit, so the
@@ -536,7 +537,6 @@ const createFreshSession = (
       // launch dir is meaningless; see _ensure_session_db_row.)
       cwd: launchCwd()
     })
-    store.adoptFreshSession(created.sessionId, created.info, created.resumeId, created.todoState)
     writeActiveSession(created.resumeId) // persisted id for launcher/recovery (#5)
     getLog().info('bootstrap', 'session created', { resumeId: created.resumeId, sid: created.sessionId })
     yield* postSessionSetup(gateway, store, created.sessionId, input.initialPrompt, input.initialImage, submitInitial)
@@ -1204,6 +1204,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         if (quitTimer) clearTimeout(quitTimer)
         quitTimer = setTimeout(disarmQuit, QUIT_WINDOW_MS)
       }
+      yield* Effect.addFinalizer(() => Effect.sync(disarmQuit))
       const interruptTurn = () => {
         const sid = gateway.sessionId()
         if (!sid) return
@@ -1526,6 +1527,10 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       }
       doQuit = (code = 0) => {
         process.exitCode = code
+        // `/quit` and action+D may follow an armed first Ctrl+C. That timer is
+        // otherwise still referenced after renderer teardown and delays the
+        // cleanup-safe process exit until the whole quit window elapses.
+        disarmQuit()
         if (!renderer.isDestroyed) renderer.destroy()
       }
 
