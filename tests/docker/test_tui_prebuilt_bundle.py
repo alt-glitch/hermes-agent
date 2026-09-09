@@ -53,11 +53,12 @@ def test_hermes_tui_dir_env_is_set(built_image: str) -> None:
 
 
 def test_prebuilt_bundle_present_and_no_runtime_install(built_image: str) -> None:
-    """The launcher must (a) find the prebuilt bundle and (b) NOT want an
-    npm install — i.e. it takes the same path as a nix/packaged release."""
+    """An explicit Ink choice must use its baked bundle without npm install."""
     py = (
-        "import json\n"
+        "import json, os\n"
         "from pathlib import Path\n"
+        # Automatic selection may prefer the separately tested native engine.
+        "os.environ['HERMES_TUI_ENGINE'] = 'ink'\n"
         "from hermes_cli.main_tui_launch import _tui_need_npm_install, _find_bundled_tui, _make_tui_argv\n"
         "ui = Path('/opt/hermes/ui-tui')\n"
         "argv, cwd = _make_tui_argv(ui, tui_dev=False)\n"

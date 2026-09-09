@@ -280,15 +280,15 @@ COPY ui-tui/ ui-tui/
 COPY ui-opentui/ ui-opentui/
 # ui-opentui is the production native engine selected automatically on supported
 # hosts; Ink remains the explicit and unsupported-host fallback. .dockerignore
-# strips OpenTUI's node_modules/dist, so install +
-# esbuild-build it here -> dist/main.js, then prune devDeps (esbuild/babel/
-# vitest); the runtime only needs the prod deps (the external @opentui/core +
-# its native blob -- the bundle inlines solid/effect). Build needs Node 26.3
-# (node:ffi floor), which this image ships.
+# strips OpenTUI's node_modules/dist, so install its build dependencies here.
+# Build dist/main.js after the final source copy below, then prune devDeps
+# (esbuild/babel/vitest); the runtime only needs the prod deps (the external
+# @opentui/core + its native blob -- the bundle inlines solid/effect). Node
+# 26.3 is required (node:ffi floor), which this image ships.
 COPY apps/shared/ apps/shared/
 RUN cd web && npm run build && \
     cd ../ui-tui && npm run build && \
-    cd ../ui-opentui && npm install --no-audit --no-fund && npm run build && npm prune --omit=dev
+    cd ../ui-opentui && npm install --no-audit --no-fund
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
@@ -299,6 +299,13 @@ RUN cd web && npm run build && \
 # gives the non-root hermes user read + traverse but no write; root retains
 # write so the build steps below don't need chmod u+w dances.
 COPY --link --chmod=a+rX,go-w . .
+
+# A fresh checkout can have newer input mtimes than a reused frontend layer:
+# Docker's COPY cache ignores mtimes. Build the native bundle after the final
+# source copy so its freshness check never hydrates a cache at container startup.
+# Dependency installation above remains cached independently of Python changes.
+# Pruning must not rewrite the lockfile after the bundle's freshness timestamp.
+RUN cd ui-opentui && npm run build && npm prune --omit=dev --no-save
 
 # ---------- Permissions ----------
 # Link hermes-agent itself (editable). Deps are already installed in the
