@@ -71,9 +71,17 @@ def _run_behind_tick(
         "upstream_sha": UPSTREAM_SHA,
         "gap": 1,
     }
-    request = _issue_request(offered_issue)
+    fixtures = _load_script(
+        ROOT / "tests" / "test_issue_intake.py", "fairness_github_fixtures"
+    )
+    github = fixtures.GitHub(
+        [fixtures.issue(offered_issue)],
+        {offered_issue: [fixtures.labeled(offered_issue, "alt-glitch")]},
+    )
     workflow_api = {
-        "select_approved_issue": lambda _state, now=None, **_kwargs: request,
+        "select_approved_issue": lambda _state, now=None, **_kwargs: (
+            intake.select_approved_issue(_state, now=now, runner=github.run)
+        ),
         "validate_issue_request": intake.validate_issue_request,
         "mark_selected": intake.mark_selected,
     }
