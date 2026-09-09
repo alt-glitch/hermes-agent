@@ -72,7 +72,7 @@ bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
   /path/to/upstream/hermes-agent
 ```
 
-`-w` separately creates an isolated worktree for the *project workspace*; it
+`-w` separately creates an isolated worktree for the _project workspace_; it
 does not select the Hermes runtime. `uv run hermes ...` remains a valid explicit
 fallback before the launcher has been installed.
 
@@ -132,6 +132,22 @@ platform-specific artifacts or bundled npm tarballs.
 - To return to OpenTUI, remove the persistent override (or set it to
   `opentui`) and run `hermes`; runtime validation/build failures fail clearly
   and leave Ink available for recovery.
+
+## Live agents
+
+The dock above the composer appears while child agents are active. It hydrates
+from the session-scoped live roster as well as streamed events, so reconnecting
+does not hide children that are still working. Finished work remains available
+through the existing `/agents` replay history.
+
+- Ctrl+T opens the agent roster without clearing the composer draft; Esc returns.
+- F7 collapses or restores the persistent dock.
+- In the roster, t opens the selected child’s bounded live transcript tail and
+  e opens its steering form.
+- Enter in the steering form queues guidance for the next tool boundary. A
+  “queued” acknowledgement does not claim that the child consumed it.
+- Existing detail, sort/filter, pause, interrupt, timeline, and replay controls
+  remain available.
 
 ## Local UX contracts
 

@@ -216,10 +216,10 @@ function shortModel(model: string): string {
   return model.includes('/') ? (model.split('/').at(-1) ?? model) : model
 }
 
-/** Reasoning effort → a compact suffix; hidden only when unset/default. */
+/** Reasoning effort → a compact suffix; medium/normal/default are baseline noise. */
 export function effortSuffix(effort: string | undefined, fast: boolean | undefined): string {
   const parts: string[] = []
-  if (effort && effort !== 'default') parts.push(effort)
+  if (effort && !['default', 'medium', 'normal'].includes(effort)) parts.push(effort)
   if (fast) parts.push('fast')
   return parts.length ? ` ·${parts.join('·')}` : ''
 }
@@ -313,9 +313,10 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
   const ctxText = createMemo(() => {
     const p = pct()
     if (p === undefined || (!fieldEnabled('context_detail') && !fieldEnabled('context_pct'))) return ''
-    if (!segs().ctxDetail || !fieldEnabled('context_detail')) return `ctx: ${p}%`
+    const mark = info().contextEstimated === true ? '~' : ''
+    if (!segs().ctxDetail || !fieldEnabled('context_detail')) return `ctx: ${mark}${p}%`
     const used = info().contextUsed
-    return `ctx: ${ctxBar(p, barCells())} ${p}%${used !== undefined ? `${DOT_SEP}${fmtTokens(used)}` : ''}`
+    return `ctx: ${ctxBar(p, barCells())} ${mark}${p}%${used !== undefined ? `${DOT_SEP}${mark}${fmtTokens(used)}` : ''}`
   })
 
   const costText = createMemo(() => {
@@ -572,12 +573,20 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
             {/* ctxText() truthy guarantees pct() is defined; `?? 0` only satisfies the type. */}
             <Show
               when={segs().ctxDetail && fieldEnabled('context_detail')}
-              fallback={<span style={{ fg: ctxColorOf(pct() ?? 0) }}>{`${pct()}%`}</span>}
+              fallback={
+                <span
+                  style={{ fg: ctxColorOf(pct() ?? 0) }}
+                >{`${info().contextEstimated === true ? '~' : ''}${pct()}%`}</span>
+              }
             >
               <span style={{ fg: ctxColorOf(pct() ?? 0) }}>{ctxBar(pct() ?? 0, barCells())}</span>
-              <span style={{ fg: theme().color.statusFg }}>{` ${pct()}%`}</span>
+              <span
+                style={{ fg: theme().color.statusFg }}
+              >{` ${info().contextEstimated === true ? '~' : ''}${pct()}%`}</span>
               <Show when={info().contextUsed !== undefined}>
-                <span style={{ fg: theme().color.muted }}>{`${DOT_SEP}${fmtTokens(info().contextUsed ?? 0)}`}</span>
+                <span
+                  style={{ fg: theme().color.muted }}
+                >{`${DOT_SEP}${info().contextEstimated === true ? '~' : ''}${fmtTokens(info().contextUsed ?? 0)}`}</span>
               </Show>
             </Show>
           </Show>

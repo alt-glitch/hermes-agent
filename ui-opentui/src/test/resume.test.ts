@@ -143,6 +143,17 @@ describe('mapResumeHistory (Phase 4b)', () => {
     expect(message?.notification?.alwaysVisible).toBe(true)
   })
 
+  test('prefers persisted task-first delegation display text', () => {
+    const [message] = mapResumeHistory([
+      {
+        role: 'user',
+        display_kind: 'async_delegation_complete',
+        display_metadata: { display_text: 'Audit docs finished · 1 agent · all done', task_count: 1 }
+      }
+    ])
+    expect(message).toMatchObject({ role: 'system', text: '◈ Audit docs finished · 1 agent · all done' })
+  })
+
   test('skips hidden persisted display rows without changing ordinary history', () => {
     const msgs = mapResumeHistory([
       { role: 'user', text: 'real question' },

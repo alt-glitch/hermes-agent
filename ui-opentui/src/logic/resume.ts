@@ -81,6 +81,8 @@ function readOptNum(value: unknown, key: string): number | undefined {
 }
 
 function delegationEventLabel(metadata: unknown): string {
+  const display = readStr(metadata, 'display_text')
+  if (display !== undefined && display.trim()) return display
   const raw = metadata && typeof metadata === 'object' ? (metadata as { task_count?: unknown }).task_count : undefined
   const count = typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : undefined
   if (count === undefined) return 'background agent work finished'

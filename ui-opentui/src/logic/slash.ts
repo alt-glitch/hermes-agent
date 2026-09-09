@@ -1547,10 +1547,12 @@ const usageCmd: ClientHandler = async (_arg, ctx, flight) => {
       `Total tokens: ${f(response.total)}`,
       `API calls: ${f(response.calls)}`
     )
-    if (response.context_max)
+    if (response.context_max) {
+      const estimated = response.context_estimated === true ? '~' : ''
       lines.push(
-        `Context: ${f(response.context_used)} / ${f(response.context_max)} (${String(response.context_percent ?? 0)}%)`
+        `Context: ${estimated}${f(response.context_used)} / ${f(response.context_max)} (${estimated}${String(response.context_percent ?? 0)}%)`
       )
+    }
     if (response.compressions) lines.push(`Compressions: ${String(response.compressions)}`)
   }
   if (lines.length) ctx.openPager('Usage', lines.join('\n').trim())

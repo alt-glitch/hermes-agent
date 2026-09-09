@@ -13,6 +13,9 @@ import {
   decodeSpawnTreeSaveResponse,
   decodeSubagentInterruptRequest,
   decodeSubagentInterruptResponse,
+  decodeSubagentListResponse,
+  decodeSubagentSteerResponse,
+  decodeSubagentTailResponse,
   decodeUsageActiveSubagents
 } from '../boundary/schema/Delegation.ts'
 
@@ -88,7 +91,8 @@ describe('delegation control schemas', () => {
       effective_at: 42,
       paused: false
     })
-    expect(expectSome(decodeSubagentInterruptRequest({ subagent_id: 'sa-7' }))).toEqual({
+    expect(expectSome(decodeSubagentInterruptRequest({ session_id: 'sid-1', subagent_id: 'sa-7' }))).toEqual({
+      session_id: 'sid-1',
       subagent_id: 'sa-7'
     })
     expect(expectSome(decodeSubagentInterruptResponse({ found: false, subagent_id: 'sa-7' }))).toEqual({
@@ -97,8 +101,44 @@ describe('delegation control schemas', () => {
     })
 
     expect(Option.isNone(decodeDelegationPauseResponse({ paused: 'yes' }))).toBe(true)
-    expect(Option.isNone(decodeSubagentInterruptRequest({ subagent_id: '' }))).toBe(true)
+    expect(Option.isNone(decodeSubagentInterruptRequest({ subagent_id: 'sa-7' }))).toBe(true)
     expect(Option.isNone(decodeSubagentInterruptResponse({ found: true }))).toBe(true)
+  })
+
+  test('decodes session-owned roster, tail, and steer results without widening status', () => {
+    const roster = expectSome(
+      decodeSubagentListResponse({
+        delegations: [],
+        subagents: [
+          {
+            accepting_steer: true,
+            delegation_id: null,
+            depth: 1,
+            goal: 'verify native behavior',
+            last_tool: null,
+            model: 'test/model',
+            parent_id: null,
+            started_at: 1_700_000_000,
+            status: 'running',
+            subagent_id: 'child-1',
+            tool_count: 2
+          }
+        ]
+      })
+    )
+    expect(roster.subagents[0]).toMatchObject({ accepting_steer: true, status: 'running', subagent_id: 'child-1' })
+    expect(Option.isNone(decodeSubagentListResponse({ delegations: [], subagents: [{ status: 'finished' }] }))).toBe(
+      true
+    )
+    expect(
+      expectSome(
+        decodeSubagentTailResponse({ available: true, subagent_id: 'child-1', text: 'last output', truncated: true })
+      )
+    ).toMatchObject({ available: true, text: 'last output', truncated: true })
+    expect(
+      expectSome(decodeSubagentSteerResponse({ status: 'queued', subagent_id: 'child-1', text: 'adjust' }))
+    ).toEqual({ status: 'queued', subagent_id: 'child-1', text: 'adjust' })
+    expect(Option.isNone(decodeSubagentSteerResponse({ status: 'delivered' }))).toBe(true)
   })
 })
 

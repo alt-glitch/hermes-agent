@@ -23,7 +23,9 @@ import { decodeSessionActiveListResponse, type ActiveItem } from '../boundary/sc
 import {
   decodeDelegationPauseResponse,
   decodeDelegationStatusResponse,
+  decodeSubagentListResponse,
   decodeSpawnTreeLoadResponse,
+  type LiveSubagentSnapshot,
   type SpawnTreeSubagent
 } from '../boundary/schema/Delegation.ts'
 import {
@@ -385,6 +387,7 @@ export interface SubagentOutputEntry {
  * existing OpenTUI detail view while the richer dashboard consumes the arrays.
  */
 export interface SubagentInfo {
+  acceptingSteer?: boolean
   apiCalls?: number
   childSessionId?: string
   costUsd?: number
@@ -499,6 +502,21 @@ function makeSubagent(payload: SpawnTreeSubagent, id: string, status: SubagentSt
   }
   mergeSubagentPayload(subagent, payload)
   return subagent
+}
+
+function liveSnapshotPayload(payload: LiveSubagentSnapshot): SpawnTreeSubagent {
+  return {
+    depth: payload.depth,
+    goal: payload.goal,
+    parent_id: payload.parent_id,
+    started_at: payload.started_at,
+    status: payload.status,
+    subagent_id: payload.subagent_id,
+    tool_count: payload.tool_count,
+    ...(payload.delegation_id === null ? {} : { delegation_id: payload.delegation_id }),
+    ...(payload.last_tool === null ? {} : { last_tool: payload.last_tool }),
+    ...(payload.model === null ? {} : { model: payload.model })
+  }
 }
 
 /** Map every known rich snake_case field without erasing values omitted by a
@@ -633,6 +651,9 @@ export interface SessionInfo {
   contextUsed?: number
   contextMax?: number
   contextPercent?: number
+  /** True when context usage is a local estimate rather than provider usage. */
+  contextEstimated?: boolean
+  contextSource?: string
   compressions?: number
   /** Estimated session cost in USD (`usage.cost_usd` — only when the gateway's
    *  pricing estimate succeeds; absent otherwise). */
@@ -701,6 +722,8 @@ export interface StoreState {
    *  composer unmounting when a blocking prompt (clarify/approval) replaces it
    *  in the <Switch>. Restored on the next composer mount; cleared on submit. */
   composerDraft: string
+  /** UTF-16 insertion offset retained while full-screen overlays unmount the composer. */
+  composerCursor: number
   /** Images queued for this session's next prompt. Session-owned: never carry
    * them across clear/new/resume boundaries. */
   pendingImages: PendingImageAttachment[]
@@ -758,6 +781,8 @@ export interface StoreState {
   dashboardHistoryIndex: number
   /** Optional semantic replay pair; owned here so slash dispatch can open it. */
   dashboardDiffPair: AgentsDashboardDiffPair | undefined
+  /** F7 collapses the persistent live-agent dock to a single summary row. */
+  agentsTrayCollapsed: boolean
   /** Whether the OS background-process panel overlay is open (/processes). */
   backgroundPanel: boolean
   /** Whether the learning Journey timeline overlay is open. */
@@ -961,6 +986,10 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   if (max !== undefined) patch.contextMax = max
   const pct = d.usage?.context_percent ?? d.context_percent
   if (pct !== undefined) patch.contextPercent = pct
+  const estimated = d.usage?.context_estimated ?? d.context_estimated
+  if (estimated !== undefined) patch.contextEstimated = estimated
+  const source = d.usage?.context_source ?? d.context_source
+  if (source !== undefined) patch.contextSource = source
   const comp = d.usage?.compressions ?? d.compressions
   if (comp !== undefined) patch.compressions = comp
   if (d.usage?.cost_usd !== undefined) patch.costUsd = d.usage.cost_usd
@@ -1098,6 +1127,14 @@ export interface SessionStoreOptions {
 
 export function createSessionStore(options?: SessionStoreOptions) {
   let overlayOwnerSequence = 0
+  let delegationControlRevision = 0
+  interface PendingQueueState {
+    readonly edit: number | undefined
+    readonly items: readonly string[]
+  }
+  const sessionQueues = new Map<string, PendingQueueState>()
+  let unboundQueue: PendingQueueState = { edit: undefined, items: [] }
+  let activeQueueOwner: string | undefined
   // Rolling cap on retained transcript rows. OpenTUI lays out via Yoga (WASM), whose
   // linear memory is grow-only — every live `<For>` row is a Yoga-node subtree, so an
   // uncapped `messages[]` ratchets the high-water mark up over a long session and never
@@ -1148,6 +1185,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     theme: DEFAULT_THEME,
     prompt: undefined,
     composerDraft: '',
+    composerCursor: 0,
     pendingImages: [],
     composerClearVersion: 0,
     composerReplaceVersion: 0,
@@ -1175,6 +1213,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     pluginsHub: false,
     petPicker: false,
     dashboardDiffPair: undefined,
+    agentsTrayCollapsed: false,
     backgroundPanel: false,
     billing: undefined,
     subscription: undefined,
@@ -1369,12 +1408,6 @@ export function createSessionStore(options?: SessionStoreOptions) {
   }
 
   // ── parts helpers (operate on a draft message inside produce) ───────────
-  function sameVisibleText(a: string | undefined, b: string | undefined): boolean {
-    const left = a?.replace(/\r\n?/gu, '\n').trim() ?? ''
-    const right = b?.replace(/\r\n?/gu, '\n').trim() ?? ''
-    return !!left && left === right
-  }
-
   function visibleText(message: Message | undefined): string {
     return (message?.parts ?? [])
       .filter(part => part.type === 'text')
@@ -1396,30 +1429,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
   /** Completion/fallback reasoning is authoritative only when no streamed
    * reasoning exists. This preserves one ordered part and prevents duplicate
    * long reasoning bodies from `reasoning.available`/`message.complete`. */
-  function appendFallbackReasoning(draft: StoreState, text: string | undefined, answer?: string): void {
+  function appendFallbackReasoning(draft: StoreState, text: string | undefined): void {
     const value = text?.trim()
     if (!value) return
     const assistant = liveAssistant(draft) ?? ensureAssistant(draft)
-    const visibleAnswer = (assistant.parts ?? [])
-      .filter(part => part.type === 'text')
-      .map(part => part.text)
-      .join('')
-    if (sameVisibleText(value, answer) || sameVisibleText(value, visibleAnswer)) return
     if (hasReasoning(assistant)) return
     const parts = (assistant.parts ??= [])
     const firstText = parts.findIndex(part => part.type === 'text')
     parts.splice(firstText < 0 ? parts.length : firstText, 0, { type: 'reasoning', id: nextId(), text: value })
   }
 
-  function dropAnswerDuplicateReasoning(message: Message, answer: string | undefined): void {
-    if (!answer || !message.parts) return
-    for (let index = message.parts.length - 1; index >= 0; index--) {
-      const part = message.parts[index]
-      if (part?.type === 'reasoning' && sameVisibleText(part.text, answer)) {
-        message.parts.splice(index, 1)
-      }
-    }
-  }
   /** Reconcile the server's authoritative final text without duplicating
    * streamed segments. Prefix-compatible finals only append their unseen tail;
    * corrected finals collapse prior text parts into one final part at the last
@@ -1845,6 +1864,42 @@ export function createSessionStore(options?: SessionStoreOptions) {
   // owns the FIFO queue + the completion hook.
   let onTurnComplete: (() => void) | undefined
 
+  const queueOwnerKey = (sessionId: string | undefined, profileName: string | undefined): string | undefined =>
+    sessionId ? JSON.stringify([profileName || 'default', sessionId]) : undefined
+
+  const queueSnapshot = (): PendingQueueState => ({
+    edit: state.queueEditIndex,
+    items: [...state.queuedPrompts]
+  })
+
+  const saveActiveQueue = (): void => {
+    const snapshot = queueSnapshot()
+    if (activeQueueOwner === undefined) unboundQueue = snapshot
+    else if (snapshot.items.length === 0) sessionQueues.delete(activeQueueOwner)
+    else sessionQueues.set(activeQueueOwner, snapshot)
+  }
+
+  const switchQueueOwner = (
+    sessionId: string | undefined,
+    profileName: string | undefined
+  ): { readonly edit: number | undefined; readonly items: string[] } => {
+    saveActiveQueue()
+    const nextOwner = queueOwnerKey(sessionId, profileName)
+    let next = nextOwner === undefined ? unboundQueue : (sessionQueues.get(nextOwner) ?? { edit: undefined, items: [] })
+    // Input queued before the first session exists belongs to that attachment.
+    if (nextOwner !== undefined && unboundQueue.items.length > 0) {
+      const offset = next.items.length
+      next = {
+        edit: unboundQueue.edit === undefined ? next.edit : offset + unboundQueue.edit,
+        items: [...next.items, ...unboundQueue.items]
+      }
+      unboundQueue = { edit: undefined, items: [] }
+      sessionQueues.set(nextOwner, next)
+    }
+    activeQueueOwner = nextOwner
+    return { edit: next.edit, items: [...next.items] }
+  }
+
   // The drain fires on the SERVER-confirmed end of a turn — the running
   // true→false edge in a `session.info` (see applyInfo). It does NOT fire on
   // `message.complete`: the gateway emits message.complete BEFORE it clears its
@@ -1967,6 +2022,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     if (front && state.queueEditIndex !== undefined) {
       setState('queueEditIndex', state.queueEditIndex + 1)
     }
+    saveActiveQueue()
     return true
   }
 
@@ -1978,6 +2034,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     if (state.queueEditIndex !== undefined) {
       setState('queueEditIndex', index => (index === undefined || index === 0 ? undefined : index - 1))
     }
+    saveActiveQueue()
     return head
   }
 
@@ -1990,6 +2047,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
       if (current === undefined || current === index) return undefined
       return current > index ? current - 1 : current
     })
+    saveActiveQueue()
     return removed
   }
 
@@ -1998,16 +2056,19 @@ export function createSessionStore(options?: SessionStoreOptions) {
     if (!Number.isSafeInteger(index) || index < 0 || index >= state.queuedPrompts.length || !text) return false
     if (!queueAccepts(state.queuedPrompts, text, index)) return false
     setState('queuedPrompts', index, text)
+    saveActiveQueue()
     return true
   }
 
   function setQueueEditIndex(index: number | undefined): void {
     if (index === undefined) {
       setState('queueEditIndex', undefined)
+      saveActiveQueue()
       return
     }
     if (Number.isSafeInteger(index) && index >= 0 && index < state.queuedPrompts.length) {
       setState('queueEditIndex', index)
+      saveActiveQueue()
     }
   }
 
@@ -2015,6 +2076,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function clearQueue(): void {
     setState('queuedPrompts', [])
     setState('queueEditIndex', undefined)
+    saveActiveQueue()
   }
 
   /** How many prompts are currently queued. */
@@ -2056,6 +2118,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         delete info.contextUsed
         delete info.contextMax
         delete info.contextPercent
+        delete info.contextEstimated
+        delete info.contextSource
         delete info.costUsd
         delete info.compressions
         delete info.activeSubagents
@@ -2094,6 +2158,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     turnInFlight = turnRunning
     agentsTurnArchived = true
     const info: SessionInfo = { startedAt: startedAtMs, ...(rawInfo ? readInfoPatch(rawInfo) : {}) }
+    const pendingQueue = switchQueueOwner(sessionId, info.profileName)
     const capped = snapshot.length > MESSAGE_CAP ? snapshot.slice(-MESSAGE_CAP) : snapshot
     const latestTodos = todoSnapshotFromState(rawTodoState)
     promptRevision += 1
@@ -2104,6 +2169,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.dropped = snapshot.length - capped.length
         draft.prompt = undefined
         draft.composerDraft = ''
+        draft.composerCursor = 0
         draft.pendingImages = []
         draft.composerClearVersion += 1
         draft.latestTodos = latestTodos
@@ -2133,8 +2199,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.lastNotification = undefined
         draft.notice = null
         draft.pendingNotice = null
-        draft.queuedPrompts = []
-        draft.queueEditIndex = undefined
+        draft.queuedPrompts = pendingQueue.items
+        draft.queueEditIndex = pendingQueue.edit
         draft.compacting = false
         draft.info = info
         draft.hint = undefined
@@ -2568,10 +2634,18 @@ export function createSessionStore(options?: SessionStoreOptions) {
   }
 
   /** Decode and merge a successful delegation.status response. */
-  function applyDelegationStatusResponse(raw: unknown, updatedAtMs = Date.now()): boolean {
+  function applyDelegationStatusResponse(
+    raw: unknown,
+    updatedAtMs = Date.now(),
+    expectedControlRevision?: number
+  ): boolean {
     const decoded = decodeDelegationStatusResponse(raw)
     if (Option.isNone(decoded)) return false
-    setState('delegation', current => applyDelegationState(current, decoded.value, updatedAtMs))
+    // A pause acknowledgement that landed after this read began owns the
+    // control state. The roster portion is still useful and session-fenced.
+    if (expectedControlRevision === undefined || expectedControlRevision === delegationControlRevision) {
+      setState('delegation', current => applyDelegationState(current, decoded.value, updatedAtMs))
+    }
     setState(
       produce(draft => {
         for (const payload of decoded.value.active) {
@@ -2590,12 +2664,51 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return true
   }
 
+  /** Merge a session-scoped authoritative live roster with streamed progress.
+   * Snapshots can be older than events, so terminal state and larger counters
+   * win. Missing snapshot rows are retained until their own lifecycle settles. */
+  function applySubagentListResponse(raw: unknown): boolean {
+    const decoded = decodeSubagentListResponse(raw)
+    if (Option.isNone(decoded)) return false
+    setState(
+      produce(draft => {
+        for (const payload of decoded.value.subagents) {
+          const projected = liveSnapshotPayload(payload)
+          const existing = draft.subagents.find(agent => agent.id === payload.subagent_id)
+          if (!existing) {
+            const created = makeSubagent(projected, payload.subagent_id, payload.status)
+            created.acceptingSteer = payload.accepting_steer
+            draft.subagents.push(created)
+            continue
+          }
+          const terminal = isTerminalStatus(existing.status)
+          const priorToolCount = existing.toolCount ?? 0
+          mergeSubagentPayload(existing, projected)
+          existing.toolCount = Math.max(priorToolCount, payload.tool_count)
+          if (!terminal) {
+            if (existing.status === 'queued') existing.status = payload.status
+            existing.acceptingSteer = payload.accepting_steer
+          } else {
+            existing.acceptingSteer = false
+          }
+        }
+        draft.subagents.sort((left, right) => left.depth - right.depth || (left.index ?? 0) - (right.index ?? 0))
+      })
+    )
+    return true
+  }
+
   /** Decode and merge a successful delegation.pause response. */
   function applyDelegationPauseResponse(raw: unknown, updatedAtMs = Date.now()): boolean {
     const decoded = decodeDelegationPauseResponse(raw)
     if (Option.isNone(decoded)) return false
+    delegationControlRevision += 1
     setState('delegation', current => applyDelegationState(current, decoded.value, updatedAtMs))
     return true
+  }
+
+  function getDelegationControlRevision(): number {
+    return delegationControlRevision
   }
 
   /** Merge a session-info patch into the chrome state (status bar — item 14).
@@ -2607,7 +2720,29 @@ export function createSessionStore(options?: SessionStoreOptions) {
     const patch = readInfoPatch(raw)
     if (Object.keys(patch).length === 0) return
     setState('info', prev => ({ ...prev, ...patch }))
+    const nextQueueOwner = queueOwnerKey(state.sessionId, state.info.profileName)
+    if (nextQueueOwner !== activeQueueOwner) {
+      const pendingQueue = switchQueueOwner(state.sessionId, state.info.profileName)
+      setState('queuedPrompts', pendingQueue.items)
+      setState('queueEditIndex', pendingQueue.edit)
+    }
     if (state.status === 'starting agent…') setState('status', undefined)
+    if (patch.running === false) {
+      clearStatusRestoreTimer()
+      lastStatusNote = ''
+      setState('status', undefined)
+      setState('compacting', false)
+      if (state.prompt !== undefined) {
+        promptRevision += 1
+        setState('prompt', undefined)
+      }
+      setState(
+        'messages',
+        produce(messages => {
+          for (const message of messages) if (message.streaming) message.streaming = false
+        })
+      )
+    }
     // Drain the busy queue ONLY when the SERVER confirms the turn ended: a
     // session.info carrying running:false while a turn was in flight. We gate on
     // turnInFlight (armed by message.start) rather than the optimistic
@@ -2795,7 +2930,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
               }
             : undefined
         if (event.payload?.reasoning) {
-          setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning, event.payload?.text)))
+          setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning)))
         }
         // Archive BEFORE the normal turn clear. A child exit can still arrive
         // before session.info(false); `agentsTurnArchived` prevents a duplicate.
@@ -2846,7 +2981,6 @@ export function createSessionStore(options?: SessionStoreOptions) {
               if (!live) return
               reconcileFinalText(live, finalText)
               live.streaming = false
-              dropAnswerDuplicateReasoning(live, finalText)
             })
           )
         }
@@ -3431,6 +3565,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
               }
             } else if (event.type === 'subagent.complete') {
               sa.status = normalizeTerminalStatus(event.payload.status)
+              sa.acceptingSteer = false
               sa.endedAt ??= Date.now()
               const summary = event.payload.summary || text || sa.summary
               if (summary) sa.summary = summary
@@ -3668,6 +3803,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
    *  blocking prompt replaces it). Cleared on submit. */
   function setComposerDraft(text: string): void {
     setState('composerDraft', text)
+    setState('composerCursor', cursor => Math.min(cursor, text.length))
+  }
+
+  function setComposerCursor(cursor: number): void {
+    if (!Number.isFinite(cursor)) return
+    setState('composerCursor', Math.min(Math.max(0, Math.trunc(cursor)), state.composerDraft.length))
   }
 
   /** Replace the mounted composer with server-provided editable text. */
@@ -3676,6 +3817,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     // editor and then submit its prefill as a replacement for that queue row.
     setState('queueEditIndex', undefined)
     setState('composerDraft', text)
+    setState('composerCursor', text.length)
     setState('composerReplaceVersion', version => version + 1)
   }
 
@@ -3692,12 +3834,17 @@ export function createSessionStore(options?: SessionStoreOptions) {
    * monotonic signal (Composer observes composerClearVersion). */
   function clearComposerDraft(): void {
     setState('composerDraft', '')
+    setState('composerCursor', 0)
     setState('composerClearVersion', version => version + 1)
   }
 
   function setBusyInputMode(mode: BusyInputMode): void {
     busyInputModeRevision += 1
     setState('busyInputMode', mode)
+  }
+
+  function toggleAgentsTrayCollapsed(): void {
+    setState('agentsTrayCollapsed', collapsed => !collapsed)
   }
 
   function hydrateBusyInputMode(mode: BusyInputMode, expectedRevision: number): boolean {
@@ -3892,6 +4039,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   function setSessionId(sid: string | undefined): void {
     setState('sessionId', sid)
+    const pendingQueue = switchQueueOwner(sid, state.info.profileName)
+    setState('queuedPrompts', pendingQueue.items)
+    setState('queueEditIndex', pendingQueue.edit)
   }
 
   function setResumeId(id: string | undefined): void {
@@ -3979,7 +4129,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     consumeAgentsNudge,
     activeSubagentCount,
     applyDelegationStatusResponse,
+    applySubagentListResponse,
     applyDelegationPauseResponse,
+    getDelegationControlRevision,
     setCatalog,
     setCommandCatalog,
     addPendingImage,
@@ -4047,6 +4199,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setStatusBarFields,
     setReasoningFull,
     setBusyInputMode,
+    toggleAgentsTrayCollapsed,
     hydrateBusyInputMode,
     getBusyInputModeRevision,
     openDashboard,
@@ -4073,6 +4226,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     recordClarifyAnswer,
     flushAbandonedClarify,
     setComposerDraft,
+    setComposerCursor,
     replaceComposerDraft,
     insertComposerDraft,
     lastUserMessage,

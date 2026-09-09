@@ -30,6 +30,8 @@ export const SessionUsageResponseSchema = loose({
   compressions: opt(Num),
   context_max: opt(Num),
   context_percent: opt(Num),
+  context_estimated: opt(Bool),
+  context_source: opt(Str),
   context_used: opt(Num),
   credits_lines: opt(Schema.Array(Str)),
   input: opt(Num),

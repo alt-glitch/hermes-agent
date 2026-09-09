@@ -80,6 +80,7 @@ function statusColor(status: string, theme: ReturnType<typeof useTheme>): string
 
 export function AgentsTray(props: {
   subagents: SubagentInfo[]
+  collapsed?: boolean
   /** Enter on a row — open that agent in the dashboard. */
   onOpen: (id: string) => void
   /** Esc (or the tray emptying while focused) — give focus back to the composer. */
@@ -158,7 +159,7 @@ export function AgentsTray(props: {
   return (
     <Show when={running().length > 0}>
       <box ref={attach} focusable style={{ flexDirection: 'column', flexShrink: 0 }}>
-        <Show when={focused()} fallback={<CompactTrayRows agents={running()} />}>
+        <Show when={focused()} fallback={<CompactTrayRows agents={running()} collapsed={props.collapsed === true} />}>
           <TrayRows agents={running()} selected={selected()} firstSeen={firstSeen} />
         </Show>
       </box>
@@ -170,7 +171,7 @@ const COMPACT_AGENT_LIMIT = 5
 
 /** Persistent live summary. No synthetic `main` row: these are only agents the
  * gateway has authoritatively reported through the subagent event stream. */
-function CompactTrayRows(props: { agents: SubagentInfo[] }) {
+function CompactTrayRows(props: { agents: SubagentInfo[]; collapsed: boolean }) {
   const theme = useTheme()
   const visible = () => props.agents.slice(0, COMPACT_AGENT_LIMIT)
   const remaining = () => Math.max(0, props.agents.length - COMPACT_AGENT_LIMIT)
@@ -187,9 +188,11 @@ function CompactTrayRows(props: { agents: SubagentInfo[] }) {
         <span style={{ fg: theme().color.accent }}>
           <b>{`◆ ${props.agents.length} agent${props.agents.length === 1 ? '' : 's'} active`}</b>
         </span>
-        <span style={{ fg: theme().color.muted }}>{'  ·  ↓ inspect'}</span>
+        <span style={{ fg: theme().color.muted }}>
+          {props.collapsed ? '  ·  Ctrl+T inspect · F7 restore' : '  ·  ↓ inspect · Ctrl+T expand · F7 collapse'}
+        </span>
       </text>
-      <For each={visible()}>
+      <For each={props.collapsed ? [] : visible()}>
         {sa => {
           const status = () => normalizeSubagentStatus(sa.status)
           return (
@@ -203,7 +206,7 @@ function CompactTrayRows(props: { agents: SubagentInfo[] }) {
           )
         }}
       </For>
-      <Show when={remaining() > 0}>
+      <Show when={!props.collapsed && remaining() > 0}>
         <text selectable={false} fg={theme().color.muted} wrapMode="none">{`… +${remaining()} more`}</text>
       </Show>
     </box>

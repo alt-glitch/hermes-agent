@@ -563,12 +563,15 @@ describe('session store — ordered parts (Phase 2b)', () => {
     ])
   })
 
-  test('completion fallback reasoning never repeats the visible final answer', () => {
+  test('completion preserves reasoning even when its visible text matches the final answer', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start' })
     store.apply({ type: 'message.delta', payload: { text: 'same answer' } })
     store.apply({ type: 'message.complete', payload: { reasoning: 'same answer', text: 'same answer' } })
-    expect(store.state.messages.at(-1)?.parts).toMatchObject([{ type: 'text', text: 'same answer' }])
+    expect(store.state.messages.at(-1)?.parts).toMatchObject([
+      { type: 'reasoning', text: 'same answer' },
+      { type: 'text', text: 'same answer' }
+    ])
   })
 
   test('distinct completion fallback reasoning is ordered before streamed answer text', () => {
@@ -1443,7 +1446,13 @@ describe('session store — session chrome / status bar (item 14)', () => {
         cwd: '/home/x/proj',
         branch: 'main',
         running: false,
-        usage: { context_used: 42000, context_max: 200000, context_percent: 21 }
+        usage: {
+          context_used: 42000,
+          context_max: 200000,
+          context_percent: 21,
+          context_estimated: true,
+          context_source: 'local_estimate'
+        }
       }
     })
     const info = store.state.info
@@ -1454,6 +1463,8 @@ describe('session store — session chrome / status bar (item 14)', () => {
     expect(info.branch).toBe('main')
     expect(info.contextPercent).toBe(21)
     expect(info.contextMax).toBe(200000)
+    expect(info.contextEstimated).toBe(true)
+    expect(info.contextSource).toBe('local_estimate')
   })
 
   test('session.info round-trips the inference `provider` field (Port #1 compat)', () => {
@@ -2371,6 +2382,8 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
         cache_hit_pct: 73,
         context_used: 84000,
         context_percent: 42,
+        context_estimated: true,
+        context_source: 'local_estimate',
         cost_usd: 0.5,
         compressions: 2
       }
@@ -2379,6 +2392,8 @@ describe('session store — todo panel snapshot + draft + /new info reset', () =
     store.clearTranscript()
     expect(store.state.info.contextUsed).toBeUndefined()
     expect(store.state.info.contextPercent).toBeUndefined()
+    expect(store.state.info.contextEstimated).toBeUndefined()
+    expect(store.state.info.contextSource).toBeUndefined()
     expect(store.state.info.costUsd).toBeUndefined()
     expect(store.state.info.compressions).toBeUndefined()
     expect(store.state.info.cacheHitPct).toBeUndefined()

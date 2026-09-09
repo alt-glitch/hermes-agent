@@ -6,6 +6,8 @@ import {
   ctrlCAction,
   isActionHotkey,
   isExitHotkey,
+  isAgentsDashboardKey,
+  isAgentsDockToggleKey,
   isRedrawHotkey,
   openTuiHotkeys
 } from '../logic/hotkeys.ts'
@@ -21,6 +23,12 @@ const key = (
 })
 
 describe('platform action hotkeys', () => {
+  test('Ctrl+T opens agents and bare F7 toggles the persistent dock', () => {
+    expect(isAgentsDashboardKey({ ...key('t', { ctrl: true }), shift: false })).toBe(true)
+    expect(isAgentsDashboardKey({ ...key('t', { ctrl: true }), shift: true })).toBe(false)
+    expect(isAgentsDockToggleKey({ ...key('f7'), shift: false })).toBe(true)
+    expect(isAgentsDockToggleKey({ ...key('f7', { ctrl: true }), shift: false })).toBe(false)
+  })
   test('Ctrl+C clears a draft before interrupting a busy turn', () => {
     expect(ctrlCAction(true, true)).toBe('clear-draft')
     expect(ctrlCAction(false, true)).toBe('clear-draft')

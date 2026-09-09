@@ -186,6 +186,8 @@ export function Composer(props: {
   /** The persisted draft to seed the buffer with on mount (survives the
    *  composer unmounting when a blocking prompt replaces it). */
   initialDraft?: (() => string) | undefined
+  /** Persisted UTF-16 insertion offset paired with initialDraft. */
+  initialCursor?: (() => number) | undefined
   /** Monotonic signal used to clear the mounted uncontrolled textarea. */
   clearVersion?: (() => number) | undefined
   /** Monotonic signal used to replace it with initialDraft (`/undo` prefill). */
@@ -193,6 +195,7 @@ export function Composer(props: {
   /** Called with the live draft text on every edit (persist) and '' on submit
    *  (clear) — lets the parent stash it so it outlives a composer unmount. */
   onDraftChange?: ((text: string) => void) | undefined
+  onCursorChange?: ((cursor: number) => void) | undefined
   queued?: (() => readonly string[]) | undefined
   queueEditIndex?: (() => number | undefined) | undefined
   onQueueEdit?: ((index: number | undefined) => void) | undefined
@@ -375,6 +378,7 @@ export function Composer(props: {
     if (!ta || text.length > BUSY_QUEUE_MAX_EDIT_CHARS) return false
     ta.setText(text)
     ta.cursorOffset = Math.min(Math.max(0, cursor), text.length)
+    props.onCursorChange?.(ta.cursorOffset)
     // Programmatic replacement/history recall abandons every retained paste
     // token not reachable from the new buffer. Restoring the same token across
     // a session clear→restore keeps it live.
@@ -414,6 +418,7 @@ export function Composer(props: {
     setBufText('')
     props.history?.reset()
     props.onDraftChange?.('')
+    props.onCursorChange?.(0)
     props.onDismiss?.()
   }
 
@@ -921,7 +926,8 @@ export function Composer(props: {
     props.pasteStore?.retainOnly(draft)
     if (draft) {
       const editable = editableProgrammaticText(draft)
-      if (editable !== undefined && setBuffer(editable)) setBufText(editable)
+      if (editable !== undefined && setBuffer(editable, props.initialCursor?.() ?? editable.length))
+        setBufText(editable)
     }
     ta?.focus()
     props.registerFocus?.(() => ta?.focus())
@@ -1031,7 +1037,14 @@ export function Composer(props: {
             // macOS Option as meta, and Ctrl+Backspace is also delete-word, so
             // neither modifier may be broadened into a line kill.
             { action: 'delete-to-line-start', name: 'backspace', super: true },
-            { action: 'delete-to-line-end', name: 'delete', super: true }
+            { action: 'delete-to-line-end', name: 'delete', super: true },
+            // Extended keyboard protocols may preserve Shift in the modifiers
+            // while reporting the printable key as uppercase. Cover both cases
+            // for the common Ctrl/Cmd+Shift+Z redo gesture.
+            { action: 'redo', ctrl: true, name: 'z', shift: true },
+            { action: 'redo', ctrl: true, name: 'Z', shift: true },
+            { action: 'redo', name: 'z', shift: true, super: true },
+            { action: 'redo', name: 'Z', shift: true, super: true }
           ]}
           onMouseDown={() => ta?.focus()}
           onSubmit={submit}
@@ -1043,6 +1056,7 @@ export function Composer(props: {
           onCursorChange={() => {
             snapImageCursor()
             syncCursorLine()
+            props.onCursorChange?.(ta?.cursorOffset ?? 0)
           }}
           onContentChange={() => {
             const text = ta?.plainText ?? ''

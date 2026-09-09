@@ -111,6 +111,26 @@ describe('session-store replacement boundary', () => {
     }
   })
 
+  test('queues remain owned by profile and session while navigation restores each FIFO', () => {
+    const store = createSessionStore()
+    store.adoptFreshSession('session-a', { profile_name: 'work' })
+    store.enqueuePrompt('a one')
+    store.enqueuePrompt('a two')
+
+    store.adoptFreshSession('session-b', { profile_name: 'work' })
+    expect(store.state.queuedPrompts).toEqual([])
+    store.enqueuePrompt('b only')
+
+    store.commitSessionSnapshot('session-a', [], { profile_name: 'work' }, () => true)
+    expect(store.state.queuedPrompts).toEqual(['a one', 'a two'])
+    expect(store.dequeuePrompt()).toBe('a one')
+
+    store.commitSessionSnapshot('session-b', [], { profile_name: 'work' }, () => true)
+    expect(store.state.queuedPrompts).toEqual(['b only'])
+    store.commitSessionSnapshot('session-a', [], { profile_name: 'other' }, () => true)
+    expect(store.state.queuedPrompts).toEqual([])
+  })
+
   test('detach leaves an honest no-session state after close/create failure', () => {
     const store = createSessionStore()
     store.setSessionId('closed-live')
@@ -197,6 +217,23 @@ describe('session-store replacement boundary', () => {
     expect(store.state.info.running).toBe(false)
     expect(store.isTurnInFlight()).toBe(true)
     store.apply({ type: 'session.info', session_id: 'live', payload: { running: false } })
+    expect(store.isTurnInFlight()).toBe(false)
+  })
+
+  test('authoritative idle snapshot heals missed completion chrome and blocking input', () => {
+    const store = createSessionStore()
+    store.adoptFreshSession('live', {})
+    store.apply({ type: 'message.start', session_id: 'live' })
+    store.apply({ type: 'message.delta', session_id: 'live', payload: { text: 'partial' } })
+    store.apply({ type: 'clarify.request', session_id: 'live', payload: { question: 'stale?', request_id: 'q1' } })
+    store.setStatus('thinking')
+
+    store.apply({ type: 'session.info', session_id: 'live', payload: { running: false } })
+
+    expect(store.state.info.running).toBe(false)
+    expect(store.state.status).toBeUndefined()
+    expect(store.state.prompt).toBeUndefined()
+    expect(store.state.messages.at(-1)?.streaming).toBe(false)
     expect(store.isTurnInFlight()).toBe(false)
   })
 

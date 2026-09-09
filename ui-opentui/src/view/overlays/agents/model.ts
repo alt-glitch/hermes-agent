@@ -41,6 +41,7 @@ export interface DashboardOutputEntry {
  * view-boundary normalizer below.
  */
 export interface DashboardAgent extends SubagentTreeItem {
+  readonly acceptingSteer?: boolean
   readonly taskLabel?: string
   readonly endedAt?: number
   readonly traceDropped?: number

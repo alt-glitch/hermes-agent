@@ -99,6 +99,8 @@ export interface AppProps {
     interrupt: (id: string) => Promise<string | void>
     interruptSubtree: (ids: readonly string[]) => Promise<string | void>
     setPaused: (paused: boolean) => Promise<string | void>
+    tail: (id: string) => Promise<{ readonly available: boolean; readonly text: string; readonly truncated: boolean }>
+    steer: (id: string, text: string) => Promise<string>
   }
 }
 
@@ -255,9 +257,11 @@ export function App(props: AppProps) {
                         registerFocus={fn => (focusComposer = fn)}
                         onDoubleEsc={openPromptHistory}
                         initialDraft={() => props.store.state.composerDraft}
+                        initialCursor={() => props.store.state.composerCursor}
                         clearVersion={() => props.store.state.composerClearVersion}
                         replaceVersion={() => props.store.state.composerReplaceVersion}
                         onDraftChange={text => props.store.setComposerDraft(text)}
+                        onCursorChange={cursor => props.store.setComposerCursor(cursor)}
                         queued={() => props.store.state.queuedPrompts}
                         queueEditIndex={() => props.store.state.queueEditIndex}
                         onQueueEdit={index => {
@@ -334,6 +338,7 @@ export function App(props: AppProps) {
                   <Show when={subagentsVisible()}>
                     <AgentsTray
                       subagents={props.store.state.subagents}
+                      collapsed={props.store.state.agentsTrayCollapsed}
                       onOpen={id => props.store.openDashboard(id)}
                       onExit={() => focusComposer?.()}
                       bind={api => (trayApi = api)}
@@ -362,7 +367,9 @@ export function App(props: AppProps) {
                   : {
                       onKillAgent: props.agentsOps.interrupt,
                       onKillSubtree: props.agentsOps.interruptSubtree,
-                      onPauseChange: props.agentsOps.setPaused
+                      onPauseChange: props.agentsOps.setPaused,
+                      onLoadTail: props.agentsOps.tail,
+                      onSteerAgent: props.agentsOps.steer
                     })}
               />
             </Match>

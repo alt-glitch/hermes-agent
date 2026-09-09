@@ -387,6 +387,19 @@ describe('account, personality, and rollback commands', () => {
     expect(p.system).toContain('Run /subscription to change plan · /topup to add to your balance')
   })
 
+  test('usage marks locally estimated context values', async () => {
+    const p = makeCtx(async () => ({
+      calls: 1,
+      context_estimated: true,
+      context_max: 100,
+      context_percent: 20,
+      context_source: 'local_estimate',
+      context_used: 20
+    }))
+    await dispatchSlash('/usage', p.ctx)
+    expect(p.paged.at(-1)?.text).toContain('Context: ~20 / 100 (~20%)')
+  })
+
   test('credits is no longer a native alias and follows the gateway dispatch ladder', async () => {
     const p = makeCtx(async method => (method === 'slash.exec' ? { output: 'unknown command: credits' } : {}))
     await dispatchSlash('/credits', p.ctx)

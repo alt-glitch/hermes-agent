@@ -100,6 +100,40 @@ describe('native agents dashboard parity', () => {
     vi.useRealTimers()
   })
 
+  test('live tail polls the selected child and steer reports queued acceptance without claiming delivery', async () => {
+    const loadTail = vi.fn(async () => ({ available: true, text: 'LIVE_CHILD_OUTPUT', truncated: true }))
+    const steer = vi.fn(async () => 'queued for child — applied at the next tool boundary')
+    const probe = await renderProbe(
+      dashboardNode({
+        subagents: [agent('live-child', 'Live child', { acceptingSteer: true })],
+        onLoadTail: loadTail,
+        onSteerAgent: steer
+      }),
+      { height: 24, kittyKeyboard: true, width: 96 }
+    )
+    try {
+      probe.keys.pressKey('t')
+      await probe.settle()
+      expect(loadTail).toHaveBeenCalledWith('live-child')
+      expect(probe.frame()).toContain('[last 16 KiB]')
+      expect(probe.frame()).toContain('LIVE_CHILD_OUTPUT')
+
+      probe.keys.pressEscape()
+      await probe.settle()
+      probe.keys.pressEscape()
+      await probe.settle()
+      probe.keys.pressKey('e')
+      await probe.keys.typeText('take the safer path')
+      probe.keys.pressEnter()
+      await probe.settle()
+      expect(steer).toHaveBeenCalledWith('live-child', 'take the safer path')
+      expect(probe.frame()).toContain('queued for child — applied at the next tool boundary')
+      expect(probe.frame()).not.toContain('delivered')
+    } finally {
+      probe.destroy()
+    }
+  })
+
   test.each([false, true].flatMap(replay => [96, 124].map(width => ({ replay, width }))))(
     'every retained detail row is reachable by paging (replay=$replay, width=$width)',
     async ({ replay, width }) => {

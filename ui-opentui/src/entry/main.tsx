@@ -22,7 +22,7 @@
 import { createDefaultOpenTuiKeymap } from '@opentui/keymap/opentui'
 import { KeymapProvider } from '@opentui/keymap/solid'
 import { render } from '@opentui/solid'
-import { Cause, Deferred, Duration, Effect } from 'effect'
+import { Cause, Deferred, Duration, Effect, Option } from 'effect'
 import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import type { KeyEvent } from '@opentui/core'
@@ -49,6 +49,7 @@ import { acquireRenderer, redrawRenderer, selectionCopyText } from '../boundary/
 import { createAgentInterrupts } from '../boundary/agentInterrupts.ts'
 import { decodeImageAttachResponse, decodeSetupStatusResponse } from '../boundary/schema/ExternalInputResponses.ts'
 import { decodeVoiceRecordResponse } from '../boundary/schema/VoiceResponses.ts'
+import { decodeSubagentSteerResponse, decodeSubagentTailResponse } from '../boundary/schema/Delegation.ts'
 import { decodePetGalleryResponse, decodePetSelectResponse } from '../boundary/schema/PetResponses.ts'
 import {
   decodePluginsListResponse,
@@ -106,6 +107,8 @@ import {
   actionExitBlocked,
   ctrlCAction,
   DASHBOARD_NEW_SESSION_MESSAGE,
+  isAgentsDashboardKey,
+  isAgentsDockToggleKey,
   isExitHotkey,
   isRedrawHotkey
 } from '../logic/hotkeys.ts'
@@ -751,11 +754,49 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           })
       })
 
+      interface DelegationStatusPacket {
+        readonly response: unknown
+        readonly revision: number
+        readonly sessionId: string
+      }
       const delegationStatusRefresher = createDelegationStatusRefresher({
-        apply: raw => store.applyDelegationStatusResponse(raw),
-        fetch: () => Effect.runPromise(gateway.request('delegation.status', { session_id: gateway.sessionId() ?? '' })),
+        apply: raw => {
+          if (!raw || typeof raw !== 'object') return false
+          const packet = raw as DelegationStatusPacket
+          if (packet.sessionId !== gateway.sessionId() || packet.sessionId !== store.state.sessionId) return true
+          return store.applyDelegationStatusResponse(packet.response, Date.now(), packet.revision)
+        },
+        fetch: async (): Promise<DelegationStatusPacket> => {
+          const sessionId = gateway.sessionId()
+          if (!sessionId) throw new Error('no active session')
+          const revision = store.getDelegationControlRevision()
+          const response = await Effect.runPromise(gateway.request('delegation.status', { session_id: sessionId }))
+          return { response, revision, sessionId }
+        },
         onFailure: cause => getLog().warn('agents', 'delegation.status failed', { cause: String(cause) }),
         onInvalid: () => getLog().warn('agents', 'invalid delegation.status response')
+      })
+
+      interface SubagentSnapshotPacket {
+        readonly response: unknown
+        readonly sessionId: string
+      }
+      const subagentListRefresher = createDelegationStatusRefresher({
+        intervalMs: 1_000,
+        apply: packet => {
+          if (!packet || typeof packet !== 'object') return false
+          const value = packet as SubagentSnapshotPacket
+          if (value.sessionId !== gateway.sessionId() || value.sessionId !== store.state.sessionId) return false
+          return store.applySubagentListResponse(value.response)
+        },
+        fetch: async (): Promise<SubagentSnapshotPacket> => {
+          const sessionId = gateway.sessionId()
+          if (!sessionId) throw new Error('no active session')
+          const response = await Effect.runPromise(gateway.request('subagent.list', { session_id: sessionId }))
+          return { response, sessionId }
+        },
+        onFailure: cause => getLog().debug('agents', 'subagent.list failed', { cause: String(cause) }),
+        onInvalid: () => getLog().debug('agents', 'stale or invalid subagent.list response')
       })
 
       const activeSessionsRefresher = createDelegationStatusRefresher({
@@ -771,13 +812,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         onInvalid: () => getLog().warn('sessions', 'invalid session.active_list response')
       })
       const activeSessionsTimer = setInterval(() => {
-        if (gateway.sessionId()) void activeSessionsRefresher.refresh()
+        if (gateway.sessionId()) {
+          void activeSessionsRefresher.refresh()
+          void subagentListRefresher.refresh()
+        }
       }, 1_500)
       activeSessionsTimer.unref()
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           clearInterval(activeSessionsTimer)
           activeSessionsRefresher.invalidate()
+          subagentListRefresher.invalidate()
         })
       )
 
@@ -861,11 +906,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         if (event.type === 'subagent.spawn_requested' || event.type === 'subagent.start') {
           if (store.consumeAgentsNudge()) store.setStatus('subagents working · /agents to watch live')
           void delegationStatusRefresher.refresh(store.state.delegation.maxSpawnDepth === null)
+          void subagentListRefresher.refresh(true)
         } else if (event.type === 'gateway.exited') {
           delegationStatusRefresher.invalidate()
           activeSessionsRefresher.invalidate()
+          subagentListRefresher.invalidate()
         } else if (event.type === 'gateway.ready') {
           void delegationStatusRefresher.refresh(true)
+          if (gateway.sessionId()) void subagentListRefresher.refresh(true)
           if (gateway.sessionId()) void activeSessionsRefresher.refresh(true)
           // Arm "Hey Hermes" if this surface owns it (the server gates on
           // config — upstream 86d5b8b90f). Fire-and-forget + idempotent
@@ -942,10 +990,6 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         }
         if (pendingSteerCount > 0) {
           store.pushSystem(`wait for ${pendingSteerCount} pending steer request(s) before trying to ${what}`)
-          return true
-        }
-        if (store.queuedCount() > 0) {
-          store.pushSystem(`send or delete ${store.queuedCount()} queued message(s) before trying to ${what}`)
           return true
         }
         if (heldTransitionBlocks(transitionSubmissions.length, heldTransitionOwner, requestedOwner)) {
@@ -1540,6 +1584,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       let toggleVoiceRecording: () => void = () => {}
       let openModelPicker: () => void = () => {}
       const onGlobalAction = (key: KeyEvent) => {
+        if (isAgentsDashboardKey(key) && !actionExitBlocked(store.state)) {
+          key.preventDefault()
+          store.openDashboard()
+          return
+        }
+        if (isAgentsDockToggleKey(key) && !actionExitBlocked(store.state)) {
+          key.preventDefault()
+          store.toggleAgentsTrayCollapsed()
+          return
+        }
         if (
           isVoiceRecordKey(key, store.state.voice.recordKey) &&
           !actionExitBlocked(store.state) &&
@@ -2214,8 +2268,38 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         delete: (id: string) => Effect.runPromise(gateway.request('learning.delete', { id }))
       }
       const agentsOps = {
-        ...createAgentInterrupts(id => Effect.runPromise(gateway.request('subagent.interrupt', { subagent_id: id }))),
-        refresh: () => delegationStatusRefresher.refresh(true).then(() => undefined),
+        ...createAgentInterrupts(id => {
+          const sessionId = gateway.sessionId()
+          if (!sessionId) return Promise.reject(new Error('no active session'))
+          return Effect.runPromise(gateway.request('subagent.interrupt', { session_id: sessionId, subagent_id: id }))
+        }),
+        refresh: () =>
+          Promise.all([delegationStatusRefresher.refresh(true), subagentListRefresher.refresh(true)]).then(
+            () => undefined
+          ),
+        tail: async (id: string) => {
+          const sessionId = gateway.sessionId()
+          if (!sessionId || store.state.sessionId !== sessionId) throw new Error('no active session')
+          const decoded = decodeSubagentTailResponse(
+            await Effect.runPromise(gateway.request('subagent.tail', { session_id: sessionId, subagent_id: id }))
+          )
+          if (Option.isNone(decoded)) throw new Error('invalid subagent.tail response')
+          if (gateway.sessionId() !== sessionId || store.state.sessionId !== sessionId)
+            throw new Error('session changed')
+          return decoded.value
+        },
+        steer: async (id: string, text: string): Promise<string> => {
+          const sessionId = gateway.sessionId()
+          if (!sessionId || store.state.sessionId !== sessionId) throw new Error('no active session')
+          const decoded = decodeSubagentSteerResponse(
+            await Effect.runPromise(gateway.request('subagent.steer', { session_id: sessionId, subagent_id: id, text }))
+          )
+          if (Option.isNone(decoded)) throw new Error('steer acknowledgement uncertain')
+          if (gateway.sessionId() !== sessionId || store.state.sessionId !== sessionId)
+            throw new Error('session changed before steer acknowledgement')
+          if (decoded.value.status === 'queued') return 'queued for child — applied at the next tool boundary'
+          throw new Error('not queued — child finished or no longer accepts guidance')
+        },
         setPaused: async (paused: boolean): Promise<string> => {
           try {
             const raw = await Effect.runPromise(gateway.request('delegation.pause', { paused }))
@@ -2413,10 +2497,6 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('finish the current session mutation before starting a live sibling')
           return undefined
         }
-        if (store.queuedCount() > 0) {
-          store.pushSystem(`send or delete ${store.queuedCount()} queued message(s) before starting a live sibling`)
-          return undefined
-        }
         if (heldTransitionBlocks(transitionSubmissions.length, heldTransitionOwner, 'live-new')) {
           store.pushSystem('held submissions belong to another session switch — retry it or /queue --clear')
           return undefined
@@ -2505,10 +2585,6 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         }
         if (pendingSteerCount > 0) {
           store.pushSystem(`wait for ${pendingSteerCount} pending steer request(s) before switching live sessions`)
-          return
-        }
-        if (store.queuedCount() > 0) {
-          store.pushSystem(`send or delete ${store.queuedCount()} queued message(s) before switching live sessions`)
           return
         }
         const transitionOwner = `activate:${target}`

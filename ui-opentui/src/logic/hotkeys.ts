@@ -9,6 +9,35 @@ interface ActionKey {
   readonly super?: boolean
 }
 
+interface AgentsKey extends ActionKey {
+  readonly option?: boolean
+  readonly shift?: boolean
+}
+
+export function isAgentsDashboardKey(key: AgentsKey): boolean {
+  return (
+    key.eventType !== 'release' &&
+    key.ctrl &&
+    !key.meta &&
+    key.super !== true &&
+    !key.option &&
+    !key.shift &&
+    key.name.toLowerCase() === 't'
+  )
+}
+
+export function isAgentsDockToggleKey(key: AgentsKey): boolean {
+  return (
+    key.eventType !== 'release' &&
+    !key.ctrl &&
+    !key.meta &&
+    key.super !== true &&
+    !key.option &&
+    !key.shift &&
+    key.name.toLowerCase() === 'f7'
+  )
+}
+
 interface ActionExitOverlayState {
   readonly backgroundPanel: boolean
   readonly billing: unknown
@@ -79,6 +108,8 @@ export function openTuiHotkeys(platform: NodeJS.Platform = process.platform): re
     ['Tab', 'apply completion'],
     ['↑/↓', 'completions / queued edit / input history / cursor'],
     ['Ctrl+X', 'delete queued message while editing'],
+    ['Ctrl+T', 'open live agents'],
+    ['F7', 'collapse / restore live-agent dock'],
     ['Enter Enter (empty)', 'stop the turn / force the next queued message'],
     ['Esc Esc', 'discard draft (recall with ↑) / open prompt history when empty'],
     ['Cmd/Super+Backspace/Delete', 'kill to current line start / end'],

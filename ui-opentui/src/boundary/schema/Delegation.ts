@@ -115,10 +115,53 @@ export type DelegationPauseRequest = typeof DelegationPauseRequestSchema.Type
 export const DelegationPauseResponseSchema = Schema.StructWithRest(Schema.Struct({ paused: Bool }), [UnknownFields])
 export type DelegationPauseResponse = typeof DelegationPauseResponseSchema.Type
 
-// ── subagent.interrupt ────────────────────────────────────────────────
+// ── session-owned live subagent controls ─────────────────────────────
+
+export const LiveSubagentStatusSchema = Schema.Literals(['queued', 'running'])
+export type LiveSubagentStatus = typeof LiveSubagentStatusSchema.Type
+
+export const LiveSubagentSnapshotSchema = Schema.StructWithRest(
+  Schema.Struct({
+    accepting_steer: Bool,
+    delegation_id: Schema.NullOr(Str),
+    depth: NonNegativeInt,
+    goal: Str,
+    last_tool: Schema.NullOr(Str),
+    model: Schema.NullOr(Str),
+    parent_id: Schema.NullOr(Str),
+    started_at: Num,
+    status: LiveSubagentStatusSchema,
+    subagent_id: Schema.NonEmptyString,
+    tool_count: NonNegativeInt
+  }),
+  [UnknownFields]
+)
+export type LiveSubagentSnapshot = typeof LiveSubagentSnapshotSchema.Type
+
+export const SubagentListResponseSchema = Schema.StructWithRest(
+  Schema.Struct({
+    // Async completion records are intentionally not projected as agents.
+    delegations: Schema.Array(Schema.Unknown),
+    subagents: Schema.Array(LiveSubagentSnapshotSchema)
+  }),
+  [UnknownFields]
+)
+export type SubagentListResponse = typeof SubagentListResponseSchema.Type
+
+export const SubagentTailResponseSchema = Schema.StructWithRest(
+  Schema.Struct({ available: Bool, subagent_id: Schema.NonEmptyString, text: Str, truncated: Bool }),
+  [UnknownFields]
+)
+export type SubagentTailResponse = typeof SubagentTailResponseSchema.Type
+
+export const SubagentSteerResponseSchema = Schema.StructWithRest(
+  Schema.Struct({ status: Schema.Literals(['queued', 'rejected']), subagent_id: Str, text: Str }),
+  [UnknownFields]
+)
+export type SubagentSteerResponse = typeof SubagentSteerResponseSchema.Type
 
 export const SubagentInterruptRequestSchema = Schema.StructWithRest(
-  Schema.Struct({ subagent_id: Schema.NonEmptyString }),
+  Schema.Struct({ session_id: Schema.NonEmptyString, subagent_id: Schema.NonEmptyString }),
   [UnknownFields]
 )
 export type SubagentInterruptRequest = typeof SubagentInterruptRequestSchema.Type
@@ -215,6 +258,9 @@ export type UsageActiveSubagents = typeof UsageActiveSubagentsSchema.Type
 export const decodeDelegationStatusResponse = Schema.decodeUnknownOption(DelegationStatusResponseSchema)
 export const decodeDelegationPauseRequest = Schema.decodeUnknownOption(DelegationPauseRequestSchema)
 export const decodeDelegationPauseResponse = Schema.decodeUnknownOption(DelegationPauseResponseSchema)
+export const decodeSubagentListResponse = Schema.decodeUnknownOption(SubagentListResponseSchema)
+export const decodeSubagentTailResponse = Schema.decodeUnknownOption(SubagentTailResponseSchema)
+export const decodeSubagentSteerResponse = Schema.decodeUnknownOption(SubagentSteerResponseSchema)
 export const decodeSubagentInterruptRequest = Schema.decodeUnknownOption(SubagentInterruptRequestSchema)
 export const decodeSubagentInterruptResponse = Schema.decodeUnknownOption(SubagentInterruptResponseSchema)
 export const decodeSpawnTreeSaveRequest = Schema.decodeUnknownOption(SpawnTreeSaveRequestSchema)

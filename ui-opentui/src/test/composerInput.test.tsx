@@ -15,6 +15,7 @@
  * INTERNALLY — the viewport follows the cursor, and Up/Down in a multi-line
  * buffer are line navigation, never history recall.
  */
+import { TextareaRenderable, type Renderable } from '@opentui/core'
 import { describe, expect, test } from 'vitest'
 
 import { COMPOSER_MAX_ROWS, envComposerRows } from '../logic/env.ts'
@@ -31,6 +32,18 @@ interface Harness {
   probe: RenderProbe
   store: ReturnType<typeof createSessionStore>
   submitted: string[]
+}
+
+function descendants(root: Renderable): Renderable[] {
+  return root.getChildren().flatMap(child => [child, ...descendants(child)])
+}
+
+function composerTextarea(h: Harness): TextareaRenderable {
+  const textarea = descendants(h.probe.renderer.root).find(
+    (item): item is TextareaRenderable => item instanceof TextareaRenderable
+  )
+  if (!textarea) throw new Error('composer textarea not mounted')
+  return textarea
 }
 
 async function mountComposer(opts?: { kitty?: boolean; history?: string[] }): Promise<Harness> {
@@ -57,6 +70,51 @@ async function pressDoubleEsc(h: Harness): Promise<void> {
 }
 
 describe('readline line editing parity', () => {
+  test('preserves insertion point while the agents dashboard owns the screen', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('abcd')
+      h.probe.keys.pressArrow('left')
+      h.probe.keys.pressArrow('left')
+      await h.probe.settle()
+      expect({ cursor: h.store.state.composerCursor, draft: h.store.state.composerDraft }).toEqual({
+        cursor: 2,
+        draft: 'abcd'
+      })
+
+      h.store.openDashboard()
+      await h.probe.settle()
+      h.store.closeDashboard()
+      await h.probe.settle()
+      expect(composerTextarea(h).cursorOffset).toBe(2)
+      await h.probe.keys.typeText('X')
+      expect(h.store.state.composerDraft).toBe('abXcd')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
+  test('accepts uppercase Ctrl/Cmd Shift-Z redo events from extended keyboard protocols', async () => {
+    const h = await mountComposer({ kitty: true })
+    try {
+      await h.probe.keys.typeText('redo me')
+      const textarea = composerTextarea(h)
+      textarea.undo()
+      await h.probe.settle()
+      expect(textarea.plainText).toBe('redo m')
+      h.probe.keys.pressKey('Z', { ctrl: true, shift: true })
+      await h.probe.settle()
+      expect(textarea.plainText).toBe('redo me')
+
+      h.probe.keys.pressKey('z', { super: true })
+      h.probe.keys.pressKey('Z', { shift: true, super: true })
+      await h.probe.settle()
+      expect(textarea.plainText).toBe('redo me')
+    } finally {
+      h.probe.destroy()
+    }
+  })
+
   test('Super+Backspace kills to the current line start', async () => {
     const h = await mountComposer({ kitty: true })
     try {

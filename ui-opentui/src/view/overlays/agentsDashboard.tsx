@@ -2,7 +2,7 @@
  * Production native /agents surface. Transport remains outside the view:
  * callers supply immutable live/history state plus pause/kill callbacks.
  */
-import { type BoxRenderable, type ScrollBoxRenderable } from '@opentui/core'
+import { type BoxRenderable, type ScrollBoxRenderable, type TextareaRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
@@ -42,7 +42,7 @@ import {
 } from './agents/model.ts'
 import { AgentDetail, AgentListRow, AgentsDiffView, AgentsTimeline, DelegationSummary } from './agents/panes.tsx'
 
-type DashboardMode = 'detail' | 'list'
+type DashboardMode = 'detail' | 'list' | 'steer' | 'tail'
 type DashboardActionResult = string | void
 type MaybePromise<T> = Promise<T> | T
 
@@ -62,12 +62,131 @@ export interface AgentsDashboardProps {
   readonly onKillAgent?: (id: string) => MaybePromise<DashboardActionResult>
   readonly onKillSubtree?: (ids: readonly string[]) => MaybePromise<DashboardActionResult>
   readonly onPauseChange?: (paused: boolean) => MaybePromise<DashboardActionResult>
+  readonly onLoadTail?: (
+    id: string
+  ) => Promise<{ readonly available: boolean; readonly text: string; readonly truncated: boolean }>
+  readonly onSteerAgent?: (id: string, text: string) => Promise<string>
   /** Subagent id to preselect on open (Enter from the agents tray). */
   readonly preselect?: string
 }
 
 const EMPTY_HISTORY: SpawnHistoryState = Object.freeze({ snapshots: Object.freeze([]) })
 const EMPTY_DELEGATION: DelegationState = createDelegationState()
+
+function AgentTail(props: {
+  readonly id: string
+  readonly load: AgentsDashboardProps['onLoadTail']
+  readonly onUpdate: () => void
+}) {
+  const theme = useTheme()
+  const [text, setText] = createSignal('Loading live transcript…')
+  createEffect(
+    on(
+      () => props.id,
+      id => {
+        setText('Loading live transcript…')
+        let alive = true
+        let pending = false
+        const refresh = async (): Promise<void> => {
+          if (pending || props.load === undefined) return
+          pending = true
+          try {
+            const result = await props.load(id)
+            if (!alive) return
+            setText(
+              result.available
+                ? `${result.truncated ? '[last 16 KiB]\n' : ''}${result.text}`
+                : 'Live transcript unavailable; the child may have finished. Streamed progress remains in Details.'
+            )
+            queueMicrotask(props.onUpdate)
+          } catch {
+            if (alive) setText('Could not refresh the live transcript.')
+          } finally {
+            pending = false
+          }
+        }
+        void refresh()
+        const timer = setInterval(() => void refresh(), 1_500)
+        onCleanup(() => {
+          alive = false
+          clearInterval(timer)
+        })
+      }
+    )
+  )
+  return (
+    <box style={{ flexDirection: 'column', paddingRight: 1 }}>
+      <text fg={theme().color.accent}>
+        <b>Live transcript · {props.id}</b>
+      </text>
+      <text fg={theme().color.text} wrapMode="word">
+        {text()}
+      </text>
+    </box>
+  )
+}
+
+function AgentSteer(props: {
+  readonly id: string
+  readonly onPending: (pending: boolean) => void
+  readonly steer: AgentsDashboardProps['onSteerAgent']
+}) {
+  const theme = useTheme()
+  const [feedback, setFeedback] = createSignal(
+    'Guidance queues at the next tool boundary; current work is not interrupted.'
+  )
+  const [pending, setPending] = createSignal(false)
+  let input: TextareaRenderable | undefined
+  onMount(() => input?.focus())
+
+  const submit = (): void => {
+    const text = input?.plainText.trim() ?? ''
+    if (!text || pending() || props.steer === undefined) return
+    setPending(true)
+    props.onPending(true)
+    setFeedback('Queueing…')
+    void props
+      .steer(props.id, text)
+      .then(message => {
+        setFeedback(message)
+        input?.setText('')
+      })
+      .catch(cause => setFeedback(cause instanceof Error ? cause.message : 'steer failed'))
+      .finally(() => {
+        setPending(false)
+        props.onPending(false)
+      })
+  }
+
+  return (
+    <box style={{ flexDirection: 'column', flexGrow: 1, minHeight: 0, paddingRight: 1 }}>
+      <text fg={theme().color.accent}>
+        <b>Steer · {props.id}</b>
+      </text>
+      <text fg={theme().color.muted}>{feedback()}</text>
+      <box style={{ flexDirection: 'row', marginTop: 1 }}>
+        <text fg={theme().color.primary}>❯ </text>
+        <textarea
+          ref={element => (input = element)}
+          maxHeight={6}
+          placeholder="Guidance for this child"
+          placeholderColor={theme().color.muted}
+          textColor={theme().color.text}
+          cursorColor={theme().color.accent}
+          keyBindings={[
+            { action: 'submit', name: 'return' },
+            { action: 'newline', name: 'return', shift: true }
+          ]}
+          onSubmit={submit}
+          style={{ flexGrow: 1, minWidth: 0 }}
+        />
+      </box>
+      <text fg={theme().color.muted}>
+        Enter queue · Shift+Enter newline · Esc back · main composer draft is preserved
+      </text>
+    </box>
+  )
+}
 
 function DiffSurface(props: { readonly pair: AgentsDashboardDiffPair; readonly width: number }) {
   const agentsA = createMemo(() => snapshotDashboardAgents(props.pair.baseline))
@@ -110,6 +229,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   )
   const [flash, setFlash] = createSignal('')
   const [actionPending, setActionPending] = createSignal(false)
+  const [steerPending, setSteerPending] = createSignal(false)
   const [nowMs, setNowMs] = createSignal(Date.now())
   const [following, setFollowing] = createSignal(true)
   const [dashboardHeight, setDashboardHeight] = createSignal(dims().height)
@@ -195,8 +315,8 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       history().snapshots.length > 0
         ? ` · [ / ] history ${String(historyIndex())}/${String(history().snapshots.length)}`
         : ''
-    const full = `↑↓/jk move · g/G top/bottom · Enter/→ open detail${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · ? keys · q close`
-    const medium = `↑↓ move · Enter/→ open detail · s/f view${locked} · ? keys · q close`
+    const full = `↑↓/jk move · g/G top/bottom · Enter/→ detail · t tail · e steer${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · ? keys · q close`
+    const medium = `↑↓ move · Enter detail · t tail · e steer · s/f view${locked} · ? keys · q close`
     const compact = `↑↓ move · Enter open · ? keys · q close${replayMode() ? ' · controls locked' : ''}`
     const tiny = `↑↓ · Enter open · ? keys · q close`
     const available = Math.max(8, dims().width - 4)
@@ -227,8 +347,10 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   }
 
   function backOrClose(): void {
+    if (mode() === 'steer' && steerPending()) return
     if (showKeys()) setShowKeys(false)
     else if (props.diffPair !== undefined) closeWithCleanup()
+    else if (mode() === 'steer' || mode() === 'tail') setMode('detail')
     else if (mode() === 'detail') setMode('list')
     else closeWithCleanup()
   }
@@ -404,6 +526,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   }
 
   useKeyboard(key => {
+    if (mode() === 'steer') return
     if (key.ctrl || key.meta) {
       if (key.ctrl && !key.meta && (key.name === 'u' || key.name === 'd')) {
         const delta = (key.name === 'u' ? -1 : 1) * Math.max(4, dims().height - 12)
@@ -444,6 +567,22 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       togglePause()
       return
     }
+    if (mode() === 'list' && key.name === 'e' && selected() !== undefined && !replayMode()) {
+      key.preventDefault()
+      if (selected()?.item.acceptingSteer === false) setFlash('child no longer accepts guidance')
+      else setMode('steer')
+      return
+    }
+    if (mode() === 'list' && key.name === 't' && selected() !== undefined && !replayMode()) {
+      key.preventDefault()
+      setMode('tail')
+      return
+    }
+    if (mode() === 'list' && key.name === 'd' && selected() !== undefined) {
+      key.preventDefault()
+      setMode('detail')
+      return
+    }
     if (key.name === 'x' && key.shift) {
       killSubtree()
       return
@@ -463,7 +602,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       returnLive()
       return
     }
-    if (mode() === 'detail') {
+    if (mode() === 'detail' || mode() === 'tail') {
       const sectionKeys: Readonly<Record<string, string>> = {
         r: 'Reasoning',
         a: 'Activity',
@@ -641,7 +780,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                 </box>
                 <box
                   id="agents-detail"
-                  visible={wide() || mode() === 'detail'}
+                  visible={wide() || mode() !== 'list'}
                   flexDirection="column"
                   flexGrow={1}
                   minHeight={0}
@@ -663,27 +802,55 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                   </Show>
                   <Show when={selected()}>
                     {node => (
-                      <AgentDetail
-                        bindScroll={scroll => {
-                          detailScroll = scroll
-                          scroll.focusable = false
-                        }}
-                        node={node()}
-                        nowMs={displayNowMs()}
-                        replay={replayMode()}
-                        showAgentHeading={!showKeys() || dashboardHeight() > 9}
-                        following={following()}
-                        onPauseFollow={() => {
-                          setFollowing(false)
-                          setMode('detail')
-                        }}
-                        onReturnLive={returnLive}
-                        onFocus={() => setMode('detail')}
-                        onToggleSection={toggleSection}
-                        rowNumber={selectedIndex() + 1}
-                        sectionOpen={sectionOpen}
-                        width={Math.max(10, dims().width - (wide() ? listWidth() : 0) - 6)}
-                      />
+                      <Show
+                        when={mode() === 'tail' && !replayMode()}
+                        fallback={
+                          <Show
+                            when={mode() === 'steer' && !replayMode()}
+                            fallback={
+                              <AgentDetail
+                                bindScroll={scroll => {
+                                  detailScroll = scroll
+                                  scroll.focusable = false
+                                }}
+                                node={node()}
+                                nowMs={displayNowMs()}
+                                replay={replayMode()}
+                                showAgentHeading={!showKeys() || dashboardHeight() > 9}
+                                following={following()}
+                                onPauseFollow={() => {
+                                  setFollowing(false)
+                                  setMode('detail')
+                                }}
+                                onReturnLive={returnLive}
+                                onFocus={() => setMode('detail')}
+                                onToggleSection={toggleSection}
+                                rowNumber={selectedIndex() + 1}
+                                sectionOpen={sectionOpen}
+                                width={Math.max(10, dims().width - (wide() ? listWidth() : 0) - 6)}
+                              />
+                            }
+                          >
+                            <AgentSteer id={node().item.id} onPending={setSteerPending} steer={props.onSteerAgent} />
+                          </Show>
+                        }
+                      >
+                        <scrollbox
+                          ref={scroll => {
+                            detailScroll = scroll
+                            scroll.focusable = false
+                          }}
+                          flexGrow={1}
+                          minHeight={0}
+                          scrollX={false}
+                        >
+                          <AgentTail
+                            id={node().item.id}
+                            load={props.onLoadTail}
+                            onUpdate={() => detailScroll?.scrollTo(Number.MAX_SAFE_INTEGER)}
+                          />
+                        </scrollbox>
+                      </Show>
                     )}
                   </Show>
                 </box>
@@ -699,7 +866,13 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                 )}
               </Show>
               <text fg={theme().color.muted} wrapMode="none">
-                {showKeys() ? '↑↓ scroll keys · Esc back · q close' : mode() === 'list' ? listFooter() : detailFooter()}
+                {showKeys()
+                  ? '↑↓ scroll keys · Esc back · q close'
+                  : mode() === 'list'
+                    ? listFooter()
+                    : mode() === 'steer'
+                      ? 'Enter queue · Esc back · main composer draft preserved'
+                      : detailFooter()}
               </text>
             </box>
           </>

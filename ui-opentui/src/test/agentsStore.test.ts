@@ -81,6 +81,68 @@ describe('Agents gateway schemas', () => {
 })
 
 describe('Agents live reducer', () => {
+  test('a late status read cannot undo a newer pause acknowledgement', () => {
+    const store = createSessionStore()
+    const staleRevision = store.getDelegationControlRevision()
+    expect(store.applyDelegationPauseResponse({ paused: true }, 20)).toBe(true)
+
+    expect(
+      store.applyDelegationStatusResponse(
+        { active: [], max_concurrent_children: 2, max_spawn_depth: 3, paused: false },
+        30,
+        staleRevision
+      )
+    ).toBe(true)
+    expect(store.state.delegation).toMatchObject({ paused: true, updatedAtMs: 20 })
+  })
+
+  test('hydrates missed starts without letting an older snapshot resurrect terminal state', () => {
+    const store = createSessionStore()
+    store.adoptFreshSession('sid-1', { profile_name: 'work' })
+    expect(
+      store.applySubagentListResponse({
+        delegations: [],
+        subagents: [
+          {
+            accepting_steer: true,
+            delegation_id: null,
+            depth: 1,
+            goal: 'hydrate me',
+            last_tool: 'read_file',
+            model: 'test/model',
+            parent_id: null,
+            started_at: 1_700_000_000,
+            status: 'running',
+            subagent_id: 'child-1',
+            tool_count: 2
+          }
+        ]
+      })
+    ).toBe(true)
+    expect(store.state.subagents[0]).toMatchObject({ acceptingSteer: true, id: 'child-1', toolCount: 2 })
+
+    store.apply({ type: 'subagent.complete', payload: { status: 'completed', subagent_id: 'child-1' } })
+    store.applySubagentListResponse({
+      delegations: [],
+      subagents: [
+        {
+          accepting_steer: true,
+          delegation_id: null,
+          depth: 1,
+          goal: 'stale',
+          last_tool: null,
+          model: 'test/model',
+          parent_id: null,
+          started_at: 1_700_000_000,
+          status: 'running',
+          subagent_id: 'child-1',
+          tool_count: 1
+        }
+      ]
+    })
+    expect(store.state.subagents[0]).toMatchObject({ acceptingSteer: false, status: 'completed', toolCount: 2 })
+  })
+
   test('maps the full snake_case payload into one canonical camelCase row', () => {
     const store = createSessionStore()
     startTurn(store)

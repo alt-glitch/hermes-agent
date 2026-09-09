@@ -28,6 +28,8 @@ const UsageSchema = Schema.Struct({
   context_used: opt(Num),
   context_max: opt(Num),
   context_percent: opt(Num),
+  context_estimated: opt(Bool),
+  context_source: opt(Str),
   compressions: opt(Num),
   cost_usd: opt(Num)
 })
@@ -67,6 +69,8 @@ export const SessionInfoPatchSchema = Schema.Struct({
   context_used: opt(Num),
   context_max: opt(Num),
   context_percent: opt(Num),
+  context_estimated: opt(Bool),
+  context_source: opt(Str),
   compressions: opt(Num),
   usage: opt(UsageSchema)
 })
