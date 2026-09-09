@@ -216,10 +216,10 @@ function shortModel(model: string): string {
   return model.includes('/') ? (model.split('/').at(-1) ?? model) : model
 }
 
-/** Reasoning effort → a compact suffix; medium/normal/default are baseline noise. */
+/** Reasoning effort → a compact suffix; hidden only when unset/default. */
 export function effortSuffix(effort: string | undefined, fast: boolean | undefined): string {
   const parts: string[] = []
-  if (effort && !['default', 'medium', 'normal'].includes(effort)) parts.push(effort)
+  if (effort && effort !== 'default') parts.push(effort)
   if (fast) parts.push('fast')
   return parts.length ? ` ·${parts.join('·')}` : ''
 }

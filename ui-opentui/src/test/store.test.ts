@@ -563,15 +563,12 @@ describe('session store — ordered parts (Phase 2b)', () => {
     ])
   })
 
-  test('completion preserves reasoning even when its visible text matches the final answer', () => {
+  test('completion fallback reasoning never repeats the visible final answer', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start' })
     store.apply({ type: 'message.delta', payload: { text: 'same answer' } })
     store.apply({ type: 'message.complete', payload: { reasoning: 'same answer', text: 'same answer' } })
-    expect(store.state.messages.at(-1)?.parts).toMatchObject([
-      { type: 'reasoning', text: 'same answer' },
-      { type: 'text', text: 'same answer' }
-    ])
+    expect(store.state.messages.at(-1)?.parts).toMatchObject([{ type: 'text', text: 'same answer' }])
   })
 
   test('distinct completion fallback reasoning is ordered before streamed answer text', () => {

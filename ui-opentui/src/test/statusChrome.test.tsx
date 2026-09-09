@@ -141,10 +141,9 @@ describe('store.applyInfo — chrome merge', () => {
 
 // ── 3. pure logic ────────────────────────────────────────────────────────
 
-test('reasoning footer shows non-default effort and hides baseline aliases', () => {
+test('reasoning footer shows concrete medium effort but hides an unset/default effort', () => {
   expect(effortSuffix('xhigh', false)).toBe(' ·xhigh')
-  expect(effortSuffix('medium', false)).toBe('')
-  expect(effortSuffix('normal', false)).toBe('')
+  expect(effortSuffix('medium', false)).toBe(' ·medium')
   expect(effortSuffix('default', false)).toBe('')
   expect(effortSuffix(undefined, false)).toBe('')
 })
@@ -402,7 +401,7 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     }
   })
 
-  test('a session.info effort update removes the suffix when it returns to medium', async () => {
+  test('a session.info effort update repaints medium immediately', async () => {
     const store = seededStore()
     const probe = await renderProbe(bar(store), { width: 120, height: 3 })
     try {
@@ -411,7 +410,7 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
       store.apply({ type: 'session.info', payload: { reasoning_effort: 'medium' } })
       await probe.settle()
 
-      expect(probe.frame()).not.toContain('·medium')
+      expect(probe.frame()).toContain('·medium')
       expect(probe.frame()).not.toContain('·high')
     } finally {
       probe.destroy()
@@ -428,7 +427,7 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     expect(frame).toContain('~84k')
   })
 
-  test('medium effort remains omitted at compact widths', async () => {
+  test('medium effort stays pinned while lower-priority session and uptime segments yield', async () => {
     const store = seededStore()
     store.applyInfo({ reasoning_effort: 'medium' })
     store.setLiveSessionChrome(1, '')
@@ -437,7 +436,9 @@ describe('StatusBar frames (one left-aligned labeled line)', () => {
     const rows = frame.split('\n').filter(row => row.trim())
     const row = rows.find(value => value.includes('claude-opus-4-8')) ?? ''
 
-    expect(row).not.toContain('·medium')
+    expect(row).toContain('·medium')
+    expect(row).not.toContain('1 session')
+    expect(row).not.toContain('up:')
     expect(rows.filter(value => value.includes('│'))).toHaveLength(1)
   })
 
