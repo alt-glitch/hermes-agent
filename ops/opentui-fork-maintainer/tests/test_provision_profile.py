@@ -109,12 +109,12 @@ def test_reprovisioned_job_uses_subscription_for_main_and_compression(environmen
     spec.loader.exec_module(configure)
     job = configure.cron_update(profile / "runtime", profile)
     jc = _load_cron_job_config(job, "test", "test")
-    runtime, model, provider = _resolve_job_runtime(job, "test", jc)
-    assert provider == runtime["provider"] == "openai-codex"
+    runtime, model = _resolve_job_runtime(job, "test", jc)
+    assert runtime["provider"] == "openai-codex"
     assert runtime["api_mode"] == "codex_responses"
     assert model == provisioner.MODEL
     assert calls and not (profile / "auth.json").exists()
-    assert jc.cfg["auxiliary"]["compression"] == {"provider": provider, "model": model}
+    assert jc.cfg["auxiliary"]["compression"] == {"provider": runtime["provider"], "model": model}
     from hermes_cli.fallback_config import get_fallback_chain
     assert get_fallback_chain(jc.cfg) == []
     reset_cache()
