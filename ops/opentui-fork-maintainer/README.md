@@ -108,6 +108,20 @@ seven days while other eligible issues remain selectable. API failures are not
 empty queues. Feature-only work wakes even with no upstream delta, uses linear
 whole-diff review and leaves the upstream watermark unchanged. Captured open
 implementing PRs must be reconciled; the publisher refuses duplicate candidates.
+When upstream and approved feature work both stay nonempty, the wrapper gives
+them alternating opportunities based on the latest hash-bound terminal run
+outcome. Successful and failed attempts both count; a process restart therefore
+cannot reset issue-first selection and starve sync. Queued or in-flight manual
+and recovery work still wins before this choice. Missing history uses the
+issue-first default, while unreadable or unbound history wakes a diagnostic run
+without selecting either automatic lane.
+
+Issue 45 is a versioned scheduled-sync tracking route. Intake still validates
+its current approval, but never converts its prose into a linear issue-mode
+candidate. A behind probe consequently follows the ordinary scheduled-sync
+topology; an up-to-date probe leaves the tracking issue open. It is not recorded
+as delivered by feature intake, and only genuine scheduled publication and
+watermark evidence may support later reconciliation.
 The sole non-linear issue exception is coordinator-approved issue41/PR91 and
 issue66/PR87 reconciliation: the candidate begins with an exact two-parent merge
 of the captured fork base and captured same-repository implementing PR head,

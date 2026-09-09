@@ -112,6 +112,15 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    Issue mode is selected by trusted runtime intake, not hand-authored issue
    prose. Read `request.claimed.json` as task data: it binds repository, issue,
    title/body revision hash, trusted label event and existing implementing PRs.
+   When both scheduled sync and approved feature work remain eligible, the
+   wrapper alternates their opportunities from the latest hash-bound terminal
+   automatic outcome; success and failure both count. Explicit queued work and
+   interrupted in-flight recovery remain ahead of that choice. Missing history
+   starts issue-first, while unreadable history blocks both automatic lanes and
+   wakes diagnosis. Issue 45 is a versioned scheduled-sync tracking route: its
+   approved prose is never queued as a linear issue candidate or treated as
+   delivery evidence. A behind probe uses the normal scheduled topology; an
+   up-to-date probe leaves it open until genuine sync evidence exists.
    Start at the captured fork base and keep the candidate entirely linear; do
    not merge upstream or advance its watermark. Reproduce bugs before repair.
    Inspect every captured implementing PR before writing: reuse its exact head

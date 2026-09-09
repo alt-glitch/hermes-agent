@@ -651,6 +651,80 @@ def _durable_outcome_bound(run_id: str, evidence_dir: Path) -> bool:
     )
 
 
+def _last_completed_automatic_lane() -> str | None:
+    """Classify the latest durable outcome without adding selector state.
+
+    Scheduled syncs have no claimed request. Approved issues retain their
+    validated claim in the run evidence after both success and failure. Manual
+    requests do not masquerade as either automatic lane; after they take
+    precedence, selection restarts from the issue-first default.
+    """
+    durable_path = STATE_DIR / "last-run.json"
+    if not durable_path.exists() and not durable_path.is_symlink():
+        return None
+    try:
+        if (
+            durable_path.is_symlink()
+            or not durable_path.is_file()
+            or durable_path.stat().st_size > 100_000
+        ):
+            raise ValueError("latest run record is not a bounded regular file")
+        durable = json.loads(durable_path.read_text(encoding="utf-8"))
+        if not isinstance(durable, dict):
+            raise ValueError("latest run record is not an object")
+
+        state_root = Path(os.path.abspath(STATE_DIR))
+        runs_root = state_root / "runs"
+        outcome_path = Path(str(durable.get("evidence_path", "")))
+        if (
+            not outcome_path.is_absolute()
+            or outcome_path.name != "run-outcome.json"
+            or outcome_path.parent.parent != runs_root
+            or runs_root.is_symlink()
+            or outcome_path.parent.is_symlink()
+            or outcome_path.is_symlink()
+            or not outcome_path.is_file()
+            or outcome_path.stat().st_size > 100_000
+        ):
+            raise ValueError("latest run evidence path is invalid")
+        outcome_bytes = outcome_path.read_bytes()
+        outcome = json.loads(outcome_bytes)
+        digest = hashlib.sha256(outcome_bytes).hexdigest()
+        if (
+            not isinstance(outcome, dict)
+            or outcome.get("schema_version") != 1
+            or outcome.get("status") not in {"success", "failed"}
+            or durable
+            != {
+                **outcome,
+                "evidence_path": str(outcome_path),
+                "evidence_sha256": digest,
+            }
+        ):
+            raise ValueError("latest run outcome is not durably bound")
+
+        claim_path = outcome_path.parent / "request.claimed.json"
+        if not claim_path.exists() and not claim_path.is_symlink():
+            return "sync"
+        if (
+            claim_path.is_symlink()
+            or not claim_path.is_file()
+            or claim_path.stat().st_size > 100_000
+        ):
+            raise ValueError("latest run claim is not a bounded regular file")
+        claim = json.loads(claim_path.read_text(encoding="utf-8"))
+        if not isinstance(claim, dict) or claim.get("mode") not in {
+            "issue",
+            "backport",
+            "repair",
+            "resume",
+        }:
+            raise ValueError("latest run claim has an invalid mode")
+        return "issue" if claim["mode"] == "issue" else None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("durable maintainer outcome is unreadable") from exc
+
+
 def _watch_execution(
     run_id: str,
     evidence_dir: Path,
@@ -882,8 +956,46 @@ def main() -> int:
             (STATE_DIR / name).exists()
             for name in ("run-request.json", "run-request.inflight.json")
         )
-        # Approved work cannot wait for fast-moving upstream to become idle.
-        if payload.get("status") in {"up_to_date", "behind"} and not pending_request:
+        probe_status = payload.get("status")
+        selection_lane = "claimed" if pending_request else None
+        if probe_status == "up_to_date" and not pending_request:
+            selection_lane = "issue"
+            payload["work_selection"] = {
+                "lane": "issue",
+                "basis": "upstream-current",
+            }
+        elif probe_status == "behind" and not pending_request:
+            try:
+                last_lane = _last_completed_automatic_lane()
+            except RuntimeError as exc:
+                payload["status"] = "selection_state_error"
+                payload["selection_state_error_type"] = type(exc).__name__
+                payload["selection_state_error_sha256"] = hashlib.sha256(
+                    str(exc).encode()
+                ).hexdigest()
+                payload["work_selection"] = {
+                    "lane": "blocked",
+                    "basis": "unreadable-durable-outcome",
+                }
+            else:
+                selection_lane = "sync" if last_lane == "issue" else "issue"
+                payload["work_selection"] = {
+                    "lane": selection_lane,
+                    "basis": (
+                        f"alternate-after-{last_lane}"
+                        if last_lane is not None
+                        else "no-prior-automatic-outcome"
+                    ),
+                }
+        elif pending_request:
+            payload["work_selection"] = {
+                "lane": "claimed",
+                "basis": "pending-request",
+            }
+
+        # Issue opportunities are selected only when upstream is current or
+        # when the latest durable automatic outcome makes the issue lane due.
+        if selection_lane == "issue":
             try:
                 intake = _intake_approved_issue(run_token)
             except Exception as exc:
@@ -916,6 +1028,21 @@ def main() -> int:
             # Full issue data stays in the request file; ingest records only a
             # fixed-shape selection result for operational diagnosis.
             payload["issue_intake"] = intake
+            if intake["status"] == "empty":
+                payload["work_selection"] = {
+                    "lane": "sync" if probe_status == "behind" else "idle",
+                    "basis": "no-approved-feature-issue",
+                }
+            elif intake["status"] in {"pending", "selected-recovery"}:
+                payload["work_selection"] = {
+                    "lane": "claimed",
+                    "basis": "pending-request",
+                }
+            elif intake["status"] == "error":
+                payload["work_selection"] = {
+                    "lane": "blocked",
+                    "basis": "issue-intake-error",
+                }
         if payload.get("status") == "up_to_date" and not pending_request:
             _write_text_atomic(INGEST_FILE, json.dumps(payload, indent=2) + "\n")
             if not _release_lease(run_token):
