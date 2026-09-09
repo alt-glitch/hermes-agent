@@ -350,8 +350,12 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
     if (mode() === 'steer' && steerPending()) return
     if (showKeys()) setShowKeys(false)
     else if (props.diffPair !== undefined) closeWithCleanup()
-    else if (mode() === 'steer' || mode() === 'tail') setMode('detail')
-    else if (mode() === 'detail') setMode('list')
+    else if (mode() === 'steer' || mode() === 'tail') {
+      setMode('detail')
+      // Destroying the focused steer input does not focus its surviving parent.
+      // Keep Esc/Ctrl+C routed through the dashboard's focus-within close layer.
+      rootRef?.focus()
+    } else if (mode() === 'detail') setMode('list')
     else closeWithCleanup()
   }
 

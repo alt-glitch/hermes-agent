@@ -103,9 +103,11 @@ describe('native agents dashboard parity', () => {
   test('live tail polls the selected child and steer reports queued acceptance without claiming delivery', async () => {
     const loadTail = vi.fn(async () => ({ available: true, text: 'LIVE_CHILD_OUTPUT', truncated: true }))
     const steer = vi.fn(async () => 'queued for child — applied at the next tool boundary')
+    const close = vi.fn()
     const probe = await renderProbe(
       dashboardNode({
         subagents: [agent('live-child', 'Live child', { acceptingSteer: true })],
+        onClose: close,
         onLoadTail: loadTail,
         onSteerAgent: steer
       }),
@@ -129,6 +131,13 @@ describe('native agents dashboard parity', () => {
       expect(steer).toHaveBeenCalledWith('live-child', 'take the safer path')
       expect(probe.frame()).toContain('queued for child — applied at the next tool boundary')
       expect(probe.frame()).not.toContain('delivered')
+
+      // Leaving a focused textarea must restore the dashboard's close layer.
+      for (let step = 0; step < 3; step += 1) {
+        probe.keys.pressEscape()
+        await probe.settle()
+      }
+      expect(close).toHaveBeenCalledOnce()
     } finally {
       probe.destroy()
     }
