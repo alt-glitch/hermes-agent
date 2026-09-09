@@ -65,6 +65,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     home = _session_home(session)
     if (marker := read_turn_marker(home, session_key)) is None:
         return None
+    if not marker.get("auto_continue", True):
+        return None  # The mailbox owns recovery and receipt identity for imported turns.
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
     if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
@@ -566,7 +568,10 @@ def _handle_busy_submit(
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
-    """Claim and fire the accepted head prompt when the session is idle."""
+    """Claim and fire the accepted head prompt when the session is idle.
+
+    The queued user's message wins over lower-priority follow-ups.
+    """
     with _mcp_reload_admission_lock, _session_mutation_lock(session):
         with _sessions_lock:
             live_session = _sessions.get(sid)
@@ -581,14 +586,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 if not queued or session.get("running") or session.get("_busy_interrupt_pending"):
                     return False
                 queue_generation = int(session.get("_queued_prompt_generation", 0))
-                queued_prompts = session.get("queued_prompts") or []
-                session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
-                if not queued_prompts:
-                    session.pop("queued_prompts", None)
+                _ac_set_queue(session, session.get("queued_prompts") or [])
                 session["running"] = True
                 session["_turn_cancel_requested"] = False
-                if queued.get("transport") is not None:
-                    session["transport"] = queued["transport"]
+                queued_transport = queued.get("transport")
+                # The queuer's transport is pinned so the drained turn reaches the client that sent it — but
+                # ATTACHED, not rebound: a mid-turn prompt from a second client used to silence the first for the
+                # whole drained turn. A peer that disconnected while its prompt sat in the queue is skipped: the
+                # prompt still runs, only the dead pin is dropped.
+                if queued_transport is not None and not _transport_is_dead(queued_transport):
+                    _attach_session_transport(session, queued_transport)
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:

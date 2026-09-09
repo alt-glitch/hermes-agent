@@ -172,7 +172,7 @@ class TestRunningJobGuard:
 
         called = []
 
-        def create_execution_side_effect(job_id, source):
+        def create_execution_side_effect(job_id, source, **kwargs):
             if job_id == "failing-job":
                 raise RuntimeError("execution ledger unavailable")
             return {"id": f"{job_id}-execution"}
@@ -441,7 +441,7 @@ class TestTickDurableDispatch:
         monkeypatch.setattr(
             sched,
             "create_execution",
-            lambda job_id, source: (
+            lambda job_id, source, **_kwargs: (
                 events.append(("ledger", job_id)),
                 {"id": f"exec-{job_id}"},
             )[1],
@@ -523,7 +523,7 @@ class TestTickBatchAdvance:
         monkeypatch.setattr(
             sched,
             "create_execution",
-            lambda job_id, source: {"id": f"exec-{job_id}"},
+            lambda job_id, source, **_kwargs: {"id": f"exec-{job_id}"},
         )
         monkeypatch.setattr(
             sched,
@@ -603,7 +603,7 @@ class TestTickBatchAdvance:
         monkeypatch.setattr(
             sched,
             "create_execution",
-            lambda job_id, source: {"id": f"exec-{job_id}"},
+            lambda job_id, source, **_kwargs: {"id": f"exec-{job_id}"},
         )
         monkeypatch.setattr(
             sched,

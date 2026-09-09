@@ -150,7 +150,7 @@ def test_admitted_event_retries_after_history_failure_without_a_second_card(
     session.update({"agent": agent, "attached_images": [], "history": [], "history_version": 0})
     monkeypatch.setattr(server, "_sessions", {"live-notification": session})
     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: None)
-    monkeypatch.setattr(server, "_record_turn_marker", lambda *_: "")
+    monkeypatch.setattr(server, "_record_turn_marker", lambda *_args, **_kwargs: "")
 
     preparation_attempts = 0
 
@@ -311,7 +311,7 @@ def test_invoked_notification_settles_without_replaying_for_display_repair(
     session.update({"agent": agent, "attached_images": [], "history": [], "history_version": 0})
     monkeypatch.setattr(server, "_sessions", {"live-notification": session})
     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: None)
-    monkeypatch.setattr(server, "_record_turn_marker", lambda *_: "")
+    monkeypatch.setattr(server, "_record_turn_marker", lambda *_args, **_kwargs: "")
 
     def prepare(_sid, owned_session, st, text, _images):
         st.history = list(owned_session["history"])

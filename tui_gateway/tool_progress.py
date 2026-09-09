@@ -402,10 +402,13 @@ def _on_tool_progress(
     sid: str, event_type: str, name: str | None = None, preview: str | None = None,
     _args: dict | None = None, **_kwargs,
 ):
-    # Branch state and messages are application data, independent of tool-progress chrome.
+    if event_type == "tool.started" and name:
+        return
+    # Branch state and subagent messages are application data, not tool-progress chrome.
+    # They must survive display.tool_progress=off like todo.updated does.
     if event_type.startswith("subagent."):
         return _progress_subagent(sid, name, preview, _kwargs, event_type)
-    if not _tool_progress_enabled(sid) or (event_type == "tool.started" and name):
+    if not _tool_progress_enabled(sid):
         return
     handler, requires = _PROGRESS_HANDLERS.get(event_type, (None, None))
     if handler is not None and (requires is None or {"name": name, "preview": preview}[requires]):

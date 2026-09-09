@@ -68,8 +68,8 @@ def test_post_turn_completion_is_admitted_or_requeued(monkeypatch, tmp_path, ref
     assert process_registry.completion_queue.empty()
 
 
-def test_post_turn_receipt_keeps_its_event_after_drain_advances(monkeypatch):
-    """Async commit of the first event must not acknowledge the requeued next event."""
+def test_post_turn_batch_settles_each_claim_only_after_history_commit(monkeypatch):
+    """A completion batch keeps every event tied to its own commit-time claim."""
     from tools import async_delegation
 
     session = {"session_key": "stored", "history_lock": threading.RLock(), "running": False}
@@ -78,7 +78,11 @@ def test_post_turn_receipt_keeps_its_event_after_drain_advances(monkeypatch):
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_: False)
     monkeypatch.setattr(process_registry, "completion_queue", queue.Queue())
     monkeypatch.setattr(process_registry, "drain_notifications", lambda **_: [(first, "first"), (second, "second")])
-    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_: "first-claim")
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_event_delivery",
+        lambda event, _owner: f"{event['session_id']}-claim",
+    )
     completed, callbacks = [], []
     monkeypatch.setattr(async_delegation, "complete_event_delivery", lambda event, claim: completed.append((event, claim)))
 
@@ -88,7 +92,11 @@ def test_post_turn_receipt_keeps_its_event_after_drain_advances(monkeypatch):
 
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
     server._run_post_turn_followups("turn", "live", session, {}, None)
-    assert process_registry.completion_queue.get_nowait() is second
+    assert process_registry.completion_queue.empty()
+    assert len(callbacks) == 1
     assert not completed
     callbacks[0](server._HistoryCommitOutcome(True, True, True))
-    assert completed == [(first, "first-claim")]
+    assert completed == [
+        (first, "first-claim"),
+        (second, "second-claim"),
+    ]

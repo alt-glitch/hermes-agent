@@ -674,7 +674,7 @@ class TestSlackModelPickerGatewayIntegration:
 
         import yaml
 
-        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.event import MessageEvent, MessageType
         from gateway.session import SessionSource
 
         captured = {}
@@ -730,7 +730,7 @@ class TestSlackModelPickerGatewayIntegration:
     async def test_text_fallback_when_no_picker(self, tmp_path, monkeypatch):
         import yaml
 
-        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.event import MessageEvent, MessageType
         from gateway.session import SessionSource
 
         class SlackNoPickerAdapter:
