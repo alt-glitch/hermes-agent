@@ -2769,7 +2769,7 @@ def claim_job_for_fire(
                 if nxt:
                     job["next_run_at"] = nxt
                     save_jobs(jobs)
-            return False
+            return reject("occurrence_completed")
         if force:
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the

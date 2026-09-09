@@ -3700,14 +3700,19 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
         rejection_reason = None if claimed else "claim_lost"
         existing_owner = None
     if claimed_job is None:
-        if rejection_reason in {"active_fire_owner", "fire_claim_held"}:
-            reason = (
+        skip_reasons = {
+            "active_fire_owner": (
                 "Scheduled occurrence deferred because the job is already running under "
                 f"active fire owner {existing_owner}."
-                if rejection_reason == "active_fire_owner" else
+            ),
+            "fire_claim_held": (
                 "Scheduled occurrence deferred by an unexpired fire claim; "
                 "execution was not started and owner liveness is not asserted."
-            )
+            ),
+            "occurrence_completed": "Scheduled occurrence already completed; execution was not started.",
+        }
+        if rejection_reason in skip_reasons:
+            reason = skip_reasons[rejection_reason]
             skip_execution(job["execution_id"], reason=reason)
             logger.info("Job '%s': %s", job["id"], reason)
             return True

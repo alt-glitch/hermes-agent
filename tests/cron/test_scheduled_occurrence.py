@@ -95,6 +95,43 @@ def test_completed_occurrence_survives_restart_and_prestamp_rollback(tmp_path, m
     assert len(effect.read_text().splitlines()) == 4
 
 
+def test_completed_occurrence_keeps_typed_rejection_and_skips_dispatch(tmp_path, monkeypatch):
+    from datetime import timedelta
+
+    from cron import executions, jobs, scheduler
+    from hermes_time import now
+
+    def unexpected_execution(*_args, **_kwargs):
+        raise AssertionError('a completed occurrence must not execute again')
+
+    monkeypatch.setattr(scheduler, 'run_one_job', unexpected_execution)
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        stored = jobs.create_job(prompt='test', schedule='every 4h')
+        rows = jobs.load_jobs()
+        slot = (now() - timedelta(minutes=10)).isoformat()
+        rows[0]['next_run_at'] = slot
+        jobs.save_jobs(rows)
+        finished = executions.create_execution(stored['id'], source='builtin', scheduled_instant=slot)
+        executions.finish_execution(finished['id'], success=True)
+
+        outcome = jobs.claim_job_for_fire(stored['id'], return_outcome=True)
+        assert isinstance(outcome, jobs.FireClaimOutcome)
+        assert outcome.claimed_job is None
+        assert outcome.reason == 'occurrence_completed'
+        assert jobs.load_jobs()[0]['next_run_at'] != slot
+
+        # A dispatcher that already captured this slot must record a skip, not
+        # a failed execution, when the durable completion wins the claim race.
+        rows[0]['next_run_at'] = slot
+        jobs.save_jobs(rows)
+        dispatch = executions.create_execution(stored['id'], source='builtin', scheduled_instant=slot)
+        assert scheduler._process_due_job({**rows[0], 'execution_id': dispatch['id']}, None, None, False)
+        receipt = executions.get_execution(dispatch['id'])
+        assert receipt is not None
+        assert receipt['status'] == 'skipped'
+        assert 'already completed' in receipt['error']
+
+
 def test_ledger_migration_and_completion_identity(tmp_path, monkeypatch):
     import sqlite3
     from cron import executions, jobs
