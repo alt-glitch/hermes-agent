@@ -413,6 +413,17 @@ def _issue_workflow() -> Any:
     return module
 
 
+def _retained_sync() -> Any:
+    """Load the retained scheduled-sync evidence owner beside this runtime."""
+    path = Path(__file__).with_name("retained_sync.py")
+    spec = importlib.util.spec_from_file_location("_opentui_retained_sync", path)
+    if not path.is_file() or spec is None or spec.loader is None:
+        raise ControlError("retained sync owner could not be located beside the runtime")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _validate_request(value: Any) -> dict[str, Any]:
     if isinstance(value, dict) and value.get("mode") == "resume":
         if set(value) != {"mode", "source_run", "manifest_sha256", "packet_sha256", "pr", "base_sha", "candidate_sha"}:
@@ -432,7 +443,11 @@ def _validate_request(value: Any) -> dict[str, Any]:
         except (RuntimeError, ValueError, KeyError, OSError) as exc:
             raise ControlError("issue request has an invalid trusted binding") from exc
     if isinstance(value, dict) and value.get("mode") == "repair":
-        if set(value) != {"mode", "pr", "base_sha", "source_sha", "instruction"}:
+        fields = {"mode", "pr", "base_sha", "source_sha", "instruction"}
+        if frozenset(value) not in {
+            frozenset(fields),
+            frozenset(fields | {"retained_sync"}),
+        }:
             raise ControlError("repair request has an invalid shape")
         if type(value["pr"]) is not int or value["pr"] <= 0:
             raise ControlError("repair request requires a positive PR number")
@@ -442,6 +457,10 @@ def _validate_request(value: Any) -> dict[str, Any]:
         instruction = value["instruction"]
         if not isinstance(instruction, str) or not 1 <= len(instruction.strip()) <= 4000:
             raise ControlError("repair instruction must contain 1 to 4000 characters")
+        try:
+            _retained_sync().validate_request_provenance(value)
+        except RuntimeError as exc:
+            raise ControlError(str(exc)) from exc
         return {**value, "instruction": instruction.strip()}
     if not isinstance(value, dict) or set(value) != {"mode", "commits"}:
         raise ControlError("request must contain exactly mode and commits")
@@ -750,15 +769,34 @@ def _derive_run_binding(
     context = _captured_run_context(state_dir, evidence_root, token)
     if mode == "repair" and claimed_value["base_sha"] != context["base_sha"]:
         raise ControlError("repair base has moved; a new explicit request is required")
+    retained_sync = None
+    if mode == "repair":
+        try:
+            retained_sync = _retained_sync().authenticate(
+                state_dir,
+                claimed_value,
+                current_run_id=context["run_id"],
+            )
+        except RuntimeError as exc:
+            raise ControlError(str(exc)) from exc
+        if retained_sync is not None:
+            if last_synced != retained_sync["last_synced_upstream"]:
+                raise ControlError("retained sync watermark provenance changed")
     binding: dict[str, Any] = {
         "mode": mode,
         "request_sha256": request_sha,
         "last_synced_upstream": last_synced,
-        "captured_upstream": context["upstream_sha"],
+        "captured_upstream": (
+            retained_sync["upstream_sha"]
+            if retained_sync is not None
+            else context["upstream_sha"]
+        ),
         "captured_base": context["base_sha"],
     }
     if mode == "issue":
         binding["issue"] = _issue_workflow().binding_issue_fields(claimed_value)
+    if retained_sync is not None:
+        binding["retained_sync"] = retained_sync
     return binding
 
 
@@ -828,6 +866,11 @@ def _valid_run_binding(value: Any) -> bool:
         "issue",
     }:
         return False
+    if value["mode"] == "repair" and "retained_sync" in value:
+        return (
+            set(value) == common | {"retained_sync"}
+            and _retained_sync().valid_binding(value["retained_sync"])
+        )
     if value["mode"] != "issue":
         return set(value) == common
     return _issue_workflow().valid_issue_binding(value, common)
@@ -836,14 +879,16 @@ def _valid_run_binding(value: Any) -> bool:
 def _retained_pr_reconciliation(
     run_binding: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if run_binding.get("mode") != "issue":
-        return None
-    return _issue_workflow().retained_pr_reconciliation(run_binding.get("issue"))
+    if run_binding.get("mode") == "issue":
+        return _issue_workflow().retained_pr_reconciliation(run_binding.get("issue"))
+    return _retained_sync().retained_pr(run_binding)
 
 
 def _expected_review_mode(run_binding: dict[str, Any]) -> str:
     if run_binding["mode"] == "scheduled":
         return "upstream-merge"
+    if run_binding.get("retained_sync") is not None:
+        return "retained-sync-repair"
     if _retained_pr_reconciliation(run_binding) is not None:
         return "retained-pr-reconciliation"
     return "linear-candidate"
@@ -2505,11 +2550,18 @@ def _review_scope(
     last_synced_upstream: str | None = None,
     captured_upstream: str | None = None,
     issue_binding: dict[str, Any] | None = None,
+    retained_sync_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Derive the trusted-upstream boundary and fork-owned review ranges."""
     retained_pr = (
         _issue_workflow().retained_pr_reconciliation(issue_binding)
         if expected_mode == "issue"
+        else None
+    )
+    retained_sync = (
+        retained_sync_binding
+        if expected_mode == "repair"
+        and _retained_sync().valid_binding(retained_sync_binding)
         else None
     )
     commits = _first_parent_commits(repo, base_sha, candidate_sha)
@@ -2521,6 +2573,10 @@ def _review_scope(
         if retained_pr is not None:
             raise ControlError(
                 "retained PR review requires the approved reconciliation merge"
+            )
+        if retained_sync is not None:
+            raise ControlError(
+                "retained sync repair requires its preserved scheduled merge"
             )
         if any(len(_commit_parents(repo, commit)) != 1 for commit in commits):
             raise ControlError("linear review candidate contains a hidden merge")
@@ -2536,12 +2592,16 @@ def _review_scope(
             raise ControlError(
                 "retained PR reconciliation must begin with the captured base as first parent"
             )
+        if retained_sync is not None:
+            raise ControlError(
+                "retained sync repair must begin with its captured base merge"
+            )
         raise ControlError(
             "scheduled review candidate must begin with a two-parent upstream merge"
         )
     if expected_mode == "issue" and retained_pr is None:
         raise ControlError("manual issue review requires a linear candidate")
-    if expected_mode in {"backport", "repair"}:
+    if expected_mode in {"backport", "repair"} and retained_sync is None:
         raise ControlError(f"manual {expected_mode} review requires a linear candidate")
     if any(len(_commit_parents(repo, commit)) != 1 for commit in commits[1:]):
         raise ControlError("post-merge adaptation history must be linear")
@@ -2554,6 +2614,24 @@ def _review_scope(
             "mode": "retained-pr-reconciliation",
             "ranges": [("candidate", base_sha, candidate_sha)],
             "upstream_sha": None,
+            "merge_commit": first,
+            "synthetic_merge_tree": None,
+        }
+    if retained_sync is not None:
+        if (
+            first != retained_sync["merge_commit"]
+            or parents[1] != retained_sync["upstream_sha"]
+            or retained_sync["source_sha"] not in commits
+            or retained_sync["repair_sha"] not in commits
+        ):
+            raise ControlError(
+                "retained sync repair does not preserve its authenticated "
+                "source and repair history"
+            )
+        return {
+            "mode": "retained-sync-repair",
+            "ranges": [("candidate", base_sha, candidate_sha)],
+            "upstream_sha": retained_sync["upstream_sha"],
             "merge_commit": first,
             "synthetic_merge_tree": None,
         }
@@ -2815,6 +2893,7 @@ def run_adversarial_review(
     last_synced_upstream: str | None = None,
     captured_upstream: str | None = None,
     issue_binding: dict[str, Any] | None = None,
+    retained_sync_binding: dict[str, Any] | None = None,
     verified_checks: list[dict[str, Any]],
 ) -> dict[str, Any]:
     if not isinstance(reviewer, dict) or set(reviewer) != {"tool", "model"}:
@@ -2835,6 +2914,7 @@ def run_adversarial_review(
         last_synced_upstream=last_synced_upstream,
         captured_upstream=captured_upstream,
         issue_binding=issue_binding,
+        retained_sync_binding=retained_sync_binding,
     )
     chunks, ranges = _review_chunks(repo, scope)
     scope_hash = hashlib.sha256(
@@ -2853,7 +2933,11 @@ def run_adversarial_review(
     prompt_hashes: list[str] = []
     review_boundary = (
         "The bounded input covers the complete captured-base-to-candidate diff; no retained PR history is excluded as trusted upstream.\n"
-        if scope["mode"] in {"linear-candidate", "retained-pr-reconciliation"}
+        if scope["mode"] in {
+            "linear-candidate",
+            "retained-pr-reconciliation",
+            "retained-sync-repair",
+        }
         else "Trusted upstream commits are not reproduced here. The runtime proved the exact merge topology and derived the conflict-resolution baseline with git merge-tree.\n"
     )
     for index, chunk in enumerate(chunks, start=1):
@@ -3557,6 +3641,7 @@ def run_gate(
                         last_synced_upstream=run_binding["last_synced_upstream"],
                         captured_upstream=run_binding["captured_upstream"],
                         issue_binding=run_binding.get("issue"),
+                        retained_sync_binding=run_binding.get("retained_sync"),
                         verified_checks=recorded,
                     )
                     review_evidence = details
@@ -4601,6 +4686,7 @@ def publish_task_draft(
         last_synced_upstream=run_binding["last_synced_upstream"],
         captured_upstream=run_binding["captured_upstream"],
         issue_binding=run_binding.get("issue"),
+        retained_sync_binding=run_binding.get("retained_sync"),
     )
     _require_retained_pr_update(repo, run_binding, expected_pr_head)
     if run_binding["mode"] == "repair":

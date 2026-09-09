@@ -82,6 +82,17 @@ def _issue_workflow() -> Any:
     return module
 
 
+def _retained_sync() -> Any:
+    """Load the retained scheduled-sync ownership policy beside the publisher."""
+    path = Path(__file__).with_name("retained_sync.py")
+    spec = importlib.util.spec_from_file_location("_opentui_pub_retained_sync", path)
+    if not path.is_file() or spec is None or spec.loader is None:
+        raise PublicationError("retained sync owner could not be located beside the publisher")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _write(path: Path, value: str) -> None:
     if path.is_symlink():
         raise PublicationError("publication state must not be a symlink")
@@ -258,7 +269,13 @@ def _candidate_head(manifest: dict[str, Any]) -> tuple[str, str, str]:
             "base_sha": base,
         }
     )
-    return f"codex/opentui-maint-{identity[:24]}", request_identity, identity
+    retained = _retained_pr_reconciliation(manifest)
+    head = (
+        retained["head_branch"]
+        if retained is not None
+        else f"codex/opentui-maint-{identity[:24]}"
+    )
+    return head, request_identity, identity
 
 
 def _validate_pr(
@@ -1244,9 +1261,11 @@ def _retained_pr_reconciliation(
     manifest: dict[str, Any],
 ) -> dict[str, Any] | None:
     binding = manifest.get("run_binding")
-    if not isinstance(binding, dict) or binding.get("mode") != "issue":
+    if not isinstance(binding, dict):
         return None
-    return _issue_workflow().retained_pr_reconciliation(binding.get("issue"))
+    if binding.get("mode") == "issue":
+        return _issue_workflow().retained_pr_reconciliation(binding.get("issue"))
+    return _retained_sync().retained_pr(binding)
 
 
 def _validate_retained_pr_owner(
