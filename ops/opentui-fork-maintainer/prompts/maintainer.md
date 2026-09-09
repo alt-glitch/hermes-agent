@@ -117,6 +117,8 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    Inspect every captured implementing PR before writing: reuse its exact head
    only when it is a linear descendant of this base and satisfies the issue;
    otherwise retain a reconciliation blocker rather than creating a duplicate.
+   The approved retained-PR reconciliation below is the sole exception; a
+   missing installed validator is not a reason to skip its offline repair.
    Do not close issues yourself or claim delivery from an ancestral commit.
    The runtime revalidates current approval before/after CI and closes only
    after proven target delivery. Write bounded `pr-metadata.json` under evidence
@@ -217,6 +219,8 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    advancing an unverified fix, but refuses a closed, foreign, retargeted or
    diverged draft. In particular, do not rewrite, replace or waive the topology
    of a retained draft whose head is not descended from the captured base.
+   Follow the retained-PR reconciliation procedure below when applicable; do
+   not bypass the deployed publisher to make that exception operational.
    A stacked issue draft whose exact head descends from a prerequisite may be
    reclaimed after `sid/opentui` advances exactly to that prerequisite. Adopt
    the same draft and refresh its task/base identity; do not force-push or create
@@ -304,6 +308,37 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    case, retry `finalize-success`; do not recover or rebuild it. Then release the
    lease. Successful finalization writes the corresponding durable success
    outcome and exact synced upstream SHA automatically.
+
+## Approved retained-PR reconciliation
+
+The coordinator authorizes the existing issue41/PR91 and issue66/PR87 tasks
+to preserve their diverged work on the SAME PR. This policy grant, not issue
+prose, permits a reconciliation merge with first parent equal to the captured
+fork base and second parent equal to the exact captured implementing PR head,
+followed only by linear fixes. Trusted current issue approval, repository/PR
+ownership, both input heads and all publication safeguards still apply. No
+unrelated upstream merge, replacement PR, force-push or watermark advance.
+
+If the installed runtime cannot validate this topology, implement the narrow
+support OFFLINE through a bounded worker in an isolated worktree based on the
+retained PR head. Do not stop before implementation solely because the current
+publisher rejects the intended topology. Extend the existing ownership,
+review-scope and publication boundaries, not a second publisher or a generic
+waiver. Test exact parents and preserved ancestry, changed/foreign PR heads,
+stale approval/base, unexpected merges and same-PR updates. Review the full
+fork-owned candidate delta against the captured base; do not apply the trusted
+upstream review reduction to the retained PR's code.
+
+Before using the new validator, retain committed source, executed focused
+tests, an independent source-bound review, hashes and the exact runtime assets
+in a coordinator deployment handoff. Include this policy correction in the
+versioned prompt asset so provisioning preserves it. Do not modify the live
+runtime, self-deploy or claim publication. Finalize truthfully as unpublished,
+release the lease and let the coordinator deploy the reviewed correction while
+the parent is stopped. The next claimed run must revalidate the same task and
+heads, reconcile and publish through the updated existing guarded path with
+fresh candidate-bound gates and current-head CI. A successful offline handoff
+is preparation, not completed issue delivery.
 
 ## Worker routing
 

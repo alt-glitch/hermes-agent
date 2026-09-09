@@ -108,6 +108,11 @@ seven days while other eligible issues remain selectable. API failures are not
 empty queues. Feature-only work wakes even with no upstream delta, uses linear
 whole-diff review and leaves the upstream watermark unchanged. Captured open
 implementing PRs must be reconciled; the publisher refuses duplicate candidates.
+The sole non-linear issue exception is coordinator-approved issue41/PR91 and
+issue66/PR87 reconciliation: the candidate begins with an exact two-parent merge
+of the captured fork base and captured same-repository implementing PR head,
+then only linear fixes. Its complete base-to-candidate diff is reviewed and it
+does not advance the upstream watermark.
 
 The parent claims via the existing `claim-request` command, inspects the issue
 and implementing PRs, and retains a reproduction or existing-fix contract proof.
@@ -155,7 +160,10 @@ checks the same-repository owner, exact base/head, task marker, remote ref and
 ancestry before any update. If failed CI left the task PR ready, the early
 publication command returns that proven PR to draft before advancing its fix
 head. An exact compatible existing issue draft can be adopted; a diverged
-retained draft is refused without rewriting or topology waiver.
+retained draft is otherwise refused without rewriting or topology waiver. The
+narrow approved reconciliation keeps the captured PR number and branch, checks
+its current head and issue authorization at each publication edge, and rejects
+replacement PRs or dropped ancestry.
 
 Every existing task owner is checked before expensive local gates, including an
 unchanged early draft when `--expected-pr-head` is omitted. A genuinely absent

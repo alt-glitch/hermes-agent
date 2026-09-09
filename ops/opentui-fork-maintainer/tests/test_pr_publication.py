@@ -284,12 +284,7 @@ def bind_issue(
         "last_synced_upstream": "e" * 40,
         "captured_upstream": "f" * 40,
         "captured_base": manifest["base_sha"],
-        "issue": {
-            "repository": pub.REPOSITORY,
-            "number": 41,
-            "revision_sha256": request["revision_sha256"],
-            "approval_event_id": "99",
-        },
+        "issue": pub._issue_workflow().binding_issue_fields(request),
     }
     return request
 
@@ -1044,6 +1039,140 @@ def test_publisher_adoption_after_empty_capture_advances_sequential_real_git_hea
         f"{candidate}:refs/heads/{adopted_head}",
         f"{latest}:refs/heads/{adopted_head}",
     ]
+    assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
+
+
+def test_retained_reconciliation_advances_only_the_captured_same_pr(
+    capture, github, monkeypatch, tmp_path
+) -> None:
+    head = "contributor/approved-41"
+    repo, remote, retained_head, candidate = prepare_owned_head_graph(
+        tmp_path, capture, head
+    )
+    retained = {
+        "number": 91,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
+        "base_branch": pub.BASE,
+        "head_branch": head,
+        "head_sha": retained_head,
+        "head_repository": pub.REPOSITORY,
+    }
+    request = bind_issue(capture, existing_prs=[retained])
+    assert capture[1]["run_binding"]["issue"]["retained_pr"] == retained
+    marker = f"<!-- maintainer-candidate:v1:{pub._candidate_head(capture[1])[2]} -->"
+    github.ref = f"{retained_head}\trefs/heads/{head}"
+    github.pr = {
+        **review_pr(),
+        "number": 91,
+        "url": retained["url"],
+        "body": f"{marker}\nContributor context.\n\nFixes #41",
+        "headRefName": head,
+        "headRefOid": retained_head,
+        "baseRefOid": capture[1]["base_sha"],
+        "isDraft": True,
+    }
+    simulated_github = github.run
+
+    def transport(argv, cwd):
+        if argv[0] == "git":
+            github.calls.append(argv)
+            result = subprocess.run(
+                argv, cwd=cwd, check=True, capture_output=True, text=True
+            )
+            if argv[1] == "push":
+                github.pr["headRefOid"] = argv[-1].split(":", 1)[0]
+            return result.stdout
+        if argv[:3] == [str(pub.GH), "pr", "list"]:
+            github.calls.append(argv)
+            return "[]"
+        return simulated_github(argv, cwd)
+
+    monkeypatch.setattr(pub, "_publication_destination", lambda *_args: str(remote))
+    monkeypatch.setattr(pub, "_run", transport)
+    capture[1].update(candidate_sha=candidate, expected_pr_head=retained_head)
+    current = {**request, "existing_prs": [dict(retained)]}
+    second = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["new-head checks"],
+        issue_request=current,
+    )
+
+    source = repo / "candidate.txt"
+    source.write_text(
+        "base\nowned head\ncorrection\nsecond correction\n", encoding="utf-8"
+    )
+    subprocess.run(
+        ["git", "commit", "-am", "second correction"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    latest = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    capture[1].update(candidate_sha=latest, expected_pr_head=candidate)
+    current["existing_prs"][0]["head_sha"] = candidate
+    third = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["latest-head checks"],
+        issue_request=current,
+    )
+    assert second["number"] == third["number"] == 91
+    assert second["head_branch"] == third["head_branch"] == head
+    assert remote_head(remote, head) == latest
+    assert [call[-1] for call in github.calls if call[:2] == ["git", "push"]] == [
+        f"{candidate}:refs/heads/{head}",
+        f"{latest}:refs/heads/{head}",
+    ]
+
+    source.write_text(
+        "base\nowned head\ncorrection\nsecond correction\nthird correction\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "commit", "-am", "third correction"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    next_candidate = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    capture[1].update(candidate_sha=next_candidate, expected_pr_head=latest)
+    current["existing_prs"][0]["head_sha"] = latest
+    live = json.loads(json.dumps(github.pr))
+    faults = (
+        ("number", 87, "approved retained implementing PR"),
+        ("headRefOid", "f" * 40, "conflicting implementing PR"),
+        ("baseRefOid", "f" * 40, "repository ownership changed"),
+        ("headRepositoryOwner", {"login": "someone-else"}, "repository ownership changed"),
+    )
+    for field, value, message in faults:
+        github.pr = json.loads(json.dumps(live))
+        github.pr[field] = value
+        if field == "number":
+            github.pr["url"] = f"https://github.com/{pub.REPOSITORY}/pull/{value}"
+        with pytest.raises(pub.PublicationError, match=message):
+            pub.publish_draft(
+                repo,
+                capture[0],
+                capture[1],
+                pending_gates=["must not publish"],
+                issue_request=current,
+            )
+        assert remote_head(remote, head) == latest
     assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
 
 

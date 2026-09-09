@@ -1000,6 +1000,11 @@ def resume_preview(
     manifest/packet/PR tuple, not permission to adopt arbitrary legacy PRs.
     """
     manifest_root = root if "publication_recovery" in manifest else source.parent
+    retained = _retained_pr_reconciliation(manifest)
+    if retained is not None and number != retained["number"]:
+        raise PublicationError(
+            "explicit adoption is not the approved retained implementing PR"
+        )
     _, digest, dimensions = preview(manifest_root, manifest)
     head, _, identity = _candidate_head(manifest)
     marker = f"<!-- maintainer-candidate:v1:{identity} -->"
@@ -1076,6 +1081,7 @@ def resume_preview(
         )
         _validate_pr(pr, head, manifest["candidate_sha"], marker)
         _validate_owned_base(pr, manifest["base_sha"])
+        _validate_retained_pr_owner(pr, manifest)
         if repo is None or node is None:
             raise PublicationError(
                 "missing draft recovery requires the existing publisher"
@@ -1167,6 +1173,55 @@ def _publication_metadata(
         None,
         None,
     )
+
+
+def _retained_pr_reconciliation(
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    binding = manifest.get("run_binding")
+    if not isinstance(binding, dict) or binding.get("mode") != "issue":
+        return None
+    return _issue_workflow().retained_pr_reconciliation(binding.get("issue"))
+
+
+def _validate_retained_pr_owner(
+    pr: dict[str, Any], manifest: dict[str, Any]
+) -> None:
+    retained = _retained_pr_reconciliation(manifest)
+    if retained is None:
+        return
+    if (
+        pr.get("number") != retained["number"]
+        or pr.get("url") != retained["url"]
+        or pr.get("baseRefName") != retained["base_branch"]
+        or pr.get("headRefName") != retained["head_branch"]
+    ):
+        raise PublicationError(
+            "publication owner is not the approved retained implementing PR"
+        )
+
+
+def _validate_retained_update_ancestry(
+    repo: Path, manifest: dict[str, Any], expected: str
+) -> None:
+    retained = _retained_pr_reconciliation(manifest)
+    if retained is None:
+        return
+    try:
+        _run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                retained["head_sha"],
+                expected,
+            ],
+            repo,
+        )
+    except PublicationError as exc:
+        raise PublicationError(
+            "retained PR current head dropped the captured implementing ancestry"
+        ) from exc
 
 
 def _reconcile_live_issue_pr(
@@ -1299,6 +1354,7 @@ def _retained_draft_adoption(
         raise PublicationError("live issue PR does not match the retained task draft")
     _validate_pr(live, draft["head_branch"], live["headRefOid"], marker)
     _validate_owned_base(live, manifest["base_sha"])
+    _validate_retained_pr_owner(live, manifest)
     return live
 
 
@@ -1369,6 +1425,7 @@ def _owned_head(
         raise PublicationError("owned PR head moved unexpectedly")
     _validate_pr(pr, head, pr["headRefOid"], marker)
     _validate_owned_base(pr, manifest["base_sha"])
+    _validate_retained_pr_owner(pr, manifest)
     ref = f"refs/heads/{head}"
     advertised = _run(["git", "ls-remote", destination, ref], root).split()
     if advertised != [pr["headRefOid"], ref]:
@@ -1395,6 +1452,7 @@ def preflight_owned_head(
         return None
     pr, head, _ = owned
     candidate = manifest["candidate_sha"]
+    _validate_retained_update_ancestry(repo, manifest, expected)
     _run(["git", "merge-base", "--is-ancestor", expected, candidate], repo)
     observed_heads = list(dict.fromkeys([expected, pr["headRefOid"]]))
     observations = collect_review_surfaces(
@@ -1471,6 +1529,7 @@ def advance_owned_head(
     """CAS only a proven fast-forward on this task's already-owned open PR."""
     pr, head, marker = _owned_head(root, destination, manifest, expected)
     candidate = manifest["candidate_sha"]
+    _validate_retained_update_ancestry(repo, manifest, expected)
     observations = collect_review_surfaces(
         root,
         pr["number"],
@@ -1628,6 +1687,7 @@ def publish_draft(
     pr = prs[0]
     _validate_pr(pr, head, candidate)
     _validate_owned_base(pr, base)
+    _validate_retained_pr_owner(pr, manifest)
     if pr.get("isDraft") is not True:
         observations = collect_review_surfaces(root, pr["number"], candidate)
         require_review_disposition(root, observations)
@@ -1665,6 +1725,7 @@ def publish_draft(
     )
     _validate_pr(pr, head, candidate, candidate_marker)
     _validate_owned_base(pr, base)
+    _validate_retained_pr_owner(pr, manifest)
     if pr.get("isDraft") is not True or _replace_status(pr["body"], status) != pr["body"]:
         raise PublicationError("task draft state was not acknowledged")
     if issue is not None and reconciled is not None:
@@ -1883,6 +1944,7 @@ def publish_preview(
         pr, head, candidate, candidate_marker if _existing_draft is not None else None
     )
     _validate_owned_base(pr, base)
+    _validate_retained_pr_owner(pr, manifest)
     marker_missing = candidate_marker not in pr["body"]
     if marker_missing:
         reconciled_prefix = body_prefix if reconciled is not None else ""
@@ -1985,6 +2047,7 @@ def publish_preview(
     )
     _validate_pr(pr, head, candidate, candidate_marker)
     _validate_owned_base(pr, base)
+    _validate_retained_pr_owner(pr, manifest)
     published = _published_block(pr["body"], identity)
     if published is None:
         raise PublicationError(
@@ -2008,6 +2071,7 @@ def publish_preview(
         )
         _validate_pr(pr, head, candidate, candidate_marker)
         _validate_owned_base(pr, base)
+        _validate_retained_pr_owner(pr, manifest)
         if pr.get("isDraft") is not False:
             raise PublicationError("candidate PR did not leave draft state after local gates")
     proof = {

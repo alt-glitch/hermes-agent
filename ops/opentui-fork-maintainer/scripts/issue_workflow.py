@@ -43,6 +43,18 @@ BEFORE_AFTER_END = "<!-- before-and-after:end -->"
 SENSITIVE_TEXT = re.compile(
     r"(?i)(sk-[a-z0-9_-]{12,}|bearer\s+[a-z0-9._-]{12,}|api[_ -]?key\s*[=:])"
 )
+# These are the only coordinator-approved issue/retained-PR reconciliation
+# identities. The implementing head is still captured from trusted intake for
+# each run; this table grants no authority to a different PR or repository.
+RETAINED_PR_RECONCILIATIONS = {41: 91, 66: 87}
+RETAINED_PR_FIELDS = {
+    "number",
+    "url",
+    "base_branch",
+    "head_branch",
+    "head_sha",
+    "head_repository",
+}
 
 
 class IssueWorkflowError(RuntimeError):
@@ -84,28 +96,65 @@ def defer_issue(
 
 def binding_issue_fields(claimed_value: dict[str, Any]) -> dict[str, Any]:
     """Project the issue identity carried by a gate's run binding."""
-    return {
+    result = {
         "repository": claimed_value["repository"],
         "number": claimed_value["issue"],
         "revision_sha256": claimed_value["revision_sha256"],
         "approval_event_id": claimed_value["approval"]["event_id"],
     }
+    retained = retained_pr_reconciliation(claimed_value)
+    if retained is not None:
+        result["retained_pr"] = retained
+    return result
+
+
+def retained_pr_reconciliation(value: Any) -> dict[str, Any] | None:
+    """Return the exact captured PR for one narrowly approved reconciliation."""
+    if not isinstance(value, dict):
+        return None
+    expected_number = RETAINED_PR_RECONCILIATIONS.get(
+        value.get("issue", value.get("number"))
+    )
+    existing = value.get("existing_prs")
+    if existing is None:
+        existing = [value.get("retained_pr")] if "retained_pr" in value else []
+    if expected_number is None or not isinstance(existing, list) or len(existing) != 1:
+        return None
+    pr = existing[0]
+    if (
+        not isinstance(pr, dict)
+        or set(pr) != RETAINED_PR_FIELDS
+        or pr.get("number") != expected_number
+        or pr.get("url") != f"https://github.com/{REPOSITORY}/pull/{expected_number}"
+        or pr.get("base_branch") != BASE_BRANCH
+        or not isinstance(pr.get("head_branch"), str)
+        or not pr["head_branch"]
+        or not SHA_RE.fullmatch(str(pr.get("head_sha", "")))
+        or pr.get("head_repository") != REPOSITORY
+    ):
+        return None
+    return {key: pr[key] for key in RETAINED_PR_FIELDS}
 
 
 def valid_issue_binding(value: dict[str, Any], common: set[str]) -> bool:
     """Validate an issue run binding on top of the common binding fields."""
     issue = value.get("issue")
+    issue_fields = {"repository", "number", "revision_sha256", "approval_event_id"}
     return (
         set(value) == common | {"issue"}
         and isinstance(issue, dict)
-        and set(issue)
-        == {"repository", "number", "revision_sha256", "approval_event_id"}
+        and frozenset(issue)
+        in {frozenset(issue_fields), frozenset(issue_fields | {"retained_pr"})}
         and issue.get("repository") == REPOSITORY
         and type(issue.get("number")) is int
         and issue["number"] > 0
         and SHA256_RE.fullmatch(str(issue.get("revision_sha256", ""))) is not None
         and isinstance(issue.get("approval_event_id"), str)
         and bool(issue["approval_event_id"])
+        and (
+            "retained_pr" not in issue
+            or retained_pr_reconciliation(issue) == issue["retained_pr"]
+        )
     )
 
 
@@ -113,6 +162,8 @@ def reconcile_issue_candidate_prs(
     current: dict[str, Any],
     candidate_sha: str,
     expected_pr: dict[str, Any] | None = None,
+    *,
+    retained_pr: dict[str, Any] | None = None,
 ) -> None:
     """Refuse any ambiguous or conflicting implementing PR for the candidate."""
     if not SHA_RE.fullmatch(candidate_sha):
@@ -120,13 +171,27 @@ def reconcile_issue_candidate_prs(
     prs = current.get("existing_prs")
     if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
         raise IssueWorkflowError("approved issue implementing PR evidence is invalid")
+    expected_retained = (
+        {**retained_pr, "head_sha": candidate_sha}
+        if retained_pr is not None
+        else None
+    )
+    if expected_retained is not None and (
+        len(prs) != 1
+        or any(
+            prs[0].get(key) != expected_value
+            for key, expected_value in expected_retained.items()
+        )
+    ):
+        raise IssueWorkflowError(
+            "approved retained implementing PR changed during revalidation"
+        )
     if expected_pr is None:
         if len(prs) > 1 or any(pr.get("head_sha") != candidate_sha for pr in prs):
             raise IssueWorkflowError(
                 "approved issue has an ambiguous or conflicting implementing PR"
             )
-        return
-    if (
+    elif (
         not isinstance(expected_pr, dict)
         or expected_pr.get("candidate_sha") != candidate_sha
         or type(expected_pr.get("number")) is not int
@@ -136,18 +201,34 @@ def reconcile_issue_candidate_prs(
         or not isinstance(expected_pr.get("head_branch"), str)
     ):
         raise IssueWorkflowError("published issue candidate PR evidence is invalid")
-    if not prs:
+    elif not prs and retained_pr is None:
         # Legacy maintainer drafts used descriptive issue links that discovery
         # cannot resolve; exact publication evidence is validated above.
         return
-    expected = {
-        "number": expected_pr["number"],
-        "url": expected_pr["url"],
-        "base_branch": expected_pr["base_branch"],
-        "head_branch": expected_pr["head_branch"],
-        "head_sha": candidate_sha,
-    }
-    if len(prs) != 1 or any(prs[0].get(key) != value for key, value in expected.items()):
+    if expected_pr is not None:
+        expected = {
+            "number": expected_pr["number"],
+            "url": expected_pr["url"],
+            "base_branch": expected_pr["base_branch"],
+            "head_branch": expected_pr["head_branch"],
+            "head_sha": candidate_sha,
+        }
+        if len(prs) != 1 or any(
+            prs[0].get(key) != expected_value
+            for key, expected_value in expected.items()
+        ):
+            raise IssueWorkflowError(
+                "approved issue has an ambiguous or conflicting implementing PR"
+            )
+    if expected_retained is not None:
+        if expected_pr is not None and any(
+            expected_pr.get(key) != expected_retained[key]
+            for key in ("number", "url", "base_branch", "head_branch")
+        ):
+            raise IssueWorkflowError(
+                "published issue candidate changed the retained PR owner"
+            )
+    elif expected_pr is not None and len(prs) != 1:
         raise IssueWorkflowError(
             "approved issue has an ambiguous or conflicting implementing PR"
         )
@@ -174,7 +255,12 @@ def revalidate(
         or any(current.get(key) != request.get(key) for key in fixed_fields)
     ):
         raise IssueWorkflowError("approved issue changed during revalidation")
-    reconcile_issue_candidate_prs(current, candidate_sha, expected_pr)
+    reconcile_issue_candidate_prs(
+        current,
+        candidate_sha,
+        expected_pr,
+        retained_pr=retained_pr_reconciliation(request),
+    )
     return current
 
 

@@ -116,6 +116,51 @@ def make_upstream_merge_repo(
     return repo, base, upstream, merge_commit, candidate
 
 
+def make_retained_reconciliation_repo(
+    tmp_path: Path,
+) -> tuple[Path, Path, str, str, str, str, Path]:
+    remote = tmp_path / "remote.git"
+    repo = tmp_path / "repo"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(tmp_path, "init", str(repo))
+    git(repo, "config", "user.email", "test@example.invalid")
+    git(repo, "config", "user.name", "Test")
+    (repo / "common").write_text("common\n", encoding="utf-8")
+    (repo / "ui-opentui").mkdir()
+    (repo / "ui-opentui" / "package-lock.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    git(repo, "add", "common", "ui-opentui/package-lock.json")
+    git(repo, "commit", "-m", "common")
+    common = git(repo, "rev-parse", "HEAD")
+
+    git(repo, "checkout", "-b", "retained-pr")
+    (repo / "retained").write_text("retained implementation\n", encoding="utf-8")
+    git(repo, "add", "retained")
+    git(repo, "commit", "-m", "retained implementation")
+    retained = git(repo, "rev-parse", "HEAD")
+
+    git(repo, "checkout", "-b", "sid/opentui", common)
+    (repo / "fork-base").write_text("new fork base\n", encoding="utf-8")
+    git(repo, "add", "fork-base")
+    git(repo, "commit", "-m", "advance fork base")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "origin", "sid/opentui")
+    git(repo, "push", "origin", "retained-pr")
+
+    git(repo, "checkout", "-b", "integration")
+    git(repo, "merge", "--no-ff", "retained-pr", "-m", "reconcile retained PR")
+    merge_commit = git(repo, "rev-parse", "HEAD")
+    (repo / "followup").write_text("linear fix\n", encoding="utf-8")
+    git(repo, "add", "followup")
+    git(repo, "commit", "-m", "linear followup")
+    candidate = git(repo, "rev-parse", "HEAD")
+    worktree = tmp_path / "opentui-maint-reconciliation-worktree"
+    git(repo, "worktree", "add", "--detach", str(worktree), candidate)
+    return repo, remote, base, retained, merge_commit, candidate, worktree
+
+
 def gate_argv(gate_id: str) -> list[str]:
     if gate_id == "focused-contracts":
         return ["uv", "run", "pytest", "tests/test_example.py"]
@@ -487,42 +532,212 @@ def test_publish_draft_cli_exposes_clean_candidate_without_running_gates(
     assert (state / "run.lease.json").exists()
 
 
-def test_diverged_retained_issue_draft_is_refused_without_topology_waiver(
+def test_retained_issue_reconciliation_is_exact_current_and_fully_reviewed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo, _, _, retained_head, worktree = make_repo(tmp_path)
-    (repo / "base-advance").write_text("new fork base\n", encoding="utf-8")
-    git(repo, "add", "base-advance")
-    git(repo, "commit", "-m", "advance fork base")
-    current_base = git(repo, "rev-parse", "HEAD")
+    repo, _, base, retained_head, merge_commit, candidate, worktree = (
+        make_retained_reconciliation_repo(tmp_path)
+    )
     state, evidence = tmp_path / "state", tmp_path / "evidence"
     write_live_lease(state)
-    request = claim_issue(state, evidence, current_base, current_base)
-    request["existing_prs"] = [issue_pr(retained_head)]
+    request = claim_issue(state, evidence, base, candidate)
+    retained = issue_pr(retained_head, number=91)
+    request["existing_prs"] = [retained]
     for path in (
         state / "run-request.inflight.json",
         evidence / "request.claimed.json",
     ):
         path.write_text(json.dumps(request), encoding="utf-8")
-    real_run_path = runtime.runpy.run_path
+    binding = runtime._derive_run_binding(state, evidence, "test-token")
+    assert binding["issue"]["retained_pr"] == retained
 
-    def refuse_publisher(path: str):
-        if path.endswith("pr_publication.py"):
-            pytest.fail("diverged draft must be refused before publication")
-        return real_run_path(path)
+    for issue_number, pr_number in ((41, 91), (66, 87)):
+        approved = {
+            **retained,
+            "number": pr_number,
+            "url": f"https://github.com/alt-glitch/hermes-agent/pull/{pr_number}",
+        }
+        scope = runtime._review_scope(
+            repo,
+            base,
+            candidate,
+            expected_mode="issue",
+            issue_binding={"number": issue_number, "retained_pr": approved},
+        )
+        assert scope == {
+            "mode": "retained-pr-reconciliation",
+            "ranges": [("candidate", base, candidate)],
+            "upstream_sha": None,
+            "merge_commit": merge_commit,
+            "synthetic_merge_tree": None,
+        }
+        _, reviewed_ranges = runtime._review_chunks(repo, scope)
+        assert reviewed_ranges[0]["diff_sha256"] == hashlib.sha256(
+            runtime._canonical_range_diff(repo, base, candidate)
+        ).hexdigest()
 
-    monkeypatch.setattr(runtime.runpy, "run_path", refuse_publisher)
+    with pytest.raises(runtime.ControlError, match="linear candidate"):
+        runtime._review_scope(repo, base, candidate, expected_mode="issue")
+    wrong_pr = {**retained, "number": 87, "url": retained["url"].replace("91", "87")}
+    with pytest.raises(runtime.ControlError, match="linear candidate"):
+        runtime._review_scope(
+            repo,
+            base,
+            candidate,
+            expected_mode="issue",
+            issue_binding={"number": 41, "retained_pr": wrong_pr},
+        )
+    with pytest.raises(runtime.ControlError, match="second parent"):
+        runtime._review_scope(
+            repo,
+            base,
+            candidate,
+            expected_mode="issue",
+            issue_binding={
+                "number": 41,
+                "retained_pr": {**retained, "head_sha": "f" * 40},
+            },
+        )
 
-    with pytest.raises(runtime.ControlError, match="descendant"):
+    tree = git(repo, "rev-parse", f"{candidate}^{{tree}}")
+
+    def commit_tree(*parents: str) -> str:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "commit-tree",
+                tree,
+                *[part for parent in parents for part in ("-p", parent)],
+            ],
+            input="test topology\n",
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    swapped = commit_tree(retained_head, base)
+    with pytest.raises(runtime.ControlError, match="reconciliation merge"):
+        runtime._review_scope(
+            repo,
+            base,
+            swapped,
+            expected_mode="issue",
+            issue_binding=binding["issue"],
+        )
+    hidden_merge = commit_tree(candidate, base)
+    with pytest.raises(runtime.ControlError, match="history must be linear"):
+        runtime._review_scope(
+            repo,
+            base,
+            hidden_merge,
+            expected_mode="issue",
+            issue_binding=binding["issue"],
+        )
+    dropped = commit_tree(base)
+    with pytest.raises(runtime.ControlError, match="reconciliation merge"):
+        runtime._review_scope(
+            repo,
+            base,
+            dropped,
+            expected_mode="issue",
+            issue_binding=binding["issue"],
+        )
+
+    workflow = runtime._issue_workflow()
+    intake = workflow._issue_intake()
+    current = {**request, "existing_prs": [dict(retained)]}
+    revalidated_heads: list[str] = []
+
+    def revalidate(_state: Path, _request: dict[str, object]) -> dict[str, object]:
+        revalidated_heads.append(current["existing_prs"][0]["head_sha"])
+        return current
+
+    intake["revalidate_approved_issue"] = revalidate
+    monkeypatch.setattr(workflow, "_issue_intake", lambda: intake)
+    monkeypatch.setattr(runtime, "_issue_workflow", lambda: workflow)
+    assert runtime._revalidate_issue_request(
+        state, evidence, "test-token", candidate_sha=retained_head
+    ) == current
+    current["existing_prs"][0]["head_sha"] = "f" * 40
+    with pytest.raises(runtime.ControlError, match="retained implementing PR changed"):
+        runtime._revalidate_issue_request(
+            state, evidence, "test-token", candidate_sha=retained_head
+        )
+    current["existing_prs"][0] = dict(retained)
+    current["existing_prs"][0]["head_repository"] = "someone-else/hermes-agent"
+    with pytest.raises(runtime.ControlError, match="retained implementing PR changed"):
+        runtime._revalidate_issue_request(
+            state, evidence, "test-token", candidate_sha=retained_head
+        )
+    current["existing_prs"] = [dict(retained)]
+    current["approval"] = {**request["approval"], "event_id": "revoked"}
+    with pytest.raises(runtime.ControlError, match="changed during revalidation"):
+        runtime._revalidate_issue_request(
+            state, evidence, "test-token", candidate_sha=retained_head
+        )
+    current["approval"] = request["approval"]
+
+    (worktree / "followup").write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(runtime.ControlError, match="tracked bytes differ"):
         runtime.publish_task_draft(
             repo,
             evidence,
             state_dir=state,
             cwd=worktree,
-            base_sha=current_base,
-            candidate_sha=retained_head,
+            base_sha=base,
+            candidate_sha=candidate,
             token="test-token",
             expected_pr_head=retained_head,
+        )
+    (worktree / "followup").write_text("linear fix\n", encoding="utf-8")
+    git(worktree, "update-index", "--refresh")
+
+    published: list[dict[str, object]] = []
+
+    def publish_draft(*_args: object, **_kwargs: object) -> dict[str, object]:
+        current["existing_prs"][0]["head_sha"] = candidate
+        proof = {
+            "candidate_sha": candidate,
+            "number": 91,
+            "url": retained["url"],
+            "base_branch": runtime.BRANCH,
+            "head_branch": retained["head_branch"],
+        }
+        published.append(proof)
+        return proof
+
+    monkeypatch.setattr(
+        runtime.runpy,
+        "run_path",
+        lambda path: {"publish_draft": publish_draft}
+        if path.endswith("pr_publication.py")
+        else pytest.fail(f"unexpected owner load: {path}"),
+    )
+    proof = runtime.publish_task_draft(
+        repo,
+        evidence,
+        state_dir=state,
+        cwd=worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+        expected_pr_head=retained_head,
+    )
+    assert proof["number"] == 91 and len(published) == 1
+    assert revalidated_heads[-2:] == [retained_head, candidate]
+    with pytest.raises(runtime.ControlError, match="captured fork snapshot"):
+        runtime.publish_task_draft(
+            repo,
+            evidence,
+            state_dir=state,
+            cwd=worktree,
+            base_sha="f" * 40,
+            candidate_sha=candidate,
+            token="test-token",
+            expected_pr_head=candidate,
         )
 
 

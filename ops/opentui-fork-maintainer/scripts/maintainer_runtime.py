@@ -833,6 +833,43 @@ def _valid_run_binding(value: Any) -> bool:
     return _issue_workflow().valid_issue_binding(value, common)
 
 
+def _retained_pr_reconciliation(
+    run_binding: dict[str, Any],
+) -> dict[str, Any] | None:
+    if run_binding.get("mode") != "issue":
+        return None
+    return _issue_workflow().retained_pr_reconciliation(run_binding.get("issue"))
+
+
+def _expected_review_mode(run_binding: dict[str, Any]) -> str:
+    if run_binding["mode"] == "scheduled":
+        return "upstream-merge"
+    if _retained_pr_reconciliation(run_binding) is not None:
+        return "retained-pr-reconciliation"
+    return "linear-candidate"
+
+
+def _require_retained_pr_update(
+    repo: Path,
+    run_binding: dict[str, Any],
+    expected_pr_head: str | None,
+) -> None:
+    retained = _retained_pr_reconciliation(run_binding)
+    if retained is None:
+        return
+    if expected_pr_head is None or not SHA_RE.fullmatch(expected_pr_head):
+        raise ControlError(
+            "retained PR reconciliation requires the exact current PR head"
+        )
+    if _git_status(
+        repo,
+        ["merge-base", "--is-ancestor", retained["head_sha"], expected_pr_head],
+    ):
+        raise ControlError(
+            "retained PR current head dropped the captured implementing ancestry"
+        )
+
+
 def _revalidate_issue_request(
     state_dir: Path,
     evidence_root: Path,
@@ -1502,9 +1539,7 @@ def validate_gate_manifest(
         raise ControlError("gate manifest review proof is invalid") from exc
     if proof != logged_proof:
         raise ControlError("gate manifest review proof does not match hashed evidence")
-    expected_review_mode = (
-        "upstream-merge" if binding["mode"] == "scheduled" else "linear-candidate"
-    )
+    expected_review_mode = _expected_review_mode(binding)
     if proof.get("review_mode") != expected_review_mode:
         raise ControlError("gate manifest review mode does not match run binding")
     resolved_base = _git(repo, ["rev-parse", f"{base_sha}^{{commit}}"])
@@ -2469,14 +2504,24 @@ def _review_scope(
     expected_mode: str | None = None,
     last_synced_upstream: str | None = None,
     captured_upstream: str | None = None,
+    issue_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Derive the trusted-upstream boundary and fork-owned review ranges."""
+    retained_pr = (
+        _issue_workflow().retained_pr_reconciliation(issue_binding)
+        if expected_mode == "issue"
+        else None
+    )
     commits = _first_parent_commits(repo, base_sha, candidate_sha)
     first = commits[0]
     parents = _commit_parents(repo, first)
     if len(parents) == 1:
         if expected_mode == "scheduled":
             raise ControlError("scheduled review requires an upstream merge candidate")
+        if retained_pr is not None:
+            raise ControlError(
+                "retained PR review requires the approved reconciliation merge"
+            )
         if any(len(_commit_parents(repo, commit)) != 1 for commit in commits):
             raise ControlError("linear review candidate contains a hidden merge")
         return {
@@ -2487,13 +2532,31 @@ def _review_scope(
             "synthetic_merge_tree": None,
         }
     if len(parents) != 2 or parents[0] != base_sha:
+        if retained_pr is not None:
+            raise ControlError(
+                "retained PR reconciliation must begin with the captured base as first parent"
+            )
         raise ControlError(
             "scheduled review candidate must begin with a two-parent upstream merge"
         )
-    if expected_mode in {"backport", "repair", "issue"}:
+    if expected_mode == "issue" and retained_pr is None:
+        raise ControlError("manual issue review requires a linear candidate")
+    if expected_mode in {"backport", "repair"}:
         raise ControlError(f"manual {expected_mode} review requires a linear candidate")
     if any(len(_commit_parents(repo, commit)) != 1 for commit in commits[1:]):
         raise ControlError("post-merge adaptation history must be linear")
+    if retained_pr is not None:
+        if parents[1] != retained_pr["head_sha"]:
+            raise ControlError(
+                "retained PR reconciliation second parent does not match the captured implementing head"
+            )
+        return {
+            "mode": "retained-pr-reconciliation",
+            "ranges": [("candidate", base_sha, candidate_sha)],
+            "upstream_sha": None,
+            "merge_commit": first,
+            "synthetic_merge_tree": None,
+        }
     upstream_sha = parents[1]
     if expected_mode == "scheduled":
         if not isinstance(captured_upstream, str) or not SHA_RE.fullmatch(
@@ -2751,6 +2814,7 @@ def run_adversarial_review(
     expected_mode: str | None = None,
     last_synced_upstream: str | None = None,
     captured_upstream: str | None = None,
+    issue_binding: dict[str, Any] | None = None,
     verified_checks: list[dict[str, Any]],
 ) -> dict[str, Any]:
     if not isinstance(reviewer, dict) or set(reviewer) != {"tool", "model"}:
@@ -2770,6 +2834,7 @@ def run_adversarial_review(
         expected_mode=expected_mode,
         last_synced_upstream=last_synced_upstream,
         captured_upstream=captured_upstream,
+        issue_binding=issue_binding,
     )
     chunks, ranges = _review_chunks(repo, scope)
     scope_hash = hashlib.sha256(
@@ -2786,6 +2851,11 @@ def run_adversarial_review(
     stdout_parts: list[bytes] = []
     stderr_parts: list[bytes] = []
     prompt_hashes: list[str] = []
+    review_boundary = (
+        "The bounded input covers the complete captured-base-to-candidate diff; no retained PR history is excluded as trusted upstream.\n"
+        if scope["mode"] in {"linear-candidate", "retained-pr-reconciliation"}
+        else "Trusted upstream commits are not reproduced here. The runtime proved the exact merge topology and derived the conflict-resolution baseline with git merge-tree.\n"
+    )
     for index, chunk in enumerate(chunks, start=1):
         prompt = (
             (
@@ -2793,8 +2863,8 @@ def run_adversarial_review(
                 f"BASE_SHA: {base_sha}\nCANDIDATE_SHA: {candidate_sha}\n"
                 f"REVIEW_MODE: {scope['mode']}\nREVIEW_SCOPE_SHA256: {scope_hash}\n"
                 f"CHUNK: {index}/{len(chunks)}\n"
-                "Trusted upstream commits are not reproduced here. The runtime proved the exact merge topology and derived the conflict-resolution baseline with git merge-tree.\n"
-                "This reviewer process intentionally has no filesystem, shell, or agent tools. The bounded exact diff below is the complete review input for this chunk. Review it directly: do not ask to run commands, inspect the tree, or defer the verdict to a later turn.\n"
+                + review_boundary
+                + "This reviewer process intentionally has no filesystem, shell, or agent tools. The bounded exact diff below is the complete review input for this chunk. Review it directly: do not ask to run commands, inspect the tree, or defer the verdict to a later turn.\n"
                 "Perform the review directly in this process. Do not spawn, delegate to, or invoke other Codex, Claude, or agent processes; the parent maintainer already bounded this review and recursive fan-out violates the gate's resource budget.\n"
                 "Find correctness, race, security, UX, and test-fidelity defects. Do not modify files.\n"
                 "This is one ordered slice of a multi-range delta. A later slice may intentionally repair code shown here, so report precise provisional findings but do not issue the release verdict yet.\n"
@@ -2828,6 +2898,11 @@ def run_adversarial_review(
 
     gate_evidence_json = json.dumps(gate_evidence, sort_keys=True, indent=2).encode()
     candidate_before = _worktree_proof(repo, candidate_sha)
+    range_guidance = (
+        "Ranges and chunks are ordered and together cover the complete captured-base-to-candidate diff. A later slice may repair an earlier finding.\n"
+        if scope["mode"] in {"linear-candidate", "retained-pr-reconciliation"}
+        else "Ranges and chunks are ordered. The conflict-resolution range compares a synthetic conflicted merge tree to the resolved merge commit: lines prefixed '-' are removed from the resolved candidate and MUST NOT be reported as retained conflict markers or live code. A later fork-adaptation slice may repair an earlier finding.\n"
+    )
     synthesis = (
         "Issue the final release verdict for the complete ordered fork sync delta.\n"
         f"BASE_SHA: {base_sha}\nCANDIDATE_SHA: {candidate_sha}\n"
@@ -2835,8 +2910,8 @@ def run_adversarial_review(
         "Your cwd is the clean, candidate-bound worktree at CANDIDATE_SHA. You have read-only Read/Grep tools solely to verify provisional findings against the final candidate. Do not use shell, network, writes, edits, or agent delegation.\n"
         f"CANDIDATE_TREE_SHA: {candidate_before['tree_sha']}\n"
         "The runtime authenticated the deterministic gate records below by re-reading each canonical in-root log and matching its SHA-256. Only safe hashes and statuses are included; do not seek or read gate logs. Treat a passed gate as authoritative evidence that its allowlisted command completed successfully.\n"
-        "Ranges and chunks are ordered. The conflict-resolution range compares a synthetic conflicted merge tree to the resolved merge commit: lines prefixed '-' are removed from the resolved candidate and MUST NOT be reported as retained conflict markers or live code. A later fork-adaptation slice may repair an earlier finding.\n"
-        "Investigate every provisional CANDIDATE_BLOCKER with Read/Grep in the final candidate. Reject only a concrete release blocker proven to remain at an exact final-candidate path. Hypothetical, conditional, stale, or unverified concerns are not blockers.\n"
+        + range_guidance
+        + "Investigate every provisional CANDIDATE_BLOCKER with Read/Grep in the final candidate. Reject only a concrete release blocker proven to remain at an exact final-candidate path. Hypothetical, conditional, stale, or unverified concerns are not blockers.\n"
         "Do not modify files.\n"
         "For every release-blocking issue that remains in the final candidate emit a line beginning exactly BLOCKER:.\n"
         "The final non-empty output line must be exactly VERDICT: APPROVED only when no blocker remains; otherwise VERDICT: REJECTED.\n"
@@ -3268,7 +3343,7 @@ def _validated_visual_retry_source(
         raise ControlError("visual retry requires a retained video-only failure")
     review = value.get("review_proof")
     review_log = _load_gate(Path(records["adversarial-review"]["output_path"]))
-    expected_mode = "upstream-merge" if run_binding["mode"] == "scheduled" else "linear-candidate"
+    expected_mode = _expected_review_mode(run_binding)
     if (
         not isinstance(review, dict)
         or review != review_log
@@ -3481,6 +3556,7 @@ def run_gate(
                         expected_mode=run_binding["mode"],
                         last_synced_upstream=run_binding["last_synced_upstream"],
                         captured_upstream=run_binding["captured_upstream"],
+                        issue_binding=run_binding.get("issue"),
                         verified_checks=recorded,
                     )
                     review_evidence = details
@@ -3911,11 +3987,7 @@ def _publication_recovery_source(
         or review.get("candidate_sha") != original["candidate_sha"]
         or review.get("verdict") != "approved"
         or review.get("review_mode")
-        != (
-            "upstream-merge"
-            if original["run_binding"]["mode"] == "scheduled"
-            else "linear-candidate"
-        )
+        != _expected_review_mode(original["run_binding"])
     ):
         raise ControlError("retained independent review is not candidate-bound approval")
     verified_checks = []
@@ -4525,7 +4597,9 @@ def publish_task_draft(
         expected_mode=run_binding["mode"],
         last_synced_upstream=run_binding["last_synced_upstream"],
         captured_upstream=run_binding["captured_upstream"],
+        issue_binding=run_binding.get("issue"),
     )
+    _require_retained_pr_update(repo, run_binding, expected_pr_head)
     if run_binding["mode"] == "repair":
         request = _read_bound_request(claimed, evidence_root, label="repair request")
         if (
@@ -4613,6 +4687,7 @@ def gate_and_ship(
     run_binding = _derive_run_binding(state_dir, manifest_path.parent, token)
     if run_binding["captured_base"] != base_sha:
         raise ControlError("gate base does not match captured fork snapshot")
+    _require_retained_pr_update(repo, run_binding, expected_pr_head)
     if run_binding["mode"] == "repair":
         request = _read_bound_request(
             evidence_root / "request.claimed.json", evidence_root, label="repair request"
