@@ -370,7 +370,7 @@ def test_continuation_delivers_once_without_rewriting_original(retained):
     assert all(call[1] in {"pr", "api"} for call in f["calls"])
 
 
-def test_recovery_copy_swap_is_refused_at_final_ship_boundary(retained, monkeypatch):
+def test_recovery_copy_swap_is_refused_before_manifest_update(retained, monkeypatch):
     f = retained
     (f["old"] / "gate-logs/focused-contracts.log").write_text(
         "interrupted local evidence\n", encoding="utf-8"
@@ -389,9 +389,11 @@ def test_recovery_copy_swap_is_refused_at_final_ship_boundary(retained, monkeypa
         if check["id"] == "opentui-install"
     )
     real_copyfile = runtime.shutil.copyfile
+    copied = []
 
     def swap_during_copy(src, dst):
         if Path(src) == source and Path(dst).name == "opentui-install.log":
+            copied.append(Path(dst))
             Path(dst).write_text("swapped after source validation\n", encoding="utf-8")
             return str(dst)
         return real_copyfile(src, dst)
@@ -406,21 +408,82 @@ def test_recovery_copy_swap_is_refused_at_final_ship_boundary(retained, monkeypa
 
     monkeypatch.setattr(runtime, "ship_candidate", ship)
 
-    with pytest.raises(
-        runtime.ControlError, match="publication recovery changed reused gate evidence"
-    ):
+    with pytest.raises(runtime.ControlError, match="copied gate evidence changed"):
         runtime.main(f["args"])
 
-    recovered = runtime._load_gate(f["output"])
-    copied = next(
-        check
-        for check in recovered["checks"]
-        if check["id"] == "opentui-install"
-    )
-    assert copied["output_sha256"] != source_hash
-    assert ship_calls == [True]
+    assert copied
+    assert runtime._file_sha256(source) == source_hash
+    assert not f["output"].exists()
+    assert ship_calls == []
     assert remote_sha(f["repo"]) == f["base"]
     assert not (f["state"] / "publish-journal.json").exists()
+
+
+def test_regenerated_retry_copy_swap_is_refused_before_manifest_update(
+    retained, monkeypatch
+):
+    f = retained
+    for gate_id in ("focused-contracts", "opentui-check"):
+        (f["old"] / "gate-logs" / f"{gate_id}.log").write_text(
+            "interrupted local evidence\n", encoding="utf-8"
+        )
+    executions = []
+
+    def execute(gate_id, _argv, output, _cwd):
+        executions.append(gate_id)
+        output.write_text("1 passed in 0.01s\n", encoding="utf-8")
+
+    monkeypatch.setattr(runtime, "_execute_recovery_gate", execute)
+    original_wait = pub.wait_for_review
+    monkeypatch.setattr(
+        pub,
+        "wait_for_review",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            pub.PublicationError("observation interrupted")
+        ),
+    )
+    with pytest.raises(runtime.ControlError, match="observation interrupted"):
+        runtime.main(f["args"])
+
+    first_manifest = f["output"].read_bytes()
+    first = runtime._load_gate(f["output"])
+    attempt = Path(first["publication_recovery"]["attempt_dir"])
+    authenticated = attempt / "opentui-check.log"
+    authenticated_hash = runtime._file_sha256(authenticated)
+    (attempt / "focused-contracts.log").write_text(
+        "lost fresh local evidence\n", encoding="utf-8"
+    )
+    real_copyfile = runtime.shutil.copyfile
+    copied = []
+
+    def swap_during_copy(src, dst):
+        if Path(src) == authenticated:
+            copied.append(Path(dst))
+            Path(dst).write_text("unauthenticated copied evidence\n", encoding="utf-8")
+            return str(dst)
+        return real_copyfile(src, dst)
+
+    monkeypatch.setattr(runtime.shutil, "copyfile", swap_during_copy)
+    monkeypatch.setattr(pub, "wait_for_review", original_wait)
+
+    with pytest.raises(runtime.ControlError, match="copied gate evidence changed"):
+        runtime.main(f["args"])
+
+    assert copied
+    assert runtime._file_sha256(authenticated) == authenticated_hash
+    assert f["output"].read_bytes() == first_manifest
+    assert remote_sha(f["repo"]) == f["base"]
+    assert not (f["state"] / "publish-journal.json").exists()
+
+    monkeypatch.setattr(runtime.shutil, "copyfile", real_copyfile)
+    assert runtime.main(f["args"]) == 0
+    assert executions == [
+        "focused-contracts",
+        "opentui-check",
+        "focused-contracts",
+        "focused-contracts",
+    ]
+    assert remote_sha(f["repo"]) == f["candidate"]
 
 
 @pytest.mark.parametrize("owner", ["live-owner", "terminal-prior-owner"])

@@ -4133,11 +4133,14 @@ def _recover_completed_gate(
             _execute_recovery_gate(gate_id, record["argv"], output, cwd)
         else:
             shutil.copyfile(Path(record["output_path"]), output)
+        output_sha256 = _file_sha256(output)
+        if gate_id not in execute and output_sha256 != record["output_sha256"]:
+            raise ControlError("publication recovery copied gate evidence changed")
         recorded.append(
             {
                 **record,
                 "output_path": str(output),
-                "output_sha256": _file_sha256(output),
+                "output_sha256": output_sha256,
             }
         )
     after = _worktree_proof(cwd, original["candidate_sha"])
