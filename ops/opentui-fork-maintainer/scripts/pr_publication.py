@@ -1013,6 +1013,10 @@ def resume_preview(
         )
     _, digest, dimensions = preview(manifest_root, manifest)
     head, _, identity = _candidate_head(manifest)
+    if retained is not None:
+        # Adoption keeps the contributor branch; the generated task branch was
+        # never published. The captured owner, not receipt prose, supplies it.
+        head = retained["head_branch"]
     marker = f"<!-- maintainer-candidate:v1:{identity} -->"
     legacy = (
         number == 81
@@ -1116,6 +1120,20 @@ def resume_preview(
         dimensions=dimensions,
         head=head,
     )
+    base_evidence = {"base_sha": manifest["base_sha"]}
+    if retained is not None:
+        if repo is None:
+            raise PublicationError("retained PR recovery requires its repository")
+        pr = json.loads(_run([
+            str(GH), "pr", "view", str(number), "--repo", REPOSITORY,
+            "--json", FIELDS + OWNERSHIP_FIELDS,
+        ], root))
+        _validate_pr(pr, head, manifest["candidate_sha"], marker)
+        _validate_retained_pr_owner(pr, manifest)
+        destination = _publication_destination(repo, remote)
+        base_evidence["base_ref_oid"] = _validate_publication_base(
+            repo, root, destination, pr, manifest
+        )
     review = wait_for_review(
         root, number, manifest["candidate_sha"], deadline_unix=deadline_unix,
         expected_pr_evidence={
@@ -1123,7 +1141,7 @@ def resume_preview(
             "preview_identity": f"<!-- maintainer-preview:{manifest['candidate_sha']}:{digest} -->",
             "block_sha256": proof["block_sha256"],
             "attachment_url": proof["attachment_url"],
-            "base_sha": manifest["base_sha"],
+            **base_evidence,
         },
         observed_heads=[manifest["candidate_sha"]],
     )

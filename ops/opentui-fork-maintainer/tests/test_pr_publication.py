@@ -6,6 +6,7 @@ import json
 import shutil
 import struct
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1304,16 +1305,35 @@ def test_retained_reconciliation_advances_only_the_captured_same_pr(
     assert github.pr["isDraft"] is False
     continuation_manifest = json.loads(json.dumps(fresh_manifest))
     continuation_manifest.pop("expected_pr_head")
-    continued = pub.publish_preview(
-        repo,
+    continued = pub.resume_preview(
         fresh_root,
+        fresh_root / "gate.json",
         continuation_manifest,
+        number=91,
+        deadline_unix=int(time.time()) + 60,
+        publication_source=fresh_root / "pr-draft.json",
+        publication_sha256=digest(fresh_root / "pr-draft.json"),
+        repo=repo,
         node=NODE,
         issue_request=fresh_request,
-        _existing_draft=second,
-        _preview_root=fresh_root,
     )
     assert continued["number"] == 91
+    # The next interruption now has pr-evidence rather than only pr-draft.
+    # Exercise that public recovery entrypoint too, not its internal publisher.
+    observed = pub.resume_preview(
+        fresh_root,
+        fresh_root / "gate.json",
+        continuation_manifest,
+        number=91,
+        deadline_unix=int(time.time()) + 60,
+        publication_source=fresh_root / "pr-evidence.json",
+        publication_sha256=digest(fresh_root / "pr-evidence.json"),
+        repo=repo,
+        node=NODE,
+        issue_request=fresh_request,
+    )
+    assert observed["head_branch"] == head
+    assert observed["candidate_sha"] == latest
     assert sum(call[:2] == ["git", "push"] for call in github.calls) == 2
 
     subprocess.run(
