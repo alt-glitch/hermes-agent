@@ -83,7 +83,7 @@ export function bodyColor(role: Message['role'], color: ThemeColors): string {
  * this chrome never repeats or rewrites the submitted content. */
 export function steerStateLabel(state: SteerState): string {
   const labels: Record<SteerState, string> = {
-    accepted: 'steer accepted — waiting for next tool boundary',
+    accepted: 'steer accepted',
     pending: 'steer pending — awaiting gateway acceptance',
     rejected: 'steer rejected — retaining for the next turn',
     retained: 'steer fallback queue full — copy this retained input to retry',

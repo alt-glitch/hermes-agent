@@ -157,6 +157,9 @@ describe('live interrupt correction ordering (native frame)', () => {
       const frame = probe.frame()
       expect(frame.indexOf('USER_STEER')).toBeGreaterThan(frame.indexOf('BEFORE_STEER'))
       expect(frame.indexOf('AFTER_STEER')).toBeGreaterThan(frame.indexOf('USER_STEER'))
+      // Acceptance does not tell the client whether the next tool boundary
+      // has already passed; response streaming must not carry that claim.
+      expect(frame).not.toContain('waiting for next tool boundary')
     } finally {
       probe.destroy()
     }
