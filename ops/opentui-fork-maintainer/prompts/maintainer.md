@@ -268,8 +268,11 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    that current canonical tip; upstream commits arriving mid-run belong to the
    next scheduled run and do not invalidate this candidate. The runtime derives a
    synthetic Git merge-tree and reviews only the resulting semantic
-   conflict-resolution delta plus linear post-merge fork adaptations. A claimed
-   manual backport or repair must remain entirely linear and reviews the whole candidate.
+   conflict-resolution delta plus every linear post-merge fork adaptation. A
+   claimed manual backport or ordinary repair must remain entirely linear and
+   reviews the whole candidate. The evidence-pinned retained-sync repair below
+   preserves its authenticated scheduled merge and uses the same merge-tree
+   reduction; it does not re-expand trusted upstream history.
    The runtime hashes one canonical binary diff stream per range, splits that
    exact stream only at complete patch boundaries below the reviewer limit,
    requires every chunk to end in `VERDICT: APPROVED` with no
@@ -370,9 +373,11 @@ retained PR head. Do not stop before implementation solely because the current
 publisher rejects the intended topology. Extend the existing ownership,
 review-scope and publication boundaries, not a second publisher or a generic
 waiver. Test exact parents and preserved ancestry, changed/foreign PR heads,
-stale approval/base, unexpected merges and same-PR updates. Review the full
-fork-owned candidate delta against the captured base; do not apply the trusted
-upstream review reduction to the retained PR's code.
+stale approval/base, unexpected merges and same-PR updates. Re-prove that the
+pinned upstream remains canonical, retain the established synthetic merge-tree
+conflict-resolution range, and review every linear change after the preserved
+merge through the candidate. Never send the complete trusted upstream history
+to the reviewer.
 
 Before using the new validator, retain committed source, executed focused
 tests, an independent source-bound review, hashes and the exact runtime assets
