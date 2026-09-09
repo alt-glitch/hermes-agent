@@ -197,6 +197,7 @@ def retained_sync_repair_fixture(
         path.write_text(json.dumps(value), encoding="utf-8")
     context_hash = file_hash(source_root / "run-context.json")
     source_manifest = {
+        "lease_token_sha256": source_context["lease_token_sha256"],
         "base_sha": base,
         "candidate_sha": source,
         "run_binding": {
@@ -313,6 +314,36 @@ def test_retained_sync_request_accepts_a_second_authenticated_identity(
     assert binding["retained_sync"]["pr"]["number"] == 137
     assert binding["retained_sync"]["source_run"] == "another-terminal-owner"
     assert set(reads.values()) == {1}
+
+
+@pytest.mark.parametrize("source_owner", ["first-attempt", "resumed", "mismatched-lease", "malformed-recovery"])
+def test_retained_source_authenticates_direct_terminal_owner(tmp_path, monkeypatch, source_owner):
+    f = retained_sync_repair_fixture(tmp_path, monkeypatch)
+    manifest_path = f["source_root"] / "gate.json"
+    manifest = json.loads(manifest_path.read_text())
+    if source_owner != "resumed":
+        manifest.pop("publication_recovery")
+    if source_owner == "mismatched-lease":
+        manifest["lease_token_sha256"] = "f" * 64
+    if source_owner == "malformed-recovery":
+        manifest["publication_recovery"] = None
+    manifest_path.write_text(json.dumps(manifest))
+    request = {
+        **f["request"],
+        "retained_sync": {
+            **f["request"]["retained_sync"],
+            "manifest_sha256": file_hash(manifest_path),
+        },
+    }
+    owner = runtime._retained_sync()
+    if source_owner in {"mismatched-lease", "malformed-recovery"}:
+        with pytest.raises(owner.RetainedSyncError, match="manifest provenance changed"):
+            owner.authenticate(f["state"], request, current_run_id=f["evidence"].name)
+    else:
+        binding = owner.authenticate(f["state"], request, current_run_id=f["evidence"].name)
+        assert binding["source_sha"] == f["source"]
+        assert binding["upstream_sha"] == f["upstream"]
+        assert binding["pr"]["head_branch"] == f["head_branch"]
 
 
 def test_retained_sync_repair_runs_fresh_gate_ship_and_finalization(

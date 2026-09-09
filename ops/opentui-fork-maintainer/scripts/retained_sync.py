@@ -129,6 +129,8 @@ def authenticate(
 
     binding = manifest.get("run_binding")
     review = manifest.get("review_proof")
+    # A first gate-and-ship has no recovery receipt. Bind its original lease
+    # directly; when a later observation receipt exists, validate that too.
     recovery = manifest.get("publication_recovery")
     owner = manifest.get("owner_preflight")
     upstream_sha = context["upstream_sha"]
@@ -136,6 +138,7 @@ def authenticate(
     merge_commit = review.get("merge_commit") if isinstance(review, dict) else None
     if (
         manifest.get("base_sha") != request["base_sha"]
+        or manifest.get("lease_token_sha256") != context["lease_token_sha256"]
         or manifest.get("candidate_sha") != request["source_sha"]
         or not isinstance(binding, dict)
         or binding.get("mode") != "scheduled"
@@ -156,12 +159,17 @@ def authenticate(
         or review.get("upstream_sha") != upstream_sha
         or not isinstance(merge_commit, str)
         or not SHA_RE.fullmatch(merge_commit)
-        or not isinstance(recovery, dict)
-        or recovery.get("source_owner") != "live-owner"
-        or recovery.get("source_evidence_dir") != str(source_root)
-        or recovery.get("context_path") != str(source_root / "run-context.json")
-        or recovery.get("context_sha256") != provenance["context_sha256"]
-        or recovery.get("number") != request["pr"]
+        or (
+            "publication_recovery" in manifest
+            and (
+                not isinstance(recovery, dict)
+                or recovery.get("source_owner") != "live-owner"
+                or recovery.get("source_evidence_dir") != str(source_root)
+                or recovery.get("context_path") != str(source_root / "run-context.json")
+                or recovery.get("context_sha256") != provenance["context_sha256"]
+                or recovery.get("number") != request["pr"]
+            )
+        )
         or not isinstance(owner, dict)
         or owner.get("repository") != REPOSITORY
         or owner.get("base_sha") != request["base_sha"]

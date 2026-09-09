@@ -343,7 +343,11 @@ linear repair and artifact hashes. PR95 remains the current acceptance case:
 
 The request is rejected unless the historical files still hash and describe
 the exact terminal unpublished scheduled owner, PR branch, base, source merge,
-upstream and prior watermark. The fresh candidate must contain source head
+upstream and prior watermark. The source manifest must bind directly to the
+source context's lease hash, including when the initial gate-and-ship failed
+before any publication continuation. A recovery receipt is not required to
+exist, but an existing receipt must still validate; it cannot replace the
+direct owner binding. The fresh candidate must contain source head
 `a4ba79d9` and retained local repair `b14ab20f` on the preserved first-parent
 chain with no additional merge. Its review rechecks that the pinned upstream is
 still canonical, compares the synthetic merge tree with the preserved merge,
