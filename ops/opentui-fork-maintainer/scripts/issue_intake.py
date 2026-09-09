@@ -651,13 +651,8 @@ def select_approved_issue(
     *,
     now: int | None = None,
     runner: Runner | None = None,
-    excluded_numbers: frozenset[int] = frozenset(),
 ) -> dict[str, Any] | None:
     """Return one deterministic approved issue without mutating the queue."""
-    if not isinstance(excluded_numbers, frozenset) or any(
-        type(number) is not int or number <= 0 for number in excluded_numbers
-    ):
-        raise IssueIntakeError("excluded issue routes are invalid")
     runner = _run if runner is None else runner
     now = int(time.time()) if now is None else now
     labels = quote(f"{SCOPE_LABEL},{READY_LABEL}", safe="")
@@ -703,7 +698,7 @@ def select_approved_issue(
                 first_error = exc
             continue
         record = intake_state["issues"].get(str(number))
-        if _eligible_by_state(record, request, now) and number not in excluded_numbers:
+        if _eligible_by_state(record, request, now):
             prior_selection = (
                 record.get("updated_unix", -1)
                 if isinstance(record, dict)

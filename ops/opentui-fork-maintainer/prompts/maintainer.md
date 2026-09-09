@@ -117,10 +117,13 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    automatic outcome; success and failure both count. Explicit queued work and
    interrupted in-flight recovery remain ahead of that choice. Missing history
    starts issue-first, while unreadable history blocks both automatic lanes and
-   wakes diagnosis. Issue 45 is a versioned scheduled-sync tracking route: its
-   approved prose is never queued as a linear issue candidate or treated as
-   delivery evidence. A behind probe uses the normal scheduled topology; an
-   up-to-date probe leaves it open until genuine sync evidence exists.
+   wakes diagnosis. Do not route by historical issue number: issue 45's current
+   approved scope is a linear fixture repair after delivered sync and remains
+   eligible. Future upstream movement belongs to recurring sync. If a current
+   issue still demands sync topology, retain a coordinator reconciliation
+   blocker; its prose cannot authorize a merge in the linear issue lane.
+   Reconcile tracking scope only against genuine publication/watermark evidence,
+   never an ancestral preparation commit or an unperformed sync.
    Start at the captured fork base and keep the candidate entirely linear; do
    not merge upstream or advance its watermark. Reproduce bugs before repair.
    Inspect every captured implementing PR before writing: reuse its exact head

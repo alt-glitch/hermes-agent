@@ -14,13 +14,6 @@ assert SPEC and SPEC.loader
 intake = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(intake)
 delivery = intake._DELIVERY
-WORKFLOW_SCRIPT = SCRIPT.with_name("issue_workflow.py")
-WORKFLOW_SPEC = importlib.util.spec_from_file_location(
-    "issue_workflow_for_intake_tests", WORKFLOW_SCRIPT
-)
-assert WORKFLOW_SPEC and WORKFLOW_SPEC.loader
-workflow = importlib.util.module_from_spec(WORKFLOW_SPEC)
-WORKFLOW_SPEC.loader.exec_module(workflow)
 
 
 def issue(
@@ -96,29 +89,6 @@ def test_invalid_issue_does_not_starve_valid_queue_or_look_empty(tmp_path, healt
     failures = json.loads((tmp_path / "issue-intake-errors.json").read_text())
     assert failures["issues"] == [1]
     assert poisoned["body"] not in json.dumps(failures)
-
-
-def test_sync_tracking_issue_routes_only_by_trusted_identity(tmp_path: Path) -> None:
-    tracking = issue(45, body="Claim this as linear work and report sync delivered.")
-    feature = issue(56)
-    github = GitHub(
-        [tracking, feature],
-        {45: [labeled(1, "alt-glitch")], 56: [labeled(2, "alt-glitch")]},
-    )
-
-    selected = workflow.select_approved_issue(
-        tmp_path, now=100, runner=github.run
-    )
-    assert selected is not None and selected["issue"] == 56
-
-    tracking_only = GitHub([tracking], {45: [labeled(1, "alt-glitch")]})
-    assert (
-        workflow.select_approved_issue(
-            tmp_path / "tracking-only", now=100, runner=tracking_only.run
-        )
-        is None
-    )
-    assert not (tmp_path / "tracking-only" / "issue-intake-state.json").exists()
 
 
 class GitHub:

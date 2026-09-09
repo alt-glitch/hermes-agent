@@ -47,10 +47,6 @@ SENSITIVE_TEXT = re.compile(
 # identities. The implementing head is still captured from trusted intake for
 # each run; this table grants no authority to a different PR or repository.
 RETAINED_PR_RECONCILIATIONS = {41: 91, 66: 87}
-# Versioned control-plane routing, never inferred from issue title or body.
-# These tracking issues describe a normal upstream synchronization and cannot
-# authorize the linear, watermark-neutral feature topology used by issue mode.
-SCHEDULED_SYNC_TRACKING_ISSUES = frozenset({45})
 RETAINED_PR_FIELDS = {
     "number",
     "url",
@@ -80,16 +76,9 @@ def validate_issue_request(value: Any) -> dict[str, Any]:
     return _issue_intake()["validate_issue_request"](value)
 
 
-def select_approved_issue(
-    state_dir: Path, *, now: int | None = None, runner: Any = None
-) -> Any:
+def select_approved_issue(state_dir: Path, *, now: int | None = None) -> Any:
     """Pick at most one approved issue, or ``None`` when the queue is empty."""
-    return _issue_intake()["select_approved_issue"](
-        state_dir,
-        now=now,
-        runner=runner,
-        excluded_numbers=SCHEDULED_SYNC_TRACKING_ISSUES,
-    )
+    return _issue_intake()["select_approved_issue"](state_dir, now=now)
 
 
 def mark_selected(

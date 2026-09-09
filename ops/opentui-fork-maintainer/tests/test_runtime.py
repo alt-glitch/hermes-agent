@@ -905,7 +905,7 @@ def test_issue_intake_queues_through_existing_request_owner(
     value = issue_request()
     selected: list[int] = []
     api = {
-        "select_approved_issue": lambda _state, now=None, **_kwargs: value,
+        "select_approved_issue": lambda _state, now=None: value,
         "validate_issue_request": lambda request: request,
         "mark_selected": lambda _state, request, now=None: selected.append(request["issue"]),
     }

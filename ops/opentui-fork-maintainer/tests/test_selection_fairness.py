@@ -31,6 +31,7 @@ def _load_script(path: Path, name: str):
 wrapper = _load_script(WRAPPER_SCRIPT, "fairness_wrapper")
 runtime = _load_script(RUNTIME_SCRIPT, "fairness_runtime")
 intake = _load_script(INTAKE_SCRIPT, "fairness_intake")
+workflow = _load_script(ROOT / "scripts" / "issue_workflow.py", "fairness_workflow")
 
 
 def _issue_request(number: int) -> dict[str, object]:
@@ -60,9 +61,7 @@ def _issue_request(number: int) -> dict[str, object]:
     }
 
 
-def _run_behind_tick(
-    root: Path, module, *, offered_issue: int
-) -> tuple[dict, dict]:
+def _run_behind_tick(root: Path, module, *, offered_issue: int) -> tuple[dict, dict]:
     state = root / "state"
     state.mkdir(exist_ok=True)
     payload = {
@@ -75,13 +74,33 @@ def _run_behind_tick(
         ROOT / "tests" / "test_issue_intake.py", "fairness_github_fixtures"
     )
     github = fixtures.GitHub(
-        [fixtures.issue(offered_issue)],
+        [
+            fixtures.issue(
+                offered_issue,
+                title=(
+                    "Reconcile the delivered sync; repair the remaining subprocess test fixture"
+                    if offered_issue == 45
+                    else None
+                ),
+                body=(
+                    "Repair tests/tools/test_local_env_blocklist.py byte-stream/EOF fixture. "
+                    "Future upstream movement belongs to the recurring sync workflow."
+                ),
+            )
+        ],
         {offered_issue: [fixtures.labeled(offered_issue, "alt-glitch")]},
     )
+
+    def select(state_dir, *, now=None):
+        # Keep both selection owners real; only the remote transport is a fixture.
+        with (
+            patch.object(workflow, "_issue_intake", return_value=vars(intake)),
+            patch.object(intake, "_run", side_effect=github.run),
+        ):
+            return workflow.select_approved_issue(state_dir, now=now)
+
     workflow_api = {
-        "select_approved_issue": lambda _state, now=None, **_kwargs: (
-            intake.select_approved_issue(_state, now=now, runner=github.run)
-        ),
+        "select_approved_issue": select,
         "validate_issue_request": intake.validate_issue_request,
         "mark_selected": intake.mark_selected,
     }
@@ -99,9 +118,7 @@ def _run_behind_tick(
         patch.object(module, "STATE_DIR", state),
         patch.object(module, "PROBE", root / "scripts" / "sync_probe.py"),
         patch.object(module, "INGEST_FILE", state / "ingest.latest.json"),
-        patch.object(
-            module, "FAIL_COUNT_FILE", state / "consecutive_probe_failures"
-        ),
+        patch.object(module, "FAIL_COUNT_FILE", state / "consecutive_probe_failures"),
         patch.object(module, "_current_execution_id", return_value="execution"),
         patch.object(module, "_launch_watchdog"),
         patch.object(module.subprocess, "run", side_effect=run),
@@ -149,17 +166,18 @@ def _complete_tick(root: Path, summary: dict, *, status: str) -> None:
 
 
 @pytest.mark.parametrize("issue_status", ["success", "failed"])
+@pytest.mark.parametrize("first_issue", [45, 56])
 def test_terminal_issue_and_failed_sync_alternate_across_restarted_wrappers(
-    tmp_path: Path, issue_status: str,
+    tmp_path: Path,
+    issue_status: str,
+    first_issue: int,
 ) -> None:
-    first, first_ingest = _run_behind_tick(tmp_path, wrapper, offered_issue=56)
-    assert first_ingest["issue_intake"]["issue"] == 56
+    first, first_ingest = _run_behind_tick(tmp_path, wrapper, offered_issue=first_issue)
+    assert first_ingest["issue_intake"]["issue"] == first_issue
     _complete_tick(tmp_path, first, status=issue_status)
 
     restarted = _load_script(WRAPPER_SCRIPT, "fairness_wrapper_restarted_once")
-    second, second_ingest = _run_behind_tick(
-        tmp_path, restarted, offered_issue=57
-    )
+    second, second_ingest = _run_behind_tick(tmp_path, restarted, offered_issue=57)
     assert "issue_intake" not in second_ingest
     assert not (tmp_path / "state" / "run-request.json").exists()
     _complete_tick(tmp_path, second, status="failed")
