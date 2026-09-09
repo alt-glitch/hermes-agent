@@ -137,8 +137,8 @@ def reconcile_issue_candidate_prs(
     ):
         raise IssueWorkflowError("published issue candidate PR evidence is invalid")
     if not prs:
-        # The maintainer-created PR deliberately does not use an auto-closing
-        # keyword, so it need not appear in the issue's implementing-PR set.
+        # Legacy maintainer drafts used descriptive issue links that discovery
+        # cannot resolve; exact publication evidence is validated above.
         return
     expected = {
         "number": expected_pr["number"],
@@ -366,7 +366,7 @@ def issue_publication_metadata(
             _safe_metadata_text(item)
     sections = [
         authored["outcome"].strip(),
-        f"Approved issue: #{request['issue']} ({request['issue_url']})",
+        f"Fixes #{request['issue']} ({request['issue_url']})",
     ]
     for heading, key in (
         ("Implementation", "implementation"),

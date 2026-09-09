@@ -149,8 +149,22 @@ def main() -> int:
 
     # 1. Fetch both remotes. Hard-fail if upstream is unreachable.
     try:
-        run(["git", "fetch", "upstream", "--quiet"])
-        run(["git", "fetch", "origin", "--quiet"])
+        run([
+            "git",
+            "fetch",
+            "upstream",
+            "--quiet",
+            "--no-tags",
+            "+refs/heads/main:refs/remotes/upstream/main",
+        ])
+        run([
+            "git",
+            "fetch",
+            "origin",
+            "--quiet",
+            "--no-tags",
+            "+refs/heads/sid/opentui:refs/remotes/origin/sid/opentui",
+        ])
     except RuntimeError as e:
         print(json.dumps({"status": "error", "error": f"fetch failed: {e}"}))
         return 1

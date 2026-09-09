@@ -95,6 +95,7 @@ class Github:
         self.statuses = {}
         self.action_jobs = {}
         self.action_logs = {}
+        self.issue_prs = None
 
     def run(self, argv, cwd):
         self.calls.append(argv)
@@ -154,9 +155,18 @@ class Github:
             # closing-keyword parser, so the maintainer's own keyword-free PR is
             # correctly ignored while a competitor's `Fixes #` PR is seen.
             if "/timeline" in endpoint:
-                return json.dumps([[self.cross_reference()]] if self.pr else [[]])
+                related = self.issue_prs
+                if related is None:
+                    related = [self.pr] if self.pr else []
+                return json.dumps([[self.cross_reference(pr) for pr in related]])
             if "/pulls/" in endpoint:
-                return json.dumps(self.rest_pull())
+                number = int(endpoint.rsplit("/", 1)[1])
+                related = self.issue_prs
+                if related is None:
+                    related = [self.pr] if self.pr else []
+                return json.dumps(
+                    self.rest_pull(next(pr for pr in related if pr["number"] == number))
+                )
             pytest.fail(f"unexpected GitHub API request: {endpoint}")
         else:
             phase = argv[2]
@@ -201,26 +211,30 @@ class Github:
             raise pub.PublicationError("simulated lost acknowledgement")
         return result
 
-    def cross_reference(self):
+    def cross_reference(self, pr=None):
+        pr = self.pr if pr is None else pr
         return {"event": "cross-referenced", "source": {"issue": {
-            "number": self.pr["number"],
-            "pull_request": {"url": self.pr["url"]},
+            "number": pr["number"],
+            "pull_request": {"url": pr["url"]},
             "repository_url": f"https://api.github.com/repos/{pub.REPOSITORY}",
-            "body": self.pr["body"],
+            "body": pr["body"],
         }}}
 
-    def rest_pull(self):
+    def rest_pull(self, pr=None):
+        pr = self.pr if pr is None else pr
+        owner = (pr.get("headRepositoryOwner") or {}).get("login", "alt-glitch")
+        repository = (pr.get("headRepository") or {}).get("name", "hermes-agent")
         return {
-            "number": self.pr["number"],
+            "number": pr["number"],
             "state": "open",
             "base": {"ref": pub.BASE},
             "head": {
-                "sha": self.pr["headRefOid"],
-                "repo": {"full_name": pub.REPOSITORY},
-                "ref": self.pr["headRefName"],
+                "sha": pr["headRefOid"],
+                "repo": {"full_name": f"{owner}/{repository}"},
+                "ref": pr["headRefName"],
             },
-            "body": self.pr["body"],
-            "html_url": self.pr["url"],
+            "body": pr["body"],
+            "html_url": pr["url"],
         }
 
 
@@ -278,6 +292,129 @@ def bind_issue(
         },
     }
     return request
+
+
+def prepare_owned_head_graph(tmp_path: Path, capture, head: str):
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "maintainer@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "OpenTUI Maintainer"], cwd=repo, check=True
+    )
+    source = repo / "candidate.txt"
+    source.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", source.name], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    source.write_text("base\nowned head\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-am", "owned head"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    expected = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", str(remote), f"{expected}:refs/heads/{head}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    source.write_text("base\nowned head\ncorrection\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-am", "correction"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    candidate = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    capture[1].update(base_sha=base, candidate_sha=candidate)
+    return repo, remote, expected, candidate
+
+
+def remote_head(remote: Path, head: str) -> str:
+    return subprocess.run(
+        ["git", "ls-remote", str(remote), f"refs/heads/{head}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[0]
+
+
+def closed_canonical_transport(
+    github, closed_duplicate: dict, candidate: str, *, lose_push_reply: list[bool] | None = None
+):
+    simulated_github = github.run
+
+    def transport(argv, cwd):
+        if argv[0] == "git":
+            github.calls.append(argv)
+            result = subprocess.run(
+                argv, cwd=cwd, check=True, capture_output=True, text=True
+            )
+            if argv[1] == "push":
+                github.pr["headRefOid"] = candidate
+                if lose_push_reply and lose_push_reply.pop(0):
+                    raise pub.PublicationError("simulated lost acknowledgement")
+            return result.stdout
+        if argv[:3] == [str(pub.GH), "pr", "list"]:
+            github.calls.append(argv)
+            assert argv[argv.index("--head") + 1] == closed_duplicate["headRefName"]
+            assert argv[argv.index("--state") + 1] == "all"
+            return json.dumps([closed_duplicate])
+        return simulated_github(argv, cwd)
+
+    return transport
+
+
+def publisher_adopts_after_empty_capture(capture, github, repo: Path, expected: str):
+    request = bind_issue(capture)
+    adopted = {
+        "number": 91,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/91",
+        "base_branch": pub.BASE,
+        "head_branch": "contributor/approved-41",
+        "head_sha": expected,
+        "head_repository": pub.REPOSITORY,
+    }
+    capture[1]["candidate_sha"] = expected
+    github.ref = f"{expected}\trefs/heads/{adopted['head_branch']}"
+    github.pr = {
+        **review_pr(),
+        "number": adopted["number"],
+        "url": adopted["url"],
+        "body": "Contributor context.\n\nFixes #41",
+        "headRefName": adopted["head_branch"],
+        "headRefOid": expected,
+        "baseRefOid": capture[1]["base_sha"],
+        "isDraft": True,
+    }
+    proof = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["candidate verification"],
+        issue_request={**request, "existing_prs": [adopted]},
+    )
+    assert json.loads(
+        (capture[0] / "request.claimed.json").read_text(encoding="utf-8")
+    )["existing_prs"] == []
+    assert proof["issue"]["existing_prs"] == [adopted]
+    return request, adopted, proof
 
 
 def write_review_disposition(root: Path, observations: dict) -> None:
@@ -552,6 +689,79 @@ def test_review_timeout_keeps_target_untouched(capture, github, monkeypatch):
     assert json.loads((root / "pr-pending.json").read_text())["status"] == "pending"
 
 
+def test_pending_ci_returns_edited_required_finding_before_timeout(
+    capture, github, monkeypatch
+):
+    root, _, _ = capture
+    github.pr = review_pr()
+    github.pr["statusCheckRollup"][1].update(
+        status="IN_PROGRESS", conclusion=None
+    )
+    github.issue_comments = [
+        {
+            "id": 101,
+            "user": {"login": "github-actions"},
+            "body": "Initial CI metadata.",
+            "created_at": "2026-09-08T10:00:00Z",
+            "updated_at": "2026-09-08T10:00:00Z",
+            "html_url": "https://example.invalid/general",
+        }
+    ]
+    observations = pub.collect_review_surfaces(root, 42, "a" * 40)
+    write_review_disposition(root, observations)
+    github.issue_comments[0].update(
+        body="Edited metadata now requires a fresh parent disposition.",
+        updated_at="2026-09-08T10:05:00Z",
+    )
+    monkeypatch.setattr(
+        pub.time,
+        "sleep",
+        lambda _seconds: pytest.fail("edited finding must return before another CI poll"),
+    )
+
+    with pytest.raises(
+        pub.PublicationError, match=r"stale.*issue_comments:101"
+    ):
+        pub.wait_for_review(root, 42, "a" * 40, max_wait_seconds=1800)
+
+    assert not (root / "pr-review.json").exists()
+
+
+def test_review_disposition_diagnostics_name_stale_and_malformed_items(capture):
+    root, _, _ = capture
+    observations = {
+        "number": 42,
+        "candidate_sha": "a" * 40,
+        "observations_sha256": "b" * 64,
+        "surfaces": {
+            "issue_comments": [
+                    {
+                        "key": "issue_comments:101",
+                        "evidence_sha256": "c" * 64,
+                        "requires_disposition": True,
+                        "body": "A required finding.",
+                    }
+            ]
+        },
+    }
+    write_review_disposition(root, observations)
+    path = root / "pr-review-disposition.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["dispositions"][0]["evidence_sha256"] = "d" * 64
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(
+        pub.PublicationError, match=r"stale.*issue_comments:101"
+    ):
+        pub.require_review_disposition(root, observations)
+
+    value["dispositions"][0] = {"key": "issue_comments:101"}
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(
+        pub.PublicationError, match=r"malformed.*issue_comments:101"
+    ):
+        pub.require_review_disposition(root, observations)
+
+
 def test_review_wait_can_outlive_old_thirty_minute_limit(
     capture, github, monkeypatch
 ) -> None:
@@ -741,6 +951,221 @@ def test_compatible_existing_issue_draft_is_adopted_without_replacement(
     assert retried["number"] == proof["number"]
     assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
     assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
+
+
+def test_publisher_adoption_after_empty_capture_advances_sequential_real_git_heads(
+    capture, github, monkeypatch, tmp_path
+) -> None:
+    adopted_head = "contributor/approved-41"
+    repo, remote, expected, candidate = prepare_owned_head_graph(
+        tmp_path, capture, adopted_head
+    )
+    request, adopted, first = publisher_adopts_after_empty_capture(
+        capture, github, repo, expected
+    )
+    marker = f"<!-- maintainer-candidate:v1:{first['candidate_identity']} -->"
+    closed_duplicate = {
+        **github.pr,
+        "number": 92,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
+        "headRefName": pub._candidate_head(capture[1])[0],
+        "headRefOid": expected,
+        "body": marker,
+        "state": "CLOSED",
+    }
+    monkeypatch.setattr(pub, "_publication_destination", lambda _repo, _remote: str(remote))
+    monkeypatch.setattr(
+        pub, "_run", closed_canonical_transport(github, closed_duplicate, candidate)
+    )
+    capture[1].update(candidate_sha=candidate, expected_pr_head=expected)
+    # The runtime captures issue observations before advancing the remote head.
+    adopted["head_sha"] = expected
+
+    second = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["new-head checks"],
+        issue_request={**request, "existing_prs": [adopted]},
+    )
+    retried = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["new-head checks"],
+        issue_request={**request, "existing_prs": [adopted]},
+    )
+    assert retried["candidate_sha"] == second["candidate_sha"]
+    assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
+
+    source = repo / "candidate.txt"
+    source.write_text("base\nowned head\ncorrection\nsecond correction\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-am", "second correction"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    latest = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    capture[1].update(candidate_sha=latest, expected_pr_head=candidate)
+    adopted["head_sha"] = candidate
+    monkeypatch.setattr(
+        pub, "_run", closed_canonical_transport(github, closed_duplicate, latest)
+    )
+    third = pub.publish_draft(
+        repo,
+        capture[0],
+        capture[1],
+        pending_gates=["latest-head checks"],
+        issue_request={**request, "existing_prs": [adopted]},
+    )
+
+    claimed = json.loads(
+        (capture[0] / "request.claimed.json").read_text(encoding="utf-8")
+    )
+    assert claimed["existing_prs"] == []
+    assert first["candidate_sha"] == expected
+    assert second["candidate_sha"] == candidate
+    assert third["candidate_sha"] == latest
+    for receipt in (first, second, third):
+        assert receipt["issue"]["existing_prs"][0]["head_sha"] == receipt["candidate_sha"]
+    assert third["number"] == first["number"] == 91
+    assert third["head_branch"] == first["head_branch"] == adopted_head
+    assert remote_head(remote, adopted_head) == latest
+    assert closed_duplicate["headRefOid"] == expected
+    pushes = [call for call in github.calls if call[:2] == ["git", "push"]]
+    assert [call[-1] for call in pushes] == [
+        f"{candidate}:refs/heads/{adopted_head}",
+        f"{latest}:refs/heads/{adopted_head}",
+    ]
+    assert not any(call[1:3] == ["pr", "create"] for call in github.calls)
+
+
+def test_empty_capture_adoption_retry_after_lost_push_reply_is_idempotent(
+    capture, github, monkeypatch, tmp_path
+) -> None:
+    adopted_head = "contributor/approved-41"
+    repo, remote, expected, candidate = prepare_owned_head_graph(
+        tmp_path, capture, adopted_head
+    )
+    _, _, receipt = publisher_adopts_after_empty_capture(capture, github, repo, expected)
+    closed_duplicate = {
+        **github.pr,
+        "number": 92,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
+        "headRefName": pub._candidate_head(capture[1])[0],
+        "headRefOid": expected,
+        "body": f"<!-- maintainer-candidate:v1:{receipt['candidate_identity']} -->",
+        "state": "CLOSED",
+    }
+    lost = [True]
+    monkeypatch.setattr(
+        pub,
+        "_run",
+        closed_canonical_transport(
+            github, closed_duplicate, candidate, lose_push_reply=lost
+        ),
+    )
+    capture[1].update(candidate_sha=candidate, expected_pr_head=expected)
+
+    with pytest.raises(pub.PublicationError, match="lost acknowledgement"):
+        pub.advance_owned_head(
+            repo, capture[0], str(remote), capture[1], expected, as_draft=True
+        )
+    pub.advance_owned_head(
+        repo, capture[0], str(remote), capture[1], expected, as_draft=True
+    )
+
+    assert remote_head(remote, adopted_head) == candidate
+    assert json.loads(
+        (capture[0] / "pr-draft.json").read_text(encoding="utf-8")
+    )["candidate_sha"] == expected
+    assert sum(call[:2] == ["git", "push"] for call in github.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("malformed-receipt", "retained task draft is invalid"),
+        ("symlinked-receipt", "retained task draft path is unsafe"),
+        ("changed-receipt", "retained task draft does not bind"),
+        ("absent-receipt", "open expected base/head"),
+        ("foreign-canonical", "open expected base/head"),
+        ("changed-live-head", "conflicting implementing PR"),
+        ("changed-live-base", "repository ownership changed"),
+        ("foreign-live-owner", "repository ownership changed"),
+        ("missing-live-marker", "expected request/base/candidate"),
+        ("ambiguous-live-identity", "ambiguous implementing PRs"),
+    ],
+)
+def test_unproven_empty_capture_adoption_refuses_before_remote_mutation(
+    capture, github, monkeypatch, tmp_path, failure, message
+) -> None:
+    adopted_head = "contributor/approved-41"
+    repo, remote, expected, candidate = prepare_owned_head_graph(
+        tmp_path, capture, adopted_head
+    )
+    _, _, receipt = publisher_adopts_after_empty_capture(capture, github, repo, expected)
+    receipt_path = capture[0] / "pr-draft.json"
+    marker = f"<!-- maintainer-candidate:v1:{receipt['candidate_identity']} -->"
+    closed_duplicate = {
+        **github.pr,
+        "number": 92,
+        "url": f"https://github.com/{pub.REPOSITORY}/pull/92",
+        "headRefName": pub._candidate_head(capture[1])[0],
+        "headRefOid": expected,
+        "body": marker,
+        "state": "CLOSED",
+    }
+    if failure == "malformed-receipt":
+        receipt_path.write_text("{", encoding="utf-8")
+    elif failure == "symlinked-receipt":
+        target = capture[0] / "untrusted-draft.json"
+        receipt_path.replace(target)
+        receipt_path.symlink_to(target)
+    elif failure == "changed-receipt":
+        changed = json.loads(receipt_path.read_text(encoding="utf-8"))
+        changed["candidate_identity"] = "f" * 64
+        receipt_path.write_text(json.dumps(changed), encoding="utf-8")
+    elif failure == "absent-receipt":
+        receipt_path.unlink()
+    elif failure == "foreign-canonical":
+        closed_duplicate["headRepositoryOwner"] = {"login": "someone-else"}
+    if failure == "changed-live-head":
+        github.pr["headRefOid"] = "f" * 40
+    elif failure == "changed-live-base":
+        github.pr["baseRefOid"] = "f" * 40
+    elif failure == "foreign-live-owner":
+        github.pr["headRepositoryOwner"] = {"login": "someone-else"}
+    elif failure == "missing-live-marker":
+        github.pr["body"] = "Fixes #41"
+    elif failure == "ambiguous-live-identity":
+        other = {
+            **github.pr,
+            "number": 93,
+            "url": f"https://github.com/{pub.REPOSITORY}/pull/93",
+            "headRefName": "other/approved-41",
+        }
+        github.issue_prs = [github.pr, other]
+    monkeypatch.setattr(
+        pub, "_run", closed_canonical_transport(github, closed_duplicate, candidate)
+    )
+    capture[1].update(candidate_sha=candidate, expected_pr_head=expected)
+
+    with pytest.raises(pub.PublicationError, match=message):
+        pub.advance_owned_head(
+            repo, capture[0], str(remote), capture[1], expected, as_draft=True
+        )
+
+    assert remote_head(remote, adopted_head) == expected
+    assert not any(call[:2] == ["git", "push"] for call in github.calls)
+    assert not any(call[1:3] in (["pr", "create"], ["pr", "ready"]) for call in github.calls)
 
 
 def test_fix_cycle_reuses_unchanged_item_disposition_across_head_snapshots(
@@ -1070,7 +1495,39 @@ def test_recovered_issue_reuses_candidate_pr_across_distinct_leases(
         len(call) > 2 and call[1:3] == ["pr", "create"] for call in github.calls
     ) == 1
     assert github.pr["body"].startswith("<!-- maintainer-candidate:v1:")
-    assert "Approved issue: #41" in github.pr["body"]
+    # Round-trip the exact generated body through real issue-scoped discovery.
+    # A descriptive link alone is not an implementing-PR reference.
+    intake = pub._issue_workflow()._issue_intake()
+
+    def discover(argv, _cwd):
+        endpoint = argv[-1]
+        if "/timeline" in endpoint:
+            return json.dumps([[{
+                "event": "cross-referenced",
+                "source": {"issue": {
+                    "number": first["number"],
+                    "pull_request": {},
+                    "repository_url": f"https://api.github.com/repos/{pub.REPOSITORY}",
+                    "body": github.pr["body"],
+                }},
+            }]])
+        assert endpoint == f"repos/{pub.REPOSITORY}/pulls/{first['number']}"
+        return json.dumps({
+            "number": first["number"],
+            "state": "open",
+            "body": github.pr["body"],
+            "html_url": first["url"],
+            "base": {"ref": pub.BASE},
+            "head": {
+                "ref": first_head,
+                "sha": second["candidate_sha"],
+                "repo": {"full_name": pub.REPOSITORY},
+            },
+        })
+
+    discovered = intake["live_existing_prs"](41, capture[0], runner=discover)
+    assert [item["number"] for item in discovered] == [first["number"]]
+    assert discovered[0]["head_sha"] == second["candidate_sha"]
     assert github.pr["body"].count("https://github.com/user-attachments/assets/") == 1
 
 

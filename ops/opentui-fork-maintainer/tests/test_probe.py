@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import subprocess
 from contextlib import redirect_stdout
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -14,6 +15,89 @@ SPEC = importlib.util.spec_from_file_location("sync_probe", SCRIPT)
 assert SPEC and SPEC.loader
 probe = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(probe)
+
+
+def git(repo: Path, *args: str, check: bool = True) -> CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def commit_file(repo: Path, name: str) -> str:
+    path = repo / name
+    path.write_text(f"{name}\n")
+    git(repo, "add", name)
+    git(repo, "commit", "-m", name)
+    return git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def remote_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    source = tmp_path / "source"
+    upstream = tmp_path / "upstream.git"
+    origin = tmp_path / "origin.git"
+    fork = tmp_path / "fork"
+    for repo in (source, upstream, origin, fork):
+        repo.mkdir()
+
+    git(source, "init", "--initial-branch=main")
+    git(source, "config", "user.name", "Probe Test")
+    git(source, "config", "user.email", "probe@example.invalid")
+    base_sha = commit_file(source, "base")
+    git(source, "branch", "sid/opentui", base_sha)
+
+    git(upstream, "init", "--bare", "--initial-branch=main")
+    git(origin, "init", "--bare", "--initial-branch=sid/opentui")
+    git(source, "remote", "add", "publish-upstream", str(upstream))
+    git(source, "remote", "add", "publish-origin", str(origin))
+
+    commit_file(source, "upstream-one")
+    git(source, "branch", "unrelated-upstream")
+    git(source, "tag", "upstream-reachable")
+    git(
+        source,
+        "push",
+        "publish-upstream",
+        "refs/heads/main:refs/heads/main",
+        "refs/heads/unrelated-upstream:refs/heads/unrelated-upstream",
+        "refs/tags/upstream-reachable:refs/tags/upstream-reachable",
+    )
+
+    git(source, "checkout", "sid/opentui")
+    commit_file(source, "origin-one")
+    git(source, "branch", "unrelated-origin")
+    git(source, "tag", "origin-reachable")
+    git(
+        source,
+        "push",
+        "publish-origin",
+        "refs/heads/sid/opentui:refs/heads/sid/opentui",
+        "refs/heads/unrelated-origin:refs/heads/unrelated-origin",
+        "refs/tags/origin-reachable:refs/tags/origin-reachable",
+    )
+
+    git(fork, "init", "--initial-branch=local")
+    git(fork, "remote", "add", "upstream", str(upstream))
+    git(fork, "remote", "add", "origin", str(origin))
+    return source, upstream, origin, fork
+
+
+def run_probe(fork: Path, state: Path) -> tuple[int, dict[str, object]]:
+    with (
+        patch.object(probe, "FORK", fork),
+        patch.object(probe, "STATE_DIR", state),
+        patch.object(probe, "LAST_SYNCED_FILE", state / "last.sha"),
+    ):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            result = probe.main()
+    return result, json.loads(stdout.getvalue())
+
+
+def assert_ref_missing(repo: Path, ref: str) -> None:
+    assert git(repo, "show-ref", "--verify", "--quiet", ref, check=False).returncode == 1
 
 
 def test_classification_marks_engine_facing_surfaces_as_port_candidates() -> None:
@@ -80,3 +164,56 @@ def test_path_summaries_hash_hostile_filenames_without_emitting_them() -> None:
     assert summary["count"] == 1
     assert summary["categories"] == {"ui-opentui": 1}
     assert len(summary["sha256"][0]) == 64
+
+
+def test_fetches_only_required_remote_heads_without_changing_remote_config(
+    tmp_path: Path,
+) -> None:
+    source, upstream, origin, fork = remote_fixture(tmp_path)
+    upstream_fetch = "+refs/heads/*:refs/remotes/upstream/*"
+    origin_fetch = "+refs/heads/*:refs/remotes/origin/*"
+
+    result, payload = run_probe(fork, tmp_path / "state")
+
+    assert result == 0
+    assert payload["upstream_sha"] == git(upstream, "rev-parse", "main").stdout.strip()
+    assert payload["branch_sha"] == git(origin, "rev-parse", "sid/opentui").stdout.strip()
+    assert_ref_missing(fork, "refs/remotes/upstream/unrelated-upstream")
+    assert_ref_missing(fork, "refs/remotes/origin/unrelated-origin")
+    assert git(fork, "tag", "--list").stdout == ""
+    assert git(fork, "config", "--get-all", "remote.upstream.fetch").stdout.strip() == upstream_fetch
+    assert git(fork, "config", "--get-all", "remote.origin.fetch").stdout.strip() == origin_fetch
+
+    git(source, "checkout", "main")
+    advanced_upstream = commit_file(source, "upstream-two")
+    git(source, "push", "publish-upstream", "refs/heads/main:refs/heads/main")
+    git(source, "checkout", "sid/opentui")
+    advanced_origin = commit_file(source, "origin-two")
+    git(
+        source,
+        "push",
+        "publish-origin",
+        "refs/heads/sid/opentui:refs/heads/sid/opentui",
+    )
+
+    result, payload = run_probe(fork, tmp_path / "state")
+
+    assert result == 0
+    assert payload["upstream_sha"] == advanced_upstream
+    assert payload["branch_sha"] == advanced_origin
+    assert_ref_missing(fork, "refs/remotes/upstream/unrelated-upstream")
+    assert_ref_missing(fork, "refs/remotes/origin/unrelated-origin")
+    assert git(fork, "tag", "--list").stdout == ""
+    assert git(fork, "config", "--get-all", "remote.upstream.fetch").stdout.strip() == upstream_fetch
+    assert git(fork, "config", "--get-all", "remote.origin.fetch").stdout.strip() == origin_fetch
+
+
+def test_fetch_fails_when_required_source_head_is_absent(tmp_path: Path) -> None:
+    _, upstream, _, fork = remote_fixture(tmp_path)
+    git(upstream, "update-ref", "-d", "refs/heads/main")
+
+    result, payload = run_probe(fork, tmp_path / "state")
+
+    assert result == 1
+    assert payload["status"] == "error"
+    assert str(payload["error"]).startswith("fetch failed:")
