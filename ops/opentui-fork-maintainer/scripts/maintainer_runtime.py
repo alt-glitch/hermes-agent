@@ -2642,6 +2642,8 @@ def _review_scope(
             or parents[1] != retained_sync["upstream_sha"]
             or retained_sync["source_sha"] not in commits
             or retained_sync["repair_sha"] not in commits
+            or commits.index(retained_sync["repair_sha"])
+            <= commits.index(retained_sync["source_sha"])
         ):
             raise ControlError(
                 "retained sync repair does not preserve its authenticated "

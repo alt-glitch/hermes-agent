@@ -1,4 +1,4 @@
-# Retained PR95 sync repair deployment handoff
+# Retained sync repair deployment handoff — PR95 acceptance case
 
 This change is an offline control-plane prerequisite. It does not deploy the
 maintainer, queue work, mutate PR95, advance `sid/opentui`, or authorize
@@ -6,7 +6,8 @@ publication. The coordinator must review the committed binary diff and retained
 test logs, then wait until the implementation parent has exited before changing
 runtime assets.
 
-The only granted source is terminal run `20260909T125428Z-216c997c`:
+The current acceptance request names terminal run
+`20260909T125428Z-216c997c`:
 
 - captured base `e55bce4630c73218d91a2f874f38946ac23844d9`;
 - captured upstream `9e6c4100cbf5222fb473ecc2b51fd17874f6ee75`;
@@ -14,10 +15,12 @@ The only granted source is terminal run `20260909T125428Z-216c997c`:
 - PR95 source `a4ba79d9f3bca7ed4a3823393507d7ed15d99de5`;
 - retained local repair `b14ab20f16b9d224e99f6bb00adc2a356e10bda0`.
 
-The manifest, run context, failed outcome and PR receipt hashes are pinned in
-`ops/opentui-fork-maintainer/scripts/retained_sync.py` and repeated in the
-maintainer README request packet. Any mismatch is a stop condition, not a reason
-to edit historical evidence or substitute another run.
+The manifest, run context, failed outcome and PR receipt hashes, plus the
+retained repair SHA, are carried by the approved request shown in the maintainer
+README. Runtime source contains no PR/source/hash allowlist. The validator
+derives the remaining topology and ownership from those hash-bound artifact
+bytes. Repository prose alone cannot authorize the path. Any mismatch is a stop
+condition, not a reason to edit historical evidence or substitute another run.
 
 ## Coordinator sequence
 
@@ -44,6 +47,12 @@ to edit historical evidence or substitute another run.
 7. Publish only through the existing `gate-and-ship` caller with PR95's exact
    current head as `--expected-pr-head`. All candidate gates, independent
    review, media and current-head required CI must be fresh.
+8. If CI observation is interrupted and that repair owner is finalized failed,
+   let normal request recovery hand the identical request to a fresh wrapper
+   owner. Continue with `resume-publication` from the terminal repair owner's
+   fresh candidate evidence. A newer canonical upstream in the fresh wrapper
+   context does not replace the authenticated retained upstream. Never reuse the
+   original scheduled source's review or media for the changed candidate.
 
 The ship lock and normal finalizer remain authoritative. A successful
 finalization records upstream `9e6c4100` as the watermark and preserves the old

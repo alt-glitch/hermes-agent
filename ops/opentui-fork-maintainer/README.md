@@ -317,11 +317,11 @@ fast-forward-only CAS, not permission to rewrite history. A new head requires
 fresh local review/evidence and current-head CI. Legacy adoption does not grant
 permission to append fixes to PR81's historical branch.
 
-Issue #96 adds one evidence-pinned exception for repairing the terminal PR95
-scheduled sync. It does not change ordinary linear repair requests. After this
-runtime is reviewed and deployed with every prior maintainer owner paused, the
-coordinator may submit the following exact request shape (with a bounded
-instruction):
+An explicitly submitted repair may authenticate a terminal scheduled-sync
+owner without a per-PR source allowlist. It does not change ordinary linear
+repair requests, and repository issue/PR prose cannot select this path. The
+coordinator's approved request must bind the exact task, source run, retained
+linear repair and artifact hashes. PR95 remains the current acceptance case:
 
 ```json
 {
@@ -335,7 +335,8 @@ instruction):
     "manifest_sha256": "59a17d0e8773ddfaed243712151dd65f0267f2d8e7dcab8326a9e6bec0ba7e99",
     "context_sha256": "970d22bd8152762718471bb8ef8e3867c3f73b1b259c237ade5dd23adf9e5fa4",
     "outcome_sha256": "4b3de4d74dedca69970240f2820e8e2fb7d7e24dd1603b61f960b93208463a06",
-    "pr_sha256": "2b1be9b695bc95ccd7e8bf0ee5f61e710d48120c07e9d8a14d7de0550f217617"
+    "pr_sha256": "2b1be9b695bc95ccd7e8bf0ee5f61e710d48120c07e9d8a14d7de0550f217617",
+    "repair_sha": "b14ab20f16b9d224e99f6bb00adc2a356e10bda0"
   }
 }
 ```
@@ -348,14 +349,16 @@ chain with no additional merge. Its review rechecks that the pinned upstream is
 still canonical, compares the synthetic merge tree with the preserved merge,
 then covers every linear post-merge adaptation and repair through the candidate;
 the trusted upstream history itself is not expanded into the reviewer prompt.
-Publication reuses PR95 through the normal expected-head preflight, runs all
-candidate-bound gates anew, waits for required current-head CI, then advances
-the target under the existing ship lock. A same-owner observation retry may
-have a newer wrapper-captured upstream, but the repair binding remains the exact
-authenticated upstream pin and every request/evidence hash and current lease is
-revalidated. The old run outcome and lease evidence remain read-only. Do not
-submit this request or deploy from an active maintainer parent; the coordinator
-owns the paused, reviewed cutover.
+Publication reuses the authenticated PR through the normal expected-head
+preflight, runs all candidate-bound gates anew, waits for required current-head
+CI, then advances the target under the existing ship lock. A same-owner retry,
+or a subsequent owner resuming the terminal CI wait from those fresh candidate
+gates, may have a newer wrapper-captured upstream. The repair binding remains
+the exact upstream recovered from its hash-bound scheduled source; every request,
+artifact and current lease is revalidated. The original scheduled evidence and
+each terminal prior-owner outcome stay read-only. Do not submit the PR95 request
+or deploy from an active maintainer parent; the coordinator owns the paused,
+reviewed cutover.
 
 A stacked issue draft may keep the same exact candidate when the target advances
 exactly to its prerequisite. The next owner reclaims the same issue revision at

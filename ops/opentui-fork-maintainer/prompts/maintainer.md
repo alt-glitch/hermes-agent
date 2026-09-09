@@ -341,31 +341,33 @@ owner authenticates the current issue, PR owner/branch/head and source before
 writing its current marker, then requires the exact marker/head/base readback
 before advancing that same branch.
 
-Approved issue96 separately binds one terminal scheduled-sync repair: source
-run `20260909T125428Z-216c997c`, PR95, captured base
-`e55bce4630c73218d91a2f874f38946ac23844d9`, captured upstream
-`9e6c4100cbf5222fb473ecc2b51fd17874f6ee75`, preserved merge
-`40e6b5d58be0cc8c028b70a318f02936d6bd3ac7`, and remote source
-`a4ba79d9f3bca7ed4a3823393507d7ed15d99de5`. This grant is usable only
-through a repair request carrying the exact manifest, context, terminal outcome
-and PR evidence hashes pinned in `scripts/retained_sync.py`. The runtime reads
-and hashes those artifacts in place, proves the old outcome is terminal and
-unpublished, and derives the PR branch and eventual upstream watermark from
-that authenticated provenance. Issue and PR prose are never provenance.
+An explicit coordinator-approved repair request may carry a `retained_sync`
+object containing an exact source run, manifest/context/terminal-outcome/PR
+artifact hashes, and the first retained linear repair SHA. There is no PR or
+hash allowlist in runtime source. The runtime hashes and parses the same artifact
+bytes, proves the old scheduled owner is terminal and unpublished, and derives
+the preserved merge, upstream, prior watermark and same-repository PR branch
+from that evidence. The outer repair request binds the PR, base and remote
+source. Repository issue/PR prose and nearby evidence can never opt into this
+path; only the validated explicit request can.
 
-After the coordinator deploys this validator while the offline implementation
-owner is stopped, the fresh wrapper owner may start from retained local repair
-`b14ab20f16b9d224e99f6bb00adc2a356e10bda0` only after proving it is a
-first-parent-linear descendant of the authenticated remote source. It must use
-PR95's exact current head as `--expected-pr-head`, keep the preserved merge as
-the first commit above the captured base, and add no later merge. Run the full
-candidate gates with new review/media and require current-head CI before the
-usual target CAS and finalization. On success the authenticated scheduled
-upstream becomes the watermark; ordinary repairs still carry no upstream
-watermark. A live, missing or changed source owner; changed target, source or
-PR; unexpected merge; stale hash; failed gate; or absent/failed CI is a refusal.
-Never reset the old lease, rewrite its failed outcome, reuse its candidate-bound
-gate evidence for changed source, create another PR, or force-push.
+The fresh wrapper owner may start from the request's retained repair only after
+proving it follows the authenticated remote source on the first-parent chain.
+It must use the authenticated PR's exact current head as `--expected-pr-head`,
+keep the preserved merge as the first commit above the captured base, and add no
+later merge. Run the full candidate gates with new review/media and require
+current-head CI before the usual target CAS and finalization. If that CI wait is
+interrupted and this repair owner becomes terminal, recover the identical
+request into a new wrapper owner and use `resume-publication` with the terminal
+repair owner's fresh candidate evidence. A later canonical upstream capture is
+allowed only as the new wrapper context; the authenticated retained upstream
+still owns review and watermark. The original scheduled source's review/media
+cannot prove the changed repair candidate. On success the authenticated
+scheduled upstream becomes the watermark; ordinary repairs still carry no
+upstream watermark. A live, missing or changed source owner; changed request,
+target, source, review/evidence or PR ownership; unexpected merge; stale hash;
+failed gate; or absent/failed CI is a refusal. Never reset an old lease, rewrite
+a terminal outcome, create another PR, or force-push.
 
 If the installed runtime cannot validate this topology, implement the narrow
 support OFFLINE through a bounded worker in an isolated worktree based on the
