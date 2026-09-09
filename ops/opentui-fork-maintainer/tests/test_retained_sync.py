@@ -34,8 +34,8 @@ def install_publication_transport(f, monkeypatch, *, ci: str = "green"):
     """Run Git against the bare fixture while simulating only GitHub's API/CLI."""
     github = Github()
     github.pr = {
-        "number": 95,
-        "url": "https://github.com/alt-glitch/hermes-agent/pull/95",
+        "number": f["pr"],
+        "url": f"https://github.com/alt-glitch/hermes-agent/pull/{f['pr']}",
         "body": "retained scheduled candidate",
         "headRefName": f["head_branch"],
         "headRefOid": f["source"],
@@ -83,7 +83,9 @@ def install_publication_transport(f, monkeypatch, *, ci: str = "green"):
     return github
 
 
-def retained_sync_repair_fixture(tmp_path, monkeypatch):
+def retained_sync_repair_fixture(
+    tmp_path, monkeypatch, *, pr=95, source_run="terminal-owner"
+):
     remote = tmp_path / "remote.git"
     repo = tmp_path / "repo"
     git(tmp_path, "init", "--bare", str(remote))
@@ -106,6 +108,12 @@ def retained_sync_repair_fixture(tmp_path, monkeypatch):
     git(repo, "add", "later-upstream")
     git(repo, "commit", "-m", "later upstream")
     wrapper_upstream = git(repo, "rev-parse", "HEAD")
+    (repo / "continuation-upstream").write_text(
+        "new upstream captured by continuation owner\n", encoding="utf-8"
+    )
+    git(repo, "add", "continuation-upstream")
+    git(repo, "commit", "-m", "continuation upstream")
+    continuation_upstream = git(repo, "rev-parse", "HEAD")
 
     git(repo, "checkout", "-b", runtime.BRANCH, common)
     (repo / "fork").write_text("fork base\n", encoding="utf-8")
@@ -133,7 +141,7 @@ def retained_sync_repair_fixture(tmp_path, monkeypatch):
 
     state = tmp_path / "state"
     evidence = state / "runs/fresh-owner"
-    source_root = state / "runs/terminal-owner"
+    source_root = state / "runs" / source_run
     write_live_lease(state)
     claim_backport(state, evidence, base, wrapper_upstream)
     fresh_context_path = evidence / "run-context.json"
@@ -177,8 +185,8 @@ def retained_sync_repair_fixture(tmp_path, monkeypatch):
         "base_sha": base,
         "candidate_sha": source,
         "head_branch": head_branch,
-        "number": 95,
-        "url": "https://github.com/alt-glitch/hermes-agent/pull/95",
+        "number": pr,
+        "url": f"https://github.com/alt-glitch/hermes-agent/pull/{pr}",
         "issue": None,
     }
     for path, value in (
@@ -210,13 +218,13 @@ def retained_sync_repair_fixture(tmp_path, monkeypatch):
             "source_evidence_dir": str(source_root),
             "context_path": str(source_root / "run-context.json"),
             "context_sha256": context_hash,
-            "number": 95,
+            "number": pr,
         },
         "owner_preflight": {
             "repository": "alt-glitch/hermes-agent",
             "base_sha": base,
             "candidate_sha": source,
-            "number": 95,
+            "number": pr,
             "head_branch": head_branch,
         },
     }
@@ -229,24 +237,14 @@ def retained_sync_repair_fixture(tmp_path, monkeypatch):
         "context_sha256": context_hash,
         "outcome_sha256": file_hash(source_root / "run-outcome.json"),
         "pr_sha256": file_hash(source_root / "pr-evidence.json"),
-    }
-    grant = {
-        **provenance,
-        "base_sha": base,
-        "source_sha": source,
         "repair_sha": candidate,
-        "upstream_sha": upstream,
-        "merge_commit": merge_commit,
-        "last_synced_upstream": common,
-        "head_branch": head_branch,
     }
     owner = runtime._retained_sync()
-    owner.RETAINED_SYNC_REPAIRS = {95: grant}
     monkeypatch.setattr(runtime, "_retained_sync", lambda: owner)
     monkeypatch.setattr(publication, "_retained_sync", lambda: owner)
     request = {
         "mode": "repair",
-        "pr": 95,
+        "pr": pr,
         "base_sha": base,
         "source_sha": source,
         "instruction": "Finish the retained scheduled sync on the same PR.",
@@ -264,16 +262,57 @@ def retained_sync_repair_fixture(tmp_path, monkeypatch):
         "evidence": evidence,
         "source_root": source_root,
         "base": base,
+        "common": common,
         "upstream": upstream,
         "wrapper_upstream": wrapper_upstream,
+        "continuation_upstream": continuation_upstream,
         "merge": merge_commit,
         "source": source,
         "candidate": candidate,
         "worktree": worktree,
         "head_branch": head_branch,
+        "pr": pr,
         "request": request,
         "owner": owner,
     }
+
+
+def test_retained_sync_request_accepts_a_second_authenticated_identity(
+    tmp_path, monkeypatch
+):
+    f = retained_sync_repair_fixture(
+        tmp_path,
+        monkeypatch,
+        pr=137,
+        source_run="another-terminal-owner",
+    )
+    evidence_paths = {
+        f["source_root"] / name
+        for name in (
+            "gate.json",
+            "run-context.json",
+            "run-outcome.json",
+            "pr-evidence.json",
+        )
+    }
+    real_read_bytes = Path.read_bytes
+    reads = {path: 0 for path in evidence_paths}
+
+    def read_once(path):
+        if path in reads:
+            reads[path] += 1
+            assert reads[path] == 1, "artifact was reopened after hash verification"
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_once)
+
+    binding = runtime._derive_run_binding(
+        f["state"], f["evidence"], "test-token"
+    )
+
+    assert binding["retained_sync"]["pr"]["number"] == 137
+    assert binding["retained_sync"]["source_run"] == "another-terminal-owner"
+    assert set(reads.values()) == {1}
 
 
 def test_retained_sync_repair_runs_fresh_gate_ship_and_finalization(
@@ -543,6 +582,216 @@ def test_retained_sync_repair_runs_fresh_gate_ship_and_finalization(
     )
 
 
+def test_terminal_retained_repair_continues_ci_wait_under_a_fresh_owner(
+    tmp_path, monkeypatch
+):
+    f = retained_sync_repair_fixture(
+        tmp_path,
+        monkeypatch,
+        pr=137,
+        source_run="scheduled-owner-for-pr-137",
+    )
+    binding = runtime._derive_run_binding(
+        f["state"], f["evidence"], "test-token"
+    )
+    real_publish = runtime._publish_pr_evidence
+    install_success_mocks(monkeypatch)
+    monkeypatch.setattr(
+        runtime, "_trusted_upstream_tip", lambda _repo: f["wrapper_upstream"]
+    )
+    github = install_publication_transport(f, monkeypatch)
+    real_run_path = runtime.runpy.run_path
+
+    def load_publisher(path, *args, **kwargs):
+        if Path(path).name == "pr_publication.py":
+            return publication.__dict__
+        return real_run_path(path, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.runpy, "run_path", load_publisher)
+    monkeypatch.setattr(runtime, "_publish_pr_evidence", real_publish)
+    packet, _ = make_gate_packet(
+        f["evidence"], f["worktree"], f["base"], f["candidate"]
+    )
+    packet.replace(f["evidence"] / "gate-packet.json")
+    transport = publication._run
+    interrupted = True
+
+    def interrupt_observation(argv, cwd):
+        nonlocal interrupted
+        if (
+            interrupted
+            and argv[:3] == [str(publication.GH), "api", "graphql"]
+            and "--paginate" in argv
+        ):
+            interrupted = False
+            raise publication.PublicationError("simulated CI observation interruption")
+        return transport(argv, cwd)
+
+    monkeypatch.setattr(publication, "_run", interrupt_observation)
+    with pytest.raises(runtime.ControlError, match="CI observation interruption"):
+        runtime.main(
+            [
+                "gate-and-ship",
+                "--state",
+                str(f["state"]),
+                "--token",
+                "test-token",
+                "--packet",
+                str(f["evidence"] / "gate-packet.json"),
+                "--manifest",
+                str(f["evidence"] / "gate.json"),
+                "--cwd",
+                str(f["worktree"]),
+                "--repo",
+                str(f["repo"]),
+                "--base",
+                f["base"],
+                "--candidate",
+                f["candidate"],
+                "--expected-pr-head",
+                f["source"],
+            ]
+        )
+
+    failed_gate = runtime._load_gate(f["evidence"] / "gate.json")
+    assert failed_gate["run_binding"] == binding
+    assert failed_gate["review_proof"]["candidate_sha"] == f["candidate"]
+    assert failed_gate["review_proof"]["candidate_sha"] != f["source"]
+    assert github.pr["headRefOid"] == f["candidate"]
+    assert remote_sha(f["repo"]) == f["base"]
+
+    outcome = runtime.finalize_failure(
+        f["state"],
+        f["evidence"],
+        stage="publish",
+        reason_code="publish-refused",
+    )
+    assert outcome["request_recovered"] is True
+    focused_record = next(
+        check for check in failed_gate["checks"] if check["id"] == "focused-contracts"
+    )
+    Path(focused_record["output_path"]).write_text(
+        "interrupted local evidence\n", encoding="utf-8"
+    )
+    runtime.release_lease(f["state"], "test-token")
+    prior_bytes = {
+        path.relative_to(f["evidence"]): path.read_bytes()
+        for path in f["evidence"].rglob("*")
+        if path.is_file()
+    }
+
+    next_owner = f["state"] / "runs/continuation-owner-for-pr-137"
+    write_live_lease(f["state"], token="continuation-token")
+    assert runtime.claim_request(f["state"], next_owner) == f["request"]
+    next_context = {
+        "schema_version": 1,
+        "run_id": next_owner.name,
+        "execution_id": "continuation-execution",
+        "lease_token_sha256": runtime.hashlib.sha256(
+            b"continuation-token"
+        ).hexdigest(),
+        "base_sha": f["base"],
+        "upstream_sha": f["continuation_upstream"],
+    }
+    next_context_path = next_owner / "run-context.json"
+    next_context_path.write_text(json.dumps(next_context), encoding="utf-8")
+    lease_path = f["state"] / "run.lease.json"
+    lease = runtime._load_gate(lease_path)
+    lease.update(
+        run_id=next_owner.name,
+        evidence_dir=str(next_owner.resolve()),
+        captured_base=f["base"],
+        captured_upstream=f["continuation_upstream"],
+        run_context_sha256=file_hash(next_context_path),
+    )
+    runtime._atomic_json(lease_path, lease)
+    monkeypatch.setattr(publication, "_run", transport)
+
+    source_manifest = f["evidence"] / "gate.json"
+    source_packet = f["evidence"] / "gate-packet.json"
+
+    def resume_args():
+        return [
+            "resume-publication",
+            "--repo",
+            str(f["repo"]),
+            "--state",
+            str(f["state"]),
+            "--token",
+            "continuation-token",
+            "--source-manifest",
+            str(source_manifest),
+            "--source-sha256",
+            file_hash(source_manifest),
+            "--source-packet",
+            str(source_packet),
+            "--packet-sha256",
+            file_hash(source_packet),
+            "--adopt-pr",
+            str(f["pr"]),
+            "--manifest",
+            str(next_owner / "gate.json"),
+        ]
+
+    request_paths = (
+        next_owner / "request.claimed.json",
+        f["state"] / "run-request.inflight.json",
+    )
+    request_bytes = {path: path.read_bytes() for path in request_paths}
+    for path in request_paths:
+        path.write_text(
+            json.dumps({**f["request"], "instruction": "changed authorization"}),
+            encoding="utf-8",
+        )
+    with pytest.raises(runtime.ControlError, match="authorization|stale"):
+        runtime.main(resume_args())
+    for path, contents in request_bytes.items():
+        path.write_bytes(contents)
+
+    review_record = next(
+        check
+        for check in failed_gate["checks"]
+        if check["id"] == "adversarial-review"
+    )
+    review_path = Path(review_record["output_path"])
+    review_bytes = review_path.read_bytes()
+    review_path.write_text("changed review evidence\n", encoding="utf-8")
+    with pytest.raises(runtime.ControlError, match="review|evidence|gate"):
+        runtime.main(resume_args())
+    review_path.write_bytes(review_bytes)
+
+    with pytest.raises(runtime.ControlError, match="lease token"):
+        bad_owner = resume_args()
+        bad_owner[bad_owner.index("--token") + 1] = "foreign-token"
+        runtime.main(bad_owner)
+
+    assert runtime.main(resume_args()) == 0
+    completed = runtime._load_gate(next_owner / "gate.json")
+    recovery = completed["publication_recovery"]
+    assert recovery["source_owner"] == "terminal-prior-owner"
+    assert recovery["regenerated_gates"] == ["focused-contracts"]
+    assert set(recovery["reused_gates"]) == runtime.REQUIRED_GATES - {
+        "focused-contracts"
+    }
+    assert len(list(Path(recovery["attempt_dir"]).glob("*.log"))) == len(
+        runtime.REQUIRED_GATES
+    )
+    assert completed["run_binding"]["captured_upstream"] == f["upstream"]
+    assert next_context["upstream_sha"] == f["continuation_upstream"]
+    assert next_context["upstream_sha"] != runtime._load_gate(
+        f["evidence"] / "run-context.json"
+    )["upstream_sha"]
+    assert completed["review_proof"]["candidate_sha"] == f["candidate"]
+    assert remote_sha(f["repo"]) == f["candidate"]
+    assert runtime._load_gate(next_owner / "run-outcome.json")["status"] == "success"
+    assert not (f["state"] / "run.lease.json").exists()
+    assert {
+        path.relative_to(f["evidence"]): path.read_bytes()
+        for path in f["evidence"].rglob("*")
+        if path.is_file()
+    } == prior_bytes
+
+
 @pytest.mark.parametrize("ci", ["missing", "failed"])
 def test_retained_sync_required_ci_cannot_ship(tmp_path, monkeypatch, ci):
     f = retained_sync_repair_fixture(tmp_path, monkeypatch)
@@ -617,7 +866,7 @@ def test_retained_sync_required_ci_cannot_ship(tmp_path, monkeypatch, ci):
     ("fault", "message"),
     [
         ("live-owner", "source owner is not terminal"),
-        ("moved-source", "source identity changed"),
+        ("moved-source", "manifest provenance changed"),
         ("changed-evidence", "outcome evidence is missing or changed"),
         ("foreign-pr", "PR provenance changed"),
         ("foreign-live-pr", "not the approved retained"),
@@ -641,8 +890,10 @@ def test_retained_sync_repair_refuses_unproven_provenance_or_topology(
         return
     if fault == "moved-source":
         request = {**f["request"], "source_sha": "f" * 40}
-        with pytest.raises(runtime.ControlError, match=message):
-            runtime._validate_request(request)
+        with pytest.raises(f["owner"].RetainedSyncError, match=message):
+            f["owner"].authenticate(
+                f["state"], request, current_run_id=f["evidence"].name
+            )
         return
     if fault == "changed-evidence":
         (f["source_root"] / "run-outcome.json").write_text(
@@ -660,7 +911,6 @@ def test_retained_sync_repair_refuses_unproven_provenance_or_topology(
         pr_path.write_text(json.dumps(pr_value), encoding="utf-8")
         changed_hash = file_hash(pr_path)
         f["request"]["retained_sync"]["pr_sha256"] = changed_hash
-        f["owner"].RETAINED_SYNC_REPAIRS[95]["pr_sha256"] = changed_hash
         for path in (
             f["state"] / "run-request.inflight.json",
             f["evidence"] / "request.claimed.json",
@@ -756,9 +1006,7 @@ def test_retained_sync_repair_refuses_unproven_provenance_or_topology(
                 last_synced_upstream=(
                     f["candidate"]
                     if fault == "regressed-watermark"
-                    else f["owner"].RETAINED_SYNC_REPAIRS[95][
-                        "last_synced_upstream"
-                    ]
+                    else f["common"]
                 ),
                 retained_sync_binding=runtime._derive_run_binding(
                     f["state"], f["evidence"], "test-token"

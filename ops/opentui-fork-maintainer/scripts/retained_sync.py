@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authenticate the one coordinator-approved retained scheduled-sync repair."""
+"""Authenticate an explicitly approved retained scheduled-sync repair."""
 
 from __future__ import annotations
 
@@ -21,7 +21,9 @@ PROVENANCE_FIELDS = (
     "context_sha256",
     "outcome_sha256",
     "pr_sha256",
+    "repair_sha",
 )
+RUN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PR_FIELDS = {
     "number",
     "url",
@@ -30,27 +32,6 @@ PR_FIELDS = {
     "head_sha",
     "head_repository",
 }
-
-# This source evidence was inspected and hash-bound by approved issue #96. A
-# repair request must repeat every hash; nearby failed runs or PR prose cannot
-# opt themselves into merge-shaped repair history.
-RETAINED_SYNC_REPAIRS: dict[int, dict[str, Any]] = {
-    95: {
-        "source_run": "20260909T125428Z-216c997c",
-        "manifest_sha256": "59a17d0e8773ddfaed243712151dd65f0267f2d8e7dcab8326a9e6bec0ba7e99",
-        "context_sha256": "970d22bd8152762718471bb8ef8e3867c3f73b1b259c237ade5dd23adf9e5fa4",
-        "outcome_sha256": "4b3de4d74dedca69970240f2820e8e2fb7d7e24dd1603b61f960b93208463a06",
-        "pr_sha256": "2b1be9b695bc95ccd7e8bf0ee5f61e710d48120c07e9d8a14d7de0550f217617",
-        "base_sha": "e55bce4630c73218d91a2f874f38946ac23844d9",
-        "source_sha": "a4ba79d9f3bca7ed4a3823393507d7ed15d99de5",
-        "repair_sha": "b14ab20f16b9d224e99f6bb00adc2a356e10bda0",
-        "upstream_sha": "9e6c4100cbf5222fb473ecc2b51fd17874f6ee75",
-        "merge_commit": "40e6b5d58be0cc8c028b70a318f02936d6bd3ac7",
-        "last_synced_upstream": "693641aa8b4359c602283bdbbc14041e03bc47bc",
-        "head_branch": "codex/opentui-maint-fc1ce2cbea7a2d28c9e10a93",
-    }
-}
-
 
 class RetainedSyncError(RuntimeError):
     """The retained scheduled-sync evidence no longer proves its owner."""
@@ -77,21 +58,32 @@ def _json(path: Path, expected_sha256: str, label: str) -> dict[str, Any]:
 
 
 def validate_request_provenance(value: dict[str, Any]) -> dict[str, str] | None:
-    """Validate the optional evidence grant without changing ordinary repairs."""
+    """Validate explicit pins without changing ordinary linear repairs."""
     provenance = value.get("retained_sync")
     if provenance is None:
         return None
     if (
         not isinstance(provenance, dict)
         or set(provenance) != set(PROVENANCE_FIELDS)
-        or not isinstance(value.get("pr"), int)
+        or type(value.get("pr")) is not int
+        or value["pr"] <= 0
+        or not isinstance(provenance.get("source_run"), str)
+        or not RUN_RE.fullmatch(provenance["source_run"])
+        or not all(
+            isinstance(provenance.get(key), str)
+            and SHA256_RE.fullmatch(provenance[key])
+            for key in (
+                "manifest_sha256",
+                "context_sha256",
+                "outcome_sha256",
+                "pr_sha256",
+            )
+        )
+        or not isinstance(provenance.get("repair_sha"), str)
+        or not SHA_RE.fullmatch(provenance["repair_sha"])
+        or provenance.get("repair_sha") == value.get("source_sha")
     ):
         raise RetainedSyncError("retained sync repair provenance has an invalid shape")
-    grant = RETAINED_SYNC_REPAIRS.get(value["pr"])
-    if grant is None or any(provenance.get(key) != grant[key] for key in PROVENANCE_FIELDS):
-        raise RetainedSyncError("retained sync repair is not coordinator-approved")
-    if value.get("base_sha") != grant["base_sha"] or value.get("source_sha") != grant["source_sha"]:
-        raise RetainedSyncError("retained sync repair source identity changed")
     return {key: provenance[key] for key in PROVENANCE_FIELDS}
 
 
@@ -105,7 +97,6 @@ def authenticate(
     provenance = validate_request_provenance(request)
     if provenance is None:
         return None
-    grant = RETAINED_SYNC_REPAIRS[request["pr"]]
     source_root = Path(
         os.path.abspath(state_dir / "runs" / provenance["source_run"])
     )
@@ -125,9 +116,11 @@ def authenticate(
 
     if (
         context.get("run_id") != provenance["source_run"]
-        or context.get("base_sha") != grant["base_sha"]
-        or context.get("upstream_sha") != grant["upstream_sha"]
-        or not SHA256_RE.fullmatch(str(context.get("lease_token_sha256", "")))
+        or context.get("base_sha") != request["base_sha"]
+        or not isinstance(context.get("upstream_sha"), str)
+        or not SHA_RE.fullmatch(context["upstream_sha"])
+        or not isinstance(context.get("lease_token_sha256"), str)
+        or not SHA256_RE.fullmatch(context["lease_token_sha256"])
         or outcome.get("status") != "failed"
         or outcome.get("published") is not False
         or outcome.get("needs_finalization") is not False
@@ -138,21 +131,31 @@ def authenticate(
     review = manifest.get("review_proof")
     recovery = manifest.get("publication_recovery")
     owner = manifest.get("owner_preflight")
+    upstream_sha = context["upstream_sha"]
+    last_synced_upstream = binding.get("last_synced_upstream") if isinstance(binding, dict) else None
+    merge_commit = review.get("merge_commit") if isinstance(review, dict) else None
     if (
-        manifest.get("base_sha") != grant["base_sha"]
-        or manifest.get("candidate_sha") != grant["source_sha"]
+        manifest.get("base_sha") != request["base_sha"]
+        or manifest.get("candidate_sha") != request["source_sha"]
         or not isinstance(binding, dict)
         or binding.get("mode") != "scheduled"
         or binding.get("request_sha256") is not None
-        or binding.get("captured_base") != grant["base_sha"]
-        or binding.get("captured_upstream") != grant["upstream_sha"]
-        or binding.get("last_synced_upstream") != grant["last_synced_upstream"]
+        or binding.get("captured_base") != request["base_sha"]
+        or binding.get("captured_upstream") != upstream_sha
+        or (
+            last_synced_upstream is not None
+            and (
+                not isinstance(last_synced_upstream, str)
+                or not SHA_RE.fullmatch(last_synced_upstream)
+            )
+        )
         or not isinstance(review, dict)
         or review.get("review_mode") != "upstream-merge"
-        or review.get("base_sha") != grant["base_sha"]
-        or review.get("candidate_sha") != grant["source_sha"]
-        or review.get("upstream_sha") != grant["upstream_sha"]
-        or review.get("merge_commit") != grant["merge_commit"]
+        or review.get("base_sha") != request["base_sha"]
+        or review.get("candidate_sha") != request["source_sha"]
+        or review.get("upstream_sha") != upstream_sha
+        or not isinstance(merge_commit, str)
+        or not SHA_RE.fullmatch(merge_commit)
         or not isinstance(recovery, dict)
         or recovery.get("source_owner") != "live-owner"
         or recovery.get("source_evidence_dir") != str(source_root)
@@ -161,19 +164,20 @@ def authenticate(
         or recovery.get("number") != request["pr"]
         or not isinstance(owner, dict)
         or owner.get("repository") != REPOSITORY
-        or owner.get("base_sha") != grant["base_sha"]
-        or owner.get("candidate_sha") != grant["source_sha"]
+        or owner.get("base_sha") != request["base_sha"]
+        or owner.get("candidate_sha") != request["source_sha"]
         or owner.get("number") != request["pr"]
-        or owner.get("head_branch") != grant["head_branch"]
+        or not isinstance(owner.get("head_branch"), str)
+        or not owner["head_branch"]
     ):
         raise RetainedSyncError("retained sync manifest provenance changed")
 
     if (
         pr.get("repository") != REPOSITORY
         or pr.get("base_branch") != BASE_BRANCH
-        or pr.get("base_sha") != grant["base_sha"]
-        or pr.get("candidate_sha") != grant["source_sha"]
-        or pr.get("head_branch") != grant["head_branch"]
+        or pr.get("base_sha") != request["base_sha"]
+        or pr.get("candidate_sha") != request["source_sha"]
+        or pr.get("head_branch") != owner["head_branch"]
         or pr.get("number") != request["pr"]
         or pr.get("url") != f"https://github.com/{REPOSITORY}/pull/{request['pr']}"
         or pr.get("issue") is not None
@@ -182,17 +186,16 @@ def authenticate(
 
     return {
         **provenance,
-        "source_sha": grant["source_sha"],
-        "repair_sha": grant["repair_sha"],
-        "upstream_sha": grant["upstream_sha"],
-        "merge_commit": grant["merge_commit"],
-        "last_synced_upstream": grant["last_synced_upstream"],
+        "source_sha": request["source_sha"],
+        "upstream_sha": upstream_sha,
+        "merge_commit": merge_commit,
+        "last_synced_upstream": last_synced_upstream,
         "pr": {
             "number": request["pr"],
             "url": f"https://github.com/{REPOSITORY}/pull/{request['pr']}",
             "base_branch": BASE_BRANCH,
-            "head_branch": grant["head_branch"],
-            "head_sha": grant["source_sha"],
+            "head_branch": owner["head_branch"],
+            "head_sha": request["source_sha"],
             "head_repository": REPOSITORY,
         },
     }
@@ -202,28 +205,37 @@ def valid_binding(value: Any) -> bool:
     """Validate persisted provenance without rereading historical evidence."""
     if not isinstance(value, dict) or set(value) != set(PROVENANCE_FIELDS) | {
         "source_sha",
-        "repair_sha",
         "upstream_sha",
         "merge_commit",
         "last_synced_upstream",
         "pr",
     }:
         return False
-    if not all(SHA_RE.fullmatch(str(value.get(key, ""))) for key in (
-        "source_sha",
-        "repair_sha",
-        "upstream_sha",
-        "merge_commit",
-        "last_synced_upstream",
-    )):
+    if not all(
+        isinstance(value.get(key), str) and SHA_RE.fullmatch(value[key])
+        for key in ("source_sha", "repair_sha", "upstream_sha", "merge_commit")
+    ) or (
+        value.get("last_synced_upstream") is not None
+        and (
+            not isinstance(value["last_synced_upstream"], str)
+            or not SHA_RE.fullmatch(value["last_synced_upstream"])
+        )
+    ):
         return False
-    if not all(SHA256_RE.fullmatch(str(value.get(key, ""))) for key in (
-        "manifest_sha256", "context_sha256", "outcome_sha256", "pr_sha256"
-    )):
+    if not all(
+        isinstance(value.get(key), str) and SHA256_RE.fullmatch(value[key])
+        for key in (
+            "manifest_sha256",
+            "context_sha256",
+            "outcome_sha256",
+            "pr_sha256",
+        )
+    ):
         return False
     pr = value.get("pr")
     if not (
         isinstance(value.get("source_run"), str)
+        and RUN_RE.fullmatch(value["source_run"]) is not None
         and isinstance(pr, dict)
         and set(pr) == PR_FIELDS
         and type(pr.get("number")) is int
@@ -232,32 +244,13 @@ def valid_binding(value: Any) -> bool:
         and pr.get("base_branch") == BASE_BRANCH
         and isinstance(pr.get("head_branch"), str)
         and bool(pr["head_branch"])
-        and SHA_RE.fullmatch(str(pr.get("head_sha", ""))) is not None
+        and isinstance(pr.get("head_sha"), str)
+        and SHA_RE.fullmatch(pr["head_sha"]) is not None
+        and pr.get("head_sha") == value.get("source_sha")
         and pr.get("head_repository") == REPOSITORY
     ):
         return False
-    grant = RETAINED_SYNC_REPAIRS.get(pr["number"])
-    return grant is not None and all(
-        value.get(key) == grant[key]
-        for key in (
-            *PROVENANCE_FIELDS,
-            "source_sha",
-            "repair_sha",
-            "upstream_sha",
-            "merge_commit",
-            "last_synced_upstream",
-        )
-    ) and all(
-        pr.get(key) == expected
-        for key, expected in {
-            "number": pr["number"],
-            "url": f"https://github.com/{REPOSITORY}/pull/{pr['number']}",
-            "base_branch": BASE_BRANCH,
-            "head_branch": grant["head_branch"],
-            "head_sha": grant["source_sha"],
-            "head_repository": REPOSITORY,
-        }.items()
-    )
+    return value["source_sha"] != value["repair_sha"]
 
 
 def retained_pr(run_binding: Any) -> dict[str, Any] | None:
