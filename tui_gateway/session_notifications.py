@@ -525,8 +525,8 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     dedup_key = _notification_event_dedup_key(evt)
     if dedup_key not in emitted:
         if is_delegation:
-            notice = _async_delegation_notice(evt, text)
-            _emit("status.update", sid, {"kind": "status", "text": notice["text"]})
+            from tools.process_registry_notifications import async_delegation_display_text
+            _emit("status.update", sid, {"kind": "status", "text": async_delegation_display_text(evt)})
         elif evt_type == "completion":
             notice = _process_completion_notice(evt, text)
             _emit("status.update", sid, {"kind": "status", "text": notice["text"]})
