@@ -317,6 +317,40 @@ fast-forward-only CAS, not permission to rewrite history. A new head requires
 fresh local review/evidence and current-head CI. Legacy adoption does not grant
 permission to append fixes to PR81's historical branch.
 
+Issue #96 adds one evidence-pinned exception for repairing the terminal PR95
+scheduled sync. It does not change ordinary linear repair requests. After this
+runtime is reviewed and deployed with every prior maintainer owner paused, the
+coordinator may submit the following exact request shape (with a bounded
+instruction):
+
+```json
+{
+  "mode": "repair",
+  "pr": 95,
+  "base_sha": "e55bce4630c73218d91a2f874f38946ac23844d9",
+  "source_sha": "a4ba79d9f3bca7ed4a3823393507d7ed15d99de5",
+  "instruction": "Continue the authenticated retained PR95 sync from its preserved linear repair and run fresh full gates.",
+  "retained_sync": {
+    "source_run": "20260909T125428Z-216c997c",
+    "manifest_sha256": "59a17d0e8773ddfaed243712151dd65f0267f2d8e7dcab8326a9e6bec0ba7e99",
+    "context_sha256": "970d22bd8152762718471bb8ef8e3867c3f73b1b259c237ade5dd23adf9e5fa4",
+    "outcome_sha256": "4b3de4d74dedca69970240f2820e8e2fb7d7e24dd1603b61f960b93208463a06",
+    "pr_sha256": "2b1be9b695bc95ccd7e8bf0ee5f61e710d48120c07e9d8a14d7de0550f217617"
+  }
+}
+```
+
+The request is rejected unless the historical files still hash and describe
+the exact terminal unpublished scheduled owner, PR branch, base, source merge,
+upstream and prior watermark. The fresh candidate must contain source head
+`a4ba79d9` and retained local repair `b14ab20f` on the preserved first-parent
+chain with no additional merge. Publication reuses PR95 through the normal
+expected-head preflight, runs all candidate-bound gates anew, waits for required
+current-head CI, then advances the target under the existing ship lock. The old
+run outcome and lease evidence remain read-only. Do not submit this request or
+deploy from an active maintainer parent; the coordinator owns the paused,
+reviewed cutover.
+
 A stacked issue draft may keep the same exact candidate when the target advances
 exactly to its prerequisite. The next owner reclaims the same issue revision at
 that new captured base and adopts the same open draft; the publisher refreshes
