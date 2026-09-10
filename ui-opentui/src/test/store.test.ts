@@ -963,6 +963,27 @@ describe('session store — blocking prompts (Phase 3)', () => {
     expect(store.state.prompt).toBeUndefined()
   })
 
+  test('an expire event settles only a live prompt of its own kind', () => {
+    const requests = [
+      { type: 'clarify.request', payload: { question: 'Q?', choices: null, request_id: 'r' } },
+      { type: 'sudo.request', payload: { request_id: 'r' } },
+      { type: 'secret.request', payload: { env_var: 'K', prompt: 'p', request_id: 'r' } },
+      { type: 'vault.unlock.request', payload: { backend: 'bw', display_name: 'Bitwarden', request_id: 'r' } }
+    ] as const
+    const expires = ['clarify.expire', 'sudo.expire', 'secret.expire', 'vault.unlock.expire'] as const
+    for (const request of requests) {
+      for (const expire of expires) {
+        const store = createSessionStore()
+        store.apply(request)
+        const kind = store.state.prompt?.kind
+        store.apply({ type: expire, payload: { request_id: 'r' } })
+        const own = expire.replace('.expire', '.request') === request.type
+        // Same request id, but only the matching kind is allowed to settle it.
+        expect(store.state.prompt?.kind, `${expire} vs ${request.type}`).toBe(own ? undefined : kind)
+      }
+    }
+  })
+
   test('vault.unlock.request sets a masked unlock prompt; only its own expiry clears it', () => {
     const store = createSessionStore()
     store.apply({

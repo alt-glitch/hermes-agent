@@ -258,6 +258,14 @@ export type ActivePrompt =
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
   | { kind: 'confirm'; spec: ConfirmSpec; onConfirm: () => void }
 
+/** Which live prompt kind each gateway `*.expire` event may settle. */
+const EXPIRE_EVENT_KIND = {
+  'clarify.expire': 'clarify',
+  'sudo.expire': 'sudo',
+  'secret.expire': 'secret',
+  'vault.unlock.expire': 'vaultUnlock'
+} as const satisfies Record<string, ActivePrompt['kind']>
+
 export type PromptSettlement =
   | 'accepted'
   | 'cancelled'
@@ -3513,20 +3521,18 @@ export function createSessionStore(options?: SessionStoreOptions) {
         })
         break
       case 'clarify.expire':
-        if (state.prompt?.kind === 'clarify' && state.prompt.requestId === event.payload.request_id) {
-          settlePrompt(state.prompt, 'expired')
-        }
-        break
       case 'sudo.expire':
-        if (state.prompt?.kind === 'sudo' && state.prompt.requestId === event.payload.request_id) {
-          settlePrompt(state.prompt, 'expired')
-        }
-        break
       case 'secret.expire':
-        if (state.prompt?.kind === 'secret' && state.prompt.requestId === event.payload.request_id) {
+      case 'vault.unlock.expire': {
+        // An expiry settles only the live prompt of its own kind and request id;
+        // a stale or foreign expiry is a no-op (approval.resolved stays separate:
+        // it also carries a session guard and a resolved/expired status mapping).
+        const kind = EXPIRE_EVENT_KIND[event.type]
+        if (state.prompt?.kind === kind && state.prompt.requestId === event.payload.request_id) {
           settlePrompt(state.prompt, 'expired')
         }
         break
+      }
       case 'vault.unlock.request':
         replacePrompt({
           kind: 'vaultUnlock',
@@ -3534,11 +3540,6 @@ export function createSessionStore(options?: SessionStoreOptions) {
           displayName: event.payload.display_name,
           requestId: event.payload.request_id
         })
-        break
-      case 'vault.unlock.expire':
-        if (state.prompt?.kind === 'vaultUnlock' && state.prompt.requestId === event.payload.request_id) {
-          settlePrompt(state.prompt, 'expired')
-        }
         break
       // ── subagents (agents dashboard) — track the delegation tree by id ──
       case 'subagent.spawn_requested':

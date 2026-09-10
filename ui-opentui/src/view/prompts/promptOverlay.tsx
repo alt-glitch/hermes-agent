@@ -62,6 +62,46 @@ interface CancelRequest {
   readonly params: Record<string, unknown>
 }
 
+/**
+ * Masked (single hidden value) prompt kinds share one wire shape:
+ * `{ [field]: value, request_id }` on `method`, with `''` as the cancellation.
+ * Each kind is one row here — the card copy, the RPC method and the field name
+ * are declared once, so submit, cancel and keyboard focus cannot drift apart.
+ */
+type MaskedKind = 'sudo' | 'secret' | 'vaultUnlock'
+interface MaskedCard<K extends MaskedKind> {
+  readonly method: PromptResponseMethod
+  readonly field: 'password' | 'value'
+  readonly icon: string
+  readonly label: (prompt: GatewayPromptOf<K>) => string
+  /** Secondary line; `''` renders nothing. */
+  readonly sub: (prompt: GatewayPromptOf<K>) => string
+}
+const MASKED_CARDS = {
+  sudo: { method: 'sudo.respond', field: 'password', icon: '🔐', label: () => 'sudo password', sub: () => '' },
+  secret: {
+    method: 'secret.respond',
+    field: 'value',
+    icon: '🔑',
+    label: prompt => `Secret: ${prompt.envVar}`,
+    sub: prompt => prompt.prompt
+  },
+  vaultUnlock: {
+    method: 'vault.unlock.respond',
+    field: 'password',
+    icon: '🔐',
+    label: prompt => `Unlock ${prompt.displayName} for this session`,
+    sub: () => 'master password · goes to the manager CLI only · Esc keeps it locked'
+  }
+} satisfies { [K in MaskedKind]: MaskedCard<K> }
+
+const isMasked = (prompt: ActivePrompt): prompt is GatewayPromptOf<MaskedKind> => prompt.kind in MASKED_CARDS
+
+function maskedRequest(prompt: GatewayPromptOf<MaskedKind>, value: string): CancelRequest {
+  const card = MASKED_CARDS[prompt.kind]
+  return { method: card.method, params: { [card.field]: value, request_id: prompt.requestId } }
+}
+
 const CANCEL_REQUEST_BUILDERS = {
   approval: (prompt: GatewayPromptOf<'approval'>): CancelRequest => ({
     method: 'approval.respond',
@@ -71,18 +111,9 @@ const CANCEL_REQUEST_BUILDERS = {
     method: 'clarify.respond',
     params: { answer: '', request_id: prompt.requestId }
   }),
-  secret: (prompt: GatewayPromptOf<'secret'>): CancelRequest => ({
-    method: 'secret.respond',
-    params: { request_id: prompt.requestId, value: '' }
-  }),
-  sudo: (prompt: GatewayPromptOf<'sudo'>): CancelRequest => ({
-    method: 'sudo.respond',
-    params: { password: '', request_id: prompt.requestId }
-  }),
-  vaultUnlock: (prompt: GatewayPromptOf<'vaultUnlock'>): CancelRequest => ({
-    method: 'vault.unlock.respond',
-    params: { password: '', request_id: prompt.requestId }
-  })
+  secret: (prompt: GatewayPromptOf<'secret'>): CancelRequest => maskedRequest(prompt, ''),
+  sudo: (prompt: GatewayPromptOf<'sudo'>): CancelRequest => maskedRequest(prompt, ''),
+  vaultUnlock: (prompt: GatewayPromptOf<'vaultUnlock'>): CancelRequest => maskedRequest(prompt, '')
 } satisfies { [K in GatewayPromptKind]: (prompt: GatewayPromptOf<K>) => CancelRequest }
 
 function cancelRequestFor<K extends GatewayPromptKind>(prompt: GatewayPromptOf<K>): CancelRequest {
@@ -102,14 +133,10 @@ export function PromptOverlay(props: PromptOverlayProps) {
   let generation = 0
   let rootRef: BoxRenderable | undefined
 
+  // Keyboard-only cards (no pointer target) take focus on the overlay root so
+  // Enter/Esc reach them; approval and confirm own their own focus handling.
   const focusKeyboardOnlyPrompt = (current: ActivePrompt | undefined): void => {
-    if (
-      current?.kind === 'clarify' ||
-      current?.kind === 'sudo' ||
-      current?.kind === 'secret' ||
-      current?.kind === 'vaultUnlock'
-    )
-      rootRef?.focus()
+    if (current && (current.kind === 'clarify' || isMasked(current))) rootRef?.focus()
   }
 
   onMount(() => focusKeyboardOnlyPrompt(prompt()))
@@ -269,10 +296,11 @@ export function PromptOverlay(props: PromptOverlayProps) {
   }
   const asApproval = narrow('approval')
   const asClarify = narrow('clarify')
-  const asSudo = narrow('sudo')
-  const asSecret = narrow('secret')
-  const asVaultUnlock = narrow('vaultUnlock')
   const asConfirm = narrow('confirm')
+  const asMasked = (): GatewayPromptOf<MaskedKind> | undefined => {
+    const p = prompt()
+    return p && isMasked(p) ? p : undefined
+  }
 
   return (
     <box ref={el => (rootRef = el)} focusable style={{ flexDirection: 'column', flexShrink: 0 }}>
@@ -316,37 +344,24 @@ export function PromptOverlay(props: PromptOverlayProps) {
             />
           )}
         </Match>
-        <Match when={asSudo()}>
-          {p => (
-            <MaskedPrompt
-              icon="🔐"
-              label="sudo password"
-              statusHint={responseHint()}
-              onSubmit={value => respond('sudo.respond', { password: value, request_id: p().requestId })}
-            />
-          )}
-        </Match>
-        <Match when={asSecret()}>
-          {p => (
-            <MaskedPrompt
-              icon="🔑"
-              label={`Secret: ${p().envVar}`}
-              sub={p().prompt}
-              statusHint={responseHint()}
-              onSubmit={value => respond('secret.respond', { request_id: p().requestId, value })}
-            />
-          )}
-        </Match>
-        <Match when={asVaultUnlock()}>
-          {p => (
-            <MaskedPrompt
-              icon="🔐"
-              label={`Unlock ${p().displayName} for this session`}
-              sub="master password · goes to the manager CLI only · Esc keeps it locked"
-              statusHint={responseHint()}
-              onSubmit={value => respond('vault.unlock.respond', { password: value, request_id: p().requestId })}
-            />
-          )}
+        <Match when={asMasked()}>
+          {p => {
+            // `p().kind` is a MaskedKind; the table row carries the card copy
+            // and the wire encoding for both submit and cancellation.
+            const card = () => MASKED_CARDS[p().kind] as MaskedCard<MaskedKind>
+            return (
+              <MaskedPrompt
+                icon={card().icon}
+                label={card().label(p())}
+                sub={card().sub(p())}
+                statusHint={responseHint()}
+                onSubmit={value => {
+                  const request = maskedRequest(p(), value)
+                  respond(request.method, request.params)
+                }}
+              />
+            )
+          }}
         </Match>
         <Match when={asConfirm()}>
           {p => (

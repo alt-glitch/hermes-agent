@@ -809,3 +809,62 @@ describe('PromptOverlay — password-manager unlock card', () => {
     }
   })
 })
+
+describe('PromptOverlay — masked cards share one wire shape', () => {
+  const cases = [
+    {
+      event: { type: 'sudo.request', payload: { request_id: 'm-1' } },
+      method: 'sudo.respond',
+      field: 'password',
+      heading: 'sudo password'
+    },
+    {
+      event: { type: 'secret.request', payload: { env_var: 'API_KEY', prompt: 'paste it', request_id: 'm-1' } },
+      method: 'secret.respond',
+      field: 'value',
+      heading: 'Secret: API_KEY'
+    },
+    {
+      event: { type: 'vault.unlock.request', payload: { backend: 'bw', display_name: 'Bitwarden', request_id: 'm-1' } },
+      method: 'vault.unlock.respond',
+      field: 'password',
+      heading: 'Unlock Bitwarden for this session'
+    }
+  ] as const
+
+  test.each(cases)('$event.type: Enter sends the typed value, Esc sends an empty one', async c => {
+    const store = createSessionStore()
+    store.apply(c.event)
+    const sent: [PromptResponseMethod, Record<string, unknown>][] = []
+    const h = await mountOverlay(store, (method, params) => {
+      sent.push([method, params])
+      return Promise.resolve(ACCEPTED)
+    })
+    try {
+      expect(h.frame()).toContain(c.heading)
+      await h.keys.typeText('s3cret')
+      await h.settle()
+      expect(h.frame()).not.toContain('s3cret')
+      h.keys.pressEnter()
+      await expect.poll(() => sent.length).toBe(1)
+      expect(sent[0]).toEqual([c.method, { [c.field]: 's3cret', request_id: 'm-1' }])
+      await expect.poll(() => store.state.prompt).toBeUndefined()
+    } finally {
+      h.destroy()
+    }
+
+    const cancelled: [PromptResponseMethod, Record<string, unknown>][] = []
+    store.apply(c.event)
+    const h2 = await mountOverlay(store, (method, params) => {
+      cancelled.push([method, params])
+      return Promise.resolve(ACCEPTED)
+    })
+    try {
+      h2.keys.pressEscape()
+      await expect.poll(() => cancelled.length).toBe(1)
+      expect(cancelled[0]).toEqual([c.method, { [c.field]: '', request_id: 'm-1' }])
+    } finally {
+      h2.destroy()
+    }
+  })
+})
