@@ -23,7 +23,8 @@ it runs. Passing tests and publication are not deployment or live issue proof.
    resolver and login/import flow. Only the separately authorized Gemini/OpenRouter
    key is copied by the provisioner. Do not copy personal MCPs or conversations,
    manually copy OAuth refresh tokens, or rewrite the user's Codex configuration.
-4. Run the candidate's `configure.py --apply` with the current identity's
+4. Run the candidate's `configure.py --apply` through
+   `uv run --no-project --python <managed-python>` with the current identity's
    `--hermes-home`, `--job-id` and `--runtime-home`. Do not use `--create-paused`
    for an existing installation. The deployment owner pauses, checks quiescence,
    journals, copies assets (including README and issue_intake.py), verifies exact
@@ -35,16 +36,19 @@ it runs. Passing tests and publication are not deployment or live issue proof.
    `openrouter/google/gemini-3.5-flash`, and timezone Asia/Kolkata. The existing
    job must have `0 3,9,15,21 * * *`, 18000-second inactivity allowance and no
    fallback route. Retain a real bounded tool-call receipt, not just YAML.
-6. Resume that job and observe an actual scheduled tick. Record scheduled time,
-   execution source/id, selected request revision and lease. A live overlapping
-   owner produces a durable skipped occurrence, not a second implementation or
-   a successful maintenance cycle. Do not fake a scheduled source using direct
-   dispatch or count a settings read as tick proof.
+6. Restore the existing enabled six-hour job and verify real routing and overlap
+   evidence. Waiting for a natural scheduled success is not a deployment gate.
+   If a natural tick is observed, retain its actual source/time/execution/lease;
+   do not label direct dispatch as scheduled. A live overlapping owner must
+   produce a durable skip, not duplicate implementation or a successful cycle.
+   Later-agent skill adoption is a separate proof: a fresh authorized owner must
+   read and apply the relevant guidance, not merely appear in a schedule listing.
 7. For real issue lifecycle proof, use an owner-approved bounded real task in
    this fork: final title/body, `opentui`, then trusted `maintainer:ready` event.
    Follow approved revision → claim → implementation → all seven candidate gates
-   → current-head Greptile 5/5 and CI → candidate PR → target CAS → durable
-   finalization/issue receipt. Preserve unrelated existing PRs. No disposable
+   (including independent review) → current-head required CI → candidate PR →
+   target CAS → durable finalization/issue receipt. Greptile is disabled; do not
+   request paid review or require its score. Preserve unrelated existing PRs. No disposable
    issue or simulated API response should be presented as real delivery.
 
 ## Current proof boundaries
