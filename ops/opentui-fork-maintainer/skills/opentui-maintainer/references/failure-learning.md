@@ -32,6 +32,34 @@ were retained. These are historical facts, not current health: read
 Save evidence first, generalize only after verifying cause and repair. Don't
 accumulate universal prohibitions or entire transcripts in skills.
 
+## Operating corrections (2026-09-07 through 2026-09-10)
+
+- Project-aware `uv run` repointed a shared editable install to candidate
+  worktrees in multiple retained runs. Use `uv run --no-project --python
+  <explicit-python>` for control-plane scripts; verify the editable binding when
+  the command boundary is part of the failure.
+- A user `env` wrapper ahead of `/usr/bin` repeatedly returned zero without
+  executing tests. After shell initialization, invoke `/usr/bin/env` explicitly
+  with pinned Node first, then `/usr/bin:/bin`, then required user tools, and
+  require actual collected/executed test counts. Preserve the user's wrapper.
+- The cleanup fence accepts the detached integration path
+  `state/worktrees/sync-<run-id>`. A differently named path refused before any
+  gate ran; correct the path without weakening cleanup validation.
+- Same-task recovery keeps the owned PR. Unchanged-candidate
+  `resume-publication` may reuse hash-valid gates; any source change requires
+  full review, gates, `--expected-pr-head` and current-head CI on that same PR.
+- External workers need selected skill entrypoints read individually to EOF.
+  A path in a packet or a capped partial `sed` is not proof of loading; avoid a
+  giant prompt dump by following only task-relevant references.
+- Read-only reviewers can inspect extra evidence through packet stdin or a
+  narrow supported `--add-dir` rooted at sanitized review inputs. Verify access
+  in the same CLI mode; never grant the whole home, profile or runtime state.
+- PID existence and non-parent wait timeouts misclassified completed zombies as
+  live work. Prefer the retained process handle's terminal result and
+  authoritative job/manifest outcome; inspect OS state only to distinguish
+  executing, zombie/unreaped and missing handles. An observation timeout never
+  authorizes a duplicate restart.
+
 ## Publication observation versus implementation retry
 
 - Keep a terminal publication timeout distinct from a failed local gate. Use

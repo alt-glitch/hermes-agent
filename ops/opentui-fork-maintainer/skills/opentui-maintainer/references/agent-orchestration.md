@@ -84,7 +84,7 @@ API for readback, not an eventually consistent search result alone.
    request. Do not promise a push notification without a real delivery route.
 
 The worker is instructed to claim the request, fetch `refs/pull/<pr>/head`, verify its SHA,
-and preserves it in a linear candidate above the captured fork base. If the
+and preserve it in a linear candidate above the captured fork base. If the
 base moved, failure finalization retires the request into `request.stale.json`
 and reports `request_retired: true`. Report it and ask for a new request against
 the new base; don't silently broaden authorization or retry that stale request.
@@ -92,16 +92,22 @@ Every publication still requires the full gates, independent review, current-hea
 required CI checks and remote compare-and-swap. Greptile
 is disabled; do not request a paid review or wait for its score. Repairs do not
 advance the upstream-sync watermark. Runtime gates enforce source/base ancestry;
-the worker's PR lookup establishes the PR-to-source relationship. Publication
-creates a run-scoped candidate PR, so checks and reviews must cover that new
-PR's current head, not merely the input PR.
+the worker's PR lookup establishes the PR-to-source relationship. A task keeps
+one owned PR: an unchanged-candidate publication continuation reuses its exact
+head and retained gates, while a changed candidate advances that same PR only
+through full `gate-and-ship`, `--expected-pr-head`, fresh review and current-head
+CI. A genuinely new task may create a new PR; a new run for the same task does
+not.
 
 ## Status, completion and retry
 
 Call `request-status --state <runtime>/state --request-id <id>`. It reports
 queued/claimed state separately from matching runs' durable outcomes. “Claimed”
 is not proof of a live process: check the retained systemd unit and the actual
-cron execution if liveness matters. Match the run's claimed request hash; the
+cron execution if liveness matters. An existing PID or non-parent wait timeout
+also does not prove execution: distinguish running, zombie/unreaped and missing
+handles, and use the retained process result plus authoritative run outcome.
+Match the run's claimed request hash; the
 latest global run may belong to somebody else. Inspect logs/PR evidence for
 details, without printing credentials or lease tokens.
 If `queue_errors` is present, report unreadable queue state rather than claiming

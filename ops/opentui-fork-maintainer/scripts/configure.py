@@ -54,6 +54,7 @@ TOOLSETS = ["terminal", "file", "skills", "delegation", "video", "todo", "no_mcp
 MAINTAINER_SKILL_SOURCES = {
     "opentui-maintainer": SOURCE_HOME / "skills/opentui-maintainer",
 }
+PROFILE_LEARNING_REFERENCE = Path("references/profile-learning.md")
 RUNTIME_ASSETS = (
     Path("README.md"),
     Path("prompts/maintainer.md"),
@@ -161,6 +162,29 @@ def deploy_assets(source_home: Path, runtime_home: Path) -> None:
         _copy_atomic(source_home / relative, runtime_home / relative)
 
 
+def _preserve_profile_learning(target: Path, staging: Path) -> None:
+    """Carry the one profile-owned reference across a versioned skill refresh."""
+    if target.is_symlink():
+        raise ConfigurationError(f"refusing aliased installed skill: {target}")
+    existing = target / PROFILE_LEARNING_REFERENCE
+    if existing.parent.is_symlink() or existing.is_symlink():
+        raise ConfigurationError(
+            f"refusing aliased profile learning reference: {existing}"
+        )
+    if not existing.exists():
+        return
+    if not existing.is_file():
+        raise ConfigurationError(
+            f"profile learning reference is not a regular file: {existing}"
+        )
+    replacement = staging / PROFILE_LEARNING_REFERENCE
+    if replacement.parent.is_symlink() or replacement.is_symlink():
+        raise ConfigurationError(
+            f"refusing aliased versioned learning destination: {replacement}"
+        )
+    _copy_atomic(existing, replacement)
+
+
 def install_maintainer_skills(hermes_home: Path) -> None:
     target_root = hermes_home / "skills/software-development"
     target_root.mkdir(parents=True, exist_ok=True)
@@ -170,6 +194,7 @@ def install_maintainer_skills(hermes_home: Path) -> None:
         if staging.exists():
             shutil.rmtree(staging)
         shutil.copytree(source, staging, symlinks=True)
+        _preserve_profile_learning(target, staging)
         if target.exists():
             backup = target_root / f".{name}.previous"
             if backup.exists():

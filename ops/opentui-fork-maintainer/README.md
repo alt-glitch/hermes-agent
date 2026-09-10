@@ -55,8 +55,17 @@ uv run --no-project --python /home/daimon/.hermes/hermes-agent/venv/bin/python \
 ```
 
 Create the profile only once. Skill refresh stages replacements before replacing
-them and preserves backups outside skill discovery. Provisioning is not a
+them and preserves backups outside skill discovery. Versioned skill files are
+refreshed wholesale; only the profile-owned
+`references/profile-learning.md` is carried byte-for-byte into the staged tree.
+Reviewed guidance belongs in source `failure-learning.md`, while short local
+notes awaiting review belong in that preserved file. Provisioning is not a
 whole-profile transaction: keep the job paused while changing its environment.
+Before the first deployment of this boundary, compare the installed
+`failure-learning.md` with its previously deployed source. If it contains a
+genuine unversioned suffix, move only that reviewed suffix into
+`profile-learning.md` while paused; the provisioner does not guess which divergent
+instructions are trustworthy local learning.
 The job ID is generated and saved in `state/job-identity.json`; subsequent
 deployments use `--job-id <that-id>`, not another `--create-paused`.
 
@@ -84,6 +93,22 @@ Run `systemctl --user daemon-reload` and inspect the effective unit environment
 before starting. Verify that `env` resolves to `/usr/bin/env` and actually runs
 a sentinel command. Do not edit the user's setup file or other gateway units.
 This drop-in survives normal Hermes gateway reinstalls.
+
+Use the same boundary for one-off control-plane and test commands: `uv run`
+must include `--no-project --python <explicit-python>`, and canonical tests run
+through explicit `/usr/bin/env` after the login shell has initialized:
+
+```bash
+/usr/bin/env \
+  PATH=/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin:/usr/bin:/bin:/home/daimon/.local/bin \
+  HERMES_PYTHON=/home/daimon/side-quests/hermes-agent/.venv/bin/python \
+  bash scripts/run_tests.sh --files ops/opentui-fork-maintainer/tests/test_configure.py \
+  -j 1 --file-retries 0
+```
+
+An exit status without collected and executed test counts is not a passing run.
+Do not edit the user's wrapper or rely on a parent-shell PATH export surviving a
+later login shell.
 
 Configuration deployment retains the existing pause/journal/verify/rollback
 protocol. Recovery journals are bound to both profile home and job ID. Relative
@@ -144,7 +169,10 @@ Each wake binds one run token, execution ID, fork base and upstream SHA in
 The absolute eleven-hour lease may span a six-hour tick; proven active-owner
 overlap is skipped, not a successful maintenance run. Healthy work is not killed
 at the separate 600-second model stale allowance. Worker packets are bounded to four hours and at
-most two concurrent workers. Background long calls and observe their exit status.
+most two concurrent workers. Run long calls in the background and observe their exit status.
+Create the detached candidate at
+`state/worktrees/sync-<run-id>`; that canonical name is part of the publisher's
+cleanup ownership proof.
 
 The complete gate installs the committed lockfile, runs focused contracts and
 the full OpenTUI check/build, obtains independent review, drives the candidate
@@ -292,7 +320,7 @@ This does not authorize a new candidate or bypass a pending task.
 After claiming, the parent invokes:
 
 ```text
-uv run <runtime>/scripts/maintainer_runtime.py resume-publication --state <state> --token <token> --source-manifest <completed-gate.json> --source-sha256 <original-hash> --source-packet <original-gate-packet.json> --packet-sha256 <original-packet-hash> --adopt-pr <verified-number> --manifest <owner-evidence>/gate.json --repo <fork>
+uv run --no-project --python <managed-python> <runtime>/scripts/maintainer_runtime.py resume-publication --state <state> --token <token> --source-manifest <completed-gate.json> --source-sha256 <original-hash> --source-packet <original-gate-packet.json> --packet-sha256 <original-packet-hash> --adopt-pr <verified-number> --manifest <owner-evidence>/gate.json --repo <fork>
 ```
 
 An interrupted observer can retry that same command under the same still-live
@@ -371,10 +399,9 @@ the task/base marker without replacing the PR, rewriting its head or weakening
 ancestry. The changed base and any changed control-plane code still require new
 candidate-bound review, gates and current-head CI.
 
-For local maintainer tests, use the canonical runner with explicit `--files`,
-`-j 1 --file-retries 0`. Inspect executed counts, not its AST estimate. On this
-host put `/usr/bin:/bin` first in the command PATH: the user `env` wrapper can
-otherwise make the runner exit zero without executing tests. Do not edit it.
+For local maintainer tests, use the canonical runner example above with explicit
+`--files`, `-j 1 --file-retries 0`. Inspect collected/executed counts, not its
+AST estimate or exit status alone.
 
 Use `hermes -p opentui-maintainer cron list`, `cron status` and `cron runs` for
 schedule/execution state. Then inspect `state/last-run.json` and its referenced

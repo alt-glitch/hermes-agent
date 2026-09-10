@@ -18,6 +18,11 @@ candidate's `ARCHITECTURE.md` before choosing an implementation boundary.
 
 ## Load only what this run needs
 
+Read every selected external `SKILL.md` to EOF individually, then read only its
+task-relevant references to EOF. Follow any truncation before acting. Do not
+batch several large instruction files into one capped command or paste their
+contents into the worker prompt.
+
 - Core/provider/gateway: load `hermes-agent-dev`, then its relevant references.
   The supplied archive's upstream contribution rules do not replace the user's
   authorized fork-sync workflow. Resolve paths from the actual worktree.
@@ -41,7 +46,8 @@ absolute paths to the relevant `SKILL.md` files in their task packets, not just
 skill names. Resolve them under the actual isolated profile's `skills/` directory;
 do not treat absence from a worker's advertised catalog as absence from disk.
 Have the worker read each relevant entrypoint and its task-specific references;
-do not paste the whole development archive into every worker prompt.
+require an EOF-complete read with bounded output per file, and do not paste the
+whole development archive into every worker prompt.
 
 ## Execution
 
@@ -63,10 +69,25 @@ unobserved work. Worker summaries are not evidence. Never fabricate a repro,
 review finding, screenshot or passing test. Diagnose a failed check before retry.
 Do not weaken a gate or manufacture a refactor to make a run look productive.
 
+Run control-plane Python through `uv run --no-project --python <explicit-python>`.
+After any login-shell initialization, launch canonical tests with explicit
+`/usr/bin/env` and a command-local PATH that keeps pinned Node first and
+`/usr/bin:/bin` before user tool directories. Require the runner's collected and
+executed test counts; exit zero without those counts is incomplete evidence.
+
+Observe a background command through its retained terminal/process handle and
+authoritative output. PID existence, `kill(pid, 0)`, `is_running()` and a
+non-parent wait timeout do not distinguish executing work from an unreaped
+zombie. Check process state when needed, but never restart work merely because
+an observer timed out or returned a null exit code.
+
 ## Learning
 
 Save exact commands/results, log paths, candidate SHA, cause and next action in
 the run directory. After proving a correction, update its smallest owning test
-or reference. Use profile memory for stable navigation facts, not transcripts,
-credentials, giant diffs or transient state. Distinguish scheduler completion
-from verified publication in every report.
+or versioned reference. Put short profile-only lessons awaiting source review in
+`references/profile-learning.md`; `configure.py` preserves only that reference
+across a wholesale versioned skill refresh. Keep exact incident logs in the run
+directory, not in either reference. Use profile memory for stable navigation
+facts, not transcripts, credentials, giant diffs or transient state. Distinguish
+scheduler completion from verified publication in every report.

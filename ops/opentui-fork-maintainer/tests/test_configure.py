@@ -137,6 +137,78 @@ def _active_prior_job() -> dict:
     }
 
 
+def test_skill_refresh_preserves_profile_learning_while_updating_versioned_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source" / "opentui-maintainer"
+    references = source / "references"
+    references.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        "---\nname: opentui-maintainer\n---\nnew entrypoint\n"
+    )
+    (references / "failure-learning.md").write_text("new versioned guidance\n")
+    (references / "profile-learning.md").write_text("# Profile-local learning\n")
+    monkeypatch.setattr(
+        configure,
+        "MAINTAINER_SKILL_SOURCES",
+        {"opentui-maintainer": source},
+    )
+
+    hermes_home = tmp_path / "hermes"
+    installed = (
+        hermes_home / "skills/software-development/opentui-maintainer"
+    )
+    installed_references = installed / "references"
+    installed_references.mkdir(parents=True)
+    (installed / "SKILL.md").write_text(
+        "---\nname: opentui-maintainer\n---\nold entrypoint\n"
+    )
+    (installed_references / "failure-learning.md").write_text(
+        "old versioned guidance\n"
+    )
+    local_learning = b"# Profile-local learning\n\n- Proven local recovery lesson.\n"
+    (installed_references / "profile-learning.md").write_bytes(local_learning)
+    (installed_references / "obsolete-versioned.md").write_text("remove me\n")
+
+    configure.install_maintainer_skills(hermes_home)
+
+    assert (installed / "SKILL.md").read_text().endswith("new entrypoint\n")
+    assert (
+        installed_references / "failure-learning.md"
+    ).read_text() == "new versioned guidance\n"
+    assert (
+        installed_references / "profile-learning.md"
+    ).read_bytes() == local_learning
+    assert not (installed_references / "obsolete-versioned.md").exists()
+
+
+def test_skill_refresh_refuses_aliased_profile_learning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source" / "opentui-maintainer"
+    (source / "references").mkdir(parents=True)
+    (source / "SKILL.md").write_text("---\nname: opentui-maintainer\n---\n")
+    monkeypatch.setattr(
+        configure,
+        "MAINTAINER_SKILL_SOURCES",
+        {"opentui-maintainer": source},
+    )
+
+    installed = (
+        tmp_path
+        / "hermes/skills/software-development/opentui-maintainer/references"
+    )
+    installed.mkdir(parents=True)
+    outside = tmp_path / "outside-learning.md"
+    outside.write_text("do not read or replace\n")
+    (installed / "profile-learning.md").symlink_to(outside)
+
+    with pytest.raises(configure.ConfigurationError, match="aliased profile learning"):
+        configure.install_maintainer_skills(tmp_path / "hermes")
+
+    assert outside.read_text() == "do not read or replace\n"
+
+
 def test_documented_uv_project_apply_reaches_hermes_imports(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     runtime_home = tmp_path / "runtime"
