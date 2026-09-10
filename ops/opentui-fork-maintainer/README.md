@@ -70,6 +70,13 @@ into versioned guidance or preserve pending lessons in `profile-learning.md`
 while paused. Retain original files and source/destination hashes. The
 provisioner does not automatically merge or infer authority from divergent
 instructions.
+If a hard interruption leaves the installed skill absent but its `.previous`
+backup present, refresh refuses before deleting the staging or backup copies.
+Journal recovery remains paused and retains its journal. Reconcile the exact
+prior tree and local-learning bytes against the deployment snapshot while
+quiescent, restore the verified installed tree, then retry the existing apply
+transaction. Do not infer backup trust solely from its filename or remove the
+surviving copies just to clear the refusal.
 The job ID is generated and saved in `state/job-identity.json`; subsequent
 deployments use `--job-id <that-id>`, not another `--create-paused`.
 

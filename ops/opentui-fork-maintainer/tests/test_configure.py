@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -208,6 +209,53 @@ def test_skill_refresh_refuses_aliased_profile_learning(
         configure.install_maintainer_skills(tmp_path / "hermes")
 
     assert outside.read_text() == "do not read or replace\n"
+
+
+def test_apply_refuses_interrupted_skill_swap_until_owner_reconciles_learning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source, runtime, home = _deployment_fixture(tmp_path, monkeypatch)
+    skill_source = configure.MAINTAINER_SKILL_SOURCES["opentui-maintainer"]
+    (skill_source / "references").mkdir()
+    (skill_source / configure.PROFILE_LEARNING_REFERENCE).write_text("source template\n")
+    configure.install_maintainer_skills(home)
+    target = home / "skills/software-development/opentui-maintainer"
+    staging = target.with_name(".opentui-maintainer.staging")
+    backup = target.with_name(".opentui-maintainer.previous")
+    local = b"A verified local lesson, not the source template.\n"
+    (target / configure.PROFILE_LEARNING_REFERENCE).write_bytes(local)
+    shutil.copytree(skill_source, staging)
+    configure._preserve_profile_learning(target, staging)
+    # Model a hard process interruption between the two renames, outside the
+    # catchable-exception rollback. Recovery must not discard either copy.
+    target.rename(backup)
+    original = _active_prior_job()
+    calls, holder, cron_call, read_call = _stateful_cron(original)
+    configure._write_deployment_journal(runtime, original, hermes_home=home)
+    kwargs = dict(
+        source_home=source, runtime_home=runtime, hermes_home=home,
+        cron_call=cron_call, cron_snapshot_call=read_call, cron_read_call=read_call,
+    )
+    for _ in range(2):
+        with pytest.raises(configure.ConfigurationError, match="interrupted skill refresh"):
+            configure.apply_configuration(**kwargs)
+        assert not target.exists()
+        assert (backup / configure.PROFILE_LEARNING_REFERENCE).read_bytes() == local
+        assert (staging / configure.PROFILE_LEARNING_REFERENCE).read_bytes() == local
+        assert configure._deployment_journal_path(runtime).exists()
+        assert holder["job"]["enabled"] is False
+        assert holder["job"]["state"] == "paused"
+    assert not any(call["action"] == "resume" for call in calls)
+
+    # The coordinator can reconcile this known fixture's exact prior tree while
+    # paused. The provisioner itself must not infer backup authority by filename.
+    backup.rename(target)
+    for _ in range(2):
+        configure.apply_configuration(**kwargs)
+        assert (target / configure.PROFILE_LEARNING_REFERENCE).read_bytes() == local
+        assert not backup.exists()
+        assert not configure._deployment_journal_path(runtime).exists()
+        assert holder["job"]["enabled"] is True
 
 
 def test_documented_uv_no_project_apply_reaches_hermes_imports(tmp_path: Path) -> None:

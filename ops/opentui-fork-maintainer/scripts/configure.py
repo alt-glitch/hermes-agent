@@ -191,12 +191,20 @@ def install_maintainer_skills(hermes_home: Path) -> None:
     for name, source in MAINTAINER_SKILL_SOURCES.items():
         target = target_root / name
         staging = target_root / f".{name}.staging"
+        backup = target_root / f".{name}.previous"
+        # A hard interruption between renames leaves the only learned copies
+        # outside target. Keep both intact; filename alone cannot authorize
+        # adopting a backup, nor may recovery silently install the template.
+        if not target.exists() and (backup.exists() or backup.is_symlink()):
+            raise ConfigurationError(
+                f"interrupted skill refresh: reconcile {backup} and {staging} "
+                f"with {target} while paused before retrying"
+            )
         if staging.exists():
             shutil.rmtree(staging)
         shutil.copytree(source, staging, symlinks=True)
         _preserve_profile_learning(target, staging)
         if target.exists():
-            backup = target_root / f".{name}.previous"
             if backup.exists():
                 shutil.rmtree(backup)
             target.rename(backup)
