@@ -1,8 +1,8 @@
 name: Label rerun
 
-# When the ``ci-reviewed`` label is added to a PR, rerun all failed jobs in
-# the latest CI run. This re-evaluates ``review-labels`` (which now sees the
-# label) and GitHub reruns the dependent ``all-checks-pass`` gate.
+# When the ``ci-reviewed`` label is added to a PR, recover the review-labels
+# job in the latest CI run. A targeted rerun re-evaluates the label and its
+# dependent ``all-checks-pass`` gate without restarting unrelated failures.
 #
 # ``gh run rerun`` only works on a completed run. Thus this waits when the
 # run is still in progress. A completed successful run needs no recovery and
@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
-      - name: Wait for CI run to finish, then rerun failed jobs
+      - name: Wait for CI run to finish, then recover the review label gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -66,28 +66,62 @@ jobs:
           # already running".
           if [ "$STATUS" != "completed" ]; then
             echo "Run is $STATUS — waiting for completion (this may take a while)..."
-            # gh run watch --exit-status exits non-zero if the run fails,
-            # which is expected (the label gate fails). Don't let that kill
-            # the workflow — we WANT to rerun failed jobs.
-            timeout 6000 gh run watch "$RUN_ID" --repo "$REPO" --interval 15 || true
+            # Without --exit-status, a completed failed run is still a
+            # successful observation. Transport errors and timeouts remain
+            # failures and must not be mistaken for completion.
+            timeout 6000 gh run watch "$RUN_ID" --repo "$REPO" --interval 15
 
             # Verify it's actually completed now.
             FINAL_INFO=$(gh run view "$RUN_ID" \
               --repo "$REPO" \
               --json status,conclusion \
-              --jq '"\(.status) \(.conclusion // "unknown")"' 2>/dev/null || true)
-            read -r STATUS CONCLUSION <<< "${FINAL_INFO:-unknown unknown}"
+              --jq '"\(.status) \(.conclusion // "unknown")"')
+            read -r STATUS CONCLUSION <<< "$FINAL_INFO"
             if [ "$STATUS" != "completed" ]; then
               echo "Run is still $STATUS; recovery pending. Rerun this helper, not the active CI run."
               exit 1
             fi
           fi
 
-          if [ "$CONCLUSION" = "success" ]; then
-            echo "Run already succeeded; no failed jobs need recovery."
-            exit 0
+          case "$CONCLUSION" in
+          success|failure) ;;
+          *)
+            echo "CI run completed with unexpected conclusion $CONCLUSION; refusing recovery."
+            exit 1
+            ;;
+          esac
+
+          LABEL_JOBS=$(gh run view "$RUN_ID" \
+            --repo "$REPO" \
+            --json jobs \
+            --jq '.jobs[] | select(.name == "Review label gate / Review label gate") | [.databaseId, .status, (.conclusion // "unknown")] | @tsv')
+          JOB_COUNT=$(printf '%s\n' "$LABEL_JOBS" | awk 'NF { count++ } END { print count + 0 }')
+          if [ "$JOB_COUNT" -ne 1 ]; then
+            echo "Expected exactly one Review label gate / Review label gate job; found $JOB_COUNT."
+            exit 1
           fi
 
-          echo "Run completed with conclusion $CONCLUSION. Rerunning all failed jobs..."
-          gh run rerun "$RUN_ID" --repo "$REPO" --failed
-          echo "Done. GitHub will rerun review-labels and all dependent jobs."
+          IFS=$'\t' read -r LABEL_JOB_ID LABEL_STATUS LABEL_CONCLUSION EXTRA <<< "$LABEL_JOBS"
+          if [ -n "${EXTRA:-}" ] || [[ "$LABEL_JOB_ID" == *[!0-9]* ]]; then
+            echo "Review label gate job data was malformed."
+            exit 1
+          fi
+          if [ "$LABEL_STATUS" != "completed" ]; then
+            echo "Review label gate job is $LABEL_STATUS; recovery pending."
+            exit 1
+          fi
+
+          case "$LABEL_CONCLUSION" in
+          success)
+            echo "Review label gate already succeeded; no label recovery needed (CI conclusion: $CONCLUSION)."
+            ;;
+          failure)
+            echo "Review label gate failed; rerunning job $LABEL_JOB_ID and its required dependents."
+            gh run rerun "$RUN_ID" --repo "$REPO" --job "$LABEL_JOB_ID"
+            echo "Targeted review label recovery submitted (CI conclusion: $CONCLUSION)."
+            ;;
+          *)
+            echo "Review label gate completed with unexpected conclusion $LABEL_CONCLUSION; refusing recovery."
+            exit 1
+            ;;
+          esac
