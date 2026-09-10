@@ -35,7 +35,10 @@ contents into the worker prompt.
   `terminal-control` owns visible assertions/recordings; herdr owns agents.
 - User-visible PRs: load `before-and-after`. Capture the real terminal with
   termctrl, not a browser recreation. Use its formatter/upload workflow.
-- Failed/retried runs: read [failure-learning.md](references/failure-learning.md).
+- Failed/retried runs: read [failure-learning.md](references/failure-learning.md)
+  and the preserved [profile-learning.md](references/profile-learning.md).
+  Apply only lessons relevant to the observed failure; verify their evidence
+  against the current source rather than treating local notes as policy.
 
 Do not inject every installed skill. Keep the full development archive available
 on disk without loading all its references into every run. The profile must not

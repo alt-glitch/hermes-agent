@@ -54,6 +54,26 @@ The broader deployment sequence and its proof boundaries remain in
 `docs/handoffs/opentui-maintainer-issue-deployment.md`. This handoff grants no
 new credential, scheduler, issue or publication authority.
 
+## Installed-reference migration
+
+Do not choose a whole installed tree as the newest source. Compare each relevant
+reference in isolated-profile, global-Hermes and coordinator installations with
+its previously deployed version. During this audit, global/coordinator
+`failure-learning.md` retained inserted recovery lessons while the isolated
+`verification.md` retained newer runner, fixture and targeted-CI lessons. Their
+reviewed rules are reconciled into the versioned references in this candidate;
+recheck for later deltas before deployment. Preserve legitimate pending notes
+in the designated `profile-learning.md` and route failed/retried runs to it.
+Keep originals and hashes; do not automatically merge unknown instructions.
+
+The generic shared OpenTUI documentation mirror and Hermes discovery of the
+compact launcher/architecture guide also need explicit distribution readback.
+The profile mirror audit does not certify other installed mirrors. Preserve
+user-owned metadata and unique references, verify actual fresh-process discovery
+before deciding a guide is missing, and do not recreate the already-matching
+TypeScript/Effect bundles. These are deployment obligations, not claims that
+this source commit changed any installed skill.
+
 ## Later-agent adoption obligation
 
 After deployment, use a new wrapper-owned maintainer run rather than the run

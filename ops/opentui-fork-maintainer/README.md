@@ -61,11 +61,15 @@ refreshed wholesale; only the profile-owned
 Reviewed guidance belongs in source `failure-learning.md`, while short local
 notes awaiting review belong in that preserved file. Provisioning is not a
 whole-profile transaction: keep the job paused while changing its environment.
-Before the first deployment of this boundary, compare the installed
-`failure-learning.md` with its previously deployed source. If it contains a
-genuine unversioned suffix, move only that reviewed suffix into
-`profile-learning.md` while paused; the provisioner does not guess which divergent
-instructions are trustworthy local learning.
+Before the first deployment of this boundary, compare all relevant installed
+references with their previously deployed source across the isolated, global
+and coordinator copies. Local learning can be inserted anywhere, not only as
+one file's suffix, and neither installed tree necessarily subsumes another.
+Review each useful delta against retained evidence: incorporate stable lessons
+into versioned guidance or preserve pending lessons in `profile-learning.md`
+while paused. Retain original files and source/destination hashes. The
+provisioner does not automatically merge or infer authority from divergent
+instructions.
 The job ID is generated and saved in `state/job-identity.json`; subsequent
 deployments use `--job-id <that-id>`, not another `--create-paused`.
 

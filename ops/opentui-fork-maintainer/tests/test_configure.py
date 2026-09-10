@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -209,7 +210,7 @@ def test_skill_refresh_refuses_aliased_profile_learning(
     assert outside.read_text() == "do not read or replace\n"
 
 
-def test_documented_uv_project_apply_reaches_hermes_imports(tmp_path: Path) -> None:
+def test_documented_uv_no_project_apply_reaches_hermes_imports(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes"
     runtime_home = tmp_path / "runtime"
     _write_config(hermes_home / "config.yaml")
@@ -218,8 +219,9 @@ def test_documented_uv_project_apply_reaches_hermes_imports(tmp_path: Path) -> N
         [
             "uv",
             "run",
-            "--project",
-            str(repo_root),
+            "--no-project",
+            "--python",
+            sys.executable,
             str(SCRIPT),
             "--apply",
             "--runtime-home",

@@ -60,6 +60,33 @@ accumulate universal prohibitions or entire transcripts in skills.
   executing, zombie/unreaped and missing handles. An observation timeout never
   authorizes a duplicate restart.
 
+## Retained learning reconciliation
+
+- Read `pr-owner-preflight-surfaces.json` after an owned-PR preflight refusal;
+  an older draft snapshot cannot disposition an edited comment. Bind each item
+  to its current body hash before retrying. This run reproduced that boundary
+  before any gate checks started.
+- Preserve immutable gate artifacts before publication recovery. Metadata-only
+  CI edits do not require a new approved review; changed source does. The
+  distinct-directory visual retry path is not unchanged-publication recovery.
+- Bind recovery to the exact claimed request, not only its normalized mode;
+  recheck authorization after observation and under the ship lock. Carry the
+  authenticated original worktree/evidence owner into finalization, rather than
+  assuming a fresh run owns an older integration tree.
+- Distinguish persistence-only retries from model dispatch. Cover no-DB mode,
+  permanent stamp failure and repeated drains; bind delayed callbacks to the
+  admitted event so a later loop iteration cannot steal acknowledgment.
+- An ownerless probe error is not a zero upstream gap. Retain a standalone
+  diagnostic without inventing a lease or touching queued requests; report a
+  concrete fetch/rate-limit error separately from failed tests.
+
+These reconcile the additional global/coordinator lessons inspected during
+issue53. Original evidence remains in runs `20260908T033027Z-a30f8bf4`,
+`20260908T110519Z-dc013cad`, `20260908T131358Z-503b39eb`,
+`20260908T153042Z-976e0d53` and
+`state/verification/probe-diagnostic-20260908T152026Z/`. They are historical
+failure inputs, not current blockers or proof of this deployment.
+
 ## Publication observation versus implementation retry
 
 - Keep a terminal publication timeout distinct from a failed local gate. Use
