@@ -130,6 +130,12 @@ export function Markdown(props: { text: string; streaming?: boolean; fg?: string
     )
     return createMarkdownCodeBlockRenderer(adapted) ?? (() => undefined)
   })
+  // `tableOptions` must keep a stable identity across text deltas: the host
+  // merges every dynamic prop into one render effect, and the native setter has
+  // no equality guard — a fresh literal per run would re-raster every settled
+  // table block on each delta. Memoized on the theme so it changes only on a
+  // skin change (markdownTableOptions.test.tsx pins the count).
+  const tableOptions = createMemo(() => ({ style: 'grid' as const, borderColor: theme().color.border }))
   // `internalBlockMode="top-level"` is the anti-flicker mode (stable head blocks
   // aren't re-rendered per delta); `tableOptions` gives native GFM tables with
   // inline formatting; `fg` overrides the base text color (muted for reasoning).
@@ -141,7 +147,7 @@ export function Markdown(props: { text: string; streaming?: boolean; fg?: string
       syntaxStyle={syntaxStyleFor(theme())}
       streaming={props.streaming ?? false}
       internalBlockMode="top-level"
-      tableOptions={{ style: 'grid', borderColor: theme().color.border }}
+      tableOptions={tableOptions()}
       renderNode={renderNode()}
       conceal
       fg={props.fg ?? theme().color.text}
