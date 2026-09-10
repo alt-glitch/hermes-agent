@@ -297,13 +297,11 @@ def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
         ),
         _bridge_schema(
             TOOL_CALL_NAME,
-            "Invoke deferred tools. Takes `calls`, an array of {name, arguments} "
-            "— one entry per invocation; a single call is an array of one. "
-            "Local tools require one entry per tool_call. Only connectors__ names "
-            "may be batched together; mixed and multi-local batches are rejected. "
-            "Connector entries execute individually with results in input order. "
-            f"Argument shapes match each tool's schema (see `{TOOL_DESCRIBE_NAME}`). "
-            "Policy, hooks, and approvals run as for directly-listed tools.",
+            "Invoke deferred tools. Takes `calls`, an array of {name, arguments} — one "
+            "entry per invocation; a single call is an array of one. Entries execute "
+            "individually in input order and results return in the same order. Argument "
+            f"shapes match each tool's schema (see `{TOOL_DESCRIBE_NAME}`). Policy, hooks, "
+            "and approvals run exactly as for directly-listed tools.",
             {
                 "calls": {
                     "type": "array",
@@ -315,7 +313,7 @@ def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
                         },
                         "required": ["name", "arguments"],
                     },
-                    "description": "One local invocation, or one or more connector invocations. Never mix local and connector tools.",
+                    "description": "Deferred tool invocations to execute as one ordered batch.",
                 },
             },
             ["calls"],
@@ -538,7 +536,7 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     * the display layer (so the activity feed shows the underlying tool),
     * the trajectory recorder.
 
-    A connector-only batch resolves
+    A multi-entry or connector-containing call resolves
     to ``(CONNECTOR_BATCH_SENTINEL, {"calls": [...]}, None)``: the batch is
     one dispatch unit owned by the ``model_tools`` bridge branch, and the
     sentinel is what planners/display layers see. A single local entry keeps
@@ -550,11 +548,7 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     if err:
         return None, {}, err
 
-    if len(entries) > 1 and any(not is_connector_name(e["name"]) for e in entries):
-        return None, {}, (
-            "Local tools require one entry per tool_call; mixed and multi-local batches are not supported."
-        )
-    if is_connector_name(entries[0]["name"]):
+    if len(entries) > 1 or any(is_connector_name(entry["name"]) for entry in entries):
         return CONNECTOR_BATCH_SENTINEL, {"calls": entries}, None
 
     name = entries[0]["name"]

@@ -1,4 +1,4 @@
-"""Local deferred tools retain the live agent path; batches must not bypass it."""
+"""Local and mixed batches retain local policy and live-agent boundaries."""
 
 import json
 from types import SimpleNamespace
@@ -6,29 +6,195 @@ from types import SimpleNamespace
 import pytest
 
 
-@pytest.mark.parametrize("mixed", [False, True])
-def test_local_batches_rejected_before_any_entry_executes(monkeypatch, mixed):
+def test_local_only_batch_does_not_require_connections_scope(monkeypatch):
     import model_tools
-    from tools.tool_search import resolve_underlying_call
-    from tools.tool_gateway import bridge, config
-    from tools.registry import invalidate_check_fn_cache
+    from tools import tool_search
 
-    monkeypatch.setattr(config, "connectors_available", lambda: True)
+    config = tool_search.ToolSearchConfig.from_raw(
+        {"enabled": "on", "defer": ["process_manage"]}
+    )
+    calls = [
+        {"name": "process_manage", "arguments": {"action": "list"}},
+        {"name": "process_manage", "arguments": {"action": "list"}},
+    ]
+    monkeypatch.setattr(tool_search, "load_config", lambda: config)
+    monkeypatch.setattr(tool_search, "load_config_readonly", lambda: config)
+    dispatched = []
+
+    def dispatch(name, arguments, **kwargs):
+        dispatched.append((name, arguments))
+        return json.dumps(
+            {"error": "two stale rows", "processes": [], "listed": True}
+        )
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+    result = json.loads(
+        model_tools.handle_function_call(
+            "tool_call", {"calls": calls}, enabled_toolsets=["terminal"]
+        )
+    )
+    assert dispatched == [("process_manage", {"action": "list"})] * 2
+    assert [entry["response"] for entry in result["results"]] == [
+        {"error": "two stale rows", "processes": [], "listed": True},
+        {"error": "two stale rows", "processes": [], "listed": True},
+    ]
+    assert result["success_count"] == 2 and result["error_count"] == 0
+
+
+def test_mixed_batch_reports_denied_entries_and_runs_allowed_siblings(monkeypatch):
+    import model_tools
+    from tools import tool_search
+    from tools.registry import invalidate_check_fn_cache, registry
+    from tools.tool_gateway import bridge, config as gateway_config
+
+    search_config = tool_search.ToolSearchConfig.from_raw(
+        {"enabled": "on", "defer": None}
+    )
+    monkeypatch.setattr(tool_search, "load_config", lambda: search_config)
+    monkeypatch.setattr(tool_search, "load_config_readonly", lambda: search_config)
+    monkeypatch.setattr(gateway_config, "connectors_available", lambda: True)
     monkeypatch.setattr(bridge, "connectors_available", lambda: True)
     invalidate_check_fn_cache()
+    unavailable_name = "mcp_batch_scope_denied"
+    registry.register(
+        name=unavailable_name,
+        handler=lambda args, **kwargs: json.dumps({"must_not": "run"}),
+        schema={
+            "name": unavailable_name,
+            "description": "Out-of-scope batch test tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        toolset="mcp-batch-scope-denied",
+    )
+    local_dispatches = []
+    original_dispatch = registry.dispatch
+
+    def dispatch(name, arguments, **kwargs):
+        local_dispatches.append(name)
+        return original_dispatch(name, arguments, **kwargs)
+
+    remote_dispatches = []
+
+    class Client:
+        def execute(self, planned):
+            remote_dispatches.extend(plan.name for plan in planned)
+            return [{"data": "remote-ok", "error": None} for _ in planned]
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+    monkeypatch.setattr(bridge, "_default_client_factory", Client)
     calls = [
-        {"name": "session_search", "arguments": {}},
-        {"name": "connectors__gmail__SEND_EMAIL" if mixed else "todo_list", "arguments": {}},
+        {"name": "process_manage", "arguments": {"action": "list"}},
+        {"name": unavailable_name, "arguments": {}},
+        {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
     ]
-    name, args, error = resolve_underlying_call({"calls": calls})
-    assert name is None and "one entry per tool_call" in error
-    invoked = []
-    monkeypatch.setattr(model_tools.registry, "dispatch", lambda *a, **kw: invoked.append(a))
-    monkeypatch.setattr(bridge, "_default_client_factory", lambda: invoked.append("gateway"))
-    result = json.loads(model_tools.handle_function_call(
-        "tool_call", {"calls": calls}, enabled_toolsets=["connections", "session_search", "todo"]))
-    assert "one entry per tool_call" in result["error"]
-    assert invoked == []
+    try:
+        result = json.loads(
+            model_tools.handle_function_call(
+                "tool_call",
+                {"calls": calls},
+                enabled_toolsets=["terminal", "connections"],
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+        )
+        restricted = json.loads(
+            model_tools.handle_function_call(
+                "tool_call",
+                {"calls": calls},
+                enabled_toolsets=["terminal"],
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+        )
+    finally:
+        registry.deregister(unavailable_name)
+    assert local_dispatches == ["process_manage", "process_manage"]
+    assert remote_dispatches == ["connectors__gmail__SEND_EMAIL"]
+    assert result["results"][0]["response"]["processes"] == []
+    assert "not available in this session" in result["results"][1]["error"]["message"]
+    assert result["results"][2]["response"] == "remote-ok"
+    assert result["success_count"] == 2 and result["error_count"] == 1
+    assert restricted["results"][0]["response"]["processes"] == []
+    assert "not available in this session" in restricted["results"][1]["error"]["message"]
+    assert "Connectors are not available in this session" in restricted["results"][2]["error"]["message"]
+    assert restricted["success_count"] == 1 and restricted["error_count"] == 2
+
+
+def test_local_batch_entries_use_real_name_policies_and_honest_results(monkeypatch):
+    import hermes_cli.plugins as plugins
+    import model_tools
+    from tools import tool_search
+
+    search_config = tool_search.ToolSearchConfig.from_raw(
+        {"enabled": "on", "defer": ["process_manage"]}
+    )
+    monkeypatch.setattr(tool_search, "load_config", lambda: search_config)
+    monkeypatch.setattr(tool_search, "load_config_readonly", lambda: search_config)
+    events = []
+
+    def request(**kwargs):
+        events.append(("request", kwargs["tool_name"], kwargs["args"]["marker"]))
+        return None
+
+    def hook(name, arguments, **kwargs):
+        events.append(("hook", name, arguments["marker"]))
+        if arguments["marker"] == "denied":
+            return "blocked locally", None
+        return None, None
+
+    def execution(**kwargs):
+        events.append(("execution", kwargs["tool_name"], kwargs["args"]["marker"]))
+        return kwargs["next_call"]()
+
+    monkeypatch.setattr(
+        plugins.get_plugin_manager(),
+        "_middleware",
+        {"tool_request": [request], "tool_execution": [execution]},
+    )
+    monkeypatch.setattr(plugins, "_dispatch_pre_tool_call_hooks", hook)
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda name, arguments, **kwargs: json.dumps(
+            {"error": "one stale process", "processes": [], "listed": True}
+        ),
+    )
+    calls = [
+        {
+            "name": "process_manage",
+            "arguments": {"action": "list", "marker": "denied"},
+        },
+        {
+            "name": "process_manage",
+            "arguments": {"action": "list", "marker": "allowed"},
+        },
+    ]
+    result = json.loads(
+        model_tools.handle_function_call(
+            "tool_call",
+            {"calls": calls},
+            enabled_toolsets=["terminal"],
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+    )
+    assert "blocked locally" in result["results"][0]["error"]["message"]
+    assert result["results"][1]["response"] == {
+        "error": "one stale process",
+        "processes": [],
+        "listed": True,
+    }
+    assert result["success_count"] == 1 and result["error_count"] == 1
+    assert events == [
+        ("request", "process_manage", "denied"),
+        ("hook", "process_manage", "denied"),
+        ("request", "process_manage", "allowed"),
+        ("hook", "process_manage", "allowed"),
+        ("execution", "process_manage", "allowed"),
+    ]
 
 
 @pytest.mark.parametrize("flatten_probe", [False, True])

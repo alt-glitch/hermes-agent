@@ -35,9 +35,8 @@ tool_describe(names)           load the full schemas for one or more tools
 tool_call(calls)               invoke deferred tools; `calls` is an array of {name, arguments}
 ```
 
-`calls` takes one entry per invocation; a single local call is an array of
-one. Only `connectors__` names may be batched together; mixed and
-multi-local batches are rejected.
+`calls` takes one entry per invocation and may mix local deferred tools with
+`connectors__` names. A single call is an array of one.
 
 A typical interaction looks like:
 
@@ -174,11 +173,11 @@ for the user to finish it; disconnecting an account is done by the user in
 the Portal.
 
 `tool_call` accepts a batch: `calls` is an array of `{name, arguments}`
-entries (a single call is an array of one). Each connector entry in a batch
-is dispatched as its own gateway request, one after another; local deferred
-tools stay one entry per `tool_call`. Approvals settle per entry before
-dispatch, and a `/stop` between entries leaves the unstarted ones unsent
-(their slots report `INTERRUPTED`).
+entries (a single call is an array of one), and may mix local deferred tools
+with connectors. Every entry is dispatched individually in input order, so
+its real tool name reaches session-scope checks, middleware, hooks, and
+approvals. A `/stop` between entries leaves the unstarted ones unsent (their
+slots report `INTERRUPTED`).
 
 ## When NOT to use it
 

@@ -674,8 +674,6 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     if err or not underlying_name:
         return tool_error(err or "tool_call could not be resolved"), None
     if underlying_name == ts.CONNECTOR_BATCH_SENTINEL:
-        if not ts.connections_in_scope(current_defs):
-            return tool_error("Connectors are not available in this session."), None
         return None, (underlying_name, underlying_args)
     # Defense in depth: resolve_underlying_call only checks the global
     # registry; also require membership in the session-scoped catalog.
@@ -761,7 +759,8 @@ def _approval_observability(ids: _CallIds):
 
 
 def _execute_tool(function_name: str, function_args: Dict[str, Any], original_args: Dict[str, Any], ids: _CallIds,
-                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool) -> Any:
+                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool,
+                  execution_observed: Optional[List[bool]] = None) -> Any:
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
     dispatch_kwargs: Dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
@@ -773,6 +772,8 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        if execution_observed is not None:
+            execution_observed.append(True)
         from tools.tool_gateway.names import is_connector_name
         if is_connector_name(function_name):
             from model_tools_connectors import dispatch_connector_call
@@ -818,6 +819,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
+    _execution_observed: Optional[List[bool]] = None,
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
@@ -826,6 +828,8 @@ def handle_function_call(
     ``_last_resolved_tool_names``). skip_pre_tool_call_hook: caller already fired
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
+    ``_execution_observed`` is an internal batch-dispatch receipt: it records
+    that execution reached the real handler instead of ending at a policy gate.
     """
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
@@ -895,7 +899,8 @@ def handle_function_call(
         # duration_ms (monotonic) is exposed to post_tool_call / transform_tool_result.
         start = time.monotonic()
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
-                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
+                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware,
+                               execution_observed=_execution_observed)
         duration_ms = _elapsed_ms(start)
         _emit(result, duration_ms=duration_ms)
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)

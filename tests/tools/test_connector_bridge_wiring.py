@@ -79,15 +79,19 @@ def test_resolve_single_connector_entry_returns_sentinel():
     assert args["calls"][0]["arguments"] == {"to": "x"}
 
 
-def test_resolve_multi_local_batch_requires_separate_calls():
+def test_resolve_multi_entry_batch_returns_sentinel_even_all_local():
     name, args, err = resolve_underlying_call(
         {"calls": [
             {"name": "some_local_tool", "arguments": {}},
             {"name": "another_local", "arguments": {}},
         ]}
     )
-    assert name is None
-    assert "one entry per tool_call" in err
+    assert err is None
+    assert name == CONNECTOR_BATCH_SENTINEL
+    assert [entry["name"] for entry in args["calls"]] == [
+        "some_local_tool",
+        "another_local",
+    ]
 
 
 def test_resolve_legacy_single_shape_unchanged_for_local_names():
