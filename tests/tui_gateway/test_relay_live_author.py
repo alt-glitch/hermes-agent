@@ -55,6 +55,10 @@ def turn_env(monkeypatch, tmp_path):
         monkeypatch.setattr(srv, name, lambda *a, **k: None)
     monkeypatch.setattr(srv, "_session_cwd", lambda session: str(tmp_path))
     monkeypatch.setattr(srv, "_get_usage", lambda agent: {})
+    # The fork's turn admission fence (ownership slot + registry identity) refuses a never-registered
+    # record; this test drives the runner directly, so stand in for both like the sibling fork tests do.
+    monkeypatch.setattr(srv, "_session_registry_matches", lambda *_: True)
+    monkeypatch.setattr(srv, "_ensure_active_session_slot", lambda *_: None)
 
 
 def test_live_relay_stamps_the_sender_as_a_delivery_author(tmp_path, monkeypatch):

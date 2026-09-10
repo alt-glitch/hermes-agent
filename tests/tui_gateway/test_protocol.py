@@ -1585,6 +1585,7 @@ def test_persist_branch_seed_forwards_original_timestamps(server, monkeypatch):
             {"role": "assistant", "content": "b", "timestamp": original_ts[1]},
         ],
         "history_lock": threading.Lock(),
+        "seeded": True,  # stamped by session.create: this history exists only in memory
     }
 
     server._persist_branch_seed(session)
