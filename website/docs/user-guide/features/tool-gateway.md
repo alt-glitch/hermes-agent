@@ -196,7 +196,7 @@ Every host is named `{label}-gateway.<domain>`, and `TOOL_GATEWAY_DOMAIN` / `TOO
 
 - `{vendor}-gateway.<domain>` — per-vendor passthroughs (Firecrawl, BFL, ...), overridable one at a time with `{VENDOR}_GATEWAY_URL`.
 - `tool-gateway.<domain>` — the shared managed origin: the vendors hosted on the gateway itself (`/api/{vendor}`) plus media uploads. `TOOL_GATEWAY_URL` pins this one exactly and skips the domain/scheme derivation.
-- `connector-gateway.<domain>` — the connectors API (`/v1/connectors/*`), its own deployment. `CONNECTOR_GATEWAY_URL` pins it exactly.
+- `connector-gateway.<domain>` — the connectors API (`/v1/connectors/*`), its own deployment. `CONNECTOR_GATEWAY_URL` pins it exactly. See [Tool Search → Connectors](./tool-search.md#connectors-remote-tools).
 
 These knobs exist for custom infrastructure setups (enterprise deployments, dev environments). Regular subscribers never set them.
 

@@ -10,7 +10,7 @@ from dataclasses import replace as dataclass_replace
 
 import pytest
 
-from tools.tool_gateway.bridge import connector_search_hits, dispatch_calls
+from tools.tool_gateway.bridge import connector_search_hits
 from tools.tool_gateway.client import ConnectorClient
 from tools.tool_gateway.errors import (
     GatewayAuthError,
@@ -68,18 +68,24 @@ def test_default_auth_reads_rotated_credentials_for_trusted_origins(tmp_path, mo
             assert _default_header_provider(origin + "/v1/connectors/search") == {
                 "Authorization": f"Bearer {token}",
             }
-    for untrusted in ("https://connector.test.evil", "http://connector.test", "https://connector.test:444", "https://elsewhere.test"):
+    for untrusted in (
+        "https://connector.test.evil",
+        "http://connector.test",
+        "https://connector.test:444",
+        "https://elsewhere.test",
+    ):
         assert _default_header_provider(untrusted) == {}
 
 
-def test_default_auth_has_no_dependency_on_temporary_compat_helpers(tmp_path, monkeypatch):
+def test_default_auth_has_no_dependency_on_managed_tool_gateway_compat_helpers(
+    tmp_path, monkeypatch
+):
     import tools.managed_tool_gateway as gateway
     from tools.tool_gateway.client import _default_header_provider
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("CONNECTOR_GATEWAY_URL", "https://connector.test")
     monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "synthetic-token")
-    # Model the scheduled removal without importing a deprecated alias.
     for name in ("managed_gateway_auth_headers", "is_managed_nous_gateway_url"):
         monkeypatch.delitem(vars(gateway), name, raising=False)
     assert _default_header_provider("https://connector.test/v1/connectors/search") == {
@@ -259,100 +265,6 @@ def test_connection_required_stays_inside_the_200_envelope():
     (result,) = make_client(transport).execute(planned(PLAN_CALLS[:1]))
     assert result["error"]["code"] == "CONNECTION_REQUIRED"
     assert result["error"]["connect_url"] == "https://example.test/connect/1"
-
-
-# ---------------------------------------------------------------------------
-# bridge: dispatch_calls is TOTAL
-# ---------------------------------------------------------------------------
-
-
-def local_echo(name, arguments):
-    return True, json.dumps({"ran": name, "args": arguments})
-
-
-def test_dispatch_mixed_batch_splices_local_and_remote_in_order():
-    transport = FakeTransport(
-        FakeResponse(
-            200,
-            execute_envelope(
-                [{"index": 0, "connector": "gmail", "tool": "GMAIL_SEND_EMAIL", "data": "sent"}]
-            ),
-        )
-    )
-    out = json.loads(
-        dispatch_calls(
-            [
-                {"name": "local_tool", "arguments": {"a": 1}},
-                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
-            ],
-            "dispatch-1",
-            local_dispatch=local_echo,
-            availability=lambda: True,
-            client_factory=lambda: make_client(transport),
-        )
-    )
-    assert out["total_count"] == 2
-    assert out["results"][0]["response"]["ran"] == "local_tool"
-    assert out["results"][1]["response"] == "sent"
-    assert out["success_count"] == 2
-
-
-def test_dispatch_refuses_oversized_batch_with_too_many_shape():
-    calls = [{"name": f"t{i}", "arguments": {}} for i in range(11)]
-    out = json.loads(dispatch_calls(calls, local_dispatch=local_echo))
-    assert "too many calls: 11 > max 10" in out["error"]
-
-
-def test_dispatch_gateway_failure_hits_only_connector_entries():
-    transport = FakeTransport(ConnectionError("down"), ConnectionError("still down"))
-    out = json.loads(
-        dispatch_calls(
-            [
-                {"name": "local_tool", "arguments": {}},
-                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
-            ],
-            local_dispatch=local_echo,
-            availability=lambda: True,
-            client_factory=lambda: make_client(transport),
-        )
-    )
-    assert "response" in out["results"][0]  # local survived
-    assert out["results"][1]["error"]["code"] == "PROVIDER_ERROR"
-    assert out["error_count"] == 1
-
-
-def test_dispatch_connector_names_with_connectors_unavailable_are_unknown_tools():
-    out = json.loads(
-        dispatch_calls(
-            [{"name": "connectors__gmail__SEND_EMAIL", "arguments": {}}],
-            local_dispatch=local_echo,
-            availability=lambda: False,
-        )
-    )
-    assert out["results"][0]["error"]["code"] == "TOOL_NOT_FOUND"
-
-
-def test_dispatch_is_total_when_everything_explodes():
-    def exploding_dispatch(name, arguments):
-        raise RuntimeError("local boom")
-
-    def exploding_factory():
-        raise RuntimeError("factory boom")
-
-    out = json.loads(
-        dispatch_calls(
-            [
-                {"name": "local_tool", "arguments": {}},
-                {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
-            ],
-            local_dispatch=exploding_dispatch,
-            availability=lambda: True,
-            client_factory=exploding_factory,
-        )
-    )
-    assert out["results"][0]["error"]["code"] == "TOOL_ERROR"
-    assert out["results"][1]["error"]["code"] == "PROVIDER_ERROR"
-    assert out["error_count"] == 2
 
 
 # ---------------------------------------------------------------------------

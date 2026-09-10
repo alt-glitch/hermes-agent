@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 from unittest.mock import patch
 
+from tools import managed_gateway_auth
+
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "managed_tool_gateway.py"
 MODULE_SPEC = spec_from_file_location("managed_tool_gateway_test_module", MODULE_PATH)
@@ -134,13 +136,8 @@ def test_is_managed_tool_gateway_ready_skips_refresh_for_expired_cached_token(tm
 
     assert refresh_calls == []
 
-def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
-    """The exact URL an agent may connect to is a code fact, not a lookup.
 
-    Exercises the real default resolution (which once resolved a typo'd
-    pseudo-vendor to a non-existent host while every other test stubbed it):
-    default resolver, real deployed host, pinned vendor path.
-    """
+def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
     with patch.dict(
         os.environ,
         {"TOOL_GATEWAY_DOMAIN": "nousresearch.com", "TOOL_GATEWAY_SCHEME": "https"},
@@ -156,89 +153,7 @@ def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
     }
 
 
-def test_connector_gateway_origin_pins_the_deployed_connectors_host():
-    # The connectors API is its own deployment on its own canonical host, so
-    # the default resolution must not land on the media/vendor origin.
-    with patch.dict(
-        os.environ,
-        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com", "TOOL_GATEWAY_SCHEME": "https"},
-        clear=False,
-    ):
-        os.environ.pop("CONNECTOR_GATEWAY_URL", None)
-        assert managed_tool_gateway.connector_gateway_origin() == (
-            "https://connector-gateway.nousresearch.com"
-        )
-
-
-def test_managed_gateway_origin_honors_the_harness_override():
-    # TOOL_GATEWAY_URL pins the full media origin (the e2e harness sets it to a
-    # loopback gateway), and the bearer gate must accept exactly that origin.
-    with patch.dict(os.environ, {"TOOL_GATEWAY_URL": "http://127.0.0.1:3009/"}, clear=False):
-        os.environ.pop("CONNECTOR_GATEWAY_URL", None)
-        assert managed_tool_gateway.managed_gateway_origin() == "http://127.0.0.1:3009"
-        assert managed_tool_gateway.is_managed_nous_gateway_url(
-            "http://127.0.0.1:3009/api/bfl/generations"
-        )
-        assert not managed_tool_gateway.is_managed_nous_gateway_url(
-            "https://tools.nousresearch.com/api/bfl/generations"
-        )
-
-
-def test_connector_gateway_origin_honors_its_own_override():
-    # CONNECTOR_GATEWAY_URL is the connectors host's own key: it moves the
-    # connectors origin without touching the media origin, and the bearer gate
-    # accepts the overridden origin.
-    with patch.dict(
-        os.environ,
-        {
-            "CONNECTOR_GATEWAY_URL": "http://127.0.0.1:3009/",
-            "TOOL_GATEWAY_DOMAIN": "nousresearch.com",
-        },
-        clear=False,
-    ):
-        os.environ.pop("TOOL_GATEWAY_URL", None)
-        assert managed_tool_gateway.connector_gateway_origin() == "http://127.0.0.1:3009"
-        assert managed_tool_gateway.managed_gateway_origin() == (
-            "https://tool-gateway.nousresearch.com"
-        )
-        assert managed_tool_gateway.is_managed_nous_gateway_url(
-            "http://127.0.0.1:3009/v1/connectors/search"
-        )
-
-
-def test_default_bearer_gate_accepts_both_deployed_hosts_only():
-    # Exact (scheme, netloc) equality against each deployed origin. Both
-    # first-party hosts are in; the retired `tools.` host, subdomain cousins,
-    # and scheme downgrades are all out.
-    with patch.dict(
-        os.environ,
-        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com", "TOOL_GATEWAY_SCHEME": "https"},
-        clear=False,
-    ):
-        os.environ.pop("TOOL_GATEWAY_URL", None)
-        os.environ.pop("CONNECTOR_GATEWAY_URL", None)
-        for trusted in (
-            "https://connector-gateway.nousresearch.com/v1/connectors/execute",
-            "https://tool-gateway.nousresearch.com/api/bfl/generations",
-        ):
-            assert managed_tool_gateway.is_managed_nous_gateway_url(trusted)
-        for untrusted in (
-            "https://tools.nousresearch.com/v1/connectors/execute",
-            "https://evil-connector-gateway.nousresearch.com.attacker.dev/v1/connectors",
-            "https://connector-gateway.nousresearch.com.attacker.dev/v1/connectors",
-            "http://connector-gateway.nousresearch.com/v1/connectors",
-            "http://tool-gateway.nousresearch.com/api/bfl/generations",
-        ):
-            assert not managed_tool_gateway.is_managed_nous_gateway_url(untrusted)
-
-
 def test_managed_vendor_endpoints_do_not_consult_entitlement():
-    """Address resolution, not a policy decision.
-
-    What an account may spend is the gateway's ruling, stated in its refusals.
-    Guessing at it here would hide the address from a caller the server would
-    have served, so entitlement must not be read on this path at all.
-    """
     with patch.dict(os.environ, {"TOOL_GATEWAY_DOMAIN": "nousresearch.com"}, clear=False), \
          patch.object(
              managed_tool_gateway,
@@ -253,56 +168,103 @@ def test_managed_vendor_endpoints_do_not_consult_entitlement():
 
 
 def test_managed_vendor_endpoints_are_none_when_no_origin_resolves():
-    # A misconfigured scheme leaves nothing to call, and the caller reports
-    # that rather than building a URL out of a broken setting.
     with patch.dict(os.environ, {"TOOL_GATEWAY_SCHEME": "ftp"}, clear=False):
         os.environ.pop("TOOL_GATEWAY_URL", None)
         assert managed_tool_gateway.managed_vendor_endpoints("vendorx") is None
 
 
-def test_managed_gateway_auth_headers_carry_the_bearer():
-    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
-        headers = managed_tool_gateway.managed_gateway_auth_headers(
-            "https://tool-gateway.example.com/api/vendorx/generations",
-            gateway_builder=lambda vendor: f"https://{vendor}-gateway.example.com",
-            token_reader=lambda: "nous-token",
-        )
-
-    assert headers == {"Authorization": "Bearer nous-token"}
-
-
-def test_managed_gateway_auth_headers_reflect_a_rotated_token():
-    # Read fresh on every call: a Nous access token expires within the hour,
-    # and a long session must not keep presenting a dead bearer.
+def test_managed_media_auth_headers_preserve_live_bearer_rotation_and_origin_trust():
     tokens = iter(["first-token", "second-token"])
     builder = lambda vendor: f"https://{vendor}-gateway.example.com"
     url = "https://tool-gateway.example.com/api/vendorx/generations"
 
-    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
-        first = managed_tool_gateway.managed_gateway_auth_headers(url, builder, lambda: next(tokens))
-        second = managed_tool_gateway.managed_gateway_auth_headers(url, builder, lambda: next(tokens))
+    first = managed_tool_gateway.managed_gateway_auth_headers(
+        url, builder, lambda: next(tokens)
+    )
+    second = managed_tool_gateway.managed_gateway_auth_headers(
+        url, builder, lambda: next(tokens)
+    )
 
-    assert first["Authorization"] == "Bearer first-token"
-    assert second["Authorization"] == "Bearer second-token"
+    assert first == {"Authorization": "Bearer first-token"}
+    assert second == {"Authorization": "Bearer second-token"}
+    assert managed_tool_gateway.managed_gateway_auth_headers(
+        "https://attacker.example/api/vendorx/generations",
+        builder,
+        lambda: "nous-token",
+    ) == {}
+    assert managed_tool_gateway.managed_gateway_auth_headers(
+        url, builder, lambda: None
+    ) == {}
 
 
-def test_managed_gateway_auth_headers_refuse_a_url_off_the_gateway_origin():
-    # Gated on the URL, never a name: our bearer must never be handed to a
-    # host that merely looks managed.
-    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
-        assert managed_tool_gateway.managed_gateway_auth_headers(
-            "https://attacker.example/api/vendorx/generations",
-            gateway_builder=lambda vendor: f"https://{vendor}-gateway.example.com",
-            token_reader=lambda: "nous-token",
-        ) == {}
+def test_connector_gateway_origin_pins_the_deployed_connectors_host():
+    # The connectors API is its own deployment on its own canonical host, so
+    # the default resolution must not land on the media/vendor origin.
+    with patch.dict(
+        os.environ,
+        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com", "TOOL_GATEWAY_SCHEME": "https"},
+        clear=False,
+    ):
+        os.environ.pop("CONNECTOR_GATEWAY_URL", None)
+        assert managed_gateway_auth.connector_gateway_origin() == (
+            "https://connector-gateway.nousresearch.com"
+        )
 
+def test_managed_gateway_origin_honors_the_harness_override():
+    # TOOL_GATEWAY_URL pins the full media origin (the e2e harness sets it to a
+    # loopback gateway), and the bearer gate must accept exactly that origin.
+    with patch.dict(os.environ, {"TOOL_GATEWAY_URL": "http://127.0.0.1:3009/"}, clear=False):
+        os.environ.pop("CONNECTOR_GATEWAY_URL", None)
+        assert managed_gateway_auth.managed_gateway_origin() == "http://127.0.0.1:3009"
+        assert managed_gateway_auth.is_managed_nous_gateway_url(
+            "http://127.0.0.1:3009/api/vendorx/generations"
+        )
+        assert not managed_gateway_auth.is_managed_nous_gateway_url(
+            "https://tools.nousresearch.com/api/vendorx/generations"
+        )
 
-def test_managed_gateway_auth_headers_empty_without_a_token():
-    # Empty rather than raising, so a caller can say "sign in" instead of
-    # sending an unauthenticated request.
-    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
-        assert managed_tool_gateway.managed_gateway_auth_headers(
-            "https://tool-gateway.example.com/api/vendorx/generations",
-            gateway_builder=lambda vendor: f"https://{vendor}-gateway.example.com",
-            token_reader=lambda: None,
-        ) == {}
+def test_connector_gateway_origin_honors_its_own_override():
+    # CONNECTOR_GATEWAY_URL is the connectors host's own key: it moves the
+    # connectors origin without touching the media origin, and the bearer gate
+    # accepts the overridden origin.
+    with patch.dict(
+        os.environ,
+        {
+            "CONNECTOR_GATEWAY_URL": "http://127.0.0.1:3009/",
+            "TOOL_GATEWAY_DOMAIN": "nousresearch.com",
+        },
+        clear=False,
+    ):
+        os.environ.pop("TOOL_GATEWAY_URL", None)
+        assert managed_gateway_auth.connector_gateway_origin() == "http://127.0.0.1:3009"
+        assert managed_gateway_auth.managed_gateway_origin() == (
+            "https://tool-gateway.nousresearch.com"
+        )
+        assert managed_gateway_auth.is_managed_nous_gateway_url(
+            "http://127.0.0.1:3009/v1/connectors/search"
+        )
+
+def test_default_bearer_gate_accepts_both_deployed_hosts_only():
+    # Exact (scheme, netloc) equality against each deployed origin. Both
+    # first-party hosts are in; the retired `tools.` host, subdomain cousins,
+    # and scheme downgrades are all out.
+    with patch.dict(
+        os.environ,
+        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com", "TOOL_GATEWAY_SCHEME": "https"},
+        clear=False,
+    ):
+        os.environ.pop("TOOL_GATEWAY_URL", None)
+        os.environ.pop("CONNECTOR_GATEWAY_URL", None)
+        for trusted in (
+            "https://connector-gateway.nousresearch.com/v1/connectors/execute",
+            "https://tool-gateway.nousresearch.com/api/vendorx/generations",
+        ):
+            assert managed_gateway_auth.is_managed_nous_gateway_url(trusted)
+        for untrusted in (
+            "https://tools.nousresearch.com/v1/connectors/execute",
+            "https://evil-connector-gateway.nousresearch.com.attacker.dev/v1/connectors",
+            "https://connector-gateway.nousresearch.com.attacker.dev/v1/connectors",
+            "http://connector-gateway.nousresearch.com/v1/connectors",
+            "http://tool-gateway.nousresearch.com/api/vendorx/generations",
+        ):
+            assert not managed_gateway_auth.is_managed_nous_gateway_url(untrusted)

@@ -330,11 +330,6 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools.update(resolve_toolset(ts_name))
-    # Connector discovery and connection management are one capability surface.
-    # The registry check_fn drops this tool when the signed-in connector gateway
-    # is unavailable; adding it here makes it reachable for every real session
-    # instead of relying on a registry-only toolset no platform selects.
-    tools.add("manage_connections")
     # Disabled toolsets are always subtracted LAST, so a tool in a disabled
     # toolset is stripped even when a composite (hermes-cli) re-enables it.
     # This ensures that even if a composite toolset (like hermes-cli) is enabled, any tools belonging to a
@@ -679,6 +674,8 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     if err or not underlying_name:
         return tool_error(err or "tool_call could not be resolved"), None
     if underlying_name == ts.CONNECTOR_BATCH_SENTINEL:
+        if not ts.connections_in_scope(current_defs):
+            return tool_error("Connectors are not available in this session."), None
         return None, (underlying_name, underlying_args)
     # Defense in depth: resolve_underlying_call only checks the global
     # registry; also require membership in the session-scoped catalog.
@@ -691,51 +688,6 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     if probe_err is not None:
         return probe_err, None
     return None, (underlying_name, underlying_args)
-
-
-def _dispatch_connector_batch(
-    calls: List[Dict[str, Any]], *, ids: _CallIds, user_task: Optional[str], enabled_tools: Optional[List[str]],
-    enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], middleware_trace: List[Dict[str, Any]],
-    current_defs: List[Dict[str, Any]],
-) -> str:
-    """Dispatch a connector/mixed calls[] batch with the per-entry policy pipeline."""
-    from tools import tool_search as ts
-    scoped = ts.scoped_deferrable_names(current_defs)
-    defer_tools = ts.load_config_readonly().effective_defer_tools
-
-    def local_dispatch(name: str, args: Dict[str, Any]):
-        if not ts.is_deferrable_tool_name(name, defer_tools):
-            return False, tool_error(
-                f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
-                "list already, call it directly instead of via tool_call.")
-        if name not in scoped:
-            return False, tool_error(
-                f"'{name}' is not available in this session. Use tool_search to find tools you can call.")
-        probe_err = ts.validate_deferred_call_args(name, args)
-        if probe_err is not None:
-            return False, probe_err
-        return True, handle_function_call(
-            name, args, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
-            skip_pre_tool_call_hook=False, skip_tool_request_middleware=False,
-            skip_tool_execution_middleware=False, tool_request_middleware_trace=list(middleware_trace),
-            enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets)
-
-    def connector_pre_dispatch(name: str, args: Dict[str, Any]):
-        try:
-            from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-            block, modified = _dispatch_pre_tool_call_hooks(
-                name, args, middleware_trace=list(middleware_trace), **ids.hook_kwargs())
-            return block, modified if isinstance(modified, dict) else None
-        except Exception as exc:
-            logger.debug("connector pre_tool_call hook error: %s", exc)
-            return None, None
-
-    try:
-        from tools.tool_gateway.bridge import dispatch_calls
-        return dispatch_calls(calls, ids.tool_call_id, local_dispatch=local_dispatch,
-                              pre_dispatch=connector_pre_dispatch)
-    except Exception as exc:
-        return tool_error(f"tool_call batch dispatch is unavailable: {exc}")
 
 
 def _apply_request_middleware(
@@ -821,6 +773,10 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        from tools.tool_gateway.names import is_connector_name
+        if is_connector_name(function_name):
+            from model_tools_connectors import dispatch_connector_call
+            return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
@@ -893,27 +849,27 @@ def handle_function_call(
         result, underlying = bridged
         if underlying is None:
             return _emit(result, duration_ms=_elapsed_ms(start))
-        try:
-            from tools import tool_search as _ts
-            is_batch = underlying[0] == _ts.CONNECTOR_BATCH_SENTINEL
-        except Exception:
-            is_batch = False
-        if is_batch:
-            current_defs = get_tool_definitions(
+        from tools.tool_gateway.names import CONNECTOR_BATCH_SENTINEL
+        if underlying[0] == CONNECTOR_BATCH_SENTINEL:
+            from model_tools_connectors import dispatch_connector_batch
+            return _emit(dispatch_connector_batch(
+                underlying[1]["calls"], ids, user_task=user_task,
+                enabled_tools=enabled_tools, middleware_trace=trace,
                 enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-                quiet_mode=True, skip_tool_search_assembly=True) or []
-            result = _dispatch_connector_batch(
-                underlying[1].get("calls") or [], ids=ids, user_task=user_task,
-                enabled_tools=enabled_tools, enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets, middleware_trace=list(trace),
-                current_defs=current_defs)
-            return _emit(result, duration_ms=_elapsed_ms(start))
+            ), duration_ms=_elapsed_ms(start))
         return handle_function_call(
             *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
             skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
             skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         )
+
+    from tools.tool_gateway.names import is_connector_name, parse_connector_name
+    if function_name == "manage_connections" or is_connector_name(function_name):
+        if "manage_connections" not in _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True):
+            return _emit(tool_error("Connectors are not available in this session."))
+        if is_connector_name(function_name) and parse_connector_name(function_name) is None:
+            return _emit(tool_error("Malformed connector tool name; expected connectors__<connector>__<tool>."))
 
     original_args = dict(function_args)
     if not skip_tool_request_middleware:

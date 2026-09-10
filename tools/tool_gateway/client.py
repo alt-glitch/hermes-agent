@@ -1,7 +1,8 @@
 """HTTP client for the connector routes on the managed tool gateway.
 
 Constructed per dispatch — a portal access token expires within the hour, so
-auth headers are read fresh on every call. Sync ``requests`` on purpose: the bridge branch cannot reach the
+auth headers are read fresh on every call (the ``managed_gateway_auth_headers``
+idiom). Sync ``requests`` on purpose: the bridge branch cannot reach the
 registry's async bridge, so every call here runs on the calling thread.
 
 Injectable seams (``transport`` / ``endpoint_resolver`` / ``header_provider``)
@@ -30,7 +31,6 @@ from __future__ import annotations
 import logging
 import uuid
 from typing import Any, Callable, Optional, Protocol, Sequence
-from urllib.parse import urlsplit
 
 import requests
 
@@ -52,10 +52,12 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 # measured batch latency is seconds, not minutes, but give slow tools room.
 EXECUTE_TIMEOUT_SECONDS = 60.0
 # Search rides the availability path of EVERY tool_search once connectors are
-# lit — a hung gateway must degrade silently AND fast, so it gets a short
-# budget and no retry. Schemas (tool_describe) is user-initiated; a short
-# budget with one retry keeps its worst case at 2x this value.
-SEARCH_TIMEOUT_SECONDS = 8.0
+# lit. A hung gateway degrades silently to local-only results, with no retry.
+# Measured: one request with 6 use_cases takes about 7 s, so an 8 s budget sat
+# on the edge and cut real answers off; 30 s tolerates a slow gateway and still
+# bounds the wait. Schemas (tool_describe) is user-initiated; a short budget
+# with one retry keeps its worst case at 2x this value.
+SEARCH_TIMEOUT_SECONDS = 30.0
 SCHEMAS_TIMEOUT_SECONDS = 10.0
 
 _MAX_RETRIES = 1  # D29: at most one retry, same key.
@@ -89,7 +91,7 @@ def _default_endpoint_resolver() -> Optional[str]:
     (``v1/connectors/*``) on its own host, not a vendor passthrough and not the
     media host.
     """
-    from tools.managed_tool_gateway import connector_gateway_origin
+    from tools.managed_gateway_auth import connector_gateway_origin
 
     try:
         return connector_gateway_origin() or None
@@ -99,22 +101,9 @@ def _default_endpoint_resolver() -> Optional[str]:
 
 
 def _default_header_provider(url: str) -> dict:
-    from tools.managed_tool_gateway import (
-        connector_gateway_origin,
-        managed_gateway_origin,
-        read_nous_access_token,
-    )
+    from tools.managed_gateway_auth import managed_gateway_auth_headers
 
-    try:
-        actual = urlsplit(url)
-        trusted = {urlsplit(origin())[:2] for origin in (connector_gateway_origin, managed_gateway_origin)}
-        if not actual.scheme or actual[:2] not in trusted:
-            return {}
-        token = read_nous_access_token()
-    except Exception as exc:
-        logger.debug("Connector gateway auth resolution failed: %s", exc)
-        return {}
-    return {"Authorization": f"Bearer {token.strip()}"} if isinstance(token, str) and token.strip() else {}
+    return managed_gateway_auth_headers(url)
 
 
 class ConnectorClient:

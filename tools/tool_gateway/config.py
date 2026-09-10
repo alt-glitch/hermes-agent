@@ -5,13 +5,10 @@ dataclass built by a tolerant ``from_raw`` so a typo in user config degrades
 to defaults instead of breaking the agent.
 
 Availability is a two-leg AND that fails closed:
-
     connectors_available() = config flag AND managed_nous_tools_enabled()
-
 The config flag is the user's off switch; the entitlement leg is the portal
-sign-in every managed tool already gates on. A third, runtime layer lives
-above this module: a 404 from any connector route means connectors are dark
-for this principal and callers silently fall back to local-only.
+sign-in every managed tool already gates on. The gateway remains authoritative:
+404 routes degrade to local-only, and execution refusals reach the caller.
 """
 
 from __future__ import annotations

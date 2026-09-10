@@ -400,8 +400,8 @@ def _unwrap_tool_search_call(
         if err or not underlying:
             return function_name, function_args, None
         if underlying == _ts.CONNECTOR_BATCH_SENTINEL:
-            # Keep the wrapper intact: model_tools owns batch partitioning and
-            # applies the real-name policy pipeline per entry.
+            # Both executors retain the wrapper: scope/probe/hooks run per entry
+            # in the batch dispatcher, not against a synthetic registry name.
             return function_name, function_args, None
         if underlying not in _tool_search_scoped_names(agent):
             return function_name, function_args, (

@@ -34,14 +34,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     "computer_use",
-    # Remote connector accounts. Core because it is the ONLY way the model can
-    # answer "am I connected?" or hand the user an authorization link, and the
-    # connector tools it services reach every platform — not just the GUI ones.
-    # Its registered toolset ("connections") is registry-only, so leaving it
-    # out of here made it unreachable: every real session passes
-    # enabled_toolsets, and a name absent from those bundles is never resolved.
-    # check_fn (_connectors_available) keeps it out of non-entitled sessions,
-    # which is what the entitlement gate is for.
+    # Service-gated connector account status and authorization links.
     "manage_connections",
 ]
 
@@ -133,6 +126,7 @@ TOOLSETS = {
     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
+    "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
     "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
     "bot_room": _ts("Verified text-only Group Chat turn capabilities"),
 

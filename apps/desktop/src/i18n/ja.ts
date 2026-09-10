@@ -2086,8 +2086,10 @@ export const ja = defineLocale({
     noSessions: 'セッションはまだありません',
     noFilterMatches: 'このフィルターに一致するセッションはありません',
     projects: {
+      showAllSessions: 'すべてのセッションを表示',
       sectionLabel: 'プロジェクト',
       home: 'ホーム',
+      autoDiscovered: '自動検出',
       newButton: '新規プロジェクト',
       createTitle: '新規プロジェクト',
       createDesc: 'ワークスペースに名前を付け、1つ以上のフォルダを追加します。',
@@ -3147,7 +3149,11 @@ export const ja = defineLocale({
         streaming: 'ストリーミング接続のエラー'
       },
       errorRetry: '再試行',
+      errorStartNewSession: '新しいセッションを開始',
       errorSwitchProvider: 'プロバイダーを切り替え',
+      errorSignInAgain: provider => `${provider} に再度サインイン`,
+      errorOauthExpired: provider =>
+        `${provider} のサインインが期限切れか取り消されました。続けるには再度サインインしてください。`,
       errorOpenLogs: 'ログを開く',
       errorOpenLogsFailed: 'ログフォルダを開けませんでした',
       errorOpenDesktopLogs: 'デスクトップのログを開く',

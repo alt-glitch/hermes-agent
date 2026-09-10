@@ -542,7 +542,7 @@ class TestBridgeDispatch:
     and refuses tool_call targets outside the session-scoped deferrable catalog."""
 
     @pytest.mark.parametrize("defer", [None, ["process_manage"]])
-    def test_deferred_core_calls_work_individually_and_in_batches(self, defer):
+    def test_deferred_core_calls_work_individually_and_reject_local_batches(self, defer):
         from model_tools import get_tool_definitions
         from tools import tool_search as ts
 
@@ -561,15 +561,15 @@ class TestBridgeDispatch:
                 batch = json.loads(handle_function_call(
                     "tool_call", {"calls": [call, call]}, enabled_toolsets=["terminal"]))
             assert single == {"processes": []}
-            assert batch["success_count"] == 2 and batch["error_count"] == 0
-            assert [entry.args[0] for entry in dispatch.call_args_list] == ["process_manage"] * 3
+            assert "one entry per tool_call" in batch["error"]
+            assert [entry.args[0] for entry in dispatch.call_args_list] == ["process_manage"]
 
     @pytest.mark.parametrize("defer,toolsets,arguments,error", [
         ([], ["terminal"], {"action": "list"}, "not a deferrable tool"),
         (["process_manage"], ["file"], {"action": "list"}, "not available in this session"),
         (["process_manage"], ["terminal"], {}, "action"),
     ])
-    def test_batched_core_calls_preserve_policy_checks(self, defer, toolsets, arguments, error):
+    def test_deferred_core_single_calls_preserve_policy_checks(self, defer, toolsets, arguments, error):
         from tools import tool_search as ts
 
         config = ts.ToolSearchConfig.from_raw({"enabled": "on", "defer": defer})
@@ -579,11 +579,10 @@ class TestBridgeDispatch:
             patch.object(ts, "load_config_readonly", return_value=config),
             patch("model_tools.registry.dispatch") as dispatch,
         ):
-            batch = json.loads(handle_function_call(
-                "tool_call", {"calls": [call, call]}, enabled_toolsets=toolsets))
+            result = json.loads(handle_function_call(
+                "tool_call", {"calls": [call]}, enabled_toolsets=toolsets))
         dispatch.assert_not_called()
-        assert batch["error_count"] == 2 and batch["success_count"] == 0
-        assert all(error in str(entry["error"]) for entry in batch["results"])
+        assert error in str(result["error"])
 
     def test_tool_search_and_describe_return_json_strings(self):
         with patch("model_tools.get_tool_definitions", return_value=[]):
