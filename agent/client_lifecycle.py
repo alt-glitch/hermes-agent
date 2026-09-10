@@ -677,7 +677,12 @@ class ClientLifecycleMixin:
             env_url = get_env_prefer_dotenv(url_var).strip().rstrip("/") if url_var else ""
             default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
             base_url = env_url or default_base
-            if self.provider in ("kimi-coding", "zai"):
+            if self.provider == "actual":
+                from hermes_cli.auth import normalize_actual_base_url
+                from hermes_cli.runtime_provider import _config_base_url_for_provider, _get_model_config
+                configured_base = _config_base_url_for_provider(_get_model_config(), "actual")
+                base_url = normalize_actual_base_url(configured_base or base_url)
+            elif self.provider in ("kimi-coding", "zai"):
                 from hermes_cli import auth as _auth
                 resolver = _auth._resolve_kimi_base_url if self.provider == "kimi-coding" else _auth._resolve_zai_base_url
                 base_url = resolver(api_key, pconfig.inference_base_url, env_url).rstrip("/")
@@ -915,6 +920,13 @@ class ClientLifecycleMixin:
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+        from hermes_cli.providers import is_actual_route
+        if is_actual_route(getattr(self, "provider", ""), runtime_base):
+            from hermes_cli.auth import normalize_actual_base_url
+            runtime_base = normalize_actual_base_url(runtime_base)
+            self.api_mode = "chat_completions"
+            if hasattr(self, "_transport_cache"):
+                self._transport_cache.clear()
         self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(runtime_base)

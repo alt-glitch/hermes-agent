@@ -490,6 +490,7 @@ def _run_after_agent_ready(
     display_kind,
     hosted_terminal_callback,
     client_submission_ids,
+    turn_author=None,
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
@@ -537,7 +538,8 @@ def _run_after_agent_ready(
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
         terminal_callback=hosted_terminal_callback,
-        client_submission_ids=client_submission_ids)
+        client_submission_ids=client_submission_ids,
+        turn_author=turn_author)
 
 
 _TRUNCATION_PARAMS = (
@@ -607,6 +609,13 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    from tools.bot_relay import DeliveryAuthor
+
+    # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.
+    raw_author = params.get("_turn_author")
+    if raw_author is not None and not isinstance(raw_author, DeliveryAuthor):
+        return _err(rid, 4124, "turn author is stamped by the gateway, never by a client")
+    turn_author = raw_author.author if raw_author is not None else None
     # tools.configure owns the session mutation lock for its whole config +
     # agent rebuild transaction. Observe its history-locked claim before any
     # config-backed admission work, otherwise this RPC can wait behind the
@@ -688,6 +697,7 @@ def _(rid, params: dict) -> dict:
                     client_submission_ids,
                     history_lock_owned=True,
                     queued=queued_submission,
+                    turn_author=turn_author,
                 )
             if busy_response is not None:
                 return busy_response
@@ -700,6 +710,9 @@ def _(rid, params: dict) -> dict:
         if err is not None:
             return err
     if turn_isolation:
+        if turn_author:
+            logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
+                         turn_author.get("id"))
         isolated_response = _submit_prompt_to_compute_host(
             rid, sid, session, text, display_kind=display_kind)
         if not isolated_response.get("error"):
@@ -731,6 +744,7 @@ def _(rid, params: dict) -> dict:
             display_kind,
             hosted_terminal_callback,
             client_submission_ids,
+            turn_author,
         ),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
@@ -1190,7 +1204,8 @@ def _(rid, params: dict) -> dict:
 _LATE_RESPOND_KEYS = {
     "terminal.read.respond": "text", "preview.read.respond": "text", "preview.act.respond": "text",
     "window.read.respond": "text", "tour.respond": "text", "mcp.setup.respond": "result",
-    "sudo.respond": "password", "secret.respond": "value"}
+    "sudo.respond": "password", "secret.respond": "value", "vault.unlock.respond": "password",
+    "vault.save_login.respond": "login", "vault.code.respond": "code"}
 for _name, _key in _LATE_RESPOND_KEYS.items():
     method(_name)(lambda rid, params, _k=_key: _respond(rid, params, _k, allow_expired=True))
 del _name, _key

@@ -128,7 +128,7 @@ def is_actual_local_base_url(base_url: str) -> bool:
 
 def normalize_actual_base_url(base_url: str) -> str:
     """Return Actual's OpenAI-compatible base URL (hosted api.actual.inc or the loopback local server;
-    both expose a /v1 surface for the Responses transport)."""
+    both expose a /v1 surface for the selected OpenAI-compatible transport)."""
     url = str(base_url or "").strip().rstrip("/")
     if not url:
         return DEFAULT_ACTUAL_BASE_URL
@@ -1794,6 +1794,14 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
 
 
 def _provider_env_base_url(pconfig: ProviderConfig) -> str:
+    if pconfig.id == "actual":
+        from hermes_cli.providers import normalize_provider
+
+        model = read_raw_config().get("model")
+        if isinstance(model, dict) and normalize_provider(str(model.get("provider") or "")) == "actual":
+            configured_url = str(model.get("base_url") or "").strip()
+            if configured_url:
+                return configured_url
     return os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
 
 

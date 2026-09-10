@@ -263,15 +263,24 @@ def _enqueue_prompt(
     front: bool = False,
     client_submission_ids: list[str] | None = None,
     image_paths: list[str] | None = None,
+    turn_author: dict | None = None,
 ) -> None:
-    """Stash a message as the next turn without losing order or correlation."""
+    """Stash a message as the next turn without losing order or correlation.
+
+    Text-only arrivals share a slot and merge losslessly; image-bearing and authored
+    (relay-sender) envelopes stay separate so attachment chronology and the sender survive.
+    ``transport`` is pinned so the drained turn streams to its sender."""
     image_paths = list(image_paths or [])
     _drop_queued_duplicates_of_inflight_user(session)
-    if not image_paths and isinstance(text, str) and text.strip() == _ac_inflight_original(session) != "":
+    text_only = not image_paths and isinstance(text, str)
+    # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
+    if text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
         return
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if turn_author:
+        queued["turn_author"] = turn_author
     existing = session.get("queued_prompt")
     if _queued_input_chars(session, extra_queue_text=text) > _MAX_PENDING_INPUT_CHARS:
         raise OverflowError("queued input text capacity invariant exceeded")
@@ -282,12 +291,14 @@ def _enqueue_prompt(
     merged_ids = list(dict.fromkeys(
         [*incoming_ids, *existing_ids] if front else [*existing_ids, *incoming_ids]
     ))
+    # Authored envelopes never merge: the sender's own words stay in their own slot.
     if (
         existing
+        and text_only
+        and not turn_author
         and isinstance(existing.get("text"), str)
-        and isinstance(text, str)
         and not existing.get("image_paths")
-        and not image_paths
+        and not existing.get("turn_author")
         and not session.get("queued_prompts")
     ):
         prev = existing["text"]
@@ -316,7 +327,7 @@ def _enqueue_prompt(
 def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict | None:
     """Drop (``None``) a text-only self-duplicate of the live user text, or rewrite a merged slot
     ``"{original}\\n\\n{later}"`` to ``later`` so the correction survives without re-firing the original. Image-bearing
-    envelopes are left alone (chronology is load-bearing).
+    and authored envelopes are left alone: chronology and the sender's own words are kept.
 
     Returns ``None`` to drop the envelope, or a (possibly rewritten) dict to keep. A merged slot
     ``"{original}\\n\\n{later}"`` (from ``_enqueue_prompt``'s consecutive text merge) is rewritten to just
@@ -325,7 +336,7 @@ def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict |
     if not isinstance(entry, dict):
         return None
     text = entry.get("text")
-    if not original or entry.get("image_paths") or not isinstance(text, str):
+    if not original or entry.get("image_paths") or entry.get("turn_author") or not isinstance(text, str):
         return entry
     # A lossless text-merge may have glued the live original onto a later follow-up: keep the remainder.
     rest = next((text[len(original + sep):] for sep in ("\n\n", "\n") if text.startswith(original + sep)), text).strip()
@@ -460,8 +471,12 @@ def _handle_busy_submit(
     *,
     history_lock_owned: bool = False,
     queued: bool = False,
+    turn_author: dict | None = None,
 ) -> dict | None:
-    """Apply busy-input policy without dropping accepted prompt correlations."""
+    """Apply busy-input policy without dropping accepted prompt correlations.
+
+    ``turn_author`` (a relay sender stamped by the gateway) rides the queued envelope so the
+    drained turn stays attributed; ``queued=True`` already forces queue mode for it."""
     mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
     lock_context = contextlib.nullcontext() if history_lock_owned else session["history_lock"]
@@ -550,6 +565,7 @@ def _handle_busy_submit(
                 transport,
                 client_submission_ids=client_submission_ids,
                 image_paths=image_paths,
+                turn_author=turn_author,
             )
         except OverflowError as exc:
             if image_paths:
@@ -610,6 +626,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session.pop("queued_prompts", None)
             session["running"] = False
             return True
+    # The compute-host frame has no author field, so only the inline runner receives it.
+    author_kwargs = {"turn_author": queued["turn_author"]} if queued.get("turn_author") else {}
     dispatch_failed = False
     dispatch_error = "queued prompt dispatch failed"
     try:
@@ -635,7 +653,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             }
             if client_submission_ids := list(queued.get("client_submission_ids") or []):
                 kwargs["client_submission_ids"] = client_submission_ids
-            _run_prompt_submit(rid, sid, session, queued["text"], **kwargs)
+            _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs)
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: {type(exc).__name__}: {exc}",

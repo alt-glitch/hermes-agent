@@ -661,7 +661,8 @@ def _emit_title_refresh(sid: str, title: str | None = None) -> None:
 
 def _invoke_agent(
     sid: str, session: dict, st: _TurnRun, prompt: Any, run_message: Any, streamer,
-    images: list[str], display_kind: str | None, display_metadata: dict | None) -> None:
+    images: list[str], display_kind: str | None, display_metadata: dict | None,
+    turn_author: dict | None = None) -> None:
     """Wire the streaming callbacks and run the conversation into ``st.result``."""
     agent = st.agent
 
@@ -707,6 +708,8 @@ def _invoke_agent(
                 st.display_row_boundary = (current_session_id, boundary or 0)
             except Exception:
                 logger.debug("failed to capture synthetic display row boundary", exc_info=True)
+    if turn_author and "turn_author" in run_params:
+        run_kwargs["turn_author"] = turn_author
     # Live-rename hook: auto-titling fires inside the turn prologue.
     agent._on_session_title = lambda title, _source: _emit_title_refresh(sid, title)
     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
@@ -1019,6 +1022,37 @@ def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
     _clear_session_context(scopes.session_tokens)
 
 
+# Bounded so a contended state.db cannot hold ``_sessions_lock``; a skipped heal is retried on the next prompt.
+_ROUTING_REOPEN_PATIENCE_S = 0.5
+
+
+def _routing_provenance_db(session: dict):
+    """The session's own SessionDB for :func:`_reopen_routed_session_row`, or a ``None`` context."""
+    try:
+        return _session_db(session)
+    except Exception:
+        logger.debug("could not resolve the session db for routing provenance", exc_info=True)
+        return contextlib.nullcontext(None)
+
+
+def _reopen_routed_session_row(db, sid: str, session: dict) -> None:
+    """Routing provenance for #106459, called under ``_sessions_lock`` while this backend still has the
+    session registered and is about to start a turn for it: an explicit-close stamp on its row missed a
+    live conversation, so it is cleared (the gateway's #54878 stale-route self-heal, which this backend
+    lacked). ``_pop_session_by_id`` claims teardown under the same lock and sets ``_closing`` before
+    ``_finalize_session`` stamps, so a close of THIS session is either not written yet or already stops
+    the turn -- it is never cleared here. Best-effort: a failure never blocks the turn."""
+    session_id = getattr(session.get("agent"), "session_id", None)  # the compression tip this turn writes
+    if db is None or not session_id:
+        return
+    try:
+        db.reopen_if_explicitly_closed(
+            session_id, provenance=f"TUI session {sid} is still registered and accepting a turn",
+            patience_s=_ROUTING_REOPEN_PATIENCE_S)
+    except Exception:
+        logger.debug("routing-provenance reopen failed for %s", session_id, exc_info=True)
+
+
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, display_notification: dict | None = None,
@@ -1027,7 +1061,8 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     loop_claim_id: str = "",
-    history_commit_callback: Callable[[_HistoryCommitOutcome], None] | None = None) -> bool:
+    history_commit_callback: Callable[[_HistoryCommitOutcome], None] | None = None,
+    turn_author: dict | None = None) -> bool:
     client_submission_ids = list(client_submission_ids or [])
     admitted = _admit_prompt_turn(
         sid, session, text, image_paths, queued_prompt_generation,
@@ -1073,7 +1108,7 @@ def _run_prompt_submit(
             prompt, run_message, cols, streamer = prepared
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
-                display_metadata)
+                display_metadata, turn_author)
             status_note, history_outcome = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             _report_history_commit(history_commit_callback, history_outcome)
@@ -1134,10 +1169,16 @@ def _run_prompt_submit(
                 invocation_started=st.invocation_started,
             ))
     run_thread = threading.Thread(target=run, daemon=True)
-    with _sessions_lock:
+    # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
+    # state registry, and _sessions_lock gates every create/close/prompt on this backend.
+    with _routing_provenance_db(session) as routing_db, _sessions_lock:
         registered = _sessions.get(sid)
         can_start = not session.get("_closing") and (registered is None or registered is session)
         if can_start:
+            # Only a registered session is proof the conversation is routed here; an unregistered one may
+            # still run its turn, but its stamp stays (#106459).
+            if registered is session:
+                _reopen_routed_session_row(routing_db, sid, session)
             session["_run_thread"] = run_thread
             run_thread.start()
     if not can_start:
