@@ -1,116 +1,98 @@
-# Upstream alignment — how we inherit OpenTUI's performance work for free
+# OpenTUI upstream alignment
 
-Context (maintainer, 2026-06-11): opencode's 100-message cap was a November-era
-performance workaround, since obsoleted. Our current OpenTUI 0.4.1 pin ships
-native Yoga (the earlier WASM ratchet is historical), while opencode still does
-not use virtualization. This document covers dependency/runtime alignment, not
-feature-completeness; the canonical Ink-parity status is
-`docs/opentui-parity-matrix.md`.
+Hermes consumes published OpenTUI packages without patching them. This document
+defines how to compare a newer upstream with the runtime Hermes actually ships.
+It is an upgrade and compatibility ledger, not the Ink-parity ledger; current
+feature status remains in `docs/opentui-parity-matrix.md`.
 
-## The invariant that makes alignment free
+## The contract in this checkout
 
-**We are dependency-forkless, and windowing is public-API-only.** The windowing
-layer (S1+S2) drives the STOCK `<scrollbox>` through documented surface only —
-`onSizeChange`, `setFrameCallback`, `scrollTop`/`viewport`/`scrollHeight`, Solid
-`<Show>` mount/unmount. Zero patches to `@opentui/core`. Every upstream release
-therefore drops in by bumping three pinned versions in `ui-opentui/package.json`
-(`@opentui/{core,keymap,solid}`, currently 0.4.1). Keep it that way: any new
-code that needs core behavior goes through a `boundary/` wrapper, never a
-patched dependency. The compatibility shims in the ledger below do monkey-patch
-exported prototypes or manipulate public frame buffers; they are isolated,
-tested exceptions to the broader application rule, not dependency forks.
+`ui-opentui/package.json` and `package-lock.json` currently pin all three
+OpenTUI packages exactly to `0.4.1`:
 
-## What native Yoga changed for us (and what it didn't)
+- `@opentui/core`
+- `@opentui/keymap`
+- `@opentui/solid`
 
-- **Killed the WASM ratchet** (grow-only linear memory → freeable native
-  allocations). This retro-justifies S2 less, but S2's append-time windowing
-  remains correct: transient mounted peaks still cost handles and RSS.
-- **Does NOT obsolete windowing.** The binding constraint is the 65,535-slot
-  native handle table: ~47 handles/row × 3,000 stored rows ≈ 141k handles —
-  over the table at ANY layout speed. Windowing is what makes the 3,000-row
-  scrollback possible; yoga's backend is irrelevant to that math.
-- **Makes windowing feel even better**: 2× layout = cheaper margin remounts =
-  smaller window margins viable and less exposure for the one accepted limit
-  (estimate-height snap under scrollbar jumps). After the bump, re-tune margin/
-  hysteresis against the scroll cell.
+The same manifest pins `effect@4.0.0-beta.78` and `solid-js@1.9.12`, and declares
+Node `>=26.3`. The lockfile plus the declarations installed from it are the API
+contract. A source checkout, a documentation mirror, or a successful example
+against another installation cannot expand that contract.
 
-## The shim ledger (delete-on-upstream-fix; all in `ui-opentui/src/boundary/`)
+The OpenTUI documentation reviewed on 2026-09-10 byte-matched upstream revision
+`ac753b48d386707a931dcf881d0741905b64b4f9`. It describes a newer Node deployment
+floor (`26.4.0`) and a composed clipboard surface (`createClipboard`,
+`createHostClipboard`, `createRendererClipboardAdapter`) that are absent from the
+installed `0.4.1` declarations. Do not import those APIs or raise Hermes' runtime
+floor from documentation alone. By contrast, the installed declarations do
+contain `createTestRenderer`, `waitForVisualIdle`, `getNativeStats`, the Keymap
+host/test APIs, `TextTableRenderable`, and `TimeToFirstDrawRenderable`; each still
+needs a candidate test before use.
 
-| shim                                  | what it papers over                                                                                                                                                                                  | delete when                                                                                    |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `ffiSafe.ts`                          | u32 draw coords go negative under Node FFI (Bun silently wraps) — ERR_INVALID_ARG_VALUE loop                                                                                                         | upstream clamps, or Node FFI path is officially supported                                      |
-| `nativeHandles.ts`                    | SyntaxStyle exhaustion crashes mid-mount; degrade-to-unstyled                                                                                                                                        | handle table widened (INDEX_BITS>16) or per-kind tables                                        |
-| `renderer.ts` lifecycle/repaint guard | core 0.4.1 treats SIGPIPE (clipboard spawn) as an exit signal; its uncaughtException handler can allocate during handle exhaustion; suspend/resume repaint can drop later bytes from one input chunk | signals/error handling fixed upstream and a public full-repaint primitive preserves the parser |
-| `clipboard.ts` hardening              | same SIGPIPE incident class                                                                                                                                                                          | with the above                                                                                 |
+## Why upstream improvements remain cheap to adopt
 
-Each is (a) isolated, (b) inert if upstream fixes the behavior, (c) worth
-reporting upstream — four concrete, reproduced, root-caused issues. Filing them
-is the cheapest alignment lever we have: it converts our workarounds into
-upstream regression tests. (Needs glitch's go-ahead — public repo activity.)
+Transcript windowing drives stock OpenTUI and Solid surfaces: scrollbox geometry,
+frame callbacks, and ordinary Solid mount/unmount behavior. Hermes does not carry
+a modified `@opentui/core`, so an upgrade is a manifest-and-lock change followed
+by compatibility verification. Keep OpenTUI-specific adaptations in
+`ui-opentui/src/boundary/` and keep ordinary view and state code on public APIs.
 
-## Busy-input parity stays inside stock OpenTUI
+"Unpatched dependency" does not mean "no compatibility code." The following
+wrappers isolate reproduced differences in the installed Node FFI path:
 
-The f7c9 busy-input port adds no dependency patch and no second frame callback.
-The queue is plain Solid/store state, `QueuedMessages` mounts stock native
-renderables, and the five-second config watcher is an Effect-scoped sleep/RPC
-loop that is finalized with the renderer. `display.busy_input_mode` in
-`config.yaml` is hydrated from `config.get full` and refreshed after a detected
-config mtime change; `queue` remains the full-screen TUI default when the value
-is missing or malformed.
+| Boundary           | Current reason                                                                                                                                                      | Removal proof                                                                                                                                                     |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ffiSafe.ts`       | Prevent invalid negative draw coordinates from reaching unsigned Node FFI calls.                                                                                    | Disable the wrapper and pass its focused regression plus the affected live scroll/diff flow on the candidate.                                                     |
+| `nativeHandles.ts` | Degrade syntax styling when the installed native handle registry is exhausted instead of crashing the mount.                                                        | Prove the candidate removes the exhaustion class, then pass the large-session resource probe with the wrapper disabled.                                           |
+| `renderer.ts`      | Own renderer acquisition/finalization, restrict non-shutdown signals, guard upstream error handlers, and request a full repaint without resetting the input parser. | Disable one workaround at a time; pass lifecycle/error and redraw tests plus a real PTY copy/input/repaint smoke.                                                 |
+| `clipboard.ts`     | Provide Hermes' bounded subprocess/OSC 52 behavior and keep clipboard failures out of input handlers.                                                               | Adopt an available upstream service only after its installed declarations and behavior cover the Hermes contract, including cleanup and remote-terminal fallback. |
 
-The renderer-side safety envelope is explicit:
+Do not delete a wrapper because a similarly named API appears on upstream main.
+Removal requires the candidate package to expose it and the original regression
+to pass with the wrapper disabled. Upstream filing or publication is a separate,
+explicitly authorized action.
 
-- at most 100 queued rows and 4,194,304 UTF-16 code units across queued bodies;
-  rejected or definitely failed steer attempts return to the same bounded
-  queue;
-- steer admission remains best-effort and in memory, matching f7c9 Ink. A child
-  crash preserves unsent queue rows and the draft, reports an uncertain
-  in-flight delivery, and never auto-replays it;
-- at most three queue rows mount at once, regardless of queue length;
-- a queued body larger than 16,384 UTF-16 code units remains sendable and
-  deletable but is never copied into the native textarea; local composer history
-  uses the same 16 Ki code-unit ceiling;
-- two empty Enter presses within 450 ms stop a busy turn or force the next
-  queued row while idle;
-- `/queue --clear` is the confirmed bulk-discard escape hatch.
+## Upgrade procedure
 
-This remains **Thinner**, not Covered: unlike Ink, the bounded queue deliberately
-does not reinterpret a queued `!command`, slash-like body, or flattened skill
-body as local executable syntax. Every queued row is sent as a model prompt
-until queue items carry typed provenance. That avoids surprising shell/slash
-execution but is a real parity gap, and the busy commands/UX still require a
-real-PTY comparison before promotion.
+1. Work in an isolated clean branch. Record the Hermes base, old exact package
+   versions, intended upstream tag/commit, selected Node identity, platform and
+   architecture.
+2. Read the candidate release source and the testing, rendering diagnostics,
+   native crash, clipboard, keymap, component and deployment documentation.
+   Compare every proposed API with the candidate's installed declarations.
+3. Update the three OpenTUI manifest pins and lockfile together. Use the
+   repository's selected Node/npm; do not reuse native modules produced by a
+   different Node ABI. A lockfile diff is part of the review surface.
+4. Run `npm ci`, `npm run check`, and `npm run build` in `ui-opentui`. Record the
+   actual test count and output from that candidate; do not copy totals from an
+   earlier release.
+5. Audit each boundary independently. First preserve the baseline with all
+   wrappers enabled, then disable only the wrapper whose upstream fix is being
+   evaluated and rerun its focused regression. Keep a wrapper when the result is
+   ambiguous.
+6. Run resource probes in fresh Node processes. `ui-opentui/scripts/mem-bench.tsx`,
+   `pager-bench.tsx`, and `queue-bench.tsx` contain their current build/run
+   commands and measurement semantics. Compare like-for-like inputs and runtime
+   identities; RSS alone is not allocation attribution.
+7. Exercise a fresh real PTY through the complete launcher/gateway path: initial
+   render, typing and paste, queued input, scroll, resize, selection/copy,
+   suspend/resume or external input, redraw, session switch and clean shutdown.
+   Headless forced frames cannot prove spontaneous repaint or native input.
+8. Verify the packaged-runtime path as well as the source tree. The launcher in
+   `hermes_cli/main_tui_launch.py` selects a runtime, re-inspects it under the
+   refresh lock, and delegates transactional build/promotion to
+   `hermes_cli/opentui_runtime.py`. A successful source build does not prove the
+   installed bundle, native package, Python source root or selected profile.
+9. Update this ledger only with reproduced changes. Keep current measurements in
+   retained release evidence rather than turning historical numbers into future
+   gates. Preserve Ink as the recovery renderer.
 
-## The upgrade playbook (per upstream release)
+## Research snapshot
 
-1. Branch `chore/opentui-X.Y.Z`, bump the three pins, `npm ci`.
-2. `npm run check`; record the exact total from that run rather than copying a
-   historical count. For the current uncommitted busy-input batch, the focused
-   evidence is 302 TypeScript tests plus 9 targeted gateway tests; the full-suite
-   total is still pending. The windowing invariants — identical scrollHeight
-   ON/OFF and byte-stable frames across corrections — are literal assertions and
-   will catch behavioral drift.
-3. Bench acceptance, sequential: `--cell gate` (determinism digest; EXPECT a
-   new digest if upstream changed rendering — eyeball the frame, re-bless),
-   `--cell mem3000 --msgs 2000` + `--cell scroll --msgs 3000` against the
-   versioned baseline for the current pin, then `--cell pipeline` (frame pacing
-   ≥22fps). The often-cited 300–375MB / p99 6–8ms figures are historical
-   pre-0.4.1 references, not the native-Yoga release gate; capture the 0.4.1
-   baseline before the next bump.
-4. Shim audit: try each boundary shim OFF; delete the ones upstream fixed.
-5. Live tmux smoke (scroll sweep / resize / selection-copy), screenshots.
-6. Windowing re-tune if layout got faster: margins up or hysteresis down,
-   re-run scroll cell, keep p99 ≤ 17ms gate.
-
-The bench suite IS the upgrade contract — it's exactly the harness that lets
-us take every upstream improvement within a day of release, with proof.
-
-## Questions worth relaying to the maintainer
-
-1. Any plan to widen the 16-bit native handle table (or split per-kind)?
-   That's our hard ceiling, independent of yoga.
-2. Is the Node `--experimental-ffi` path on their support radar, or Bun-only?
-   (Native yoga adds new FFI surface; we run Node.)
-3. Would they take the windowing layer's core-agnostic pieces (exact-height
-   spacer pattern, correction-legality rule) as a documented recipe or
-   framework-level utility? We have it production-shaped with tests.
+On 2026-09-10, read-only remote checks observed OpenTUI main at
+`ac753b48d386707a931dcf881d0741905b64b4f9`. That revision's test renderer uses
+visual-idle/native-cell signals, and its clipboard source exposes the composed
+service described above. Those observations are upgrade leads, not evidence that
+Hermes `0.4.1` has the same surface. Exact multi-project provenance and the
+installed-versus-reference policy are maintained in the maintainer engineering
+reference.
