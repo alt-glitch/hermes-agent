@@ -482,6 +482,8 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "toolsets": None,
         "skills": None,
         "usage_file": "usage.json",
+        # upstream d7b0a72c forwards --reasoning through the oneshot launch
+        "reasoning": None,
     }
 
 
