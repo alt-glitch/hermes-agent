@@ -286,6 +286,14 @@ const SensitivePromptExpiryShape = {
 }
 const SudoExpire = Schema.Struct({ type: Schema.Literal('sudo.expire'), ...SensitivePromptExpiryShape })
 const SecretExpire = Schema.Struct({ type: Schema.Literal('secret.expire'), ...SensitivePromptExpiryShape })
+// External password-manager unlock (1Password / Bitwarden): the agent needs the
+// manager's master password for this session; answered by vault.unlock.respond.
+const VaultUnlockRequest = Schema.Struct({
+  type: Schema.Literal('vault.unlock.request'),
+  session_id: opt(Str),
+  payload: Schema.Struct({ backend: Str, display_name: Str, request_id: Str })
+})
+const VaultUnlockExpire = Schema.Struct({ type: Schema.Literal('vault.unlock.expire'), ...SensitivePromptExpiryShape })
 const ClarifyExpire = Schema.Struct({
   type: Schema.Literal('clarify.expire'),
   session_id: opt(Str),
@@ -474,7 +482,9 @@ const SessionTurnEvents = Schema.Union([
   SudoRequest,
   SecretRequest,
   SudoExpire,
-  SecretExpire
+  SecretExpire,
+  VaultUnlockRequest,
+  VaultUnlockExpire
 ])
 const ChromeTransportEvents = Schema.Union([
   StatusUpdate,

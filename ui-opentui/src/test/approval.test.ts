@@ -14,6 +14,7 @@ describe('blocking prompt response boundary', () => {
     expect(classifyPromptResponse('clarify.respond', { status: 'ok' })).toEqual({ kind: 'accepted' })
     expect(classifyPromptResponse('sudo.respond', { status: 'ok' })).toEqual({ kind: 'accepted' })
     expect(classifyPromptResponse('secret.respond', { status: 'ok' })).toEqual({ kind: 'accepted' })
+    expect(classifyPromptResponse('vault.unlock.respond', { status: 'ok' })).toEqual({ kind: 'accepted' })
     expect(classifyPromptResponse('approval.respond', { resolved: 1 })).toEqual({ kind: 'accepted' })
     expect(classifyPromptResponse('approval.respond', { resolved: 0 })).toEqual({
       kind: 'terminal',
@@ -26,7 +27,7 @@ describe('blocking prompt response boundary', () => {
   })
 
   test('treats every exact late expiry response as terminal without accepting it', () => {
-    for (const method of ['clarify.respond', 'sudo.respond', 'secret.respond'] as const) {
+    for (const method of ['clarify.respond', 'sudo.respond', 'secret.respond', 'vault.unlock.respond'] as const) {
       expect(classifyPromptResponse(method, { status: 'expired' })).toEqual({ kind: 'terminal', reason: 'expired' })
     }
   })

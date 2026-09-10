@@ -1,7 +1,12 @@
 /** Effect 4 decode boundary for blocking-prompt requests and response RPCs. */
 import { Option, Schema } from 'effect'
 
-export type PromptResponseMethod = 'approval.respond' | 'clarify.respond' | 'secret.respond' | 'sudo.respond'
+export type PromptResponseMethod =
+  | 'approval.respond'
+  | 'clarify.respond'
+  | 'secret.respond'
+  | 'sudo.respond'
+  | 'vault.unlock.respond'
 
 const Str = Schema.String
 const opt = Schema.optionalKey

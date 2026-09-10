@@ -139,12 +139,13 @@ describe('installTerminalChrome — native triggerNotification transport', () =>
 
 describe('promptNotification + env gate', () => {
   test('every known prompt kind has copy; unknown kinds fall back', () => {
-    for (const kind of ['clarify', 'approval', 'sudo', 'secret', 'confirm', 'someday-new']) {
+    for (const kind of ['clarify', 'approval', 'sudo', 'secret', 'vaultUnlock', 'confirm', 'someday-new']) {
       const n = promptNotification(kind)
       expect(n.title).toBe('Hermes')
       expect(n.body).toBeTruthy()
     }
     expect(promptNotification('someday-new').body).toBe('is waiting for your input')
+    expect(promptNotification('vaultUnlock').body).not.toBe('is waiting for your input')
   })
 
   test('HERMES_TUI_NOTIFY=0/false/off disables; default on', () => {

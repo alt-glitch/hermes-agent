@@ -253,6 +253,8 @@ export type ActivePrompt =
     }
   | { kind: 'sudo'; requestId: string }
   | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
+  /** External password-manager unlock — masked master password for one session. */
+  | { kind: 'vaultUnlock'; backend: string; displayName: string; requestId: string }
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
   | { kind: 'confirm'; spec: ConfirmSpec; onConfirm: () => void }
 
@@ -269,7 +271,8 @@ const PROMPT_LABEL: Record<ActivePrompt['kind'], string> = {
   clarify: 'clarification',
   confirm: 'confirmation',
   secret: 'secret prompt',
-  sudo: 'sudo prompt'
+  sudo: 'sudo prompt',
+  vaultUnlock: 'password-manager unlock'
 }
 
 const BATCH_SETTLEMENT_REASON: Partial<Record<PromptSettlement, string>> = {
@@ -3521,6 +3524,19 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       case 'secret.expire':
         if (state.prompt?.kind === 'secret' && state.prompt.requestId === event.payload.request_id) {
+          settlePrompt(state.prompt, 'expired')
+        }
+        break
+      case 'vault.unlock.request':
+        replacePrompt({
+          kind: 'vaultUnlock',
+          backend: event.payload.backend,
+          displayName: event.payload.display_name,
+          requestId: event.payload.request_id
+        })
+        break
+      case 'vault.unlock.expire':
+        if (state.prompt?.kind === 'vaultUnlock' && state.prompt.requestId === event.payload.request_id) {
           settlePrompt(state.prompt, 'expired')
         }
         break

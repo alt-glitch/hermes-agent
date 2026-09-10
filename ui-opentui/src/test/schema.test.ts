@@ -118,13 +118,31 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     expect(
       Option.isSome(decode({ type: 'secret.request', payload: { env_var: 'X', prompt: 'p', request_id: 'r' } }))
     ).toBe(true)
-    for (const type of ['sudo.expire', 'secret.expire'] as const) {
+    for (const type of ['sudo.expire', 'secret.expire', 'vault.unlock.expire'] as const) {
       const ev = decode({ type, payload: { request_id: `${type}-1` } })
       expect(Option.isSome(ev)).toBe(true)
-      if (Option.isSome(ev) && (ev.value.type === 'sudo.expire' || ev.value.type === 'secret.expire')) {
+      if (
+        Option.isSome(ev) &&
+        (ev.value.type === 'sudo.expire' ||
+          ev.value.type === 'secret.expire' ||
+          ev.value.type === 'vault.unlock.expire')
+      ) {
         expect(ev.value.payload.request_id).toBe(`${type}-1`)
       }
     }
+  })
+
+  test('decodes the password-manager unlock request and rejects one missing its manager', () => {
+    const ev = decode({
+      type: 'vault.unlock.request',
+      session_id: 's1',
+      payload: { backend: 'bitwarden', display_name: 'Bitwarden', request_id: 'v1' }
+    })
+    expect(Option.isSome(ev)).toBe(true)
+    if (Option.isSome(ev) && ev.value.type === 'vault.unlock.request') {
+      expect(ev.value.payload).toEqual({ backend: 'bitwarden', display_name: 'Bitwarden', request_id: 'v1' })
+    }
+    expect(Option.isNone(decode({ type: 'vault.unlock.request', payload: { request_id: 'v1' } }))).toBe(true)
   })
 
   test('decodes request-correlated approval lifecycle and clarify expiry events', () => {

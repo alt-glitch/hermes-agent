@@ -963,6 +963,26 @@ describe('session store — blocking prompts (Phase 3)', () => {
     expect(store.state.prompt).toBeUndefined()
   })
 
+  test('vault.unlock.request sets a masked unlock prompt; only its own expiry clears it', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'vault.unlock.request',
+      payload: { backend: 'onepassword', display_name: '1Password', request_id: 'v1' }
+    })
+    expect(store.state.prompt).toMatchObject({
+      kind: 'vaultUnlock',
+      backend: 'onepassword',
+      displayName: '1Password',
+      requestId: 'v1'
+    })
+    // A sibling sensitive expiry never settles the unlock card.
+    store.apply({ type: 'sudo.expire', payload: { request_id: 'v1' } })
+    store.apply({ type: 'vault.unlock.expire', payload: { request_id: 'v0' } })
+    expect(store.state.prompt).toMatchObject({ kind: 'vaultUnlock', requestId: 'v1' })
+    store.apply({ type: 'vault.unlock.expire', payload: { request_id: 'v1' } })
+    expect(store.state.prompt).toBeUndefined()
+  })
+
   test('approval terminal events clear only the exact live session and request', () => {
     const store = createSessionStore()
     store.adoptFreshSession('live-1')

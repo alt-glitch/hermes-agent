@@ -743,3 +743,69 @@ describe('PromptOverlay — batch clarify per-question locks', () => {
     }
   })
 })
+
+describe('PromptOverlay — password-manager unlock card', () => {
+  const UNLOCK = {
+    type: 'vault.unlock.request',
+    payload: { backend: 'onepassword', display_name: '1Password', request_id: 'vault-1' }
+  } as const
+
+  test('renders a masked card naming the manager and submits the master password to vault.unlock.respond', async () => {
+    const store = createSessionStore()
+    store.apply(UNLOCK)
+    const sent: [PromptResponseMethod, Record<string, unknown>][] = []
+    const h = await mountOverlay(store, (method, params) => {
+      sent.push([method, params])
+      return Promise.resolve(ACCEPTED)
+    })
+    try {
+      expect(h.frame()).toContain('Unlock 1Password for this session')
+      await h.keys.typeText('hunter2')
+      await h.settle()
+      // The secret never reaches a renderable; only its mask does.
+      expect(h.frame()).not.toContain('hunter2')
+      expect(h.frame()).toContain('*******')
+      h.keys.pressEnter()
+      await expect.poll(() => sent.length).toBe(1)
+      expect(sent[0]).toEqual(['vault.unlock.respond', { password: 'hunter2', request_id: 'vault-1' }])
+      await expect.poll(() => store.state.prompt).toBeUndefined()
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('Esc keeps the manager locked: an empty password goes back to the same request', async () => {
+    const store = createSessionStore()
+    store.apply(UNLOCK)
+    const sent: [PromptResponseMethod, Record<string, unknown>][] = []
+    const h = await mountOverlay(store, (method, params) => {
+      sent.push([method, params])
+      return Promise.resolve(ACCEPTED)
+    })
+    try {
+      h.keys.pressEscape()
+      await expect.poll(() => sent.length).toBe(1)
+      expect(sent[0]).toEqual(['vault.unlock.respond', { password: '', request_id: 'vault-1' }])
+      await expect.poll(() => store.state.prompt).toBeUndefined()
+    } finally {
+      h.destroy()
+    }
+  })
+
+  test('a late expiry for the same request closes the card without any response', async () => {
+    const store = createSessionStore()
+    store.apply(UNLOCK)
+    const sent: unknown[] = []
+    const h = await mountOverlay(store, (_method, params) => {
+      sent.push(params)
+      return Promise.resolve(EXPIRED)
+    })
+    try {
+      store.apply({ type: 'vault.unlock.expire', payload: { request_id: 'vault-1' } })
+      await expect.poll(() => store.state.prompt).toBeUndefined()
+      expect(sent).toEqual([])
+    } finally {
+      h.destroy()
+    }
+  })
+})

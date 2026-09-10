@@ -2,7 +2,8 @@
  * PromptOverlay — renders the active blocking prompt and binds each answer/cancel
  * to the matching `*.respond` RPC (spec §4 reply contract; §8 #6 deadlock fix):
  *   clarify.respond {answer, request_id} · approval.respond {choice, request_id, session_id} ·
- *   sudo.respond {password, request_id} · secret.respond {value, request_id}.
+ *   sudo.respond {password, request_id} · secret.respond {value, request_id} ·
+ *   vault.unlock.respond {password, request_id}.
  * Idle Esc/Ctrl+C sends the deny/empty reply. While delivery is pending or
  * uncertain, `r` deliberately retries that exact response while Esc/Ctrl+C
  * dismisses locally without claiming it was received.
@@ -77,6 +78,10 @@ const CANCEL_REQUEST_BUILDERS = {
   sudo: (prompt: GatewayPromptOf<'sudo'>): CancelRequest => ({
     method: 'sudo.respond',
     params: { password: '', request_id: prompt.requestId }
+  }),
+  vaultUnlock: (prompt: GatewayPromptOf<'vaultUnlock'>): CancelRequest => ({
+    method: 'vault.unlock.respond',
+    params: { password: '', request_id: prompt.requestId }
   })
 } satisfies { [K in GatewayPromptKind]: (prompt: GatewayPromptOf<K>) => CancelRequest }
 
@@ -98,7 +103,13 @@ export function PromptOverlay(props: PromptOverlayProps) {
   let rootRef: BoxRenderable | undefined
 
   const focusKeyboardOnlyPrompt = (current: ActivePrompt | undefined): void => {
-    if (current?.kind === 'clarify' || current?.kind === 'sudo' || current?.kind === 'secret') rootRef?.focus()
+    if (
+      current?.kind === 'clarify' ||
+      current?.kind === 'sudo' ||
+      current?.kind === 'secret' ||
+      current?.kind === 'vaultUnlock'
+    )
+      rootRef?.focus()
   }
 
   onMount(() => focusKeyboardOnlyPrompt(prompt()))
@@ -260,6 +271,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
   const asClarify = narrow('clarify')
   const asSudo = narrow('sudo')
   const asSecret = narrow('secret')
+  const asVaultUnlock = narrow('vaultUnlock')
   const asConfirm = narrow('confirm')
 
   return (
@@ -322,6 +334,17 @@ export function PromptOverlay(props: PromptOverlayProps) {
               sub={p().prompt}
               statusHint={responseHint()}
               onSubmit={value => respond('secret.respond', { request_id: p().requestId, value })}
+            />
+          )}
+        </Match>
+        <Match when={asVaultUnlock()}>
+          {p => (
+            <MaskedPrompt
+              icon="🔐"
+              label={`Unlock ${p().displayName} for this session`}
+              sub="master password · goes to the manager CLI only · Esc keeps it locked"
+              statusHint={responseHint()}
+              onSubmit={value => respond('vault.unlock.respond', { password: value, request_id: p().requestId })}
             />
           )}
         </Match>

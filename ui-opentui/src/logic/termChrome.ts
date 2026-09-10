@@ -60,6 +60,8 @@ export function promptNotification(kind: string): TermNotification {
       return { title: 'Hermes', body: 'needs your sudo password' }
     case 'secret':
       return { title: 'Hermes', body: 'needs a secret/API key' }
+    case 'vaultUnlock':
+      return { title: 'Hermes', body: 'needs your password manager unlocked' }
     case 'confirm':
       return { title: 'Hermes', body: 'is asking you to confirm' }
     default:
