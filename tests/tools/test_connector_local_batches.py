@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 
-def test_local_only_batch_does_not_require_connections_scope(monkeypatch):
+@pytest.mark.parametrize("short_circuit", [False, True])
+def test_local_only_batch_does_not_require_connections_scope(monkeypatch, short_circuit):
     import model_tools
     from tools import tool_search
 
@@ -28,12 +29,21 @@ def test_local_only_batch_does_not_require_connections_scope(monkeypatch):
         )
 
     monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+    if short_circuit:
+        from hermes_cli.plugins import get_plugin_manager
+
+        # Middleware may serve a cached result without entering the handler.
+        monkeypatch.setattr(get_plugin_manager(), "_middleware", {
+            "tool_execution": [lambda **kwargs: json.dumps(
+                {"error": "two stale rows", "processes": [], "listed": True}
+            )],
+        })
     result = json.loads(
         model_tools.handle_function_call(
             "tool_call", {"calls": calls}, enabled_toolsets=["terminal"]
         )
     )
-    assert dispatched == [("process_manage", {"action": "list"})] * 2
+    assert dispatched == ([] if short_circuit else [("process_manage", {"action": "list"})] * 2)
     assert [entry["response"] for entry in result["results"]] == [
         {"error": "two stale rows", "processes": [], "listed": True},
         {"error": "two stale rows", "processes": [], "listed": True},
