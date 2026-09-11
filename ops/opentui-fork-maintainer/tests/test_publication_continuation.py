@@ -457,6 +457,45 @@ def test_prior_owner_without_terminal_unshipped_evidence_is_refused(retained):
                 call_prior_owner_validator(f, validator)
 
 
+@pytest.mark.parametrize(
+    "journal_fault", ["prepared-phase", "other-candidate", "other-evidence-dir"]
+)
+def test_reconciler_closed_outcome_requires_journal_bound_to_source(
+    retained, journal_fault
+):
+    # A journal that exists but does not prove THIS source's aborted, unshipped
+    # publication must not unlock the reconciler's generic external-blocker code.
+    f = retained
+    write_json(
+        f["old"] / "run-outcome.json",
+        {
+            "status": "failed",
+            "stage": "external",
+            "reason_code": "external-blocker",
+            "published": False,
+            "needs_finalization": False,
+        },
+    )
+    write_aborted_publication_journal(f)
+    journal_path = f["state"] / "publish-journal.json"
+    journal = runtime._load_gate(journal_path)
+    if journal_fault == "prepared-phase":
+        journal["phase"] = "prepared"
+        del journal["aborted_unix"]
+    elif journal_fault == "other-candidate":
+        journal["candidate_sha"] = f["base"]
+    else:
+        journal["evidence_dir"] = str(f["fresh"].resolve())
+    write_json(journal_path, journal)
+    messages = {
+        "retained": "original run has no terminal unshipped publication failure",
+        "recovery": "prior owner has no terminal unshipped publication failure",
+    }
+    for validator, message in messages.items():
+        with pytest.raises(runtime.ControlError, match=message):
+            call_prior_owner_validator(f, validator)
+
+
 def test_continuation_delivers_once_without_rewriting_original(retained):
     f = retained
     before = retained_artifacts(f["old"])
