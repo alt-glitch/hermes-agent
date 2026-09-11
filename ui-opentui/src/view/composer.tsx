@@ -368,7 +368,11 @@ export function Composer(props: {
     const version = ++pasteReconcileVersion
     queueMicrotask(() => {
       if (version !== pasteReconcileVersion || !ta || ta.isDestroyed) return
-      props.pasteStore?.retainOnly(ta.plainText)
+      const store = props.pasteStore
+      // `plainText` copies the whole native edit buffer; with nothing retained
+      // there is nothing to release, so skip the second copy per keystroke.
+      if (!store || store.stats().count === 0) return
+      store.retainOnly(ta.plainText)
     })
   }
 
@@ -471,9 +475,11 @@ export function Composer(props: {
 
   const snapImageCursor = (): void => {
     if (!ta || ta.isDestroyed) return
+    const images = props.pendingImages?.() ?? []
+    if (images.length === 0) return // nothing to snap to; skip the native buffer copy
     const text = ta.plainText
     const cursor = ta.cursorOffset
-    for (const image of props.pendingImages?.() ?? []) {
+    for (const image of images) {
       const start = text.indexOf(image.token)
       if (start < 0) continue
       const end = start + image.token.length
