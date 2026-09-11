@@ -834,6 +834,27 @@ describe('/btw snapshot question parity', () => {
     expect(p.bgTasks).toEqual(['bg-1', 'bg-2'])
     expect(p.system).toEqual(['bg bg-1 started', 'bg bg-2 started'])
   })
+
+  test('/bg and /btw acks that land after the session changed are dropped', async () => {
+    // commitSessionSnapshot resets bgTasks and background.complete is scoped to the
+    // originating session, so a late ack must not strand a `bg: 1` badge (or a stale
+    // system line) in the successor session.
+    for (const [command, method] of [
+      ['/bg late', 'prompt.background'],
+      ['/btw late', 'prompt.btw']
+    ] as const) {
+      let resolve!: (value: unknown) => void
+      const pending = new Promise<unknown>(done => (resolve = done))
+      const stale = makeCtx(async m => (m === method ? pending : {}))
+      const run = dispatchSlash(command, stale.ctx)
+      stale.session.value = 'sid-2'
+      resolve({ task_id: 'late-1' })
+      await run
+      expect(stale.calls).toEqual([{ method, params: { session_id: 'sid-1', text: 'late' } }])
+      expect(stale.bgTasks).toEqual([])
+      expect(stale.system).toEqual([])
+    }
+  })
 })
 
 describe('voice command parity', () => {

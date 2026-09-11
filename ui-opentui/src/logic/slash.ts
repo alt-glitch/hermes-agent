@@ -2146,14 +2146,19 @@ const subscriptionCmd: ClientHandler = async (_arg, ctx, flight) => {
  *  `prompt.background` (Ink parity): echo "bg <id> started" and track the task so
  *  the `bg: N` badge counts it until `background.complete` clears it. NOT the OS
  *  process panel (that's /processes). */
-const backgroundCmd: ClientHandler = async (arg, ctx) => {
+const backgroundCmd: ClientHandler = async (arg, ctx, flight) => {
   const text = arg.trim()
   if (!text) {
     ctx.pushSystem('/bg <prompt> — launch a background prompt')
     return
   }
+  const sid = ctx.sessionId()
   try {
-    const r = await ctx.request('prompt.background', { session_id: ctx.sessionId(), text })
+    const r = await ctx.request('prompt.background', { session_id: sid, text })
+    // A late ack belongs to the session it was sent on: commitSessionSnapshot reset
+    // bgTasks and `background.complete` is scoped to that session, so counting the
+    // task here would strand a `bg: 1` badge that never clears.
+    if (!currentSessionIs(ctx, sid, flight)) return
     const taskId = readStr(r, 'task_id')
     if (taskId) {
       ctx.addBgTask(taskId)
@@ -2162,6 +2167,7 @@ const backgroundCmd: ClientHandler = async (arg, ctx) => {
       ctx.pushSystem('/bg: no task id returned')
     }
   } catch (error) {
+    if (!currentSessionIs(ctx, sid, flight)) return
     ctx.pushSystem(`/bg: ${error instanceof Error ? error.message : 'failed'}`)
   }
 }
@@ -2169,18 +2175,21 @@ const backgroundCmd: ClientHandler = async (arg, ctx) => {
 /** `/btw <question>` — ask against a read-only snapshot of this conversation.
  * The auxiliary answer arrives asynchronously as `btw.complete`; unlike /bg,
  * this never enters the background-prompt task counter. */
-const btwCmd: ClientHandler = async (arg, ctx) => {
+const btwCmd: ClientHandler = async (arg, ctx, flight) => {
   const text = arg.trim()
   if (!text) {
     ctx.pushSystem('/btw <question> — ask about this conversation')
     return
   }
+  const sid = ctx.sessionId()
   try {
-    const response = await ctx.request('prompt.btw', { session_id: ctx.sessionId(), text })
+    const response = await ctx.request('prompt.btw', { session_id: sid, text })
+    if (!currentSessionIs(ctx, sid, flight)) return
     const taskId = readStr(response, 'task_id')
     if (taskId) ctx.pushSystem(`btw ${taskId} — answering from a conversation snapshot`)
     else ctx.pushSystem('/btw: no task id returned')
   } catch (error) {
+    if (!currentSessionIs(ctx, sid, flight)) return
     ctx.pushSystem(`/btw: ${error instanceof Error ? error.message : 'failed'}`)
   }
 }
