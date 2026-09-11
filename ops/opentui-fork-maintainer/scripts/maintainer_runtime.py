@@ -3833,6 +3833,48 @@ def _validate_success_cleanup_worktree(
     return resolved_cwd
 
 
+def _terminal_unshipped_outcome(
+    outcome: dict[str, Any],
+    *,
+    state_dir: Path,
+    source_root: Path,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> bool:
+    """Accept only a terminal refusal or a journal-proven aborted publication."""
+    if (
+        outcome.get("status") != "failed"
+        or outcome.get("published") is not False
+        or outcome.get("needs_finalization") is not False
+    ):
+        return False
+    if (
+        outcome.get("stage") == "publish"
+        and outcome.get("reason_code") == "publish-refused"
+    ):
+        return True
+    if not (
+        outcome.get("stage") == "external"
+        and outcome.get("reason_code") == "external-blocker"
+    ):
+        return False
+    try:
+        journal = _load_publish_journal(
+            state_dir, require_manifest_evidence=False
+        )
+    except ControlError:
+        return False
+    return bool(
+        journal is not None
+        and journal["phase"] == "aborted"
+        and Path(journal["evidence_dir"]).resolve() == source_root.resolve()
+        and Path(journal["manifest_path"]).resolve() == manifest_path.resolve()
+        and journal["candidate_sha"] == manifest.get("candidate_sha")
+        and journal["base_sha"] == manifest.get("base_sha")
+        and journal["manifest_sha256"] == _file_sha256(manifest_path)
+    )
+
+
 def validate_retained_gate(
     repo: Path, receipt: dict[str, Any], evidence_root: Path,
 ) -> dict[str, Any]:
@@ -3852,17 +3894,19 @@ def validate_retained_gate(
             raise ControlError(f"retained {key} changed")
     context = _load_gate(Path(receipt["context_path"]))
     outcome = _load_gate(Path(receipt["outcome_path"]))
+    original = _load_gate(source)
     if (
         context.get("run_id") != root.name
         or not context.get("execution_id")
-        or outcome.get("status") != "failed"
-        or outcome.get("stage") != "publish"
-        or outcome.get("reason_code") != "publish-refused"
-        or outcome.get("published") is not False
-        or outcome.get("needs_finalization") is not False
+        or not _terminal_unshipped_outcome(
+            outcome,
+            state_dir=evidence_root.parent.parent,
+            source_root=root,
+            manifest_path=source,
+            manifest=original,
+        )
     ):
         raise ControlError("original run has no terminal unshipped publication failure")
-    original = _load_gate(source)
     if (
         original.get("base_sha") != context.get("base_sha")
         or not _run_context_matches_captured_upstream(
@@ -4003,6 +4047,7 @@ def _publication_recovery_source(
         if _file_sha256(path) != receipt[f"{key}_sha256"]:
             raise ControlError(f"publication recovery {key} changed")
     context = _load_gate(Path(receipt["context_path"]))
+    original = _load_gate(Path(receipt["manifest_path"]))
     if owner == "terminal-prior-owner":
         outcome = _evidence_path(
             receipt.get("outcome_path"), source_root, label="recovery outcome"
@@ -4010,12 +4055,12 @@ def _publication_recovery_source(
         if _file_sha256(outcome) != receipt.get("outcome_sha256"):
             raise ControlError("publication recovery outcome changed")
         outcome_value = _load_gate(outcome)
-        if (
-            outcome_value.get("status") != "failed"
-            or outcome_value.get("stage") != "publish"
-            or outcome_value.get("reason_code") != "publish-refused"
-            or outcome_value.get("published") is not False
-            or outcome_value.get("needs_finalization") is not False
+        if not _terminal_unshipped_outcome(
+            outcome_value,
+            state_dir=evidence_root.parent.parent,
+            source_root=source_root,
+            manifest_path=Path(receipt["manifest_path"]),
+            manifest=original,
         ):
             raise ControlError("prior owner has no terminal unshipped publication failure")
     elif owner != "live-owner":
@@ -4026,7 +4071,6 @@ def _publication_recovery_source(
         or not SHA256_RE.fullmatch(str(context.get("lease_token_sha256", "")))
     ):
         raise ControlError("publication recovery context identity is invalid")
-    original = _load_gate(Path(receipt["manifest_path"]))
     packet = _load_gate(Path(receipt["packet_path"]))
     items = packet.get("checks") if set(packet) == {"checks"} else None
     checks = original.get("checks")

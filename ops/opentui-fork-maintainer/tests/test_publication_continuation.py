@@ -343,6 +343,120 @@ def retained(tmp_path, monkeypatch):
             "args": args, "pr": pr, "calls": calls}
 
 
+def prior_owner_receipt(f):
+    receipt = {
+        "number": 42,
+        "source_evidence_dir": str(f["old"]),
+        "source_owner": "terminal-prior-owner",
+    }
+    for key, path in {
+        "manifest": f["source"],
+        "packet": f["old"] / "gate-packet.json",
+        "context": f["old"] / "run-context.json",
+        "outcome": f["old"] / "run-outcome.json",
+        "pr": f["old"] / "pr-evidence.json",
+    }.items():
+        receipt[f"{key}_path"] = str(path)
+        receipt[f"{key}_sha256"] = runtime._file_sha256(path)
+    return receipt
+
+
+def write_aborted_publication_journal(f):
+    source = runtime._load_gate(f["source"])
+    write_json(
+        f["state"] / "publish-journal.json",
+        {
+            "schema_version": 1,
+            "phase": "aborted",
+            "repo": str(f["repo"].resolve()),
+            "remote": "origin",
+            "branch": runtime.BRANCH,
+            "base_sha": f["base"],
+            "candidate_sha": f["candidate"],
+            "manifest_path": str(f["source"].resolve()),
+            "manifest_sha256": runtime._file_sha256(f["source"]),
+            "evidence_dir": str(f["old"].resolve()),
+            "worktree": str(f["cwd"].resolve()),
+            "upstream_sha": f["base"],
+            "run_binding": source["run_binding"],
+            "prepared_unix": 100,
+            "aborted_unix": 101,
+        },
+    )
+
+
+def call_prior_owner_validator(f, validator):
+    receipt = prior_owner_receipt(f)
+    if validator == "retained":
+        return runtime.validate_retained_gate(f["repo"], receipt, f["fresh"])
+    recovered, _, _, _ = runtime._publication_recovery_source(
+        f["repo"], receipt, f["fresh"]
+    )
+    return recovered
+
+
+def test_terminal_unshipped_prior_owner_outcomes_are_eligible_for_resume(retained):
+    f = retained
+    for validator in ("retained", "recovery"):
+        assert (
+            call_prior_owner_validator(f, validator)["candidate_sha"]
+            == f["candidate"]
+        )
+
+    write_json(
+        f["old"] / "run-outcome.json",
+        {
+            "status": "failed",
+            "stage": "external",
+            "reason_code": "external-blocker",
+            "published": False,
+            "needs_finalization": False,
+        },
+    )
+    write_aborted_publication_journal(f)
+
+    for validator in ("retained", "recovery"):
+        assert (
+            call_prior_owner_validator(f, validator)["candidate_sha"]
+            == f["candidate"]
+        )
+
+
+def test_prior_owner_without_terminal_unshipped_evidence_is_refused(retained):
+    f = retained
+    messages = {
+        "retained": "original run has no terminal unshipped publication failure",
+        "recovery": "prior owner has no terminal unshipped publication failure",
+    }
+    write_json(
+        f["old"] / "run-outcome.json",
+        {
+            "status": "failed",
+            "stage": "external",
+            "reason_code": "external-blocker",
+            "published": False,
+            "needs_finalization": False,
+        },
+    )
+    for validator, message in messages.items():
+        with pytest.raises(runtime.ControlError, match=message):
+            call_prior_owner_validator(f, validator)
+
+    for field in ("published", "needs_finalization"):
+        outcome = {
+            "status": "failed",
+            "stage": "publish",
+            "reason_code": "publish-refused",
+            "published": False,
+            "needs_finalization": False,
+        }
+        outcome[field] = True
+        write_json(f["old"] / "run-outcome.json", outcome)
+        for validator, message in messages.items():
+            with pytest.raises(runtime.ControlError, match=message):
+                call_prior_owner_validator(f, validator)
+
+
 def test_continuation_delivers_once_without_rewriting_original(retained):
     f = retained
     before = retained_artifacts(f["old"])
