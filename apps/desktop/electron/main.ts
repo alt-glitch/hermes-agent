@@ -202,7 +202,7 @@ import {
 import { startGatewaysAfterUpdateAbort, stopGatewayBeforeUpdate } from './gateway-stop-before-update'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
-import { clearStaleGitLocks } from './gitlock'
+import { desktopBackendSpawnEnv, guestOnboardingEnabled } from './guest-onboarding'
 import { readAndConsumeHandoffResult } from './handoff-result'
 import {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
@@ -386,13 +386,7 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
-import {
-  compareApiUrl,
-  parseCompareBehindCount,
-  resolveBehindCount,
-  resolveCommitLogSelection,
-  shouldCountCommits
-} from './update-count'
+import { branchTipApiUrl, cacheIsFresh, compareApiUrl, githubRepoSlug, parseCompare } from './update-api-check'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
@@ -857,6 +851,7 @@ const DESKTOP_CONNECTION_CONFIG_PATH = path.join(app.getPath('userData'), 'conne
 const DESKTOP_CONNECTIONS_REGISTRY_PATH = path.join(app.getPath('userData'), 'connections.json')
 const DESKTOP_INSTALLATION_PATH = path.join(app.getPath('userData'), 'desktop-installation.json')
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
+const DESKTOP_UPDATE_CHECK_CACHE_PATH = path.join(app.getPath('userData'), 'update-check-cache.json')
 const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-state.json')
 const DESKTOP_BACKEND_OWNERSHIP_PATH = path.join(app.getPath('userData'), 'backend-ownership.json')
 const DESKTOP_MANAGED_SSH_RECOVERY_PATH = path.join(app.getPath('userData'), 'managed-ssh-update-recovery.json')
@@ -905,6 +900,9 @@ const BOOT_FAKE_ERROR = process.env.HERMES_DESKTOP_BOOT_FAKE_ERROR || ''
 // nobody to answer a modal, so the active-work confirmation would hang the
 // caller instead of letting the process exit. Force quits set this.
 const SKIP_QUIT_CONFIRM = process.env.HERMES_DESKTOP_SKIP_QUIT_CONFIRM === '1'
+// Nous free tier gate, decided ONCE here and stamped onto every backend spawn
+// (desktopBackendSpawnEnv) and the renderer (hermes:launch-flags).
+const GUEST_ONBOARDING = guestOnboardingEnabled()
 
 const BOOT_FAKE_STEP_MS = (() => {
   const raw = Number.parseInt(String(process.env.HERMES_DESKTOP_BOOT_FAKE_STEP_MS || ''), 10)
@@ -3081,7 +3079,10 @@ function runGit(args, options: any = {}): Promise<{ code: number; stdout: string
       options.onLine?.('stderr', text)
     })
     child.once('error', reject)
-    child.once('exit', code => resolve({ code, stdout, stderr }))
+    // 'close', not 'exit': exit can fire before the stdio pipes drain, and a
+    // resolved-early `remote get-url` came back as "" often enough to route
+    // passive checks down the wrong remote path.
+    child.once('close', code => resolve({ code, stdout, stderr }))
   })
 }
 
@@ -3131,7 +3132,15 @@ async function resolveHealedBranch(updateRoot, branch) {
   return 'main'
 }
 
-async function checkUpdates() {
+// Passive checks never touch git's network side. Every client used to `git
+// fetch` twice per half hour; across the install base that was tens of
+// millions of pack negotiations a day against one repo (GitHub flagged it).
+// The REST API answers the same question in one 40-byte response, so the
+// check is API-first with a 24h on-disk cache keyed on local HEAD (applying an
+// update changes HEAD, which busts the cache immediately). `git fetch` runs only
+// inside applyUpdates. `force` (menu item, Settings "Check now") skips the
+// cache; the renderer's background poller never passes it.
+async function checkUpdates({ force = false }: { force?: boolean } = {}) {
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
@@ -3146,214 +3155,175 @@ async function checkUpdates() {
     }
   }
 
-  branch = await resolveHealedBranch(updateRoot, branch)
-  const originUrl = await getOriginUrl(updateRoot)
-
-  if (isOfficialSshRemote(originUrl)) {
-    const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
-
-    const [currentSha, target, dirtyStr, currentBranch] = await Promise.all([
-      git(['rev-parse', 'HEAD']),
-      runGit(['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${branch}`], { cwd: updateRoot }),
-      git(['status', '--porcelain']),
-      git(['rev-parse', '--abbrev-ref', 'HEAD'])
-    ])
-
-    const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
-
-    if (target.code !== 0 || !targetSha) {
-      return {
-        supported: true,
-        branch,
-        error: 'fetch-failed',
-        message: firstLine(target.stderr) || 'git ls-remote failed.',
-        hermesRoot: updateRoot,
-        fetchedAt: Date.now()
-      }
-    }
-
-    // Passive SSH-official checks only know tip SHAs (ls-remote) — never
-    // fabricate a "1 commit behind". Recover the exact count via the GitHub
-    // compare API when possible; otherwise behind stays null ("update
-    // available, count unknown") and updateAvailable carries the signal.
-    // ahead_by === 0 with differing tips means the remote tip is reachable
-    // from our HEAD — a local carried commit sitting AHEAD, not behind:
-    // flagging that as an update nudges the user into wiping their work.
-    const tipsEqual = Boolean(currentSha && currentSha === targetSha)
-
-    const sshBehind = tipsEqual
-      ? 0
-      : await fetchCompareBehindCount({ currentSha, originUrl: OFFICIAL_REPO_HTTPS_URL, targetSha })
-
-    const upToDate = tipsEqual || sshBehind === 0
-
-    return {
-      supported: true,
-      branch,
-      currentBranch,
-      behind: upToDate ? 0 : sshBehind,
-      updateAvailable: !upToDate,
-      currentSha,
-      targetSha,
-      commits: [],
-      dirty: dirtyStr.length > 0,
-      hermesRoot: updateRoot,
-      fetchedAt: Date.now()
-    }
-  }
-
-  // Self-heal abandoned git lock files before fetching. A stale
-  // .git/shallow.lock from a crashed/interrupted fetch otherwise fails every
-  // later fetch ("Unable to create '.git/shallow.lock': File exists") and this
-  // check reports 'fetch-failed' forever — git never removes these itself.
-  await clearStaleGitLocks(updateRoot)
-
-  const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
-
-  if (fetched.code !== 0) {
-    return {
-      supported: true,
-      branch,
-      error: 'fetch-failed',
-      message: firstLine(fetched.stderr) || 'git fetch failed.',
-      hermesRoot: updateRoot,
-      fetchedAt: Date.now()
-    }
-  }
-
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
 
-  const [currentSha, targetSha, dirtyStr, currentBranch, shallowStr] = await Promise.all([
+  const [currentSha, dirtyStr, currentBranch, originUrl] = await Promise.all([
     git(['rev-parse', 'HEAD']),
-    git(['rev-parse', `origin/${branch}`]),
     git(['status', '--porcelain']),
     git(['rev-parse', '--abbrev-ref', 'HEAD']),
-    git(['rev-parse', '--is-shallow-repository'])
+    getOriginUrl(updateRoot)
   ])
 
-  const isShallow = shallowStr === 'true'
+  const cached = readUpdateCheckCache()
+  const now = Date.now()
 
-  // A shallow graph cannot provide a trustworthy exact count, even when it has
-  // a visible merge-base. Skip the ancestry walk and use the SHA fallback.
-  const countStr = shouldCountCommits({ isShallow }) ? await git(['rev-list', `HEAD..origin/${branch}`, '--count']) : ''
-
-  // A positive directional ancestry result remains trustworthy in a shallow
-  // graph and prevents a local commit on top of origin from looking outdated.
-  const targetIsAncestorOfHead =
-    isShallow &&
-    currentSha !== targetSha &&
-    (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
-
-  let behind = resolveBehindCount({
-    countStr,
-    currentSha,
-    targetSha,
-    isShallow,
-    targetIsAncestorOfHead
-  })
-
-  // Recover the exact count a shallow clone can't compute: the GitHub compare
-  // API knows the full graph regardless of local clone depth. Best-effort —
-  // offline, rate-limited, or non-GitHub origins keep the honest null
-  // ("update available", no fabricated number).
-  if (behind === null) {
-    behind = await fetchCompareBehindCount({ currentSha, originUrl, targetSha })
+  if (!force && cacheIsFresh(cached, { branch, currentSha, now })) {
+    return { ...cached.status, dirty: dirtyStr.length > 0, currentBranch }
   }
 
-  // behind === null means "update available, exact count unknown" (shallow
-  // clone): still list what origin offers — resolveCommitLogSelection keeps
-  // the shallow log to the fetched tip so the range walk can't enumerate the
-  // contaminated ancestry — so "See what's new" stays useful and honest.
-  const commits = behind !== 0 ? await readCommitLog(updateRoot, branch, isShallow) : []
+  branch = await resolveHealedBranch(updateRoot, branch)
+  const slug = githubRepoSlug(originUrl)
 
-  return {
+  const status = slug
+    ? await checkUpdatesViaApi({ slug, branch, currentSha })
+    : await checkUpdatesViaLsRemote({ updateRoot, branch, currentSha })
+
+  const result = {
     supported: true,
     branch,
     currentBranch,
-    behind,
-    updateAvailable: behind === null || behind > 0,
     currentSha,
-    targetSha,
-    commits,
     dirty: dirtyStr.length > 0,
     hermesRoot: updateRoot,
-    fetchedAt: Date.now()
+    fetchedAt: now,
+    ...status
   }
+
+  writeUpdateCheckCache({ fetchedAt: now, currentSha, branch, status: result })
+
+  return result
 }
 
-// Best-effort exact behind-count for graphs the local clone can't measure.
-// Delegates URL building + response parsing to update-count.ts (pure, unit
-// tested); this wrapper only does the bounded network call. Any failure —
-// offline, 4xx/5xx, rate limit, shape surprise — returns null so callers keep
-// the honest "update available, count unknown" state.
-async function fetchCompareBehindCount({ currentSha, originUrl, targetSha }) {
-  const url = compareApiUrl({ currentSha, originUrl, targetSha })
-
-  if (!url) {
-    return null
-  }
-
+function readUpdateCheckCache() {
   try {
-    const payload = await new Promise((resolve, reject) => {
-      const req = https.get(
-        url,
-        {
-          headers: {
-            Accept: 'application/vnd.github+json',
-            // GitHub requires a UA on api.github.com; requests without one 403.
-            'User-Agent': 'hermes-desktop-update-check'
-          },
-          timeout: 10_000
-        },
-        res => {
-          const chunks = []
-          res.on('error', reject)
-          res.on('data', chunk => chunks.push(chunk))
-          res.on('end', () => {
-            if ((res.statusCode || 500) >= 400) {
-              reject(new Error(`compare API ${res.statusCode}`))
+    const parsed = JSON.parse(fs.readFileSync(DESKTOP_UPDATE_CHECK_CACHE_PATH, 'utf8'))
 
-              return
-            }
-
-            try {
-              resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-            } catch (error) {
-              reject(error)
-            }
-          })
-        }
-      )
-
-      req.on('timeout', () => req.destroy(new Error('compare API timeout')))
-      req.on('error', reject)
-    })
-
-    return parseCompareBehindCount(payload)
+    return parsed && typeof parsed === 'object' && parsed.status ? parsed : null
   } catch {
     return null
   }
 }
 
-async function readCommitLog(cwd, branch, isShallow) {
-  const SEP = '\x1f'
-  const REC = '\x1e'
-  const { limit, revision } = resolveCommitLogSelection({ branch, isShallow })
+function writeUpdateCheckCache(entry) {
+  try {
+    fs.mkdirSync(path.dirname(DESKTOP_UPDATE_CHECK_CACHE_PATH), { recursive: true })
+    writeFileAtomic(DESKTOP_UPDATE_CHECK_CACHE_PATH, JSON.stringify(entry))
+  } catch (error) {
+    rememberLog(`[updates] could not persist check cache: ${error?.message || error}`)
+  }
+}
 
-  const { stdout } = await runGit(
-    ['log', revision, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', String(limit)],
-    { cwd }
-  )
+// GitHub origins (official repo AND forks): tip SHA via the commits endpoint,
+// then the compare endpoint only when the tips differ — it yields the exact
+// behind count plus the commit list the overlay renders, replacing both
+// `rev-list --count` and `git log HEAD..origin/<branch>`.
+async function checkUpdatesViaApi({ slug, branch, currentSha }) {
+  let targetSha
 
-  return stdout
-    .split(REC)
-    .map(line => line.trim())
-    .filter(Boolean)
-    .map(line => {
-      const [sha, summary, author, at] = line.split(SEP)
+  try {
+    targetSha = String(await fetchGitHubApi(branchTipApiUrl(slug, branch), 'application/vnd.github.sha')).trim()
+  } catch (error) {
+    return { error: 'fetch-failed', message: `GitHub API: ${error?.message || error}` }
+  }
 
-      return { sha, summary, author, at: Number.parseInt(at, 10) * 1000 }
-    })
+  if (!/^[0-9a-f]{40}$/i.test(targetSha)) {
+    return { error: 'fetch-failed', message: 'GitHub API returned no tip SHA.' }
+  }
+
+  if (targetSha === currentSha) {
+    return { behind: 0, updateAvailable: false, targetSha, commits: [] }
+  }
+
+  // Compare failure (rate-limited, local-only HEAD 404) keeps the honest
+  // "update available, count unknown" — never a fabricated number.
+  const compared = await fetchGitHubApi(compareApiUrl(slug, currentSha, targetSha))
+    .then(parseCompare)
+    .catch(() => null)
+
+  // ahead_by === 0 with differing tips: the remote tip is reachable from our
+  // HEAD — a local commit sitting AHEAD, not behind. Flagging that as an update
+  // nudges the user into wiping their work.
+  if (compared?.behind === 0) {
+    return { behind: 0, updateAvailable: false, targetSha, commits: [] }
+  }
+
+  return {
+    behind: compared ? compared.behind : null,
+    updateAvailable: true,
+    targetSha,
+    commits: compared?.commits ?? []
+  }
+}
+
+// Non-GitHub origins: one ls-remote for the tip SHA (still no pack transfer),
+// counting via the local graph only when the tip is already known locally.
+async function checkUpdatesViaLsRemote({ updateRoot, branch, currentSha }) {
+  const target = await runGit(['ls-remote', 'origin', `refs/heads/${branch}`], { cwd: updateRoot })
+  const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
+
+  if (target.code !== 0 || !targetSha) {
+    return { error: 'fetch-failed', message: firstLine(target.stderr) || 'git ls-remote failed.' }
+  }
+
+  if (targetSha === currentSha) {
+    return { behind: 0, updateAvailable: false, targetSha, commits: [] }
+  }
+
+  const known = (await runGit(['cat-file', '-e', `${targetSha}^{commit}`], { cwd: updateRoot })).code === 0
+
+  const isAncestor =
+    known && (await runGit(['merge-base', '--is-ancestor', targetSha, 'HEAD'], { cwd: updateRoot })).code === 0
+
+  if (isAncestor) {
+    return { behind: 0, updateAvailable: false, targetSha, commits: [] }
+  }
+
+  return { behind: null, updateAvailable: true, targetSha, commits: [] }
+}
+
+function fetchGitHubApi(url, accept = 'application/vnd.github+json') {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      url,
+      {
+        headers: {
+          Accept: accept,
+          // GitHub requires a UA on api.github.com; requests without one 403.
+          'User-Agent': 'hermes-desktop-update-check'
+        },
+        timeout: 10_000
+      },
+      res => {
+        const chunks = []
+        res.on('error', reject)
+        res.on('data', chunk => chunks.push(chunk))
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8')
+
+          if ((res.statusCode || 500) >= 400) {
+            reject(new Error(`HTTP ${res.statusCode}`))
+
+            return
+          }
+
+          if (accept === 'application/vnd.github.sha') {
+            resolve(body)
+
+            return
+          }
+
+          try {
+            resolve(JSON.parse(body))
+          } catch (error) {
+            reject(error)
+          }
+        })
+      }
+    )
+
+    req.on('timeout', () => req.destroy(new Error('timeout')))
+    req.on('error', reject)
+  })
 }
 
 let updateInFlight = false
@@ -10729,6 +10699,9 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       probeReuseProof: sshProbeReuseProof,
       adoptServedToken: adoptServedDashboardToken,
       rememberLog: sshRememberLog,
+      // Same launch-time free-tier decision the local spawns get; the POSIX
+      // spawn command adds HERMES_GUEST_ONBOARDING=1 only when this is on.
+      guestOnboarding: GUEST_ONBOARDING,
       signal: lease.signal
     })
   } catch (error: any) {
@@ -12662,25 +12635,28 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     backend.args,
     hiddenWindowsChildOptions({
       cwd: hermesCwd,
-      env: {
-        ...process.env,
-        HERMES_HOME,
-        ...backend.env,
-        // Pin the gateway's tool/terminal cwd to the same directory we chose for
-        // the child process. Inherited TERMINAL_CWD (or a stale config bridge)
-        // can still point at the install dir even when spawn cwd is home.
-        TERMINAL_CWD: hermesCwd,
-        HERMES_DASHBOARD_SESSION_TOKEN: token,
-        // Marks this dashboard backend as desktop-spawned so it runs the cron
-        // scheduler tick loop (the gateway isn't running under the app).
-        HERMES_DESKTOP: '1',
-        // Exact parent identity lets the backend self-exit after an unclean
-        // Desktop death without mistaking a reused PID for its owner. If the
-        // optional marker probe fails, retain legacy PID-only tracking.
-        ...parentIdentityEnv,
-        HERMES_WEB_DIST: webDist,
-        ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
-      },
+      env: desktopBackendSpawnEnv(
+        {
+          ...process.env,
+          HERMES_HOME,
+          ...backend.env,
+          // Pin the gateway's tool/terminal cwd to the same directory we chose for
+          // the child process. Inherited TERMINAL_CWD (or a stale config bridge)
+          // can still point at the install dir even when spawn cwd is home.
+          TERMINAL_CWD: hermesCwd,
+          HERMES_DASHBOARD_SESSION_TOKEN: token,
+          // Marks this dashboard backend as desktop-spawned so it runs the cron
+          // scheduler tick loop (the gateway isn't running under the app).
+          HERMES_DESKTOP: '1',
+          // Exact parent identity lets the backend self-exit after an unclean
+          // Desktop death without mistaking a reused PID for its owner. If the
+          // optional marker probe fails, retain legacy PID-only tracking.
+          ...parentIdentityEnv,
+          HERMES_WEB_DIST: webDist,
+          ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
+        },
+        GUEST_ONBOARDING
+      ),
       shell: backend.shell,
       stdio: ['ignore', 'pipe', 'pipe']
     })
@@ -13079,30 +13055,33 @@ async function startHermes() {
       backend.args,
       hiddenWindowsChildOptions({
         cwd: hermesCwd,
-        env: {
-          ...process.env,
-          // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
-          // resolves to the SAME location our resolveHermesHome() picked. Without
-          // this pin, Python falls back to ~/.hermes on every platform — fine on
-          // mac/linux (where our default matches), but on Windows our default is
-          // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
-          // Mismatch would split config / sessions / .env / logs across two
-          // directories. install.ps1 sets HERMES_HOME via setx; the desktop
-          // can't reliably do that, so we set it inline for every spawn.
-          HERMES_HOME,
-          ...backend.env,
-          TERMINAL_CWD: hermesCwd,
-          HERMES_DASHBOARD_SESSION_TOKEN: token,
-          // Marks this dashboard backend as desktop-spawned so it runs the cron
-          // scheduler tick loop (the gateway isn't running under the app).
-          HERMES_DESKTOP: '1',
-          // Exact parent identity lets the backend self-exit after an unclean
-          // Desktop death without mistaking a reused PID for its owner. If the
-          // optional marker probe fails, retain legacy PID-only tracking.
-          ...parentIdentityEnv,
-          HERMES_WEB_DIST: webDist,
-          ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
-        },
+        env: desktopBackendSpawnEnv(
+          {
+            ...process.env,
+            // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
+            // resolves to the SAME location our resolveHermesHome() picked. Without
+            // this pin, Python falls back to ~/.hermes on every platform — fine on
+            // mac/linux (where our default matches), but on Windows our default is
+            // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
+            // Mismatch would split config / sessions / .env / logs across two
+            // directories. install.ps1 sets HERMES_HOME via setx; the desktop
+            // can't reliably do that, so we set it inline for every spawn.
+            HERMES_HOME,
+            ...backend.env,
+            TERMINAL_CWD: hermesCwd,
+            HERMES_DASHBOARD_SESSION_TOKEN: token,
+            // Marks this dashboard backend as desktop-spawned so it runs the cron
+            // scheduler tick loop (the gateway isn't running under the app).
+            HERMES_DESKTOP: '1',
+            // Exact parent identity lets the backend self-exit after an unclean
+            // Desktop death without mistaking a reused PID for its owner. If the
+            // optional marker probe fails, retain legacy PID-only tracking.
+            ...parentIdentityEnv,
+            HERMES_WEB_DIST: webDist,
+            ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
+          },
+          GUEST_ONBOARDING
+        ),
         shell: backend.shell,
         stdio: ['ignore', 'pipe', 'pipe']
       })
@@ -17207,7 +17186,8 @@ ipcMain.on('hermes:translucency:support', event => {
 // only strips internal flags.
 ipcMain.on('hermes:launch-flags', event => {
   event.returnValue = {
-    localModels: process.argv.includes('--local') || process.platform === 'win32' || process.platform === 'darwin'
+    localModels: process.argv.includes('--local') || process.platform === 'win32' || process.platform === 'darwin',
+    guestOnboarding: GUEST_ONBOARDING
   }
 })
 
@@ -17548,8 +17528,8 @@ const terminalIpc = registerTerminalIpc({
 
 const disposeTerminalSession = terminalIpc.disposeTerminalSession
 
-ipcMain.handle('hermes:updates:check', async () =>
-  checkUpdates().catch(error => ({
+ipcMain.handle('hermes:updates:check', async (_event, opts) =>
+  checkUpdates({ force: Boolean(opts?.force) }).catch(error => ({
     supported: true,
     branch: readDesktopUpdateConfig().branch,
     error: 'check-failed',

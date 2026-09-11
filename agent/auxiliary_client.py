@@ -113,7 +113,7 @@ from agent.model_metadata import (
 )
 from hermes_cli.config import get_hermes_home
 from agent.auxiliary_health import _custom_health_base_url, _unhealthy_cache_key
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
 from utils import base_url_host_matches, base_url_hostname, base_url_origin, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
@@ -2234,13 +2234,36 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         return None, None
     if runtime is None and nous:
         logger.debug("Auxiliary Nous: runtime JWT refresh failed; checking stored auth.json token.")
+    if runtime is not None:
+        api_key, base_url = runtime
+    else:
+        api_key = _nous_api_key(nous or {})
+        if not api_key:
+            logger.warning(
+                "Auxiliary Nous client unavailable: no usable inference JWT found "
+                "(run: hermes auth add nous)."
+            )
+            _mark_provider_unhealthy("nous", ttl=60)
+            return None, None
+        base_url = str(
+            (nous or {}).get("inference_base_url") or os.getenv("NOUS_INFERENCE_BASE_URL", _NOUS_DEFAULT_BASE_URL)
+        ).rstrip("/")
+    lane = "vision" if vision else "text"
+    # The free tier's host serves exactly one model, for every lane: asking it for the Portal's
+    # recommended aux model is a guaranteed 429 ``model_not_free``. Pin the route's model instead.
+    # Vision rides the same id (the backing model is multimodal; a backing that is not answers
+    # the request with the upstream's own error, which the ladder handles like any other).
+    from hermes_cli.anon_auth import GUEST_MODEL, route_is_welcome_host
     global auxiliary_is_nous
+    if route_is_welcome_host(base_url):
+        auxiliary_is_nous = True
+        logger.debug("Auxiliary/%s: Nous free tier; using %s", lane, GUEST_MODEL)
+        return _create_openai_client(api_key=api_key, base_url=base_url), GUEST_MODEL
     auxiliary_is_nous = True
     logger.debug("Auxiliary client: Nous Portal")
     # Portal recommended-models is authoritative (tier-aware); _NOUS_MODEL when unreachable/null.
     # Probes skip the lookup: exact model is irrelevant and it hits the network.
     model = _NOUS_MODEL
-    lane = "vision" if vision else "text"
     if not _aux_probe_active():
         try:
             from hermes_cli.models import get_nous_recommended_aux_model
@@ -2256,20 +2279,6 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
                 "falling back to %s",
                 lane, exc, model,
             )
-    if runtime is not None:
-        api_key, base_url = runtime
-    else:
-        api_key = _nous_api_key(nous or {})
-        if not api_key:
-            logger.warning(
-                "Auxiliary Nous client unavailable: no usable inference JWT found "
-                "(run: hermes auth add nous)."
-            )
-            _mark_provider_unhealthy("nous", ttl=60)
-            return None, None
-        base_url = str(
-            (nous or {}).get("inference_base_url") or os.getenv("NOUS_INFERENCE_BASE_URL", _NOUS_DEFAULT_BASE_URL)
-        ).rstrip("/")
     return _create_openai_client(api_key=api_key, base_url=base_url), model
 
 
@@ -2998,7 +3007,7 @@ def _contains_any(text: str, needles: Tuple[str, ...]) -> bool:
 _PAYMENT_KEYWORDS = (
     "credits", "insufficient funds", "can only afford", "billing", "payment required",
     "out of funds", "run out of funds", "balance_depleted", "no usable credits",
-    "model_not_supported_on_free_tier", "not available on the free tier",
+    "model_not_supported_on_free_tier", "not available on the free tier", "isn't available on the free tier",
     "requires a subscription", "upgrade for access", "upgrade for higher limits",
     "reached your session usage limit", "quota exceeded", "quota_exceeded",
     "too many tokens per day", "daily limit", "tokens per day", "daily quota", "resource exhausted",
@@ -3031,7 +3040,7 @@ _RATE_LIMIT_KEYWORDS = (
 _RATE_LIMIT_BILLING_KEYWORDS = (
     "credits", "insufficient funds", "billing", "payment required", "can only afford",
     "out of funds", "run out of funds", "balance_depleted", "no usable credits",
-    "model_not_supported_on_free_tier", "not available on the free tier",
+    "model_not_supported_on_free_tier", "not available on the free tier", "isn't available on the free tier",
 )
 
 
@@ -5305,7 +5314,9 @@ def _client_cache_key(
     # share an entry, and the second builder's _store_cached_client would close the first's client.
     model_key = model or runtime.get("model", "")
     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
-    return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
+    # Profile home leads the key: callers that omit api_key (pool / Nous auth.json paths) would
+    # otherwise share one client across multiplex profiles holding different credentials.
+    return (hermes_home_key(), provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
 
 
 def _current_event_loop() -> Any:

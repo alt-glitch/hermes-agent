@@ -457,6 +457,11 @@ def _finalize_routing(agent, api_mode, credential_pool):
         if agent.provider not in _AGGREGATOR_PROVIDERS:
             agent.model = normalize_model_for_provider(agent.model, agent.provider)
 
+    # Nous model policy follows the ROUTE (the welcome host serves one model); a credential-pool
+    # swap can change the route later, so ``_swap_credential`` applies the same helper again.
+    from hermes_cli.anon_auth import pin_model_for_route
+    agent.model = pin_model_for_route(agent.provider, agent.base_url, agent.model)
+
     # Auto-upgrade to Responses for GPT-5.x-style models and direct OpenAI URLs, unless
     # api_mode was explicit, the runtime is ACP (`acp://` clients route themselves, no
     # Responses surface) or Azure OpenAI (gpt-5.x on /chat/completions only). Provider
@@ -684,12 +689,6 @@ def _setup_logging(agent):
     # would starve the root file handlers. Noise reduction belongs in hermes_logging.
 
 
-def _bedrock_region_from_url(base_url) -> str:
-    """AWS region from a bedrock-runtime.<region>.amazonaws.com URL (default us-east-1)."""
-    m = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
-    return m.group(1) if m else "us-east-1"
-
-
 def _print_key_banner(key, label: str, warn_missing: bool = False) -> None:
     """Masked credential line. ``key`` may be a callable Entra ID bearer provider (Azure
     Foundry) — never invoke or inspect it. Keys ≤ 12 chars (incl. "dummy-key") are not shown."""
@@ -711,14 +710,10 @@ def _init_anthropic_client(agent, api_key, base_url, _provider_timeout):
     agent._anthropic_base_url = base_url
     if agent.provider == "bedrock":
         # AnthropicBedrock SDK for full feature parity (prompt caching, thinking budgets).
-        from agent.anthropic_adapter import build_anthropic_bedrock_client
-        _br_region = agent._bedrock_region = _bedrock_region_from_url(base_url)
-        agent._anthropic_client = build_anthropic_bedrock_client(_br_region)
-        agent._anthropic_api_key = "aws-sdk"
-        agent._is_anthropic_oauth = False
-        agent.api_key = "aws-sdk"
+        from agent.bedrock_adapter import bind_bedrock_runtime
+        bind_bedrock_runtime(agent, base_url, "anthropic_messages")
         if not agent.quiet_mode:
-            print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock + AnthropicBedrock SDK, {_br_region})")
+            print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock + AnthropicBedrock SDK, {agent._bedrock_region})")
         return
     # ANTHROPIC_TOKEN fallback only for native Anthropic — other anthropic_messages providers
     # must use their own key or Anthropic credentials leak to third-party endpoints.
@@ -780,22 +775,8 @@ def _init_moa_client(agent, api_key):
 
 def _init_bedrock_client(agent, base_url):
     """bedrock_converse: boto3 directly, no OpenAI client."""
-    agent._bedrock_region = _bedrock_region_from_url(base_url)
-    # Guardrail config — read from config.yaml at init time.
-    agent._bedrock_guardrail_config = None
-    with suppress(Exception):
-        from hermes_cli.config import load_config_readonly as _load_br_cfg
-        _gr = _load_br_cfg().get("bedrock", {}).get("guardrail", {})
-        if _gr.get("guardrail_identifier") and _gr.get("guardrail_version"):
-            agent._bedrock_guardrail_config = {
-                "guardrailIdentifier": _gr["guardrail_identifier"],
-                "guardrailVersion": _gr["guardrail_version"],
-            }
-            for _src, _dst in (("stream_processing_mode", "streamProcessingMode"), ("trace", "trace")):
-                if _gr.get(_src):
-                    agent._bedrock_guardrail_config[_dst] = _gr[_src]
-    agent.client = None
-    agent._client_kwargs = {}
+    from agent.bedrock_adapter import bind_bedrock_runtime
+    bind_bedrock_runtime(agent, base_url, "bedrock_converse")
     if not agent.quiet_mode:
         _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
         print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")

@@ -323,6 +323,10 @@ declare global {
       /** Launch flag: the app was started with --local, enabling the
        *  local-models GUI surfaces. Absent/false = every local surface hides. */
       localModelsEnabled?: boolean
+      /** Launch flag: the Nous free tier is on for this launch
+       *  (HERMES_GUEST_ONBOARDING=1 or --guest-onboarding). Read-only fact the
+       *  main process also stamps onto every backend it spawns. */
+      guestOnboardingEnabled?: boolean
       setTranslucency?: (payload: TranslucencyState) => void
       setKeepAwake?: (on: boolean) => void
       setDisableF12?: (blocked: boolean) => void
@@ -522,7 +526,7 @@ declare global {
       relaunchApp?: () => Promise<void>
       getRemoteDisplayReason?: () => Promise<string | null>
       updates: {
-        check: () => Promise<DesktopUpdateStatus>
+        check: (opts?: { force?: boolean }) => Promise<DesktopUpdateStatus>
         apply: (opts?: DesktopUpdateApplyOptions) => Promise<DesktopUpdateApplyResult>
         getBranch: () => Promise<{ branch: string }>
         setBranch: (name: string) => Promise<{ branch: string }>

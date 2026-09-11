@@ -11,7 +11,7 @@ import asyncio
 import logging
 import time
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.platforms.event import MessageEvent, MessageType
 
@@ -414,9 +414,11 @@ class GatewayGoalsMixin:
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
-
-    async def _loop_wakeup_fire_one(self, sid: str, state: Any, now: float, warned_no_route: set) -> None:
-        """Inject one due /loop wakeup into its session, applying every deferral rule."""
+    async def _loop_wakeup_fire_one(
+        self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
+    ) -> None:
+        """Inject one due /loop wakeup into its session, applying every deferral rule. ``profile`` is
+        the store being scanned (None = default); a ``profile`` persisted in the route wins."""
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
 
         if state.awaiting_response or now < state.next_due_at:
@@ -426,12 +428,17 @@ class GatewayGoalsMixin:
         chat_id = route.get("chat_id", "")
         if not platform_name or not chat_id:
             return  # CLI / TUI-owned loop — their own schedulers drive it.
-        adapter = next((a for p, a in self.adapters.items() if p.value == platform_name), None)
+        profile = route.get("profile") or profile
+        # The loop's OWN profile's adapter map, fail closed: ``self.adapters`` is the default profile's,
+        # so a secondary session's wakeup would inject via the default bot on a bare chat_id (a
+        # Telegram DM lands in the user's chat with the other bot).
+        adapters = self._adapters_for_profile(profile)
+        adapter = next((a for p, a in adapters.items() if p.value == platform_name), None)
         if adapter is None:
             if sid not in warned_no_route:
                 warned_no_route.add(sid)
                 logger.debug(
-                    "loop wakeup: no adapter for platform %r (session %s)", platform_name, sid,
+                    "loop wakeup: no adapter for platform %r (session %s, profile %s)", platform_name, sid, profile,
                 )
             return
 
@@ -443,6 +450,8 @@ class GatewayGoalsMixin:
         })
         if source is None:
             return
+        if profile and not getattr(source, "profile", None):
+            source.profile = profile  # session key + runtime scope of the injected turn
         session_key = None
         with suppress(Exception):
             session_key = self._session_key_for_source(source)
@@ -651,6 +660,12 @@ class GatewayGoalsMixin:
           idle boundary)
         - no routing metadata on the loop → skip with a one-time warning
           (CLI/TUI loops carry no route and are driven by their own surfaces)
+
+        Multiplex: one gateway-wide task, so ``list_active_loops`` alone reads only the launch home's
+        store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
+        profile's store is scanned under its own runtime scope, and each hit is fired against that
+        profile's adapters (``_fire_due_loop_wakeups_once`` resolves via ``_adapter_for_source``,
+        failing closed to the shared Relay transport for a secondary without a native adapter).
         """
         from gateway.run import _multiplex_profile_homes, _profile_runtime_scope
 
