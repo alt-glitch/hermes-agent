@@ -342,6 +342,13 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    case, retry `finalize-success`; do not recover or rebuild it. Then release the
    lease. Successful finalization writes the corresponding durable success
    outcome and exact synced upstream SHA automatically.
+   When a completed gate reached a `prepared` publication journal but the guarded
+   push did not land, finalize with `--stage publish --reason-code
+   publish-refused` yourself before exiting; that is the terminal state
+   `resume-publication` reuses directly. A run the reconciler had to close is
+   recorded as `external`/`external-blocker` and is resumable only when the
+   aborted journal is still bound to that run's evidence, manifest, candidate
+   and base.
 
 ## Approved retained-PR reconciliation
 
