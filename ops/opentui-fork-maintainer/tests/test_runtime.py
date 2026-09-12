@@ -1786,6 +1786,161 @@ def test_dirty_checked_out_daily_driver_is_not_mutated(tmp_path: Path) -> None:
     assert remote_sha(repo) == candidate
 
 
+def test_ship_candidate_observes_remote_before_opening_post_publish_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state = tmp_path / "state"
+    write_live_lease(state, expires_unix=4_000_000_000)
+    gate = tmp_path / "gate.json"
+    manifest(gate, gate_worktree, base, candidate)
+    journal = state / "publish-journal.json"
+    lease = state / "run.lease.json"
+    real_run = subprocess.run
+    observed: list[dict[str, object]] = []
+    failed = False
+
+    def run(argv, *args, **kwargs):
+        nonlocal failed
+        if "ls-remote" in argv:
+            # The remote observation happens while the pre-publish lease and
+            # journal state is still intact, so a failed read can never strand
+            # a prepared publication.
+            observed.append(
+                {
+                    "journal_exists": journal.exists(),
+                    "lease_expires_unix": json.loads(lease.read_text())[
+                        "expires_unix"
+                    ],
+                }
+            )
+            if not failed:
+                failed = True
+                return subprocess.CompletedProcess(argv, 128, "", "transient")
+        return real_run(argv, *args, **kwargs)
+
+    waits: list[float] = []
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    monkeypatch.setattr(runtime.time, "sleep", waits.append)
+
+    runtime.ship_candidate(
+        repo,
+        gate,
+        state_dir=state,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+
+    assert remote_sha(repo) == candidate
+    assert waits == [2]
+    assert observed[0] == {
+        "journal_exists": False,
+        "lease_expires_unix": 4_000_000_000,
+    }
+    assert json.loads(journal.read_text())["phase"] == "published"
+    assert json.loads(lease.read_text())["expires_unix"] != 4_000_000_000
+
+
+def test_unobserved_remote_fails_closed_without_a_prepared_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state = tmp_path / "state"
+    write_live_lease(state, expires_unix=4_000_000_000)
+    gate = tmp_path / "gate.json"
+    manifest(gate, gate_worktree, base, candidate)
+    real_run = subprocess.run
+    attempts = 0
+
+    def run(argv, *args, **kwargs):
+        nonlocal attempts
+        if "ls-remote" in argv:
+            attempts += 1
+            return subprocess.CompletedProcess(argv, 128, "", "unreachable")
+        return real_run(argv, *args, **kwargs)
+
+    waits: list[float] = []
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    monkeypatch.setattr(runtime.time, "sleep", waits.append)
+
+    with pytest.raises(runtime.ControlError, match="ls-remote"):
+        runtime.ship_candidate(
+            repo,
+            gate,
+            state_dir=state,
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+        )
+
+    assert attempts == runtime.REMOTE_OBSERVE_ATTEMPTS
+    assert waits == list(runtime.REMOTE_OBSERVE_BACKOFF_SECONDS)
+    assert not (state / "publish-journal.json").exists()
+    assert (
+        json.loads((state / "run.lease.json").read_text())["expires_unix"]
+        == 4_000_000_000
+    )
+    # The faked transport cannot answer reads either, so observe the remote
+    # through the captured real runner.
+    assert (
+        real_run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "ls-remote",
+                "--heads",
+                "origin",
+                "refs/heads/sid/opentui",
+            ],
+            capture_output=True,
+            text=True,
+        ).stdout.split()[0]
+        == base
+    )
+
+
+def test_refused_guarded_push_is_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state = tmp_path / "state"
+    write_live_lease(state, expires_unix=4_000_000_000)
+    gate = tmp_path / "gate.json"
+    manifest(gate, gate_worktree, base, candidate)
+    real_run = subprocess.run
+    pushes = 0
+
+    def run(argv, *args, **kwargs):
+        nonlocal pushes
+        if "push" in argv:
+            pushes += 1
+            return subprocess.CompletedProcess(argv, 1, "", "stale info")
+        return real_run(argv, *args, **kwargs)
+
+    waits: list[float] = []
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    monkeypatch.setattr(runtime.time, "sleep", waits.append)
+
+    with pytest.raises(
+        runtime.ControlError, match="guarded remote fast-forward was refused"
+    ):
+        runtime.ship_candidate(
+            repo,
+            gate,
+            state_dir=state,
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+        )
+
+    assert pushes == 1
+    assert waits == []
+    assert remote_sha(repo) == base
+    assert json.loads((state / "publish-journal.json").read_text())["phase"] == "prepared"
+
+
 def file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

@@ -103,6 +103,12 @@ REVIEW_TIMEOUT_SECONDS = 30 * 60
 REVIEW_PROMPT_MAX_BYTES = 350_000
 TRUSTED_FETCH_TIMEOUT_SECONDS = 10 * 60
 TRUSTED_FETCH_ATTEMPTS = 3
+# A transient network failure while merely observing the remote must not be
+# allowed to widen the lease or file a prepared publication. Reads are retried
+# a bounded number of times; writes are never retried.
+REMOTE_OBSERVE_ATTEMPTS = 3
+REMOTE_OBSERVE_BACKOFF_SECONDS = (2, 4)
+RETRIABLE_GIT_OPS = frozenset({"ls-remote", "fetch"})
 REVIEW_PREREQUISITE_GATES = (
     "opentui-install",
     "focused-contracts",
@@ -1130,6 +1136,26 @@ def _git(repo: Path, args: list[str], *, check: bool = True) -> str:
     return result.stdout.strip()
 
 
+def _git_retry(repo: Path, args: list[str]) -> str:
+    """Run a read-only remote observation with bounded backoff.
+
+    Only the allowlisted read-only network operations are retried: they
+    advertise or transfer objects and cannot create, move, or delete a ref.
+    Every write (notably ``push``) and every local operation runs exactly once
+    so a transient failure can never be laundered into a second mutation.
+    """
+    if args[0] not in RETRIABLE_GIT_OPS:
+        return _git(repo, args)
+    for attempt in range(REMOTE_OBSERVE_ATTEMPTS):
+        try:
+            return _git(repo, args)
+        except (ControlError, subprocess.TimeoutExpired):
+            if attempt + 1 >= REMOTE_OBSERVE_ATTEMPTS:
+                raise
+            time.sleep(REMOTE_OBSERVE_BACKOFF_SECONDS[attempt])
+    raise ControlError(f"git operation failed: {args[0]}")
+
+
 def _git_status(repo: Path, args: list[str]) -> int:
     return subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=180
@@ -1614,7 +1640,7 @@ def validate_gate_manifest(
 
 
 def _remote_sha(repo: Path, remote: str, branch: str) -> str:
-    output = _git(repo, ["ls-remote", "--heads", remote, f"refs/heads/{branch}"])
+    output = _git_retry(repo, ["ls-remote", "--heads", remote, f"refs/heads/{branch}"])
     parts = output.split()
     if len(parts) != 2 or not SHA_RE.fullmatch(parts[0]):
         raise ControlError("could not resolve the remote branch exactly")
@@ -1805,6 +1831,13 @@ def ship_candidate(
             state_dir, manifest_path.parent, token
         ) != manifest["run_binding"]:
             raise ControlError("bound request changed after verification")
+        # Observe the remote before widening the lease or filing the prepared
+        # journal. A transient observation failure must leave no post-publish
+        # lease and no prepared publication behind to reconcile; only a
+        # successfully observed remote may open the pre-push crash window.
+        current_remote = _remote_sha(repo, remote, branch)
+        if current_remote not in {base_sha, candidate_sha}:
+            raise ControlError("remote branch moved since base capture")
         # All expensive implementation and acceptance work is complete. Bound
         # the only remaining crash window before touching the remote so a
         # post-push process death can be retried after minutes, not six hours.
@@ -1842,9 +1875,6 @@ def ship_candidate(
             prepared = prior
         else:
             _atomic_json(_journal_path(state_dir), prepared)
-        current_remote = _remote_sha(repo, remote, branch)
-        if current_remote not in {base_sha, candidate_sha}:
-            raise ControlError("remote branch moved since base capture")
         if current_remote == base_sha:
             subprocess.run(
                 [
