@@ -96,6 +96,17 @@ non-parent wait timeout do not distinguish executing work from an unreaped
 zombie. Check process state when needed, but never restart work merely because
 an observer timed out or returned a null exit code.
 
+## Self-deploy
+
+When a run fixes a bug in `ops/opentui-fork-maintainer`, it may adopt that
+reviewed, published commit into the live runtime itself — at the end of the run,
+while holding the run token, and only through `configure.py --self-deploy <40-char
+sha>`. Never deploy mid-run, never edit the live runtime by hand, and never adopt
+an uncommitted edit. The command refuses a dirty ops worktree, a live foreign run
+lease, and any blob that does not match the pinned commit; it rolls back on a
+failed startup check. Read [self-deploy.md](references/self-deploy.md) before the
+first deploy and report every deploy with its receipt path.
+
 ## Learning
 
 Save exact commands/results, log paths, candidate SHA, cause and next action in

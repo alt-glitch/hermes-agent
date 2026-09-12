@@ -13,12 +13,16 @@ from __future__ import annotations
 import argparse
 import copy
 import fcntl
+import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from contextlib import closing, contextmanager, nullcontext
@@ -69,6 +73,12 @@ RUNTIME_ASSETS = (
     Path("scripts/worktree.sh"),
 )
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# The ops subtree inside the maintainer's own checkout. Self-deploy adopts the
+# tree at a pinned commit from this prefix and nothing else.
+OPS_SOURCE_PREFIX = "ops/opentui-fork-maintainer"
+SELF_DEPLOY_RECEIPT_PREFIX = "self-deploy."
+GIT_TIMEOUT_SECONDS = 180
 
 
 class ConfigurationError(RuntimeError):
@@ -130,9 +140,12 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return value
 
 
-def validate_sources(source_home: Path = SOURCE_HOME) -> None:
+def validate_sources(
+    source_home: Path = SOURCE_HOME,
+    sources: dict[str, Path] | None = None,
+) -> None:
     required = [source_home / relative for relative in RUNTIME_ASSETS]
-    required.extend(source / "SKILL.md" for source in MAINTAINER_SKILL_SOURCES.values())
+    required.extend(source / "SKILL.md" for source in (sources or MAINTAINER_SKILL_SOURCES).values())
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise ConfigurationError("missing deployment source(s): " + ", ".join(missing))
@@ -185,10 +198,12 @@ def _preserve_profile_learning(target: Path, staging: Path) -> None:
     _copy_atomic(existing, replacement)
 
 
-def install_maintainer_skills(hermes_home: Path) -> None:
+def install_maintainer_skills(
+    hermes_home: Path, sources: dict[str, Path] | None = None
+) -> None:
     target_root = hermes_home / "skills/software-development"
     target_root.mkdir(parents=True, exist_ok=True)
-    for name, source in MAINTAINER_SKILL_SOURCES.items():
+    for name, source in (sources or MAINTAINER_SKILL_SOURCES).items():
         target = target_root / name
         staging = target_root / f".{name}.staging"
         backup = target_root / f".{name}.previous"
@@ -278,24 +293,40 @@ def _normalize_backports(commits: list[str]) -> list[str]:
     return normalized
 
 
+def _read_lease_file(state_dir: Path) -> dict[str, Any] | None:
+    try:
+        lease = json.loads((state_dir / "run.lease.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return lease if isinstance(lease, dict) else None
+
+
+def _lease_is_live(lease: dict[str, Any] | None, now: int) -> bool:
+    if not isinstance(lease, dict):
+        return False
+    try:
+        expires = int(lease.get("expires_unix", 0))
+    except (TypeError, ValueError):
+        return False
+    return expires > now
+
+
 @contextmanager
-def _maintenance_quiescence_lock(runtime_home: Path):
-    """Serialize deployments and refuse to mutate an active maintainer runtime."""
+def _maintenance_quiescence_lock(runtime_home: Path, *, allowed_token: str | None = None):
+    """Serialize deployments and refuse to mutate an active maintainer runtime.
+
+    With ``allowed_token`` the caller holds that run's lease itself; every other
+    live lease is still refused. Without it any live lease blocks the deploy,
+    which is the operator path.
+    """
     state_dir = runtime_home / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "run.lease.lock").open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        lease_file = state_dir / "run.lease.json"
-        try:
-            lease = json.loads(lease_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            lease = None
-        if isinstance(lease, dict):
-            try:
-                expires = int(lease.get("expires_unix", 0))
-            except (TypeError, ValueError):
-                expires = 0
-            if expires > int(time.time()):
+        lease = _read_lease_file(state_dir)
+        if _lease_is_live(lease, int(time.time())):
+            assert lease is not None
+            if lease.get("token") != allowed_token:
                 raise ConfigurationError(
                     "cannot deploy while a maintainer run holds an active lease"
                 )
@@ -361,6 +392,307 @@ def queue_backport(runtime_home: Path, commits: list[str]) -> Path:
         return _write_backport_request(
             runtime_home / "state/run-request.json", normalized
         )
+
+
+def _git(repo: Path, args: list[str], *, text: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=text,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+
+
+def _git_out(repo: Path, args: list[str]) -> str:
+    result = _git(repo, args)
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        raise ConfigurationError(
+            f"git {args[0]} failed in {repo}: {detail[-1] if detail else 'unknown error'}"
+        )
+    return result.stdout.strip()
+
+
+def _git_is_ancestor(repo: Path, candidate: str, tip: str) -> bool:
+    if candidate == tip:
+        return True
+    return _git(repo, ["merge-base", "--is-ancestor", candidate, tip]).returncode == 0
+
+
+def _require_full_sha(value: str) -> str:
+    if not _FULL_SHA_RE.fullmatch(value or ""):
+        raise ConfigurationError(f"self-deploy requires a full 40-character commit SHA: {value!r}")
+    return value
+
+
+def _require_clean_ops_worktree(repo: Path, prefix: str = OPS_SOURCE_PREFIX) -> None:
+    """Never adopt a pinned commit while its ops subtree has local edits.
+
+    Content is read from the commit tree, so a dirty worktree cannot leak into
+    the runtime; refusing here keeps "the reviewed commit is what ships" honest
+    instead of silently discarding an in-flight edit an operator believes is live.
+    """
+    dirty = _git_out(repo, ["status", "--porcelain=v1", "--", prefix])
+    if dirty:
+        raise ConfigurationError(
+            f"refusing self-deploy from a dirty worktree under {prefix}: "
+            + dirty.replace("\n", "; ")
+        )
+
+
+def _require_published_ancestor(
+    repo: Path,
+    sha: str,
+    published_refs: list[str],
+    gated_candidate: str | None = None,
+) -> list[dict[str, str]]:
+    """The pinned commit must already be published on a branch the run names.
+
+    Ancestry on a published ref is the whole authorization: a commit reachable
+    from a shipped branch passed the same gate/review as the product commits on
+    it. The optional gated candidate is only accepted when it is itself anchored
+    to a published ref, so it can narrow the anchor but never widen it.
+    """
+    if not published_refs:
+        raise ConfigurationError("self-deploy requires at least one --published-ref")
+    anchors = [
+        {
+            "ref": ref,
+            "tip": _git_out(repo, ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"]),
+        }
+        for ref in published_refs
+    ]
+    if gated_candidate is not None:
+        gated = _require_full_sha(gated_candidate)
+        if not any(_git_is_ancestor(repo, gated, anchor["tip"]) for anchor in anchors):
+            raise ConfigurationError(
+                "gated candidate is not published on any named ref: "
+                + ", ".join(anchor["ref"] for anchor in anchors)
+            )
+        if not _git_is_ancestor(repo, sha, gated):
+            raise ConfigurationError(
+                f"pinned commit {sha} is not an ancestor of the gated candidate {gated}"
+            )
+        return anchors
+    if not any(_git_is_ancestor(repo, sha, anchor["tip"]) for anchor in anchors):
+        raise ConfigurationError(
+            f"pinned commit {sha} is not an ancestor of a published ref: "
+            + ", ".join(anchor["ref"] for anchor in anchors)
+        )
+    return anchors
+
+
+def _materialize_commit(repo: Path, sha: str, destination: Path, prefix: str = OPS_SOURCE_PREFIX) -> Path:
+    """Extract one commit's ops subtree into a scratch tree.
+
+    Reading blobs straight from the object store is what makes "pinned commit,
+    never a dirty worktree" true rather than aspirational.
+    """
+    result = _git(repo, ["archive", "--format=tar", sha, prefix], text=False)
+    if result.returncode != 0:
+        raise ConfigurationError(
+            "cannot archive pinned commit: "
+            + (result.stderr or b"").decode("utf-8", "replace").strip()
+        )
+    destination.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+        try:
+            archive.extractall(destination, filter="data")
+        except TypeError:  # Python < 3.11.4 has no extraction filter argument.
+            archive.extractall(destination)
+    source_home = destination / prefix
+    if not source_home.is_dir():
+        raise ConfigurationError(f"pinned commit has no {prefix} tree")
+    return source_home
+
+
+def _commit_blobs(repo: Path, sha: str, prefix: str) -> dict[str, str]:
+    """Map every blob path at ``sha`` under ``prefix`` to its git blob hash."""
+    raw = _git_out(repo, ["ls-tree", "-r", "-z", sha, "--", prefix])
+    blobs: dict[str, str] = {}
+    for entry in raw.split("\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) != 3 or parts[1] != "blob":
+            continue
+        blobs[path] = parts[2]
+    return blobs
+
+
+def _installed_blob(repo: Path, path: Path) -> str:
+    return _git_out(repo, ["hash-object", str(path)])
+
+
+def _verify_deployed_blobs(
+    repo: Path,
+    sha: str,
+    runtime_home: Path,
+    hermes_home: Path,
+    sources: dict[str, Path],
+    prefix: str = OPS_SOURCE_PREFIX,
+) -> dict[str, str]:
+    """Prove every installed file is byte-identical to the pinned commit's blob.
+
+    ``profile-learning.md`` is deliberately exempt: it is the profile-owned
+    reference the skill refresh carries across, not committed policy.
+    """
+    expected = _commit_blobs(repo, sha, prefix)
+    verified: dict[str, str] = {}
+    for relative in RUNTIME_ASSETS:
+        key = f"{prefix}/{relative.as_posix()}"
+        blob = expected.get(key)
+        if blob is None:
+            raise ConfigurationError(f"pinned commit does not track {key}")
+        installed = runtime_home / relative
+        actual = _installed_blob(repo, installed)
+        if actual != blob:
+            raise ConfigurationError(
+                f"deployed {relative} does not match the pinned commit blob"
+            )
+        verified[relative.as_posix()] = actual
+    for name in sources:
+        skill_prefix = f"{prefix}/skills/{name}"
+        for path, blob in _commit_blobs(repo, sha, skill_prefix).items():
+            tail = path[len(skill_prefix) + 1 :]
+            if tail == PROFILE_LEARNING_REFERENCE.as_posix():
+                continue
+            installed = hermes_home / "skills/software-development" / name / tail
+            actual = _installed_blob(repo, installed)
+            if actual != blob:
+                raise ConfigurationError(
+                    f"deployed skills/{name}/{tail} does not match the pinned commit blob"
+                )
+            verified[f"skills/{name}/{tail}"] = actual
+    return verified
+
+
+def _verify_runtime_help(runtime_home: Path) -> None:
+    """The deployed control plane must at least start and parse its own CLI."""
+    script = runtime_home / "scripts/maintainer_runtime.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise ConfigurationError(
+            "deployed maintainer_runtime.py --help failed with "
+            f"exit {result.returncode}: {(result.stderr or '').strip()}"
+        )
+
+
+def _hash_targets(paths: list[Path]) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for path in paths:
+        if path.is_file():
+            hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
+
+
+def _require_live_run_lease(state_dir: Path, token: str) -> dict[str, Any]:
+    lease = _read_lease_file(state_dir)
+    if lease is None:
+        raise ConfigurationError("self-deploy requires a valid run lease")
+    if lease.get("token") != token:
+        raise ConfigurationError("self-deploy run token does not match the live lease")
+    try:
+        expires = int(lease.get("expires_unix", 0))
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError("self-deploy run lease expiry is invalid") from exc
+    if expires <= int(time.time()):
+        raise ConfigurationError("self-deploy run lease has expired")
+    return lease
+
+
+def _write_self_deploy_receipt(path: Path, receipt: dict[str, Any]) -> None:
+    _atomic_write_json(path, receipt)
+
+
+def self_deploy_configuration(
+    *,
+    repo: Path,
+    sha: str,
+    published_refs: list[str],
+    run_token: str,
+    state_dir: Path,
+    runtime_home: Path,
+    hermes_home: Path,
+    gated_candidate: str | None = None,
+    source_prefix: str = OPS_SOURCE_PREFIX,
+) -> dict[str, Any]:
+    """Adopt a pinned, published ops commit into the live runtime home.
+
+    The next scheduled tick, never this process, executes the new code: the
+    module is never imported here and the only execution is a subprocess
+    ``--help`` used as a startup check. Every mutable target is snapshotted and
+    restored if any verification step fails.
+    """
+    sha = _require_full_sha(sha)
+    _require_clean_ops_worktree(repo, source_prefix)
+    anchors = _require_published_ancestor(repo, sha, published_refs, gated_candidate)
+    stamp = datetime.now(timezone.utc)
+    receipt_path = runtime_home / "state" / (
+        f"{SELF_DEPLOY_RECEIPT_PREFIX}{stamp.strftime('%Y%m%dT%H%M%SZ')}-{sha[:12]}.json"
+    )
+
+    with _maintenance_quiescence_lock(runtime_home, allowed_token=run_token):
+        lease = _require_live_run_lease(state_dir, run_token)
+        run_id = str(lease.get("run_id") or "")
+        targets = [runtime_home / relative for relative in RUNTIME_ASSETS]
+        targets.extend(
+            hermes_home / "skills/software-development" / name
+            for name in MAINTAINER_SKILL_SOURCES
+        )
+        before = _hash_targets(targets)
+        with tempfile.TemporaryDirectory(prefix="opentui-maintainer-selfdeploy-") as raw:
+            source_home = _materialize_commit(repo, sha, Path(raw), source_prefix)
+            sources = {
+                name: source_home / "skills" / name for name in MAINTAINER_SKILL_SOURCES
+            }
+            validate_sources(source_home, sources=sources)
+            receipt = {
+                "version": 1,
+                "status": "applied",
+                "effective": "next-tick",
+                "sha": sha,
+                "repo": str(repo),
+                "run_id": run_id,
+                "run_token_sha256": hashlib.sha256(run_token.encode()).hexdigest(),
+                "published_refs": anchors,
+                "gated_candidate": gated_candidate,
+                "deployed_at": stamp.isoformat(),
+                "files_before": before,
+                "files_after": {},
+                "files_blob": {},
+            }
+            try:
+                with rollback_paths(targets):
+                    deploy_assets(source_home, runtime_home)
+                    install_maintainer_skills(hermes_home, sources=sources)
+                    require_installed_skills(hermes_home)
+                    receipt["files_blob"] = _verify_deployed_blobs(
+                        repo, sha, runtime_home, hermes_home, sources, source_prefix
+                    )
+                    _verify_runtime_help(runtime_home)
+                    receipt["files_after"] = _hash_targets(targets)
+            except BaseException as exc:
+                failed = dict(receipt)
+                failed["status"] = "rolled-back"
+                failed["error"] = f"{type(exc).__name__}: {exc}"
+                failed["files_after"] = _hash_targets(targets)
+                _write_self_deploy_receipt(receipt_path, failed)
+                if not isinstance(exc, Exception):
+                    raise
+                if isinstance(exc, ConfigurationError):
+                    raise
+                raise ConfigurationError(
+                    f"self-deploy raised {type(exc).__name__}"
+                ) from exc
+            _write_self_deploy_receipt(receipt_path, receipt)
+    return {"receipt": str(receipt_path), "sha": sha, "run_id": run_id, "effective": "next-tick"}
 
 
 def _cron_restore_update(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -981,6 +1313,25 @@ def _parser() -> argparse.ArgumentParser:
         metavar="SHA",
         help="queue one upstream commit for the next run (repeatable; requires --apply)",
     )
+    parser.add_argument(
+        "--self-deploy",
+        metavar="SHA",
+        help="adopt a pinned, published ops commit from --repo into the live runtime (run-token gated)",
+    )
+    parser.add_argument(
+        "--published-ref",
+        action="append",
+        default=[],
+        metavar="REF",
+        help="ref the run published to; --self-deploy SHA must be an ancestor of one (repeatable)",
+    )
+    parser.add_argument("--gated-candidate", metavar="SHA",
+                        help="optional candidate the pinned commit must also be an ancestor of")
+    parser.add_argument("--repo", type=Path, default=None,
+                        help="checkout whose commit tree is adopted (required with --self-deploy)")
+    parser.add_argument("--state", type=Path, default=None,
+                        help="runtime state dir holding the caller's run lease")
+    parser.add_argument("--token", default=None, help="the caller's live run token")
     parser.add_argument("--runtime-home", type=Path, default=RUNTIME_HOME)
     parser.add_argument("--hermes-home", type=Path, default=Path.home() / ".hermes")
     return parser
@@ -988,6 +1339,30 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.self_deploy:
+        if args.apply or args.create_paused or args.backport:
+            raise ConfigurationError(
+                "--self-deploy runs alone; it never applies cron configuration"
+            )
+        missing = [
+            name
+            for name, value in (("--repo", args.repo), ("--state", args.state), ("--token", args.token))
+            if not value
+        ]
+        if missing:
+            raise ConfigurationError("--self-deploy requires " + ", ".join(missing))
+        result = self_deploy_configuration(
+            repo=args.repo,
+            sha=args.self_deploy,
+            published_refs=args.published_ref,
+            run_token=args.token,
+            state_dir=args.state,
+            runtime_home=args.runtime_home,
+            hermes_home=args.hermes_home,
+            gated_candidate=args.gated_candidate,
+        )
+        print(json.dumps({"apply": True, "self_deploy": result}, indent=2))
+        return 0
     plan = cron_update(args.runtime_home, args.hermes_home, job_id=args.job_id)
     if args.create_paused:
         plan.pop("job_id")
