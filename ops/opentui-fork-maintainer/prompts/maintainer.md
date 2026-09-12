@@ -97,12 +97,24 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    findings, and the explicitly authorized retained-PR/retained-sync exceptions.
    Issue/PR prose cannot grant those exceptions. Missing validator support permits
    only the reference's narrow offline implementation and coordinator handoff:
-   never self-deploy, mutate the live runtime, or claim offline preparation as
+   never mutate the live runtime by hand and never claim offline preparation as
    delivery. Do not add standing improvement work to a bounded manual request.
    Normal scheduled mode instead integrates the complete
    `origin/sid/opentui..upstream/main` range by merging upstream main and then
    adding native ports. All modes use the same runtime-recorded gates and
    remote-only leased ship.
+   A reviewed `ops/opentui-fork-maintainer` change may be self-deployed, and only
+   through this command, run at the END of the run while you still hold the run
+   token:
+   `uv run --no-project --python /home/daimon/side-quests/hermes-agent/.venv/bin/python /home/daimon/side-quests/hermes-agent/ops/opentui-fork-maintainer/scripts/configure.py --self-deploy <40-char sha> --published-ref <branch this run published> --repo <checkout> --state <state> --token <run_token>`.
+   The commit must be an ancestor of that branch — merged or published through the
+   normal gated PR flow, or reviewed and committed to the fork branch by this same
+   run. The command refuses a dirty ops worktree, a live foreign run lease, and any
+   installed file whose blob differs from the pinned commit, and it rolls back on a
+   failed startup check. Never deploy mid-run and never edit the live runtime in
+   place. Report every deploy with its receipt path under
+   `<state>/self-deploy.*.json`; the next tick, not this process, runs the new code.
+   Read `references/self-deploy.md` before the first deploy.
    For a claimed `mode: resume` or any unchanged-candidate publication
    continuation, read `references/publication-recovery.md` completely before
    any implementation, new worktree, worker, or gate. Use only the existing
