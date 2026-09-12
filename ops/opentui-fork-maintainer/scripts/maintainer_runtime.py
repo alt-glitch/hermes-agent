@@ -493,10 +493,12 @@ def submit_request(state_dir: Path, value: Any) -> dict[str, Any]:
             existing = _read_bound_request(pending[0], state_dir, label="pending request")
             if existing != value:
                 raise ControlError("another request is pending; inspect it instead of replacing it")
+            _clear_request_deferral(state_dir, value)
             status = "claimed" if pending[0].name.endswith("inflight.json") else "queued"
             created = False
         else:
             _atomic_json(state_dir / "run-request.json", value)
+            _clear_request_deferral(state_dir, value)
             status, created = "queued", True
     return {"request_id": _canonical_json_sha256(value), "status": status, "created": created}
 
@@ -655,6 +657,100 @@ def _record_retry_context(
     )
 
 
+def _runtime_fingerprint() -> str:
+    """Hash the deployed control-plane script so a refusal binds to a deploy."""
+    return _file_sha256(Path(__file__).resolve())
+
+
+def _request_deferral_path(state_dir: Path) -> Path:
+    return state_dir / "request-deferred.json"
+
+
+def _record_request_refusal(
+    state_dir: Path,
+    request_value: dict[str, Any],
+    *,
+    run_id: str,
+    stage: str,
+    reason_code: str,
+) -> None:
+    """Remember that this exact request was refused by this exact runtime.
+
+    The next claim of the same request under the same deployed runtime would
+    repeat the same doomed attempt: nothing changed except the clock. Keep the
+    refusal durable and keyed by both hashes so a deploy (a new runtime file)
+    or an explicit operator resubmission releases it.
+    """
+    _atomic_json(
+        _request_deferral_path(state_dir),
+        {
+            "schema_version": 1,
+            "request_sha256": _canonical_json_sha256(request_value),
+            "runtime_sha256": _runtime_fingerprint(),
+            "run_id": run_id,
+            "stage": stage,
+            "reason_code": reason_code,
+            "refused_unix": int(time.time()),
+        },
+    )
+
+
+def _request_deferral(
+    state_dir: Path, request_value: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return the refusal that still applies to this request, if any."""
+    path = _request_deferral_path(state_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    if value.get("request_sha256") != _canonical_json_sha256(request_value):
+        return None
+    if value.get("runtime_sha256") != _runtime_fingerprint():
+        return None
+    return value
+
+
+def _clear_request_deferral(state_dir: Path, request_value: dict[str, Any]) -> None:
+    """Release a refusal when the operator explicitly resubmits that request."""
+    path = _request_deferral_path(state_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(value, dict) and value.get(
+        "request_sha256"
+    ) == _canonical_json_sha256(request_value):
+        path.unlink(missing_ok=True)
+
+
+def _defer_doomed_request(
+    state_dir: Path, request_value: dict[str, Any], refusal: dict[str, Any]
+) -> dict[str, Any]:
+    """Record one refused claim without consuming a run, and leave the queue."""
+    run_id = str(refusal["run_id"])
+    reason = f"runtime unchanged since refusal by run {run_id}"
+    _atomic_json(
+        _request_deferral_path(state_dir),
+        {
+            **refusal,
+            "reason": reason,
+            "deferred_unix": int(time.time()),
+            "deferred_count": int(refusal.get("deferred_count", 0)) + 1,
+        },
+    )
+    return {
+        "status": "deferred",
+        "request_id": _canonical_json_sha256(request_value),
+        "reason": reason,
+        "refused_by": run_id,
+        "stage": refusal.get("stage"),
+        "reason_code": refusal.get("reason_code"),
+    }
+
+
 def _claim_request_unlocked(
     state_dir: Path, evidence_dir: Path
 ) -> dict[str, Any] | None:
@@ -677,6 +773,12 @@ def _claim_request_unlocked(
         value = _validate_request(json.loads(source.read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError) as exc:
         raise ControlError(f"invalid request file: {type(exc).__name__}") from exc
+    refusal = _request_deferral(state_dir, value)
+    if refusal is not None:
+        # The request stays queued: the next claim re-evaluates the runtime
+        # hash, so a deploy retries it automatically and an operator
+        # resubmission clears the refusal.
+        return _defer_doomed_request(state_dir, value, refusal)
     if source == request:
         os.replace(request, inflight)
     _atomic_json(evidence_dir / "request.claimed.json", value)
@@ -5313,6 +5415,7 @@ def finalize_failure(
     request_recovered = request_retired = retirement_undecided = False
     request_deferred = False
     retry_after_unix: int | None = None
+    recovered_request: dict[str, Any] | None = None
     with _request_lock(state_dir):
         if claimed.exists():
             if (evidence_root / "request.consumed.json").exists():
@@ -5325,6 +5428,7 @@ def finalize_failure(
                 if _read_bound_request(queued, state_dir, label="queued request") != claimed_value:
                     raise ControlError("queued request does not match this failed run")
                 request_recovered = True
+                recovered_request = claimed_value
             elif not inflight.exists() and stale.exists():
                 if _read_bound_request(stale, evidence_root, label="stale request") != claimed_value:
                     raise ControlError("stale request does not match this failed run")
@@ -5384,8 +5488,23 @@ def finalize_failure(
                 else:
                     _recover_request_unlocked(state_dir)
                     request_recovered = True
+                    recovered_request = claimed_value
         elif inflight.exists():
             raise ControlError("in-flight request is not bound to this failed run")
+        if recovered_request is not None and recovered_request.get("mode") == "resume":
+            # A refused publication-continuation has no path forward except the
+            # same resume-publication attempt against the same retained evidence,
+            # so claiming it again under this same runtime would repeat the same
+            # doomed attempt and spend a whole run re-proving the refusal. Recovered
+            # backport/repair/issue work is different: a fresh owner can reuse its
+            # retry context and still make progress, so it is never suppressed here.
+            _record_request_refusal(
+                state_dir,
+                recovered_request,
+                run_id=evidence_root.name,
+                stage=stage,
+                reason_code=reason_code,
+            )
     return _record_run_outcome(
         state_dir,
         evidence_root,
