@@ -22,9 +22,9 @@ def test_setup_hermes_script_has_termux_path():
     assert "$PREFIX/bin" in content
 
 
-def test_setup_hermes_installs_worktree_aware_launcher():
+def test_setup_hermes_installs_managed_launcher():
     content = SETUP_SCRIPT.read_text(encoding="utf-8")
 
     assert "scripts/write-hermes-launcher.sh" in content
-    assert '"$COMMAND_LINK_DIR/hermes" "$HERMES_BIN" "$SCRIPT_DIR"' in content
+    assert '"$COMMAND_LINK_DIR/hermes" "$HERMES_BIN"' in content
     assert 'ln -sf "$HERMES_BIN" "$COMMAND_LINK_DIR/hermes"' not in content

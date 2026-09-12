@@ -97,22 +97,19 @@ unset NODE_ENV
 ls -la ui-opentui/dist/main.js                            # confirm built
 ```
 
-## STEP 4 — Install the worktree-aware `hermes` launcher
-Do not repoint a global symlink each time you change checkouts. Generate the
-launcher through the same path as `install.sh`:
+## STEP 4 — Install the `hermes` launcher
+Generate the launcher through the same path as `install.sh`:
 ```bash
 bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
-  ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes \
-  /home/daimon/side-quests/hermes-agent /home/daimon/github/hermes-agent
+  ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes
 hash -r
 ```
-Outside an explicitly trusted Hermes checkout this runs the managed fork. Inside
-the registered fork/upstream clones or any of their linked worktrees it imports
-that exact tree (including its Python gateway and terminal UI source — OpenTUI in
-the fork, Ink upstream) while reusing the nearest available venv. Verify with:
+It always runs the managed fork, from any directory, including other Hermes
+checkouts and worktrees. Run a checkout's own source explicitly with
+`uv run hermes ...` from that tree. Verify with:
 ```bash
 cd ~/.hermes/hermes-agent && hermes --version
-cd /path/to/a/hermes-worktree && hermes --version
+cd /path/to/a/hermes-worktree && hermes --version   # same output
 ```
 `~/.local/bin/hermes` is intentionally a regular script, not a symlink. If
 `/usr/local/bin/hermes` shadows it, ensure `~/.local/bin` is earlier on PATH.
