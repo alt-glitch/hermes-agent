@@ -1922,9 +1922,17 @@ def test_ship_candidate_observes_remote_before_opening_post_publish_window(
                 return subprocess.CompletedProcess(argv, 128, "", "transient")
         return real_run(argv, *args, **kwargs)
 
+    main_thread = threading.current_thread()
     waits: list[float] = []
+
+    def record(seconds: float) -> None:
+        # Only the retry under test sleeps on this thread; a background poller
+        # left behind by another test must not pollute the schedule.
+        if threading.current_thread() is main_thread:
+            waits.append(seconds)
+
     monkeypatch.setattr(runtime.subprocess, "run", run)
-    monkeypatch.setattr(runtime.time, "sleep", waits.append)
+    monkeypatch.setattr(runtime.time, "sleep", record)
 
     runtime.ship_candidate(
         repo,
