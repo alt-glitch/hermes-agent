@@ -102,7 +102,7 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
    through this command, run at the END of the run while you still hold the run
    token:
    `uv run --no-project --python /home/daimon/side-quests/hermes-agent/.venv/bin/python /home/daimon/side-quests/hermes-agent/ops/opentui-fork-maintainer/scripts/configure.py --self-deploy <40-char sha> --published-ref <branch this run published> --repo <checkout> --state <state> --token <run_token>`.
-   The commit must be an ancestor of that branch — merged or published through the
+   The commit must be an ancestor of that branch: merged or published through the
    normal gated PR flow, or reviewed and committed to the fork branch by this same
    run. The command refuses a dirty ops worktree, a live foreign run lease, and any
    installed file whose blob differs from the pinned commit, and it rolls back on a
@@ -293,7 +293,8 @@ wrapper's absolute evidence directory rather than reconstructing a relative one.
     Hard rules: 30 minutes wall clock and two findings per run, so the phase
     cannot starve the next tick; never weaken a gate or test to make a run look
     clean; never edit the live runtime home directly.
-    <!-- self-deploy rule: owned by sid/ms-selfdeploy -->
+    A fix that merged to the fork branch this run may be self-deployed now under
+    the step 2 self-deploy rule, so the next tick runs it instead of a human.
     When the request or failure signature is unchanged, read the previous run's
     `retrospective.json` and `handoff.md` FIRST and act on them instead of
     re-diagnosing; a deferred claim means the runtime has not changed since the
