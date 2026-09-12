@@ -27,9 +27,11 @@ uv run --no-project --python /home/daimon/side-quests/hermes-agent/.venv/bin/pyt
 ```
 
 - `--self-deploy` takes the **full 40-character** commit SHA, never a short form
-  or a branch name. Pass `--published-ref` once per branch the commit must be an
-  ancestor of. `--gated-candidate <sha>` narrows the anchor to one candidate; it
-  is accepted only when that candidate is itself an ancestor of a published ref.
+  or a branch name. `--published-ref` is a branch name on `origin` (for example
+  `sid/opentui`); its tip is read from the remote with `ls-remote`, so a local
+  tracking ref cannot authorize a deploy. Repeat it per branch the commit must be
+  an ancestor of. `--gated-candidate <sha>` narrows the anchor to one candidate;
+  it is accepted only when that candidate is itself an ancestor of a published ref.
 - The command requires a **live run lease** owned by `--token`, and refuses while
   any other run lease is live. It reads asset content straight from the pinned
   commit's blobs, so a dirty worktree can never ship; it also refuses outright

@@ -77,6 +77,7 @@ _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # The ops subtree inside the maintainer's own checkout. Self-deploy adopts the
 # tree at a pinned commit from this prefix and nothing else.
 OPS_SOURCE_PREFIX = "ops/opentui-fork-maintainer"
+PUBLISH_REMOTE = "origin"
 SELF_DEPLOY_RECEIPT_PREFIX = "self-deploy."
 GIT_TIMEOUT_SECONDS = 180
 
@@ -440,28 +441,42 @@ def _require_clean_ops_worktree(repo: Path, prefix: str = OPS_SOURCE_PREFIX) -> 
         )
 
 
+def _remote_branch_tip(repo: Path, remote: str, branch: str) -> str:
+    """The commit the remote currently serves for *branch*, not a local mirror.
+
+    A local ``refs/remotes/<remote>/<branch>`` can be fabricated or stale with one
+    ``update-ref``; asking the remote makes "published" mean what the fork has.
+    """
+    output = _git_out(repo, ["ls-remote", "--exit-code", "--heads", remote, f"refs/heads/{branch}"])
+    tip = output.split()[0] if output else ""
+    if not _FULL_SHA_RE.fullmatch(tip):
+        raise ConfigurationError(f"{remote} does not publish branch {branch!r}")
+    return tip
+
+
 def _require_published_ancestor(
     repo: Path,
     sha: str,
     published_refs: list[str],
     gated_candidate: str | None = None,
+    remote: str = PUBLISH_REMOTE,
 ) -> list[dict[str, str]]:
     """The pinned commit must already be published on a branch the run names.
 
     Ancestry on a published ref is the whole authorization: a commit reachable
     from a shipped branch passed the same gate/review as the product commits on
-    it. The optional gated candidate is only accepted when it is itself anchored
-    to a published ref, so it can narrow the anchor but never widen it.
+    it. Each ref is a branch name on the publish remote and its tip is read from
+    the remote itself. The optional gated candidate is only accepted when it is
+    itself anchored to a published ref, so it can narrow the anchor but never
+    widen it.
     """
     if not published_refs:
         raise ConfigurationError("self-deploy requires at least one --published-ref")
-    anchors = [
-        {
-            "ref": ref,
-            "tip": _git_out(repo, ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"]),
-        }
-        for ref in published_refs
-    ]
+    anchors = []
+    for ref in published_refs:
+        tip = _remote_branch_tip(repo, remote, ref)
+        _git_out(repo, ["fetch", "--quiet", remote, tip])
+        anchors.append({"ref": f"{remote}/{ref}", "tip": tip})
     if gated_candidate is not None:
         gated = _require_full_sha(gated_candidate)
         if not any(_git_is_ancestor(repo, gated, anchor["tip"]) for anchor in anchors):
@@ -1323,7 +1338,7 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="REF",
-        help="ref the run published to; --self-deploy SHA must be an ancestor of one (repeatable)",
+        help="branch on origin the run published to, read via ls-remote; --self-deploy SHA must be an ancestor of one (repeatable)",
     )
     parser.add_argument("--gated-candidate", metavar="SHA",
                         help="optional candidate the pinned commit must also be an ancestor of")

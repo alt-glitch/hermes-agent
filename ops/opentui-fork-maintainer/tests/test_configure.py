@@ -1118,8 +1118,12 @@ def _self_deploy_fixture(tmp_path: Path, monkeypatch):
     )
     _git_test(repo, "init", "-q", "-b", "main")
     sha = _commit_all(repo, "ops change")
-    published_ref = "refs/remotes/origin/sid/maintainer-self-heal"
-    _git_test(repo, "update-ref", published_ref, sha)
+    # "Published" means the remote serves it: a bare origin, pushed to.
+    origin = tmp_path / "origin.git"
+    _git_test(repo, "init", "-q", "--bare", str(origin))
+    _git_test(repo, "remote", "add", "origin", str(origin))
+    published_ref = "sid/maintainer-self-heal"
+    _git_test(repo, "push", "-q", "origin", f"HEAD:refs/heads/{published_ref}")
 
     runtime = tmp_path / "runtime"
     state = runtime / "state"
@@ -1189,6 +1193,23 @@ def test_self_deploy_refuses_a_commit_outside_the_published_branch(
     _git_test(repo, "checkout", "-q", "-b", "side")
     (fixture["ops"] / "scripts/other.py").write_text("x\n")
     outsider = _commit_all(repo, "unpublished sibling")
+
+    with pytest.raises(configure.ConfigurationError, match="is not an ancestor"):
+        _self_deploy(fixture, sha=outsider)
+
+    assert not (fixture["runtime"] / "scripts/maintainer_runtime.py").exists()
+
+
+def test_self_deploy_ignores_a_fabricated_local_tracking_ref(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fixture = _self_deploy_fixture(tmp_path, monkeypatch)
+    repo = fixture["repo"]
+    _git_test(repo, "checkout", "-q", "-b", "side")
+    (fixture["ops"] / "scripts/other.py").write_text("x\n")
+    outsider = _commit_all(repo, "never pushed")
+    # A local remote-tracking ref is one update-ref away; it must not count.
+    _git_test(repo, "update-ref", f"refs/remotes/origin/{fixture['ref']}", outsider)
 
     with pytest.raises(configure.ConfigurationError, match="is not an ancestor"):
         _self_deploy(fixture, sha=outsider)
