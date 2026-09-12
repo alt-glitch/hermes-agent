@@ -18,6 +18,16 @@ candidate's `ARCHITECTURE.md` before choosing an implementation boundary.
 
 ## Load only what this run needs
 
+The deployed policy incorporates this skill's versioned references. Resolve
+their paths beside this loaded `SKILL.md`, not beside the deployed prompt:
+
+- Claimed issue/backport/repair: read [request-modes.md](references/request-modes.md).
+- Publication continuation or recovery: read
+  [publication-recovery.md](references/publication-recovery.md) before new work.
+- A fresh scheduled upstream integration: read
+  [native-improvement.md](references/native-improvement.md) for its bounded
+  OpenTUI improvement pass. Diagnostic, idle and manual-task wakes do not opt in.
+
 Read every selected external `SKILL.md` to EOF individually, then read only its
 task-relevant references to EOF. Follow any truncation before acting. Do not
 batch several large instruction files into one capped command or paste their
@@ -54,13 +64,15 @@ whole development archive into every worker prompt.
 
 ## Execution
 
-The parent uses `gpt-6-astra` through `openai-codex` subscription auth with medium
-reasoning and Hermes' normal `codex_responses` loop. Use Hermes' credential
-resolver and supported login/import flow, never hand-copy refresh tokens or
-modify the user's Codex configuration. Compaction uses the same provider; do not
-fall back to Nous. Preserve maintainer-only YOLO and the 600-second model stale
-allowance. The separate Gemini video gate stays on OpenRouter.
-Do not send temperature/top-p/logprobs. Route settings belong in this
+The parent and compaction use `anthropic/claude-fable-5.1` through the `nous`
+provider at medium effort. Use Hermes' credential resolver and its supported
+Nous Portal route; never hand-copy refresh tokens or modify unrelated auth.
+Keep the provisioned chat-completions transport: native Anthropic beta examples
+are not configuration for this Portal route. Do not silently fall back to
+Codex, OpenRouter or another model. Preserve maintainer-only YOLO and the
+600-second model stale allowance. The separate Gemini video gate stays on
+OpenRouter. Let the installed provider adapter own sampling parameters.
+Route settings belong in this
 profile/job, never the default profile. The 300,000-token compression cap is a
 trigger; Hermes may compress earlier at its ratio limit.
 
