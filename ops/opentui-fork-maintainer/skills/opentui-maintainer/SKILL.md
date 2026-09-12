@@ -99,8 +99,13 @@ an observer timed out or returned a null exit code.
 ## Learning
 
 Save exact commands/results, log paths, candidate SHA, cause and next action in
-the run directory. After proving a correction, update its smallest owning test
-or versioned reference. Put short profile-only lessons awaiting source review in
+the run directory. Every run ends with the mandatory retrospective in
+[retrospective.md](references/retrospective.md), which owns the procedure, the
+classification table and the `retrospective.json` schema. Invariant: every failed
+command in a run either becomes a committed fix, a reference lesson with
+evidence, or an explicit external classification; silent repetition is a defect.
+After proving a correction, update its smallest owning test or versioned
+reference. Put short profile-only lessons awaiting source review in
 `references/profile-learning.md`; `configure.py` preserves only that reference
 across a wholesale versioned skill refresh. Keep exact incident logs in the run
 directory, not in either reference. Use profile memory for stable navigation
