@@ -5584,6 +5584,10 @@ def reconcile_run(
             if not journal_matches:
                 raise
 
+    # A run with no publication journal, or one whose remote is neither the
+    # captured base nor a descendant of the candidate, is blocked by something
+    # external to this run's own publication.
+    stage, reason_code = "external", "external-blocker"
     if (
         journal_matches
         and journal is not None
@@ -5619,12 +5623,19 @@ def reconcile_run(
             )
             release_lease(state_dir, token)
             return {"status": "success", **result}
+        if journal["phase"] == "prepared" and remote_sha == journal["base_sha"]:
+            # The prepared journal plus an untouched remote proves this run's
+            # own publication was refused, not blocked by an outside cause.
+            # Consumers accept this shape and the historical
+            # external/external-blocker one for runs closed before the
+            # distinction existed.
+            stage, reason_code = "publish", "publish-refused"
 
     outcome = finalize_failure(
         state_dir,
         evidence_root,
-        stage="external",
-        reason_code="external-blocker",
+        stage=stage,
+        reason_code=reason_code,
     )
     release_lease(state_dir, token)
     return outcome

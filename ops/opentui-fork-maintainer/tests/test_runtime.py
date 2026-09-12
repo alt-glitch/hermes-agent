@@ -4041,6 +4041,104 @@ def test_reconcile_finalizes_published_candidate_after_remote_advances(
     assert outcome["remote_head_sha"] == descendant
 
 
+def test_reconcile_records_unshipped_prepared_publication_as_publish_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "test-run"
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="state/runs/test-run/integration"
+    )
+    write_live_lease(state)
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    # Reproduce the incident shape: the publication journal stopped at
+    # ``prepared``, the lease had already been widened to the post-publish TTL,
+    # and nothing ever reached the remote.
+    git(repo, "push", "--force", "origin", f"{base}:refs/heads/sid/opentui")
+    journal_path = state / "publish-journal.json"
+    journal = json.loads(journal_path.read_text())
+    journal.update({"phase": "prepared", "prepared_unix": int(runtime.time.time())})
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease.update({"expires_unix": 1, "max_expires_unix": 1})
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    outcome = runtime.reconcile_run(
+        state, evidence, token="test-token", allow_expired=True
+    )
+
+    assert (outcome["stage"], outcome["reason_code"]) == ("publish", "publish-refused")
+    assert outcome["published"] is False
+    assert outcome["needs_finalization"] is False
+    assert outcome["request_recovered"] is True
+    aborted = runtime._load_publish_journal(state, require_manifest_evidence=False)
+    assert aborted is not None and aborted["phase"] == "aborted"
+    assert not lease_path.exists()
+    assert (state / "run-request.json").exists()
+    assert remote_sha(repo) == base
+
+    manifest_value = runtime._load_gate(manifest_path)
+
+    def accepted(value: dict[str, object]) -> bool:
+        return runtime._terminal_unshipped_outcome(
+            value,
+            state_dir=state,
+            source_root=evidence,
+            manifest_path=manifest_path,
+            manifest=manifest_value,
+        )
+
+    # The reconciler's own verdict is an accepted terminal unshipped source...
+    assert accepted(outcome)
+    # ...and the historical shape stays accepted for runs closed before the
+    # distinction existed.
+    assert accepted(
+        {**outcome, "stage": "external", "reason_code": "external-blocker"}
+    )
+    assert not accepted({**outcome, "stage": "external"})
+
+
+def test_reconcile_without_a_publication_journal_stays_external_blocker(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "test-run"
+    repo, _, base, candidate, _ = make_repo(tmp_path)
+    write_live_lease(state)
+    claim_backport(state, evidence, base, candidate)
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease.update({"expires_unix": 1, "max_expires_unix": 1})
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    outcome = runtime.reconcile_run(
+        state, evidence, token="test-token", allow_expired=True
+    )
+
+    assert (outcome["stage"], outcome["reason_code"]) == (
+        "external",
+        "external-blocker",
+    )
+    assert not (state / "publish-journal.json").exists()
+    assert not lease_path.exists()
+    assert (state / "run-request.json").exists()
+    assert remote_sha(repo) == base
+
+
 def test_finalize_failure_recognizes_published_candidate_under_remote_descendant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
