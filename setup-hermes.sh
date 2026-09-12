@@ -388,8 +388,8 @@ HERMES_BIN="$SCRIPT_DIR/venv/bin/hermes"
 COMMAND_LINK_DIR="$(get_command_link_dir)"
 COMMAND_LINK_DISPLAY_DIR="$(get_command_link_display_dir)"
 bash "$SCRIPT_DIR/scripts/write-hermes-launcher.sh" \
-    "$COMMAND_LINK_DIR/hermes" "$HERMES_BIN" "$SCRIPT_DIR"
-echo -e "${GREEN}✓${NC} Installed worktree-aware hermes launcher → $COMMAND_LINK_DISPLAY_DIR/hermes"
+    "$COMMAND_LINK_DIR/hermes" "$HERMES_BIN"
+echo -e "${GREEN}✓${NC} Installed hermes launcher → $COMMAND_LINK_DISPLAY_DIR/hermes"
 
 if is_termux; then
     export PATH="$COMMAND_LINK_DIR:$PATH"

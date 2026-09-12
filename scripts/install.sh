@@ -2243,15 +2243,11 @@ EOF
         mv -f "$managed_cli_tmp" "$managed_cli"
     fi
 
-    # Install an atomic, worktree-aware user-facing launcher. Outside a Hermes
-    # source checkout it executes managed_cli. Inside one, the generated
-    # launcher pins Python/TUI imports to that checkout and borrows the nearest
-    # available venv (current checkout, primary checkout for a linked worktree,
-    # then the managed install). The generator replaces legacy symlinks without
-    # following them, preserving the #21454 symlink-stomp fix.
+    # Install an atomic user-facing launcher that always executes managed_cli,
+    # whatever the caller's working directory. The generator replaces legacy
+    # symlinks without following them, preserving the #21454 symlink-stomp fix.
     bash "$INSTALL_DIR/scripts/write-hermes-launcher.sh" \
-        "$command_link_dir/hermes" "$managed_cli" \
-        "$INSTALL_DIR" "$_SCRIPT_DIR/.."
+        "$command_link_dir/hermes" "$managed_cli"
     log_success "Installed hermes launcher → $command_link_display_dir/hermes"
 
     # Also expose `hermes-agent`. The `hermes-agent` console script declared in
