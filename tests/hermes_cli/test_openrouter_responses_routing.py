@@ -27,7 +27,13 @@ def test_openrouter_explicit_transport_across_credentials(
     }
     monkeypatch.setattr(rp, "_get_model_config", lambda: model_config)
     monkeypatch.setattr(rp, "load_config", lambda: {"model": model_config})
-    monkeypatch.setattr(rp, "_getenv", lambda name, default="": "environment-key" if name == "OPENROUTER_API_KEY" else default)
+    # Credential reads go through the canonical agent.secret_scope.get_secret_str, imported by name into
+    # runtime_provider_backends (upstream dd1baee0e43 removed the rp._getenv shim this test used to patch).
+    from hermes_cli import runtime_provider_backends as rpb
+
+    monkeypatch.setattr(
+        rpb, "get_secret_str", lambda name, default="": "environment-key" if name == "OPENROUTER_API_KEY" else default
+    )
     entry = SimpleNamespace(
         access_token="pool-key", source="manual", base_url=rp.OPENROUTER_BASE_URL
     )
