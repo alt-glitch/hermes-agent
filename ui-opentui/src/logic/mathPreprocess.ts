@@ -160,6 +160,7 @@ export function preprocessMath(markdown: string, _opts?: { streaming?: boolean |
   const out: string[] = []
   let changed = false
   let fence: { char: string; len: number } | null = null
+  const noCloserAhead = { dollar: false, bracket: false }
   let i = 0
 
   // Emit a converted display block as its own paragraph: blank-line separated
@@ -224,17 +225,28 @@ export function preprocessMath(markdown: string, _opts?: { streaming?: boolean |
       // Multi-line block: scan ahead for a real closer before committing. If
       // none exists in the rest of the (possibly still-streaming) document,
       // the line stays verbatim — Ink's paragraph fallback.
+      //
+      // A scan that reached EOF without a closer proves that no later opener
+      // of the same delimiter can find one either (its scan range is a strict
+      // subset), so remember that and skip the rescan: without it a document
+      // of unmatched openers costs O(lines²) on every streaming delta.
       let closeIdx = -1
       let closeTail = ''
 
-      for (let j = i + 1; j < lines.length; j++) {
-        const m = (lines[j] ?? '').match(closeRe)
+      if (!noCloserAhead[mathOpen[1] === '$$' ? 'dollar' : 'bracket']) {
+        for (let j = i + 1; j < lines.length; j++) {
+          const m = (lines[j] ?? '').match(closeRe)
 
-        if (m) {
-          closeIdx = j
-          closeTail = m[1] ?? ''
+          if (m) {
+            closeIdx = j
+            closeTail = m[1] ?? ''
 
-          break
+            break
+          }
+        }
+
+        if (closeIdx < 0) {
+          noCloserAhead[mathOpen[1] === '$$' ? 'dollar' : 'bracket'] = true
         }
       }
 

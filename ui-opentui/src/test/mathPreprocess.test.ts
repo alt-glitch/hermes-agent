@@ -117,6 +117,22 @@ describe('preprocessMath — display math', () => {
     const s = 'Before\n$$\nE = mc^2'
     expect(preprocessMath(s)).toBe(s)
   })
+
+  it('many unmatched openers of one delimiter stay verbatim while the other delimiter still closes', () => {
+    // The closer scan for `$$` is remembered as exhausted after the first
+    // miss (no later `$$` opener can find one); `\[` keeps its own state.
+    const unmatched = Array.from({ length: 40 }, (_, n) => `$$ x_${n}`).join('\n')
+    expect(preprocessMath(unmatched)).toBe(unmatched)
+    const mixed = `${unmatched}\n\\[\n\\alpha\n\\]\nAfter`
+    expect(preprocessMath(mixed)).toBe(`${unmatched}\n\nα\n\nAfter`)
+  })
+
+  it('an unmatched opener does not hide a later same-delimiter block that does close', () => {
+    // A miss is only remembered when the scan reached EOF; here the first
+    // opener's scan finds the `$$` closer on line 2 and consumes that block,
+    // and the final lone `$$` (no closer) stays verbatim.
+    expect(preprocessMath('$$ a\n$$\nx^2\n$$\nTail')).toBe(' a\n\nx^2\n$$\nTail')
+  })
 })
 
 describe('preprocessMath — \\boxed sentinels are stripped to plain text', () => {
