@@ -837,6 +837,9 @@ DEFAULT_CONFIG = {
         # fights terminal auto-scroll in non-fullscreen mode.
         # See #45592.
         "cli_refresh_interval": 1.0,
+        # Vi/vim keybindings in the CLI input composer (config-only, no slash command).
+        # Off by default, preserving prompt_toolkit's standard emacs bindings.
+        "vim_mode": False,
         "user_message_preview": {  # CLI: submitted user-message lines echoed to scrollback
             "first_lines": 2,
             "last_lines": 2,
@@ -896,7 +899,8 @@ DEFAULT_CONFIG = {
         # CLI/TUI status bar fields. Non-empty = only listed fields show (built-in order kept,
         # config controls visibility not ordering); empty = default set. Available: model,
         # context_detail, context_pct, cache_hit, latency, tps, compressions, bg_tasks,
-        # bg_processes, bg_subagents, goal, duration, prompt_elapsed, idle_since, focus, yolo,
+        # bg_processes, bg_subagents, goal, git_branch (⎇ current branch, opt-in only), duration,
+        # prompt_elapsed, idle_since, focus, yolo,
         # stash, battery, title, total_tokens (session Σ, opt-in only). Narrow terminals still drop
         # context_detail/prompt_elapsed/idle_since.
         "status_bar": {

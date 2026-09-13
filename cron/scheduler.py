@@ -1439,8 +1439,9 @@ def _snapshot_pin(job: dict, axis: str, current: str, job_id: str) -> str:
     if snapshot and current and snapshot.lower() != current.lower():
         logger.info(
             "Job '%s': running on creation-snapshot %s %r (global default is now %r); "
-            "`hermes cron edit %s --%s <value>` or cron.%s in config.yaml moves it.",
-            job_id, axis, snapshot, current, job_id, axis,
+            "`hermes cron resnap %s` adopts the new default (stays unpinned), "
+            "`hermes cron edit %s --%s <value>` or cron.%s in config.yaml pins it.",
+            job_id, axis, snapshot, current, job_id, job_id, axis,
             "model" if axis == "model" else "model_provider")
     return snapshot
 
@@ -2383,6 +2384,15 @@ def run_job(
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
+        # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
+        # tail can schedule a bounded automatic re-run instead of waiting a full period.
+        try:
+            from cron.unreachable_retry import is_model_unreachable_failure
+            if is_model_unreachable_failure(e, agent):
+                job["_model_unreachable"] = True
+        except Exception:  # classification must never mask the real failure
+            logger.debug("Job '%s': unreachable-failure classification failed", job_id)
         # No audit row when we failed before the agent existed; the audit write must never raise.
         if _audit is not None:
             _audit.write({}, error_msg)
@@ -2759,6 +2769,16 @@ def _save_compose_deliver(
         output_file=output_file)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
+    if d.should_deliver and not d.success and job.get("_model_unreachable"):
+        # The model was never reached and a bounded automatic re-run will be scheduled
+        # (cron/unreachable_retry.py): hold the failure notice — the re-run either
+        # delivers the real result or, once the ladder is exhausted, the next failure
+        # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
+        from cron.unreachable_retry import will_retry
+        if will_retry(job):
+            d.should_deliver = False
+            logger.info(
+                "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
     # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
     # not be swallowed; bracketed-prefix / trailing-line tolerance is kept.
     if d.should_deliver and d.success and _is_cron_silence_response(deliver_content):
@@ -2841,13 +2861,17 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
-    mark_kwargs = {"delivery_error": d.delivery_error}
+    mark_kwargs: dict = {"delivery_error": d.delivery_error}
     if _finite_recurring_job(job):
         mark_kwargs["expected_execution_id"] = execution_id
     run_claim = job.get("run_claim")
     run_token = run_claim.get("token") if isinstance(run_claim, dict) else None
     if run_token:
         mark_kwargs["expected_run_claim_token"] = run_token
+    if not d.success and job.pop("_model_unreachable", False):
+        # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
+        # (cron/unreachable_retry.py) inside the same fenced store write.
+        mark_kwargs["model_unreachable"] = True
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
     if fire_owner is not None:
