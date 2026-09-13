@@ -36,7 +36,7 @@ def test_label_recovery_targets_only_the_review_gate(
     tmp_path, scenario, success, rerun
 ):
     workflow = yaml.safe_load(
-        (Path(__file__).parents[1] / ".github/workflows/label-rerun.yml").read_text()
+        (Path(__file__).parents[2] / ".github/workflows/label-rerun.yml").read_text()
     )
     script = workflow["jobs"]["rerun-review-labels"]["steps"][0]["run"]
     gh = tmp_path / "gh"
