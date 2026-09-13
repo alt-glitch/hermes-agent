@@ -45,7 +45,10 @@ def _probe(root):
             session.notify_on_complete = True
         owner, sibling = sessions
         deadline = time.monotonic() + 5
-        while not all(s.output_buffer for s in sessions):
+        # Wait for the writer's own marker: a login shell (zsh rc noise, MOTD)
+        # can fill the buffer before the writer prints, and the assertions
+        # below require the writer's output to have reached the registry.
+        while not all(f"{name}-output" in s.output_buffer for name, s in zip(("owner", "sibling"), sessions)):
             assert time.monotonic() < deadline, "writers did not become ready"
             time.sleep(0.01)
         assert all(s.process.poll() is None for s in sessions)
