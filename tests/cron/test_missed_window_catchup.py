@@ -87,7 +87,13 @@ class TestMissedWindowCatchUp:
 
         slot_env["crash"]()
         after_crash = J.get_job(job_id)
-        assert J._ensure_aware(J.datetime.fromisoformat(after_crash["next_run_at"])) > J._hermes_now()
+        # The occurrence must survive the crash in the store: either the schedule was not yet
+        # advanced past it (this fork creates the execution row before the gated advance, so the
+        # instant is still ``next_run_at``) or the advance left a ``pending_slot`` stamp carrying it.
+        if J._ensure_aware(J.datetime.fromisoformat(after_crash["next_run_at"])) > J._hermes_now():
+            assert (after_crash.get("pending_slot") or {}).get("scheduled_at") == slot
+        else:
+            assert after_crash["next_run_at"] == slot
         assert slot_env["fires"]() == 0
 
         # Restarted scheduler: the occurrence must come back and run exactly once.
