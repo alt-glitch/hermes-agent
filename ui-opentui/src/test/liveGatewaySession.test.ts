@@ -30,6 +30,23 @@ describe('live gateway session tracking', () => {
     ).toBe('live-5')
   })
 
+  test('branch routing uses the same decoder branchSession adopts the child with', () => {
+    // Additive fields the backend may attach (info snapshot) must not desync
+    // routing from UI ownership; a schema-invalid branch leaves routing alone.
+    expect(
+      trackedSessionIdAfterRequest(
+        'live-4',
+        'session.branch',
+        {},
+        { info: [], parent: 'key-4', session_id: ' live-6 ', session_key: 'key-6', title: 'Fork' }
+      )
+    ).toBe('live-6')
+    expect(trackedSessionIdAfterRequest('live-4', 'session.branch', {}, { session_id: 'live-7' })).toBe('live-4')
+    expect(trackedSessionIdAfterRequest('live-4', 'session.branch', {}, { session_id: '  ', title: 'x' })).toBe(
+      'live-4'
+    )
+  })
+
   test('a successful matching close clears the routing id, including closed:false', () => {
     expect(
       trackedSessionIdAfterRequest('live-1', 'session.close', { session_id: 'live-1' }, { closed: false })

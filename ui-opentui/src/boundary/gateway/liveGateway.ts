@@ -21,6 +21,7 @@ import { getLog } from '../log.ts'
 import { GatewayEventSchema, type GatewayEvent } from '../schema/GatewayEvent.ts'
 import {
   decodeSessionActivateResponse,
+  decodeSessionBranchResponse,
   decodeSessionCloseResponse,
   decodeSessionResumeResponse
 } from '../schema/SessionOrchestratorResponses.ts'
@@ -83,7 +84,13 @@ export function trackedSessionIdAfterRequest(
     const decoded = decodeSessionActivateResponse(result)
     return decoded?.session_id.trim() || current
   }
-  if ((method === 'session.create' || method === 'session.branch') && result && typeof result === 'object') {
+  if (method === 'session.branch') {
+    // Same decoder branchSession() adopts the child with: routing and UI
+    // ownership must agree on what a valid branch response is.
+    const decoded = decodeSessionBranchResponse(result)
+    return decoded?.session_id.trim() || current
+  }
+  if (method === 'session.create' && result && typeof result === 'object') {
     const response = result as { info?: unknown; session_id?: unknown }
     const infoValid =
       response.info === undefined ||
