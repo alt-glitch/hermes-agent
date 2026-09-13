@@ -38,6 +38,20 @@ describe('fuzzyFilter — subsequence matching', () => {
     // genuinely scattered match.
     expect(byLabel('son', ['meson', 'saturn-sonnet'])).toEqual(['saturn-sonnet', 'meson'])
   })
+
+  test('separator variants fold both ways: `-`, `_`, `.` are interchangeable with each other and with space', () => {
+    // Parity with the Ink/desktop pickers (upstream 3f022595): a user typing a
+    // model id from memory gets the same rows whichever separator they recall.
+    const catalog = ['gpt-4o', 'claude-3-opus', 'qwen3.8-flash', 'snake_case_model']
+    expect(byLabel('gpt.4o', catalog)).toEqual(['gpt-4o'])
+    expect(byLabel('gpt_4o', catalog)).toEqual(['gpt-4o'])
+    expect(byLabel('claude_3', catalog)).toEqual(['claude-3-opus'])
+    expect(byLabel('qwen3-8', catalog)).toEqual(['qwen3.8-flash'])
+    expect(byLabel('snake-case', catalog)).toEqual(['snake_case_model'])
+    // The exact spelling still matches, and a folded query cannot invent a hit.
+    expect(byLabel('gpt-4o', catalog)).toEqual(['gpt-4o'])
+    expect(byLabel('gpt.5o', catalog)).toEqual([])
+  })
 })
 
 describe('fuzzyFilter — multi-field, multi-term', () => {

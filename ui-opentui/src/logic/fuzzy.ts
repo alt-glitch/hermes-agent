@@ -19,8 +19,18 @@
  *   for an empty needle; the old all-rows behavior is preserved here).
  * - Equal final scores keep catalog order (fuzzysort's sort is not stable; the
  *   adapter re-sorts with the original index as tie-break).
+ * - Separators `-`, `_`, `.` fold to a space on BOTH sides before matching
+ *   (upstream 3f022595's `searchFold`, shared with the Ink/desktop pickers), so
+ *   `gpt.4o`, `claude_3` and `qwen3-8` hit `gpt-4o`, `claude-3-opus` and
+ *   `qwen3.8-flash` the way a user typing from memory expects. The fold is one
+ *   char in, one char out, so any future highlighter can apply it without
+ *   drift. Query folding happens BEFORE the whitespace split: a folded
+ *   separator becomes a term boundary, so `gpt.4o` searches like `gpt 4o`.
  */
 import fuzzysort from 'fuzzysort'
+
+/** Length-preserving search fold: lower-case and `[-_.]` → space. */
+export const searchFold = (value: string): string => value.toLowerCase().replace(/[-_.]/g, ' ')
 
 /** One searchable field of an item (e.g. model id ×2, provider slug, lab name). */
 export interface FuzzyField {
@@ -44,14 +54,14 @@ interface Entry<T> {
  * Every whitespace-split term must fuzzy-match at least one field.
  */
 export function fuzzyFilter<T>(query: string, items: readonly T[], fieldsOf: (item: T) => FuzzyField[]): T[] {
-  const terms = query.trim().split(/\s+/).filter(Boolean)
+  const terms = searchFold(query).trim().split(/\s+/).filter(Boolean)
   if (!terms.length) return [...items]
 
   let pool: Entry<T>[] = items.map((item, at) => ({ at, fields: fieldsOf(item), item, total: 0 }))
   // Items may carry different field counts (description/haystacks optional):
   // one key per field slot, missing slots read as '' (never match).
   const keyCount = pool.reduce((max, e) => Math.max(max, e.fields.length), 0)
-  const keys = Array.from({ length: keyCount }, (_, i) => (e: Entry<T>) => e.fields[i]?.text ?? '')
+  const keys = Array.from({ length: keyCount }, (_, i) => (e: Entry<T>) => searchFold(e.fields[i]?.text ?? ''))
 
   for (const term of terms) {
     const results = fuzzysort.go(term, pool, {
