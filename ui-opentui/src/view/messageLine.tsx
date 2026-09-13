@@ -6,7 +6,7 @@
  * `text`. Fully themed; rich text via <b>/<span>, never an attributes bitmask (§8 #1).
  *
  * Visual hierarchy (design pass, Appendix C): the view is a dark room and gold
- * is the single lamp — it sits on the NEWEST answer's `⚕` and the user's `❯`,
+ * is the single lamp — it sits on the NEWEST answer's `☤` and the user's `❯`,
  * nowhere else (older assistant glyphs demote to grey: they merely happened).
  * The user's prompt BODY is muted (your words are context; the answer is the
  * reward) and the turn is set off by MORE blank space than the parts inside a
@@ -62,7 +62,7 @@ export function turnSpacing(role: Message['role'], compact: boolean): { top: num
 
 /**
  * Role-glyph color (pure — table-tested). Gold is EARNED: the user's `❯` and
- * the NEWEST answer's `⚕` are primary; an older assistant glyph demotes to
+ * the NEWEST answer's `☤` are primary; an older assistant glyph demotes to
  * grey (it merely happened); system notes stay dim.
  */
 export function glyphColor(role: Message['role'], latest: boolean, color: ThemeColors): string {
@@ -232,7 +232,7 @@ export function MessageLine(props: { message: Message; latest?: boolean }) {
             >
               <box style={{ flexShrink: 0, width: GUTTER }}>
                 {/* the role glyph is decorative — exclude it from mouse selection (item 4).
-            Bold so the user `❯` / assistant `⚕` turn boundaries pop (item 8). */}
+            Bold so the user `❯` / assistant `☤` turn boundaries pop (item 8). */}
                 <text selectable={false}>
                   <span style={{ fg: glyphFg() }}>
                     <b>{glyph()}</b>

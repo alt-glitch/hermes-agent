@@ -7,7 +7,7 @@
  * context; `selectable=false` keeps it out of copy/selection.
  *
  * Compact: a colored `◆` marker (distinct from the `●` status dot, the `·`
- * system glyph, and the `⚕`/`❯` turn glyphs) + a bold kind label + the text.
+ * system glyph, and the `☤`/`❯` turn glyphs) + a bold kind label + the text.
  */
 import { createSignal, Show } from 'solid-js'
 

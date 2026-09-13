@@ -77,7 +77,7 @@ describe('tool glyph vocabulary (registry) — identity survives the collapsed v
   test('the settled per-tool glyph map, pinned', () => {
     expect(TOOL_GLYPHS).toEqual({
       clarify: '?',
-      delegate_task: '⚕',
+      delegate_task: '☤',
       execute_code: '$',
       patch: '◆',
       process: '$',
@@ -116,7 +116,7 @@ describe('tool glyph vocabulary (registry) — identity survives the collapsed v
 const color = DARK_THEME.color
 
 describe('glyphColor — gold is earned', () => {
-  test('the user ❯ and the NEWEST answer ⚕ are primary; older answers grey', () => {
+  test('the user ❯ and the NEWEST answer ☤ are primary; older answers grey', () => {
     expect(glyphColor('user', false, color)).toBe(color.primary)
     expect(glyphColor('assistant', true, color)).toBe(color.primary)
     expect(glyphColor('assistant', false, color)).toBe(color.muted)

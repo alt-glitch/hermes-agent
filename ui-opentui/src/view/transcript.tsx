@@ -167,7 +167,7 @@ export function Transcript(props: { store: SessionStore }) {
   const dropped = () => props.store.state.dropped
   const sid = () => props.store.state.sessionId
   // The NEWEST assistant answer's index — gold is earned (design pass): only
-  // that turn's `⚕` glyph stays primary; older answers demote to grey.
+  // that turn's `☤` glyph stays primary; older answers demote to grey.
   const latestAssistant = createMemo(() => {
     const messages = props.store.state.messages
     for (let i = messages.length - 1; i >= 0; i--) {

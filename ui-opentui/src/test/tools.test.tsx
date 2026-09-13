@@ -762,7 +762,7 @@ describe('tool lifecycle states — running / done / failed (Epic 2.5)', () => {
       const frame = await probe.waitForFrame(f => f.includes('terminal'))
       const row = frame.split('\n').find(line => line.includes('terminal')) ?? ''
       // ✗ IN the head-glyph position (immediately before the name, after the
-      // assistant row's `⚕` gutter), replacing the expand glyph…
+      // assistant row's `☤` gutter), replacing the expand glyph…
       expect(row).toContain('✗ terminal')
       expect(row).not.toContain('▶')
       expect(row).toContain('✗ exit status 1') // error subtitle stays

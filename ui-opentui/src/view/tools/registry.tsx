@@ -60,11 +60,11 @@ export interface ToolRenderer {
  * swaps to `▼`. Running stays `⚡` (accent heat) and failure `✗` (error) —
  * lifecycle owns those two; this map owns WHAT the tool is:
  *   terminal `$` · read `◇` · write/patch `◆` · search `○` · web `●` ·
- *   clarify `?` · skill `▲` · delegate `⚕` (the one whimsy) · MCP/unknown `◦`
+ *   clarify `?` · skill `▲` · delegate `☤` (the one whimsy) · MCP/unknown `◦`
  */
 export const TOOL_GLYPHS: Record<string, string> = {
   clarify: '?',
-  delegate_task: '⚕',
+  delegate_task: '☤',
   execute_code: '$',
   patch: '◆',
   process: '$',

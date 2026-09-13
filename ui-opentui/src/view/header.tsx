@@ -5,7 +5,7 @@
  * styles — §7.5). All session chrome (model/context/cost/duration/profile/mcp/
  * cwd) lives in the dense bottom status bar (`statusBar.tsx`).
  *
- * Design pass (Appendix C): persistent chrome must not spend gold — the `⚕`
+ * Design pass (Appendix C): persistent chrome must not spend gold — the `☤`
  * icon in accent is the ONLY warm pixel up here; the wordmark demotes to muted
  * bold. This component also owns painting the ROOT CANVAS: it is always
  * mounted, so a reactive effect pushes `theme.color.bg` (true black by
