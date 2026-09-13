@@ -169,7 +169,19 @@ describe('session-orchestrator RPC Effect boundaries', () => {
           started_at: 100,
           title: ''
         },
-        { cwd: '/w', ended_at: 130, id: 'db-3', last_active: 125, message_count: 1, model: 'm', preview: 'p', resolved_id: 'db-3b', source: '', started_at: 100, title: 't' }
+        {
+          cwd: '/w',
+          ended_at: 130,
+          id: 'db-3',
+          last_active: 125,
+          message_count: 1,
+          model: 'm',
+          preview: 'p',
+          resolved_id: 'db-3b',
+          source: '',
+          started_at: 100,
+          title: 't'
+        }
       ],
       truncated: true
     })

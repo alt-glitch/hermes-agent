@@ -95,7 +95,18 @@ describe('mapSessionRows (widened session.list projection)', () => {
         // pre-widening gateway row: no cwd/last_active/ended_at/model keys at all
         { id: 's2', message_count: 0, preview: '', started_at: 5, title: '' },
         // current `_session_row_summary` row for a live session: nullable fields are null
-        { cwd: null, ended_at: null, id: 's3', last_active: 9, message_count: 1, model: null, preview: 'p', source: '', started_at: 8, title: 't' },
+        {
+          cwd: null,
+          ended_at: null,
+          id: 's3',
+          last_active: 9,
+          message_count: 1,
+          model: null,
+          preview: 'p',
+          source: '',
+          started_at: 8,
+          title: 't'
+        },
         { title: 'no id — dropped' },
         { id: 's4', message_count: 'seven', preview: '', started_at: 1, title: '' }, // wrong type — dropped, rest survive
         'garbage'
@@ -119,7 +130,15 @@ describe('mapSessionRows (widened session.list projection)', () => {
     // last_active falls back to started_at
     expect(rows[1]).toMatchObject({ id: 's2', lastActive: 5, startedAt: 5 })
     // nulls never become row keys (exactOptionalPropertyTypes contract of SessionRow)
-    expect(rows[2]).toEqual({ id: 's3', lastActive: 9, messageCount: 1, preview: 'p', source: '', startedAt: 8, title: 't' })
+    expect(rows[2]).toEqual({
+      id: 's3',
+      lastActive: 9,
+      messageCount: 1,
+      preview: 'p',
+      source: '',
+      startedAt: 8,
+      title: 't'
+    })
     expect(mapSessionRows(null)).toEqual({ rows: [], truncated: false })
     expect(mapSessionRows({ sessions: 'nope' })).toEqual({ rows: [], truncated: false })
   })

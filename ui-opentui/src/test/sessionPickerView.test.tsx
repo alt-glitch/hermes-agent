@@ -110,7 +110,15 @@ async function mountPicker(options: MountOptions = {}): Promise<Harness> {
       const offset = typeof params.offset === 'number' ? params.offset : 0
       const limit = typeof params.limit === 'number' ? params.limit : sessions.length
       const page = options.paged ? sessions.slice(offset, offset + limit) : sessions
-      const payload = { sessions: page, truncated: options.truncated ?? false }
+      // Fakes may omit fields; the gateway (`_session_row_summary`) always emits them, coerced.
+      const wire = page.map(s => ({
+        message_count: 0,
+        preview: '',
+        started_at: s.last_active ?? 0,
+        title: '',
+        ...s
+      }))
+      const payload = { sessions: wire, truncated: options.truncated ?? false }
       return options.listDelay
         ? new Promise(resolve => setTimeout(() => resolve(payload), options.listDelay))
         : Promise.resolve(payload)
