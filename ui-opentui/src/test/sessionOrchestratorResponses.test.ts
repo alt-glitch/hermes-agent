@@ -153,6 +153,32 @@ describe('session-orchestrator RPC Effect boundaries', () => {
     ).toMatchObject({ sessions: [{ id: 'db-1', message_count: 8, title: 'Stored session' }] })
   })
 
+  test('session.list keeps the widened row fields the gateway always emits (nullable) and the truncated flag', () => {
+    // Shape of tui_gateway/methods_session.py::_session_row_summary for a still-open session.
+    const decoded = decodeSessionListResponse({
+      sessions: [
+        {
+          cwd: null,
+          ended_at: null,
+          id: 'db-2',
+          last_active: 120,
+          message_count: 3,
+          model: null,
+          preview: '',
+          source: 'tui',
+          started_at: 100,
+          title: ''
+        },
+        { cwd: '/w', ended_at: 130, id: 'db-3', last_active: 125, message_count: 1, model: 'm', preview: 'p', resolved_id: 'db-3b', source: '', started_at: 100, title: 't' }
+      ],
+      truncated: true
+    })
+    expect(decoded?.truncated).toBe(true)
+    expect(decoded?.sessions?.[0]).toMatchObject({ cwd: null, ended_at: null, last_active: 120, model: null })
+    expect(decoded?.sessions?.[1]).toMatchObject({ cwd: '/w', ended_at: 130, model: 'm', resolved_id: 'db-3b' })
+    expect(decodeSessionListResponse({ sessions: [], truncated: 'yes' })).toBeUndefined()
+  })
+
   test('rejects malformed close, delete, and stored-session list fields', () => {
     expect(decodeSessionCloseResponse({})).toBeUndefined()
     expect(decodeSessionCloseResponse({ closed: 'yes' })).toBeUndefined()

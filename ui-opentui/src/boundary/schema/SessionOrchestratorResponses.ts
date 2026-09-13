@@ -101,9 +101,16 @@ export type SessionDeleteResponse = typeof SessionDeleteResponseSchema.Type
 
 export const SessionListItemSchema = Schema.StructWithRest(
   Schema.Struct({
+    // `tui_gateway/methods_session.py::_session_row_summary` always emits these; the
+    // nullable ones are coerced to `None` server-side when the DB row lacks them.
+    cwd: opt(Schema.NullOr(Str)),
+    ended_at: opt(Schema.NullOr(Num)),
     id: Str,
+    last_active: opt(Num),
     message_count: Num,
+    model: opt(Schema.NullOr(Str)),
     preview: Str,
+    resolved_id: opt(Str),
     source: opt(Str),
     started_at: Num,
     title: Str
@@ -113,7 +120,7 @@ export const SessionListItemSchema = Schema.StructWithRest(
 export type SessionListItem = typeof SessionListItemSchema.Type
 
 export const SessionListResponseSchema = Schema.StructWithRest(
-  Schema.Struct({ sessions: opt(Schema.Array(SessionListItemSchema)) }),
+  Schema.Struct({ sessions: opt(Schema.Array(SessionListItemSchema)), truncated: opt(Bool) }),
   [UnknownFields]
 )
 export type SessionListResponse = typeof SessionListResponseSchema.Type
@@ -163,3 +170,7 @@ export const decodeSessionDeleteResponse = (value: unknown): SessionDeleteRespon
   some(decodeDelete(value))
 
 export const decodeSessionListResponse = (value: unknown): SessionListResponse | undefined => some(decodeList(value))
+
+const decodeListItem = Schema.decodeUnknownOption(SessionListItemSchema)
+/** One `session.list` row; the picker decodes rows individually so one malformed row cannot hide the rest. */
+export const decodeSessionListItem = (value: unknown): SessionListItem | undefined => some(decodeListItem(value))

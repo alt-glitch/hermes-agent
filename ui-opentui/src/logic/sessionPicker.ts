@@ -16,6 +16,7 @@
  *     · tail-truncated cwd),
  *   - `/sessions <tab>` arg parsing and the `/resume <id|name>` resolver.
  */
+import { decodeSessionListItem } from '../boundary/schema/SessionOrchestratorResponses.ts'
 import { fuzzyFilter, type FuzzyField } from './fuzzy.ts'
 
 // ── tabs + classification ─────────────────────────────────────────────────
@@ -104,43 +105,30 @@ export interface SessionRow {
   cwd?: string
 }
 
-function readStr(value: unknown, key: string): string | undefined {
-  if (!value || typeof value !== 'object') return undefined
-  const v = (value as { [k: string]: unknown })[key]
-  return typeof v === 'string' ? v : undefined
-}
-
-function readNum(value: unknown, key: string): number {
-  if (!value || typeof value !== 'object') return 0
-  const v = (value as { [k: string]: unknown })[key]
-  return typeof v === 'number' ? v : 0
-}
-
-/** Map a widened `session.list` result into rows + the honesty flag. */
+/** Map a widened `session.list` result into rows + the honesty flag. Rows are decoded one at a time
+ * through the boundary schema (`SessionListItemSchema`, the single owner of the wire row shape); a
+ * row the schema rejects is dropped, the rest survive. */
 export function mapSessionRows(result: unknown): { rows: SessionRow[]; truncated: boolean } {
   if (!result || typeof result !== 'object') return { rows: [], truncated: false }
   const sessions = (result as { sessions?: unknown }).sessions
   const truncated = (result as { truncated?: unknown }).truncated === true
   if (!Array.isArray(sessions)) return { rows: [], truncated }
   const rows: SessionRow[] = []
-  for (const s of sessions) {
-    const id = readStr(s, 'id')
-    if (!id) continue
+  for (const raw of sessions) {
+    const s = decodeSessionListItem(raw)
+    if (!s || !s.id) continue
     const row: SessionRow = {
-      id,
-      lastActive: readNum(s, 'last_active') || readNum(s, 'started_at'),
-      messageCount: readNum(s, 'message_count'),
-      preview: readStr(s, 'preview') ?? '',
-      source: readStr(s, 'source') ?? '',
-      startedAt: readNum(s, 'started_at'),
-      title: readStr(s, 'title') ?? ''
+      id: s.id,
+      lastActive: s.last_active || s.started_at,
+      messageCount: s.message_count,
+      preview: s.preview,
+      source: s.source ?? '',
+      startedAt: s.started_at,
+      title: s.title
     }
-    const endedAt = readNum(s, 'ended_at')
-    if (endedAt) row.endedAt = endedAt
-    const model = readStr(s, 'model')
-    if (model) row.model = model
-    const cwd = readStr(s, 'cwd')
-    if (cwd) row.cwd = cwd
+    if (s.ended_at) row.endedAt = s.ended_at
+    if (s.model) row.model = s.model
+    if (s.cwd) row.cwd = s.cwd
     rows.push(row)
   }
   return { rows, truncated }
