@@ -25,9 +25,11 @@ REPO = Path(__file__).resolve().parents[2]
 CONTRACT = REPO / "apps" / "shared" / "src" / "gateway-events.json"
 GATEWAY_DIR = REPO / "tui_gateway"
 
-# Every helper whose first positional argument is the wire ``type``.
+# Every helper whose first positional argument is the wire ``type``. ``_event_frame`` covers frames
+# built ahead of transport I/O and delivered later (``methods_session_control``).
 _EMIT_HELPERS = (
-    "_emit", "_block", "_read_block", "_broadcast_global_event", "_voice_emit", "_pet_emit", "_emit_tool_lifecycle")
+    "_emit", "_block", "_read_block", "_broadcast_global_event", "_voice_emit", "_pet_emit", "_emit_tool_lifecycle",
+    "_event_frame")
 _LITERAL_EMIT = re.compile(r"\b(?:%s)\(\s*\"([a-z_][a-z0-9_.]*)\"" % "|".join(_EMIT_HELPERS))
 # ``{"type": "gateway.ready", ...}`` literal frames (entry.py / ws.py) and other
 # ``"type": "<name>"`` params written straight into an ``event`` frame.

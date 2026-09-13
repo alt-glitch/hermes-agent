@@ -337,6 +337,11 @@ export interface ApprovalRequestPayload {
   smart_denied?: boolean
 }
 
+export interface ApprovalResolvedPayload {
+  request_id: string
+  status: string
+}
+
 export interface SudoRequestPayload {
   request_id: string
 }
@@ -398,6 +403,7 @@ export interface TerminalClosePayload {
 export const BACKEND_EVENT_NAMES = [
   'agent.terminal.output',
   'approval.request',
+  'approval.resolved',
   'background.complete',
   'billing.step_up.verification',
   'bot_relay.outbox.pending',
@@ -408,6 +414,7 @@ export const BACKEND_EVENT_NAMES = [
   'clarify.expire',
   'clarify.request',
   'cron.changed',
+  'dashboard.new_session_requested',
   'error',
   'gateway.ready',
   'layout.apply',
@@ -457,6 +464,7 @@ export const BACKEND_EVENT_NAMES = [
   'status.update',
   'subagent.complete',
   'subagent.progress',
+  'subagent.reasoning',
   'subagent.spawn_requested',
   'subagent.start',
   'subagent.thinking',
@@ -495,6 +503,8 @@ export type BackendGatewayEventName = (typeof BACKEND_EVENT_NAMES)[number]
 export interface BackendGatewayEventMap {
   'agent.terminal.output': TerminalOutputPayload
   'approval.request': ApprovalRequestPayload
+  /** Terminal state of one approval request (`server._emit_approval_lifecycle`). */
+  'approval.resolved': ApprovalResolvedPayload
   'background.complete': SideAgentCompletePayload
   'billing.step_up.verification': BillingStepUpVerificationPayload
   'bot_relay.outbox.pending': Record<string, unknown>
@@ -505,6 +515,8 @@ export interface BackendGatewayEventMap {
   'clarify.expire': RequestExpirePayload
   'clarify.request': ClarifyRequestPayload
   'cron.changed': Record<string, unknown>
+  /** A hosted TUI asked the dashboard for a fresh chat (`methods_session.dashboard.new_session_requested`). */
+  'dashboard.new_session_requested': { reason?: string }
   error: ErrorPayload
   'gateway.ready': GatewayReadyPayload
   'layout.apply': Record<string, unknown>
@@ -555,6 +567,7 @@ export interface BackendGatewayEventMap {
   'status.update': StatusUpdatePayload
   'subagent.complete': SubagentEventPayload
   'subagent.progress': SubagentEventPayload
+  'subagent.reasoning': SubagentEventPayload
   'subagent.spawn_requested': SubagentEventPayload
   'subagent.start': SubagentEventPayload
   'subagent.thinking': SubagentEventPayload
@@ -593,7 +606,6 @@ export interface BackendGatewayEventMap {
  * state. Excluded from `gateway-events.json` on purpose.
  */
 export interface ClientLocalGatewayEventMap {
-  'dashboard.new_session_requested': { reason?: string }
   'gateway.protocol_error': { preview?: string }
   'gateway.reconnecting': { attempt?: number; delay_ms?: number }
   'gateway.start_timeout': { cwd?: string; python?: string; stderr_tail?: string }

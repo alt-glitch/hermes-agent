@@ -1,6 +1,7 @@
 [
   "agent.terminal.output",
   "approval.request",
+  "approval.resolved",
   "background.complete",
   "billing.step_up.verification",
   "bot_relay.outbox.pending",
@@ -11,6 +12,7 @@
   "clarify.expire",
   "clarify.request",
   "cron.changed",
+  "dashboard.new_session_requested",
   "error",
   "gateway.ready",
   "layout.apply",
@@ -60,6 +62,7 @@
   "status.update",
   "subagent.complete",
   "subagent.progress",
+  "subagent.reasoning",
   "subagent.spawn_requested",
   "subagent.start",
   "subagent.thinking",
