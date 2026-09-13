@@ -21,6 +21,11 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   own bounded lease and durable execution/claim heartbeats; don't confuse a
   healthy long tool call with permission to bypass ownership checks.
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
+- Every recurring occurrence is accounted for: `tick()` advances `next_run_at` BEFORE dispatch
+  (at-most-once across a mid-run crash) and stamps `pending_slot` in the same save; a scan that
+  finds the stamp with a dead owner restores the instant ONCE (`cron/occurrences.py`), the
+  executions ledger's `scheduled_instant` blocks a second fire, `cron.catch_up_missed: false`
+  skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
 - File lock `~/.hermes/cron/.tick.lock` prevents duplicate ticks across processes.
 - Jobs-store lock contention is bounded and fails closed; do not enter a foreign live
   transaction after timeout. A scheduler tick ledgers/submits gated workers before one
@@ -55,8 +60,11 @@ zero outside a kanban task (footprint ladder rung 3).
   notify-*, dispatch, daemon, gc`. Argparse alias dispatch must accept both `list` and `ls` (root).
 - **Toolset:** `tools/kanban_tools.py` — `kanban_show, kanban_complete, kanban_request_review,
   kanban_request_changes, kanban_block, kanban_heartbeat, kanban_comment, kanban_create, kanban_link,
-  kanban_attach, kanban_attach_url, kanban_attachments`; profiles enabling `kanban` outside a
-  dispatched task also get `kanban_list` and `kanban_unblock` for board routing.
+  kanban_attach, kanban_attach_url, kanban_attachments`; platforms whose saved selection enables
+  `kanban` (`hermes tools enable kanban --platform <p>`; default-off, in `CONFIGURABLE_TOOLSETS`) get
+  the full set plus `kanban_list`/`kanban_unblock` for board routing. The check_fn reads the schema
+  build's own selection (`tools/kanban_toolset_context.py`), never the legacy top-level `toolsets`
+  key alone.
 - **Dispatcher:** long-lived loop (default 60s) that reclaims stale claims, promotes ready tasks,
   atomically claims, and spawns assigned profiles. Runs **inside the gateway** by default
   (`kanban.dispatch_in_gateway: true`). Standalone: `plugins/kanban/systemd/hermes-kanban-dispatcher.service`.

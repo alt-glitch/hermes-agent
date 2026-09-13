@@ -187,7 +187,7 @@ def _typed_stop_phrase_response(rid, text):
     return _ok(rid, {"voice_stopped": True})
 
 
-_HOSTED_TASK_FIELDS = {"room_id", "task_id", "thread_id", "turn_id", "execution_generation"}
+_HOSTED_TASK_FIELDS = {"room_id", "task_id", "thread_id", "turn_id", "execution_generation", "member_id"}
 
 
 def _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback):
@@ -451,6 +451,7 @@ def _persist_session_row_for_submit(rid, sid, session):
                 "was not saved; repair state.db and try again")
         else:
             _persist_branch_seed(session)
+            return None
     except Exception as exc:
         from hermes_state_errors import is_disk_full_error
         if is_disk_full_error(exc):
@@ -460,13 +461,16 @@ def _persist_session_row_for_submit(rid, sid, session):
         else:
             logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
             error = _err(rid, 5071, f"session storage could not be written: {exc}")
-    if error is None:
-        return None
+    # No turn thread will start, so neither resume nor the busy queue may see
+    # this rejected prompt as live. Release the slot a turn would normally own
+    # and terminally settle any concurrently accepted inputs.
     with session["history_lock"]:
         session["running"] = False
         session["last_active"] = time.time()
+        session.pop("_hosted_room_task", None)
         failed_submission_ids = _settle_pending_input_ids_locked(session)
         _clear_inflight_turn(session)
+        _release_active_session_slot(session)
         if failed_submission_ids:
             try:
                 _emit_terminal_turn_error(
@@ -579,6 +583,10 @@ def _lock_in_submit_turn(
     return None, fields
 
 
+# Per-turn client surfaces that carry a model-bound note (session_notifications._surface_note).
+_CLIENT_SURFACES = frozenset({"hud", "voice-live"})
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -639,8 +647,13 @@ def _(rid, params: dict) -> dict:
         # leaves the session untouched.  The reason travels as machine-readable data.
         reason = getattr(limit_message, "reason", None)
         return _err(rid, 4090, str(limit_message), {"reason": reason} if reason else None)
-    # Rewritten every submit: a session alternates app window / HUD; stale "hud" misinforms.
-    session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
+    # Rewritten every submit: a session alternates app window / HUD / live voice; a stale value misinforms.
+    session["client_surface"] = params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""
+    # Live-voice delegations carry the recent spoken transcript for the MODEL INPUT only (the persisted
+    # user row stays the words the user said); anything else clears it.
+    voice_context = params.get("voice_context")
+    session["voice_live_context"] = (
+        voice_context[:6000] if session["client_surface"] == "voice-live" and isinstance(voice_context, str) else "")
     has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)
     if has_truncation and isinstance(text, str):
         # A rewind replays what the transcript shows: re-expand a skill invocation or

@@ -403,10 +403,10 @@ class GatewayGoalsMixin:
         if not claim_id:
             return
 
-        # The --until judge is a sync aux-LLM call — keep it off the event loop.
-        # Keep multiplexed profile credentials/context across the executor
-        # hop. Bare run_in_executor drops those contextvars and can make
-        # --until judging resolve the wrong auxiliary provider/account.
+        # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
+        # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
+        # so a served secondary's tick would be written into the DEFAULT profile's state.db and
+        # --until judging could resolve the wrong auxiliary provider/account.
         decision = await self._run_in_executor_with_context(
             lambda: mgr.complete_tick(final_response or "", claim_id)
         )

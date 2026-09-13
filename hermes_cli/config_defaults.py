@@ -627,8 +627,9 @@ DEFAULT_CONFIG = {
         # path.
         "in_place": True,
         # Per-model threshold overrides: keys substring-match the model name (longest wins), values
-        # replace the global `threshold`, e.g. {"glm-5.2": 0.40}. The <512K floor (0.75) still
-        # applies raise-only on top.
+        # replace the global `threshold`, e.g. {"glm-5.2": 0.40}. Prefix a key with "<provider>:" to
+        # scope it to one route ({"openai-codex:astra": 0.85} leaves Astra on OpenRouter/Nous at the
+        # global value). The <512K floor (0.75) still applies raise-only on top.
         "model_thresholds": {},
         # Opt-in idle compaction (0 = off): a session resuming after this many idle seconds compacts
         # up front, before the first reply. Time-based complement to `threshold`; skipped when
@@ -1115,6 +1116,19 @@ DEFAULT_CONFIG = {
     },
 
     "voice": {
+        # How the Desktop voice conversation is wired:
+        #   chained  — STT → Hermes turn → TTS (the stt.* / tts.* providers below)
+        #   gpt-live — one full-duplex voice model (OpenAI GPT-Live) owns the mic and speaker and
+        #              DELEGATES every real request to Hermes (any model / provider you have
+        #              selected); needs an OpenAI API key. $0.05/min voice layer billing.
+        "voice_chat_mode": "chained",
+        "gpt_live": {
+            "model": "gpt-live-1",
+            "voice": "marin",  # marin | quartz | ripple | vesper | willow | stone | gleam | meridian | ...
+            # Extra sentences appended to the live model's conversation persona (tone, pacing, language).
+            "instructions": "",
+            # optional "api_key" / "base_url" keys override the OpenAI audio credentials for this mode only
+        },
         "record_key": "ctrl+b",
         "submit_mode": "direct",  # TUI: direct submits immediately; draft = editable transcript
         "max_recording_seconds": 120,
@@ -1358,6 +1372,7 @@ DEFAULT_CONFIG = {
         # See #79686.
         "ledger": True,
     },
+
     # Curator — background maintenance of AGENT-CREATED skills (never hub-installed): marks
     # long-unused skills stale, archives (never deletes) obsolete ones, optionally consolidates
     # overlaps via a forked aux-model agent. Inactivity-triggered from session start, no cron
@@ -1366,8 +1381,8 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "interval_hours": 24 * 7,  # hours between runs
         "min_idle_hours": 2,  # only run after the agent has been idle this long
-        "stale_after_days": 30,  # mark "stale" after this many unused days
-        "archive_after_days": 90,  # move to skills/.archive/ (recoverable) after this many
+        "stale_after_days": 14,  # mark "stale" after this many unused days
+        "archive_after_days": 30,  # move to skills/.archive/ (recoverable) after this many
         # LLM consolidation (umbrella-building) pass. OFF = deterministic inactivity prune only, no
         # aux-model cost. `hermes curator run --consolidate` overrides once.
         "consolidate": False,
@@ -1478,7 +1493,7 @@ DEFAULT_CONFIG = {
     },
 
     "whatsapp": {
-        # reply_prefix: None = built-in "⚕ *Hermes Agent*" header; "" disables; \n allowed.
+        # reply_prefix: None = built-in "☤ *Hermes Agent*" header; "" disables; \n allowed.
     },
 
     "telegram": {
@@ -1618,6 +1633,7 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
         # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
         # created this way are user-owned in the same flat jobs table. Interactive toolsets
@@ -1689,6 +1705,10 @@ DEFAULT_CONFIG = {
         # (long TTS audio, big exports) need more than 30s. Env: HERMES_CRON_MEDIA_SEND_TIMEOUT.
         # Keep in sync with cron.scheduler._DEFAULT_MEDIA_SEND_TIMEOUT.
         "media_send_timeout_seconds": 300,
+        # Managed systemd gateway with no user session (containers, no linger): false runs
+        # cron jobs as a direct external subprocess (warns once; no cgroup isolation), true
+        # fails closed with the enable-linger remedy. Kanban always requires a scope.
+        "require_restart_safe_scope": False,
     },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
@@ -1886,8 +1906,6 @@ DEFAULT_CONFIG = {
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
-        # Named-profile allowlist for multiplex mode. None = serve all; [] = default only.
-        "multiplex_profile_allowlist": None,
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,
@@ -1929,6 +1947,19 @@ DEFAULT_CONFIG = {
         # (primary copy: state.db gateway_routing table). True for external tooling and downgrade
         # safety; False stops producing the file.
         "write_sessions_json": True,
+        # One gateway for every profile on this host: the DEFAULT profile's gateway also connects
+        # each named profile's bots (their own .env / config.yaml, per-profile secret scope) and
+        # stamps the profile into session keys. Flip with `hermes gateway migrate --multiplex`
+        # (records a rollback manifest; `--standalone` undoes it) or `hermes config set
+        # gateway.multiplex_profiles true` + `hermes gateway restart`. GATEWAY_MULTIPLEX_PROFILES
+        # in the environment overrides. Two profiles configuring the same bot token cannot be
+        # served together — the duplicate adapter is parked; `hermes profile create --clone`
+        # therefore leaves messaging channels behind unless --clone-channels is passed.
+        "multiplex_profiles": False,
+        # Route inbound chats of the default profile's bots to another profile
+        # (gateway/profile_routing.py): [{profile, platform, chat_id|user_id|guild_id|...}].
+        # Most-specific match wins; only read by the multiplexing default gateway.
+        "profile_routes": [],
         # Scale-to-zero idle TIMEOUT only. When an instance is opted in via the NAS "Labs" toggle
         # (HERMES_SCALE_TO_ZERO env stamp) AND messaging is relay-only/absent AND a wakeUrl is
         # registered, the relay transport goes dormant so the platform (e.g. Fly autostop) can
@@ -2367,7 +2398,7 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
-    "_config_version": 42,  # Config schema version - bump this when adding new required fields
+    "_config_version": 44,  # Config schema version - bump this when adding new required fields
 }
 
 
