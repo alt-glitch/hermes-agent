@@ -37,6 +37,7 @@ import {
   type SlashContext
 } from '../logic/slash.ts'
 import { normalizeSlashSearchQuery, scoreSlashMenuItem } from '../logic/slashFuzzy.ts'
+import { decodeCommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
 import { fuzzyFilter } from '../logic/fuzzy.ts'
 import type { SessionTabId } from '../logic/sessionPicker.ts'
 import { isWakeUserDisabled, setWakeUserDisabled } from '../logic/wake.ts'
@@ -187,12 +188,24 @@ describe('catalogCommandItems (slash-highlight boot seed — glitch 2026-06-14)'
       { text: '/q' }
     ])
   })
-  test('shape-defensive: junk / missing pairs → []', () => {
-    expect(catalogCommandItems(null)).toEqual([])
-    expect(catalogCommandItems({})).toEqual([])
-    expect(catalogCommandItems({ pairs: 'nope' })).toEqual([])
-    // skip non-array pairs, non-string names, and empty names
-    expect(catalogCommandItems({ pairs: [['/ok', 'd'], 42, [123, 'd'], ['', 'd'], []] })).toEqual([{ text: '/ok' }])
+  test('a cleared or decode-rejected catalog (undefined) seeds nothing', () => {
+    expect(catalogCommandItems(undefined)).toEqual([])
+  })
+  test('empty canonical names are skipped and aliases already present are not repeated', () => {
+    expect(
+      catalogCommandItems({
+        canon: { '/ok': '/ok' },
+        pairs: [
+          ['/ok', 'd'],
+          ['', 'd']
+        ]
+      })
+    ).toEqual([{ text: '/ok' }])
+  })
+  test('malformed wire rows are rejected by the boundary decoder before seeding', () => {
+    // Ownership: `decodeCommandsCatalogResponse` fails closed on a bad row, so
+    // `catalogCommandItems` never sees one (sessionCommandResponses.test.ts).
+    expect(catalogCommandItems(decodeCommandsCatalogResponse({ pairs: [['/ok', 'd'], 42] }))).toEqual([])
   })
 })
 

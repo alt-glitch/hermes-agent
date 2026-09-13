@@ -447,29 +447,25 @@ export function mapCompletions(result: unknown): CompletionItem[] {
   return out
 }
 
-/** Extract `{text}` items from a `commands.catalog` result for seeding the
- *  composer's slash-highlight catalog. Canonical rows come from `pairs`; aliases
- *  come from `canon` keys. Shape-defensive and de-duplicated. */
-export function catalogCommandItems(result: unknown): { text: string }[] {
-  if (!result || typeof result !== 'object') return []
-  const pairs = (result as { pairs?: unknown }).pairs
-  if (!Array.isArray(pairs)) return []
+/** Extract `{text}` items from a decoded `commands.catalog` result for seeding
+ *  the composer's slash-highlight catalog. Canonical rows come from `pairs`;
+ *  aliases come from `canon` keys. De-duplicated. Shape validation is owned by
+ *  `decodeCommandsCatalogResponse` at the gateway boundary; `undefined` is the
+ *  decode-rejected or cleared catalog and yields no items. */
+export function catalogCommandItems(catalog: CommandsCatalogResponse | undefined): { text: string }[] {
+  if (!catalog) return []
   const out: { text: string }[] = []
   const seen = new Set<string>()
-  for (const pair of pairs as unknown[]) {
-    const name = Array.isArray(pair) ? (pair as unknown[])[0] : undefined
-    if (typeof name === 'string' && name && !seen.has(name)) {
+  for (const [name] of catalog.pairs) {
+    if (name && !seen.has(name)) {
       seen.add(name)
       out.push({ text: name })
     }
   }
-  const canon = (result as { canon?: unknown }).canon
-  if (canon && typeof canon === 'object' && !Array.isArray(canon)) {
-    for (const name of Object.keys(canon)) {
-      if (name && !seen.has(name)) {
-        seen.add(name)
-        out.push({ text: name })
-      }
+  for (const name of Object.keys(catalog.canon ?? {})) {
+    if (name && !seen.has(name)) {
+      seen.add(name)
+      out.push({ text: name })
     }
   }
   return out
