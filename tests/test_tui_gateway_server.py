@@ -21119,15 +21119,23 @@ def test_notification_poller_delivers_completion(monkeypatch):
                 "messages": [{"role": "assistant", "content": "ok"}],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+    # The turn thread must NOT run inline: _run_prompt_submit starts it while holding
+    # _sessions_lock, and the turn's post-turn _drain_queued_prompt takes
+    # _mcp_reload_admission_lock -> _sessions_lock. Running it under _sessions_lock inverts
+    # that order against any real run thread leaked by an earlier test in this module and
+    # deadlocks the file (CI: SIGKILL at the per-file cap). Defer the body until the poller
+    # loop has returned and the registry lock is free.
+    deferred_turns = []
+
+    class _DeferredThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
             self._target = target
         def start(self):
-            self._target()
+            deferred_turns.append(self._target)
 
     sess = _session(agent=_Agent())
     server._sessions["sid_poll"] = sess
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server.threading, "Thread", _DeferredThread)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -21159,6 +21167,8 @@ def test_notification_poller_delivers_completion(monkeypatch):
 
     try:
         server._notification_poller_loop(stop, "sid_poll", sess)
+        for run_turn in deferred_turns:
+            run_turn()
 
         # The concise status remains non-transcript chrome, while the complete
         # model prompt is available from the expandable process card.
@@ -21192,15 +21202,19 @@ def test_notification_poller_skips_consumed(monkeypatch):
             turns.append(prompt)
             return {"final_response": "ok", "messages": []}
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+    # Same deferral as test_notification_poller_delivers_completion: never run the turn
+    # body inline under _sessions_lock.
+    deferred_turns = []
+
+    class _DeferredThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
             self._target = target
         def start(self):
-            self._target()
+            deferred_turns.append(self._target)
 
     sess = _session(agent=_Agent())
     server._sessions["sid_skip"] = sess
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server.threading, "Thread", _DeferredThread)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -21226,6 +21240,8 @@ def test_notification_poller_skips_consumed(monkeypatch):
 
     try:
         server._notification_poller_loop(stop, "sid_skip", sess)
+        for run_turn in deferred_turns:
+            run_turn()
         assert len(turns) == 0
     finally:
         server._sessions.pop("sid_skip", None)

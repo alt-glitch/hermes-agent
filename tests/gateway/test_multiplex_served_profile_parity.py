@@ -105,8 +105,11 @@ def test_loop_completion_persists_into_the_served_profiles_store(served):
         mgr = LoopManager(session_id=entry.session_id)
         mgr.set("check", interval_seconds=300, route={"platform": "telegram", "chat_id": "1001", "profile": "alpha"})
         assert mgr.fire_tick()
+        # This fork binds completion to the persisted wakeup claim: only the turn carrying the
+        # tick's claim_id may complete it (gateway/run_goals.py), so pass it like the real hop does.
         asyncio.run(runner._post_turn_loop_completion(
-            session_entry=entry, source=_alpha_source(), final_response="done"))
+            session_entry=entry, source=_alpha_source(), final_response="done",
+            claim_id=mgr.state.claim_id))
 
     def loop_row(home):
         import sqlite3

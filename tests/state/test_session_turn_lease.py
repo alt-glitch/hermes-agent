@@ -498,11 +498,13 @@ def test_turn_lease_revives_expired_row_still_owned_by_writer(tmp_path):
 
     assert db.try_acquire_session_turn_lease("shared", holder, ttl_seconds=0.05)
     time.sleep(0.12)
+    # The renewal TTL only has to outlive the contender's acquire below; 0.2s is inside
+    # scheduler jitter on a loaded 2-worker CI runner and made this assertion flaky.
     assert db.append_messages_batch(
         "shared",
         [{"role": "assistant", "content": "after ttl"}],
         turn_lease_holder=holder,
-        turn_lease_ttl_seconds=0.2,
+        turn_lease_ttl_seconds=5.0,
     ) == 1
     assert not db.try_acquire_session_turn_lease(
         "shared", f"pid={os.getpid()}:turn=contender", ttl_seconds=5
