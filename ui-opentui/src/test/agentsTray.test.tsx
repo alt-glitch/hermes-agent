@@ -334,7 +334,7 @@ describe('agents tray — Enter opens the dashboard preselected', () => {
       const frame = await h.probe.waitForFrame(f => f.includes('Spawn tree'))
       expect(h.store.state.dashboard).toBe(true)
       expect(h.store.state.dashboardAgent).toBe('a2')
-      expect(frame).toMatch(/2 ● compile Y/) // master list contains the requested row
+      expect(frame).toMatch(/2\s+● compile Y/) // master list contains the requested row
       expect(h.submitted).toEqual([]) // Enter opened the dashboard, no submit
     } finally {
       h.probe.destroy()

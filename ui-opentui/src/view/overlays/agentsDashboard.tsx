@@ -33,6 +33,7 @@ import {
   AGENTS_SORT_ORDER,
   cycleDashboardValue,
   dashboardWindow,
+  dashboardTreePaths,
   prepareDashboardRows,
   selectedDashboardIndex,
   snapshotDashboardAgents,
@@ -236,6 +237,8 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   const [masterHeight, setMasterHeight] = createSignal(0)
   const [sections, setSections] = createSignal<Readonly<Record<string, boolean>>>({})
   const [showKeys, setShowKeys] = createSignal(false)
+  const [timelineExpanded, setTimelineExpanded] = createSignal(false)
+  const [collapsed, setCollapsed] = createSignal<ReadonlySet<string>>(new Set())
   let rootRef: BoxRenderable | undefined
   let masterRef: BoxRenderable | undefined
   let detailScroll: ScrollBoxRenderable | undefined
@@ -257,15 +260,18 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   const tree = createMemo(() => buildSubagentTree(agents()))
   const totals = createMemo(() => treeTotals(tree()))
   const widths = createMemo(() => widthByDepth(tree()))
-  const rows = createMemo(() => prepareDashboardRows(agents(), sort(), filter()))
+  const paths = createMemo(() => dashboardTreePaths(tree()))
+  const treeView = () => sort() === 'depth-first' && filter() === 'all'
+  const rows = createMemo(() => prepareDashboardRows(agents(), sort(), filter(), collapsed()))
   const selectedIndex = createMemo(() => selectedDashboardIndex(rows(), selectedId()))
   const selected = createMemo(() => {
     const index = selectedIndex()
     return index < 0 ? undefined : rows()[index]
   })
   const wide = () => dims().width >= 110
-  const listWidth = () => (wide() ? Math.min(52, Math.floor(dims().width * 0.4)) : Math.max(12, dims().width - 4))
-  const showTimeline = () => dims().width >= 78 && dims().height >= 26
+  const split = () => wide() && mode() !== 'list'
+  const listWidth = () => (split() ? Math.min(52, Math.floor(dims().width * 0.4)) : Math.max(12, dims().width - 4))
+  const showTimeline = () => timelineExpanded() && dims().width >= 78 && dashboardHeight() >= 26
   const timelineRows = () => Math.min(4, rows().length)
   const listCapacity = () => Math.max(1, Math.floor((masterHeight() - 1) / 2))
   // Terminal dimensions include chrome owned by the parent. Size help from the
@@ -315,9 +321,9 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       history().snapshots.length > 0
         ? ` · [ / ] history ${String(historyIndex())}/${String(history().snapshots.length)}`
         : ''
-    const full = `↑↓/jk move · g/G top/bottom · Enter/→ detail · t tail · e steer${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · ? keys · q close`
-    const medium = `↑↓ move · Enter detail · t tail · e steer · s/f view${locked} · ? keys · q close`
-    const compact = `↑↓ move · Enter open · ? keys · q close${replayMode() ? ' · controls locked' : ''}`
+    const full = `↑↓/jk move · ←/→ fold · Enter detail · t tail · e steer${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · v timeline · ? keys · q close`
+    const medium = `↑↓ move · ←/→ fold · Enter inspect · t tail · e steer · s/f view · v timeline · ? keys · q close${replayMode() ? ' · controls locked' : ''}`
+    const compact = `↑↓ move · ←/→ fold · Enter open · ? keys · q close${replayMode() ? ' · controls locked' : ''}`
     const tiny = `↑↓ · Enter open · ? keys · q close`
     const available = Math.max(8, dims().width - 4)
     const footer =
@@ -429,6 +435,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
     setLastTurn(false)
     setMode('list')
     setSelectedId(undefined)
+    setCollapsed(new Set<string>())
     setFlash(next === 0 ? 'live turn' : `replay · ${String(next)}/${String(history().snapshots.length)}`)
   }
 
@@ -527,6 +534,21 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   function scrollDetail(delta: number): void {
     setFollowing(false)
     detailScroll?.scrollBy(delta)
+  }
+
+  function foldBranch(expand: boolean): void {
+    const node = selected()
+    if (!node || !treeView()) return
+    const id = node.item.id
+    if (expand) {
+      if (collapsed().has(id)) setCollapsed(current => new Set([...current].filter(value => value !== id)))
+      else if (node.children[0]) setSelectedId(node.children[0].item.id)
+    } else if (node.children.length > 0 && !collapsed().has(id)) {
+      setCollapsed(current => new Set([...current, id]))
+    } else {
+      const parent = paths().get(id)?.ancestors.at(-1)
+      if (parent) setSelectedId(parent)
+    }
   }
 
   useKeyboard(key => {
@@ -636,7 +658,10 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       return
     }
 
-    if ((key.name === 'return' || key.name === 'right' || key.name === 'l') && selected() !== undefined) {
+    if (key.name === 'v') setTimelineExpanded(current => !current)
+    else if (key.name === 'left' || key.name === 'h') foldBranch(false)
+    else if (key.name === 'right' || key.name === 'l') foldBranch(true)
+    else if (key.name === 'return' && selected() !== undefined) {
       setMode('detail')
     } else if (key.name === 'up' || key.name === 'k') moveSelection(-1)
     else if (key.name === 'down' || key.name === 'j') moveSelection(1)
@@ -681,7 +706,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                 >
                   <text wrapMode="word" fg={theme().color.text}>
                     {
-                      'Keys · Tab: list/detail · ↑↓/jk: move/scroll · PgUp/PgDn: page · Home/g: top · End/G: bottom\n[ older · ] newer/live · Enter/→/l: detail · Esc/←/h: back · q: close\nDetail: r reasoning · a activity · t tools · o output · b budget · d details · e trace · f files · n progress · L follow/bottom\nList: s sort · f filter · x kill agent · X kill subtree · p pause/resume spawning (does not pause running agents)'
+                      'Keys · Tab: list/detail · ↑↓/jk: move/scroll · PgUp/PgDn: page · Home/g: top · End/G: bottom\nTree: ←/h fold or parent · →/l expand or child · Enter detail · Esc back · q close\n[ older · ] newer/live · v timeline · t tail · e steer\nDetail: r reasoning · a activity · t tools · o output · b budget · d details · e trace · f files · n progress · L follow/bottom\nList: s sort · f filter (filtered/sorted views unfold branches) · x kill agent · X kill subtree · p pause/resume spawning (does not pause running agents)'
                     }
                   </text>
                 </scrollbox>
@@ -702,6 +727,22 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                     models · {truncRight(mix(), Math.max(8, dims().width - 13))}
                   </text>
                 )}
+              </Show>
+              <Show when={mode() === 'list' && selected()}>
+                {node => (
+                  <text height={1} flexShrink={0} wrapMode="none" fg={theme().color.label}>
+                    {truncRight(
+                      `${node().item.parentId ?? 'root'} → ${node().item.id} · depth ${paths().get(node().item.id)?.ancestors.length ?? 0}${node().item.parentId && !agents().some(agent => agent.id === node().item.parentId) ? ' · parent unavailable' : ''}`,
+                      Math.max(8, dims().width - 6)
+                    )}
+                  </text>
+                )}
+              </Show>
+              <Show when={!treeView()}>
+                <text height={1} flexShrink={0} wrapMode="none" fg={theme().color.muted}>
+                  View: {AGENTS_SORT_LABEL[sort()]} / {AGENTS_FILTER_LABEL[filter()]} · branches unfolded; parent IDs
+                  retained
+                </text>
               </Show>
             </box>
 
@@ -738,9 +779,9 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                       if (master !== undefined && !master.isDestroyed) setMasterHeight(master.height)
                     })
                   }}
-                  visible={wide() || mode() === 'list'}
+                  visible={split() || mode() === 'list'}
                   flexDirection="column"
-                  flexGrow={wide() ? 0 : 1}
+                  flexGrow={split() ? 0 : 1}
                   flexShrink={0}
                   minHeight={0}
                   width={listWidth()}
@@ -770,6 +811,13 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                             }}
                             peak={peak()}
                             width={Math.max(10, listWidth() - 2)}
+                            treePath={treeView() ? paths().get(id) : undefined}
+                            collapsed={collapsed().has(id)}
+                            overview={mode() === 'list'}
+                            onToggle={() => {
+                              setSelectedId(id)
+                              foldBranch(collapsed().has(id))
+                            }}
                           />
                         )}
                       </Show>
@@ -784,16 +832,16 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                 </box>
                 <box
                   id="agents-detail"
-                  visible={wide() || mode() !== 'list'}
+                  visible={mode() !== 'list'}
                   flexDirection="column"
                   flexGrow={1}
                   minHeight={0}
                   minWidth={0}
                   paddingLeft={1}
-                  border={wide() ? ['left'] : []}
+                  border={split() ? ['left'] : []}
                   borderColor={theme().color.border}
                 >
-                  <Show when={!wide()}>
+                  <Show when={mode() !== 'list'}>
                     <text
                       height={1}
                       flexShrink={0}
@@ -804,7 +852,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                       ← Back to agents
                     </text>
                   </Show>
-                  <Show when={selected()}>
+                  <Show when={mode() !== 'list' && selected()}>
                     {node => (
                       <Show
                         when={mode() === 'tail' && !replayMode()}

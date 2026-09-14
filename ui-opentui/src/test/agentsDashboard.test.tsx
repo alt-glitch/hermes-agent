@@ -38,12 +38,13 @@ describe('agents message-first native view', () => {
     store.apply({ type: 'subagent.complete', payload: { subagent_id: 'a1', summary: '**Verified** release report' } })
     const probe = await renderProbe(node, { width: 132, height: 32 })
     try {
+      probe.keys.pressEnter()
+      await probe.settle()
       expect(probe.frame()).toContain('Messages')
       expect(probe.frame()).toContain('▸ Tool calls')
       expect(probe.frame()).not.toContain('PRIVATE_TOOL_DIAGNOSTIC')
       const markdown = descendants(probe.renderer.root).filter(item => item instanceof MarkdownRenderable)
       expect(markdown.filter(item => item.content === '**Verified** release report')).toHaveLength(1)
-      probe.keys.pressEnter()
       probe.keys.pressKey('t')
       await probe.settle()
       expect(probe.frame()).toContain('PRIVATE_TOOL_DIAGNOSTIC')
@@ -60,6 +61,8 @@ describe('agents message-first native view', () => {
     })
     const probe = await renderProbe(node, { width: 132, height: 34 })
     try {
+      probe.keys.pressEnter()
+      await probe.settle()
       const reply = descendants(probe.renderer.root).find(
         item => item instanceof MarkdownRenderable && item.content.startsWith('# Release')
       )

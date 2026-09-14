@@ -135,19 +135,38 @@ platform-specific artifacts or bundled npm tarballs.
 
 ## Live agents
 
-The dock above the composer appears while child agents are active. It hydrates
+The dock below the composer appears while child agents are active. It hydrates
 from the session-scoped live roster as well as streamed events, so reconnecting
 does not hide children that are still working. Finished work remains available
 through the existing `/agents` replay history.
 
 - Ctrl+T opens the agent roster without clearing the composer draft; Esc returns.
+- Down from an empty composer focuses a bounded active-agent list. Up/Down and
+  the mouse wheel keep the selected agent visible, even with hundreds of children.
 - F7 collapses or restores the persistent dock.
+- The roster opens as a full-width ownership tree. Left folds a branch (or moves
+  to its parent); Right expands it (or moves to its first child). Clicking an
+  already-selected branch also toggles it. Parent IDs and spawn times remain
+  visible independently of deep indentation.
+- Enter opens the selected agent's messages/details; Esc returns to the tree
+  without losing selection or folded branches. At wide sizes, inspection keeps
+  a compact tree beside the messages. The live pane is not mounted in tree mode.
+- v toggles the timeline. Sorted/filtered views unfold branches so matching
+  descendants remain discoverable; returning to the tree restores its folds.
 - In the roster, t opens the selected child’s bounded live transcript tail and
   e opens its steering form.
 - Enter in the steering form queues guidance for the next tool boundary. A
   “queued” acknowledgement does not claim that the child consumed it.
 - Existing detail, sort/filter, pause, interrupt, timeline, and replay controls
   remain available.
+
+For a gateway-free, synthetic 223-agent navigation check:
+
+```sh
+node scripts/build.mjs scripts/agent-navigation.tsx .accept-agents
+node --experimental-ffi --no-warnings .accept-agents/agent-navigation.js
+# Add --tree to start directly on a deep ownership branch.
+```
 
 ## Local UX contracts
 

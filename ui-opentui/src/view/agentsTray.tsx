@@ -29,6 +29,8 @@ import { delegationTaskPrefix } from '../logic/delegationLabels.ts'
 import type { SubagentInfo } from '../logic/store.ts'
 import { isRunning, normalizeSubagentStatus } from '../logic/subagentTree.ts'
 import { elapsedSeconds, useElapsedTick } from './elapsed.ts'
+import { useDimensions } from './dimensions.tsx'
+import { dashboardWindow } from './overlays/agents/model.ts'
 import { useTheme } from './theme.tsx'
 
 /** What the App binds to hand the tray keyboard focus (composer Down). */
@@ -89,10 +91,27 @@ export function AgentsTray(props: {
   bind?: ((api: AgentsTrayApi) => void) | undefined
 }) {
   const running = createMemo(() => props.subagents.filter(isTrayAgent))
+  const dims = useDimensions()
   const [focused, setFocused] = createSignal(false)
-  const [sel, setSel] = createSignal(0)
-  // Clamp against a shrinking list (an agent above the selection completing).
-  const selected = () => Math.min(sel(), Math.max(0, running().length - 1))
+  const [selectedId, setSelectedId] = createSignal<string>()
+  const [height, setHeight] = createSignal(2)
+  let previousIndex = 0
+  const selected = createMemo(() => {
+    const index = running().findIndex(agent => agent.id === selectedId())
+    return index < 0 ? Math.min(previousIndex, Math.max(0, running().length - 1)) : index
+  })
+  createEffect(() => {
+    previousIndex = selected()
+    setSelectedId(running()[previousIndex]?.id)
+  })
+  // Leave room for the composer and transcript; use settled native height for
+  // the mounted window, including when an ancestor constrains the allocation.
+  const expandedHeight = () => Math.min(running().length + 1, Math.max(2, Math.floor(dims().height / 2)))
+  const visible = createMemo(() => dashboardWindow(running(), selected(), Math.max(1, height() - 1)))
+  const move = (delta: number) => {
+    const index = Math.max(0, Math.min(running().length - 1, selected() + delta))
+    setSelectedId(running()[index]?.id)
+  }
   let boxRef: BoxRenderable | undefined
 
   // First-seen wall clock per agent id — the subagent stream carries no start
@@ -113,7 +132,7 @@ export function AgentsTray(props: {
   props.bind?.({
     focusTray: () => {
       if (running().length === 0 || !boxRef) return false
-      setSel(0)
+      setSelectedId(running()[0]?.id)
       setFocused(true)
       boxRef.focus()
       return true
@@ -133,10 +152,10 @@ export function AgentsTray(props: {
     // defaultPrevented: the Down that HANDED us focus was consumed by the composer.
     if (!focused() || key.defaultPrevented) return
     if (key.name === 'up') {
-      setSel(Math.max(0, selected() - 1))
+      move(-1)
       key.preventDefault()
     } else if (key.name === 'down') {
-      setSel(Math.min(running().length - 1, selected() + 1))
+      move(1)
       key.preventDefault()
     } else if (key.name === 'return') {
       const sa = running()[selected()]
@@ -158,9 +177,32 @@ export function AgentsTray(props: {
   // focus to the same box and swaps in the existing full inspector rows.
   return (
     <Show when={running().length > 0}>
-      <box ref={attach} focusable style={{ flexDirection: 'column', flexShrink: 0 }}>
+      <box
+        ref={attach}
+        onSizeChange={() => {
+          const box = boxRef
+          queueMicrotask(() => {
+            if (box && !box.isDestroyed) setHeight(box.height)
+          })
+        }}
+        onMouseScroll={event => {
+          if (!focused()) return
+          event.preventDefault()
+          event.stopPropagation()
+          if (event.scroll?.direction === 'up') move(-1)
+          else if (event.scroll?.direction === 'down') move(1)
+        }}
+        focusable
+        height={focused() ? expandedHeight() : 'auto'}
+        style={{ flexDirection: 'column', flexShrink: 1, minHeight: focused() ? 2 : 0 }}
+      >
         <Show when={focused()} fallback={<CompactTrayRows agents={running()} collapsed={props.collapsed === true} />}>
-          <TrayRows agents={running()} selected={selected()} firstSeen={firstSeen} />
+          <TrayRows
+            agents={visible().rows}
+            selected={selected() - visible().start}
+            firstSeen={firstSeen}
+            position={`${selected() + 1}/${running().length}`}
+          />
         </Show>
       </box>
     </Show>
@@ -215,7 +257,12 @@ function CompactTrayRows(props: { agents: SubagentInfo[]; collapsed: boolean }) 
 
 /** The expanded rows — split out so the 1s elapsed tick is only subscribed while
  *  the tray is focused (the `<Show>` scope owns the subscription's onCleanup). */
-function TrayRows(props: { agents: SubagentInfo[]; selected: number; firstSeen: Map<string, number> }) {
+function TrayRows(props: {
+  agents: readonly SubagentInfo[]
+  selected: number
+  firstSeen: Map<string, number>
+  position: string
+}) {
   const theme = useTheme()
   const tick = useElapsedTick()
   return (
@@ -223,6 +270,8 @@ function TrayRows(props: { agents: SubagentInfo[]; selected: number; firstSeen: 
       style={{
         backgroundColor: theme().color.completionBg,
         flexDirection: 'column',
+        minHeight: 0,
+        overflow: 'hidden',
         paddingLeft: 1,
         paddingRight: 1
       }}
@@ -235,6 +284,9 @@ function TrayRows(props: { agents: SubagentInfo[]; selected: number; firstSeen: 
           const status = () => normalizeSubagentStatus(sa.status)
           return (
             <box
+              id={`agent-tray-row-${sa.id}`}
+              height={1}
+              flexShrink={0}
               style={{
                 backgroundColor: active() ? theme().color.completionCurrentBg : theme().color.completionBg
               }}
@@ -255,8 +307,8 @@ function TrayRows(props: { agents: SubagentInfo[]; selected: number; firstSeen: 
           )
         }}
       </For>
-      <text selectable={false} fg={theme().color.muted}>
-        ↑/↓ select · Enter inspect · Esc back
+      <text height={1} flexShrink={0} wrapMode="none" selectable={false} fg={theme().color.muted}>
+        ↑/↓ · Enter inspect · Esc back · {props.position}
       </text>
     </box>
   )

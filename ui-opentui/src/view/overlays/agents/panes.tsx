@@ -16,7 +16,7 @@ import { delegationTaskPrefix } from '../../../logic/delegationLabels.ts'
 import type { Theme } from '../../../logic/theme.ts'
 import { truncRightCells as truncRight } from '../../../logic/truncate.ts'
 import { useTheme } from '../../theme.tsx'
-import type { DashboardAgent, DashboardOutputEntry } from './model.ts'
+import type { DashboardAgent, DashboardOutputEntry, DashboardTreePath } from './model.ts'
 import { snapshotDashboardAgents } from './model.ts'
 import { AgentMessages } from './messages.tsx'
 import { agentElapsed } from './timeline.tsx'
@@ -59,6 +59,10 @@ export function AgentListRow(props: {
   readonly onSelect: () => void
   readonly peak: number
   readonly width: number
+  readonly treePath?: DashboardTreePath | undefined
+  readonly collapsed?: boolean
+  readonly onToggle?: () => void
+  readonly overview?: boolean
 }) {
   const theme = useTheme()
   const visual = createMemo(() => statusVisual(props.node.item.status, theme()))
@@ -83,7 +87,12 @@ export function AgentListRow(props: {
     const paren = value.indexOf('(')
     return truncRight((paren > 0 ? value.slice(0, paren) : value).trim(), 14)
   })
-  const goalBudget = createMemo(() => Math.max(8, props.width - 10 - Math.min(4, props.node.item.depth) * 2))
+  const branch = createMemo(() => {
+    const prefix = props.treePath?.prefix ?? ''
+    const budget = Math.max(2, Math.floor(props.width / 4))
+    return prefix.length > budget ? `…${prefix.slice(-(budget - 1))}` : prefix
+  })
+  const goalBudget = createMemo(() => Math.max(8, props.width - 12 - branch().length))
   const tools = createMemo(() =>
     props.node.aggregate.totalTools > 0 ? ` ·${String(props.node.aggregate.totalTools)}t` : ''
   )
@@ -112,14 +121,20 @@ export function AgentListRow(props: {
       <text
         bg={props.active ? theme().color.selectionBg : 'transparent'}
         fg={props.active ? theme().color.accent : theme().color.text}
-        onMouseDown={props.onSelect}
+        onMouseDown={() => {
+          if (props.active && props.treePath && props.node.children.length > 0) props.onToggle?.()
+          else props.onSelect()
+        }}
         wrapMode="none"
       >
         <span style={{ fg: props.active ? theme().color.accent : theme().color.muted }}>
           {' '}
           {rowId(props.absoluteIndex)}{' '}
         </span>
-        <span style={{ fg: theme().color.muted }}>{'  '.repeat(Math.min(4, Math.max(0, props.node.item.depth)))}</span>
+        <span style={{ fg: theme().color.muted }}>{branch()}</span>
+        <span style={{ fg: theme().color.accent }}>
+          {props.treePath && props.node.children.length > 0 ? (props.collapsed ? '▸ ' : '▾ ') : '  '}
+        </span>
         <Show when={heat()}>{color => <span style={{ fg: color() }}>▍</span>}</Show>
         <span style={{ fg: props.active ? theme().color.accent : visual().color }}>{visual().glyph} </span>
         <span style={{ fg: props.active ? theme().color.accent : theme().color.text }}>
@@ -132,7 +147,9 @@ export function AgentListRow(props: {
       </text>
       <text fg={theme().color.muted} wrapMode="none" bg={props.active ? theme().color.selectionBg : 'transparent'}>
         {truncRight(
-          `    ${normalizeSubagentStatus(props.node.item.status)} · ${agentElapsed(props.node.item, props.nowMs) === undefined ? 'elapsed ?' : fmtDuration(agentElapsed(props.node.item, props.nowMs) ?? 0)}${tools()} · ${activity()}`,
+          props.overview
+            ? `    ${props.node.item.id} ← ${props.node.item.parentId ?? 'root'} · ${normalizeSubagentStatus(props.node.item.status)} · started ${props.node.item.startedAt === undefined ? '?' : new Date(props.node.item.startedAt).toLocaleTimeString()} · ${agentElapsed(props.node.item, props.nowMs) === undefined ? 'elapsed ?' : fmtDuration(agentElapsed(props.node.item, props.nowMs) ?? 0)}`
+            : `    ${normalizeSubagentStatus(props.node.item.status)} · ${agentElapsed(props.node.item, props.nowMs) === undefined ? 'elapsed ?' : fmtDuration(agentElapsed(props.node.item, props.nowMs) ?? 0)}${tools()} · ${activity()}`,
           props.width
         )}
       </text>
@@ -275,6 +292,16 @@ export function AgentDetail(props: {
         >
           <Markdown text={agent().goal} />
           <box style={{ flexDirection: 'column', marginTop: 1 }}>
+            <Field name="agent id" value={agent().id} width={props.width} />
+            <Field name="spawned by" value={agent().parentId ?? 'root (no parent reported)'} width={props.width} />
+            <Field
+              name="started"
+              value={agent().startedAt === undefined ? 'unknown' : new Date(agent().startedAt ?? 0).toLocaleString()}
+              width={props.width}
+            />
+            <Show when={agent().delegationId}>
+              {id => <Field name="delegation" value={id()} width={props.width} />}
+            </Show>
             <Field
               name="depth"
               value={`${String(agent().depth)} · ${normalizeSubagentStatus(agent().status)}`}
