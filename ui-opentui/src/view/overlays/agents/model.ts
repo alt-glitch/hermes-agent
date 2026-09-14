@@ -287,10 +287,41 @@ function matchesFilter(node: SubagentNode<DashboardAgent>, filter: AgentsFilterM
 export function prepareDashboardRows(
   agents: readonly DashboardAgent[],
   sort: AgentsSortMode,
-  filter: AgentsFilterMode
+  filter: AgentsFilterMode,
+  collapsed: ReadonlySet<string> = new Set()
 ): readonly SubagentNode<DashboardAgent>[] {
   const roots = [...buildSubagentTree(agents)].sort(SORT_COMPARATORS[sort])
-  return flattenTree(roots).filter(node => matchesFilter(node, filter))
+  // Filtered views must still find matching descendants of folded branches.
+  if (sort !== 'depth-first' || filter !== 'all') return flattenTree(roots).filter(node => matchesFilter(node, filter))
+  const rows: SubagentNode<DashboardAgent>[] = []
+  const visit = (node: SubagentNode<DashboardAgent>) => {
+    rows.push(node)
+    if (!collapsed.has(node.item.id)) node.children.forEach(visit)
+  }
+  roots.forEach(visit)
+  return rows
+}
+
+export interface DashboardTreePath {
+  readonly ancestors: readonly string[]
+  readonly prefix: string
+}
+
+/** Derive geometry from canonical edges, never from the reported depth or a
+ * filtered/sorted row's position. Missing/cyclic parents remain honest roots. */
+export function dashboardTreePaths(
+  roots: readonly SubagentNode<DashboardAgent>[]
+): ReadonlyMap<string, DashboardTreePath> {
+  const paths = new Map<string, DashboardTreePath>()
+  const visit = (nodes: readonly SubagentNode<DashboardAgent>[], ancestors: readonly string[], stems: string) => {
+    nodes.forEach((node, index) => {
+      const last = index === nodes.length - 1
+      paths.set(node.item.id, { ancestors, prefix: ancestors.length === 0 ? '' : `${stems}${last ? '└─' : '├─'}` })
+      visit(node.children, [...ancestors, node.item.id], ancestors.length === 0 ? '' : `${stems}${last ? '  ' : '│ '}`)
+    })
+  }
+  visit(roots, [], '')
+  return paths
 }
 
 export function cycleDashboardValue<T>(order: readonly T[], current: T): T {

@@ -273,7 +273,7 @@ describe('native agents dashboard parity', () => {
       probe.keys.pressEscape()
       await probe.settle()
       expect(probe.frame()).toContain('Enter')
-      probe.keys.pressArrow('right')
+      probe.keys.pressEnter()
       await probe.settle()
       expect(probe.frame()).toContain('Esc back')
       probe.keys.pressArrow('left')
@@ -633,18 +633,25 @@ describe('native agents dashboard parity', () => {
 
   test('captureCharFrame renders a nested bounded tree, metrics, and timeline', async () => {
     const delegation = { ...createDelegationState(), maxConcurrentChildren: 4, maxSpawnDepth: 3 }
-    const frame = await captureFrame(dashboardNode({ delegation }), {
+    const probe = await renderProbe(dashboardNode({ delegation }), {
       height: 34,
-      until: 'Spawn tree',
       width: 124
     })
-    expect(frame).toContain('Spawn tree')
-    expect(frame).toContain('Timeline')
-    expect(frame).toContain('Research the release blockers')
-    expect(frame).toContain('Audit native platform artifacts')
-    expect(frame).toContain('Probe the unavailable mirror')
-    expect(frame).toContain('caps d3/4')
-    expect(frame).toContain('sonnet-5×1')
+    try {
+      expect(probe.frame()).not.toContain('Timeline')
+      probe.keys.pressKey('v')
+      await probe.settle()
+      const frame = probe.frame()
+      expect(frame).toContain('Spawn tree')
+      expect(frame).toContain('Timeline')
+      expect(frame).toContain('Research the release blockers')
+      expect(frame).toContain('Audit native platform artifacts')
+      expect(frame).toContain('Probe the unavailable mirror')
+      expect(frame).toContain('caps d3/4')
+      expect(frame).toContain('sonnet-5×1')
+    } finally {
+      probe.destroy()
+    }
   })
 
   test('timeline keeps simultaneous fan-outs as distinct lanes with a scaled ruler', async () => {
@@ -660,21 +667,27 @@ describe('native agents dashboard parity', () => {
         status: 'completed'
       })
     ]
-    const frame = await captureFrame(dashboardNode({ subagents: simultaneous }), {
+    const probe = await renderProbe(dashboardNode({ subagents: simultaneous }), {
       height: 34,
-      until: 'Timeline',
       width: 116
     })
-    const lanes = frame.split('\n').filter(line => line.includes('╺'))
-    const ruler = frame.split('\n').find(line => line.includes('0─'))
-    const labels = frame.split('\n').find(line => /┤\s+42s/.test(line))
+    try {
+      probe.keys.pressKey('v')
+      await probe.settle()
+      const frame = probe.frame()
+      const lanes = frame.split('\n').filter(line => line.includes('╺'))
+      const ruler = frame.split('\n').find(line => line.includes('0─'))
+      const labels = frame.split('\n').find(line => /┤\s+42s/.test(line))
 
-    expect(lanes).toHaveLength(4)
-    expect(lanes.slice(0, 3).every(line => line.includes('●'))).toBe(true)
-    expect(lanes.some(line => line.includes('✓'))).toBe(true)
-    expect(frame).not.toContain('██')
-    expect(ruler).toBeDefined()
-    expect(labels).toBeDefined()
+      expect(lanes).toHaveLength(4)
+      expect(lanes.slice(0, 3).every(line => line.includes('●'))).toBe(true)
+      expect(lanes.some(line => line.includes('✓'))).toBe(true)
+      expect(frame).not.toContain('██')
+      expect(ruler).toBeDefined()
+      expect(labels).toBeDefined()
+    } finally {
+      probe.destroy()
+    }
   })
 
   test('the 132-column control footer stays whole inside its border and padding', async () => {
@@ -889,12 +902,14 @@ describe('native agents dashboard parity', () => {
       { height: 32, width: 120 }
     )
     try {
+      probe.keys.pressKey('v')
+      await probe.settle()
       expect(probe.frame()).toContain('Timeline')
       probe.resize(68, 22)
       await probe.settle()
       const frame = probe.frame()
       expect(frame).not.toContain('Timeline')
-      expect(frame).toContain('↑↓ move · Enter open')
+      expect(frame).toContain('Enter open')
       probe.keys.pressEnter()
       await probe.settle()
       expect(probe.frame()).toContain('Audit native platform artifacts')
@@ -934,7 +949,7 @@ describe('native agents dashboard parity', () => {
       probe.destroy()
     }
   })
-  test('wide master-detail uses measured height, stable row instances and wheel selection across resize', async () => {
+  test('wide ownership overview uses measured height, stable row instances and wheel selection across resize', async () => {
     const many = Array.from({ length: 100 }, (_, index) =>
       agent(`row-${String(index)}`, `Task ${String(index)}`, { index })
     )
@@ -952,7 +967,7 @@ describe('native agents dashboard parity', () => {
       const first = descendants(probe.renderer.root).find(item => item.id === 'agent-row-row-0')
       const detail = descendants(probe.renderer.root).find(item => item.id === 'agents-detail')
       expect(master?.visible).toBe(true)
-      expect(detail?.visible).toBe(true)
+      expect(detail?.visible).toBe(false)
       expect(descendants(probe.renderer.root).filter(item => item.id.startsWith('agent-row-')).length).toBeGreaterThan(
         18
       )
@@ -962,7 +977,7 @@ describe('native agents dashboard parity', () => {
       expect(descendants(probe.renderer.root)).toContain(first)
       if (master === undefined) throw new Error('missing master')
       await probe.scroll(master.x + 3, master.y + 2, 'down')
-      expect(probe.frame()).toContain('#2')
+      expect(probe.frame()).toContain('root → row-1')
       probe.resize(76, 18)
       await probe.settle()
       expect(detail?.visible).toBe(false)
@@ -977,8 +992,8 @@ describe('native agents dashboard parity', () => {
       expect(probe.frame()).toContain('Task 99')
       probe.resize(140, 62)
       await probe.settle()
-      expect(probe.frame()).toContain('#100')
-      expect(detail?.visible).toBe(true)
+      expect(probe.frame()).toContain('root → row-99')
+      expect(detail?.visible).toBe(false)
       for (const width of [80, 40]) {
         probe.resize(width, 12)
         await probe.settle()
@@ -1014,13 +1029,20 @@ describe('native agents dashboard parity', () => {
       expect(agentEndTime(item, START + 50_000)).toBe(START + 12_000)
       expect(agentElapsed(item, START + 50_000)).toBe(12)
     }
-    const frame = await captureFrame(dashboardNode({ subagents: [completed, failed] }), { width: 100, height: 24 })
-    expect(frame).toContain('completed · 12s')
-    expect(frame).toContain('failed · 12s')
-    expect(frame).toContain('VERIFIED_FINAL')
-    expect(frame).toContain('MIRROR_FAILED_FINAL')
-    expect(frame).not.toContain('STALE_PROGRESS')
-    expect(frame).not.toContain('waiting')
+    const probe = await renderProbe(dashboardNode({ subagents: [completed, failed] }), { width: 132, height: 24 })
+    try {
+      probe.keys.pressEnter()
+      await probe.settle()
+      const frame = probe.frame()
+      expect(frame).toContain('completed · 12s')
+      expect(frame).toContain('failed · 12s')
+      expect(frame).toContain('VERIFIED_FINAL')
+      expect(frame).toContain('MIRROR_FAILED_FINAL')
+      expect(frame).not.toContain('STALE_PROGRESS')
+      expect(frame).not.toContain('waiting')
+    } finally {
+      probe.destroy()
+    }
   })
 
   test('a shortened completion preview is not a second final answer in replay', async () => {
@@ -1036,6 +1058,8 @@ describe('native agents dashboard parity', () => {
       height: 42
     })
     try {
+      probe.keys.pressEnter()
+      await probe.settle()
       const bodies = descendants(probe.renderer.root).filter(item => item instanceof MarkdownRenderable)
       expect(bodies).toHaveLength(1)
       expect(bodies[0]).toHaveProperty('content', full)
@@ -1053,10 +1077,17 @@ describe('native agents dashboard parity', () => {
     expect(agentEndTime(finished, START + 50_000)).toBeUndefined()
     expect(agentEndTime(active, START + 50_000)).toBe(START + 50_000)
     expect(agentEndTime({ ...finished, endedAt: START + 5_000 }, START + 50_000)).toBe(START + 5_000)
-    const frame = await captureFrame(dashboardNode({ subagents: [finished, active] }), { width: 132, height: 32 })
-    expect(frame).toContain('timing unknown')
-    expect(frame).toContain('Finished without timestamp')
-    expect(frame).toContain('Still working')
+    const probe = await renderProbe(dashboardNode({ subagents: [finished, active] }), { width: 132, height: 32 })
+    try {
+      probe.keys.pressKey('v')
+      await probe.settle()
+      const frame = probe.frame()
+      expect(frame).toContain('timing unknown')
+      expect(frame).toContain('Finished without timestamp')
+      expect(frame).toContain('Still working')
+    } finally {
+      probe.destroy()
+    }
   })
 
   test('replay preserves trace metadata and keeps real reasoning separate from activity', async () => {
@@ -1084,6 +1115,8 @@ describe('native agents dashboard parity', () => {
       height: 34
     })
     try {
+      probe.keys.pressEnter()
+      await probe.settle()
       expect(probe.frame()).toContain('Readable task')
       expect(probe.frame()).toContain('3 events omitted')
       expect(probe.frame()).toContain('▸ Reasoning')
@@ -1093,7 +1126,6 @@ describe('native agents dashboard parity', () => {
           item => item instanceof MarkdownRenderable && item.content === '**MODEL_REASONING**'
         )
       ).toBe(false)
-      probe.keys.pressEnter()
       probe.keys.pressKey('r')
       await probe.settle()
       const reasoning = descendants(probe.renderer.root).find(
@@ -1135,9 +1167,9 @@ describe('native agents dashboard parity', () => {
       dimensions
     )
     try {
-      if (dimensions.width < 110) {
-        probe.keys.pressEnter()
-        await probe.settle()
+      probe.keys.pressEnter()
+      await probe.settle()
+      {
         expect(
           probe
             .frame()

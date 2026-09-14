@@ -9,7 +9,7 @@ import { describe, expect, test } from 'vitest'
 import { createSessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
-import { captureFrame } from './lib/render.ts'
+import { captureFrame, renderProbe } from './lib/render.ts'
 
 function seedHello(store: ReturnType<typeof createSessionStore>) {
   store.apply({ type: 'gateway.ready' })
@@ -427,20 +427,29 @@ describe('App render (Phase 1, themed)', () => {
     store.apply({ type: 'subagent.tool', payload: { subagent_id: 'a1', tool_name: 'web_search', text: 'opentui' } })
     store.openDashboard()
 
-    const frame = await captureFrame(
+    const probe = await renderProbe(
       () => (
         <ThemeProvider theme={() => store.state.theme}>
           <App store={store} />
         </ThemeProvider>
       ),
-      { until: 'Spawn tree', width: 72, height: 24 }
+      { width: 72, height: 24 }
     )
 
-    expect(frame).toContain('Spawn tree') // native dashboard header
-    expect(frame).toContain('research the topic') // subagent goal
-    expect(frame).toContain('Web Search') // canonical tool summary
-    expect(frame).toContain('Enter open') // list→detail interaction hint
-    expect(frame).not.toContain('parent turn') // transcript replaced by the dashboard
+    try {
+      const frame = probe.frame()
+      expect(frame).toContain('Spawn tree') // native dashboard header
+      expect(frame).toContain('research the topic') // subagent goal
+      expect(frame).not.toContain('Web Search') // overview is ownership, not activity
+      expect(frame).toContain('Enter open') // list→detail interaction hint
+      expect(frame).not.toContain('parent turn') // transcript replaced by the dashboard
+      probe.keys.pressEnter()
+      await probe.settle()
+      await probe.keys.typeText('t') // tool activity is explicitly expanded in detail
+      expect(await probe.waitForFrame(next => next.includes('Web Search'))).toContain('Web Search')
+    } finally {
+      probe.destroy()
+    }
   })
 
   test('a chrome usage notice renders as a banner in the input zone (mount integration)', async () => {
