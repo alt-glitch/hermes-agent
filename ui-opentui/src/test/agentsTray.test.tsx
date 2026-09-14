@@ -16,13 +16,13 @@
  * so the menu-precedence pin runs against entry-parity completions.
  */
 import { RGBA } from '@opentui/core'
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { createPromptHistory } from '../logic/history.ts'
 import { planCompletion } from '../logic/slash.ts'
 import { createSessionStore, type CompletionItem, type SessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
-import { isTrayAgent } from '../view/agentsTray.tsx'
+import { isTrayAgent, reconcileFirstSeen } from '../view/agentsTray.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
@@ -336,6 +336,56 @@ describe('agents tray — Enter opens the dashboard preselected', () => {
       expect(h.store.state.dashboardAgent).toBe('a2')
       expect(frame).toMatch(/2 ● compile Y/) // master list contains the requested row
       expect(h.submitted).toEqual([]) // Enter opened the dashboard, no submit
+    } finally {
+      h.probe.destroy()
+    }
+  })
+})
+
+describe('agents tray — first-seen clock lifetime', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  test('reconcileFirstSeen keeps running stamps, stamps newcomers, and never retains more than the running set', () => {
+    const seen = new Map<string, number>()
+    reconcileFirstSeen(seen, [{ id: 'a' }, { id: 'b' }], 1_000)
+    expect([...seen]).toEqual([
+      ['a', 1_000],
+      ['b', 1_000]
+    ])
+    // b keeps its stamp, c is new, a is gone
+    reconcileFirstSeen(seen, [{ id: 'b' }, { id: 'c' }], 5_000)
+    expect([...seen]).toEqual([
+      ['b', 1_000],
+      ['c', 5_000]
+    ])
+    // an empty running set (turn finished / session replaced) empties the map
+    reconcileFirstSeen(seen, [], 9_000)
+    expect(seen.size).toBe(0)
+    // a re-used id starts fresh, not at its predecessor's stamp
+    reconcileFirstSeen(seen, [{ id: 'a' }], 9_000)
+    expect(seen.get('a')).toBe(9_000)
+  })
+
+  test('a re-spawned id after session replacement shows elapsed from ITS start, not the earlier agent’s', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(1_000_000)
+    const h = await mountApp()
+    try {
+      spawn(h.store, 'a1', 'research X')
+      await h.probe.waitForFrame(f => f.includes('⛓'))
+      // 5 minutes pass; the session is replaced (subagents reset), then the SAME id spawns again
+      vi.setSystemTime(1_000_000 + 300_000)
+      h.store.adoptFreshSession('sid-2')
+      await h.probe.waitForFrame(f => !f.includes('⛓'))
+      spawn(h.store, 'a1', 'research X again')
+      await h.probe.waitForFrame(f => f.includes('⛓'))
+      h.probe.keys.pressArrow('down')
+      const frame = await h.probe.waitForFrame(f => f.includes('● running'))
+      // fresh clock: 0:00, not 5:00 inherited from the first a1
+      expect(frame).toContain('· 0:00')
+      expect(frame).not.toContain('· 5:00')
     } finally {
       h.probe.destroy()
     }

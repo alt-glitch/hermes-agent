@@ -43,6 +43,26 @@ export function isTrayAgent(sa: SubagentInfo): boolean {
   return isRunning(sa)
 }
 
+/** Reconcile the tray's first-seen clock with the CURRENT running set: keep
+ *  the stamp of every agent still running, stamp newcomers with `now`, drop
+ *  everything else. Retained entries never exceed the running membership, so
+ *  a long-lived tray does not accumulate every id it ever saw, and an id that
+ *  disappears and re-appears (session replacement, replay) starts at 0:00
+ *  instead of inheriting its predecessor's elapsed time. Mutates in place:
+ *  the map is deliberately non-reactive (rows repaint via the shared tick). */
+export function reconcileFirstSeen(
+  firstSeen: Map<string, number>,
+  running: readonly { readonly id: string }[],
+  now: number
+): void {
+  const live = new Set<string>()
+  for (const sa of running) {
+    live.add(sa.id)
+    if (!firstSeen.has(sa.id)) firstSeen.set(sa.id, now)
+  }
+  for (const id of firstSeen.keys()) if (!live.has(id)) firstSeen.delete(id)
+}
+
 /** `m:ss` for the row's elapsed-ish counter. */
 function fmtElapsed(secs: number): string {
   return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`
@@ -98,10 +118,12 @@ export function AgentsTray(props: {
   // First-seen wall clock per agent id — the subagent stream carries no start
   // timestamp, so "elapsed-ish" is time since the tray first saw the agent.
   // Non-reactive Map; rows repaint via the shared 1s tick while expanded.
+  // Reconciled against the running set on every change: the AgentsTray stays
+  // mounted across turns and session replacements, so an insert-only map
+  // would retain every id ever seen and hand a re-used id its predecessor's
+  // start time.
   const firstSeen = new Map<string, number>()
-  createEffect(() => {
-    for (const sa of running()) if (!firstSeen.has(sa.id)) firstSeen.set(sa.id, Date.now())
-  })
+  createEffect(() => reconcileFirstSeen(firstSeen, running(), Date.now()))
 
   const attach = (el: BoxRenderable) => {
     boxRef = el
