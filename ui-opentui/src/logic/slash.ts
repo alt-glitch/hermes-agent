@@ -908,6 +908,39 @@ async function switchModel(
  *  (Epic 7; the catalog is prefetched at bootstrap and refreshed on switch).
  *  An empty cache mounts a loading shell first; its hydration then awaits the
  *  in-flight prefetch (bounded) so an early `/model` never doubles the RPC. */
+
+/** Effort rows of the model picker's second stage (upstream 2c0bec33f9c6 —
+ *  the Ink picker's step 3/3): the backend's ladder ascending, the off state,
+ *  then "keep" (empty value = no `--reasoning` flag on the emitted switch).
+ *  Mirrors `VALID_REASONING_EFFORTS` (hermes_constants.py); the gateway
+ *  validates the level, so a drift surfaces as its `bad_reasoning` error. */
+export const REASONING_PICKER_ITEMS: readonly PickerItem[] = [
+  ...['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(level => ({ label: level, value: level })),
+  { description: 'disable reasoning', label: 'none', value: 'none' },
+  { description: 'no --reasoning flag on the switch', label: 'Keep current effort', value: '' }
+]
+
+/** Model picker value → the config.set value with the effort riding along
+ *  (`X --provider p --reasoning high`). Empty effort = the plain pick. */
+export function modelSwitchValue(model: string, effort: string): string {
+  const level = effort.trim()
+  return level ? `${model} --reasoning ${level}` : model
+}
+
+/** The bare-`/model` pick hand-off: a catalog row opens the effort stage in
+ *  the same overlay slot; its pick performs the one switch. Custom-model setup
+ *  and a same-tick close of the finished stage are the caller's concern. */
+function openReasoningStage(ctx: SlashContext, model: string): void {
+  registerPickerRefresh(undefined) // fixed rows: no Ctrl+R re-fetch
+  registerPickerTabs(undefined) // no provider strip for the effort ladder
+  ctx.openPicker({
+    initialTab: 'all',
+    items: [...REASONING_PICKER_ITEMS],
+    onPick: effort => void switchModel(ctx, modelSwitchValue(model, effort), false, 'session'),
+    title: `Reasoning effort for ${model.split(' --')[0] ?? model}`
+  })
+}
+
 const modelCmd: ClientHandler = async (arg, ctx) => {
   const setupValue = '__hermes_add_custom_model__'
   const setupItem: PickerItem = {
@@ -947,7 +980,8 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
             ctx.pushSystem('Custom model setup is unavailable in this TUI host.')
           }
         } else {
-          void switchModel(ctx, name, false, 'session')
+          // Stage 2 of 2: the effort rides with the pick (upstream 2c0bec33f9c6).
+          openReasoningStage(ctx, name)
         }
       },
       title: 'Switch model'

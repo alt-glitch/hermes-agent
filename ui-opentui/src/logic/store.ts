@@ -12,7 +12,7 @@
  * concat (prefer `payload.text`), skin→theme, LRU dedup, hydrate-while-buffering.
  */
 import { Option } from 'effect'
-import { createStore, produce } from 'solid-js/store'
+import { createStore, produce, unwrap } from 'solid-js/store'
 
 import type { ApprovalRequestPayload } from '../boundary/promptResponses.ts'
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
@@ -2410,14 +2410,27 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('sessionPicker', undefined)
   }
 
-  /** Open the generic picker (model picker, skills hub, …). */
+  /** Open the generic picker (model picker, skills hub, …). A follow-up
+   *  stage REPLACES the open picker: `setState('picker', obj)` would merge
+   *  the two objects, keeping stage 1's identity (and its overlay mount). */
   function openPicker(picker: PickerState) {
-    setState('picker', picker)
+    setState(
+      produce(draft => {
+        draft.picker = picker
+      })
+    )
   }
 
-  /** Close the generic picker. */
-  function closePicker() {
+  /** Close the generic picker. With `expected`, only that picker closes: a
+   *  deferred close of a finished stage must not kill the stage its pick
+   *  opened in its place (the model picker's effort step). Same idiom as
+   *  `clearPrompt`. */
+  function closePicker(expected?: PickerState): boolean {
+    // Raw identity: the store hands out proxies, callers may hold either side.
+    if (expected !== undefined && unwrap(state.picker) !== unwrap(expected)) return false
+    if (state.picker === undefined) return false
     setState('picker', undefined)
+    return true
   }
 
   function openCustomModelSetup(setup: CustomModelSetupState) {
