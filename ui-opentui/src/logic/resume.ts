@@ -89,6 +89,15 @@ function delegationEventLabel(metadata: unknown): string {
   return `${count} background agent${count === 1 ? '' : 's'} finished`
 }
 
+/** Compact title for a persisted background-process completion: the gateway's
+ *  `display_text` ("Background Process Finished: <cmd>") when present, else a
+ *  neutral fallback (matches Ink's toTranscriptMessages). */
+function processEventLabel(metadata: unknown): string {
+  const display = readStr(metadata, 'display_text')
+  if (display !== undefined && display.trim()) return display
+  return 'background process finished'
+}
+
 /** Map a `session.list` result into switcher rows (loose-typed read). */
 export function mapSessionList(result: unknown): SessionItem[] {
   if (!result || typeof result !== 'object') return []
@@ -150,10 +159,16 @@ export function mapResumeHistory(history: unknown): Message[] {
       pendingTools = []
       continue
     }
-    if (displayKind === 'async_delegation_complete') {
+    if (displayKind === 'async_delegation_complete' || displayKind === 'process_complete') {
       const metadata =
         raw && typeof raw === 'object' ? (raw as { display_metadata?: unknown }).display_metadata : undefined
-      const message: Message = { role: 'system', text: `◈ ${delegationEventLabel(metadata)}` }
+      // Fork-authored process rows already arrive as typed `notification` rows
+      // (session_history projects their card metadata). A row persisted by the
+      // classic CLI (upstream f1d5c99fe5c5) carries only `display_text`, so it
+      // falls through here: paint the compact title, never the raw wall.
+      const label =
+        displayKind === 'process_complete' ? processEventLabel(metadata) : delegationEventLabel(metadata)
+      const message: Message = { role: 'system', text: `◈ ${label}` }
       if (ts !== undefined) message.timestamp = ts
       out.push(message)
       pendingTools = []
