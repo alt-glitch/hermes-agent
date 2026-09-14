@@ -22,7 +22,7 @@ import type { PromptHistory as ComposerHistory } from '../logic/history.ts'
 import type { PasteStore } from '../logic/pastes.ts'
 import { actionCommand, promptHistoryEntries } from '../logic/promptHistory.ts'
 import type { BackgroundProcess } from '../logic/backgroundActivity.ts'
-import type { PickerItem, SessionStore } from '../logic/store.ts'
+import type { PickerItem, PickerState, SessionStore } from '../logic/store.ts'
 import { AgentsTray, type AgentsTrayApi } from './agentsTray.tsx'
 import { Composer } from './composer.tsx'
 import { DimensionsProvider } from './dimensions.tsx'
@@ -185,7 +185,10 @@ export function App(props: AppProps) {
       props.store.closeSessionPicker()
       props.onSessionPickerClosed?.()
     })
-  const closePicker = () => deferClose(() => props.store.closePicker())
+  // Bind the close to the picker that is open NOW: a pick may synchronously
+  // open a follow-up stage, which the deferred close must leave alone.
+  const closePickerStage = (expected: PickerState | undefined) => deferClose(() => props.store.closePicker(expected))
+  const closePicker = () => closePickerStage(picker())
   const closeCustomModelSetup = () => deferClose(() => props.store.closeCustomModelSetup())
   const closePromptHistory = () => deferClose(() => props.store.closePromptHistory())
   // Esc+Esc viewer trigger (Epic 5): only when this session HAS user prompts —
@@ -306,18 +309,21 @@ export function App(props: AppProps) {
                     <Match when={customModelSetup()}>
                       {setup => <CustomModelSetup setup={setup()} onClose={closeCustomModelSetup} />}
                     </Match>
-                    <Match when={picker()}>
+                    {/* keyed: a new PickerState is a new picker. The overlay
+                        keeps mount-time state (typed query, Ctrl+R rows, tab),
+                        so a replacement stage must mount fresh, not inherit. */}
+                    <Match when={picker()} keyed>
                       {p => (
                         <Picker
-                          title={p().title}
-                          items={p().items}
-                          errorLabel={p().errorLabel ?? 'Could not load options'}
-                          initialRefresh={p().initialRefresh === true}
-                          initialTab={p().initialTab ?? 'current'}
-                          loadingLabel={p().loadingLabel ?? 'Loading…'}
+                          title={p.title}
+                          items={p.items}
+                          errorLabel={p.errorLabel ?? 'Could not load options'}
+                          initialRefresh={p.initialRefresh === true}
+                          initialTab={p.initialTab ?? 'current'}
+                          loadingLabel={p.loadingLabel ?? 'Loading…'}
                           onPick={value => {
-                            p().onPick(value)
-                            closePicker()
+                            p.onPick(value)
+                            closePickerStage(p)
                           }}
                           onClose={closePicker}
                         />

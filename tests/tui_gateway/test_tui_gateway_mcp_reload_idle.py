@@ -26,8 +26,9 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
     calls: list[str] = []
     emitted: list[tuple[str, str, dict]] = []
     agent = object()
+    other_agent = object()
     requested = {"agent": agent, "running": True}
-    other = {"agent": object(), "running": False}
+    other = {"agent": other_agent, "running": False}
     server._sessions["reload-requested"] = requested
     server._sessions["reload-other"] = other
 
@@ -38,11 +39,13 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
         mcp_tool_discovery, "discover_mcp_tools", lambda: calls.append("discover")
     )
 
+    # The MCP pool is process-global, so a completed reload refreshes EVERY
+    # live agent, not only the requester (upstream 243392b196c5).
     def refresh(live_agent, *, enabled_override, quiet_mode):
-        assert live_agent is agent
+        assert live_agent in (agent, other_agent)
         assert enabled_override == ["hermes"]
         assert quiet_mode is True
-        calls.append("refresh")
+        calls.append("refresh:requested" if live_agent is agent else "refresh:other")
 
     monkeypatch.setattr(mcp_tool_agent, "refresh_agent_mcp_tools", refresh)
     monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["hermes"])
@@ -77,13 +80,11 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
         other["running"] = False
         after_idle = server._methods["reload.mcp"]("r3", params)
         assert after_idle["result"]["status"] == "reloaded"
-        assert calls == ["shutdown", "discover", "refresh"]
-        assert emitted == [
-            (
-                "session.info",
-                "reload-requested",
-                {"running": False},
-            )
+        assert calls[:2] == ["shutdown", "discover"]
+        assert sorted(calls[2:]) == ["refresh:other", "refresh:requested"]
+        assert sorted(emitted) == [
+            ("session.info", "reload-other", {"running": False}),
+            ("session.info", "reload-requested", {"running": False}),
         ]
     finally:
         server._sessions.pop("reload-requested", None)

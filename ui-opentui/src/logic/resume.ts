@@ -11,7 +11,7 @@
  * text is given a text part after that tool trail so it renders in live order.
  * IDs are `r*` (distinct from live `p*`).
  */
-import type { Message, Part, SessionItem, ToolPartState } from './store.ts'
+import type { Message, Part, ToolPartState } from './store.ts'
 import { parseNotification } from './backgroundActivity.ts'
 import { stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
 
@@ -62,17 +62,10 @@ function rememberToolCalls(raw: unknown, calls: Map<string, RawToolCall>): void 
   }
 }
 
-function readNum(value: unknown, key: string): number {
-  if (!value || typeof value !== 'object') return 0
-  const v = (value as { [k: string]: unknown })[key]
-  return typeof v === 'number' ? v : 0
-}
-
 /**
  * Read an OPTIONAL finite numeric field (the per-message `timestamp` key, unix
  * seconds — see SessionPeek.ts `timestamp: opt(Schema.NullOr(Schema.Unknown))`).
  * Returns undefined when absent/null/non-finite so we NEVER fabricate a stamp.
- * (Distinct from `readNum`, which defaults missing → 0 for counts.)
  */
 function readOptNum(value: unknown, key: string): number | undefined {
   if (!value || typeof value !== 'object') return undefined
@@ -89,23 +82,13 @@ function delegationEventLabel(metadata: unknown): string {
   return `${count} background agent${count === 1 ? '' : 's'} finished`
 }
 
-/** Map a `session.list` result into switcher rows (loose-typed read). */
-export function mapSessionList(result: unknown): SessionItem[] {
-  if (!result || typeof result !== 'object') return []
-  const sessions = (result as { sessions?: unknown }).sessions
-  if (!Array.isArray(sessions)) return []
-  const out: SessionItem[] = []
-  for (const s of sessions) {
-    const id = readStr(s, 'id')
-    if (!id) continue
-    out.push({
-      id,
-      messageCount: readNum(s, 'message_count'),
-      preview: readStr(s, 'preview') ?? '',
-      title: readStr(s, 'title') ?? ''
-    })
-  }
-  return out
+/** Compact title for a persisted background-process completion: the gateway's
+ *  `display_text` ("Background Process Finished: <cmd>") when present, else a
+ *  neutral fallback (matches Ink's toTranscriptMessages). */
+function processEventLabel(metadata: unknown): string {
+  const display = readStr(metadata, 'display_text')
+  if (display !== undefined && display.trim()) return display
+  return 'background process finished'
 }
 
 export function mapResumeHistory(history: unknown): Message[] {
@@ -150,10 +133,15 @@ export function mapResumeHistory(history: unknown): Message[] {
       pendingTools = []
       continue
     }
-    if (displayKind === 'async_delegation_complete') {
+    if (displayKind === 'async_delegation_complete' || displayKind === 'process_complete') {
       const metadata =
         raw && typeof raw === 'object' ? (raw as { display_metadata?: unknown }).display_metadata : undefined
-      const message: Message = { role: 'system', text: `◈ ${delegationEventLabel(metadata)}` }
+      // Fork-authored process rows already arrive as typed `notification` rows
+      // (session_history projects their card metadata). A row persisted by the
+      // classic CLI (upstream f1d5c99fe5c5) carries only `display_text`, so it
+      // falls through here: paint the compact title, never the raw wall.
+      const label = displayKind === 'process_complete' ? processEventLabel(metadata) : delegationEventLabel(metadata)
+      const message: Message = { role: 'system', text: `◈ ${label}` }
       if (ts !== undefined) message.timestamp = ts
       out.push(message)
       pendingTools = []

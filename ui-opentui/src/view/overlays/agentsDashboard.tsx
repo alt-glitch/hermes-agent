@@ -257,7 +257,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
   const tree = createMemo(() => buildSubagentTree(agents()))
   const totals = createMemo(() => treeTotals(tree()))
   const widths = createMemo(() => widthByDepth(tree()))
-  const rows = createMemo(() => prepareDashboardRows(agents(), sort(), filter()))
+  const rows = createMemo(() => prepareDashboardRows(tree(), sort(), filter()))
   const selectedIndex = createMemo(() => selectedDashboardIndex(rows(), selectedId()))
   const selected = createMemo(() => {
     const index = selectedIndex()

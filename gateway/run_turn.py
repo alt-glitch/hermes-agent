@@ -2090,6 +2090,20 @@ class GatewayTurnMixin:
             return _profile_runtime_scope(self._resolve_profile_home_for_source(source))
         return nullcontext()
 
+    def _media_delivery_scope_for_source(self, source: SessionSource):
+        """Home + terminal-policy scope for validating a turn's MEDIA / local-file paths on the
+        adapter's delivery side, which runs after the routed turn scope was reset.
+
+        Docker path translation (``platforms/base.py::_translate_docker_container_media_path``)
+        infers the producing container from the ACTIVE profile (``get_active_profile_name``) and the
+        scope-aware ``TERMINAL_DOCKER_VOLUMES``; without this a secondary's ``MEDIA:/output/x.png``
+        resolves against the default profile's sandbox and mounts (#109024). No secret hydration:
+        path validation reads no credentials and this runs on the event loop."""
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return nullcontext()
+        from gateway.run import _profile_runtime_scope
+        return _profile_runtime_scope(self._resolve_profile_home_for_source(source), {})
+
     def _reset_notice_session_info(self, source: SessionSource) -> str:
         """Session-info block for the auto-reset notice, resolved inside the profile serving ``source``.
 
@@ -2338,6 +2352,7 @@ class GatewayTurnMixin:
             from tools.mcp_tool_discovery import discover_mcp_tools
             from tools.mcp_tool import _servers, _lock, _server_visible_in_scope
             from tools.mcp_tool_agent import reprobe_tool_availability
+            from tools.mcp_tool_scope import _key_name
             from tools.registry import registry
 
             reload_scope = registry.current_scope_key() if multiplex else None
@@ -2345,8 +2360,8 @@ class GatewayTurnMixin:
             def _scoped_server_names() -> set:
                 with _lock:
                     return {
-                        name for name in _servers
-                        if _server_visible_in_scope(name, reload_scope)
+                        _key_name(key) for key in _servers
+                        if _server_visible_in_scope(key, reload_scope)
                     }
 
             old_servers = _scoped_server_names()

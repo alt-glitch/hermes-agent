@@ -72,7 +72,23 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
             return True
     if evt_key in current_keys:
         return False
+    if resolved_key == evt_key and _notif_other_profile_session_owns(sid, session, evt):
+        return True
     return _notif_live_session_matches({evt_key, resolved_key}, exclude=session)
+
+
+def _notif_other_profile_session_owns(sid: str, session: dict, evt: dict) -> bool:
+    """True when a live session on ANOTHER profile store provably owns ``evt`` (its compression lineage
+    resolves there). Every poller drains one process-wide queue, but lineage is looked up in the
+    dequeuer's own store; without this, profile B dequeuing an event keyed on profile A's compressed
+    parent found no owner anywhere and dropped it for good. Snapshot under the lock, resolve outside it."""
+    own_home = str(session.get("profile_home") or "")
+    candidates = _notif_locked_sessions(
+        lambda ss: [(other_sid, other) for other_sid, other in ss.items()
+                    if other is not session and not other.get("_finalized")
+                    and str(other.get("profile_home") or "") != own_home],
+        [])
+    return any(_session_owns_notification_event(other_sid, other, evt) for other_sid, other in candidates)
 
 
 def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool:
@@ -548,7 +564,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
 
 
 def _notif_dispatch_completions(sid, session, notifications, registry, deferred):
-    from tools.process_registry_notifications import ProcessNotificationBatch
+    from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
 
     if not notifications:
@@ -561,7 +577,8 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         return
     claimed = [(event, text, claim) for event, text in notifications
                if (claim := claim_event_delivery(event, "tui-completion-batch")) is not None]
-    text = ProcessNotificationBatch(tuple((event, text) for event, text, _claim in claimed)).render(registry)
+    batch = ProcessNotificationBatch(tuple((event, text) for event, text, _claim in claimed))
+    text = batch.render(registry)
     if text is None:
         _notif_release_turn(session)
         for event, _text, claim in claimed:

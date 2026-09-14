@@ -9,6 +9,7 @@ import type { BusyInputMode } from '../logic/busyQueue.ts'
 import {
   buildModelTabs,
   BUSY_QUEUE_FULL_MESSAGE,
+  canRefreshPicker,
   clearModelPrefetch,
   classifySubmit,
   clientCommandNames,
@@ -24,6 +25,7 @@ import {
   HISTORY_MAX_PREVIEW,
   mapModelOptions,
   modelOptionsParams,
+  modelSwitchValue,
   mapCompletions,
   parseSlash,
   pickerTabs,
@@ -1729,8 +1731,29 @@ describe('dispatchSlash — client commands', () => {
     expect(selectable[0]!.current).toBe(true)
     expect(selectable[0]!.label).toBe('claude-sonnet-4.6')
     expect(selectable[1]!.current).toBeUndefined()
-    // picking switches through config.set with session scope
+    // picking a model opens the EFFORT stage (upstream 2c0bec33f9c6) in the
+    // same slot — no switch yet; "Keep current effort" then switches the plain
+    // pick through config.set with session scope.
     p.pickers[0]!.onPick('claude-opus-4.6 --provider anthropic')
+    await new Promise(r => setTimeout(r, 0))
+    expect(p.calls.some(c => c.method === 'config.set')).toBe(false)
+    expect(p.pickers).toHaveLength(2)
+    expect(p.pickers[1]!.title).toBe('Reasoning effort for claude-opus-4.6')
+    expect(p.pickers[1]!.items.map(i => i.value)).toEqual([
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+      'ultra',
+      'none',
+      ''
+    ])
+    // the fixed ladder registers NO refresh/tab seams (they belonged to the catalog stage)
+    expect(canRefreshPicker()).toBe(false)
+    expect(pickerTabs(p.pickers[1]!.items)).toEqual([])
+    p.pickers[1]!.onPick('')
     await new Promise(r => setTimeout(r, 0))
     expect(
       p.calls.some(
@@ -1740,6 +1763,20 @@ describe('dispatchSlash — client commands', () => {
           c.params.session_id === 'sid-1'
       )
     ).toBe(true)
+  })
+
+  test('/model picker effort stage: a level rides with the pick as --reasoning <level>', async () => {
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { value: 'claude-opus-4.6' }))
+    await dispatchSlash('/model', p.ctx)
+    await runPickerRefresh(false)
+    p.pickers[0]!.onPick('claude-opus-4.6 --provider anthropic')
+    p.pickers[1]!.onPick('high')
+    await new Promise(r => setTimeout(r, 0))
+    const set = p.calls.find(c => c.method === 'config.set')
+    expect(set?.params.value).toBe('claude-opus-4.6 --provider anthropic --reasoning high --session')
+    // the gateway validates the level; the client only composes the flag
+    expect(modelSwitchValue('m --provider p', 'none')).toBe('m --provider p --reasoning none')
+    expect(modelSwitchValue('m', '  ')).toBe('m')
   })
 
   test('/model --refresh refetches and opens the picker without config.set — even mid-turn (f27d45e288)', async () => {
@@ -1853,6 +1890,7 @@ describe('dispatchSlash — client commands', () => {
     // cross-provider pick: switch lands on the gateway, then a background
     // refresh re-fetches model.options so the cached ✓ stays fresh.
     p.pickers[0]!.onPick('hermes-4-405b --provider nous')
+    p.pickers[1]!.onPick('') // keep current effort
     await new Promise(r => setTimeout(r, 0))
     expect(
       p.calls.some(c => c.method === 'config.set' && c.params.value === 'hermes-4-405b --provider nous --session')

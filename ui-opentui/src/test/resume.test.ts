@@ -154,6 +154,30 @@ describe('mapResumeHistory (Phase 4b)', () => {
     expect(message).toMatchObject({ role: 'system', text: '◈ Audit docs finished · 1 agent · all done' })
   })
 
+  test('maps classic-CLI process completions (display_text only) to a compact system row, never the raw wall', () => {
+    // upstream f1d5c99fe5c5: a row persisted by the classic CLI carries only
+    // `display_text`; the fork's gateway projects its own rows as typed
+    // notifications, so this is the cross-surface resume path.
+    const msgs = mapResumeHistory([
+      {
+        role: 'user',
+        text: '[IMPORTANT: Background process proc_1 completed normally (exit code 0).\nCommand: npm test\nOutput: …]',
+        display_kind: 'process_complete',
+        display_metadata: { display_text: 'Background Process Finished: npm test' },
+        timestamp: 1_753_500_000
+      },
+      {
+        role: 'user',
+        text: '[IMPORTANT: Background process proc_2 completed (exit code 1).]',
+        display_kind: 'process_complete'
+      }
+    ])
+    expect(msgs).toEqual([
+      { role: 'system', text: '◈ Background Process Finished: npm test', timestamp: 1_753_500_000 },
+      { role: 'system', text: '◈ background process finished' }
+    ])
+  })
+
   test('skips hidden persisted display rows without changing ordinary history', () => {
     const msgs = mapResumeHistory([
       { role: 'user', text: 'real question' },

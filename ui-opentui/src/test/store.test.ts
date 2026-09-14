@@ -10,6 +10,7 @@ import { approvalChoices } from '../logic/approval.ts'
 import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { DEFAULT_THEME } from '../logic/theme.ts'
 import { createSessionStore, startupCatalogRetryDelay, todoTree, type Message, type TodoItem } from '../logic/store.ts'
+import { unwrap } from 'solid-js/store'
 import type { BillingBlockDecoded } from '../boundary/schema/GatewayEvent.ts'
 
 describe('session store — theming / dedup / hydrate (Phase 1)', () => {
@@ -2519,5 +2520,26 @@ describe('session store — btw completion', () => {
       role: 'system',
       text: '[btw "why did the plan change?"] Because the constraint changed.'
     })
+  })
+})
+
+describe('session store — generic picker stages', () => {
+  test('closePicker(expected) only closes the picker it was bound to (a pick may open a follow-up stage)', () => {
+    const store = createSessionStore()
+    const stage1 = { items: [], onPick: () => {}, title: 'Switch model' }
+    const stage2 = { items: [], onPick: () => {}, title: 'Reasoning effort for m' }
+    store.openPicker(stage1)
+    // stage-1 pick synchronously replaces itself with stage 2, then the
+    // deferred close bound to stage 1 fires: stage 2 must survive it.
+    store.openPicker(stage2)
+    expect(store.closePicker(stage1)).toBe(false)
+    expect(unwrap(store.state.picker)).toBe(stage2)
+    expect(store.closePicker(stage2)).toBe(true)
+    expect(store.state.picker).toBeUndefined()
+    // no picker open → a stale close is a no-op, and the unscoped close still works
+    expect(store.closePicker(stage2)).toBe(false)
+    store.openPicker(stage1)
+    expect(store.closePicker()).toBe(true)
+    expect(store.state.picker).toBeUndefined()
   })
 })
