@@ -5,7 +5,8 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { createDelegationState } from '../logic/agentStatus.ts'
 import type { SpawnHistoryState, SpawnSnapshot } from '../logic/spawnHistory.ts'
-import { dashboardAgentFromRecord, type DashboardAgent } from '../view/overlays/agents/model.ts'
+import { dashboardAgentFromRecord, prepareDashboardRows, type DashboardAgent } from '../view/overlays/agents/model.ts'
+import { buildSubagentTree, flattenTree } from '../logic/subagentTree.ts'
 import { agentElapsed, agentEndTime } from '../view/overlays/agents/timeline.tsx'
 import { AgentsDashboard } from '../view/overlays/agentsDashboard.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
@@ -93,6 +94,41 @@ function snapshot(id: string, label: string, rows: readonly DashboardAgent[], of
     subagents: Object.freeze(rows.map(row => Object.freeze({ ...row })))
   })
 }
+
+describe('dashboard rows share the dashboard tree', () => {
+  test('prepareDashboardRows returns the SAME node instances it was given, in sorted/filtered order', () => {
+    const wide = [
+      ...RICH_AGENTS,
+      agent('leaf-2', 'Second leaf', { depth: 1, index: 3, parentId: 'root', status: 'running', toolCount: 9 })
+    ]
+    const tree = buildSubagentTree(wide)
+    const byId = new Map(flattenTree(tree).map(node => [node.item.id, node]))
+    const rows = prepareDashboardRows(tree, 'depth-first', 'all')
+    // one build feeds totals, widths AND rows: every row is a node of that tree
+    for (const row of rows) expect(row).toBe(byId.get(row.item.id))
+    expect(rows.map(row => row.item.id)).toEqual(['root', 'child', 'failed', 'leaf-2'])
+    // sorting orders ROOTS (Ink parity; descendants keep tree order) and the
+    // filter still applies, all over the supplied roots without rebuilding
+    // busiest = subtree AGGREGATE tools: root's tree totals 15 (3+2+1+9), so 20 outranks it
+    const second = agent('root-2', 'Second root', { index: 4, toolCount: 20 })
+    const twoRoots = buildSubagentTree([...wide, second])
+    expect(prepareDashboardRows(twoRoots, 'tools-desc', 'all').map(row => row.item.id)).toEqual([
+      'root-2',
+      'root',
+      'child',
+      'failed',
+      'leaf-2'
+    ])
+    expect(prepareDashboardRows(tree, 'depth-first', 'leaf').map(row => row.item.id)).toEqual([
+      'child',
+      'failed',
+      'leaf-2'
+    ])
+    expect(prepareDashboardRows(tree, 'status', 'failed').map(row => row.item.id)).toEqual(['failed'])
+    // the input roots array is not mutated by sorting
+    expect(tree.map(node => node.item.id)).toEqual(buildSubagentTree(wide).map(node => node.item.id))
+  })
+})
 
 describe('native agents dashboard parity', () => {
   afterEach(() => {

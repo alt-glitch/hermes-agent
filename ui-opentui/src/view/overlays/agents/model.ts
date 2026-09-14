@@ -1,7 +1,6 @@
 import type { TraceEntry } from '../../../logic/store.ts'
 import { stableSpawnAgentId, type SpawnSnapshot } from '../../../logic/spawnHistory.ts'
 import {
-  buildSubagentTree,
   flattenTree,
   normalizeSubagentStatus,
   type SubagentNode,
@@ -283,14 +282,17 @@ function matchesFilter(node: SubagentNode<DashboardAgent>, filter: AgentsFilterM
   }
 }
 
-/** Ink-compatible root sorting followed by a depth-first, filterable traversal. */
+/** Ink-compatible root sorting followed by a depth-first, filterable traversal.
+ *  Takes the ALREADY-BUILT roots (the dashboard's `tree` memo, which totals and
+ *  depth widths also read) so one reactive update builds the tree once; the
+ *  returned rows are those same node instances. */
 export function prepareDashboardRows(
-  agents: readonly DashboardAgent[],
+  roots: readonly SubagentNode<DashboardAgent>[],
   sort: AgentsSortMode,
   filter: AgentsFilterMode
 ): readonly SubagentNode<DashboardAgent>[] {
-  const roots = [...buildSubagentTree(agents)].sort(SORT_COMPARATORS[sort])
-  return flattenTree(roots).filter(node => matchesFilter(node, filter))
+  const sorted = [...roots].sort(SORT_COMPARATORS[sort])
+  return flattenTree(sorted).filter(node => matchesFilter(node, filter))
 }
 
 export function cycleDashboardValue<T>(order: readonly T[], current: T): T {
