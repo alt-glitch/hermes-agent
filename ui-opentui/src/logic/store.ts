@@ -309,16 +309,6 @@ export interface PagerState {
   text: string
 }
 
-/** One row in the legacy flat session list (from `session.list`). Kept for
- *  `mapSessionList` (resume.ts); the resume PICKER uses the richer
- *  `SessionRow` (logic/sessionPicker.ts). */
-export interface SessionItem {
-  id: string
-  title: string
-  preview: string
-  messageCount: number
-}
-
 /** The open resume picker overlay (/sessions, /resume, boot `--resume`):
  *  just the pre-selected tab — the overlay fetches its own rows. */
 export interface SessionPickerOverlay {
