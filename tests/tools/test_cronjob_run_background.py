@@ -325,9 +325,8 @@ class TestInFlightDedupe:
         seen_during_run = {}
 
         def probe_run(job, **kw):
-            seen_during_run["token"] = sched._running_run_claim_tokens.get(
-                "job-bg-token"
-            )
+            key = sched._inflight_key("job-bg-token")
+            seen_during_run["token"] = sched._running_run_claim_tokens.get(key)
             return True
 
         with (
@@ -345,7 +344,7 @@ class TestInFlightDedupe:
 
         assert res["success"] is True
         assert seen_during_run["token"] == "manual-dispatch-token"
-        assert "job-bg-token" not in sched._running_run_claim_tokens
+        assert sched._inflight_key("job-bg-token") not in sched._running_run_claim_tokens
 
     def test_run_claimed_job_reports_exact_unknown_execution_not_stale_success(self):
         from tools.cronjob_tools import _run_claimed_job
@@ -418,12 +417,13 @@ class TestInFlightDedupe:
         from cron import scheduler as sched
 
         job_id = "job-shared-token"
+        key = sched._inflight_key(job_id)
         assert sched.try_register_running_job(job_id, run_claim_token="dispatch-token")
         try:
-            assert sched._running_run_claim_tokens[job_id] == "dispatch-token"
+            assert sched._running_run_claim_tokens[key] == "dispatch-token"
         finally:
             sched.release_running_job(job_id)
-        assert job_id not in sched._running_run_claim_tokens
+        assert key not in sched._running_run_claim_tokens
 
 
 class TestCronjobRunToolIntegration:

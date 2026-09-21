@@ -60,7 +60,7 @@ def server(hermes_home, monkeypatch):
     # originals on teardown so nothing leaks to later tests either.
     monkeypatch.setattr(mod, "_hermes_home", hermes_home)
     monkeypatch.setattr(mod, "_cfg_cache", None)
-    monkeypatch.setattr(mod, "_cfg_mtime", None)
+    monkeypatch.setattr(mod, "_cfg_sig", None)
     monkeypatch.setattr(mod, "_cfg_path", None)
     monkeypatch.setattr(mod, "_sessions", {})
     yield mod
@@ -73,8 +73,7 @@ def server(hermes_home, monkeypatch):
     for session in mod._sessions.values():
         assert mod._release_active_session_slot(session)
     mod._sessions.clear()
-    mod._pending.clear()
-    mod._answers.clear()
+    __import__("tui_gateway.server_requests", fromlist=["x"]).reset_for_tests()
 
 
 @pytest.fixture()

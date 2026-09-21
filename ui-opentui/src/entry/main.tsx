@@ -188,7 +188,7 @@ import { App } from '../view/App.tsx'
 import { refreshLearnedNames, seedLearnedNames } from '../view/composer.tsx'
 import { TerminalChrome } from '../view/terminalChrome.tsx'
 import { mergeWidgetCompletionItems } from '../widgets/completion.ts'
-import { registerWidgetNotifier } from '../widgets/host.ts'
+import { disposeAllWidgets, registerWidgetNotifier } from '../widgets/host.ts'
 import { listWidgetApps } from '../widgets/registry.ts'
 import { loadUserWidgets, onUserWidgets, watchUserWidgets } from '../widgets/userWidgets.ts'
 
@@ -200,6 +200,11 @@ registerRemoteParsers()
 import type { SessionOrchestratorOps } from '../view/overlays/sessionOrchestrator.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { makeFakeGatewayLayer, type FakeGatewayController } from './fakeGateway.ts'
+
+export function disposeWidgetAppScope(): void {
+  disposeAllWidgets()
+  registerWidgetNotifier(() => {})
+}
 
 export interface TuiInput {
   /** Mouse tracking on/off. */
@@ -1540,6 +1545,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // transcript — a silently-registered widget is indistinguishable from a
       // failed one. Watcher + announce subscription release with the scope.
       registerWidgetNotifier(text => store.pushSystem(text))
+      yield* Effect.addFinalizer(() => Effect.sync(disposeWidgetAppScope))
       const stopWidgetWatch = watchUserWidgets()
       yield* Effect.addFinalizer(() => Effect.sync(stopWidgetWatch))
       let unsubscribeWidgets: () => void = () => {}

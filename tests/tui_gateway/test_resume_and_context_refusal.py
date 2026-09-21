@@ -92,7 +92,8 @@ def test_concurrent_eager_resumes_reuse_winner_without_reentering_lock(monkeypat
     monkeypatch.setattr(server, "_make_agent_in_context", make_agent)
     monkeypatch.setattr(server, "_init_session", init_session)
     monkeypatch.setattr(server, "_session_info", lambda *a: {})
-    monkeypatch.setattr(server, "_live_session_payload", lambda sid, *a, **k: {"session_id": sid})
+    monkeypatch.setattr(server, "_live_session_payload", lambda sid, *a, **k: {
+        "session_id": sid, "message_count": 0, "messages": [], "info": {}})
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
     monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: None)
     monkeypatch.setattr(server, "_cancel_ws_orphan_reap", lambda *a: None)

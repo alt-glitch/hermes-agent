@@ -676,9 +676,8 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
             captured["prompt"] = prompt
             return {"final_response": "ok", "failed": False, "partial": False}
 
-    class FakeSessionDB:
-        def __new__(cls):
-            return sentinel_db
+    def fake_acquire(db_path=None):
+        return sentinel_db
 
     def mod(name, **attrs):
         module = types.ModuleType(name)
@@ -687,7 +686,8 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
         return module
 
     monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=FakeAgent))
-    monkeypatch.setitem(sys.modules, "hermes_state", mod("hermes_state", SessionDB=FakeSessionDB))
+    # Oneshot borrows the process-shared registry handle (one writer per state.db path).
+    monkeypatch.setitem(sys.modules, "hermes_state_registry", mod("hermes_state_registry", acquire=fake_acquire))
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.config",
@@ -703,13 +703,16 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
         "hermes_cli.runtime_provider",
         mod(
             "hermes_cli.runtime_provider",
-            resolve_runtime_provider=lambda **_kwargs: {
-                "api_key": "k",
-                "base_url": "u",
-                "provider": "p",
-                "api_mode": "chat_completions",
-                "credential_pool": None,
-            },
+            resolve_runtime_with_fallback=lambda _cfg, **_kwargs: (
+                {
+                    "api_key": "k",
+                    "base_url": "u",
+                    "provider": "p",
+                    "api_mode": "chat_completions",
+                    "credential_pool": None,
+                },
+                None,
+            ),
         ),
     )
     monkeypatch.setitem(
@@ -828,7 +831,9 @@ def test_print_tui_exit_summary_prefers_actual_active_session_file(
     active = tmp_path / "active.json"
     active.write_text('{"session_id":"actual_session"}', encoding="utf-8")
     monkeypatch.setitem(
-        sys.modules, "hermes_state", types.SimpleNamespace(SessionDB=lambda: _FakeDB())
+        sys.modules,
+        "hermes_state",
+        types.SimpleNamespace(SessionDB=lambda **_kwargs: _FakeDB()),
     )
 
     main_mod._print_tui_exit_summary("startup_resume", str(active))

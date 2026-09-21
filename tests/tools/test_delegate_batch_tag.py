@@ -113,7 +113,8 @@ def test_nested_lifecycle_keeps_its_own_cli_goal_and_batch():
     assert len(lines) == 3
     assert all("Inspect nested parser" in line and "Outer coordinator" not in line for line in lines[:2])
     assert all(_batch_prefix("inner-batch", 1, 2) in line for line in lines[:2])
-    assert "Parser request stalled" in lines[1]
+    assert "Subagent timed out" in lines[1]
+    assert "delegation.child_timeout_seconds" in lines[1]
     assert "Outer coordinator" in lines[2]
     outer("subagent.complete", status="completed")
     # Detached descendants still own their events after the coordinator finishes.

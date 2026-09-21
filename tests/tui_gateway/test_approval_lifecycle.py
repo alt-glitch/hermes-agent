@@ -20,6 +20,15 @@ def _wait_for_event(events: list[tuple[str, str, dict]], kind: str) -> tuple[str
     raise AssertionError(f"{kind} was not emitted")
 
 
+def _wait_for_request(frames: list[dict], method: str) -> dict:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if match := next((frame for frame in frames if frame.get("method") == method), None):
+            return match
+        time.sleep(0.001)
+    raise AssertionError(f"{method} server request was not emitted")
+
+
 @pytest.fixture(autouse=True)
 def _state(monkeypatch):
     approval._gateway_queues.clear()
@@ -38,6 +47,13 @@ def _state(monkeypatch):
 
 def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch):
     events: list[tuple[str, str, dict]] = []
+    request_frames: list[dict] = []
+
+    class _RequestTransport:
+        def write(self, frame: dict) -> None:
+            request_frames.append(frame)
+
+    transport = _RequestTransport()
     monkeypatch.setattr(
         server,
         "_emit",
@@ -50,6 +66,7 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
         "history": [],
         "history_lock": threading.Lock(),
         "session_key": session_key,
+        "transport": transport,
     }
     server._sessions[sid] = session
     assert server._wire_session_agent(sid, session_key, session["agent"]) is True
@@ -70,8 +87,8 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
         )
     )
     waiter.start()
-    request = _wait_for_event(events, "approval.request")
-    request_id = request[2]["request_id"]
+    request = _wait_for_request(request_frames, "approval")
+    request_id = request["params"]["request_id"]
     response = server.handle_request(
         {
             "id": "resolve",
@@ -88,6 +105,7 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
     assert ("approval.resolved", sid, {"request_id": request_id, "status": "resolved"}) in events
 
     events.clear()
+    request_frames.clear()
     second: dict = {}
     waiter = threading.Thread(
         target=lambda: second.update(
@@ -104,8 +122,8 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
         )
     )
     waiter.start()
-    request = _wait_for_event(events, "approval.request")
-    request_id = request[2]["request_id"]
+    request = _wait_for_request(request_frames, "approval")
+    request_id = request["params"]["request_id"]
     replay_sid = "ui-approval-replay"
     replay_agent = SimpleNamespace(session_id=session_key, model="test", platform="tui")
     server._sessions[replay_sid] = {
@@ -113,6 +131,7 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
         "history": [],
         "history_lock": threading.Lock(),
         "session_key": session_key,
+        "transport": transport,
     }
     assert server._wire_session_agent(replay_sid, session_key, replay_agent) is True
     acknowledged = server.handle_request(
