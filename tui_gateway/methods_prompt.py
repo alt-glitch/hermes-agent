@@ -573,7 +573,9 @@ def _lock_in_submit_turn(
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
-    with session["history_lock"]:
+    with _session_turn_admission(session) as admitted:
+        if not admitted:
+            return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
         if session.get("_tools_configuring"):
             return _err(
                 rid, 4009,
@@ -694,7 +696,6 @@ def _(rid, params: dict) -> dict:
             return refusal
         if (t := current_transport()) is not None:
             _rebind_live_transport(sid, session, t)
-            _cancel_ws_orphan_reap(sid)
     # Claim against process-global MCP mutation before checking/setting the
     # per-session running flag. A racing reload must see this turn as admitted.
     with _try_mcp_turn_admission(session, sid=sid) as admitted:

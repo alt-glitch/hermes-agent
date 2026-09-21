@@ -557,10 +557,19 @@ class GatewayGoalsMixin:
             # Profile-aware native adapter first. Relay is an alias transport,
             # so resolve it through the shared delivery resolver rather than a
             # literal platform-name scan.
-            adapter = self._adapter_for_source(source)
+            source_profile = (getattr(source, "profile", None) or "").strip()
+            active_profile_name = getattr(self, "_active_profile_name", None)
+            active_profile = active_profile_name() if callable(active_profile_name) else "default"
+            adapter_for_source = getattr(self, "_delivery_adapter_for", None)
+            if source_profile and source_profile not in {"default", active_profile}:
+                adapters_for_profile = getattr(self, "_adapters_for_profile", None)
+                profile_adapters = adapters_for_profile(source_profile) if callable(adapters_for_profile) else {}
+                adapter = profile_adapters.get(source.platform) if isinstance(profile_adapters, dict) else None
+            elif callable(adapter_for_source):
+                adapter = adapter_for_source(source)
+            else:
+                adapter = (getattr(self, "adapters", None) or {}).get(source.platform)
             if adapter is None:
-                source_profile = (getattr(source, "profile", None) or "").strip()
-                active_profile = self._active_profile_name()
                 delivery_adapters = self.adapters
                 if source_profile and source_profile not in {"default", active_profile}:
                     # A missing secondary-profile native adapter must fail
@@ -674,7 +683,11 @@ class GatewayGoalsMixin:
         Each hit uses ``_fire_due_loop_wakeups_once`` so canonical session origins, adapter ownership,
         Relay fallback, stale-claim recovery, and claim IDs stay identical to a direct scan.
         """
-        from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
+        from gateway.run import (
+            _async_profile_runtime_scope,
+            _handoff_watch_scopes,
+            _multiplex_profile_homes,
+        )
         from gateway.run_idle_gates import profile_has_active_loop
 
         await asyncio.sleep(5)  # let platforms finish connecting
@@ -689,7 +702,11 @@ class GatewayGoalsMixin:
         while self._running:
             try:
                 scan_now = time.time()
-                for profile_name, profile_home in _handoff_watch_scopes(self):
+                scopes = _handoff_watch_scopes(self)
+                config = getattr(self, "config", None)
+                if getattr(config, "multiplex_profiles", False):
+                    scopes = list(_multiplex_profile_homes(config))
+                for profile_name, profile_home in scopes:
                     # Idle gate skips secondary scope setup when no active loop exists. The root
                     # scan stays cheap and binds the launch profile once multiplexing is active.
                     if profile_home is not None and not await self._run_in_executor_with_context(

@@ -38,7 +38,7 @@ def test_openrouter_explicit_transport_across_credentials(
         access_token="pool-key", source="manual", base_url=rp.OPENROUTER_BASE_URL
     )
     pool = SimpleNamespace(
-        has_credentials=lambda: credential_source == "pool", select=lambda: entry
+        has_credentials=lambda: credential_source == "pool", select=lambda **_kwargs: entry
     )
     monkeypatch.setattr(rp, "load_pool", lambda provider: pool)
 

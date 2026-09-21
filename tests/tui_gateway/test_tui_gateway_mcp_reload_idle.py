@@ -38,10 +38,12 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
         mcp_tool_discovery, "discover_mcp_tools", lambda: calls.append("discover")
     )
 
+    refreshed: list[object] = []
+
     def refresh(live_agent, *, enabled_override, quiet_mode):
-        assert live_agent is agent
         assert enabled_override == ["hermes"]
         assert quiet_mode is True
+        refreshed.append(live_agent)
         calls.append("refresh")
 
     monkeypatch.setattr(mcp_tool_agent, "refresh_agent_mcp_tools", refresh)
@@ -77,13 +79,19 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
         other["running"] = False
         after_idle = server._methods["reload.mcp"]("r3", params)
         assert after_idle["result"]["status"] == "reloaded"
-        assert calls == ["shutdown", "discover", "refresh"]
+        assert calls == ["shutdown", "discover", "refresh", "refresh"]
+        assert refreshed == [agent, other["agent"]]
         assert emitted == [
             (
                 "session.info",
                 "reload-requested",
                 {"running": False},
-            )
+            ),
+            (
+                "session.info",
+                "reload-other",
+                {"running": False},
+            ),
         ]
     finally:
         server._sessions.pop("reload-requested", None)

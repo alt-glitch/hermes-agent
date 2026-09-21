@@ -30323,6 +30323,30 @@
             ],
             "default": null,
             "title": "Tool Preview"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Started At"
+          },
+          "task_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Task Label"
           }
         },
         "required": [
@@ -35709,6 +35733,18 @@
     {
       "name": "subagent.start",
       "summary": "A delegated child started running.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/SubagentEventPayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "subagent.text",
+      "summary": "A streamed child response chunk for the parent trace and child-session mirror.",
       "params": [
         {
           "name": "payload",

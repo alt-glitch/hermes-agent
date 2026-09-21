@@ -414,8 +414,6 @@ class TestCmdUpdateBranchFallback:
     def test_update_falls_back_to_main_when_current_branch_is_local_only(
         self, mock_run, _mock_which, mock_args
     ):
-        from hermes_cli import main as hm
-
         base_side_effect = _make_run_side_effect(
             branch="local/experiment", verify_ok=False, commit_count="3"
         )
@@ -433,13 +431,7 @@ class TestCmdUpdateBranchFallback:
 
         mock_run.side_effect = side_effect
 
-        with patch.object(
-            hm, "_reload_updated_runtime_modules", side_effect=SystemExit(0)
-        ):
-            with pytest.raises(SystemExit) as exit_info:
-                cmd_update(mock_args)
-
-        assert exit_info.value.code == 0
+        cmd_update(mock_args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         rev_list = next(c for c in commands if "rev-list" in c)
@@ -453,19 +445,11 @@ class TestCmdUpdateBranchFallback:
     def test_bare_update_follows_remote_fork_branch(
         self, mock_run, _mock_which, mock_args
     ):
-        from hermes_cli import main as hm
-
         mock_run.side_effect = _make_run_side_effect(
             branch="sid/opentui", verify_ok=True, commit_count="2"
         )
 
-        with patch.object(
-            hm, "_reload_updated_runtime_modules", side_effect=SystemExit(0)
-        ):
-            with pytest.raises(SystemExit) as exit_info:
-                cmd_update(mock_args)
-
-        assert exit_info.value.code == 0
+        cmd_update(mock_args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         rev_list = next(c for c in commands if "rev-list" in c)

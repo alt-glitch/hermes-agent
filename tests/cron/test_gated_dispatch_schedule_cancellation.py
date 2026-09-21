@@ -65,7 +65,7 @@ def test_tick_shutdown_preserves_unstarted_due_occurrence(tick_store, monkeypatc
                 assert scheduler.mark_running_jobs_interrupted("shutdown inside advance") == [job["id"]]
                 return original_advance(ids, **kwargs)
             result = original_advance(ids, **kwargs)
-            pending = scheduler._gated_dispatches[job["id"]]
+            pending = scheduler._gated_dispatches[scheduler._inflight_key(job["id"])]
             shutdown = threading.Thread(target=scheduler.mark_running_jobs_interrupted, args=("shutdown during advance",))
             shutdown.start()
             assert pending.cancelled.wait(timeout=3)

@@ -785,11 +785,12 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
     """Reuse with _session_resume_lock already held (including the eager double-check)."""
     if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
         return refusal
-    _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
-    payload = _live_session_payload(sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
-                                    transport=current_transport() or _stdio_transport,
-                                    include_tool_output=_flag(ctx.params, "with_tool_output"),
-                                    include_ui_chrome=is_truthy_value(ctx.params.get("with_ui_chrome", ctx.params.get("with_tool_output", False))))
+    params = getattr(ctx, "params", {})
+    payload = _live_session_payload(
+        sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
+        transport=current_transport() or _stdio_transport,
+        include_tool_output=_flag(params, "with_tool_output"),
+        include_ui_chrome=is_truthy_value(params.get("with_ui_chrome", params.get("with_tool_output", False))))
     payload["resumed"] = ctx.target
     if ctx.defer_history:
         payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),

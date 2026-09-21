@@ -358,6 +358,7 @@ async def test_loop_watcher_scans_each_multiplex_profile(tmp_path, monkeypatch):
     for _, home in homes:
         home.mkdir()
     monkeypatch.setattr("gateway.run._multiplex_profile_homes", lambda _cfg: homes)
+    monkeypatch.setattr("gateway.run_idle_gates.profile_has_active_loop", lambda _home: True)
 
     seen = []
 

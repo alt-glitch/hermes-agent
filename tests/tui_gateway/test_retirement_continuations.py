@@ -22,6 +22,7 @@ def test_crash_continuation_reserves_before_build_and_refuses_prepared_backend(t
 
     monkeypatch.setattr(server, "_start_agent_build", build)
     monkeypatch.setattr(server, "_wait_agent", lambda *args, **kw: {"error": "no model in test"})
+    monkeypatch.setattr(server, "_sessions", {})
     token = fence.prepare()["token"]
     try:
         assert server._maybe_schedule_auto_continue("s", session, "recovery") is None
@@ -33,9 +34,8 @@ def test_crash_continuation_reserves_before_build_and_refuses_prepared_backend(t
         assert fence.prepare() == {"ok": False, "idle": False}
     finally:
         release.set()
-        for thread in threading.enumerate():
-            if thread.name == "auto-continue-s":
-                thread.join(10)
+        session["_auto_continue_thread"].join(10)
+    assert not session["_auto_continue_thread"].is_alive()
     assert fence.prepare()["ok"] is True
 
 

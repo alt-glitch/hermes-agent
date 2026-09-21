@@ -494,6 +494,8 @@ class SubagentEventPayload(Payload):
     summary: str | None = None
     duration_seconds: float | None = None
     tool_preview: str | None = None
+    started_at: float | None = None
+    task_label: str | None = None
 
 
 for _name, _doc in (
@@ -502,6 +504,7 @@ for _name, _doc in (
     ("subagent.progress", "Batched tool-name progress from a child."),
     ("subagent.thinking", "A child's reasoning chunk."),
     ("subagent.reasoning", "A child's reasoning chunk (fork alias of subagent.thinking, relayed as reasoning.delta)."),
+    ("subagent.text", "A streamed child response chunk for the parent trace and child-session mirror."),
     ("subagent.tool", "A child called a tool."),
     ("subagent.complete", "A child finished (status + observability rollup)."),
 ):

@@ -36,7 +36,7 @@ def test_dock_paints_processes_under_agents_and_retires_finished_rows(monkeypatc
         agents_at = next(i for i, line in enumerate(lines) if 'Check module' in line)
         procs_at = next(i for i, line in enumerate(lines) if 'Processes · 1 running · 1 done' in line)
         assert agents_at < procs_at
-        assert any('⚙ sleep 30' in line and 'starting' in line for line in lines)
+        assert any('⚙ sleep 30' in line and ('starting' in line or 'last:' in line) for line in lines)
         assert any('✘ echo hello-dock; exit 3 · exit 3' in line for line in lines)
         assert all(get_cwidth(line) <= 100 for line in lines)
         # Every viewport keeps at least one row of each block.

@@ -74,6 +74,9 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         return None
     if session.get("_auto_continue_scheduled"):
         return None
+    from hermes_cli.backend_retirement import retirement
+    if not retirement.acquire():
+        return None
     session["_auto_continue_scheduled"] = True
     attempt, text = marker["attempts"] + 1, _auto_continue_note(marker["prompt"])
     loop_claim_id = ""
@@ -96,10 +99,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             err = {"error": {"message": "agent build failed"}}
         if err:  # leave the marker: the next resume retries (bounded by attempts)
             session["_auto_continue_scheduled"] = False
+            retirement.release()
             return
         with session["history_lock"]:
             if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
                 session["_auto_continue_scheduled"] = False  # a real user prompt beat us; it clears the marker
+                retirement.release()
                 return
             session["running"] = True
             session["last_active"] = time.time()
@@ -112,6 +117,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             with session["history_lock"]:
                 session["running"] = False
                 session["_auto_continue_scheduled"] = False
+            retirement.release()
             return
         with session["history_lock"]:
             # Marker inputs read back by _run_prompt_submit: attempt count (crash breaker) and the ORIGINAL prompt (no
@@ -142,9 +148,17 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 session.pop("_auto_continue_attempt", None)
                 session.pop("_auto_continue_prompt", None)
                 session["running"] = False
-    if _start_session_work(kickoff, name=f"auto-continue-{sid}") is None:
+        finally:
+            retirement.release()
+    try:
+        from agent.memory_provider import spawn_context_thread
+        thread = spawn_context_thread(kickoff, name=f"auto-continue-{sid}")
+        session["_auto_continue_thread"] = thread
+        thread.start()
+    except BaseException:
         session["_auto_continue_scheduled"] = False
-        return None
+        retirement.release()
+        raise
     logger.info("auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago)", session_key, attempt, age)
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
@@ -606,21 +620,23 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 or session.get("_closing")
             ):
                 return False
-            with session["history_lock"]:
-                queued = session.get("queued_prompt")
-                if not queued or session.get("running") or session.get("_busy_interrupt_pending"):
-                    return False
-                queue_generation = int(session.get("_queued_prompt_generation", 0))
-                _ac_set_queue(session, session.get("queued_prompts") or [])
-                session["running"] = True
-                session["_turn_cancel_requested"] = False
-                queued_transport = queued.get("transport")
-                # The queuer's transport is pinned so the drained turn reaches the client that sent it — but
-                # ATTACHED, not rebound: a mid-turn prompt from a second client used to silence the first for the
-                # whole drained turn. A peer that disconnected while its prompt sat in the queue is skipped: the
-                # prompt still runs, only the dead pin is dropped.
-                if queued_transport is not None and not _transport_is_dead(queued_transport):
-                    _attach_session_transport(session, queued_transport)
+        with _session_turn_admission(session) as admitted:
+            if not admitted:
+                return False
+            queued = session.get("queued_prompt")
+            if not queued or session.get("running") or session.get("_busy_interrupt_pending"):
+                return False
+            queue_generation = int(session.get("_queued_prompt_generation", 0))
+            _ac_set_queue(session, session.get("queued_prompts") or [])
+            session["running"] = True
+            session["_turn_cancel_requested"] = False
+            queued_transport = queued.get("transport")
+            # The queuer's transport is pinned so the drained turn reaches the client that sent it — but
+            # ATTACHED, not rebound: a mid-turn prompt from a second client used to silence the first for the
+            # whole drained turn. A peer that disconnected while its prompt sat in the queue is skipped: the
+            # prompt still runs, only the dead pin is dropped.
+            if queued_transport is not None and not _transport_is_dead(queued_transport):
+                _attach_session_transport(session, queued_transport)
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:

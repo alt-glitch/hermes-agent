@@ -14632,7 +14632,7 @@ def test_prompt_submit_rebases_compressed_history_on_model_switch(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, daemon=None, **_kwargs):
             self._target = target
 
         def start(self):

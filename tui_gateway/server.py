@@ -638,8 +638,9 @@ def _default_session_cwd() -> str:
 
 def _write_json_frame(obj: dict) -> bool:
     """Deliver a frame after its replay bookkeeping is complete."""
-    if obj.get("method") == "event":
-        params = obj.get("params")
+    params = obj.get("params")
+    if obj.get("method") == "event" or (isinstance(obj.get("id"), str) and "method" in obj):
+        # Events and server→client requests both carry the owning session id.
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
             return t.write(obj)

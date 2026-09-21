@@ -57,7 +57,8 @@ def test_process_completion_display_keeps_payload_separate_across_surfaces(monke
     entries, _, _ = _collect_resume_entries(cli.conversation_history, {}, lambda text: text)
     assert entries == [("event", expected)]
 
-    # TUI gateway: the status line and the persisted turn carry the same compact title.
+    # TUI gateway: the fork's notification-card wire keeps compact chrome
+    # separate from the full model-facing completion payload.
     emitted, submitted = [], []
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
     monkeypatch.setattr(server, "_notif_submit", lambda *args, **kw: submitted.append((args, kw)))
@@ -65,11 +66,25 @@ def test_process_completion_display_keeps_payload_separate_across_surfaces(monke
     session = {"session_key": "display-session", "history_lock": threading.RLock()}
     server._notif_handle_ready("ui-session", session, events, set(), registry, format_process_notification, None,
                                owned=True)
-    assert emitted[0][2] == {"kind": "process", "text": expected}
     (_rid, _sid, _session, text, _what), kwargs = submitted[0]
     assert text == payload
     assert kwargs["display_kind"] == PROCESS_COMPLETE_DISPLAY_KIND
-    assert kwargs["display_metadata"] == {"display_text": expected}
+    assert kwargs["display_metadata"] == {
+        "always_visible": True,
+        "key": "proc:proc_1",
+        "kind": "process.complete",
+        "level": "success",
+        "text": "cd /tmp && bash long-build.sh · completed · proc_1",
+    }
+    assert kwargs["display_notification"] == {
+        **kwargs["display_metadata"],
+        "detail": payload,
+    }
+    assert emitted[0][0] == "status.update"
+    assert emitted[0][2] == {
+        "kind": "status",
+        "text": kwargs["display_metadata"]["text"],
+    }
 
 
 def test_process_completion_titles_reflect_outcome_and_batch():

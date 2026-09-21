@@ -4224,6 +4224,8 @@ export interface SubagentEventPayload {
   summary?: string | null
   duration_seconds?: number | null
   tool_preview?: string | null
+  started_at?: number | null
+  task_label?: string | null
 }
 /** ``tools/delegate_tool_results.py::_extract_output_tail`` row. */
 export interface SubagentOutputTailEntry {
@@ -5195,6 +5197,8 @@ export interface BackendGatewayEventMap {
   'subagent.spawn_requested': SubagentEventPayload
   /** A delegated child started running. */
   'subagent.start': SubagentEventPayload
+  /** A streamed child response chunk for the parent trace and child-session mirror. */
+  'subagent.text': SubagentEventPayload
   /** A child's reasoning chunk. */
   'subagent.thinking': SubagentEventPayload
   /** A child called a tool. */
@@ -5284,6 +5288,7 @@ export const GATEWAY_EVENT_TYPES = [
   'subagent.reasoning',
   'subagent.spawn_requested',
   'subagent.start',
+  'subagent.text',
   'subagent.thinking',
   'subagent.tool',
   'terminal.close',

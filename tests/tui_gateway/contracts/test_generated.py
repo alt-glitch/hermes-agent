@@ -65,7 +65,9 @@ def emitted_event_names() -> set[str]:
     names.update(_CHILD_DELTA_EVENTS.values())
     for src in (REPO / "tools").glob("delegate_tool*.py"):
         names.update(_SUBAGENT_RELAY.findall(_read(src)))
-    names.discard("subagent.text")  # mirrored into the watch window as message.delta, never emitted
+    # subagent.text IS emitted on the fork wire (parent trace frames via tool_progress.
+    # _progress_subagent); it is also mirrored into the watch window as message.delta.
+    # The contract in tui_gateway/contracts/events.py declares it.
     from tools.registry import _tool_module_candidates
 
     for src in _tool_module_candidates(REPO / "tools"):
