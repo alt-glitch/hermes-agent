@@ -2,8 +2,10 @@
  * Widget host behavior — registry catalog rules, launch/toggle/close,
  * modal input dispatch, late-update guards, per-widget failure isolation.
  */
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
+import { disposeWidgetAppScope } from '../entry/main.tsx'
+import { DARK_THEME } from '../logic/theme.ts'
 import {
   ambientWidgets,
   closeWidget,
@@ -17,6 +19,7 @@ import {
 } from '../widgets/host.ts'
 import { defineWidgetApp, getWidgetApp, listWidgetApps, removeWidgetApp } from '../widgets/registry.ts'
 import { h, Text } from '../widgets/element.ts'
+import { useEffect } from '../widgets/runtime.ts'
 import type { WidgetApp, WidgetInput } from '../widgets/types.ts'
 
 const KEY = {
@@ -54,6 +57,46 @@ afterEach(() => {
   disposeAllWidgets()
   for (const app of listWidgetApps()) removeWidgetApp(app.id)
   registerWidgetNotifier(() => {})
+  vi.useRealTimers()
+})
+
+test('app-scope cleanup disposes an active widget interval and resets its notifier', () => {
+  vi.useFakeTimers()
+  const notices: string[] = []
+  registerWidgetNotifier(text => notices.push(text))
+  function Clock() {
+    useEffect(() => {
+      const id = setInterval(() => {}, 1000)
+      return () => clearInterval(id)
+    }, [])
+    return h(Text, null, 'clock')
+  }
+  ambientApp('clocky', { render: () => h(Clock, null) })
+  launchWidget('clocky')
+  const instance = widgetInstanceFor('clocky')
+  instance?.render({ cols: 80, rows: 24, state: ambientWidgets()[0]?.state, t: DARK_THEME })
+  expect(vi.getTimerCount()).toBe(1)
+
+  disposeWidgetAppScope()
+
+  expect(instance?.isDisposed()).toBe(true)
+  expect(ambientWidgets()).toHaveLength(0)
+  expect(modalWidget()).toBeUndefined()
+  expect(vi.getTimerCount()).toBe(0)
+
+  defineWidgetApp({
+    help: 'modal',
+    id: 'crashy',
+    init: () => ({}),
+    mode: 'modal',
+    reduce: () => {
+      throw new Error('after cleanup')
+    },
+    render: () => h(Text, null, 'crash')
+  })
+  launchWidget('crashy')
+  dispatchWidgetInput(key())
+  expect(notices).toEqual([])
 })
 
 describe('registry', () => {

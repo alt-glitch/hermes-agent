@@ -1846,6 +1846,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         noticeTimer = undefined
         if (state.notice?.id === n.id) setState('notice', null)
       }, n.ttlMs)
+      noticeTimer.unref()
     }
   }
 

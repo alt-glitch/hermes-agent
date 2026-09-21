@@ -80,8 +80,9 @@ describe('chrome notice lifecycle', () => {
     expect(store.state.notice).toBeNull()
   })
 
-  test('TTL auto-expiry: a ttl notice clears itself after ttlMs', () => {
+  test('TTL auto-expiry: a ttl notice uses an unreferenced timer and clears itself after ttlMs', () => {
     vi.useFakeTimers()
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout')
     try {
       const store = createSessionStore()
       store.apply({ type: 'gateway.ready' })
@@ -89,9 +90,37 @@ describe('chrome notice lifecycle', () => {
         type: 'notification.show',
         payload: { kind: 'ttl', ttl_ms: 50, text: 'transient', level: 'info', key: 'credits.usage', id: 't1' }
       })
+      const ttlHandle = setTimeoutSpy.mock.results.at(-1)?.value as ReturnType<typeof setTimeout>
+      expect(ttlHandle.hasRef()).toBe(false)
       expect(store.state.notice?.id).toBe('t1')
       vi.advanceTimersByTime(50)
       expect(store.state.notice).toBeNull()
+    } finally {
+      setTimeoutSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  test('TTL replacement is latest-wins and clear cancels the replacement timer', () => {
+    vi.useFakeTimers()
+    try {
+      const store = createSessionStore()
+      store.apply({ type: 'gateway.ready' })
+      store.apply({
+        type: 'notification.show',
+        payload: { kind: 'ttl', ttl_ms: 50, text: 'first', level: 'info', key: 'first', id: 't1' }
+      })
+      vi.advanceTimersByTime(25)
+      store.apply({
+        type: 'notification.show',
+        payload: { kind: 'ttl', ttl_ms: 100, text: 'second', level: 'info', key: 'second', id: 't2' }
+      })
+      expect(vi.getTimerCount()).toBe(1)
+      vi.advanceTimersByTime(25)
+      expect(store.state.notice?.id).toBe('t2')
+      store.apply({ type: 'notification.clear', payload: { key: 'second' } })
+      expect(store.state.notice).toBeNull()
+      expect(vi.getTimerCount()).toBe(0)
     } finally {
       vi.useRealTimers()
     }
