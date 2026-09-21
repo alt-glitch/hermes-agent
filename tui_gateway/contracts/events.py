@@ -104,7 +104,13 @@ event("notice", NoticePayload, doc="Informational one-liner for the session (cap
 # ── turn stream ───────────────────────────────────────────────────────────────────────────────
 
 
-event("message.start", None, doc="A turn began streaming; no payload.")
+class MessageStartPayload(Payload):
+    """``prompt_turn._admit_prompt_turn`` / queued-drain settlement correlation."""
+
+    client_submission_ids: list[str] | None = None
+
+
+event("message.start", MessageStartPayload, doc="A turn began streaming, optionally correlated to accepted client input.")
 
 
 class StreamDeltaPayload(Payload):
@@ -185,9 +191,10 @@ class MessageCompletePayload(Payload):
     recoverable: bool | None = None
     error_surface: ErrorSurface | None = None
     partial: bool | None = None
+    client_submission_ids: list[str] | None = None
 
 
-event("message.complete", MessageCompletePayload, doc="The turn ended: final text, usage and outcome.")
+event("message.complete", MessageCompletePayload, doc="The turn ended: final text, usage, outcome and accepted-input settlement.")
 
 
 class StatusUpdatePayload(Payload):
@@ -341,6 +348,8 @@ class NotificationShowPayload(Payload):
     ttl_ms: int | None = None
     key: str | None = None
     id: str | None = None
+    always_visible: bool | None = None
+    detail: str | None = None
 
 
 class NotificationClearPayload(Payload):

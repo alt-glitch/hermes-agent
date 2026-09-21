@@ -692,12 +692,12 @@
     },
     {
       "name": "delegation.status",
-      "summary": "Running subagent tree plus the spawn pause flag and limits.",
+      "summary": "Running subagent tree plus the spawn pause flag and limits, optionally scoped to a live agent session.",
       "params": [
         {
           "name": "params",
           "schema": {
-            "$ref": "#/components/schemas/ProfileParams"
+            "$ref": "#/components/schemas/DelegationStatusParams"
           }
         }
       ],
@@ -8369,6 +8369,18 @@
             "default": null,
             "title": "Branch"
           },
+          "backend": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Backend"
+          },
           "history_reset": {
             "anyOf": [
               {
@@ -10445,6 +10457,37 @@
           "paused"
         ],
         "title": "DelegationPauseResult",
+        "type": "object"
+      },
+      "DelegationStatusParams": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          }
+        },
+        "title": "DelegationStatusParams",
         "type": "object"
       },
       "DelegationStatusResult": {
@@ -15246,6 +15289,21 @@
             ],
             "default": null,
             "title": "Partial"
+          },
+          "client_submission_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Submission Ids"
           }
         },
         "title": "MessageCompletePayload",
@@ -15437,6 +15495,29 @@
           "role"
         ],
         "title": "MessageReactionPayload",
+        "type": "object"
+      },
+      "MessageStartPayload": {
+        "additionalProperties": false,
+        "description": "``prompt_turn._admit_prompt_turn`` / queued-drain settlement correlation.",
+        "properties": {
+          "client_submission_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Submission Ids"
+          }
+        },
+        "title": "MessageStartPayload",
         "type": "object"
       },
       "MoaAggregatingPayload": {
@@ -16361,6 +16442,30 @@
             ],
             "default": null,
             "title": "Id"
+          },
+          "always_visible": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Always Visible"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Detail"
           }
         },
         "required": [
@@ -22388,6 +22493,18 @@
             "default": null,
             "title": "Queued"
           },
+          "client_submission_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Submission Id"
+          },
           "surface": {
             "anyOf": [
               {
@@ -24389,6 +24506,16 @@
             "default": false,
             "title": "Omit Messages",
             "type": "boolean"
+          },
+          "with_tool_output": {
+            "default": false,
+            "title": "With Tool Output",
+            "type": "boolean"
+          },
+          "with_ui_chrome": {
+            "default": false,
+            "title": "With Ui Chrome",
+            "type": "boolean"
           }
         },
         "required": [
@@ -24784,6 +24911,18 @@
           "stored_session_id": {
             "title": "Stored Session Id",
             "type": "string"
+          },
+          "session_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Key"
           },
           "title": {
             "title": "Title",
@@ -25463,6 +25602,18 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "client_submission_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Submission Id"
           }
         },
         "required": [
@@ -26496,6 +26647,45 @@
             "default": null,
             "title": "Limit"
           },
+          "offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Offset"
+          },
+          "query": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Query"
+          },
+          "sources": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sources"
+          },
           "include_hidden": {
             "default": false,
             "title": "Include Hidden",
@@ -26514,6 +26704,18 @@
             },
             "title": "Sessions",
             "type": "array"
+          },
+          "truncated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Truncated"
           }
         },
         "required": [
@@ -26566,6 +26768,47 @@
             "default": "",
             "title": "Source",
             "type": "string"
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cwd"
+          },
+          "last_active": {
+            "default": 0,
+            "title": "Last Active",
+            "type": "number"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ended At"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model"
           }
         },
         "required": [
@@ -27216,6 +27459,16 @@
           "omit_messages": {
             "default": false,
             "title": "Omit Messages",
+            "type": "boolean"
+          },
+          "with_tool_output": {
+            "default": false,
+            "title": "With Tool Output",
+            "type": "boolean"
+          },
+          "with_ui_chrome": {
+            "default": false,
+            "title": "With Ui Chrome",
             "type": "boolean"
           },
           "eager_build": {
@@ -34963,7 +35216,7 @@
     },
     {
       "name": "message.complete",
-      "summary": "The turn ended: final text, usage and outcome.",
+      "summary": "The turn ended: final text, usage, outcome and accepted-input settlement.",
       "params": [
         {
           "name": "payload",
@@ -35011,13 +35264,12 @@
     },
     {
       "name": "message.start",
-      "summary": "A turn began streaming; no payload.",
+      "summary": "A turn began streaming, optionally correlated to accepted client input.",
       "params": [
         {
           "name": "payload",
           "schema": {
-            "type": "object",
-            "additionalProperties": false
+            "$ref": "#/components/schemas/MessageStartPayload"
           }
         }
       ]

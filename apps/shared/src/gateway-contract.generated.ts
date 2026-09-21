@@ -279,6 +279,10 @@ export interface BillingStepUpResult {
   recovery?: string | null
   granted?: boolean | null
 }
+export interface DelegationStatusParams {
+  profile?: string | null
+  session_id?: string | null
+}
 export interface DelegationStatusResult {
   active: ActiveSubagent[]
   paused: boolean
@@ -582,6 +586,7 @@ export interface ConfigSetResult {
   tool_progress?: string | null
   cwd?: string | null
   branch?: string | null
+  backend?: string | null
   history_reset?: boolean | null
   info?: SessionLiveInfo | null
 }
@@ -2182,6 +2187,7 @@ export interface PromptSubmitParams {
   display_kind?: string | null
   interrupted?: boolean | null
   queued?: boolean | null
+  client_submission_id?: string | null
   surface?: string | null
   voice_context?: string | null
   title_preview?: string | null
@@ -2553,6 +2559,8 @@ export interface SessionResumeParams {
   lazy?: boolean
   defer_history?: boolean
   omit_messages?: boolean
+  with_tool_output?: boolean
+  with_ui_chrome?: boolean
   eager_build?: boolean
   close_on_disconnect?: boolean
 }
@@ -2625,6 +2633,8 @@ export interface SessionActivateParams {
   profile?: string | null
   cols?: number | null
   omit_messages?: boolean
+  with_tool_output?: boolean
+  with_ui_chrome?: boolean
 }
 export interface SessionActivateResult {
   session_id: string
@@ -2652,10 +2662,14 @@ export interface SessionListParams {
   profile?: string | null
   title?: string | null
   limit?: number | null
+  offset?: number | null
+  query?: string | null
+  sources?: string[] | null
   include_hidden?: boolean
 }
 export interface SessionListResult {
   sessions: SessionListRow[]
+  truncated?: boolean | null
 }
 /** ``methods_session._session_row_summary``; ``resolved_id`` only on a title lookup that followed a compression lineage to its tip. */
 export interface SessionListRow {
@@ -2666,6 +2680,10 @@ export interface SessionListRow {
   started_at?: number
   message_count?: number
   source?: string
+  cwd?: string | null
+  last_active?: number
+  ended_at?: number | null
+  model?: string | null
 }
 export interface SessionMostRecentParams {
   profile?: string | null
@@ -2790,6 +2808,7 @@ export interface SessionBranchParams {
 export interface SessionBranchResult {
   session_id: string
   stored_session_id: string
+  session_key?: string | null
   title: string
   parent: string
   message_count: number
@@ -2939,6 +2958,7 @@ export interface SessionCorrectionParams {
   session_id: string
   profile?: string | null
   text: string
+  client_submission_id?: string | null
 }
 export interface SessionCorrectionResult {
   status: CorrectionStatus
@@ -3999,6 +4019,10 @@ export interface ErrorPayload {
 export interface NoticePayload {
   message: string
 }
+/** ``prompt_turn._admit_prompt_turn`` / queued-drain settlement correlation. */
+export interface MessageStartPayload {
+  client_submission_ids?: string[] | null
+}
 /** ``prompt_turn._invoke_agent._stream`` (message.delta: ``text`` + optional ``rendered``), ``agent_callbacks._agent_cbs`` (reasoning.delta / thinking.delta), ``tool_progress._progress_reasoning`` (reasoning.available). ``verbose`` rides only when the session's verbose reasoning mode is on. */
 export interface StreamDeltaPayload {
   text: string
@@ -4025,6 +4049,7 @@ export interface MessageCompletePayload {
   recoverable?: boolean | null
   error_surface?: ErrorSurface | null
   partial?: boolean | null
+  client_submission_ids?: string[] | null
 }
 /** ``prompt_turn._result_status``. */
 export type TurnStatus = 'complete' | 'error' | 'interrupted'
@@ -4126,6 +4151,8 @@ export interface NotificationShowPayload {
   ttl_ms?: number | null
   key?: string | null
   id?: string | null
+  always_visible?: boolean | null
+  detail?: string | null
 }
 export interface NotificationClearPayload {
   key: string
@@ -4406,8 +4433,8 @@ export interface RpcMethods {
   'dashboard.new_session_requested': { params: DashboardNewSessionRequestedParams; result: DashboardNewSessionRequestedResult }
   /** Block/unblock NEW spawns globally (active children keep running); returns the new state. */
   'delegation.pause': { params: DelegationPauseParams; result: DelegationPauseResult }
-  /** Running subagent tree plus the spawn pause flag and limits. */
-  'delegation.status': { params: ProfileParams; result: DelegationStatusResult }
+  /** Running subagent tree plus the spawn pause flag and limits, optionally scoped to a live agent session. */
+  'delegation.status': { params: DelegationStatusParams; result: DelegationStatusResult }
   /** Upload a force-redacted debug bundle to Nous-internal diagnostics storage. */
   'diagnostics.share_nous': { params: DiagnosticsShareNousParams; result: DiagnosticsShareNousResult }
   /** Stage a non-image file into the session workspace and hand back its @file: ref. */
@@ -5084,7 +5111,7 @@ export interface BackendGatewayEventMap {
   'gateway.ready': GatewayReadyPayload
   /** Apply a named desktop layout preset. */
   'layout.apply': LayoutApplyPayload
-  /** The turn ended: final text, usage and outcome. */
+  /** The turn ended: final text, usage, outcome and accepted-input settlement. */
   'message.complete': MessageCompletePayload
   /** One streamed chunk of the assistant reply. */
   'message.delta': StreamDeltaPayload
@@ -5092,8 +5119,8 @@ export interface BackendGatewayEventMap {
   'message.interim': MessageInterimPayload
   /** The agent reacted to a message; paint it live. */
   'message.reaction': MessageReactionPayload
-  /** A turn began streaming; no payload. */
-  'message.start': Record<string, never>
+  /** A turn began streaming, optionally correlated to accepted client input. */
+  'message.start': MessageStartPayload
   /** The MoA aggregator started. */
   'moa.aggregating': MoaAggregatingPayload
   /** MoA phase transition (currently only ``aggregator``). */

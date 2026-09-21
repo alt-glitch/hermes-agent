@@ -155,6 +155,8 @@ class SessionResumeParams(SessionParams):
     lazy: bool = False
     defer_history: bool = False
     omit_messages: bool = False
+    with_tool_output: bool = False
+    with_ui_chrome: bool = False
     eager_build: bool = False
     close_on_disconnect: bool = False
 
@@ -170,6 +172,8 @@ method("session.resume", params=SessionResumeParams, result=SessionResumeResult,
 class SessionActivateParams(SessionParams):
     cols: int | None = None  # sent by the desktop; the handler keeps the session's current width
     omit_messages: bool = False
+    with_tool_output: bool = False
+    with_ui_chrome: bool = False
 
 
 class SessionActivateResult(LiveSessionSnapshot):
@@ -186,6 +190,9 @@ method("session.activate", params=SessionActivateParams, result=SessionActivateR
 class SessionListParams(ProfileParams):
     title: str | None = None  # exact-title lookup (title as identity); windowless
     limit: int | None = None
+    offset: int | None = None
+    query: str | None = None
+    sources: list[str] | None = None
     include_hidden: bool = False
 
 
@@ -200,10 +207,15 @@ class SessionListRow(Result):
     started_at: float = 0
     message_count: int = 0
     source: str = ""
+    cwd: str | None = None
+    last_active: float = 0
+    ended_at: float | None = None
+    model: str | None = None
 
 
 class SessionListResult(Result):
     sessions: list[SessionListRow]
+    truncated: bool | None = None
 
 
 method("session.list", params=SessionListParams, result=SessionListResult,
@@ -348,6 +360,7 @@ class SessionBranchParams(SessionParams):
 class SessionBranchResult(Result):
     session_id: str
     stored_session_id: str
+    session_key: str | None = None
     title: str
     parent: str
     message_count: int
@@ -539,6 +552,7 @@ class CorrectionStatus(WireEnum):
 
 class SessionCorrectionParams(SessionParams):
     text: str
+    client_submission_id: str | None = None
 
 
 class SessionCorrectionResult(Result):

@@ -101,6 +101,10 @@ _cfg_lock = threading.Lock()
 # compare/check/write transaction needs its own lock, not the unrelated config cache lock.
 _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+# Legacy blocking-prompt seam retained for fork callers/tests; production prompts use server_requests.
+_prompt_lock = threading.Lock()
+_pending: dict[str, tuple[str, threading.Event]] = {}
+_answers: dict[str, str] = {}
 _cfg_cache: dict | None = None
 _cfg_sig: tuple | None = None
 _cfg_path = None
@@ -510,9 +514,10 @@ def _response_profile_name(profile: str | None = None) -> str:
 def _db_unavailable_error(rid, *, code: int):
     from hermes_state_user_copy import describe_storage_failure, storage_failure_details
     failure = describe_storage_failure(_db_error)
+    lead = "state.db unavailable" if code == 5046 else "Session storage is unavailable"
     return _err(
         rid, code,
-        f"Session storage is unavailable: {failure.gloss}. {failure.action}",
+        f"{lead}: {failure.gloss}. {failure.action}",
         data={"code": failure.code, "cause": failure.cause, "details": storage_failure_details(_db_error)})
 
 
@@ -1240,16 +1245,18 @@ def _load_cfg_raw() -> dict:
     """The active profile's config.yaml EXACTLY as written — the write-back primitive, ONLY for
     read→mutate→``_save_cfg`` round-trips and raw inspection (defaults / managed overlay / ``${VAR}``
     expansion applied here would be persisted on the next save). Behavioral reads use :func:`_load_cfg`.
-    Cache keyed on the resolved path so profiles don't clobber."""
+    Cache keyed on the resolved path and bytes so same-size, pinned-mtime replacements cannot go stale."""
     global _cfg_cache, _cfg_sig, _cfg_path
     with contextlib.suppress(Exception):
         p = _active_config_path()
-        sig = file_signature(p.stat()) if p.exists() else None
+        raw = p.read_bytes() if p.exists() else None
+        sig = (*file_signature(p.stat()), raw) if raw is not None else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_sig == sig and _cfg_path == p:
                 return copy.deepcopy(_cfg_cache)
-        from hermes_cli.config import read_user_config_raw
-        data = read_user_config_raw(p) if p.exists() else {}
+        import yaml
+        data = yaml.safe_load(raw) if raw is not None else {}
+        data = data if isinstance(data, dict) else {}
         with _cfg_lock:  # cache the RAW config: _save_cfg writes _cfg_cache back to disk
             _cfg_cache, _cfg_sig, _cfg_path = copy.deepcopy(data), sig, p
         return data
@@ -1277,7 +1284,7 @@ def _save_cfg(cfg: dict):
     with _cfg_lock:
         _cfg_cache, _cfg_path = copy.deepcopy(cfg), path
         try:
-            _cfg_sig = file_signature(path.stat())
+            _cfg_sig = (*file_signature(path.stat()), path.read_bytes())
         except Exception:
             _cfg_sig = None
 
@@ -1414,9 +1421,35 @@ def _tour_request(sid: str, payload: dict) -> str:
     return answer or _TOUR_BRIDGE_UNAVAILABLE
 
 
+def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, **_kwargs) -> str:
+    """Compatibility bridge for fork callers that still use the pre-server-request prompt seam."""
+    rid = uuid.uuid4().hex[:8]
+    ready = threading.Event()
+    with _prompt_lock:
+        _pending[rid] = (sid, ready)
+    try:
+        _emit(event, sid, {**payload, "request_id": rid})
+        ready.wait(timeout)
+        with _prompt_lock:
+            return _answers.pop(rid, "")
+    finally:
+        with _prompt_lock:
+            _pending.pop(rid, None)
+            _answers.pop(rid, None)
+
+
 def _clear_pending(sid: str | None = None) -> None:
-    """Withdraw open server→client requests: only *sid*'s (session.interrupt must not cancel other sessions'
-    prompts), or every one when *sid* is None (process exit). Each one gets a ``request.cancel``."""
+    """Withdraw open requests for one session, or every request on process exit."""
+    with _prompt_lock:
+        legacy = [
+            (rid, entry)
+            for rid, entry in _pending.items()
+            if sid is None or entry[0] == sid
+        ]
+        for rid, _entry in legacy:
+            _answers.setdefault(rid, "")
+    for _rid, (_owner, ready) in legacy:
+        ready.set()
     from tui_gateway import server_requests
     server_requests.cancel(sid, reason="interrupted" if sid else "shutdown")
 

@@ -381,8 +381,12 @@ class DelegationStatusResult(Result):
     max_concurrent_children: int
 
 
-method("delegation.status", params=ProfileParams, result=DelegationStatusResult,
-       doc="Running subagent tree plus the spawn pause flag and limits.")
+class DelegationStatusParams(ProfileParams):
+    session_id: str | None = None
+
+
+method("delegation.status", params=DelegationStatusParams, result=DelegationStatusResult,
+       doc="Running subagent tree plus the spawn pause flag and limits, optionally scoped to a live agent session.")
 
 
 class DelegationPauseParams(ProfileParams):

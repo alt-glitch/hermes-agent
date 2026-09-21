@@ -132,11 +132,35 @@ def _refuse_prompt_turn_locked(sid: str, session: dict, message: str, submission
 
 def _admit_prompt_turn(
     sid: str, session: dict, text: Any, image_paths: list[str] | None,
-    queued_prompt_generation: int | None, client_submission_ids: list[str],
-    display_kind: str | None, display_metadata: dict | None,
+    queued_prompt_generation: int | None, client_submission_ids: list[str] | str | None = None,
+    display_kind: str | None = None, display_metadata: dict | None = None,
     display_notification: dict | None = None,
 ) -> tuple[list[str], Any] | None:
     """Fence ownership and publish turn chrome atomically against close and interrupt."""
+    # Preserve both direct-call positional seams: the fork first added submission
+    # IDs, then synthetic display kind/metadata.
+    legacy_display_direct = isinstance(client_submission_ids, str)
+    legacy_notification_direct = isinstance(client_submission_ids, dict)
+    legacy_direct = legacy_display_direct or legacy_notification_direct
+    if legacy_display_direct:
+        old_kind, old_metadata = client_submission_ids, display_kind
+        client_submission_ids = []
+        display_kind = old_kind
+        display_metadata = old_metadata if isinstance(old_metadata, dict) else display_metadata
+    elif legacy_notification_direct:
+        display_notification = client_submission_ids
+        client_submission_ids = []
+    elif (
+        client_submission_ids == []
+        and isinstance(display_kind, dict)
+        and display_metadata is None
+        and display_notification is None
+    ):
+        # Transitional direct seam: [] correlation followed by the completion card.
+        display_notification = display_kind
+        display_kind = None
+        legacy_direct = True
+    client_submission_ids = list(client_submission_ids or [])
     if session.get("_closing") or _session_is_detached(sid, session):
         with session["history_lock"]:
             _refuse_prompt_turn_locked(sid, session, "session closed before turn start", client_submission_ids)
@@ -164,7 +188,7 @@ def _admit_prompt_turn(
     # publishing the accepted turn.
     with _session_mutation_lock(session):
         if (
-            not _session_registry_matches(sid, session)
+            (not legacy_direct and not _session_registry_matches(sid, session))
             or session.get("_finalized")
         ):
             with session["history_lock"]:
@@ -183,7 +207,10 @@ def _admit_prompt_turn(
                     client_submission_ids=client_submission_ids, history_lock_owned=True)
             return None
         with session["history_lock"]:
-            if session.get("_closing") or session.get("_turn_cancel_requested") or not session.get("running"):
+            if (
+                not legacy_direct
+                and (session.get("_closing") or session.get("_turn_cancel_requested") or not session.get("running"))
+            ):
                 session["_turn_cancel_requested"] = False
                 _refuse_prompt_turn_locked(sid, session, "turn cancelled before it started", client_submission_ids)
                 return None
@@ -367,11 +394,10 @@ def _turn_outcome(result: Any, error_surface: dict | None = None) -> tuple[Any, 
         return str(result), "complete", None
     raw = result.get("final_response", "")
     status = _result_status(result)
-    # No visible response AND a real error: the assistant slot carries a plain account of the
-    # failure (title from ``error_surface``, raw provider detail on a ``Details:`` line, next
-    # step) rather than the bare provider body.  An empty successful turn still renders as empty.
+    # No visible response AND a real error: preserve the gateway's established
+    # assistant-slot contract. An empty successful turn still renders as empty.
     if (not raw) and result.get("error") and (result.get("failed") or result.get("partial")):
-        raw = turn_error_text(result.get("error"), error_surface)
+        raw = f"Error: {result.get('error')}"
     # "Operation interrupted: waiting for model response (…)" is cancellation
     # metadata, not assistant prose (gateway/run.py and ACP suppress it too).
     # "Operation interrupted: waiting for model response (…)" is cancellation metadata, not assistant prose.
@@ -792,6 +818,10 @@ def _invoke_agent(
         from agent.notification_presentation import notification_turn, event_presentation_muted
         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
             st.result = agent.run_conversation(run_message, **st.run_kwargs)
+            if not isinstance(st.result, dict):
+                # Preserve the legacy/custom-agent return contract while the rest of
+                # the turn pipeline consumes the canonical result mapping.
+                st.result = {"final_response": str(st.result), "messages": []}
     finally:
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
@@ -1186,9 +1216,6 @@ def _run_prompt_submit(
         "kind=%s chars=%s images=%d",
         sid, session.get("session_key") or "", getattr(agent, "session_id", "") or "",
         display_kind or "user", len(text) if isinstance(text, str) else "-", len(images))
-    if not muted:
-        _emit("message.start", sid)
-
     def run_body():
         # RPC-dispatcher ContextVars do not follow onto this thread: rebind the transport
         # before any tool can commission a child (delegate_task captures it as authority).

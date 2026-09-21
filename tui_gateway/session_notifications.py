@@ -605,9 +605,10 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             display_text = _process_completion_notice(evt, text)["text"]
         else:
             display_text = text
+        status_kind = "status" if is_delegation or evt_type == "completion" else "process"
         from agent.notification_presentation import diagnostic_process_event
         from gateway.warning_notifications import render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": display_text}),
+        render_notification(lambda: _emit("status.update", sid, {"kind": status_kind, "text": display_text}),
                             platform="tui", diagnostic=diagnostic_process_event(evt))
         emitted.add(dedup_key)
     if evt_type == "completion" and completions is not None:

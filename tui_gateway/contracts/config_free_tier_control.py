@@ -100,6 +100,7 @@ class ConfigSetResult(Result):
     tool_progress: str | None = None
     cwd: str | None = None
     branch: str | None = None
+    backend: str | None = None
     history_reset: bool | None = None
     info: SessionLiveInfo | None = None
 

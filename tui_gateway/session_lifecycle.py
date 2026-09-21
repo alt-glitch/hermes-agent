@@ -6,6 +6,7 @@ globals at install time (method_ctx.bind_module), so they reference server.py gl
 from __future__ import annotations
 
 import logging
+import threading
 
 import contextlib
 
@@ -23,7 +24,7 @@ def _session_turn_admission(session: dict):
 
 def _start_session_work(target, *, name: str, session: dict | None = None):
     """Reserve before spawning; release only after the worker (including cleanup) has unwound."""
-    from agent.memory_provider import spawn_context_thread
+    from agent.memory_provider import ctx_bound
     from hermes_cli.backend_retirement import retirement
 
     if not retirement.acquire():
@@ -36,7 +37,9 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
             retirement.release()
 
     try:
-        thread = spawn_context_thread(run, name=name)
+        # Keep the historical construction seam used by gateway tests while
+        # still carrying profile ContextVars into the worker.
+        thread = threading.Thread(target=ctx_bound(run), daemon=True)
         if session is not None:
             session["_run_thread"] = thread
         thread.start()
