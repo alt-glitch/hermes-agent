@@ -667,6 +667,61 @@ method("session.events.stats", params=SessionEventsStatsParams, result=SessionEv
        doc="Replay-buffer occupancy telemetry (ops/debug).")
 
 
+class SessionPeekParams(ProfileParams):
+    """``methods_session.session.peek`` reads a stored row without constructing an agent."""
+
+    session_id: str
+    head: int = 2
+    tail: int = 2
+
+
+class SessionPeekMetadata(Result):
+    id: str
+    title: str
+    source: str
+    model: str | None
+    cwd: str | None
+    started_at: float
+    ended_at: float | None
+    end_reason: str | None
+    message_count: int
+    last_active: float
+    cost_usd: float | None
+
+
+class SessionPeekMessage(Result):
+    id: int | None
+    role: str
+    content: str
+    truncated: bool
+    timestamp: float | None
+
+
+class SessionPeekResult(Result):
+    session: SessionPeekMetadata
+    head: list[SessionPeekMessage]
+    tail: list[SessionPeekMessage]
+    total_messages: int
+
+
+method("session.peek", params=SessionPeekParams, result=SessionPeekResult,
+       doc="DB-only metadata plus non-overlapping head/tail display-message excerpts for the resume picker.")
+
+
+class DashboardNewSessionRequestedParams(Params):
+    session_id: str = ""
+    reason: str = ""
+
+
+class DashboardNewSessionRequestedResult(Result):
+    ok: bool
+
+
+method("dashboard.new_session_requested", params=DashboardNewSessionRequestedParams,
+       result=DashboardNewSessionRequestedResult,
+       doc="Publish a hosted TUI's fresh-chat request to the dashboard-owned transport.")
+
+
 # ── one-shot LLM ──────────────────────────────────────────────────────────────────────────────
 
 

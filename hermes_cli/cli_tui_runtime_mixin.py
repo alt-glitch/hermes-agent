@@ -117,10 +117,18 @@ class CLITuiRuntimeMixin:
 
         self._agent_running = self._interactive_turn = True
         self._pet_turn_error = self._pet_reasoning = False
+        self._last_loop_turn_failed = False
         self._turn_summary_begin()
         self._app.invalidate()
         try:
-            self.chat(notification_preview or user_input, images=submit_images or None, voice_input=is_voice_input)
+            self.chat(
+                notification_preview or user_input,
+                images=submit_images or None,
+                voice_input=is_voice_input,
+            )
+        except BaseException:
+            self._last_loop_turn_failed = True
+            raise
         finally:
             self._tui_after_turn()
 

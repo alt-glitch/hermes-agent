@@ -561,8 +561,7 @@ class CLILoopsMixin:
         now = time.time()
         state = mgr.state
         if state is not None and state.awaiting_response:
-            # This hook runs only at the CLI idle boundary: an expired claim
-            # cannot still belong to a live turn in this process.
+            # At the CLI idle boundary an expired claim cannot still belong to a live turn here.
             mgr.recover_stale_tick(now)
         if not mgr.is_due(now):
             return

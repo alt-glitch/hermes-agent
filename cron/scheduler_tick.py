@@ -4,6 +4,43 @@ import concurrent.futures
 import contextlib
 
 
+def _advance_gated_dispatches(_sched, pending_dispatches: list) -> None:
+    """Advance only admitted occurrences, with receipts for cancellation compensation."""
+    with _sched.cron_store_transaction():
+        with _sched._running_lock:
+            active = {}
+            for _, job_id, _, _, cancelled in pending_dispatches:
+                key = _sched._inflight_key(job_id)
+                pending = _sched._gated_dispatches.get(key)
+                if pending is not None and pending.cancelled is cancelled and not cancelled.is_set():
+                    active[key] = pending
+        if not active:
+            return
+        receipts = {}
+        try:
+            _sched.advance_next_runs([key[1] for key in active], write_receipts=receipts)
+        except BaseException:
+            for pending in active.values():
+                pending.cancelled.set()
+            raise
+        finally:
+            # Receipts exist before the write, even if a successful replace then raises.
+            for job_id, (original_next, proposed) in receipts.items():
+                key = _sched._inflight_key(job_id)
+                pending = active.get(key)
+                if pending is not None:
+                    pending.schedule_advance = (
+                        original_next,
+                        {
+                            field: proposed.get(field)
+                            for field in _sched._SCHEDULE_OCCURRENCE_FIELDS
+                        },
+                    )
+            for key, pending in active.items():
+                if pending.cancelled.is_set():
+                    _sched._restore_cancelled_schedule(key[1], pending)
+
+
 def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None):
     from hermes_cli.backend_retirement import retirement
 
@@ -77,11 +114,6 @@ def _tick_admitted(
         if verbose:
             _sched.logger.info("%s - %s job(s) due", _sched._hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
-        # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
-        # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
-        _sched.advance_next_runs([job["id"] for job in due_jobs])
-
         _max_workers = _sched._resolve_max_parallel_workers()
         if verbose:
             _sched.logger.info(
@@ -92,15 +124,36 @@ def _tick_admitted(
         def _process_job(job: dict) -> bool:
             return _sched._process_due_job(job, adapters, loop, verbose)
 
-        # Persistent pool, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
-        # re-arms next_run_at on completion, so no catch-up queue is needed.
+        # Fork invariant: ledger and register every worker before ONE batched schedule advance, then
+        # open their start gates. A failed batch cancels unstarted workers and restores their slots.
         _results: list = []
         _all_futures: list = []
         pool = _sched._get_parallel_pool(_max_workers)
-        for job in due_jobs:
-            fut = _sched._submit_with_guard(job, pool, _process_job)
-            if fut is None:
-                continue
+        pending_dispatches = []
+        try:
+            for job in due_jobs:
+                pending = _sched._submit_with_guard(job, pool, _process_job)
+                if pending is not None:
+                    pending_dispatches.append(pending)
+            if pending_dispatches:
+                _advance_gated_dispatches(_sched, pending_dispatches)
+        except BaseException as advance_err:
+            for pending in pending_dispatches:
+                pending[4].set()
+            dispatched_ids = {pending[1] for pending in pending_dispatches}
+            for job in due_jobs:
+                claim = job.get("run_claim")
+                if job["id"] in dispatched_ids and isinstance(claim, dict) and claim.get("token"):
+                    with contextlib.suppress(Exception):
+                        _sched.clear_run_claim(job["id"], expected_token=claim["token"])
+            # The awakened worker owns release_running_job in its finally; never release here.
+            for pending in pending_dispatches:
+                pending[3].set()
+                _sched._finish_execution_best_effort(
+                    pending[2], success=False, error=f"Schedule advance failed: {advance_err}")
+            raise
+        for fut, _, _, start_gate, _ in pending_dispatches:
+            start_gate.set()
             _all_futures.append(fut)
             if not sync:
                 _results.append(True)  # optimistically counted
