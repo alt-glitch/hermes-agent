@@ -113,6 +113,12 @@ def test_progressing_delegate_task_can_outlive_generic_deadline(monkeypatch):
     assert not any(desc.startswith("tool running: delegate_task") for desc in parent.activity)
 
 
+def test_manage_connections_owns_its_bounded_wait():
+    # The connection operation's deadline is server-owned (a constant in tools/connectors/operation.py);
+    # the generic guard would report tool_timeout while the approval card is still live.
+    assert "manage_connections" in te._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS
+
+
 def test_exemption_is_narrow():
     assert "terminal" not in te._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS
     assert "execute_code" not in te._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS

@@ -5,6 +5,8 @@ import { createRef } from 'react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type * as ConfigApi from '@/api/config'
+
 import type { ConfigSettings as ConfigSettingsType } from './config-settings'
 
 const getHermesConfigRecord = vi.fn()
@@ -12,7 +14,10 @@ const getHermesConfigSchema = vi.fn()
 const saveHermesConfig = vi.fn()
 const getElevenLabsVoices = vi.fn()
 
-vi.mock('@/hermes', () => ({
+// Keep the real read-origin helpers (WeakMap peek/bind) live: the shared
+// config hook reaches them through the barrel, and a bare mock would throw.
+vi.mock('@/hermes', async () => ({
+  ...(await vi.importActual<typeof ConfigApi>('@/api/config')),
   getHermesConfigRecord: () => getHermesConfigRecord(),
   getHermesConfigSchema: () => getHermesConfigSchema(),
   saveHermesConfig: (config: unknown, profile?: string) => saveHermesConfig(config, profile),
@@ -26,10 +31,14 @@ vi.mock('../hooks/use-on-profile-switch', () => ({
 
 // The real stores pull in the gateway/profile stack, which needs a live
 // backend connection. This page only reads the "applies to" scope override
-// and the repo-discovery signature, neither of which this test touches.
+// and the repo-discovery signature, neither of which this test touches. The
+// scope chip it renders also reads the selected profile and the loud-note
+// selector, so those are stubbed to the single-profile default shape.
 vi.mock('@/store/settings-scope', () => ({
   $settingsRequestProfile: atom<string | undefined>(undefined),
-  $settingsScopeOverride: atom<null | string>(null)
+  $settingsScopeEditsNonDefault: atom(false),
+  $settingsScopeOverride: atom<null | string>(null),
+  $settingsScopeProfile: atom<string>('default')
 }))
 
 vi.mock('@/store/projects', () => ({
@@ -58,14 +67,14 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-function renderConfigSettings() {
+function renderConfigSettings(activeSectionId = 'safety') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const importInputRef = createRef<HTMLInputElement>()
 
   render(
     <MemoryRouter>
       <QueryClientProvider client={client}>
-        <ConfigSettings activeSectionId="safety" importInputRef={importInputRef} />
+        <ConfigSettings activeSectionId={activeSectionId} importInputRef={importInputRef} />
       </QueryClientProvider>
     </MemoryRouter>
   )
@@ -74,6 +83,35 @@ function renderConfigSettings() {
 }
 
 describe('ConfigSettings autosave', () => {
+  it('renders and saves the Codex compression auto-raise setting', async () => {
+    getHermesConfigRecord.mockResolvedValue({
+      compression: { codex_gpt55_autoraise: true }
+    })
+    getHermesConfigSchema.mockResolvedValue({
+      fields: {
+        'compression.codex_gpt55_autoraise': { type: 'boolean' }
+      }
+    })
+
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    try {
+      renderConfigSettings('memory')
+
+      expect(await screen.findByText('Codex Compression Auto-Raise')).toBeTruthy()
+      expect(screen.getByText('Raise compression to 85% for supported ChatGPT Codex OAuth models.')).toBeTruthy()
+
+      screen.getByRole('switch').click()
+      await vi.advanceTimersByTimeAsync(700)
+
+      await vi.waitFor(() =>
+        expect(saveHermesConfig).toHaveBeenCalledWith({ compression: { codex_gpt55_autoraise: false } }, undefined)
+      )
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('sends a later revert instead of diffing it away against the stale page-load baseline', async () => {
     getHermesConfigRecord.mockResolvedValue({ checkpoints: { enabled: false }, other: 'untouched' })
 

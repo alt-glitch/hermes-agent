@@ -11,7 +11,7 @@ import logging
 import pytest
 
 from agent.tool_dispatch_helpers import _peel_bridge_call
-from tools.tool_gateway.bridge import connector_describe
+from tools.connectors.gateway.bridge import connector_describe
 from tools.tool_search import (
     CONNECTOR_BATCH_SENTINEL,
     ToolSearchConfig,
@@ -94,11 +94,23 @@ def test_resolve_multi_entry_batch_returns_sentinel_even_all_local():
     ]
 
 
-def test_resolve_legacy_single_shape_unchanged_for_local_names():
-    # Non-deferrable local name keeps the historical rejection message.
+def test_resolve_unknown_name_points_at_tool_search_not_direct_call():
+    # An unregistered name (typically a deferred MCP tool cited by its bare suffix) must
+    # NOT be told "call it directly" — that is the opposite of the required correction.
+    from tools.registry import registry
+
     name, args, err = resolve_underlying_call({"name": "not_a_real_tool", "arguments": {}})
     assert name is None
-    assert "not a deferrable tool" in (err or "")
+    assert "not a known tool name" in err and "call it directly" not in err.lower()
+    registry.register(name="mcp__mempalace__mempalace_search", toolset="mcp-mempalace",
+                      handler=lambda a, **kw: "{}",
+                      schema={"name": "mcp__mempalace__mempalace_search", "description": "x",
+                              "parameters": {"type": "object", "properties": {}}})
+    _, _, err = resolve_underlying_call({"name": "mempalace_search", "arguments": {}})
+    registry.deregister("mcp__mempalace__mempalace_search")
+    assert "Did you mean 'mcp__mempalace__mempalace_search'?" in err
+    _, _, err = resolve_underlying_call({"name": "read_file", "arguments": {}})
+    assert "directly-listed tool" in err and "not a known tool" not in err
 
 
 def test_resolve_legacy_connector_single_shape_routes_to_sentinel():
@@ -110,6 +122,23 @@ def test_resolve_legacy_connector_single_shape_routes_to_sentinel():
     assert len(args["calls"]) == 1
 
 
+def test_normalize_parses_string_envelope_batch():
+    """#114484: a model-emitted JSON-string batch envelope parses like the array form."""
+    calls = [{"name": "session_search", "arguments": {"query": "x"}}]
+    entries, err = normalize_tool_call_entries({"calls": json.dumps(calls)})
+    assert err is None
+    assert entries == calls
+
+
+def test_normalize_parses_string_envelope_single_dict():
+    """#114484: a stringified single dict normalizes to a batch of one."""
+    entries, err = normalize_tool_call_entries(
+        {"calls": json.dumps({"name": "session_search", "arguments": {"query": "x"}})}
+    )
+    assert err is None
+    assert entries == [{"name": "session_search", "arguments": {"query": "x"}}]
+
+
 @pytest.mark.parametrize(
     "bad,expected_fragment",
     [
@@ -119,7 +148,8 @@ def test_resolve_legacy_connector_single_shape_routes_to_sentinel():
         ({"calls": [{"name": "tool_search"}]}, "itself a bridge tool"),
         ({"calls": [{"name": "x", "arguments": "not json {"}]}, "not valid JSON"),
         ({"calls": [{"name": "x", "arguments": 42}]}, "must be an object"),
-        ({"calls": "nope"}, "non-empty array"),
+        ({"calls": "nope"}, "not valid JSON"),
+        ({"calls": json.dumps({"query": "x"})}, "requires a 'name'"),
     ],
 )
 def test_normalize_rejects_malformed_batches(bad, expected_fragment):
@@ -282,7 +312,7 @@ def test_search_keeps_only_the_twin_a_colliding_name_reaches(order, caplog):
             },
         }
 
-    with caplog.at_level(logging.WARNING, logger="tools.connector_search"):
+    with caplog.at_level(logging.WARNING, logger="tools.connectors.search"):
         out = json.loads(dispatch_tool_search(
             {"queries": ["gmail fetch profile"]},
             current_tool_defs=_local_defs(),
@@ -463,7 +493,7 @@ def test_peel_keeps_mixed_and_local_batches_as_sequential_barrier():
 
 def _connectors_on(monkeypatch, client_factory):
     from tools.registry import invalidate_check_fn_cache
-    from tools.tool_gateway import bridge, config
+    from tools.connectors.gateway import bridge, config
 
     monkeypatch.setattr(config, "connectors_available", lambda: True)
     monkeypatch.setattr(bridge, "connectors_available", lambda: True)
@@ -572,7 +602,7 @@ class _RecordingTransport:
 
 
 def _recording_client_factory(transport):
-    from tools.tool_gateway.client import ConnectorClient
+    from tools.connectors.gateway.client import ConnectorClient
 
     return lambda: ConnectorClient(
         transport=transport,
