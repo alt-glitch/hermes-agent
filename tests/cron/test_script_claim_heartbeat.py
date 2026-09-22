@@ -733,5 +733,5 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
     finish.assert_called_once_with(
         "execution-cas",
         success=False,
-        error="Fire claim ownership lost before terminal completion.",
+        error="Fire or run claim ownership lost before terminal completion.",
     )

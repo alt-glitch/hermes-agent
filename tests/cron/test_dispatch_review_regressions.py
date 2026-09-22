@@ -69,7 +69,8 @@ def test_stale_sweep_cancels_unstarted_dispatch_and_finishes_its_ledger(tmp_path
 
         class StalledSubmitPool:
             def submit(self, callback):
-                scheduler._running_since[created["id"]] -= 10_000
+                key = scheduler._inflight_key(created["id"])
+                scheduler._running_since[key] -= 10_000
                 assert scheduler.sweep_stale_inflight([dispatched]) == [created["id"]]
                 future = concurrent.futures.Future()
                 future.set_result(callback())
