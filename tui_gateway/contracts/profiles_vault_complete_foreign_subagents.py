@@ -108,6 +108,52 @@ method("model.disconnect", params=ModelDisconnectParams, result=ModelDisconnectR
        doc="Remove every credential (env keys and OAuth state) for a provider.")
 
 
+class CustomProviderApiMode(WireEnum):
+    chat_completions = "chat_completions"
+    anthropic_messages = "anthropic_messages"
+    codex_responses = "codex_responses"
+
+
+class ModelCustomProbeParams(Params):
+    base_url: str
+    api_key: str = ""
+    api_mode: CustomProviderApiMode = CustomProviderApiMode.chat_completions
+
+
+class ModelCustomProbeResult(Result):
+    models: list[str]
+    probed_url: str | None
+    resolved_base_url: str
+    suggested_base_url: str | None
+    used_fallback: bool
+    reachable: bool
+
+
+method("model.custom.probe", params=ModelCustomProbeParams, result=ModelCustomProbeResult,
+       doc="Probe an OpenAI/Anthropic-compatible endpoint without persisting its configuration.")
+
+
+class ModelCustomSaveParams(ModelCustomProbeParams):
+    display_name: str = ""
+    model: str
+    context_length: int | None = None
+    discover_models: bool = True
+
+
+class ModelCustomSaveResult(Result):
+    provider_key: str
+    provider_identity: str
+    model: str
+    base_url: str
+    switch_value: str
+    created: bool
+    key_env: str | None
+
+
+method("model.custom.save", params=ModelCustomSaveParams, result=ModelCustomSaveResult,
+       doc="Persist a canonical custom provider while keeping credentials outside config.yaml.")
+
+
 # ── profiles (methods_profiles) ───────────────────────────────────────────────────────────────
 
 

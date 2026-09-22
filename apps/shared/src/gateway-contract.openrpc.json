@@ -763,6 +763,24 @@
       }
     },
     {
+      "name": "dashboard.new_session_requested",
+      "summary": "Publish a hosted TUI's fresh-chat request to the dashboard-owned transport.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/DashboardNewSessionRequestedParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DashboardNewSessionRequestedResult"
+        }
+      }
+    },
+    {
       "name": "delegation.pause",
       "summary": "Block/unblock NEW spawns globally (active children keep running); returns the new state.",
       "params": [
@@ -1695,6 +1713,42 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/MessageReactResult"
+        }
+      }
+    },
+    {
+      "name": "model.custom.probe",
+      "summary": "Probe an OpenAI/Anthropic-compatible endpoint without persisting its configuration.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ModelCustomProbeParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ModelCustomProbeResult"
+        }
+      }
+    },
+    {
+      "name": "model.custom.save",
+      "summary": "Persist a canonical custom provider while keeping credentials outside config.yaml.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ModelCustomSaveParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ModelCustomSaveResult"
         }
       }
     },
@@ -3121,6 +3175,24 @@
       }
     },
     {
+      "name": "session.peek",
+      "summary": "DB-only metadata plus non-overlapping head/tail display-message excerpts for the resume picker.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionPeekParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionPeekResult"
+        }
+      }
+    },
+    {
       "name": "session.redirect",
       "summary": "Redirect the active turn (queued for the next turn while the agent is still building).",
       "params": [
@@ -3459,6 +3531,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/SpawnTreeSaveResult"
+        }
+      }
+    },
+    {
+      "name": "startup.catalog",
+      "summary": "Startup-panel inventory of callable tools, installed skills, enabled MCP servers, and agent readiness.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/StartupCatalogParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/StartupCatalogResult"
         }
       }
     },
@@ -11415,6 +11505,32 @@
         "title": "CurrentSubscription",
         "type": "object"
       },
+      "CustomProviderApiMode": {
+        "enum": [
+          "chat_completions",
+          "anthropic_messages",
+          "codex_responses"
+        ],
+        "title": "CustomProviderApiMode",
+        "type": "string"
+      },
+      "DashboardNewSessionRequestedParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "default": "",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "title": "DashboardNewSessionRequestedParams",
+        "type": "object"
+      },
       "DashboardNewSessionRequestedPayload": {
         "additionalProperties": false,
         "description": "``methods_session.dashboard.new_session_requested`` \u2014 a hosted TUI asked the dashboard\nfor a fresh chat (dashboard owns the embedded PTY lifecycle).",
@@ -11426,6 +11542,20 @@
           }
         },
         "title": "DashboardNewSessionRequestedPayload",
+        "type": "object"
+      },
+      "DashboardNewSessionRequestedResult": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "title": "DashboardNewSessionRequestedResult",
         "type": "object"
       },
       "DelegationPauseParams": {
@@ -16710,6 +16840,186 @@
           "reasoning"
         ],
         "title": "ModelCapabilities",
+        "type": "object"
+      },
+      "ModelCustomProbeParams": {
+        "additionalProperties": false,
+        "properties": {
+          "base_url": {
+            "title": "Base Url",
+            "type": "string"
+          },
+          "api_key": {
+            "default": "",
+            "title": "Api Key",
+            "type": "string"
+          },
+          "api_mode": {
+            "$ref": "#/components/schemas/CustomProviderApiMode",
+            "default": "chat_completions"
+          }
+        },
+        "required": [
+          "base_url"
+        ],
+        "title": "ModelCustomProbeParams",
+        "type": "object"
+      },
+      "ModelCustomProbeResult": {
+        "additionalProperties": false,
+        "properties": {
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "probed_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Probed Url"
+          },
+          "resolved_base_url": {
+            "title": "Resolved Base Url",
+            "type": "string"
+          },
+          "suggested_base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Base Url"
+          },
+          "used_fallback": {
+            "title": "Used Fallback",
+            "type": "boolean"
+          },
+          "reachable": {
+            "title": "Reachable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "models",
+          "probed_url",
+          "resolved_base_url",
+          "suggested_base_url",
+          "used_fallback",
+          "reachable"
+        ],
+        "title": "ModelCustomProbeResult",
+        "type": "object"
+      },
+      "ModelCustomSaveParams": {
+        "additionalProperties": false,
+        "properties": {
+          "base_url": {
+            "title": "Base Url",
+            "type": "string"
+          },
+          "api_key": {
+            "default": "",
+            "title": "Api Key",
+            "type": "string"
+          },
+          "api_mode": {
+            "$ref": "#/components/schemas/CustomProviderApiMode",
+            "default": "chat_completions"
+          },
+          "display_name": {
+            "default": "",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "context_length": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Context Length"
+          },
+          "discover_models": {
+            "default": true,
+            "title": "Discover Models",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "base_url",
+          "model"
+        ],
+        "title": "ModelCustomSaveParams",
+        "type": "object"
+      },
+      "ModelCustomSaveResult": {
+        "additionalProperties": false,
+        "properties": {
+          "provider_key": {
+            "title": "Provider Key",
+            "type": "string"
+          },
+          "provider_identity": {
+            "title": "Provider Identity",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "base_url": {
+            "title": "Base Url",
+            "type": "string"
+          },
+          "switch_value": {
+            "title": "Switch Value",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "boolean"
+          },
+          "key_env": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Env"
+          }
+        },
+        "required": [
+          "provider_key",
+          "provider_identity",
+          "model",
+          "base_url",
+          "switch_value",
+          "created",
+          "key_env"
+        ],
+        "title": "ModelCustomSaveResult",
         "type": "object"
       },
       "ModelDisconnectParams": {
@@ -25576,6 +25886,16 @@
             "default": false,
             "title": "Omit Messages",
             "type": "boolean"
+          },
+          "with_tool_output": {
+            "default": false,
+            "title": "With Tool Output",
+            "type": "boolean"
+          },
+          "with_ui_chrome": {
+            "default": false,
+            "title": "With Ui Chrome",
+            "type": "boolean"
           }
         },
         "required": [
@@ -25971,6 +26291,18 @@
           "stored_session_id": {
             "title": "Stored Session Id",
             "type": "string"
+          },
+          "session_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Key"
           },
           "title": {
             "title": "Title",
@@ -26650,6 +26982,18 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "client_submission_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Submission Id"
           }
         },
         "required": [
@@ -27683,6 +28027,45 @@
             "default": null,
             "title": "Limit"
           },
+          "offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Offset"
+          },
+          "query": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Query"
+          },
+          "sources": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sources"
+          },
           "include_hidden": {
             "default": false,
             "title": "Include Hidden",
@@ -27701,6 +28084,18 @@
             },
             "title": "Sessions",
             "type": "array"
+          },
+          "truncated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Truncated"
           }
         },
         "required": [
@@ -27753,6 +28148,47 @@
             "default": "",
             "title": "Source",
             "type": "string"
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cwd"
+          },
+          "last_active": {
+            "default": 0,
+            "title": "Last Active",
+            "type": "number"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ended At"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model"
           }
         },
         "required": [
@@ -28124,6 +28560,224 @@
         "title": "SessionParams",
         "type": "object"
       },
+      "SessionPeekMessage": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "timestamp": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timestamp"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "content",
+          "truncated",
+          "timestamp"
+        ],
+        "title": "SessionPeekMessage",
+        "type": "object"
+      },
+      "SessionPeekMetadata": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cwd"
+          },
+          "started_at": {
+            "title": "Started At",
+            "type": "number"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "end_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Reason"
+          },
+          "message_count": {
+            "title": "Message Count",
+            "type": "integer"
+          },
+          "last_active": {
+            "title": "Last Active",
+            "type": "number"
+          },
+          "cost_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Usd"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "source",
+          "model",
+          "cwd",
+          "started_at",
+          "ended_at",
+          "end_reason",
+          "message_count",
+          "last_active",
+          "cost_usd"
+        ],
+        "title": "SessionPeekMetadata",
+        "type": "object"
+      },
+      "SessionPeekParams": {
+        "additionalProperties": false,
+        "description": "``methods_session.session.peek`` reads a stored row without constructing an agent.",
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "head": {
+            "default": 2,
+            "title": "Head",
+            "type": "integer"
+          },
+          "tail": {
+            "default": 2,
+            "title": "Tail",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionPeekParams",
+        "type": "object"
+      },
+      "SessionPeekResult": {
+        "additionalProperties": false,
+        "properties": {
+          "session": {
+            "$ref": "#/components/schemas/SessionPeekMetadata"
+          },
+          "head": {
+            "items": {
+              "$ref": "#/components/schemas/SessionPeekMessage"
+            },
+            "title": "Head",
+            "type": "array"
+          },
+          "tail": {
+            "items": {
+              "$ref": "#/components/schemas/SessionPeekMessage"
+            },
+            "title": "Tail",
+            "type": "array"
+          },
+          "total_messages": {
+            "title": "Total Messages",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session",
+          "head",
+          "tail",
+          "total_messages"
+        ],
+        "title": "SessionPeekResult",
+        "type": "object"
+      },
       "SessionReclaimedPayload": {
         "additionalProperties": false,
         "description": "``session_lifecycle._announce_session_reclaimed`` (broadcast).",
@@ -28206,6 +28860,16 @@
           "omit_messages": {
             "default": false,
             "title": "Omit Messages",
+            "type": "boolean"
+          },
+          "with_tool_output": {
+            "default": false,
+            "title": "With Tool Output",
+            "type": "boolean"
+          },
+          "with_ui_chrome": {
+            "default": false,
+            "title": "With Ui Chrome",
             "type": "boolean"
           },
           "eager_build": {
@@ -30511,6 +31175,208 @@
           "session_id"
         ],
         "title": "SpawnTreeSaveResult",
+        "type": "object"
+      },
+      "StartupCatalogParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          }
+        },
+        "title": "StartupCatalogParams",
+        "type": "object"
+      },
+      "StartupCatalogReadiness": {
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/StartupCatalogReadinessStatus"
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Warning"
+          },
+          "retry_after_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Retry After Ms"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "StartupCatalogReadiness",
+        "type": "object"
+      },
+      "StartupCatalogReadinessStatus": {
+        "enum": [
+          "ready",
+          "pending",
+          "failed"
+        ],
+        "title": "StartupCatalogReadinessStatus",
+        "type": "string"
+      },
+      "StartupCatalogResult": {
+        "additionalProperties": false,
+        "properties": {
+          "tools": {
+            "$ref": "#/components/schemas/StartupToolsCatalog"
+          },
+          "skills": {
+            "$ref": "#/components/schemas/StartupSkillsCatalog"
+          },
+          "mcp": {
+            "$ref": "#/components/schemas/StartupMcpCatalog"
+          },
+          "readiness": {
+            "$ref": "#/components/schemas/StartupCatalogReadiness"
+          }
+        },
+        "required": [
+          "tools",
+          "skills",
+          "mcp",
+          "readiness"
+        ],
+        "title": "StartupCatalogResult",
+        "type": "object"
+      },
+      "StartupMcpCatalog": {
+        "additionalProperties": false,
+        "properties": {
+          "servers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Servers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "servers"
+        ],
+        "title": "StartupMcpCatalog",
+        "type": "object"
+      },
+      "StartupSkillCategory": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "count"
+        ],
+        "title": "StartupSkillCategory",
+        "type": "object"
+      },
+      "StartupSkillsCatalog": {
+        "additionalProperties": false,
+        "properties": {
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "categories": {
+            "items": {
+              "$ref": "#/components/schemas/StartupSkillCategory"
+            },
+            "title": "Categories",
+            "type": "array"
+          }
+        },
+        "required": [
+          "total",
+          "categories"
+        ],
+        "title": "StartupSkillsCatalog",
+        "type": "object"
+      },
+      "StartupToolsCatalog": {
+        "additionalProperties": false,
+        "properties": {
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "toolsets": {
+            "items": {
+              "$ref": "#/components/schemas/StartupToolset"
+            },
+            "title": "Toolsets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "total",
+          "toolsets"
+        ],
+        "title": "StartupToolsCatalog",
+        "type": "object"
+      },
+      "StartupToolset": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "count",
+          "enabled",
+          "tools"
+        ],
+        "title": "StartupToolset",
         "type": "object"
       },
       "StatusUpdatePayload": {

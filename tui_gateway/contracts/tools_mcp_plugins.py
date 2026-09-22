@@ -94,6 +94,59 @@ method("tools.configure", params=ToolsConfigureParams, result=ToolsConfigureResu
        doc="Persist a toolset / MCP enable-disable change and rebuild the session agent so it takes effect now.")
 
 
+class StartupCatalogParams(_SessionScoped):
+    pass
+
+
+class StartupToolset(Result):
+    name: str
+    count: int
+    enabled: bool
+    tools: list[str]
+
+
+class StartupToolsCatalog(Result):
+    total: int
+    toolsets: list[StartupToolset]
+
+
+class StartupSkillCategory(Result):
+    name: str
+    count: int
+
+
+class StartupSkillsCatalog(Result):
+    total: int
+    categories: list[StartupSkillCategory]
+
+
+class StartupMcpCatalog(Result):
+    servers: list[str]
+
+
+class StartupCatalogReadinessStatus(WireEnum):
+    ready = "ready"
+    pending = "pending"
+    failed = "failed"
+
+
+class StartupCatalogReadiness(Result):
+    status: StartupCatalogReadinessStatus
+    warning: str | None = None
+    retry_after_ms: int | None = None
+
+
+class StartupCatalogResult(Result):
+    tools: StartupToolsCatalog
+    skills: StartupSkillsCatalog
+    mcp: StartupMcpCatalog
+    readiness: StartupCatalogReadiness
+
+
+method("startup.catalog", params=StartupCatalogParams, result=StartupCatalogResult,
+       doc="Startup-panel inventory of callable tools, installed skills, enabled MCP servers, and agent readiness.")
+
+
 # ── reload ────────────────────────────────────────────────────────────────────────────────────
 
 

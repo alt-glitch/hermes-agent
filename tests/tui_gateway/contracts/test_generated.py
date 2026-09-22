@@ -35,7 +35,7 @@ def test_generated_files_are_current(gen):
 
 # The emitter inventory the old gateway-events.json scan used, kept as the completeness oracle:
 # names must come from CODE the gateway runs, never from the contract tables themselves.
-_EMIT_HELPERS = ("_emit", "_broadcast_global_event", "_voice_emit", "_pet_emit", "_emit_tool_lifecycle")
+_EMIT_HELPERS = ("_emit", "_event_frame", "_broadcast_global_event", "_voice_emit", "_pet_emit", "_emit_tool_lifecycle")
 _LITERAL_EMIT = re.compile(r"\b(?:%s)\(\s*\"([a-z_][a-z0-9_.]*)\"" % "|".join(_EMIT_HELPERS))
 _REQUEST_HELPERS = ("server_requests\\.send", "server_requests\\.send_async", "_ask", "_read_block")
 _LITERAL_REQUEST = re.compile(r"\b(?:%s)\(\s*\"([a-z_][a-z0-9_.]*)\"" % "|".join(_REQUEST_HELPERS))
@@ -65,7 +65,9 @@ def emitted_event_names() -> set[str]:
     names.update(_CHILD_DELTA_EVENTS.values())
     for src in (REPO / "tools").glob("delegate_tool*.py"):
         names.update(_SUBAGENT_RELAY.findall(_read(src)))
-    names.discard("subagent.text")  # mirrored into the watch window as message.delta, never emitted
+    # subagent.text IS emitted on the fork wire (parent trace frames via tool_progress.
+    # _progress_subagent); it is also mirrored into the watch window as message.delta.
+    # The contract in tui_gateway/contracts/events.py declares it.
     from tools.registry import _tool_module_candidates
 
     for src in _tool_module_candidates(REPO / "tools"):

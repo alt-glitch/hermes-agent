@@ -1604,6 +1604,38 @@ export interface ModelDisconnectResult {
   name: string
   disconnected: boolean
 }
+export interface ModelCustomProbeParams {
+  base_url: string
+  api_key?: string
+  api_mode?: CustomProviderApiMode
+}
+export type CustomProviderApiMode = 'chat_completions' | 'anthropic_messages' | 'codex_responses'
+export interface ModelCustomProbeResult {
+  models: string[]
+  probed_url: string | null
+  resolved_base_url: string
+  suggested_base_url: string | null
+  used_fallback: boolean
+  reachable: boolean
+}
+export interface ModelCustomSaveParams {
+  base_url: string
+  api_key?: string
+  api_mode?: CustomProviderApiMode
+  display_name?: string
+  model: string
+  context_length?: number | null
+  discover_models?: boolean
+}
+export interface ModelCustomSaveResult {
+  provider_key: string
+  provider_identity: string
+  model: string
+  base_url: string
+  switch_value: string
+  created: boolean
+  key_env: string | null
+}
 export interface ProfilesListParams {
   profile?: string | null
   include_sessions?: boolean | string | null
@@ -2685,6 +2717,8 @@ export interface SessionResumeParams {
   lazy?: boolean
   defer_history?: boolean
   omit_messages?: boolean
+  with_tool_output?: boolean
+  with_ui_chrome?: boolean
   eager_build?: boolean
   close_on_disconnect?: boolean
 }
@@ -2757,6 +2791,8 @@ export interface SessionActivateParams {
   profile?: string | null
   cols?: number | null
   omit_messages?: boolean
+  with_tool_output?: boolean
+  with_ui_chrome?: boolean
 }
 export interface SessionActivateResult {
   session_id: string
@@ -2784,10 +2820,14 @@ export interface SessionListParams {
   profile?: string | null
   title?: string | null
   limit?: number | null
+  offset?: number | null
+  query?: string | null
+  sources?: string[] | null
   include_hidden?: boolean
 }
 export interface SessionListResult {
   sessions: SessionListRow[]
+  truncated?: boolean | null
 }
 /** ``methods_session._session_row_summary``; ``resolved_id`` only on a title lookup that followed a compression lineage to its tip. */
 export interface SessionListRow {
@@ -2798,6 +2838,10 @@ export interface SessionListRow {
   started_at?: number
   message_count?: number
   source?: string
+  cwd?: string | null
+  last_active?: number
+  ended_at?: number | null
+  model?: string | null
 }
 export interface SessionMostRecentParams {
   profile?: string | null
@@ -2922,6 +2966,7 @@ export interface SessionBranchParams {
 export interface SessionBranchResult {
   session_id: string
   stored_session_id: string
+  session_key?: string | null
   title: string
   parent: string
   message_count: number
@@ -3071,6 +3116,7 @@ export interface SessionCorrectionParams {
   session_id: string
   profile?: string | null
   text: string
+  client_submission_id?: string | null
 }
 export interface SessionCorrectionResult {
   status: CorrectionStatus
@@ -3153,6 +3199,46 @@ export interface SessionEventsStatsResult {
   max_per_session: number
   max_bytes_per_session: number
   max_bytes_process: number
+}
+/** ``methods_session.session.peek`` reads a stored row without constructing an agent. */
+export interface SessionPeekParams {
+  profile?: string | null
+  session_id: string
+  head?: number
+  tail?: number
+}
+export interface SessionPeekResult {
+  session: SessionPeekMetadata
+  head: SessionPeekMessage[]
+  tail: SessionPeekMessage[]
+  total_messages: number
+}
+export interface SessionPeekMetadata {
+  id: string
+  title: string
+  source: string
+  model: string | null
+  cwd: string | null
+  started_at: number
+  ended_at: number | null
+  end_reason: string | null
+  message_count: number
+  last_active: number
+  cost_usd: number | null
+}
+export interface SessionPeekMessage {
+  id: number | null
+  role: string
+  content: string
+  truncated: boolean
+  timestamp: number | null
+}
+export interface DashboardNewSessionRequestedParams {
+  session_id?: string
+  reason?: string
+}
+export interface DashboardNewSessionRequestedResult {
+  ok: boolean
 }
 /** Needs a ``template`` or ``instructions`` / ``input``; a live ``session_id`` lends its model. */
 export interface LlmOneshotParams {
@@ -3535,6 +3621,42 @@ export interface ToolsConfigureResult {
   reset: boolean
   unknown: string[]
 }
+export interface StartupCatalogParams {
+  session_id?: string | null
+}
+export interface StartupCatalogResult {
+  tools: StartupToolsCatalog
+  skills: StartupSkillsCatalog
+  mcp: StartupMcpCatalog
+  readiness: StartupCatalogReadiness
+}
+export interface StartupToolsCatalog {
+  total: number
+  toolsets: StartupToolset[]
+}
+export interface StartupToolset {
+  name: string
+  count: number
+  enabled: boolean
+  tools: string[]
+}
+export interface StartupSkillsCatalog {
+  total: number
+  categories: StartupSkillCategory[]
+}
+export interface StartupSkillCategory {
+  name: string
+  count: number
+}
+export interface StartupMcpCatalog {
+  servers: string[]
+}
+export interface StartupCatalogReadiness {
+  status: StartupCatalogReadinessStatus
+  warning?: string | null
+  retry_after_ms?: number | null
+}
+export type StartupCatalogReadinessStatus = 'ready' | 'pending' | 'failed'
 export type ReloadEnvParams = Record<string, never>
 export interface ReloadEnvResult {
   updated: number
@@ -4513,6 +4635,8 @@ export interface RpcMethods {
   'connectors.tools': { params: ConnectorToolsParams; result: ConnectorToolsResult }
   /** List/add/remove/pause/resume cron jobs in the (optionally profile-scoped) cron store. */
   'cron.manage': { params: CronManageParams; result: CronManageResult }
+  /** Publish a hosted TUI's fresh-chat request to the dashboard-owned transport. */
+  'dashboard.new_session_requested': { params: DashboardNewSessionRequestedParams; result: DashboardNewSessionRequestedResult }
   /** Block/unblock NEW spawns globally (active children keep running); returns the new state. */
   'delegation.pause': { params: DelegationPauseParams; result: DelegationPauseResult }
   /** Running subagent tree plus the spawn pause flag and limits. */
@@ -4617,6 +4741,10 @@ export interface RpcMethods {
   'mcp.servers.test': { params: McpServerNameParams; result: McpServersTestResult }
   /** Set/clear one author's emoji reaction on a message; returns the row's full reaction list. */
   'message.react': { params: MessageReactParams; result: MessageReactResult }
+  /** Probe an OpenAI/Anthropic-compatible endpoint without persisting its configuration. */
+  'model.custom.probe': { params: ModelCustomProbeParams; result: ModelCustomProbeResult }
+  /** Persist a canonical custom provider while keeping credentials outside config.yaml. */
+  'model.custom.save': { params: ModelCustomSaveParams; result: ModelCustomSaveResult }
   /** Remove every credential (env keys and OAuth state) for a provider. */
   'model.disconnect': { params: ModelDisconnectParams; result: ModelDisconnectResult }
   /** Provider/model inventory for the picker, layered over the session's live provider when given. */
@@ -4775,6 +4903,8 @@ export interface RpcMethods {
   'session.list': { params: SessionListParams; result: SessionListResult }
   /** Most recent human-facing session; errors fold into a null session_id. */
   'session.most_recent': { params: SessionMostRecentParams; result: SessionMostRecentResult }
+  /** DB-only metadata plus non-overlapping head/tail display-message excerpts for the resume picker. */
+  'session.peek': { params: SessionPeekParams; result: SessionPeekResult }
   /** Redirect the active turn (queued for the next turn while the agent is still building). */
   'session.redirect': { params: SessionCorrectionParams; result: SessionCorrectionResult }
   /** Attach to a stored session: reuse it if live here, else lazy / deferred / cold / eager rebuild. */
@@ -4813,6 +4943,8 @@ export interface RpcMethods {
   'spawn_tree.load': { params: SpawnTreeLoadParams; result: SpawnTreeLoadResult }
   /** Persist a finished delegation tree snapshot under the session's spawn-trees dir. */
   'spawn_tree.save': { params: SpawnTreeSaveParams; result: SpawnTreeSaveResult }
+  /** Startup-panel inventory of callable tools, installed skills, enabled MCP servers, and agent readiness. */
+  'startup.catalog': { params: StartupCatalogParams; result: StartupCatalogResult }
   /** Hard-interrupt one owned child; ``found`` is false when it already finished. */
   'subagent.interrupt': { params: SubagentIdParams; result: SubagentInterruptResult }
   /** Live children owned by this session (other sessions' children never leak). */
@@ -4924,6 +5056,7 @@ export const RPC_METHODS = [
   'connectors.policy.set',
   'connectors.tools',
   'cron.manage',
+  'dashboard.new_session_requested',
   'delegation.pause',
   'delegation.status',
   'diagnostics.share_nous',
@@ -4976,6 +5109,8 @@ export const RPC_METHODS = [
   'mcp.servers.status',
   'mcp.servers.test',
   'message.react',
+  'model.custom.probe',
+  'model.custom.save',
   'model.disconnect',
   'model.options',
   'model.save_key',
@@ -5055,6 +5190,7 @@ export const RPC_METHODS = [
   'session.interrupt',
   'session.list',
   'session.most_recent',
+  'session.peek',
   'session.redirect',
   'session.resume',
   'session.save',
@@ -5074,6 +5210,7 @@ export const RPC_METHODS = [
   'spawn_tree.list',
   'spawn_tree.load',
   'spawn_tree.save',
+  'startup.catalog',
   'subagent.interrupt',
   'subagent.list',
   'subagent.steer',
