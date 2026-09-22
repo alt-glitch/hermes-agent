@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest'
 import {
   createDelegationStatusRefresher,
   createSpawnTreeSaveDrainer,
+  shouldPollSubagentRoster,
   tuiAgentsNudgeConfigValue
 } from '../logic/agentsRuntime.ts'
 import type { SpawnTreeSaveIntent } from '../logic/store.ts'
@@ -212,4 +213,21 @@ test('Agents nudge config extraction preserves explicit false and defaults missi
   expect(tuiAgentsNudgeConfigValue({ display: { tui_agents_nudge: true } })).toBe(true)
   expect(tuiAgentsNudgeConfigValue({ display: 'compact' })).toBeUndefined()
   expect(tuiAgentsNudgeConfigValue({})).toBeUndefined()
+})
+
+describe('subagent roster poll gating', () => {
+  test('an idle session with an all-terminal roster and no live surface does not poll', () => {
+    // This is the steady idle-composer case: nothing on screen observes the
+    // roster and every child has settled, so a tick must not issue a wasted RPC.
+    expect(shouldPollSubagentRoster(false, false)).toBe(false)
+  })
+
+  test('an open Agents surface polls even when the roster is all-terminal', () => {
+    expect(shouldPollSubagentRoster(true, false)).toBe(true)
+  })
+
+  test('a non-terminal child polls even with no live surface (lifecycle settling)', () => {
+    expect(shouldPollSubagentRoster(false, true)).toBe(true)
+    expect(shouldPollSubagentRoster(true, true)).toBe(true)
+  })
 })
