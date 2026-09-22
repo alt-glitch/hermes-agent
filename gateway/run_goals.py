@@ -8,6 +8,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from contextlib import suppress
@@ -99,7 +100,13 @@ class GatewayGoalsMixin:
 
     @staticmethod
     def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False) -> MessageEvent:
-        """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session."""
+        """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
+
+        The stored source's ``message_id`` is the message that registered the watch; a synthetic
+        prompt is not a reply to it, so it is dropped or every progress bubble and final reply
+        would quote that stale message (Telegram DM topics route anchorless via the topic id).
+        """
+        source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
         return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
@@ -132,7 +139,7 @@ class GatewayGoalsMixin:
                 return
             session_id = current
             watch[quick_key] = (source, session_id)
-        adapter = self._adapter_for_source(source)
+        adapter = self._delivery_adapter_for(source)
         if adapter is None or not adapter._message_handler:
             return
         if (
@@ -153,6 +160,8 @@ class GatewayGoalsMixin:
         event = self._synthetic_prompt_event(source, prompt)
         event.metadata["gateway_session_key"] = quick_key
         event._heartbeat_execution_started = False
+        # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
+        # non-internal so authorization and the emergency stop still apply.
         event._heartbeat_session_id = session_id
         # A pinned route skips topic recovery: no await between the idle
         # check and adapter claim. FIFO alone never wakes an idle session.
@@ -196,7 +205,7 @@ class GatewayGoalsMixin:
             logger.debug("Failed to start heartbeat poller", exc_info=True)
 
     def _goal_notice_adapter(self, source: Any):
-        adapter = self._adapter_for_source(source)
+        adapter = self._delivery_adapter_for(source)
         if not adapter:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
         return adapter
@@ -299,7 +308,7 @@ class GatewayGoalsMixin:
             return
         # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
         try:
-            adapter = self._adapter_for_source(source)
+            adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
                 self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
@@ -661,33 +670,37 @@ class GatewayGoalsMixin:
         - no routing metadata on the loop → skip with a one-time warning
           (CLI/TUI loops carry no route and are driven by their own surfaces)
 
-        Multiplex: one gateway-wide task, so ``list_active_loops`` alone reads only the launch home's
-        store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
-        profile's store is scanned under its own runtime scope, and each hit is fired against that
-        profile's adapters (``_fire_due_loop_wakeups_once`` resolves via ``_adapter_for_source``,
-        failing closed to the shared Relay transport for a secondary without a native adapter).
+        Multiplex: one gateway-wide task scans every served profile under its own runtime scope.
+        Each hit uses ``_fire_due_loop_wakeups_once`` so canonical session origins, adapter ownership,
+        Relay fallback, stale-claim recovery, and claim IDs stay identical to a direct scan.
         """
-        from gateway.run import _multiplex_profile_homes, _profile_runtime_scope
+        from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
+        from gateway.run_idle_gates import profile_has_active_loop
 
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
+
+        def _scope(profile_home):
+            if profile_home is not None:
+                return _async_profile_runtime_scope(profile_home)
+            from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
+            return async_launch_profile_scope_if_multiplexed()
+
         while self._running:
             try:
-                now = time.time()
-                if getattr(self.config, "multiplex_profiles", False):
-                    scopes = _multiplex_profile_homes(self.config)
-                    for profile_name, profile_home in scopes:
-                        with _profile_runtime_scope(profile_home):
-                            await self._fire_due_loop_wakeups_once(
-                                profile_name=profile_name,
-                                now=now,
-                                warned_no_route=warned_no_route,
-                            )
-                else:
-                    await self._fire_due_loop_wakeups_once(
-                        now=now,
-                        warned_no_route=warned_no_route,
-                    )
+                scan_now = time.time()
+                for profile_name, profile_home in _handoff_watch_scopes(self):
+                    # Idle gate skips secondary scope setup when no active loop exists. The root
+                    # scan stays cheap and binds the launch profile once multiplexing is active.
+                    if profile_home is not None and not await self._run_in_executor_with_context(
+                            profile_has_active_loop, profile_home):
+                        continue
+                    async with _scope(profile_home):
+                        await self._fire_due_loop_wakeups_once(
+                            profile_name=profile_name,
+                            now=scan_now,
+                            warned_no_route=warned_no_route,
+                        )
             except Exception as exc:
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)

@@ -109,6 +109,7 @@ class TestCompletionQueue:
 
         completion = registry.completion_queue.get_nowait()
         assert len(completion["output"]) == 2000
+        assert completion["output_cut"] == 3000
         assert completion["output_truncated"] is True
         assert completion["output_retained_chars"] == 5000
 
@@ -116,7 +117,38 @@ class TestCompletionQueue:
         rendered = format_process_notification(completion)
         assert rendered is not None
         assert "final 2,000 of 5,000 retained characters" in rendered
+        assert "first 3000 characters cut" in rendered
         assert f"process(action='log', session_id='{s.id}')" in rendered
+
+    def test_completion_output_is_sized_per_process(self, registry):
+        """A spawner whose output is the payload can request a larger completion."""
+        s = _make_session(notify_on_complete=True, output="x" * 5000)
+        s.completion_output_chars = 6000
+        s.exited, s.exit_code = True, 0
+        registry._running[s.id] = s
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(s)
+
+        completion = registry.completion_queue.get_nowait()
+        assert len(completion["output"]) == 5000
+        assert "output_cut" not in completion
+        assert "output_truncated" not in completion
+
+    def test_polled_result_carries_the_same_reply_as_the_notification(self, registry):
+        s = _make_session(sid="proc_polled", output="Reply from @b:\n" + "x" * 4000)
+        s.completion_output_chars = 6000
+        s.exited, s.exit_code = True, 0
+        registry._finished[s.id] = s
+        with patch.object(registry, "_reconcile_local_exit"), patch.object(registry, "_write_checkpoint"):
+            result = registry.wait(s.id, timeout=1)
+        assert result["status"] == "exited"
+        assert result["output"].startswith("Reply from @b:")
+        assert "output_cut" not in result
+
+        s.completion_output_chars = 1000
+        result = registry.wait(s.id, timeout=1)
+        assert len(result["output"]) == 1000
+        assert result["output_cut"] == len(s.output_buffer) - 1000
 
     def test_output_finalizer_failure_keeps_completion_authoritative(self, registry, caplog):
         """Cleanup bookkeeping cannot suppress the exit checkpoint or notification."""
@@ -159,7 +191,6 @@ class TestCompletionQueue:
         mover.start()
         assert finalizer_started.wait(2)
 
-        # Finalizing one process must not hold the registry-wide lookup lock.
         other = _make_session(sid="proc_unrelated", output="other", exited=True, exit_code=0)
         registry._finished[other.id] = other
         unrelated_done = threading.Event()
@@ -225,6 +256,7 @@ class TestCompletionQueue:
         s._output_finalizer = lambda result: result.update(output=result["output"].replace("\nPRIVATE-MARKER", ""))
         registry._running[s.id] = s
         monkeypatch.setattr(registry, "_signal_kill", lambda *_args: None)
+        monkeypatch.setattr(registry, "_post_kill_survivors", lambda *_args: [])
         monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
 
         result = registry.kill_process(s.id)
@@ -270,7 +302,6 @@ class TestCheckpointNotify:
             assert len(data) == 1
             assert data[0]["notify_on_complete"] is True
 
-
     def test_recover_defaults_false(self, registry, tmp_path):
         """Old checkpoint entries without the field default to False."""
         checkpoint = tmp_path / "procs.json"
@@ -315,6 +346,16 @@ class TestTerminalSchema:
             )
             _, kwargs = mock_tt.call_args
             assert kwargs["notify_on_complete"] is True
+
+    def test_cut_completion_says_so_and_points_at_the_log(self):
+        """The rendered notice names the cut and the process log; a whole output renders as before."""
+        from tools.process_registry_notifications import format_process_notification
+        base = {"type": "completion", "session_id": "proc_abc", "command": "hermes peer dm mini",
+                "exit_code": 0, "output": "Reply from mini:\ntail"}
+        cut = format_process_notification({**base, "output_cut": 3000})
+        assert "first 3000 characters cut" in cut and 'process(action="log", session_id="proc_abc")' in cut
+        assert cut.endswith("Reply from mini:\ntail]")
+        assert "cut" not in format_process_notification(base)
 
 
 # =========================================================================
