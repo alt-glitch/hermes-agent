@@ -8529,6 +8529,18 @@
               }
             ],
             "default": null
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Backend"
           }
         },
         "required": [

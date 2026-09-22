@@ -512,6 +512,7 @@ export interface ConfigSetResult {
   branch?: string | null
   history_reset?: boolean | null
   info?: SessionLiveInfo | null
+  backend?: string | null
 }
 /** ``tui_gateway/server.py::_session_info`` — the ``session.info`` event and the ``info`` field of ``session.create`` / ``session.resume`` / ``session.activate`` results. */
 export interface SessionLiveInfo {

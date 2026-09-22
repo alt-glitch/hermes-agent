@@ -101,6 +101,7 @@ class ConfigSetResult(Result):
     branch: str | None = None
     history_reset: bool | None = None
     info: SessionLiveInfo | None = None
+    backend: str | None = None
 
 
 method("config.set", params=ConfigSetParams, result=ConfigSetResult,
