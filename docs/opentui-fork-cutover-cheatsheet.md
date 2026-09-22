@@ -52,6 +52,7 @@ The launcher selects it outside development worktrees. After this, one managed
 install, one fork branch.
 
 > We do NOT delete `~/.hermes/hermes-agent` and re-clone — it has linked worktrees
+<!-- no-tmp: ok — historical worktree path reference from the cutover run, not a command to run -->
 > (`/tmp/fable-fix`) and shared git objects. We add the fork as a remote and switch
 > branches in place. Cleaner + reversible.
 
@@ -183,6 +184,7 @@ fnm default 25.9.0    # only if you want the old node default back
    the *code* checkout's branch + venv change).
 3. **The quiet-quill worktree is NOT touched** — the launcher selects it only
    while your shell is inside that worktree; elsewhere it uses the managed install.
+<!-- no-tmp: ok — historical worktree path reference from the cutover run, not a command to run -->
 4. **Linked worktree `/tmp/fable-fix`** shares this repo's `.git`. Switching branches
    in `~/.hermes/hermes-agent` is fine (worktrees are independent checkouts), but
    don't `git checkout sid/opentui` *there* while fable-fix also wants it — it's on

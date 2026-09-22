@@ -160,6 +160,7 @@ then paste — text must land without a prior click.
 
 ## F5 + F6 — clarify prompt rewrite (`view/prompts/clarifyPrompt.tsx`)
 
+<!-- no-tmp: ok — records the historical screenshot path from the design review, not a command to run -->
 Screenshot `/tmp/screenshots/SCR-20260613-iznq.png` confirms: long options run off the right
 edge (no wrap), options differ only by `▶`/`—` glyphs (no numbers, weak), and "✎ Other…" is
 a `<select>` row that *switches* to an input on Enter rather than being an inline input.

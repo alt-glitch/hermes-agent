@@ -18,10 +18,13 @@ import { createCliRenderer, type CliRenderer, type Renderable, RGBA, SyntaxStyle
 import { render } from '@opentui/solid'
 import { writeFile } from 'node:fs/promises'
 
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 import { registerRemoteParsers } from '../boundary/parsers.ts'
 import { messageText } from '../logic/copy.ts'
 
-const OUTPUT_PATH = process.env.SEL_SMOKE_OUT ?? '/tmp/opentui-selection-smoke.json'
+const OUTPUT_PATH = process.env.SEL_SMOKE_OUT ?? join(tmpdir(), 'opentui-selection-smoke.json')
 const SELECTED_RENDERED_TEXT = 'selected-rendered-token'
 const CODE_PAINT_MARKER = 'ffiPaintMarker'
 const MARKDOWN_SOURCE = [

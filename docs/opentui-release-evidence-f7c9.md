@@ -8,7 +8,9 @@ working tree. Runtime: Node 26.3, OpenTUI 0.4.1, Effect 4.0.0-beta.78.
 - OpenTUI full gate: 101 files, 1,430 tests, 40.72 s, one worker.
 - Static/type/build: green. Lint: zero errors and 16 pre-existing warnings.
 - Python gateway/release contracts: 27 passed, 2 skipped.
+<!-- no-tmp: ok — records the historical artifact path from the 2026-07-12 run, not a command to run -->
 - Live PTY fallback: tmux exercised `/details` and `/model --refresh` at
+  <!-- no-tmp: ok — historical artifact path reference -->
   132x40, then resized to 90x28. PNG: `/tmp/hermes-opentui-final.png`.
   `termctrl --host opentui` sessions were stale because the host handshake did
   not complete, so they are not claimed as evidence for this final smoke.
@@ -46,8 +48,11 @@ All component fixtures contain 100 messages.
 
 Cold run RSS was 202.7/205.1/201.5 MB; warm run RSS was
 192.0/191.5/196.0 MB; live fixture RSS was 270.5/286.2/268.7 MB. Raw component
+<!-- no-tmp: ok — records the historical log paths from the 2026-07-12 run, not commands to run -->
 logs are `/tmp/opentui-resume-cold-r{0,1,2}.txt`,
+<!-- no-tmp: ok — historical log path reference -->
 `/tmp/opentui-resume-switch-r{0,1,2}.txt`, and
+<!-- no-tmp: ok — historical log path reference -->
 `/tmp/opentui-live-r{0,1,2}.txt`.
 
 Ten repeated 100-message replacements passed the exact retained-state gate:

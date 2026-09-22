@@ -31,7 +31,7 @@ import { fileURLToPath } from 'node:url'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const defaultRoot = resolve(scriptDir, '../..')
-const originalHome = process.env.HOME || '/tmp'
+const originalHome = process.env.HOME || tmpdir()
 
 function parseArgs(argv) {
   const options = {

@@ -84,13 +84,13 @@ shell PTY; a one-shot parent may reap the session daemon. Pass launch variables
 with `/usr/bin/env` after `--` so the OpenTUI child inherits them.
 
 ```sh
-termctrl start tui --host opentui --cols 132 --rows 40 --record /tmp/tui.termctrl -- \
+termctrl start tui --host opentui --cols 132 --rows 40 --record "${TMPDIR:-/tmp}/tui.termctrl" -- \
   /usr/bin/env HERMES_TUI_ENGINE=opentui HERMES_TUI_MOUSE=1 hermes
 termctrl wait --timeout 20000 tui "Type to chat"
 termctrl show tui
 termctrl resize tui --cols 100 --rows 30
 termctrl show tui # inspect the settled post-resize frame before persisting it
-termctrl save tui --format png --out /tmp/hermes-opentui.png
+termctrl save tui --format png --out "${TMPDIR:-/tmp}/hermes-opentui.png"
 termctrl stop tui
 ```
 
