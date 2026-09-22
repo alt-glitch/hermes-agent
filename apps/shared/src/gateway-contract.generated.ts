@@ -279,6 +279,10 @@ export interface BillingStepUpResult {
   recovery?: string | null
   granted?: boolean | null
 }
+export interface DelegationStatusParams {
+  profile?: string | null
+  session_id?: string | null
+}
 export interface DelegationStatusResult {
   active: ActiveSubagent[]
   paused: boolean
@@ -2334,6 +2338,7 @@ export interface PromptSubmitParams {
   display_kind?: string | null
   interrupted?: boolean | null
   queued?: boolean | null
+  client_submission_id?: string | null
   surface?: string | null
   voice_context?: string | null
   title_preview?: string | null
@@ -4640,8 +4645,8 @@ export interface RpcMethods {
   'dashboard.new_session_requested': { params: DashboardNewSessionRequestedParams; result: DashboardNewSessionRequestedResult }
   /** Block/unblock NEW spawns globally (active children keep running); returns the new state. */
   'delegation.pause': { params: DelegationPauseParams; result: DelegationPauseResult }
-  /** Running subagent tree plus the spawn pause flag and limits. */
-  'delegation.status': { params: ProfileParams; result: DelegationStatusResult }
+  /** Running subagent tree plus the spawn pause flag and limits, optionally scoped to a live agent session. */
+  'delegation.status': { params: DelegationStatusParams; result: DelegationStatusResult }
   /** Upload a force-redacted debug bundle to Nous-internal diagnostics storage. */
   'diagnostics.share_nous': { params: DiagnosticsShareNousParams; result: DiagnosticsShareNousResult }
   /** Stage a non-image file into the session workspace and hand back its @file: ref. */

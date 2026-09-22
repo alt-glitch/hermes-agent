@@ -8621,7 +8621,7 @@ def test_notification_poller_delivers_owned_events(
 
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
-        assert status_calls[0][2]["kind"] == "status"
+        assert status_calls[0][2]["kind"] == "process"
         assert len(delivered) == 1
         card_calls = [a for a in emitted if a[0] == "notification.show"]
         assert len(card_calls) == 1
@@ -14656,11 +14656,12 @@ def test_prompt_submit_rebases_compressed_history_on_model_switch(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, daemon=None, **_kwargs):
             self._target = target
 
         def start(self):
-            self._target()
+            if self._target is not None:
+                self._target()
 
     old_history = [
         {"role": "user", "content": "old one"},
@@ -14673,7 +14674,9 @@ def test_prompt_submit_rebases_compressed_history_on_model_switch(monkeypatch):
     server._sessions["sid"] = session
     emits = []
     try:
+        from agent import memory_provider
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(memory_provider.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
@@ -16222,20 +16225,25 @@ def test_clear_pending_without_sid_clears_all():
 
 
 # ---------------------------------------------------------------------------
-# Blocking prompts wait for the human (v6 north-star #5): _block with
-# timeout=None must never expire — interrupt/shutdown (_clear_pending)
-# are the only releases.
+# Blocking server→client requests wait for the human when timeout=None;
+# interrupt/shutdown cancellation is the only other release.
 # ---------------------------------------------------------------------------
 
 
 def _run_block_in_thread(monkeypatch, sid):
-    """Start _block(timeout=None) on a background thread; return
-    (thread, results, get_rid) where get_rid polls for the pending rid."""
-    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
-    results: list[str] = []
+    """Start server_requests.send(timeout=None) on a background thread."""
+    from tui_gateway import server_requests
+
+    monkeypatch.setattr(server_requests, "_write", lambda _frame: None)
+    monkeypatch.setattr(server_requests, "_answerable", lambda _sid: True)
+    results: list[dict | None] = []
 
     def runner():
-        results.append(server._block("clarify.request", sid, {"question": "q"}))
+        results.append(
+            server_requests.send(
+                "clarify", sid, {"question": "q"}, timeout=None
+            )
+        )
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
@@ -16243,48 +16251,51 @@ def _run_block_in_thread(monkeypatch, sid):
     def get_rid():
         deadline = time.time() + 5
         while time.time() < deadline:
-            with server._prompt_lock:
-                for rid, (owner, _ev) in server._pending.items():
-                    if owner == sid:
-                        return rid
+            requests = server_requests.open_requests(sid)
+            if requests:
+                return requests[0]["id"]
             time.sleep(0.01)
-        raise AssertionError("pending rid never appeared for sid=%s" % sid)
+        raise AssertionError("pending request never appeared for sid=%s" % sid)
 
     return t, results, get_rid
 
 
 def test_block_no_timeout_waits_for_delayed_answer(monkeypatch):
-    """_block(timeout=None) must keep blocking until the answer arrives —
-    no premature empty return."""
+    """timeout=None must keep blocking until the response frame arrives."""
+    from tui_gateway import server_requests
+
     t, results, get_rid = _run_block_in_thread(monkeypatch, "sid_block_wait")
     rid = get_rid()
 
-    # Answer after a short delay; _block must still be waiting.
     time.sleep(0.3)
-    assert t.is_alive(), "_block returned before any answer was provided"
-    with server._prompt_lock:
-        server._answers[rid] = "green"
-        server._pending[rid][1].set()
+    assert t.is_alive(), "server request returned before any answer was provided"
+    assert server_requests.resolve_response(
+        {"jsonrpc": "2.0", "id": rid, "result": {"answer": "green"}}
+    )
 
     t.join(timeout=5)
     assert not t.is_alive()
-    assert results == ["green"]
+    assert results == [{"answer": "green"}]
 
 
 def test_clear_pending_releases_no_timeout_block(monkeypatch):
-    """_clear_pending(sid) must release a timeout=None _block with ''."""
+    """_clear_pending(sid) must cancel a timeout=None request with None."""
+    from tui_gateway import server_requests
+
     t, results, get_rid = _run_block_in_thread(monkeypatch, "sid_block_clear")
     get_rid()
 
     server._clear_pending("sid_block_clear")
     t.join(timeout=5)
     assert not t.is_alive()
-    assert results == [""]
+    assert results == [None]
+    server_requests.reset_for_tests()
 
 
 def test_clear_pending_other_sid_does_not_release_block(monkeypatch):
-    """_clear_pending on an unrelated session must NOT release a pending
-    timeout=None _block (session scoping)."""
+    """_clear_pending on another session must not cancel this request."""
+    from tui_gateway import server_requests
+
     t, results, get_rid = _run_block_in_thread(monkeypatch, "sid_block_scoped")
     rid = get_rid()
 
@@ -16296,13 +16307,13 @@ def test_clear_pending_other_sid_does_not_release_block(monkeypatch):
     )
     assert not results
 
-    # Clean up: release properly so the thread joins.
-    with server._prompt_lock:
-        server._answers[rid] = "done"
-        server._pending[rid][1].set()
+    assert server_requests.resolve_response(
+        {"jsonrpc": "2.0", "id": rid, "result": {"answer": "done"}}
+    )
     t.join(timeout=5)
     assert not t.is_alive()
-    assert results == ["done"]
+    assert results == [{"answer": "done"}]
+    server_requests.reset_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -19028,9 +19039,11 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     assert complete_events, "expected message.complete to be emitted"
     payload = complete_events[-1][2]
     assert payload.get("status") == "error"
-    assert payload.get("text", "").startswith("Error:")
-    assert "kimi-k2.6" in payload.get("text", "")
-
+    text = payload.get("text", "")
+    assert not text.startswith("Error:")
+    assert "Details: HTTP 400: invalid model id 'kimi-k2.6'" in text
+    assert "/retry" in text or "/model" in text
+    assert payload.get("error") == "HTTP 400: invalid model id 'kimi-k2.6'"
 
 def test_prompt_submit_accepts_legacy_string_result(monkeypatch):
     """A legacy/custom agent may return reply text instead of a result mapping."""
@@ -20464,7 +20477,8 @@ def test_session_peek_db_unavailable(monkeypatch):
     )
 
     assert resp["error"]["code"] == 5046
-    assert "state.db unavailable" in resp["error"]["message"]
+    assert "Session storage is unavailable" in resp["error"]["message"]
+    assert "session database is locked" in resp["error"]["message"]
 
 
 # ── verification.status ──────────────────────────────────────────────
@@ -21625,14 +21639,17 @@ def test_notification_poller_delivers_completion(monkeypatch):
     deferred_turns = []
 
     class _DeferredThread:
-        def __init__(self, target=None, daemon=None, **_kwargs):
+        def __init__(self, target=None, daemon=None, **kwargs):
             self._target = target
+            self._name = kwargs.get("name")
         def start(self):
-            deferred_turns.append(self._target)
+            if self._name == "prompt-turn-sid_poll":
+                deferred_turns.append(self._target)
 
     sess = _session(agent=_Agent())
     server._sessions["sid_poll"] = sess
-    monkeypatch.setattr(server.threading, "Thread", _DeferredThread)
+    from agent import memory_provider
+    monkeypatch.setattr(memory_provider, "threading", types.SimpleNamespace(Thread=_DeferredThread))
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -21667,11 +21684,11 @@ def test_notification_poller_delivers_completion(monkeypatch):
         for run_turn in deferred_turns:
             run_turn()
 
-        # The concise status remains non-transcript chrome, while the complete
+        # The concise process status remains non-transcript chrome, while the complete
         # model prompt is available from the expandable process card.
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) >= 1
-        assert status_calls[0][2]["kind"] == "status"
+        assert status_calls[0][2]["kind"] == "process"
         assert len(turns) == 1
         card_calls = [a for a in emitted if a[0] == "notification.show"]
         assert len(card_calls) == 1
@@ -26246,9 +26263,9 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert live.get("explicit_cwd") is True
 
 
-def test_load_cfg_raw_sees_replacement_with_pinned_mtime_and_size(monkeypatch, tmp_path):
-    """#111105: the raw-config cache must not serve (and later write back) a stale document after a
-    same-size replacement that keeps the old mtime."""
+def test_load_cfg_raw_sees_atomic_replacement_with_pinned_mtime_and_size(monkeypatch, tmp_path):
+    """#111105: the cache signature detects the atomic replacement used by config writers even when
+    size and mtime are preserved."""
     import shutil
 
     cfg = tmp_path / "config.yaml"
@@ -26259,8 +26276,9 @@ def test_load_cfg_raw_sees_replacement_with_pinned_mtime_and_size(monkeypatch, t
     monkeypatch.setattr(server, "_cfg_path", None)
     assert server._load_cfg_raw()["model"]["default"] == "bbbb-route"
     st = cfg.stat()
-    other = tmp_path / "other.yaml"
-    other.write_text("model:\n  default: aaaa-route\n", encoding="utf-8")
-    shutil.copy2(other, cfg)
+    replacement = tmp_path / "config.yaml.new"
+    replacement.write_text("model:\n  default: aaaa-route\n", encoding="utf-8")
+    shutil.copystat(cfg, replacement)
+    replacement.replace(cfg)
     os.utime(cfg, ns=(st.st_atime_ns, st.st_mtime_ns))
     assert server._load_cfg_raw()["model"]["default"] == "aaaa-route"

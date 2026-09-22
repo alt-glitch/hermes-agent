@@ -800,12 +800,12 @@
     },
     {
       "name": "delegation.status",
-      "summary": "Running subagent tree plus the spawn pause flag and limits.",
+      "summary": "Running subagent tree plus the spawn pause flag and limits, optionally scoped to a live agent session.",
       "params": [
         {
           "name": "params",
           "schema": {
-            "$ref": "#/components/schemas/ProfileParams"
+            "$ref": "#/components/schemas/DelegationStatusParams"
           }
         }
       ],
@@ -11606,6 +11606,37 @@
           "paused"
         ],
         "title": "DelegationPauseResult",
+        "type": "object"
+      },
+      "DelegationStatusParams": {
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          }
+        },
+        "title": "DelegationStatusParams",
         "type": "object"
       },
       "DelegationStatusResult": {
@@ -23896,6 +23927,18 @@
             ],
             "default": null,
             "title": "Queued"
+          },
+          "client_submission_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Submission Id"
           },
           "surface": {
             "anyOf": [
