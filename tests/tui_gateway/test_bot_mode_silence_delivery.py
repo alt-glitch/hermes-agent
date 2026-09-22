@@ -26,21 +26,21 @@ def test_live_bot_chat_completion_empties_marker_only_for_successful_turns(monke
     session = {"pending_title": None, "session_key": "k", "history_lock": contextlib.nullcontext(),
                "agent": SimpleNamespace(_session_title_hint="Bot Chat")}
 
-    payload, _, status = srv._complete_turn_payload(session, _turn({"final_response": " *NO_REPLY* "}), None, 80)
+    payload, _, status = srv._complete_turn_payload("sid", session, _turn({"final_response": " *NO_REPLY* "}), None, 80)
     assert (status, payload["text"]) == ("complete", "")
 
     prose = "[SILENT] is mentioned here, but this is a real answer."
-    payload, _, _ = srv._complete_turn_payload(session, _turn({"final_response": prose}), None, 80)
+    payload, _, _ = srv._complete_turn_payload("sid", session, _turn({"final_response": prose}), None, 80)
     assert payload["text"] == prose
 
     failed = {"final_response": "NO_REPLY", "error": "provider failed", "failed": True}
-    payload, _, status = srv._complete_turn_payload(session, _turn(failed), None, 80)
+    payload, _, status = srv._complete_turn_payload("sid", session, _turn(failed), None, 80)
     assert (status, payload["text"]) == ("error", "NO_REPLY")
 
     # A plain (non-Bot-Chat) desktop session keeps the marker: the gate is the canonical title.
     session["agent"] = SimpleNamespace(_session_title_hint="Scratch")
     monkeypatch.setattr(srv, "_session_live_title", lambda _s, _k: "Scratch")
-    payload, _, _ = srv._complete_turn_payload(session, _turn({"final_response": "NO_REPLY"}), None, 80)
+    payload, _, _ = srv._complete_turn_payload("sid", session, _turn({"final_response": "NO_REPLY"}), None, 80)
     assert payload["text"] == "NO_REPLY"
 
 

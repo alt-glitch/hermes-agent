@@ -63,12 +63,14 @@ def _turn_env(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
     monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    monkeypatch.setattr(server, "_sessions", {})
 
 
 def test_hosted_room_turn_releases_bot_room_slot_when_it_ends(monkeypatch, tmp_path):
     _turn_env(monkeypatch, tmp_path)
     lease = _Lease()
     session = _session(ROOM_SESSION_SOURCE, lease)
+    server._sessions["ui-sid"] = session
 
     assert server._run_prompt_submit("rid", "ui-sid", session, "@sentinel ping") is True
 
@@ -82,6 +84,7 @@ def test_ordinary_session_keeps_its_slot_after_a_turn(monkeypatch, tmp_path):
     _turn_env(monkeypatch, tmp_path)
     lease = _Lease()
     session = _session("desktop", lease)
+    server._sessions["ui-sid"] = session
 
     assert server._run_prompt_submit("rid", "ui-sid", session, "hello") is True
 

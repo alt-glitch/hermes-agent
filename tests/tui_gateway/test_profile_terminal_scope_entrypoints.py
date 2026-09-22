@@ -57,6 +57,28 @@ def _run_side_worker(session, body):
         assert done.wait(15), "side worker did not finish"
 
 
+@pytest.fixture(autouse=True)
+def _restore_context_scopes():
+    from agent import runtime_cwd
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.approval_context import reset_current_session_key, set_current_session_key
+    from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
+
+    tokens = (
+        (set_terminal_scope(None), reset_terminal_scope),
+        (set_secret_scope({}), reset_secret_scope),
+        (set_hermes_home_override(None), reset_hermes_home_override),
+        (set_current_session_key(""), reset_current_session_key),
+        (runtime_cwd.set_session_cwd(None), runtime_cwd.reset_session_cwd),
+    )
+    try:
+        yield
+    finally:
+        for token, reset in reversed(tokens):
+            reset(token)
+
+
 def test_secondary_side_worker_runs_its_own_terminal_backend(tmp_path):
     session = {"profile_home": str(_secondary(tmp_path)), "cwd": str(tmp_path)}
     got = {}

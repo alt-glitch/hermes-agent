@@ -9,6 +9,8 @@ fall back to os.environ, every terminal command in a dashboard/TUI/web session
 saw an empty HERMES_SESSION_ID even though agent_init had set it via
 set_current_session_id().
 """
+from pathlib import Path
+
 import pytest
 
 from gateway.session_context import (
@@ -21,15 +23,19 @@ import tui_gateway.server as server
 
 @pytest.fixture(autouse=True)
 def _reset_contextvars():
-    """Reset all session contextvars to _UNSET between tests.
+    """Reset all session contextvars to _UNSET around every test.
 
     In production each asyncio.Task/worker thread gets a fresh context copy
     where the defaults are _UNSET. In tests functions share one thread
-    context, so a value set by test A would leak into test B without this.
+    context, so a value set by another test would leak in without this.
     """
-    yield
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    try:
+        yield
+    finally:
+        for var in _VAR_MAP.values():
+            var.set(_UNSET)
 
 
 class _FakeAgent:
@@ -54,6 +60,7 @@ def _install_session(
     }
     if profile_home is not None:
         sess["profile_home"] = str(profile_home)
+        monkeypatch.setattr(server, "profile_name_for_home", lambda home: Path(home).name)
     monkeypatch.setattr(server, "_sessions", {session_key: sess}, raising=False)
     return sess
 

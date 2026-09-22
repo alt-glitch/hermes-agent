@@ -28,7 +28,7 @@ def test_diagnostic_turn_runs_but_never_echoes_on_wire(turn_env, marker_home, mo
         agent.clarify_callback("Recovery approval?", ["yes", "no"])
         return {"final_response": "technical final", "messages": []}
     agent.run_conversation = run
-    session = _session(agent=agent, running=True)
+    session = _session(agent=agent, running=True, sid="session")
     session["profile_home"] = str(owner)
     server._run_prompt_submit("request", "session", session, "engine failure",
                               display_metadata={"notification_category": "diagnostic"})
@@ -64,7 +64,7 @@ def test_next_human_followup_is_outside_diagnostic_presentation_scope(turn_env, 
     monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (threading.Event(), SimpleNamespace(join=lambda: None)))
     agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None,
         run_conversation=lambda *a, **k: {"final_response": "diagnostic echo", "messages": []})
-    session = _session(agent=agent, running=True)
+    session = _session(agent=agent, running=True, sid="session")
     def followups(*a):
         server._emit("message.complete", "session", {"text": "next requested result"})
     monkeypatch.setattr(server, "_run_post_turn_followups", followups)

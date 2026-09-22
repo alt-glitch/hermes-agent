@@ -93,14 +93,14 @@ def test_a_loop_wakeup_whose_send_cannot_start_hands_the_turn_back(monkeypatch):
     monkeypatch.setattr(server, "_run_prompt_submit",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no free worker")))
     ticks: list = []
-    mgr = SimpleNamespace(abandon_tick=lambda: ticks.append("abandoned"),
-                          complete_tick=lambda text: ticks.append("completed") or {})
+    mgr = SimpleNamespace(abandon_tick=lambda claim_id: ticks.append(("abandoned", claim_id)),
+                          complete_tick=lambda text, claim_id: ticks.append("completed") or {})
     session = _claimed_session()
 
-    server._notif_slash_loop_tick("rid", "sid", session, mgr, "/skill go")
+    server._notif_slash_loop_tick("rid", "sid", session, mgr, "/skill go", "claim-1")
 
     assert session["running"] is False
-    assert ticks == ["completed"]
+    assert ticks == [("abandoned", "claim-1")]
 
 
 def test_the_poller_thread_survives_a_dispatch_that_raises(monkeypatch):

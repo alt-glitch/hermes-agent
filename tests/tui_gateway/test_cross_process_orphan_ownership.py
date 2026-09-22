@@ -280,6 +280,7 @@ def test_own_live_lease_ids_reports_live_owners_and_skips_the_excluded(
 
     first = _Lease("first")
     second = _Lease("second")
+    deferred = set(server._deferred_active_session_leases)
     monkeypatch.setattr(
         server,
         "_sessions",
@@ -290,8 +291,8 @@ def test_own_live_lease_ids_reports_live_owners_and_skips_the_excluded(
         },
     )
 
-    assert server._own_live_lease_ids() == {"first", "second"}
-    assert server._own_live_lease_ids(exclude=first) == {"second"}
+    assert server._own_live_lease_ids() == {"first", "second", *deferred}
+    assert server._own_live_lease_ids(exclude=first) == {"second", *deferred}
 
 
 def test_automatic_cleanup_reclaims_own_orphan_lease_not_treated_as_sibling(

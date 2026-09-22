@@ -50,6 +50,11 @@ def server():
     # which is shared with every other test file in the process.
     methods = dict(mod._methods)
     real_stdout = mod._real_stdout
+    # The initial-import fakes above are intentionally shallow.  Runtime code now
+    # stamps session.info with the active profile, so restore that one binding to
+    # a real string for tests that execute session RPCs.
+    setattr(mod, "_current_profile_name", lambda: "default")
+    setattr(mod, "profile_name_for_home", lambda _home: None)
     yield mod
     # Reset module-level state without re-importing. importlib.reload
     # would re-register the module's atexit hooks (ThreadPoolExecutor
@@ -420,7 +425,8 @@ def test_server_request_waits_for_a_ws_client_that_advertised(server):
     _ws_session(server, "ws-new", peer)
     token = bind_transport(peer)
     try:
-        response = server.handle_request({"id": 1, "method": "client.capabilities", "params": {"server_requests": True}})
+        response = server.dispatch({"id": 1, "method": "client.capabilities", "params": {"server_requests": True}},
+                                   transport=peer)
     finally:
         reset_transport(token)
     assert "clarify" in response["result"]["server_requests"]
@@ -1372,6 +1378,9 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
         def set_session_title(self, _key, _title):
             return None
 
+        def set_auto_title(self, _key, _title, *, source):
+            return None
+
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test/model")
     monkeypatch.setattr(server, "_new_session_key", lambda: "20260101_000001_child0")
@@ -1436,6 +1445,9 @@ def test_session_branch_with_count_truncates_history(server, monkeypatch):
             return list(range(1, len(messages) + 1))
 
         def set_session_title(self, _key, _title):
+            return None
+
+        def set_auto_title(self, _key, _title, *, source):
             return None
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -1506,6 +1518,9 @@ def test_session_branch_forwards_original_timestamps(server, monkeypatch):
             return list(range(1, len(messages) + 1))
 
         def set_session_title(self, _key, _title):
+            return None
+
+        def set_auto_title(self, _key, _title, *, source):
             return None
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())

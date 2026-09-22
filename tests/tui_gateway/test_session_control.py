@@ -237,7 +237,7 @@ class TestStructuredRead:
         from tui_gateway.event_replay import latest_seq
 
         sid, key, _ = session
-        server._emit("status.update", sid, {"status": "idle"})
+        server._emit("status.update", sid, {"kind": "status", "text": "idle"})
 
         read = _call(server, "session.control.read", session_id=sid)["result"]
         assert read["event_seq"] == latest_seq(sid)

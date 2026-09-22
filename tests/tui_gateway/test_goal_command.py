@@ -343,6 +343,7 @@ def test_iteration_limit_fallback_is_judged_and_can_continue(
         clear_interrupt=lambda: None,
     )
     session = _turn_session(agent, session_key)
+    server._sessions["sid"] = session
 
     server._run_prompt_submit("rid", "sid", session, "initial work")
 

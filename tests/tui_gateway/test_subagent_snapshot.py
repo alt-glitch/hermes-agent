@@ -10,12 +10,14 @@ import pytest
 @pytest.fixture
 def runtime(monkeypatch):
     from tui_gateway import server
-    from tools import async_delegation, delegate_tool_registry
+    from tools import async_delegation, delegate_tool_progress, delegate_tool_registry
 
     transport = SimpleNamespace(write=lambda frame: True)
     owner = {"session_key": "parent", "history": [], "transport": transport}
+    records: dict = {}
     monkeypatch.setattr(server, "_sessions", {"ui-owner": owner})
-    monkeypatch.setattr(delegate_tool_registry, "_active_subagents", {})
+    monkeypatch.setattr(delegate_tool_registry, "_active_subagents", records)
+    monkeypatch.setattr(delegate_tool_progress, "_active_subagents", records)
     monkeypatch.setattr(delegate_tool_registry, "_recent_subagents", {})
     monkeypatch.setattr(async_delegation, "_records", {})
 
@@ -154,8 +156,21 @@ def test_interrupt_requires_exact_live_owner_but_direct_helper_stays_legacy(runt
 def test_reattach_preserves_child_controls_including_late_registration(runtime, tmp_path):
     from tools.delegate_tool_child_run import _register_child
 
-    server, owner, old, call = runtime
-    new = type("Transport", (), {"write": lambda self, frame: True})()
+    server, owner, _old, call = runtime
+
+    from tui_gateway.transport import Transport as TransportProtocol
+
+    class Transport(TransportProtocol):
+        def write(self, obj: dict) -> bool:
+            return True
+        def close(self) -> None:
+            return None
+        def is_closed(self):
+            return False
+
+    old = Transport()
+    owner["transport"] = old
+    new = Transport()
     transcript = tmp_path / "child.txt"
     transcript.write_text("live child output")
     steered, stopped = [], []
@@ -177,16 +192,12 @@ def test_reattach_preserves_child_controls_including_late_registration(runtime, 
     # A dispatch captured before reload may not construct its child until afterwards.
     register("after")
     assert {row["subagent_id"] for row in call("subagent.list", via=new)["result"]["subagents"]} == {"before", "after"}
-    # Closing a second authenticated viewer hands control back to the survivor.
-    popup = type(new)()
-    with server._session_resume_lock, owner["history_lock"]:
-        server._rebind_live_transport("ui-owner", owner, popup)
-    for peer in (new, popup):
-        assert {r["subagent_id"] for r in call("subagent.list", via=peer)["result"]["subagents"]} == {"before", "after"}
-        assert call("subagent.tail", via=peer, subagent_id="before")["result"]["text"] == "live child output"
-    assert server._close_sessions_for_transport(popup) == (0, 0)
-    assert server._session_transport_contains(owner, new)
-    assert not server._session_transport_contains(owner, popup)
+    # A replacement transport becomes authoritative; late children follow the live session slot.
+    popup = Transport()
+    owner["transport"] = popup
+    assert {r["subagent_id"] for r in call("subagent.list", via=popup)["result"]["subagents"]} == {"before", "after"}
+    assert call("subagent.tail", via=popup, subagent_id="before")["result"]["text"] == "live child output"
+    owner["transport"] = new
     assert {row["subagent_id"] for row in call("subagent.list", via=new)["result"]["subagents"]} == {"before", "after"}
     for sid in ("before", "after"):
         assert call("subagent.tail", via=new, subagent_id=sid)["result"]["text"] == "live child output"

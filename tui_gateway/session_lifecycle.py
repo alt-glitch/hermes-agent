@@ -194,6 +194,15 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
         claim_error = exc
 
     result = limit_message or _SESSION_OWNERSHIP_UNAVAILABLE
+    if limit_message is not None:
+        from hermes_cli.active_sessions import SESSION_NOT_OWNED
+        if (
+            getattr(limit_message, "reason", None) == SESSION_NOT_OWNED
+            and _take_over_detached_runtime_lease(
+                sid, session, str(session.get("session_key") or "")
+            )
+        ):
+            result = None
     with _session_mutation_lock(session):
         if not _session_registry_matches(sid, session) or session.get("_finalized"):
             # Teardown detached/finalized this exact record while the
@@ -667,8 +676,9 @@ def _settle_isolated_turn_before_close(session: dict) -> None:
     grace timer, else a second backend acquires the stored session while the child is still writing."""
     if not session.get("_compute_host_turn_id") or not _session_uses_compute_host(session):
         return
-    with contextlib.suppress(Exception):
-        _interrupt_session_turn(_lifecycle_own_sid(session), session)
+    if not session.get("_turn_cancel_requested"):
+        with contextlib.suppress(Exception):
+            _interrupt_session_turn(_lifecycle_own_sid(session), session)
     deadline = time.monotonic() + _TURN_SETTLE_BEFORE_CLOSE_SECONDS
     while session.get("_compute_host_turn_id") and time.monotonic() < deadline:
         time.sleep(0.05)

@@ -280,6 +280,7 @@ def test_returned_partial_error_keeps_final_response_text(emits, turn_env, monke
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "hello")
 
+    server._sessions["sid"] = session
     server._run_prompt_submit("rid", "sid", session, "hello")
 
     completes = _events(emits, "message.complete")
@@ -318,6 +319,7 @@ def test_only_partial_answers_on_failed_turns_set_flag(emits, turn_env, result, 
     session = _session(agent=agent, running=True)
     server._start_inflight_turn(session, "do the thing")
 
+    server._sessions["sid"] = session
     server._run_prompt_submit("rid", "sid", session, "do the thing")
 
     payload = _events(emits, "message.complete")[0]

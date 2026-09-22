@@ -40,6 +40,15 @@ def picker_env(monkeypatch, tmp_path):
         default_aux_model="fake-small", fallback_models=("fake-large[1m]", "fake-small", "fake-pinned-only"),
         model_aliases={"large": "fake-large[1m]"})
     register_provider(profile)
+    from hermes_cli import models
+    from hermes_cli import models_catalog_static
+    entry = models_catalog_static.ProviderEntry(
+        profile.name, profile.display_name, profile.description or profile.display_name
+    )
+    canonical = [*models.CANONICAL_PROVIDERS, entry]
+    monkeypatch.setattr(models, "CANONICAL_PROVIDERS", canonical)
+    monkeypatch.setattr(models_catalog_static, "CANONICAL_PROVIDERS", canonical)
+    models._PROVIDER_LABELS[profile.name] = profile.display_name
     real_which = shutil.which
     monkeypatch.setattr(shutil, "which",
                         lambda cmd, *a, **kw: sys.executable if cmd == profile.process_command else real_which(cmd, *a, **kw))

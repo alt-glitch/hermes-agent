@@ -35,26 +35,32 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
     child_key = str(payload.get("child_session_id") or "")
     if not child_key:
         return
-    # Liveness registry first: accurate with no window open (one opened mid-run knows busy).
-    if event_type == "subagent.complete":
-        _active_child_runs.pop(child_key, None)
-    else:
-        _active_child_runs[child_key] = time.time()
-    # Mirror only into a live watch session NOT upgraded to a full agent (an upgraded one owns
-    # a real native stream). Either way drop state so a reopened window starts fresh.
-    live = _find_live_session_by_key(child_key)
-    if live is None or live[1].get("agent") is not None:
-        with _child_mirrors_lock:
-            _child_mirrors.pop(child_key, None)
-        return
-    csid = live[0]
-    text = str(payload.get("text") or "")
+    owner = str(payload.get("subagent_id") or "")
     with _child_mirrors_lock:
-        st = _child_mirrors.setdefault(child_key, {"seq": 0, "open_tool": None, "started": False})
+        current = _child_mirrors.get(child_key)
+        if current is not None and owner and current.get("owner") not in (None, owner):
+            return
+        # Completion closes this owner's mirror before any late callback can
+        # recreate it. A fresh owner may still start a later run for the same key.
+        if event_type == "subagent.complete":
+            _active_child_runs.pop(child_key, None)
+        else:
+            _active_child_runs[child_key] = time.time()
+        live = _find_live_session_by_key(child_key)
+        if live is None or live[1].get("agent") is not None:
+            _child_mirrors.pop(child_key, None)
+            return
+        csid = live[0]
+        text = str(payload.get("text") or "")
+        st = _child_mirrors.setdefault(
+            child_key,
+            {"seq": 0, "open_tool": None, "started": False, "owner": owner or None},
+        )
+        if owner and st.get("owner") is None:
+            st["owner"] = owner
         if not st["started"]:
             st["started"] = True
             _emit("message.start", csid)
-        # thinking/text/start (the child's goal, as a one-time header) are plain deltas.
         if event_type in _CHILD_DELTA_EVENTS:
             if text:
                 _emit(_CHILD_DELTA_EVENTS[event_type], csid,
@@ -63,7 +69,10 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
         if event_type not in ("subagent.tool", "subagent.complete"):
             return
         if st["open_tool"]:
-            _emit("tool.complete", csid, st["open_tool"])
+            open_tool = st["open_tool"]
+            _emit("tool.complete", csid, {
+                "tool_id": open_tool["tool_id"], "name": open_tool["name"], "args": open_tool.get("args") or {}})
+            st["open_tool"] = None
         if event_type == "subagent.tool":
             st["seq"] += 1
             tool = {"name": str(payload.get("tool_name") or "tool"),

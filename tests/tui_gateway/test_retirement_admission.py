@@ -64,6 +64,7 @@ def test_queued_and_running_rpc_hold_admission_until_the_response(runtime, monke
 
 def test_prompt_claim_and_automatic_continuations_cannot_cross_prepare(runtime, monkeypatch):
     server, fence = runtime
+    monkeypatch.setattr(server, "_sessions", {})
     session = {"history_lock": threading.RLock(), "running": False, "history": []}
     dispatched = []
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **kw: dispatched.append(a))
@@ -91,5 +92,6 @@ def test_prompt_claim_and_automatic_continuations_cannot_cross_prepare(runtime, 
                        "active_session_lease": SimpleNamespace(lease_id="l", released=False)}
     assert server._poll_bot_live_delivery_once("s", mailbox_session) is False
     assert fence.cancel(token) == {"ok": True}
+    session["queued_prompt"] = None
     assert server._notif_claim_turn(session) is True
     assert session["running"] is True

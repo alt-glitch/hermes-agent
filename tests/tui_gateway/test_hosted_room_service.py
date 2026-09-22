@@ -606,6 +606,13 @@ def test_same_thread_followup_migrates_and_delivers_committed_peer_reply(
         payload={"text": "@hermes continue", "thread_id": "thread-1"},
     )
     _wait_for(lambda: len(service.rpc.prompts) == 2)
+    _wait_for(
+        lambda: any(
+            event["kind"] == "room.activity"
+            and event["payload"]["discussion_event_id"] == "user-2"
+            for event in service._events("room-1")
+        )
+    )
     assert service.stop(timeout=5.0)
 
     profile, prompt = service.rpc.prompts[1]

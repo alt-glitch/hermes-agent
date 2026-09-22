@@ -20,6 +20,15 @@ def _wait_for_event(events: list[tuple[str, str, dict]], kind: str) -> tuple[str
     raise AssertionError(f"{kind} was not emitted")
 
 
+def _wait_for_request(frames: list[dict], method: str) -> dict:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if match := next((frame for frame in frames if frame.get("method") == method), None):
+            return match
+        time.sleep(0.001)
+    raise AssertionError(f"{method} server request was not emitted")
+
+
 @pytest.fixture(autouse=True)
 def _state(monkeypatch):
     approval._gateway_queues.clear()
@@ -38,6 +47,13 @@ def _state(monkeypatch):
 
 def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch):
     events: list[tuple[str, str, dict]] = []
+    request_frames: list[dict] = []
+
+    class _RequestTransport:
+        def write(self, frame: dict) -> None:
+            request_frames.append(frame)
+
+    transport = _RequestTransport()
     monkeypatch.setattr(
         server,
         "_emit",
@@ -50,6 +66,7 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
         "history": [],
         "history_lock": threading.Lock(),
         "session_key": session_key,
+        "transport": transport,
     }
     server._sessions[sid] = session
     assert server._wire_session_agent(sid, session_key, session["agent"]) is True
@@ -70,8 +87,8 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
         )
     )
     waiter.start()
-    request = _wait_for_event(events, "approval.request")
-    request_id = request[2]["request_id"]
+    request = _wait_for_request(request_frames, "approval")
+    request_id = request["params"]["request_id"]
     response = server.handle_request(
         {
             "id": "resolve",
@@ -88,6 +105,7 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
     assert ("approval.resolved", sid, {"request_id": request_id, "status": "resolved"}) in events
 
     events.clear()
+    request_frames.clear()
     second: dict = {}
     waiter = threading.Thread(
         target=lambda: second.update(
@@ -104,8 +122,8 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
         )
     )
     waiter.start()
-    request = _wait_for_event(events, "approval.request")
-    request_id = request[2]["request_id"]
+    request = _wait_for_request(request_frames, "approval")
+    request_id = request["params"]["request_id"]
     replay_sid = "ui-approval-replay"
     replay_agent = SimpleNamespace(session_id=session_key, model="test", platform="tui")
     server._sessions[replay_sid] = {
@@ -113,6 +131,7 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
         "history": [],
         "history_lock": threading.Lock(),
         "session_key": session_key,
+        "transport": transport,
     }
     assert server._wire_session_agent(replay_sid, session_key, replay_agent) is True
     acknowledged = server.handle_request(
@@ -138,20 +157,17 @@ def test_tui_emits_exact_terminal_event_for_resolution_and_teardown(monkeypatch)
 
 def test_session_close_interrupts_before_releasing_captured_clarify_callback(monkeypatch):
     """A detached turn cannot re-arm a captured callback or cancel another session."""
+    from tui_gateway import server_requests
+
     sid, session_key = "ui-clarify", "stored-clarify"
     other_sid = "ui-other-clarify"
-    events: list[tuple[str, str, dict]] = []
+    frames: list[dict] = []
     result: dict[str, str] = {}
     other_result: dict[str, str] = {}
-    monkeypatch.setattr(
-        server,
-        "_emit",
-        lambda kind, owner, payload=None: events.append((kind, owner, payload or {})),
-    )
+    monkeypatch.setattr(server_requests, "_write", lambda frame: frames.append(frame))
     monkeypatch.setattr(server, "_TURN_SETTLE_BEFORE_CLOSE_SECONDS", 0.05)
     monkeypatch.setattr(server, "_finalize_session", lambda *_args, **_kwargs: None)
-    server._pending.clear()
-    server._answers.clear()
+    server_requests.reset_for_tests()
 
     class InterruptibleAgent:
         def __init__(self):
@@ -164,11 +180,8 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
             return None
 
     agent = InterruptibleAgent()
-    captured_clarify = lambda question: server._block(
-        "clarify.request",
-        sid,
-        {"question": question, "choices": ["Yes", "No"]},
-        timeout=None,
+    captured_clarify = lambda question: server._clarify_block(
+        sid, question, ["Yes", "No"]
     )
 
     def run_turn():
@@ -179,11 +192,8 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
     waiter = threading.Thread(target=run_turn)
     other_waiter = threading.Thread(
         target=lambda: other_result.update(
-            answer=server._block(
-                "clarify.request",
-                other_sid,
-                {"question": "Other session?", "choices": ["Yes", "No"]},
-                timeout=None,
+            answer=server._clarify_block(
+                other_sid, "Other session?", ["Yes", "No"]
             )
         )
     )
@@ -203,9 +213,8 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
     }
     waiter.start()
     other_waiter.start()
-    _wait_for_event(events, "clarify.request")
     deadline = time.monotonic() + 2
-    while len([event for event in events if event[0] == "clarify.request"]) < 2:
+    while len([frame for frame in frames if frame.get("method") == "clarify"]) < 2:
         if time.monotonic() >= deadline:
             raise AssertionError("both clarification waits were not emitted")
         time.sleep(0.001)
@@ -220,14 +229,18 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
         assert not waiter.is_alive()
         assert agent.interrupted.is_set()
         assert result == {"first": ""}
-        assert [event[2]["question"] for event in events if event[:2] == ("clarify.request", sid)] == [
-            "Continue?"
+        own_frames = [
+            frame for frame in frames
+            if frame.get("method") == "clarify"
+            and frame.get("params", {}).get("session_id") == sid
         ]
+        assert [frame["params"]["question"] for frame in own_frames] == ["Continue?"]
         assert other_waiter.is_alive()
-        assert {owner for owner, _event in server._pending.values()} == {other_sid}
+        assert [request["method"] for request in server_requests.open_requests(other_sid)] == ["clarify"]
     finally:
-        server._clear_pending(other_sid)
+        server_requests.cancel(other_sid, reason="interrupted")
         other_waiter.join(timeout=1)
+        server_requests.reset_for_tests()
 
     assert other_result == {"answer": ""}
 

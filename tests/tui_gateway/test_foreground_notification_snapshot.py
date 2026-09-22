@@ -37,7 +37,7 @@ def test_tui_real_turn_snapshot_next_turn_and_child_threads(turn_env, marker_hom
     monkeypatch.setattr(server.threading, "Thread", server._RealThread)
     monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (threading.Event(), SimpleNamespace(join=lambda: None)))
     agent = Agent()
-    session = _session(agent=agent, profile_home=str(home))
+    session = _session(agent=agent, profile_home=str(home), running=True)
     monkeypatch.setitem(server._sessions, "snapshot", session)
     for name, cb in server._agent_cbs("snapshot").items():
         setattr(agent, name, cb)
@@ -62,6 +62,7 @@ def test_tui_real_turn_snapshot_next_turn_and_child_threads(turn_env, marker_hom
         return {"final_response": "requested result", "messages": []}
     agent.run_conversation = run
     for _ in expected:
+        session["running"] = True
         assert server._run_prompt_submit("r", "snapshot", session, "human request")
         session["_run_thread"].join(10)
         assert not session["_run_thread"].is_alive()

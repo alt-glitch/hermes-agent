@@ -140,6 +140,7 @@ def test_explicit_workspace_moves_reach_new_codex_threads(workspace_runtime, act
         assert runtime.starts[-1] == str(runtime.new)
     finally:
         server._clear_session_context(tokens)
+    runtime_cwd.set_session_cwd(str(runtime.other))
     assert terminal_tool._task_env_overrides[agent.session_id]["cwd"] == str(runtime.new)
     assert neighbor.session_cwd == str(runtime.other)
     assert runtime_cwd.resolve_agent_cwd() == runtime.other
