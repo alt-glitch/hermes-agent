@@ -128,7 +128,11 @@ def test_delegate_wait_does_not_mask_its_stale_monitor_with_parent_heartbeats(mo
     class _OnePollFuture:
         calls = 0
 
-        def result(self, timeout):
+        def done(self):
+            # Match the Future API consulted after a timed wait times out.
+            return self.calls > 1
+
+        def result(self, timeout=None):
             self.calls += 1
             if self.calls == 1:
                 raise concurrent.futures.TimeoutError

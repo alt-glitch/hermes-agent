@@ -557,7 +557,10 @@ class GatewayGoalsMixin:
             # Profile-aware native adapter first. Relay is an alias transport,
             # so resolve it through the shared delivery resolver rather than a
             # literal platform-name scan.
-            adapter = self._adapter_for_source(source)
+            # Loop rows restored from durable state have no live transport provenance.
+            # Resolve through the profile's adapter map first so a secondary never borrows the
+            # default bot merely because this scan runs outside its original inbound event.
+            adapter = self._adapters_for_profile(getattr(source, "profile", None)).get(source.platform)
             if adapter is None:
                 source_profile = (getattr(source, "profile", None) or "").strip()
                 active_profile = self._active_profile_name()

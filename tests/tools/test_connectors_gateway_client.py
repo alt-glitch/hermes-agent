@@ -57,7 +57,7 @@ def make_client(transport):
 
 
 def test_default_auth_reads_rotated_credentials_for_trusted_origins(tmp_path, monkeypatch):
-    from tools.tool_gateway.client import _default_header_provider
+    from tools.connectors.gateway.client import _default_header_provider
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("CONNECTOR_GATEWAY_URL", "https://connector.test")
@@ -81,7 +81,7 @@ def test_default_auth_has_no_dependency_on_managed_tool_gateway_compat_helpers(
     tmp_path, monkeypatch
 ):
     import tools.managed_tool_gateway as gateway
-    from tools.tool_gateway.client import _default_header_provider
+    from tools.connectors.gateway.client import _default_header_provider
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("CONNECTOR_GATEWAY_URL", "https://connector.test")

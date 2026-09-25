@@ -355,10 +355,15 @@ class _ChildProgressRelay:
         if event_type == "subagent.start" and goal:
             line = f"🔀 {_short(goal, 55)}"
         elif event_type == "subagent.complete" and kwargs.get("status") in SUBAGENT_FAILURE_STATUSES:
+            error = kwargs.get("summary") or preview
             line = format_subagent_failure_line(
-                goal, kwargs.get("status"), error=kwargs.get("summary") or preview,
+                goal, kwargs.get("status"), error=error,
                 duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),
             )
+            # A nested relay carries a caller-provided summary that identifies its own branch.
+            # Preserve it alongside the upstream timeout guidance rather than replacing it.
+            if kwargs.get("status") == "timeout" and error and str(error) not in line:
+                line += f" Reason: {_clean_error_text(error)}."
         else:
             return
         self._tree_line(line, _batch_prefix(

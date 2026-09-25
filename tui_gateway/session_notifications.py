@@ -603,7 +603,8 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             from tools.process_registry_notifications import async_delegation_display_text
             display_text = async_delegation_display_text(evt)
         elif evt_type == "completion":
-            display_text = _process_completion_notice(evt, text)["text"]
+            from tools.process_registry_notifications import process_completion_display_text
+            display_text = process_completion_display_text([evt])
         else:
             display_text = text
         from agent.notification_presentation import diagnostic_process_event
@@ -1040,10 +1041,11 @@ def _notification_turn_display(evt: dict, detail: str, sid: str = "") -> dict:
                 "display_notification": _async_delegation_notice(evt, detail)}),
         }
     if evt.get("type", "completion") == "completion":
+        from tools.process_registry_notifications import process_completion_display_text
         notice = _process_completion_notice(evt, detail)
         return {
             "display_kind": "process_complete",
-            "display_metadata": _process_completion_display_metadata(evt),
+            "display_metadata": {"display_text": process_completion_display_text([evt])},
             **({} if already_shown else {
                 "display_notification": notice}),
         }

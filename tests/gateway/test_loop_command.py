@@ -357,7 +357,8 @@ async def test_loop_watcher_scans_each_multiplex_profile(tmp_path, monkeypatch):
     homes = [("alpha", tmp_path / "alpha"), ("beta", tmp_path / "beta")]
     for _, home in homes:
         home.mkdir()
-    monkeypatch.setattr("gateway.run._multiplex_profile_homes", lambda _cfg: homes)
+    monkeypatch.setattr("gateway.run._handoff_watch_scopes", lambda _runner: homes)
+    monkeypatch.setattr("gateway.run_idle_gates.profile_has_active_loop", lambda _home: True)
 
     seen = []
 

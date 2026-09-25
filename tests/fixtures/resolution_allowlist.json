@@ -406,7 +406,7 @@
   },
   {
     "path": "hermes_cli/update_cmd_deps.py",
-    "symbol": "_update_node_dependencies",
+    "symbol": "_update_workspace_node_dependencies",
     "kind": "bare_which"
   },
   {
@@ -702,6 +702,21 @@
   {
     "path": "tools/computer_use/cua_backend_driver.py",
     "symbol": "_candidate_cua_driver_commands",
+    "kind": "known_path_table"
+  },
+  {
+    "path": "hermes_cli/main_tui_launch.py",
+    "symbol": "_node26_bin_or_none",
+    "kind": "bare_which"
+  },
+  {
+    "path": "ops/opentui-fork-maintainer/scripts/opentui_fork_sync.py",
+    "symbol": "_cron_env",
+    "kind": "known_path_table"
+  },
+  {
+    "path": "ops/opentui-fork-maintainer/scripts/opentui_fork_sync.py",
+    "symbol": "_uv",
     "kind": "known_path_table"
   }
 ]

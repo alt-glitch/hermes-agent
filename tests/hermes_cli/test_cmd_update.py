@@ -433,8 +433,10 @@ class TestCmdUpdateBranchFallback:
 
         mock_run.side_effect = side_effect
 
+        # Upstream moved the post-pull continuation out of main.py; stop at
+        # the first post-merge dependency hook rather than its removed reload helper.
         with patch.object(
-            hm, "_reload_updated_runtime_modules", side_effect=SystemExit(0)
+            hm, "_upgrade_pip_before_lazy_refresh", side_effect=SystemExit(0)
         ):
             with pytest.raises(SystemExit) as exit_info:
                 cmd_update(mock_args)
@@ -459,8 +461,10 @@ class TestCmdUpdateBranchFallback:
             branch="sid/opentui", verify_ok=True, commit_count="2"
         )
 
+        # Upstream moved the post-pull continuation out of main.py; stop at
+        # the first post-merge dependency hook rather than its removed reload helper.
         with patch.object(
-            hm, "_reload_updated_runtime_modules", side_effect=SystemExit(0)
+            hm, "_upgrade_pip_before_lazy_refresh", side_effect=SystemExit(0)
         ):
             with pytest.raises(SystemExit) as exit_info:
                 cmd_update(mock_args)

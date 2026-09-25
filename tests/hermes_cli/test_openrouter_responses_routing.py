@@ -37,8 +37,12 @@ def test_openrouter_explicit_transport_across_credentials(
     entry = SimpleNamespace(
         access_token="pool-key", source="manual", base_url=rp.OPENROUTER_BASE_URL
     )
+    def select(*, model=None):
+        assert model == "openai/gpt-6-astra"
+        return entry
+
     pool = SimpleNamespace(
-        has_credentials=lambda: credential_source == "pool", select=lambda: entry
+        has_credentials=lambda: credential_source == "pool", select=select
     )
     monkeypatch.setattr(rp, "load_pool", lambda provider: pool)
 
