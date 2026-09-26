@@ -293,7 +293,7 @@ COPY ui-opentui/ ui-opentui/
 COPY apps/shared/ apps/shared/
 RUN cd web && npm run build && \
     cd ../ui-tui && npm run build && \
-    cd ../ui-opentui && npm install --no-audit --no-fund
+    cd ../ui-opentui && npm ci --no-audit --no-fund
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
