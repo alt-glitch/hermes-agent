@@ -65,11 +65,15 @@ def test_process_completion_display_keeps_payload_separate_across_surfaces(monke
     session = {"session_key": "display-session", "history_lock": threading.RLock()}
     server._notif_handle_ready("ui-session", session, events, set(), registry, format_process_notification, None,
                                owned=True)
-    assert emitted[0][2] == {"kind": "process", "text": expected}
+    # Fork: the OpenTUI status bar keys on the session id (`<cmd> · <state> · <sid>`); the compact
+    # upstream title travels in the persisted metadata alongside the fork's typed card fields.
+    assert emitted[0][2]["kind"] == "process"
+    assert emitted[0][2]["text"].endswith("· proc_1")
     (_rid, _sid, _session, text, _what), kwargs = submitted[0]
     assert text == payload
     assert kwargs["display_kind"] == PROCESS_COMPLETE_DISPLAY_KIND
-    assert kwargs["display_metadata"] == {"display_text": expected}
+    assert kwargs["display_metadata"]["display_text"] == expected
+    assert kwargs["display_metadata"]["kind"] == "process.complete"
 
 
 def test_process_completion_titles_reflect_outcome_and_batch():

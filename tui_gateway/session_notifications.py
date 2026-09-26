@@ -603,8 +603,9 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             from tools.process_registry_notifications import async_delegation_display_text
             display_text = async_delegation_display_text(evt)
         elif evt_type == "completion":
-            from tools.process_registry_notifications import process_completion_display_text
-            display_text = process_completion_display_text([evt])
+            # Fork status line: ``<cmd> · <state> · <session_id>`` (the OpenTUI status bar keys on the
+            # session id); upstream's compact title is carried in the persisted display metadata.
+            display_text = _process_completion_notice(evt, text)["text"]
         else:
             display_text = text
         from agent.notification_presentation import diagnostic_process_event
@@ -1026,8 +1027,15 @@ def _process_completion_notice(evt: dict, detail: str) -> dict:
 
 
 def _process_completion_display_metadata(evt: dict) -> dict:
-    """Persist the compact card fields; the full prompt already persists as the row content."""
-    return _process_completion_notice(evt, "")
+    """Persist the compact card fields plus upstream's ``display_text`` title.
+
+    Two consumers read this row: the fork's typed card restore (``session_history`` /
+    OpenTUI ``resume.ts`` need ``kind``/``key``/``level``/``text``) and upstream's
+    Ink/Desktop/CLI resume entries (``display_text``). The full prompt already
+    persists as the row content.
+    """
+    from tools.process_registry_notifications import process_completion_display_text
+    return {**_process_completion_notice(evt, ""), "display_text": process_completion_display_text([evt])}
 
 
 def _notification_turn_display(evt: dict, detail: str, sid: str = "") -> dict:
@@ -1041,11 +1049,10 @@ def _notification_turn_display(evt: dict, detail: str, sid: str = "") -> dict:
                 "display_notification": _async_delegation_notice(evt, detail)}),
         }
     if evt.get("type", "completion") == "completion":
-        from tools.process_registry_notifications import process_completion_display_text
         notice = _process_completion_notice(evt, detail)
         return {
             "display_kind": "process_complete",
-            "display_metadata": {"display_text": process_completion_display_text([evt])},
+            "display_metadata": _process_completion_display_metadata(evt),
             **({} if already_shown else {
                 "display_notification": notice}),
         }
