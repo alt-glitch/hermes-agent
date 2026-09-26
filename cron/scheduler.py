@@ -2983,16 +2983,18 @@ class _FireOwnership:
     def lost(self) -> bool:
         if self.transport_cancelled():
             return True
+        if self_removal_delivery_allowed(self.job["id"]):
+            # The run deleted its own record; there is no claim (fire owner or one-shot run
+            # token) left to re-resolve, so neither check below may declare it lost.
+            return False
         if self.run_token:
+            # Fork: one-shots are fenced by the dispatch nonce, not a reusable process identity.
             try:
                 if not run_claim_is_owned(self.job["id"], expected_token=self.run_token):
                     return True
             except Exception:
                 return True
         if self.owner is None:
-            return False
-        if self_removal_delivery_allowed(self.job["id"]):
-            # The run deleted its own record; there is no claim left to re-resolve.
             return False
         # The heartbeat's latched miss is one sample, not the verdict (#113357): the store is
         # re-checked here, and a claim that still validates keeps the run's real outcome. The
