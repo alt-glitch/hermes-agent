@@ -26,6 +26,10 @@ cd "$(dirname "$0")/.."
 # runs the SAME Node 26.3, not the shell's default.
 NODE_BIN="$(command -v node || echo node)"
 
+# Scratch files honour TMPDIR (Hermes points it at HERMES_HOME/cache/scratch);
+# fall back to /tmp only where TMPDIR is unset.
+SCRATCH="${TMPDIR:-/tmp}"
+
 pass=0; fail=0; skip=0
 ok()   { echo "  ✅ $1"; pass=$((pass+1)); }
 bad()  { echo "  ❌ $1"; fail=$((fail+1)); }
@@ -42,8 +46,8 @@ else
 fi
 
 echo "== [2/5] check: prettier + tsc + eslint + vitest =="
-if bash scripts/check.sh >/tmp/accept-check.log 2>&1; then ok "check green ($(grep -c 'passed' /tmp/accept-check.log >/dev/null 2>&1; grep -oE '[0-9]+ passed' /tmp/accept-check.log | tail -1))"
-else bad "check failed — see /tmp/accept-check.log"; tail -20 /tmp/accept-check.log; fi
+if bash scripts/check.sh >"$SCRATCH/accept-check.log" 2>&1; then ok "check green ($(grep -c 'passed' "$SCRATCH/accept-check.log" >/dev/null 2>&1; grep -oE '[0-9]+ passed' "$SCRATCH/accept-check.log" | tail -1))"
+else bad "check failed — see $SCRATCH/accept-check.log"; tail -20 "$SCRATCH/accept-check.log"; fi
 
 echo "== [3/5] live-gateway transport smoke (real Python gateway, no Bun) =="
 if [ -n "${HERMES_PYTHON_SRC_ROOT:-}" ] || [ -x "../.venv/bin/python" ]; then
@@ -68,17 +72,17 @@ fi
 echo "== [5/5] selection/markdown smoke in a real tmux TTY (tree-sitter under FFI) =="
 if command -v tmux >/dev/null 2>&1; then
   rm -rf .accept && node scripts/build.mjs src/test/selectionCopy.smoke.tsx .accept >/dev/null 2>&1
-  rm -f /tmp/accept-sel.json
+  rm -f "$SCRATCH/accept-sel.json"
   S="accept-$$"
   tmux kill-session -t "$S" 2>/dev/null
   tmux new-session -d -s "$S" -x 120 -y 40
-  tmux send-keys -t "$S" "SEL_SMOKE_OUT=/tmp/accept-sel.json $NODE_BIN --experimental-ffi --no-warnings $PWD/.accept/selectionCopy.smoke.js; tmux wait-for -S $S" Enter
+  tmux send-keys -t "$S" "SEL_SMOKE_OUT=$SCRATCH/accept-sel.json $NODE_BIN --experimental-ffi --no-warnings $PWD/.accept/selectionCopy.smoke.js; tmux wait-for -S $S" Enter
   tmux wait-for "$S" 2>/dev/null || sleep 6
   tmux kill-session -t "$S" 2>/dev/null
-  if node -e 'process.exit(require("/tmp/accept-sel.json").pass===true?0:1)' 2>/dev/null; then
+  if node -e "process.exit(require(process.env.SEL_SMOKE_OUT || '$SCRATCH/accept-sel.json').pass===true?0:1)" 2>/dev/null; then
     ok "markdown painted + native selection extracted + /copy source helper preserved (tree-sitter under node FFI)"
   else
-    bad "selection/markdown smoke failed — see /tmp/accept-sel.json"; cat /tmp/accept-sel.json 2>/dev/null
+    bad "selection/markdown smoke failed — see $SCRATCH/accept-sel.json"; cat "$SCRATCH/accept-sel.json" 2>/dev/null
   fi
   rm -rf .accept
 else

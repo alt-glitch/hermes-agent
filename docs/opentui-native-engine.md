@@ -386,7 +386,9 @@ Covered claim.
 - **Default-engine selection:** auto-picks OpenTUI only when the host is genuinely
   set up (Node ≥ 26.3 + built bundle), else Ink; explicit env/config bypasses the
   probe.
+<!-- no-tmp: ok — the point of the sentence is that filling /tmp is the hazard to avoid -->
 - **Known sharp edges:** `libopentui.so` native-lib distribution (P1 upstream:
+  <!-- no-tmp: ok — the hazard being described is /tmp filling up -->
   copies can fill `/tmp`); the Dockerfile Node major bump needs full-image CI
   verification; tree-sitter grammars are fetched from GitHub on first use and
   cached in `~/.hermes/cache/opentui-parsers/` — air-gapped hosts get plain-text

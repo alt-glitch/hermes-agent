@@ -265,8 +265,8 @@ cd ui-opentui && ([ -d node_modules ] || npm install) && npm run check && node s
 # Live tmux render-verify (see tmux-pane-screenshot skill)
 tmux new-session -d -s otui -x 120 -y 34
 tmux send-keys -t otui "cd <gateway-or-cli-clone> && hermes --tui" Enter
-sleep 20 && ~/.claude/skills/tmux-pane-screenshot/scripts/tshot.sh otui:0.0 /tmp/otui.png 2
-# then: vision_analyze /tmp/otui.png ; remember slash autocomplete eats the FIRST Enter (send twice)
+sleep 20 && ~/.claude/skills/tmux-pane-screenshot/scripts/tshot.sh otui:0.0 "${TMPDIR:-/tmp}/otui.png" 2
+# then: vision_analyze "${TMPDIR:-/tmp}/otui.png" ; remember slash autocomplete eats the FIRST Enter (send twice)
 
 # Python gate (the upstream clone's .venv has pytest + full optional deps)
 source ~/github/hermes-agent/.venv/bin/activate; export TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0
@@ -358,8 +358,8 @@ worked:
 
 ### 9.4 Adversarial review with Claude Code (the per-task gate)
 
-- Small diff (< ~5k lines) → **pipe context+diff via stdin**: `cat /tmp/ctx.md | claude -p
-  --dangerously-skip-permissions --max-turns 12 '<focused prompt>' 2>/dev/null > /tmp/review.md`.
+- Small diff (< ~5k lines) → **pipe context+diff via stdin**: `cat "${TMPDIR:-/tmp}/ctx.md" | claude -p
+  --dangerously-skip-permissions --max-turns 12 '<focused prompt>' 2>/dev/null > "${TMPDIR:-/tmp}/review.md"`.
 - **ALWAYS tell it: "Do NOT spawn sub-agents / do not use the Task tool (it deadlocks headless)."**
   This is the #1 way a headless `claude -p` review hangs with zero output.
 - Give it the diff + the reference code to verify against (`file:line` ranges), and ask for

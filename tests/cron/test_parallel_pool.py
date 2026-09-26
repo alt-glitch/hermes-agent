@@ -20,8 +20,8 @@ class TestPersistentPool:
         import cron.scheduler as sched
 
         # Reset module state.
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
 
         pool1 = sched._get_parallel_pool(4)
         pool2 = sched._get_parallel_pool(4)
@@ -35,13 +35,13 @@ class TestPersistentPool:
         """_shutdown_parallel_pool resets state."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._get_parallel_pool(2)
 
         sched._shutdown_parallel_pool()
-        assert sched._parallel_pool is None
-        assert sched._parallel_pool_max_workers is None
+        assert not sched._parallel_pools
+        assert not sched._parallel_pool_max_workers
 
 
 class TestRunningJobGuard:
@@ -52,8 +52,8 @@ class TestRunningJobGuard:
         import cron.scheduler as sched
 
         # Reset state.
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         job = {
@@ -67,7 +67,7 @@ class TestRunningJobGuard:
         }
 
         # Simulate the job already running.
-        sched._running_job_ids.add("guard-job")
+        sched._running_job_ids.add(sched._inflight_key("guard-job"))
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
@@ -87,7 +87,7 @@ class TestRunningJobGuard:
         assert skipped[0]["started_at"] is None
         assert "in-process owner" in skipped[0]["error"]
 
-        sched._running_job_ids.discard("guard-job")
+        sched._running_job_ids.discard(sched._inflight_key("guard-job"))
         sched._shutdown_parallel_pool()
 
 
@@ -140,15 +140,15 @@ class TestRunningJobGuard:
         assert claim_calls == [(
             "queued-job", {"return_job": True, "return_outcome": True}
         )]
-        assert "queued-job" not in sched._running_job_ids
+        assert sched._inflight_key("queued-job") not in sched._running_job_ids
 
 
     def test_create_execution_failure_does_not_wedge_running_set(self, tmp_path, monkeypatch):
         """create_execution failures clear the running lock and still allow next jobs."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         failing_job = {
@@ -202,8 +202,8 @@ class TestRunningJobGuard:
 
         assert n == 1
         assert called == ["healthy-job"]
-        assert "failing-job" not in sched._running_job_ids
-        assert "healthy-job" not in sched._running_job_ids
+        assert sched._inflight_key("failing-job") not in sched._running_job_ids
+        assert sched._inflight_key("healthy-job") not in sched._running_job_ids
 
         sched._shutdown_parallel_pool()
 
@@ -215,8 +215,8 @@ class TestSyncMode:
         """sync=True waits for jobs and returns actual results."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         jobs = [
@@ -242,8 +242,8 @@ class TestSyncMode:
         """sync=False returns before parallel jobs finish (optimistic count)."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         job = {
@@ -289,8 +289,8 @@ class TestWorkdirParallelPool:
         """Independent task-scoped workdirs can occupy parallel workers."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
         jobs = [
             {
@@ -342,8 +342,8 @@ class TestWorkdirParallelPool:
         """sync=False returns immediately even when a workdir job is slow."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         job = {
@@ -385,8 +385,8 @@ class TestWorkdirParallelPool:
         """A workdir job already in _running_job_ids is skipped on next tick."""
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         job = {
@@ -401,7 +401,7 @@ class TestWorkdirParallelPool:
         }
 
         # Simulate the job already running.
-        sched._running_job_ids.add("guard-seq")
+        sched._running_job_ids.add(sched._inflight_key("guard-seq"))
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
@@ -415,7 +415,7 @@ class TestWorkdirParallelPool:
         assert n == 0  # skipped, not dispatched
         assert dispatched == []
 
-        sched._running_job_ids.discard("guard-seq")
+        sched._running_job_ids.discard(sched._inflight_key("guard-seq"))
         sched._shutdown_parallel_pool()
 
 class TestTickDurableDispatch:
@@ -424,8 +424,8 @@ class TestTickDurableDispatch:
     def test_tick_ledgers_then_batch_advances_before_run(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
 
         jobs = [
@@ -502,8 +502,8 @@ class TestTickBatchAdvance:
     ):
         import cron.scheduler as sched
 
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        sched._parallel_pools.clear()
+        sched._parallel_pool_max_workers.clear()
         sched._running_job_ids.clear()
         jobs = [
             {
@@ -569,7 +569,7 @@ class TestTickBatchAdvance:
                 "deliver": "local",
             },
         ]
-        sched._running_job_ids.add("job-2")
+        sched._running_job_ids.add(sched._inflight_key("job-2"))
         worker_started = threading.Event()
         worker_finished = threading.Event()
         release_calls = []
@@ -593,9 +593,9 @@ class TestTickBatchAdvance:
                 threading.Thread(target=run, daemon=True).start()
                 return future
 
-        def record_release(job_id):
+        def record_release(job_id, home=None):
             release_calls.append((job_id, threading.current_thread()))
-            real_release(job_id)
+            real_release(job_id, home=home)
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(sched, "sweep_stale_inflight", lambda _jobs: None)
@@ -640,8 +640,8 @@ class TestTickBatchAdvance:
             assert worker_started.wait(timeout=1)
             assert worker_finished.wait(timeout=1)
             assert run_calls == []
-            assert "job-1" not in sched._running_job_ids
-            assert "job-2" in sched._running_job_ids
+            assert sched._inflight_key("job-1") not in sched._running_job_ids
+            assert sched._inflight_key("job-2") in sched._running_job_ids
             assert [job_id for job_id, _thread in release_calls] == ["job-1"]
             assert release_calls[0][1] is not threading.current_thread()
             assert finished_executions == [
@@ -652,6 +652,122 @@ class TestTickBatchAdvance:
                         "error": "Schedule advance failed: cannot advance job-2",
                     },
                 )
+            ]
+        finally:
+            sched._running_job_ids.clear()
+            sched._running_futures.clear()
+
+    def test_batch_advance_failure_cancels_gated_dispatches(
+        self, monkeypatch
+    ):
+        import cron.scheduler as sched
+
+        sched._running_job_ids.clear()
+        sched._running_futures.clear()
+        jobs = [
+            {
+                "id": "job-1",
+                "name": "submitted first",
+                "prompt": "must not run",
+                "schedule": "every 5m",
+                "enabled": True,
+                "next_run_at": "2020-01-01T00:00:00",
+                "deliver": "local",
+            },
+            {
+                "id": "job-2",
+                "name": "submitted second",
+                "prompt": "must not run",
+                "schedule": "every 5m",
+                "enabled": True,
+                "next_run_at": "2020-01-01T00:00:00",
+                "deliver": "local",
+            },
+        ]
+        workers_finished = threading.Event()
+        finished_count = 0
+        finished_lock = threading.Lock()
+        release_calls = []
+        run_calls = []
+        finished_executions = []
+        real_release = sched.release_running_job
+
+        class _DaemonPool:
+            def submit(self, callback):
+                future = concurrent.futures.Future()
+
+                def run():
+                    nonlocal finished_count
+                    try:
+                        future.set_result(callback())
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                    finally:
+                        with finished_lock:
+                            finished_count += 1
+                            if finished_count == len(jobs):
+                                workers_finished.set()
+
+                threading.Thread(target=run, daemon=True).start()
+                return future
+
+        def record_release(job_id, home=None):
+            release_calls.append((job_id, threading.current_thread()))
+            real_release(job_id, home=home)
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(sched, "sweep_stale_inflight", lambda _jobs: None)
+        monkeypatch.setattr(sched, "_get_parallel_pool", lambda _workers: _DaemonPool())
+        monkeypatch.setattr(
+            sched,
+            "create_execution",
+            lambda job_id, source, **_kwargs: {"id": f"exec-{job_id}"},
+        )
+        monkeypatch.setattr(
+            sched,
+            "advance_next_runs",
+            lambda _job_ids, **_kw: (_ for _ in ()).throw(
+                RuntimeError("cannot batch advance")
+            ),
+        )
+        monkeypatch.setattr(
+            sched,
+            "run_one_job",
+            lambda job, **_kwargs: run_calls.append(job["id"]) or True,
+        )
+        monkeypatch.setattr(sched, "release_running_job", record_release)
+        monkeypatch.setattr(
+            sched,
+            "_finish_execution_best_effort",
+            lambda execution_id, **kwargs: finished_executions.append(
+                (execution_id, kwargs)
+            ),
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="cannot batch advance"):
+                sched.tick(verbose=False)
+
+            assert workers_finished.wait(timeout=1)
+            assert run_calls == []
+            assert not sched._running_job_ids
+            assert {job_id for job_id, _thread in release_calls} == {"job-1", "job-2"}
+            assert all(thread is not threading.current_thread() for _, thread in release_calls)
+            assert sorted(finished_executions) == [
+                (
+                    "exec-job-1",
+                    {
+                        "success": False,
+                        "error": "Schedule advance failed: cannot batch advance",
+                    },
+                ),
+                (
+                    "exec-job-2",
+                    {
+                        "success": False,
+                        "error": "Schedule advance failed: cannot batch advance",
+                    },
+                ),
             ]
         finally:
             sched._running_job_ids.clear()

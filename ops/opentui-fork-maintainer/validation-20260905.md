@@ -27,6 +27,7 @@ claim that the replacement cron has been activated or these changes published.
 - Full supplied development archive and selected skills installed with backups
   outside discovery; three focused skill entrypoints pass skill validation.
 
+<!-- no-tmp: ok — records the historical diagnostics directory from the 2026-09-05 run, not a command to run -->
 Raw local artifacts are under `/tmp/opentui-maintainer-20260905/`; they are
 temporary diagnostics, not durable publication evidence or public attachments.
 The final cron proof must use the runtime-owned run directory.

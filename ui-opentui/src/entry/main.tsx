@@ -87,8 +87,10 @@ import {
 import {
   createDelegationStatusRefresher,
   createSpawnTreeSaveDrainer,
+  shouldPollSubagentRoster,
   tuiAgentsNudgeConfigValue
 } from '../logic/agentsRuntime.ts'
+import { isTerminalStatus } from '../logic/subagentTree.ts'
 import { nthAssistantResponse } from '../logic/copy.ts'
 import { presentBillingVerification } from '../logic/billingVerification.ts'
 import { performHeapdump } from '../logic/diagnostics.ts'
@@ -812,10 +814,18 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         onInvalid: () => getLog().warn('sessions', 'invalid session.active_list response')
       })
       const activeSessionsTimer = setInterval(() => {
-        if (gateway.sessionId()) {
-          void activeSessionsRefresher.refresh()
-          void subagentListRefresher.refresh()
-        }
+        if (!gateway.sessionId()) return
+        void activeSessionsRefresher.refresh()
+        // The roster poll is demand-driven: an idle session with an all-terminal
+        // (or empty) roster and the full /agents dashboard closed would otherwise
+        // issue a wasted Node→Python subagent.list RPC every 1.5s. Poll only when
+        // a consumer can observe a change — the dashboard is open, or the stored
+        // roster still has a non-terminal child whose lifecycle events may have
+        // been missed across a reconnect. The persistent tray reads the same
+        // store the poll would update, so it adds no poll of its own.
+        const hasLiveSurface = store.state.dashboard
+        const hasNonTerminal = store.state.subagents.some(agent => !isTerminalStatus(agent.status))
+        if (shouldPollSubagentRoster(hasLiveSurface, hasNonTerminal)) void subagentListRefresher.refresh()
       }, 1_500)
       activeSessionsTimer.unref()
       yield* Effect.addFinalizer(() =>

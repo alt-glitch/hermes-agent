@@ -8,6 +8,7 @@ import { test } from 'vitest'
 
 import { registryBackendDialScopeKey, resolveRegistryLocalRoute } from './connection-registry'
 import {
+  BackgroundSlotRetryBackoff,
   LocalBackendSlotWaitTimeoutError,
   LocalBackendSpawnCoordinator,
   releaseLocalBackendSlotAfterExit,
@@ -25,6 +26,20 @@ const deferred = () => {
 }
 
 const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+
+test('background slot failures back off per profile and clear after a later success', () => {
+  const retries = new BackgroundSlotRetryBackoff({ baseDelayMs: 1_000, maxDelayMs: 8_000 })
+
+  assert.equal(retries.canAttempt('over-cap', 0), true)
+  assert.equal(retries.recordFailure('over-cap', 0), 1_000)
+  assert.equal(retries.canAttempt('over-cap', 999), false)
+  assert.equal(retries.canAttempt('over-cap', 1_000), true)
+  assert.equal(retries.recordFailure('over-cap', 1_000), 2_000)
+  assert.equal(retries.canAttempt('other-profile', 1_001), true)
+
+  retries.clear('over-cap')
+  assert.equal(retries.canAttempt('over-cap', 1_001), true)
+})
 
 test('100 concurrent local requests never hold more than the configured slots', async () => {
   const limit = 12

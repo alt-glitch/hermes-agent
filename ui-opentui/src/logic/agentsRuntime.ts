@@ -169,3 +169,23 @@ export function tuiAgentsNudgeConfigValue(config: Readonly<Record<string, unknow
     ? Reflect.get(display, 'tui_agents_nudge')
     : undefined
 }
+
+/**
+ * Decide whether the periodic `subagent.list` roster poll should fire this tick.
+ *
+ * The roster poll is demand-driven: while the session is idle (no live Agents
+ * surface and no non-terminal child) every tick is a wasted Node→Python RPC
+ * whose handler snapshots the process-global subagent registry. Poll only when
+ * a consumer can observe a change — the /agents dashboard (or expanded tray) is
+ * open, or the stored roster still has a non-terminal child whose lifecycle the
+ * events alone may not have settled (missed terminal events, reconnects).
+ *
+ * `hasLiveSurface` is the dashboard-open or tray-visible flag; `hasNonTerminal`
+ * reports whether any stored row is not in a terminal status. Both are cheap
+ * reads off the store. The decision is deliberately re-evaluated every tick so
+ * opening/closing the surface or a roster settling disarms the poll without a
+ * separate subscription.
+ */
+export function shouldPollSubagentRoster(hasLiveSurface: boolean, hasNonTerminal: boolean): boolean {
+  return hasLiveSurface || hasNonTerminal
+}

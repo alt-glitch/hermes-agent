@@ -104,7 +104,20 @@ const baseProps = {
   voiceLabel: ''
 }
 
-describe('StatusRule reasoning effort', () => {
+describe('StatusRule model label', () => {
+  it('shows a clamped effort as what the route sends, never as a distinct level (#61634)', () => {
+    const clamped = textContent(
+      StatusRule({ ...baseProps, modelReasoningEffort: 'ultra', modelReasoningEffortWire: 'max' })
+    )
+
+    expect(clamped).toContain('ultra→max')
+    // Verbatim (or not-yet-stamped) wire levels make no claim.
+    expect(
+      textContent(StatusRule({ ...baseProps, modelReasoningEffort: 'high', modelReasoningEffortWire: 'high' }))
+    ).toContain('opus 4.8 high')
+    expect(textContent(StatusRule({ ...baseProps, modelReasoningEffort: 'ultra' }))).toContain('opus 4.8 ultra')
+  })
+
   it('shows medium as a concrete effort and keeps it when lower-priority session chrome yields', () => {
     const element = StatusRule({
       ...baseProps,

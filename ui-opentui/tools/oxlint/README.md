@@ -4,7 +4,7 @@ Run from `ui-opentui` with Node 26.3 or later:
 
 ```sh
 npm run lint:anti-slop
-npm run --silent lint:anti-slop -- --format json > /tmp/opentui-anti-slop.json
+npm run --silent lint:anti-slop -- --format json > "${TMPDIR:-/tmp}/opentui-anti-slop.json"
 ```
 
 This is an explicit migration audit, separate from the existing type-aware
