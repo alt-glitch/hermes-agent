@@ -87,7 +87,7 @@ def test_post_turn_drain_uses_owner_and_preserves_real_clarify(turn_env, marker_
     assert controls == ["yes"]
     assert process_registry.completion_queue.empty()
     assert "watch diagnostic retained" in caplog.text
-    presentation = [f for f in frames if f.get("params", {}).get("type") in {"status.update", "message.complete", "error"}]
+    presentation = [f for f in frames if f.get("params", {}).get("type") in {"status.update", "message.complete", "message.start", "error"}]
     assert bool(presentation) is not (setting is True)
     assert len([f for f in frames if f.get("method") == "clarify"]) == 1
 

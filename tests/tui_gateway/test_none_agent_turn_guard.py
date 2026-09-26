@@ -13,7 +13,6 @@ import threading
 import types
 
 from tui_gateway import server
-from tui_gateway.session_lifecycle import _SESSION_CLOSED_DURING_ADMISSION
 from tui_gateway.user_messages import AGENT_BUILD_ABANDONED
 
 
@@ -57,19 +56,25 @@ def _turn_env(monkeypatch, tmp_path) -> list:
 
 
 def test_turn_without_agent_is_refused_with_retryable_frame(monkeypatch, tmp_path):
-    """A detached record is rejected during admission before its stale build error; ``running`` is released."""
+    """The recorded build reason reaches the client as a retryable runtime frame; ``running`` is released."""
     emitted = _turn_env(monkeypatch, tmp_path)
     session = _session(None, agent_error=AGENT_BUILD_ABANDONED)
 
-    assert server._run_prompt_submit("rid", "ui-sid", session, "继续") is False
+    # Fork: turn admission rejects a record that is not the live ``_sessions`` slot, so register it
+    # (as the control below does) to reach the None-agent guard under test.
+    server._sessions["ui-sid"] = session
+    try:
+        assert server._run_prompt_submit("rid", "ui-sid", session, "继续") is False
+    finally:
+        server._sessions.pop("ui-sid", None)
 
     frames = [p for (t, _sid, p) in emitted if t == "message.complete"]
     assert len(frames) == 1
     assert frames[0]["status"] == "error" and frames[0]["recoverable"] is True
-    assert frames[0]["error"] == _SESSION_CLOSED_DURING_ADMISSION
-    assert "error_surface" not in frames[0]
+    assert frames[0]["error"] == AGENT_BUILD_ABANDONED
+    assert frames[0]["error_surface"] == {"layer": "runtime", "code": "agent_init_failed", "retryable": True}
     assert session["running"] is False
-    assert session["inflight_turn"] is None  # a detached record has no resumable owner
+    assert session["inflight_turn"]["status"] == "error"  # retained for session.resume
 
     # Control: a built agent still runs the turn to completion and clears the interim closure.
     agent = types.SimpleNamespace(

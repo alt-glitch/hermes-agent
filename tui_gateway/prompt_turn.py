@@ -144,7 +144,11 @@ def _admit_prompt_turn(
     display_kind: str | None = None, display_metadata: dict | None = None,
     display_notification: dict | None = None,
 ) -> tuple[list[str], Any] | None:
-    """Fence ownership and publish turn chrome atomically against close and interrupt."""
+    """Fence ownership and publish turn chrome atomically against close and interrupt.
+
+    A diagnostic turn the owning profile mutes publishes no ``message.start`` (same rule
+    ``_run_prompt_submit`` uses to hide the turn; upstream gates this frame with
+    ``if not muted``)."""
     # Preserve both direct-call positional seams: the fork first added submission
     # IDs, then synthetic display kind/metadata.
     legacy_display_direct = isinstance(client_submission_ids, str)
@@ -169,6 +173,12 @@ def _admit_prompt_turn(
         display_kind = None
         legacy_direct = True
     client_submission_ids = list(client_submission_ids or [])
+    muted = False
+    if isinstance(display_metadata, dict) and display_metadata.get("notification_category") == "diagnostic":
+        from gateway.warning_notifications import diagnostic_turn_muted
+        from agent.notification_presentation import notification_config_snapshot
+        with _session_profile_runtime_scope(session):
+            muted = diagnostic_turn_muted(display_metadata, "tui", notification_config_snapshot())
     if session.get("_closing") or _session_is_detached(sid, session):
         with session["history_lock"]:
             _refuse_prompt_turn_locked(sid, session, "session closed before turn start", client_submission_ids)
@@ -204,13 +214,18 @@ def _admit_prompt_turn(
             return None
         agent = session.get("agent")
         if agent is None:
+            # A deferred build can finish without attaching an agent (record replaced/closed mid-build:
+            # ``agent_ready`` set, ``agent`` None, see ``_start_agent_build``). Surface the recorded build
+            # reason so the client sees why, not a generic refusal (#111531).
+            reason = session.get("agent_error") or AGENT_MISSING_FOR_TURN
+            logger.info("Refusing turn for session %s: no agent attached (%s)", session.get("session_key") or sid, reason)
             with session["history_lock"]:
                 session["running"] = False
                 session.pop("_auto_continue_attempt", None)
                 session.pop("_auto_continue_prompt", None)
                 session.pop("_submit_user_row", None)
                 _emit_terminal_turn_error(
-                    sid, session, "session agent unavailable before turn start",
+                    sid, session, reason,
                     error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
                     client_submission_ids=client_submission_ids, history_lock_owned=True)
             return None
@@ -240,7 +255,9 @@ def _admit_prompt_turn(
             turn_start_submission_ids = list(session["_active_client_submission_ids"])
             if display_notification is not None:
                 _emit("notification.show", sid, display_notification)
-            if turn_start_submission_ids:
+            if muted:
+                pass  # diagnostic turn hidden by the owner's policy: no presentation chrome
+            elif turn_start_submission_ids:
                 _emit("message.start", sid, {"client_submission_ids": turn_start_submission_ids})
             else:
                 _emit("message.start", sid)
