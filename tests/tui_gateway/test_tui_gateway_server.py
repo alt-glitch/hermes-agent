@@ -8621,7 +8621,7 @@ def test_notification_poller_delivers_owned_events(
 
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
-        assert status_calls[0][2]["kind"] == "process"
+        assert status_calls[0][2]["kind"] == "status"
         assert len(delivered) == 1
         card_calls = [a for a in emitted if a[0] == "notification.show"]
         assert len(card_calls) == 1
@@ -21688,7 +21688,7 @@ def test_notification_poller_delivers_completion(monkeypatch):
         # model prompt is available from the expandable process card.
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) >= 1
-        assert status_calls[0][2]["kind"] == "process"
+        assert status_calls[0][2]["kind"] == "status"
         assert len(turns) == 1
         card_calls = [a for a in emitted if a[0] == "notification.show"]
         assert len(card_calls) == 1
