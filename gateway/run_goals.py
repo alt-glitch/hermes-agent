@@ -510,7 +510,6 @@ class GatewayGoalsMixin:
         import dataclasses
         from gateway.config import Platform
         from gateway.delivery import resolve_delivery_transport
-        from gateway.run import _profile_runtime_scope
         from gateway.session import SessionSource
         from hermes_cli.loops import (
             LoopManager,

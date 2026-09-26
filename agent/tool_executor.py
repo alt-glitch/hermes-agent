@@ -593,14 +593,6 @@ def _set_worker_activity_callback(agent) -> None:
         set_activity_callback(agent._touch_activity)
 
 
-# Tools whose call blocks on a long-running operation that supervises its own liveness: no generic activity
-# heartbeat or sequential deadline. ``delegate_task`` in a nested orchestrator blocks for the whole batch by
-# design (children carry progress-aware heartbeats that interrupt stalls, plus the optional
-# ``delegation.child_timeout_seconds``). Under the 420 s deadline every real batch "timed out" while its
-# children ran on as orphans, and the orchestrator spent the following hours polling transcripts (measured:
-# 332 timeouts, ~$4k of orchestrator turns in one run).
-_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task"})
-
 
 # Must stay far below the gateway turn-inactivity timeout (default 1800s) so a silent tool never looks idle.
 _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S = 30.0
@@ -836,8 +828,10 @@ def _resolve_sequential_tool_timeout() -> float | None:
 
 
 # Tools whose call blocks on a long-running operation that supervises its own liveness: no generic
-# sequential deadline. ``delegate_task`` owns child heartbeat/stale/timeout policy; ``manage_connections``
-# owns the connection operation deadline and may keep an approval card open.
+# sequential deadline and (fork) no generic activity heartbeat either. ``delegate_task`` owns child
+# heartbeat/stale/timeout policy; under the 420 s deadline every real nested batch "timed out" while its
+# children ran on as orphans (measured: 332 timeouts, ~$4k of orchestrator turns in one run).
+# ``manage_connections`` owns the connection operation deadline and may keep an approval card open.
 _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task", "manage_connections"})
 
 
