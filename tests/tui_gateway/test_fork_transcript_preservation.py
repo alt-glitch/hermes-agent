@@ -72,7 +72,7 @@ def test_busy_process_completion_emits_one_expandable_card_without_raw_status(mo
     ) is True
     assert [kind for kind, _ in events] == ["status.update"]
     status = events[0][1]
-    assert status["kind"] == "process"
+    assert status["kind"] == "status"
     assert status["text"].endswith("· proc-test")
     assert registry.completion_queue.get_nowait() == event
 

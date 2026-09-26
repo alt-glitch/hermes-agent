@@ -145,11 +145,18 @@ def _notif_release_turn(session: dict) -> None:
         session["running"] = False
 
 
-def _notif_claim_turn(session: dict) -> bool:
-    """Claim idle work under retirement, MCP reload, and session admission fences."""
+def _notif_claim_turn(session: dict, guard=None) -> bool:
+    """Claim idle work under retirement, MCP reload, and session admission fences.
+
+    ``guard`` is re-evaluated under the same history lock as the ``running`` claim, for callers
+    whose eligibility depends on session fields this function does not check itself (the /loop
+    tick's ``_auto_continue_scheduled`` and turn-marker probes); a check made before the lock is
+    a race with recovery."""
     with _mcp_reload_admission_lock, _session_turn_admission(session) as admitted:
         if (not admitted or session.get("running") or session.get("queued_prompt")
                 or session.get("_closing") or session.get("_finalized")):
+            return False
+        if guard is not None and not guard():
             return False
         session["running"] = True
         session["_turn_cancel_requested"] = False
@@ -291,16 +298,20 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     if (state is None or state.status != "active" or now < state.next_due_at
             or goal_blocks_loop_tick(sid_key) or _loop_route_is_gateway_chat(state)):
         return
+    def _tick_eligible() -> bool:
+        # Fork contract: a wakeup never races an auto-continue or a recovery/user turn marker.
+        return not session.get("_auto_continue_scheduled") and \
+            read_turn_marker(_session_home(session), sid_key) is None
     with session["history_lock"]:
-        if session.get("running") or session.get("_auto_continue_scheduled"):
-            return
-        if read_turn_marker(_session_home(session), sid_key) is not None:
+        if session.get("running") or not _tick_eligible():
             return
         if state.awaiting_response and not mgr.recover_stale_tick(now):
             return
         if not mgr.is_due(now):
             return
-    if not _notif_claim_turn(session):
+    # Re-check the two recovery probes under the claim's own lock: the admission fence
+    # (``_mcp_reload_admission_lock`` before the history lock) forces the claim out of the block above.
+    if not _notif_claim_turn(session, guard=_tick_eligible):
         return
     wakeup = mgr.fire_tick()
     if not wakeup:
@@ -599,18 +610,22 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     # while distinct watch_match events from one process must stay visible.
     dedup_key = _notification_event_dedup_key(evt)
     if dedup_key not in emitted:
+        # Fork: delegation and process completions get a typed card (``notification.show`` /
+        # persisted ``display_metadata``), so their status line is ``kind: "status"`` (status bar
+        # only; OpenTUI's store pushes a transcript row for any other kind, which would duplicate
+        # the card). Other events (watch matches, heartbeats) keep upstream's ``"process"``.
         if is_delegation:
             from tools.process_registry_notifications import async_delegation_display_text
-            display_text = async_delegation_display_text(evt)
+            kind, display_text = "status", async_delegation_display_text(evt)
         elif evt_type == "completion":
-            # Fork status line: ``<cmd> · <state> · <session_id>`` (the OpenTUI status bar keys on the
-            # session id); upstream's compact title is carried in the persisted display metadata.
-            display_text = _process_completion_notice(evt, text)["text"]
+            # ``<cmd> · <state> · <session_id>``: the status bar keys on the session id; upstream's
+            # compact title travels in the persisted display metadata instead.
+            kind, display_text = "status", _process_completion_notice(evt, text)["text"]
         else:
-            display_text = text
+            kind, display_text = "process", text
         from agent.notification_presentation import diagnostic_process_event
         from gateway.warning_notifications import render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": display_text}),
+        render_notification(lambda: _emit("status.update", sid, {"kind": kind, "text": display_text}),
                             platform="tui", diagnostic=diagnostic_process_event(evt))
         emitted.add(dedup_key)
     if evt_type == "completion" and completions is not None:

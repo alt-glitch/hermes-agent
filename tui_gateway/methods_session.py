@@ -785,6 +785,7 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
     """Reuse with _session_resume_lock already held (including the eager double-check)."""
     if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
         return refusal
+    _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
     params = getattr(ctx, "params", {})
     payload = _live_session_payload(
         sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,

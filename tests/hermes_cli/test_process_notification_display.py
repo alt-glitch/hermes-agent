@@ -67,7 +67,7 @@ def test_process_completion_display_keeps_payload_separate_across_surfaces(monke
                                owned=True)
     # Fork: the OpenTUI status bar keys on the session id (`<cmd> · <state> · <sid>`); the compact
     # upstream title travels in the persisted metadata alongside the fork's typed card fields.
-    assert emitted[0][2]["kind"] == "process"
+    assert emitted[0][2]["kind"] == "status"  # fork: typed card carries the row; status bar only
     assert emitted[0][2]["text"].endswith("· proc_1")
     (_rid, _sid, _session, text, _what), kwargs = submitted[0]
     assert text == payload
