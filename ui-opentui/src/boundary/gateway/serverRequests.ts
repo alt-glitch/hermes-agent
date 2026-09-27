@@ -6,6 +6,8 @@
  * Methods without a row (desktop GUI bridges: preview.*, window.read, terminal.read, tour,
  * vault.save_login, vault.code) are not handled; the client answers -32601 so the tool fails fast.
  */
+import { createEffect, createRoot, on } from 'solid-js'
+
 import type { ActivePrompt } from '../../logic/store.ts'
 import { approvalPolicy } from '../../logic/approval.ts'
 import { normalizeClarifyQuestions } from '../../logic/clarifyBatch.ts'
@@ -73,85 +75,99 @@ export const SERVER_REQUEST_PROMPTS: Readonly<Record<string, (id: string, params
 }
 
 /** How `answer` ended: written, not written (transport down — the request stays open for a retry),
- *  or no longer open (answered, cancelled, or owned by a session that is no longer displayed). */
+ *  or no longer open (answered, cancelled, or never received). */
 export type AnswerOutcome = 'sent' | 'not-sent' | 'closed'
 
 export interface ServerRequestRouter {
   /** RawClientOptions.onServerRequest; also the replay path for a hydration's `open_requests`. */
   readonly handle: (request: ServerRequest) => boolean
-  /** Answer queued request `id`. On 'sent' the next queued request opens. */
+  /** Answer held request `id`. On 'sent' the next request of the displayed session opens. */
   readonly answer: (id: string, result: ServerRequestResult) => AnswerOutcome
   /** The backend settled `id` without this answer (`request.cancel`, final `clarify.lock`): drop it and,
-   *  when it was the shown one, open the next. True when it was queued. */
+   *  when it was the shown one, open the next. True when it was held. */
   readonly forget: (id: string) => boolean
-  /** Queued request ids for the displayed session, shown one first. */
+  /** Held request ids for the displayed session, shown one first. */
   readonly pending: () => readonly string[]
+  /** Stop following the displayed session. */
+  readonly dispose: () => void
 }
 
 export interface ServerRequestRouterOptions {
   /** Show one prompt (store.openPrompt); the store holds a single visible prompt. */
   readonly openPrompt: (prompt: ActivePrompt) => void
-  /** The session whose transcript is on screen (store.state.sessionId). */
+  /** The session whose transcript is on screen (store.state.sessionId). A reactive accessor: the
+   *  router follows it and opens the new session's oldest held request when it changes. */
   readonly displayedSessionId: () => string | undefined
 }
 
-/**
- * Requests are shown only for the displayed session, one at a time, oldest first. A request for any
- * other session is neither answered nor kept: the backend keeps it in `open_requests` until it is
- * answered or expires, and activating that session replays it through `handle`
- * (sessionLifecycle.ts → GatewayTransport.replayRequests). The queue belongs to one session; the
- * first call after a session switch starts it empty.
- */
-interface Queued {
+interface Held {
   readonly request: ServerRequest
   readonly prompt: ActivePrompt
 }
 
+/**
+ * Every request is held, per session, oldest first, until it is answered or the backend settles it
+ * (`request.cancel` → `forget`; the backend cancels a closed session's requests). Only the displayed
+ * session's oldest request is shown. When the displayed session changes, its oldest held request
+ * opens, so a request that arrived for a session before it was displayed is shown as soon as it is,
+ * whether it came before or after the hydration's `open_requests`. A replayed id that is already held
+ * keeps its place.
+ */
 export function createServerRequestRouter(options: ServerRequestRouterOptions): ServerRequestRouter {
-  let owner: string | undefined
-  let queue: Queued[] = []
-  const current = (): Queued[] => {
-    const displayed = options.displayedSessionId()
-    if (displayed !== owner) {
-      owner = displayed
-      queue = []
-    }
-    return queue
+  const held = new Map<string, Held[]>()
+  const sessionOf = (request: ServerRequest): string => str(request.params['session_id'])
+  const showHead = (sessionId: string | undefined): void => {
+    const head = sessionId === undefined ? undefined : held.get(sessionId)?.[0]
+    if (head) options.openPrompt(head.prompt)
   }
-  const show = (queued: Queued | undefined): void => {
-    if (queued) options.openPrompt(queued.prompt)
+  const find = (id: string): { readonly sessionId: string; readonly queue: Held[]; readonly index: number } | null => {
+    for (const [sessionId, queue] of held) {
+      const index = queue.findIndex(h => h.request.id === id)
+      if (index >= 0) return { sessionId, queue, index }
+    }
+    return null
   }
   const remove = (id: string): boolean => {
-    const requests = current()
-    const index = requests.findIndex(q => q.request.id === id)
-    if (index < 0) return false
-    requests.splice(index, 1)
-    if (index === 0) show(requests[0])
+    const found = find(id)
+    if (!found) return false
+    found.queue.splice(found.index, 1)
+    if (found.queue.length === 0) held.delete(found.sessionId)
+    if (found.index === 0 && found.sessionId === options.displayedSessionId()) showHead(found.sessionId)
     return true
   }
+  const dispose = createRoot(dispose => {
+    createEffect(on(options.displayedSessionId, showHead, { defer: true }))
+    return dispose
+  })
   return {
     handle: request => {
       const toPrompt = SERVER_REQUEST_PROMPTS[request.method]
       if (!toPrompt) return false
-      const requests = current()
-      if (owner === undefined || request.params['session_id'] !== owner) return true
-      const queued = { request, prompt: toPrompt(request.id, request.params) }
-      const index = requests.findIndex(q => q.request.id === request.id)
-      // A replay of a request already queued takes its place (it carries the batch answers locked
-      // so far); the shown one re-opens, since hydration cleared the store prompt.
-      if (index >= 0) requests[index] = queued
-      else requests.push(queued)
-      if (requests[0] === queued) show(queued)
+      const sessionId = sessionOf(request)
+      const queue = held.get(sessionId) ?? []
+      held.set(sessionId, queue)
+      const next = { request, prompt: toPrompt(request.id, request.params) }
+      const index = queue.findIndex(h => h.request.id === request.id)
+      // A replay of a held request takes its place (it carries the batch answers locked so far).
+      if (index >= 0) queue[index] = next
+      else queue.push(next)
+      // The shown one re-opens too: hydration cleared the store prompt.
+      if (queue[0] === next && sessionId === options.displayedSessionId()) options.openPrompt(next.prompt)
       return true
     },
     answer: (id, result) => {
-      const request = current().find(q => q.request.id === id)?.request
+      const found = find(id)
+      const request = found?.queue[found.index]?.request
       if (!request) return 'closed'
       if (!request.respond({ ...result })) return 'not-sent'
       remove(id)
       return 'sent'
     },
     forget: remove,
-    pending: () => current().map(q => q.request.id)
+    pending: () => {
+      const displayed = options.displayedSessionId()
+      return displayed === undefined ? [] : (held.get(displayed) ?? []).map(h => h.request.id)
+    },
+    dispose
   }
 }

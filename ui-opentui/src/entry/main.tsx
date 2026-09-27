@@ -1102,6 +1102,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         openPrompt: store.openPrompt,
         displayedSessionId: () => store.state.sessionId
       })
+      yield* Effect.addFinalizer(() => Effect.sync(serverRequests.dispose))
       const stopServingRequests = gateway.serveRequests?.(serverRequests.handle)
       if (stopServingRequests) yield* Effect.addFinalizer(() => Effect.sync(stopServingRequests))
 

@@ -208,7 +208,35 @@ test('an open_requests replay on session activation opens the prompt; the answer
   client.stop()
 })
 
-test('a request for a session that is not displayed is neither shown nor answered; activating it replays it', async () => {
+test('a request for a session that is not displayed is held; switching to that session opens it without a replay', async () => {
+  const gateway = mockGateway({
+    // open_requests was built before either s2 request existed; srq-late lands mid-activate, before
+    // the response (the window where displayedSessionId is still s1).
+    'session.activate': params => {
+      gateway.send(clarify('srq-late', 's2', 'Also for s2?'))
+      return { session_id: params['session_id'], messages: [], open_requests: [] }
+    }
+  })
+  const { store, router, client, transport } = startClient(gateway, 's1')
+
+  gateway.send(clarify('srq-other', 's2', 'For s2?'))
+  // A later frame on the same stream proves the first one was processed.
+  gateway.send(clarify('srq-mine', 's1', 'For s1?'))
+  await vi.waitFor(() => expect(store.state.prompt).toMatchObject({ requestId: 'srq-mine' }))
+  expect(router.pending()).toEqual(['srq-mine'])
+  expect(gateway.responsesFor('srq-other')).toEqual([])
+
+  // The backend built open_requests before srq-other existed: the switch alone must show it.
+  await Effect.runPromise(activateSession(transport, store, { targetSessionId: 's2' }))
+  expect(store.state.prompt).toMatchObject({ kind: 'clarify', question: 'For s2?', requestId: 'srq-other' })
+  expect(router.pending()).toEqual(['srq-other', 'srq-late'])
+  expect(router.answer('srq-other', { answer: 'ok' })).toBe('sent')
+  expect(store.state.prompt).toMatchObject({ question: 'Also for s2?', requestId: 'srq-late' })
+  await vi.waitFor(() => expect(gateway.responsesFor('srq-other')).toHaveLength(1))
+  client.stop()
+})
+
+test('a replay of a held request does not duplicate it: the answer writes exactly one frame', async () => {
   const pending = { id: 'srq-other', method: 'clarify', params: { session_id: 's2', question: 'For s2?' } }
   const gateway = mockGateway({
     'session.activate': params => ({ session_id: params['session_id'], messages: [], open_requests: [pending] })
@@ -216,17 +244,47 @@ test('a request for a session that is not displayed is neither shown nor answere
   const { store, router, client, transport } = startClient(gateway, 's1')
 
   gateway.send({ jsonrpc: '2.0', ...pending })
-  // A later frame on the same stream proves the first one was processed.
   gateway.send(clarify('srq-mine', 's1', 'For s1?'))
   await vi.waitFor(() => expect(store.state.prompt).toMatchObject({ requestId: 'srq-mine' }))
-  expect(router.pending()).toEqual(['srq-mine'])
-  expect(gateway.responsesFor('srq-other')).toEqual([])
 
   await Effect.runPromise(activateSession(transport, store, { targetSessionId: 's2' }))
-  expect(store.state.prompt).toMatchObject({ kind: 'clarify', question: 'For s2?', requestId: 'srq-other' })
+  expect(store.state.prompt).toMatchObject({ requestId: 'srq-other' })
   expect(router.pending()).toEqual(['srq-other'])
   expect(router.answer('srq-other', { answer: 'ok' })).toBe('sent')
+  expect(router.answer('srq-other', { answer: 'again' })).toBe('closed')
   await vi.waitFor(() => expect(gateway.responsesFor('srq-other')).toHaveLength(1))
+  await new Promise(resolve => setTimeout(resolve, 10))
+  expect(gateway.responsesFor('srq-other')).toEqual([{ jsonrpc: '2.0', id: 'srq-other', result: { answer: 'ok' } }])
+  expect(router.pending()).toEqual([])
+  client.stop()
+})
+
+test('request.cancel for a held request of a session that is not displayed drops it; a later switch shows nothing', async () => {
+  const gateway = mockGateway({
+    'session.activate': params => ({ session_id: params['session_id'], messages: [], open_requests: [] })
+  })
+  const { store, router, client, transport } = startClient(gateway, 's1')
+
+  gateway.send(clarify('srq-other', 's2', 'For s2?'))
+  gateway.send({
+    jsonrpc: '2.0',
+    method: 'event',
+    params: {
+      type: 'request.cancel',
+      session_id: 's2',
+      payload: { id: 'srq-other', method: 'clarify', reason: 'timeout' }
+    }
+  })
+  gateway.send(clarify('srq-mine', 's1', 'For s1?'))
+  await vi.waitFor(() => expect(store.state.prompt).toMatchObject({ requestId: 'srq-mine' }))
+  expect(router.forget('srq-other')).toBe(false)
+
+  await Effect.runPromise(activateSession(transport, store, { targetSessionId: 's2' }))
+  expect(store.state.sessionId).toBe('s2')
+  expect(store.state.prompt).toBeUndefined()
+  expect(router.pending()).toEqual([])
+  expect(router.answer('srq-other', { answer: 'late' })).toBe('closed')
+  expect(gateway.responsesFor('srq-other')).toEqual([])
   client.stop()
 })
 
