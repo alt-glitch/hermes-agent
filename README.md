@@ -51,22 +51,11 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 > `--dir ~/.hermes/hermes-opentui` to keep both side-by-side. See
 > [`docs/opentui-fork-cutover-cheatsheet.md`](docs/opentui-fork-cutover-cheatsheet.md).
 >
-> **Worktree-aware `hermes`:** the installer writes a regular launcher at
-> `~/.local/bin/hermes` (or the platform command directory). Outside a Hermes
-> checkout it runs the managed install. Inside the explicitly trusted install
-> checkout or any linked worktree, it runs that exact tree's Python/TUI source,
-> borrowing dependencies from the tree's `.venv`/`venv`, the primary checkout's
-> venv, or finally the managed venv. Trust is keyed to Git's common directory,
-> persisted beside the launcher, and never inferred from filenames alone.
->
-> Register another clone once (for example, an upstream development checkout):
-> ```bash
-> bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
->   ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes \
->   ~/github/hermes-agent
-> ```
-> Its linked worktrees then select themselves automatically; unregistered clones
-> continue to use the managed fork.
+> **`hermes` command:** the installer writes a plain launcher at
+> `~/.local/bin/hermes` (or the platform command directory) that always runs
+> the managed install, whatever directory you are in. To run a checkout's own
+> code, call that checkout's own launcher, `<checkout>/.hermes/bin/hermes`
+> (published by `./setup-hermes.sh`), or `source ./activate` in it.
 >
 > Everything below is the **upstream** install (NousResearch/main — the Ink TUI).
 
@@ -262,13 +251,10 @@ Start with the [PM developer workflow](website/docs/reference/package-management
 for activation, daily use, dependency changes, and leaving the environment.
 [Development Setup](CONTRIBUTING.md#development-setup) covers the separate test environment and verification commands.
 
-The installed `~/.local/bin/hermes` launcher explicitly trusts the checkout used
-to install it. After you `cd` into that checkout or one of its linked worktrees,
-bare `hermes` imports that exact tree while reusing an available
-checkout/managed venv. Outside a trusted Hermes checkout it continues to run the
-managed installation. Register a separate clone with
-`scripts/write-hermes-launcher.sh` as shown in Quick Install; trust persists
-across installer reruns.
+The installed `~/.local/bin/hermes` launcher always runs the managed
+installation, from any directory. To run a development checkout's code, call
+its own launcher explicitly (`<checkout>/.hermes/bin/hermes`, published by
+`./setup-hermes.sh`).
 
 ---
 

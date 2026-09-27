@@ -13,9 +13,9 @@
 #   --verbose             stream every child command's output (the default
 #                         off a terminal and in CI)
 #
-# Fork (sid/opentui) additions: --repo and sticky self-checkout defaults, the
-# worktree-aware `hermes` launcher (products), and the best-effort
-# `opentui-engine` stage that prepares the native OpenTUI engine.
+# Fork (sid/opentui) additions: --repo and sticky self-checkout defaults and
+# the best-effort `opentui-engine` stage that prepares the native OpenTUI
+# engine.
 set -u
 
 # Prevent uv from discovering config files (uv.toml, pyproject.toml) from the
@@ -768,37 +768,8 @@ stage_products() {
     (cd "$INSTALL_DIR" && run_logged "Building the hermes command and apps" \
         "$boot_py" -I -B -X utf8 hermes_cli/source_completion.py "${args[@]}") \
         || fail "app products or command publication failed"
-    install_worktree_launcher
     wire_shell_path
     log_success "app products and hermes command ready"
-}
-
-# Fork: the user-facing ~/.local/bin/hermes is the worktree-aware launcher
-# (scripts/write-hermes-launcher.sh), installed over the plain forwarder that
-# source_completion publishes. Outside a trusted Hermes checkout it executes
-# this install's published launcher ($INSTALL_DIR/.hermes/bin/hermes); inside
-# one (or a linked worktree sharing its git dir) it runs that checkout's
-# source. Trust is explicit: the managed checkout plus the checkout this
-# installer runs from. The generator writes atomically and replaces a legacy
-# symlink without following it (the #21454 symlink-stomp fix). PM does not
-# claim the result as its own convenience, so `hermes update` leaves it alone.
-install_worktree_launcher() {
-    local generator="$INSTALL_DIR/scripts/write-hermes-launcher.sh"
-    local managed_cli="$INSTALL_DIR/.hermes/bin/hermes"
-    local target="$HOME/.local/bin/hermes"
-    local trusted=("$INSTALL_DIR") checkout
-    # Trees without the fork generator keep the forwarder PM just published.
-    [ -f "$generator" ] || return 0
-    if [ ! -x "$managed_cli" ]; then
-        log_warn "worktree-aware hermes launcher skipped: $managed_cli was not published"
-        return 0
-    fi
-    if checkout="$(self_checkout)"; then
-        trusted+=("$checkout")
-    fi
-    bash "$generator" "$target" "$managed_cli" "${trusted[@]}" \
-        || fail "cannot install the worktree-aware hermes launcher at $target"
-    log_success "installed worktree-aware hermes launcher → $target"
 }
 
 stage_desktop() {

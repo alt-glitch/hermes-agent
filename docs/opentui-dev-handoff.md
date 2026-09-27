@@ -13,12 +13,9 @@ assumes NO prior transcript/memory.
 - The native engine source is **`ui-opentui/`**; the legacy Ink engine is `ui-tui/` (shipping
   default, untouched by this campaign). The Python gateway is `tui_gateway/`, launcher
   `hermes_cli/main.py`.
-- **A trusted worktree can be the user's LIVE global `hermes` runtime.** The regular
-  `~/.local/bin/hermes` launcher selects the current checkout only when its Git common directory
-  is in `~/.local/bin/hermes.trusted-roots`; otherwise it uses the managed install. Consequences:
-  (1) NEVER leave a trusted worktree half-merged/conflicted — a new `hermes` session would fail to
-  build; (2) after source changes, rebuild `dist/main.js`; (3) leave the worktree (or remove its
-  common dir from the trust file) to bypass it with the managed install.
+- **The global `hermes` never runs a worktree.** `~/.local/bin/hermes` is a plain launcher for the
+  managed install, from any directory. Run a worktree's code with `<worktree>/.hermes/bin/hermes`;
+  after source changes, rebuild `dist/main.js` first.
 - Backups of pre-merge branch states exist as `backup/*` refs (recoverable via `git reset`).
 
 ## Runtime, build, gate (Node 26 — NOT Bun; the port is done)

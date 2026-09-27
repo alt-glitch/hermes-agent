@@ -333,6 +333,8 @@ def _owns_launcher(target: Path, root: Path) -> bool:
     bootstrap = f"sys.path.insert(0, {str(root)!r})"
     if paths.intersection(tokens) or any(bootstrap in token for token in tokens):
         return True
+    if _is_retired_fork_launcher(target, tokens, root):
+        return True
     # The historical updater wrote ACP as a sibling-hermes forwarder. Adopt
     # it only when that sibling demonstrably belongs to this installation.
     if target.name == "hermes-acp":
@@ -340,6 +342,19 @@ def _owns_launcher(target: Path, root: Path) -> bool:
         return (tokens == ["exec", str(sibling), "acp", "$@"]
                 and _owns_launcher(sibling, root))
     return False
+
+
+def _is_retired_fork_launcher(target: Path, tokens: list[str], root: Path) -> bool:
+    """Fork: scripts/write-hermes-launcher.sh output bound to this install.
+
+    Every version wrote this signature; `managed_cli=` must name this install's
+    old venv or PM entrypoint (compared resolved, so symlinked roots match).
+    """
+    if target.name != "hermes" or not {"PYTHONSAFEPATH=1", "$managed_cli"} <= set(tokens):
+        return False
+    bound = [t.removeprefix("managed_cli=") for t in tokens if t.startswith("managed_cli=/")]
+    owned = {root / "venv/bin/hermes", root / ".hermes/bin/hermes"}
+    return len(bound) == 1 and Path(bound[0]).resolve() in owned
 
 
 def _publish_conveniences(root: Path, out_dir: Path, names, *, create: bool = True) -> dict[Path, bool]:
