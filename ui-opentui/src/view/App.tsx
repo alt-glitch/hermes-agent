@@ -42,7 +42,7 @@ import { PluginsHub, type PluginOps } from './overlays/pluginsHub.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
 import { SessionOrchestrator, type SessionOrchestratorOps } from './overlays/sessionOrchestrator.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
-import type { PromptResponseDisposition, PromptResponseMethod } from '../boundary/promptResponses.ts'
+import type { PromptReply, PromptResponseDisposition } from '../boundary/promptResponses.ts'
 import { SessionInfoProvider } from './sessionInfo.tsx'
 import { StatusBar } from './statusBar.tsx'
 import { TodoPanel } from './todoPanel.tsx'
@@ -64,10 +64,7 @@ export interface AppProps {
   /** Entry observes edit end so a queue held across turn-settle can drain. */
   readonly onQueueEditChange?: (index: number | undefined) => void
   readonly onType?: (text: string, cursor: number) => void
-  readonly onRespond?: (
-    method: PromptResponseMethod,
-    params: Record<string, unknown>
-  ) => Promise<PromptResponseDisposition>
+  readonly onRespond?: (reply: PromptReply) => Promise<PromptResponseDisposition>
   readonly onResume?: (sessionId: string) => void
   readonly onActivateSession?: (sessionId: string) => void
   readonly onNewLiveSession?: () => void

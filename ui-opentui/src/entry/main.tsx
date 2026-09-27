@@ -35,12 +35,14 @@ import { GatewayService, type GatewayTransport } from '../boundary/gateway/Gatew
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
 import {
-  classifyPromptResponse,
+  classifyClarifyLock,
+  PROMPT_ACCEPTED,
+  PROMPT_EXPIRED,
   promptTransportUncertain,
-  reconcilePendingApprovalSnapshot,
-  type PromptResponseDisposition,
-  type PromptResponseMethod
+  type PromptReply,
+  type PromptResponseDisposition
 } from '../boundary/promptResponses.ts'
+import { createServerRequestRouter } from '../boundary/gateway/serverRequests.ts'
 import { startMemlog } from '../boundary/memlog.ts'
 import { startMemoryMonitor } from '../boundary/memoryMonitor.ts'
 import { startProactiveGc } from '../boundary/proactiveGc.ts'
@@ -304,25 +306,6 @@ const writeActiveSession = (sid: string | undefined) => {
   }
 }
 
-/** Reconcile missed approval terminal events without blocking session resume. */
-const schedulePendingApprovalReconciliation = (
-  gateway: GatewayTransport,
-  store: SessionStore,
-  sessionId: string
-): void => {
-  void reconcilePendingApprovalSnapshot(
-    () => Effect.runPromise(gateway.request('approval.pending', { session_id: sessionId })),
-    store,
-    sessionId
-  )
-    .then(outcome => {
-      if (outcome === 'invalid') getLog().warn('approval', 'invalid pending snapshot', { session_id: sessionId })
-    })
-    .catch(cause =>
-      getLog().warn('approval', 'pending snapshot failed', { cause: String(cause), session_id: sessionId })
-    )
-}
-
 const resumeInto = (
   gateway: GatewayTransport,
   store: SessionStore,
@@ -346,7 +329,6 @@ const resumeInto = (
       resumed: resumed.resumedId,
       sid: resumed.sessionId
     })
-    schedulePendingApprovalReconciliation(gateway, store, resumed.sessionId)
     if (resumed.previousSessionId) {
       Effect.runFork(
         gateway
@@ -1120,7 +1102,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
+      // Backend→client requests (clarify, approval, sudo, secret, vault.unlock_prompt) open
+      // store prompts; the answer goes back as the JSON-RPC response (see `respond`).
+      const serverRequests = createServerRequestRouter(store.openPrompt)
+      const stopServingRequests = gateway.serveRequests?.(serverRequests.handle)
+      if (stopServingRequests) yield* Effect.addFinalizer(() => Effect.sync(stopServingRequests))
+
       yield* gateway.subscribe(event => {
+        if (event.type === 'request.cancel') serverRequests.forget(event.payload.id)
         if (!eventMayEnterStore(event, gateway.sessionId(), store.isBuffering())) return
         const liveSessionId = gateway.sessionId()
         const eventSessionId = event.session_id ?? liveSessionId
@@ -3290,19 +3279,27 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           })
       }
 
-      // Blocking prompts retain UI ownership until a decoded gateway ack.
-      const respond = async (
-        method: PromptResponseMethod,
-        params: Record<string, unknown>
-      ): Promise<PromptResponseDisposition> => {
+      // Blocking prompts: an answer is the JSON-RPC response to the open
+      // server request (false = no longer open or transport down → expired);
+      // a batch-clarify lock is the clarify.lock RPC and keeps the request open.
+      const respond = async (reply: PromptReply): Promise<PromptResponseDisposition> => {
+        if (reply.kind === 'answer') {
+          return serverRequests.answer(reply.requestId, reply.result) ? PROMPT_ACCEPTED : PROMPT_EXPIRED
+        }
         try {
-          // @ts-expect-error contract drift: clarify.respond, secret.respond, sudo.respond, vault.unlock.respond are not registered methods (I4)
-          const raw = await Effect.runPromise(gateway.request(method, params))
-          const disposition = classifyPromptResponse(method, raw)
-          if (disposition.kind === 'uncertain') getLog().warn('respond', disposition.message, { method })
+          const raw = await Effect.runPromise(
+            gateway.request('clarify.lock', {
+              answer: reply.answer,
+              question_id: reply.questionId,
+              request_id: reply.requestId
+            })
+          )
+          const disposition = classifyClarifyLock(raw)
+          if (disposition.kind === 'uncertain')
+            getLog().warn('respond', disposition.message, { method: 'clarify.lock' })
           return disposition
         } catch (cause) {
-          getLog().warn('respond', 'failed', { cause: String(cause), method })
+          getLog().warn('respond', 'failed', { cause: String(cause), method: 'clarify.lock' })
           return promptTransportUncertain(cause)
         }
       }

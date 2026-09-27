@@ -14,13 +14,13 @@
  * the input returns to the list. Enter on a choice answers it; Enter in the
  * input submits the typed text. The parent overlay owns Esc/Ctrl+C. When there
  * are no choices the input is the only control and is focused immediately.
- * Answered via `clarify.respond {answer, request_id}` (the caller wires onAnswer).
+ * Answered with the `clarify` request's JSON-RPC response `{answer}` (the caller wires onAnswer).
  *
  * BATCH mode (`questions` non-empty — multi-question clarify): a compact status
  * list — every question on its own row (✓ answered / ▸ active / · pending),
  * only the ACTIVE question's choices + input expanded, so a 5-question batch
  * stays a few rows tall. Enter locks the active answer via `onQuestionAnswer`
- * (clarify.respond + question_id) and the prompt remounts on the next
+ * (clarify.lock + question_id) and the prompt remounts on the next
  * unanswered question; Tab / Shift-Tab cycle the active question with wrap, and
  * revisiting an answered question restores its earlier state (choice answers
  * put the cursor back on their row; typed answers land on the input row with
@@ -49,7 +49,7 @@ export function ClarifyPrompt(props: {
   /** Standalone harnesses may own close directly; PromptOverlay omits this. */
   onCancel?: (() => void) | undefined
   statusHint?: string | undefined
-  /** Batch mode: lock ONE question's answer (clarify.respond + question_id). */
+  /** Batch mode: lock ONE question's answer (clarify.lock + question_id). */
   onQuestionAnswer?: (qid: string, answer: string) => void
 }) {
   const theme = useTheme()

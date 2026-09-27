@@ -14,6 +14,7 @@ import { describe, expect, test } from 'vitest'
 
 import { installTerminalChrome, type TerminalChromeSeam } from '../boundary/termChrome.ts'
 import { createSessionStore } from '../logic/store.ts'
+import { SERVER_REQUEST_PROMPTS } from '../boundary/gateway/serverRequests.ts'
 import { bellOnPromptFromConfig } from '../logic/details.ts'
 import {
   notifyEnabled,
@@ -215,10 +216,7 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
     const { dispose, notifications, store } = mount()
     try {
       expect(notifications).toEqual([])
-      store.apply({
-        type: 'clarify.request',
-        payload: { choices: null, question: 'which one?', request_id: 'r1' }
-      })
+      store.openPrompt(SERVER_REQUEST_PROMPTS['clarify']!('r1', { choices: null, question: 'which one?' }))
       expect(notifications).toEqual(['needs an answer to continue'])
       // clearing the prompt does not notify again
       store.clearPrompt()
@@ -232,10 +230,7 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
     const { bells, dispose, store } = mount()
     try {
       store.setBellOnPrompt(true)
-      store.apply({
-        type: 'clarify.request',
-        payload: { choices: null, question: 'first?', request_id: 'r1' }
-      })
+      store.openPrompt(SERVER_REQUEST_PROMPTS['clarify']!('r1', { choices: null, question: 'first?' }))
       expect(bells).toEqual([BEL])
 
       // Unrelated reactive work while the same prompt remains open cannot ring again.
@@ -243,10 +238,7 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
       expect(bells).toEqual([BEL])
 
       store.clearPrompt()
-      store.apply({
-        type: 'secret.request',
-        payload: { env_var: 'TOKEN', prompt: 'token?', request_id: 'r2' }
-      })
+      store.openPrompt(SERVER_REQUEST_PROMPTS['secret']!('r2', { env_var: 'TOKEN', prompt: 'token?' }))
       expect(bells).toEqual([BEL, BEL])
     } finally {
       dispose()

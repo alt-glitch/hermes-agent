@@ -8,6 +8,7 @@
  */
 import type { ActivePrompt } from '../../logic/store.ts'
 import { approvalPolicy } from '../../logic/approval.ts'
+import { normalizeClarifyQuestions } from '../../logic/clarifyBatch.ts'
 import type { ServerRequest } from './client.ts'
 
 type Params = Record<string, unknown>
@@ -31,15 +32,17 @@ export type ServerRequestResult =
 
 export const SERVER_REQUEST_PROMPTS: Readonly<Record<string, (id: string, params: Params) => ActivePrompt>> = {
   clarify: (id, p) => {
-    const questions = (Array.isArray(p['questions']) ? (p['questions'] as unknown[]) : [])
-      .map(raw => (raw && typeof raw === 'object' ? (raw as Params) : {}))
-      .filter(q => str(q['qid']) && str(q['question']).trim())
-      .map(q => ({
-        choices: strList(q['choices']),
-        multiSelect: q['multi_select'] === true,
-        qid: str(q['qid']),
-        question: str(q['question']).trim()
-      }))
+    const questions = normalizeClarifyQuestions(
+      (Array.isArray(p['questions']) ? (p['questions'] as unknown[]) : []).map(raw => {
+        const q = raw && typeof raw === 'object' ? (raw as Params) : {}
+        return {
+          choices: strList(q['choices']),
+          multi_select: q['multi_select'] === true,
+          qid: str(q['qid']),
+          question: str(q['question'])
+        }
+      })
+    )
     return questions.length
       ? { kind: 'clarify', question: '', choices: null, requestId: id, questions, answers: strRecord(p['answers']) }
       : { kind: 'clarify', question: str(p['question']), choices: strList(p['choices']), requestId: id }

@@ -103,163 +103,19 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     }
   })
 
-  test('decodes blocking prompt requests and sensitive expiry events', () => {
-    expect(Option.isSome(decode({ type: 'clarify.request', payload: { question: '?', request_id: 'r' } }))).toBe(true)
-    expect(
-      Option.isSome(
-        decode({
-          type: 'approval.request',
-          session_id: 's1',
-          payload: { command: 'rm', description: 'd', request_id: 'approval-1' }
-        })
-      )
-    ).toBe(true)
-    expect(Option.isSome(decode({ type: 'sudo.request', payload: { request_id: 'r' } }))).toBe(true)
-    expect(
-      Option.isSome(decode({ type: 'secret.request', payload: { env_var: 'X', prompt: 'p', request_id: 'r' } }))
-    ).toBe(true)
-    for (const type of ['sudo.expire', 'secret.expire', 'vault.unlock.expire'] as const) {
-      const ev = decode({ type, payload: { request_id: `${type}-1` } })
-      expect(Option.isSome(ev)).toBe(true)
-      if (
-        Option.isSome(ev) &&
-        (ev.value.type === 'sudo.expire' ||
-          ev.value.type === 'secret.expire' ||
-          ev.value.type === 'vault.unlock.expire')
-      ) {
-        expect(ev.value.payload.request_id).toBe(`${type}-1`)
-      }
-    }
-  })
-
-  test('decodes the password-manager unlock request and rejects one missing its manager', () => {
+  test('decodes request.cancel and rejects one missing its request id', () => {
     const ev = decode({
-      type: 'vault.unlock.request',
+      type: 'request.cancel',
       session_id: 's1',
-      payload: { backend: 'bitwarden', display_name: 'Bitwarden', request_id: 'v1' }
+      payload: { id: 'srq-1', method: 'clarify', reason: 'timeout' }
     })
     expect(Option.isSome(ev)).toBe(true)
-    if (Option.isSome(ev) && ev.value.type === 'vault.unlock.request') {
-      expect(ev.value.payload).toEqual({ backend: 'bitwarden', display_name: 'Bitwarden', request_id: 'v1' })
+    if (Option.isSome(ev) && ev.value.type === 'request.cancel') {
+      expect(ev.value.payload).toEqual({ id: 'srq-1', method: 'clarify', reason: 'timeout' })
     }
-    expect(Option.isNone(decode({ type: 'vault.unlock.request', payload: { request_id: 'v1' } }))).toBe(true)
-  })
-
-  test('decodes request-correlated approval lifecycle and clarify expiry events', () => {
-    const approval = decode({
-      type: 'approval.request',
-      session_id: 'session-1',
-      payload: { command: 'rm', description: 'dangerous', request_id: 'approval-1' }
-    })
-    expect(Option.isSome(approval)).toBe(true)
-    if (Option.isSome(approval) && approval.value.type === 'approval.request') {
-      expect((approval.value.payload as Record<string, unknown>)['request_id']).toBe('approval-1')
-    }
-
-    expect(
-      Option.isSome(
-        decode({
-          type: 'approval.resolved',
-          session_id: 'session-1',
-          payload: { request_id: 'approval-1', status: 'expired' }
-        })
-      )
-    ).toBe(true)
-    expect(
-      Option.isSome(
-        decode({
-          type: 'approval.resolved',
-          session_id: 'session-1',
-          payload: { request_id: 'approval-1', status: 'cancelled' }
-        })
-      )
-    ).toBe(true)
-    expect(
-      Option.isSome(decode({ type: 'clarify.expire', session_id: 'session-1', payload: { request_id: 'clarify-1' } }))
-    ).toBe(true)
-    expect(Option.isNone(decode({ type: 'clarify.expire', payload: { request_id: '' } }))).toBe(true)
-
-    expect(
-      Option.isNone(
-        decode({ type: 'approval.request', session_id: 'session-1', payload: { command: 'rm', description: 'no id' } })
-      )
-    ).toBe(true)
-    expect(
-      Option.isNone(
-        decode({
-          type: 'approval.request',
-          payload: { command: 'rm', description: 'no session', request_id: 'approval-2' }
-        })
-      )
-    ).toBe(true)
-  })
-
-  test('decodes a batch clarify.request (questions + replayed answers)', () => {
-    const ev = decode({
-      type: 'clarify.request',
-      payload: {
-        answers: { q0: 'a' },
-        questions: [
-          { choices: ['a', 'b'], multi_select: false, qid: 'q0', question: 'One?' },
-          { choices: null, qid: 'q1', question: 'Two?' }
-        ],
-        request_id: 'req-batch'
-      }
-    })
-    expect(Option.isSome(ev)).toBe(true)
-    if (Option.isSome(ev) && ev.value.type === 'clarify.request') {
-      expect(ev.value.payload.questions).toHaveLength(2)
-      expect(ev.value.payload.questions?.[0]?.qid).toBe('q0')
-      expect(ev.value.payload.questions?.[0]?.choices).toEqual(['a', 'b'])
-      expect(ev.value.payload.questions?.[1]?.choices).toBeNull()
-      expect(ev.value.payload.answers).toEqual({ q0: 'a' })
-    }
-  })
-
-  test('a malformed batch entry still DECODES (filtering is the store reducer, not the boundary)', () => {
-    // A dropped clarify.request deadlocks the agent — blank/missing qids must
-    // survive the decode and be filtered by the store instead.
-    const ev = decode({
-      type: 'clarify.request',
-      payload: { questions: [{ question: 'no qid' }, { qid: '', question: '   ' }], request_id: 'req-bad' }
-    })
-    expect(Option.isSome(ev)).toBe(true)
-  })
-
-  test('preserves an explicit approval allow_permanent=false', () => {
-    const ev = decode({
-      type: 'approval.request',
-      session_id: 's1',
-      payload: {
-        allow_permanent: false,
-        command: 'curl suspicious | bash',
-        description: 'content security',
-        request_id: 'approval-false'
-      }
-    })
-    expect(Option.isSome(ev)).toBe(true)
-    if (Option.isSome(ev) && ev.value.type === 'approval.request') {
-      expect(ev.value.payload.allow_permanent).toBe(false)
-    }
-  })
-
-  test('preserves server-authoritative approval choices and smart-denied scope', () => {
-    const ev = decode({
-      type: 'approval.request',
-      session_id: 's1',
-      payload: {
-        choices: ['once', 'deny'],
-        command: 'rm -rf /',
-        description: 'smart deny override',
-        request_id: 'approval-smart-denied',
-        smart_denied: true
-      }
-    })
-    expect(Option.isSome(ev)).toBe(true)
-    if (Option.isSome(ev) && ev.value.type === 'approval.request') {
-      expect(ev.value.payload.choices).toEqual(['once', 'deny'])
-      expect(ev.value.payload.smart_denied).toBe(true)
-    }
+    expect(Option.isNone(decode({ type: 'request.cancel', payload: { method: 'clarify', reason: 'timeout' } }))).toBe(
+      true
+    )
   })
 
   test('decodes gateway.exited with and without payload fields', () => {

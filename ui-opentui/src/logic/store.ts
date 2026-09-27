@@ -15,7 +15,6 @@ import type { RpcRequest } from '../boundary/gateway/rpc.ts'
 import { Option } from 'effect'
 import { createStore, produce } from 'solid-js/store'
 
-import type { ApprovalRequestPayload } from '../boundary/promptResponses.ts'
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
 import type { BillingOverlayState, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { CommandsCatalogResponse } from '../boundary/schema/SessionCommandResponses.ts'
@@ -80,13 +79,8 @@ import {
   normalizeTerminalStatus,
   type SubagentStatus
 } from './subagentTree.ts'
-import { approvalPolicy, type ApprovalChoicePolicy } from './approval.ts'
-import {
-  formatAbandonedClarifyBatch,
-  normalizeClarifyQuestions,
-  remainingClarifyQids,
-  type ClarifyBatchQuestion
-} from './clarifyBatch.ts'
+import type { ApprovalChoicePolicy } from './approval.ts'
+import { formatAbandonedClarifyBatch, remainingClarifyQids, type ClarifyBatchQuestion } from './clarifyBatch.ts'
 import { billingWallAction, billingWallCopy, runBillingWallAction, type BillingWallHost } from './billingWall.ts'
 import { appendSubagentTrace, finishSubagentTrace, trimSubagentTrace } from './subagentTrace.ts'
 
@@ -229,8 +223,9 @@ export type ConfirmRequest = string | ConfirmSpec
 
 /**
  * A BLOCKING interactive request from the agent (spec §8 #6 — unhandled = deadlock).
- * Each is answered via the matching `*.respond` RPC. Esc/Ctrl+C initiates a
- * deny/empty response while idle and can dismiss locally if delivery stalls.
+ * Gateway kinds are opened by a backend→client JSON-RPC request
+ * (boundary/gateway/serverRequests.ts; `requestId` is that request's id) and
+ * answered with its JSON-RPC response. Esc/Ctrl+C sends the deny/empty answer.
  */
 export type ActivePrompt =
   | {
@@ -259,14 +254,6 @@ export type ActivePrompt =
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
   | { kind: 'confirm'; spec: ConfirmSpec; onConfirm: () => void }
 
-/** Which live prompt kind each gateway `*.expire` event may settle. */
-const EXPIRE_EVENT_KIND = {
-  'clarify.expire': 'clarify',
-  'sudo.expire': 'sudo',
-  'secret.expire': 'secret',
-  'vault.unlock.expire': 'vaultUnlock'
-} as const satisfies Record<string, ActivePrompt['kind']>
-
 export type PromptSettlement =
   | 'accepted'
   | 'cancelled'
@@ -274,6 +261,11 @@ export type PromptSettlement =
   | 'obsolete'
   | 'dismissed-unconfirmed'
   | 'terminal-unconfirmed'
+
+/** `request.cancel` reason → how the withdrawn prompt settles: `resolved` means another
+ *  surface answered it; every other reason (timeout, interrupted, shutdown, session_closed,
+ *  free-form) means the request ended unanswered. */
+const CANCEL_SETTLEMENT: Readonly<Record<string, PromptSettlement>> = { resolved: 'obsolete' }
 
 const PROMPT_LABEL: Record<ActivePrompt['kind'], string> = {
   approval: 'approval',
@@ -1271,31 +1263,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     statusBarFields: null
   })
 
-  // Every blocking-prompt replacement advances this revision. Async pending
-  // snapshots and RPC settlements must present the revision they captured,
-  // so an older continuation cannot mutate a newer prompt with the same kind.
-  let promptRevision = 0
-
-  function approvalPrompt(
-    payload: ApprovalRequestPayload,
-    sessionId: string
-  ): Extract<ActivePrompt, { kind: 'approval' }> {
-    return {
-      kind: 'approval',
-      allowPermanent: approvalPolicy({
-        ...(payload.allow_permanent === undefined ? {} : { allowPermanent: payload.allow_permanent }),
-        ...(payload.choices === undefined ? {} : { choices: payload.choices }),
-        ...(payload.smart_denied === undefined ? {} : { smartDenied: payload.smart_denied })
-      }),
-      command: payload.command,
-      description: payload.description,
-      requestId: payload.request_id,
-      sessionId
-    }
-  }
-
   function replacePrompt(next: ActivePrompt): void {
-    promptRevision += 1
     setState('prompt', next)
   }
 
@@ -2194,7 +2162,6 @@ export function createSessionStore(options?: SessionStoreOptions) {
     const pendingQueue = switchQueueOwner(sessionId, info.profileName)
     const capped = snapshot.length > MESSAGE_CAP ? snapshot.slice(-MESSAGE_CAP) : snapshot
     const latestTodos = todoSnapshotFromState(rawTodoState)
-    promptRevision += 1
 
     setState(
       produce(draft => {
@@ -2765,10 +2732,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
       lastStatusNote = ''
       setState('status', undefined)
       setState('compacting', false)
-      if (state.prompt !== undefined) {
-        promptRevision += 1
-        setState('prompt', undefined)
-      }
+      if (state.prompt !== undefined) setState('prompt', undefined)
       setState(
         'messages',
         produce(messages => {
@@ -2943,8 +2907,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
       case 'message.complete': {
         settlePendingSteers(event.payload?.client_submission_ids)
         // Backstop for the clarify tool.complete flush above: a turn can settle
-        // with the timed-out batch prompt still open (no clarify.expire event
-        // exists on this wire) — persist the partials before the turn closes.
+        // with the timed-out batch prompt still open (before its request.cancel
+        // arrives) — persist the partials before the turn closes.
         flushAbandonedClarify('timed out')
         // Terminal error frame (upstream 57b351d3689/b8675a18990): the
         // structured status/error/partial fields drive the failure state —
@@ -3468,78 +3432,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
         if (name === 'clarify') flushAbandonedClarify('timed out')
         break
       }
-      // ── blocking prompts (spec §8 #6 — unhandled = the agent deadlocks) ──
-      case 'clarify.request': {
-        // Batch (multi-question) clarify: malformed entries (blank qid/question)
-        // are filtered; when none survive, the single-question payload fields
-        // stay authoritative (backward compatibility with the plain shape).
-        const batch = normalizeClarifyQuestions(event.payload.questions)
-        replacePrompt(
-          batch.length
-            ? {
-                kind: 'clarify',
-                question: '',
-                choices: null,
-                requestId: event.payload.request_id,
-                questions: batch,
-                // Locked answers replayed on reconnect (qid → answer) — seed the
-                // per-question ✓ state instead of presenting all as unanswered.
-                answers: { ...(event.payload.answers ?? {}) }
-              }
-            : {
-                kind: 'clarify',
-                question: event.payload.question ?? '',
-                // decoded choices are readonly — copy to the store's mutable string[]
-                choices: event.payload.choices ? [...event.payload.choices] : null,
-                requestId: event.payload.request_id
-              }
-        )
-        break
-      }
-      case 'approval.request':
-        replacePrompt(approvalPrompt(event.payload, event.session_id))
-        break
-      case 'approval.resolved':
-        if (
-          state.sessionId === event.session_id &&
-          state.prompt?.kind === 'approval' &&
-          state.prompt.sessionId === event.session_id &&
-          state.prompt.requestId === event.payload.request_id
-        ) {
-          settlePrompt(state.prompt, event.payload.status === 'resolved' ? 'accepted' : event.payload.status)
+      // ── blocking prompts: opened by server requests (serverRequests.ts) ──
+      case 'request.cancel':
+        // The backend withdrew the request: close only the prompt it opened.
+        if (state.prompt && 'requestId' in state.prompt && state.prompt.requestId === event.payload.id) {
+          settlePrompt(state.prompt, CANCEL_SETTLEMENT[event.payload.reason] ?? 'expired')
         }
-        break
-      case 'sudo.request':
-        replacePrompt({ kind: 'sudo', requestId: event.payload.request_id })
-        break
-      case 'secret.request':
-        replacePrompt({
-          kind: 'secret',
-          envVar: event.payload.env_var,
-          prompt: event.payload.prompt,
-          requestId: event.payload.request_id
-        })
-        break
-      case 'clarify.expire':
-      case 'sudo.expire':
-      case 'secret.expire':
-      case 'vault.unlock.expire': {
-        // An expiry settles only the live prompt of its own kind and request id;
-        // a stale or foreign expiry is a no-op (approval.resolved stays separate:
-        // it also carries a session guard and a resolved/expired status mapping).
-        const kind = EXPIRE_EVENT_KIND[event.type]
-        if (state.prompt?.kind === kind && state.prompt.requestId === event.payload.request_id) {
-          settlePrompt(state.prompt, 'expired')
-        }
-        break
-      }
-      case 'vault.unlock.request':
-        replacePrompt({
-          kind: 'vaultUnlock',
-          backend: event.payload.backend,
-          displayName: event.payload.display_name,
-          requestId: event.payload.request_id
-        })
         break
       // ── subagents (agents dashboard) — track the delegation tree by id ──
       case 'subagent.spawn_requested':
@@ -3745,7 +3643,6 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function clearPrompt(expected?: ActivePrompt): boolean {
     if (expected !== undefined && state.prompt !== expected) return false
     if (state.prompt === undefined) return false
-    promptRevision += 1
     setState('prompt', undefined)
     return true
   }
@@ -3767,41 +3664,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return clearPrompt(expected)
   }
 
-  function getPromptRevision(): number {
-    return promptRevision
-  }
-
-  function getPromptRequestId(): string | undefined {
-    const prompt = state.prompt
-    return prompt && 'requestId' in prompt ? prompt.requestId : undefined
-  }
-
-  /**
-   * Apply one authoritative approval.pending FIFO snapshot only if the active
-   * session and prompt generation still match the request that fetched it.
-   */
-  function reconcilePendingApprovals(
-    sessionId: string,
-    expectedRevision: number,
-    expectedRequestId: string | undefined,
-    approvals: readonly ApprovalRequestPayload[]
-  ): boolean {
-    if (state.sessionId !== sessionId || promptRevision !== expectedRevision) return false
-    const current = state.prompt
-    if (getPromptRequestId() !== expectedRequestId) return false
-    if (current !== undefined && current.kind !== 'approval') return false
-    const pending = approvals[0]
-    if (!pending) return current?.kind === 'approval' ? settlePrompt(current, 'obsolete') : true
-    if (!pending.request_id.trim()) return false
-    if (current?.kind === 'approval' && current.requestId === pending.request_id && current.sessionId === sessionId) {
-      return true
-    }
-    replacePrompt(approvalPrompt(pending, sessionId))
-    return true
-  }
-
   /** Lock one batch-clarify answer locally (call AFTER its per-question
-   *  `clarify.respond {question_id}` was acknowledged, so the local answers map
+   *  `clarify.lock {question_id}` was acknowledged, so the local answers map
    *  mirrors the gateway's accumulator exactly). Returns how many questions
    *  remain unlocked — 0 means the batch is complete and the prompt can close. */
   function recordClarifyAnswer(qid: string, answer: string): number {
@@ -4261,9 +4125,6 @@ export function createSessionStore(options?: SessionStoreOptions) {
     settlePrompt,
     /** Open a prompt from a backend→client request (boundary/gateway/serverRequests.ts). */
     openPrompt: replacePrompt,
-    getPromptRevision,
-    getPromptRequestId,
-    reconcilePendingApprovals,
     recordClarifyAnswer,
     flushAbandonedClarify,
     setComposerDraft,

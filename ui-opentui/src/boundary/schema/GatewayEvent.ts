@@ -14,7 +14,6 @@
  */
 import { Schema } from 'effect'
 
-import { ApprovalRequestPayloadSchema } from '../promptResponses.ts'
 import { SpawnTreeSubagentSchema } from './Delegation.ts'
 import { TodoStateSchema } from './TodoState.ts'
 
@@ -229,74 +228,13 @@ const TodoUpdated = Schema.Struct({
   payload: TodoStateSchema
 })
 
-// blocking prompts (deadlock-critical — Phase 3 renders these)
-// Batch clarify (multi-question): every entry field is optional at the
-// boundary — malformed entries (blank qid/question) are FILTERED by the store
-// (logic/clarifyBatch.ts), never allowed to fail the whole event decode (a
-// dropped clarify.request deadlocks the agent).
-const ClarifyBatchQuestionWire = Schema.Struct({
-  choices: opt(Schema.NullOr(Schema.Array(Str))),
-  multi_select: opt(Schema.Boolean),
-  qid: opt(Str),
-  question: opt(Str)
-})
-const ClarifyRequest = Schema.Struct({
-  type: Schema.Literal('clarify.request'),
+// The backend withdrew an open server→client request (timeout, interrupt,
+// resolved elsewhere, session closed): close the prompt whose requestId == id.
+// Payload per tui_gateway/contracts/server_requests.py RequestCancelPayload.
+const RequestCancel = Schema.Struct({
+  type: Schema.Literal('request.cancel'),
   session_id: opt(Str),
-  payload: Schema.Struct({
-    // Answers already locked server-side (qid → answer) — present only on the
-    // reconnect-replay snapshot of a partially answered batch.
-    answers: opt(Schema.Record(Str, Str)),
-    choices: opt(Schema.NullOr(Schema.Array(Str))),
-    question: opt(Str),
-    questions: opt(Schema.Array(ClarifyBatchQuestionWire)),
-    request_id: Str
-  })
-})
-export type ClarifyBatchQuestionWireDecoded = typeof ClarifyBatchQuestionWire.Type
-const ApprovalRequest = Schema.Struct({
-  type: Schema.Literal('approval.request'),
-  session_id: Schema.NonEmptyString,
-  payload: ApprovalRequestPayloadSchema
-})
-const ApprovalResolved = Schema.Struct({
-  type: Schema.Literal('approval.resolved'),
-  session_id: Schema.NonEmptyString,
-  payload: Schema.Struct({
-    // The envelope `session_id` routes the event; the payload carries only
-    // request_id + status (tui_gateway/server.py _emit_approval_lifecycle).
-    request_id: Schema.NonEmptyString,
-    status: Schema.Literals(['resolved', 'expired', 'cancelled'])
-  })
-})
-const SudoRequest = Schema.Struct({
-  type: Schema.Literal('sudo.request'),
-  session_id: opt(Str),
-  payload: Schema.Struct({ request_id: Str })
-})
-const SecretRequest = Schema.Struct({
-  type: Schema.Literal('secret.request'),
-  session_id: opt(Str),
-  payload: Schema.Struct({ env_var: Str, prompt: Str, request_id: Str })
-})
-const SensitivePromptExpiryShape = {
-  session_id: opt(Str),
-  payload: Schema.Struct({ request_id: Str })
-}
-const SudoExpire = Schema.Struct({ type: Schema.Literal('sudo.expire'), ...SensitivePromptExpiryShape })
-const SecretExpire = Schema.Struct({ type: Schema.Literal('secret.expire'), ...SensitivePromptExpiryShape })
-// External password-manager unlock (1Password / Bitwarden): the agent needs the
-// manager's master password for this session; answered by vault.unlock.respond.
-const VaultUnlockRequest = Schema.Struct({
-  type: Schema.Literal('vault.unlock.request'),
-  session_id: opt(Str),
-  payload: Schema.Struct({ backend: Str, display_name: Str, request_id: Str })
-})
-const VaultUnlockExpire = Schema.Struct({ type: Schema.Literal('vault.unlock.expire'), ...SensitivePromptExpiryShape })
-const ClarifyExpire = Schema.Struct({
-  type: Schema.Literal('clarify.expire'),
-  session_id: opt(Str),
-  payload: Schema.Struct({ request_id: Schema.NonEmptyString })
+  payload: Schema.Struct({ id: Str, method: Str, reason: Str })
 })
 
 // chrome / agent
@@ -474,16 +412,7 @@ const SessionTurnEvents = Schema.Union([
   ToolProgress,
   ToolGenerating,
   TodoUpdated,
-  ClarifyRequest,
-  ClarifyExpire,
-  ApprovalRequest,
-  ApprovalResolved,
-  SudoRequest,
-  SecretRequest,
-  SudoExpire,
-  SecretExpire,
-  VaultUnlockRequest,
-  VaultUnlockExpire
+  RequestCancel
 ])
 const ChromeTransportEvents = Schema.Union([
   StatusUpdate,
