@@ -219,6 +219,21 @@ def test_main_check_still_uses_branch_without_release_requests(releases, capsys)
     assert releases.requests == []
 
 
+def test_main_check_compares_the_checkout_branch_update_follows(releases, capsys):
+    # Fork invariant: on the main channel, --check reports on the same branch
+    # `hermes update` follows (the checkout's own), not origin/main.
+    git(releases.origin, "checkout", "-b", "sid/opentui")
+    (releases.origin / "fork.txt").write_text("fork", encoding="utf-8")
+    git(releases.origin, "add", ".")
+    git(releases.origin, "commit", "-m", "fork")
+    git(releases.origin, "checkout", "main")
+    set_install_channel("main", releases.root)
+    update_cmd._cmd_update_check(branch="sid/opentui")
+    out = capsys.readouterr().out
+    assert "behind origin/sid/opentui" in out
+    assert "origin/main" not in out
+
+
 @pytest.mark.parametrize("channel", ["stable", "canary"])
 def test_origin_tag_cannot_substitute_a_fork_commit(releases, channel):
     git(releases.origin, "tag", "-f", releases.tags[channel], releases.commits[3])

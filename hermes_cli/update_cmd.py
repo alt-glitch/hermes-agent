@@ -600,9 +600,13 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
 
     selected_channel = _source_update_channel(channel=channel, branch_explicit=branch_explicit)
     if not branch_explicit:
-        branch = _check.channel_compare_branch(selected_channel, git_cmd, root)
-        if branch is None:
+        channel_branch = _check.channel_compare_branch(selected_channel, git_cmd, root)
+        if channel_branch is None:
             return
+        # Fork: the unpinned main source branch keeps the caller's checkout branch
+        # (e.g. sid/opentui), the same branch ``hermes update`` follows.
+        if channel_branch != "main":
+            branch = channel_branch
 
     # Installer checkouts are shallow (`git clone --depth 1`). A plain fetch would unshallow
     # the repo (the exact cost the shallow clone avoided) and rev-list would then report a
