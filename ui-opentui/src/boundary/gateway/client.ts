@@ -26,6 +26,7 @@ import { getHeapStatistics } from 'node:v8'
 
 import type { Log } from '../log.ts'
 import { resolvePython, resolveSrcRoot } from './python.ts'
+import type { RpcMethod, RpcParams, RpcResult } from './rpc.ts'
 
 interface Pending {
   resolve: (result: unknown) => void
@@ -901,8 +902,18 @@ export class RawGatewayClient {
     this.pushTransportLog(`[protocol] unroutable frame: ${line.slice(0, 120)}`)
   }
 
-  /** Send a JSON-RPC request; resolves with `result` (long handlers reply async). */
-  request<A = unknown>(method: string, params: unknown): Promise<A> {
+  /**
+   * Send a JSON-RPC request typed against the generated contract: `params`
+   * must match the method's declared Params model and the promise carries its
+   * declared Result type. The wire result is not validated here; decoders in
+   * boundary/schema remain the runtime check.
+   */
+  request<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
+    return this.send<RpcResult<M>>(method, params)
+  }
+
+  /** Untyped JSON-RPC send; resolves with `result` (long handlers reply async). */
+  private send<A>(method: string, params: unknown): Promise<A> {
     const requestedAttachUrl = resolveGatewayAttachUrl()
     if (requestedAttachUrl) {
       if (requestedAttachUrl !== this.attachUrl) {

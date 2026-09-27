@@ -18,6 +18,7 @@ import { performance } from 'node:perf_hooks'
 
 import { GatewayService, type GatewayTransport } from '../src/boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../src/boundary/gateway/liveGateway.ts'
+import type { RpcMethod, RpcParams, RpcResult } from '../src/boundary/gateway/rpc.ts'
 
 const READY_TIMEOUT_MS = 20_000
 
@@ -28,15 +29,15 @@ interface Stage<A> {
   readonly value: A
 }
 
-function timedRequest<A>(
+function timedRequest<M extends RpcMethod>(
   gateway: GatewayTransport,
-  method: string,
-  params: unknown,
+  method: M,
+  params: RpcParams<M>,
   origin: number
-): Effect.Effect<Stage<A>, unknown> {
+): Effect.Effect<Stage<RpcResult<M>>, unknown> {
   return Effect.gen(function* () {
     const startMs = performance.now() - origin
-    const value = yield* gateway.request<A>(method, params)
+    const value = yield* gateway.request(method, params)
     return { endMs: performance.now() - origin, method, startMs, value }
   })
 }
@@ -70,10 +71,7 @@ async function main(): Promise<void> {
       catch: cause => cause
     })
 
-    const session = yield* timedRequest<{
-      readonly session_id: string
-      readonly stored_session_id?: string
-    }>(gateway, 'session.create', { cols: 120, cwd: process.env.HERMES_CWD }, origin)
+    const session = yield* timedRequest(gateway, 'session.create', { cols: 120, cwd: process.env.HERMES_CWD }, origin)
     const sid = session.value.session_id
     let modelOptionsEndMs: number | undefined
     const modelOptionsStartMs = performance.now() - origin
@@ -86,9 +84,9 @@ async function main(): Promise<void> {
       })
 
     const requests = {
-      catalog: timedRequest<unknown>(gateway, 'startup.catalog', { session_id: sid }, origin),
-      commands: timedRequest<unknown>(gateway, 'commands.catalog', {}, origin),
-      config: timedRequest<unknown>(gateway, 'config.get', { key: 'full' }, origin)
+      catalog: timedRequest(gateway, 'startup.catalog', { session_id: sid }, origin),
+      commands: timedRequest(gateway, 'commands.catalog', {}, origin),
+      config: timedRequest(gateway, 'config.get', { key: 'full' }, origin)
     }
     const stages =
       mode === 'parallel'

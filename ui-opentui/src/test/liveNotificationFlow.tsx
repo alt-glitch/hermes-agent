@@ -389,9 +389,7 @@ async function submit(
   queued = false
 ): Promise<JsonRecord> {
   store.pushUser(text)
-  const response = await runtime.runPromise(
-    gateway.request<unknown>('prompt.submit', { queued, session_id: sessionId, text })
-  )
+  const response = await runtime.runPromise(gateway.request('prompt.submit', { queued, session_id: sessionId, text }))
   return asRecord(response) ?? {}
 }
 
@@ -591,9 +589,7 @@ async function main(): Promise<void> {
     const queued = await submit(runtime, gateway, liveStore, liveSessionId, QUEUED_INPUT, true)
     assert.equal(queued.status, 'queued')
     const killed = asRecord(
-      await runtime.runPromise(
-        gateway.request<unknown>('process.kill', { process_id: cancelId, session_id: liveSessionId })
-      )
+      await runtime.runPromise(gateway.request('process.kill', { process_id: cancelId, session_id: liveSessionId }))
     )
     assert(killed && (killed.status === 'killed' || killed.status === 'already_exited'))
     assert.equal(killed.completion_reason, 'killed')
@@ -609,7 +605,7 @@ async function main(): Promise<void> {
       )
     } catch (error) {
       const processList = await runtime
-        .runPromise(gateway.request<unknown>('process.list', { session_id: liveSessionId }))
+        .runPromise(gateway.request('process.list', { session_id: liveSessionId }))
         .catch(listError => ({ listError: String(listError) }))
       console.error(
         'completion diagnostics:',

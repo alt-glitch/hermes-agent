@@ -44,6 +44,7 @@ import { isWakeUserDisabled, setWakeUserDisabled } from '../logic/wake.ts'
 import type { ConfirmRequest, Message, PickerItem } from '../logic/store.ts'
 import type { BillingOverlayState, BillingStateResponse, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { SessionCompressResponse } from '../boundary/compression.ts'
+import { scriptedRpc } from './lib/scriptedRpc.ts'
 
 // the picker-refresh/tabs/prefetch seams are module-level state — never leak them across tests
 afterEach(() => {
@@ -752,10 +753,10 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     redraw: () => {
       redraws.value += 1
     },
-    request: (method, params) => {
+    request: scriptedRpc((method, params) => {
       calls.push({ method, params })
       return request(method, params)
-    },
+    }),
     sessionId: () => session.value,
     sessionOwnerId: () => session.value,
     submit: text => {

@@ -22,7 +22,10 @@
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
-    "isolatedModules": true
+    "isolatedModules": true,
+    "paths": {
+      "@hermes/gateway-contract": ["../apps/shared/src/gateway-contract.generated.ts"]
+    }
   },
   "include": ["src", "scripts"],
   "exclude": ["node_modules"]

@@ -8,6 +8,7 @@
  * routes keys. The poll cadence (2s interval, 5-minute cap) and error→copy map
  * match the Ink TUI and the classic CLI for parity.
  */
+import type { RpcRequest } from '../boundary/gateway/rpc.ts'
 import type {
   AmountValidation,
   BillingChargeResponse,
@@ -26,7 +27,7 @@ const POLL_CAP_MS = 5 * 60 * 1000
 
 /** The host capabilities the billing flow needs (a subset of SlashContext). */
 export interface BillingHost {
-  request: (method: string, params: Record<string, unknown>) => Promise<unknown>
+  request: RpcRequest
   pushSystem: (text: string) => void
   confirm: (request: ConfirmRequest, onConfirm: () => void) => void
   sessionId: () => string | undefined
