@@ -54,7 +54,11 @@ jobs:
               continue  # GitHub id+login noreply emails auto-resolve
             fi
 
-            if [ -f "contributors/emails/${email}" ]; then
+            # Fold case: emails differing only in case are one file on
+            # macOS/Windows, so add_contributor.py refuses case variants and
+            # git author emails for one person vary in case.
+            if [ -f "contributors/emails/${email}" ] \
+               || ls contributors/emails | grep -qixF -- "$email"; then
               continue  # mapped via the contributors directory
             fi
 
