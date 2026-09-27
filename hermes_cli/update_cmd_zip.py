@@ -383,6 +383,10 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False,
     # The static archive would silently ignore --branch — the exact silent-divergence bug it exists to
     # prevent. Refuse rather than lie.
     branch = _m()._resolve_update_branch(args)
+    # Fork: without --branch the resolver follows the checkout's own branch. A pinned
+    # commit archive does not depend on it, so only an explicit or unpinned branch is refused.
+    if branch != "main" and target_sha is not None and not (getattr(args, "branch", None) or "").strip():
+        branch = "main"
     if branch != "main":
         print(f"✗ --branch={branch} is not supported on the Windows ZIP-fallback update path.")
         print(
