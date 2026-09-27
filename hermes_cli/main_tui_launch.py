@@ -445,6 +445,13 @@ def _node26_bin_or_none() -> str | None:
     path = shutil.which("node")
     if path:
         candidates.append(path)
+    # PM's installed Node (a fresh install puts it in the tool store, which is
+    # not on PATH). Read-only: find_node_executable never provisions.
+    from hermes_constants import find_node_executable
+
+    managed = find_node_executable("node")
+    if managed and managed not in candidates:
+        candidates.append(managed)
     candidates.extend(_fnm_node26_candidates())
     for cand in candidates:
         ver = _node_version_tuple(cand)

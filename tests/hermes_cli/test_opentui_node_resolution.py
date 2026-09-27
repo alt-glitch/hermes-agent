@@ -67,3 +67,40 @@ class TestFnmNode26Discovery:
         monkeypatch.setenv("HERMES_NODE", str(explicit))
         monkeypatch.setattr(main_mod.shutil, "which", lambda _b: None)
         assert main_mod._node26_bin_or_none() == str(explicit)
+
+
+class TestPmManagedNode26:
+    def test_engine_is_opentui_with_only_pm_managed_node26(self, tmp_path, monkeypatch):
+        """A fresh install's Node 26 lives in PM's tool store, off PATH; the
+        default engine must still resolve to OpenTUI."""
+        import types
+
+        import pm
+
+        managed = tmp_path / "tools" / "node-26.7.0-linux-x64" / "bin" / "node"
+        _fake_node(managed, "v26.7.0")
+        empty_bin = tmp_path / "empty-bin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.delenv("HERMES_NODE", raising=False)
+        monkeypatch.delenv("HERMES_TUI_ENGINE", raising=False)
+        monkeypatch.setenv("FNM_DIR", str(tmp_path / "no-fnm"))
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "no-xdg"))
+        monkeypatch.setattr(main_mod.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+        monkeypatch.setattr(
+            pm, "installed_package",
+            lambda name, **_kw: types.SimpleNamespace(binary=managed) if name == "node" else None,
+        )
+        # Everything past node discovery is a built, current packaged runtime.
+        monkeypatch.setattr(main_mod, "_config_tui_engine_early", lambda: None)
+        monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: False)
+        monkeypatch.setattr(main_mod, "_opentui_runtime_location",
+                            lambda **_kw: types.SimpleNamespace(seed_dir=tmp_path, runtime_dir=tmp_path))
+        monkeypatch.setattr(main_mod, "_opentui_node_identity",
+                            lambda node, **_kw: "identity" if node == str(managed) else None)
+        rt = main_mod._opentui_runtime
+        monkeypatch.setattr(rt, "packaged_prebuilt_runtime_current", lambda *_a: True)
+        monkeypatch.setattr(rt, "bundle_payload_present", lambda *_a: True)
+        monkeypatch.setattr(rt, "runtime_payload_present", lambda *_a: True)
+
+        assert main_mod._resolve_tui_engine() == "opentui"
