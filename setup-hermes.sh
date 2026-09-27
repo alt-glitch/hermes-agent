@@ -10,8 +10,6 @@
 #      PM owns the final interpreter, tool store, and dependency generation.
 #   3. Point you at `source ./activate` — the venv-style way to put the pm
 #      env (PATH + tool vars) into your current shell.
-#   4. (fork) Publish the hermes commands; on POSIX the user-facing `hermes`
-#      is the worktree-aware launcher from scripts/write-hermes-launcher.sh.
 # There is no pip fallback tier here on purpose.
 # ============================================================================
 
@@ -209,7 +207,7 @@ else
 fi
 
 # ============================================================================
-# Publish user-facing launchers (fork: `hermes` is the worktree-aware launcher)
+# Publish user-facing launchers
 # ============================================================================
 
 echo -e "${CYAN}→${NC} Setting up hermes command..."
@@ -219,36 +217,11 @@ bin_dir="$HOME/.local/bin"
 if [ "$os" = win32 ]; then
     bin_dir="$(cygpath -am "${HERMES_HOME:-${LOCALAPPDATA:-$HOME/AppData/Local}/hermes}/bin")"
 fi
-# Fork: the worktree-aware launcher generator (POSIX shells only).
-launcher_generator="$SCRIPT_DIR/scripts/write-hermes-launcher.sh"
-worktree_launcher=false
-if [ "$os" != win32 ] && [ -f "$launcher_generator" ]; then
-    worktree_launcher=true
-fi
-# A worktree-aware launcher from an earlier run (every generator version
-# writes a `managed_cli=` line) is not one of the shared writer's own
-# conveniences, so it would refuse to publish over it and report failure. Set
-# it aside first; the generator rewrites it below and its sibling trust file
-# (hermes.trusted-roots) persists.
-if [ "$worktree_launcher" = true ] && [ -f "$bin_dir/hermes" ] && [ ! -L "$bin_dir/hermes" ] \
-    && grep -q '^managed_cli=' "$bin_dir/hermes"; then
-    rm -f "$bin_dir/hermes"
-fi
 if ! "$boot_py" -I -X utf8 hermes_cli/_launchers.py "$bin_dir"; then
     echo -e "${RED}✗${NC} launcher publication failed" >&2
     exit 1
 fi
 echo -e "${GREEN}✓${NC} Published Hermes commands in $bin_dir"
-# Replace the plain forwarder with the worktree-aware launcher: outside a
-# trusted Hermes checkout it executes this checkout's published launcher;
-# inside one (or a linked worktree sharing its git dir) it runs that checkout's
-# source. This checkout is trusted explicitly. The generator writes atomically
-# and never follows a legacy symlink (the #21454 symlink-stomp fix).
-if [ "$worktree_launcher" = true ]; then
-    bash "$launcher_generator" \
-        "$bin_dir/hermes" "$SCRIPT_DIR/.hermes/bin/hermes" "$SCRIPT_DIR"
-    echo -e "${GREEN}✓${NC} Installed worktree-aware hermes launcher → $bin_dir/hermes"
-fi
 
 if [ "$os" != win32 ]; then
     # Determine the appropriate shell config file

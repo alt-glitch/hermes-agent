@@ -331,6 +331,9 @@ def _owns_launcher(target: Path, root: Path) -> bool:
     )}
     # Current store launchers pass this Python bootstrap as one shell argument.
     bootstrap = f"sys.path.insert(0, {str(root)!r})"
+    # Fork: the retired worktree-aware launcher (scripts/write-hermes-launcher.sh)
+    # bound this install's entrypoint with a `managed_cli=` assignment.
+    paths |= {f"managed_cli={root / p}" for p in ("venv/bin/hermes", ".hermes/bin/hermes")}
     if paths.intersection(tokens) or any(bootstrap in token for token in tokens):
         return True
     # The historical updater wrote ACP as a sibling-hermes forwarder. Adopt

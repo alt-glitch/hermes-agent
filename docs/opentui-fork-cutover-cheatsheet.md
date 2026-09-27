@@ -31,17 +31,16 @@ one-time machine-specific cutover — not needed for a fresh install.
 # B. glitch's cutover cheat-sheet — replace the existing dual install with `sid/opentui`
 
 Copy-paste. Reversible. Live setup is **untouched** until you run these.
-Originally generated 2026-06-16 and updated 2026-07-17 for the
-worktree-aware launcher. **Model: B — replace the
+Originally generated 2026-06-16; the worktree-aware launcher it once
+installed is retired. **Model: B — replace the
 canonical install at `~/.hermes/hermes-agent` with the fork's `sid/opentui`.**
 
 ## Your actual topology (read this — it's interconnected)
 - **Canonical install:** `~/.hermes/hermes-agent` — a **git checkout** of
   NousResearch on `main`, **venv at `~/.hermes/hermes-agent/venv`**. The **gateway
   runs from here** (`ExecStart=…/.hermes/hermes-agent/venv/bin/python …`).
-- **Your `hermes` command:** `~/.local/bin/hermes` is a worktree-aware launcher.
-  It uses the managed install outside a Hermes checkout and the current source
-  tree inside one. (There may also be `/usr/local/bin/hermes` lower on PATH.)
+- **Your `hermes` command:** `~/.local/bin/hermes` is a plain launcher that
+  always runs the managed install. (There may also be `/usr/local/bin/hermes` lower on PATH.)
 - **Fork:** `/home/daimon/side-quests/hermes-agent` on `sid/opentui`
   (`origin`=alt-glitch, `upstream`=NousResearch).
 - **Data/config/state:** `~/.hermes` (auth, sessions, skills, cron) — **never moves.**
@@ -98,22 +97,13 @@ unset NODE_ENV
 ls -la ui-opentui/dist/main.js                            # confirm built
 ```
 
-## STEP 4 — Install the worktree-aware `hermes` launcher
-Do not repoint a global symlink each time you change checkouts. Generate the
-launcher through the same path as `install.sh`:
+## STEP 4 — Publish the `hermes` launcher
+`install.sh` and `hermes update` publish `~/.local/bin/hermes` as a plain
+launcher for the managed install; it runs the same code from any directory. To
+run a checkout's own code, call its launcher explicitly:
 ```bash
-bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
-  ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes \
-  /home/daimon/side-quests/hermes-agent /home/daimon/github/hermes-agent
-hash -r
-```
-Outside an explicitly trusted Hermes checkout this runs the managed fork. Inside
-the registered fork/upstream clones or any of their linked worktrees it imports
-that exact tree (including its Python gateway and terminal UI source — OpenTUI in
-the fork, Ink upstream) while reusing the nearest available venv. Verify with:
-```bash
-cd ~/.hermes/hermes-agent && hermes --version
-cd /path/to/a/hermes-worktree && hermes --version
+hermes --version                                   # managed install
+/path/to/a/hermes-worktree/.venv/bin/hermes --version
 ```
 `~/.local/bin/hermes` is intentionally a regular script, not a symlink. If
 `/usr/local/bin/hermes` shadows it, ensure `~/.local/bin` is earlier on PATH.
@@ -142,8 +132,7 @@ hermes update                         # follows the managed checkout's current b
 # explicit equivalent:
 hermes update --branch sid/opentui
 ```
-The update rebuilds the managed runtime. The worktree-aware launcher remains in
-place and automatically selects source when you enter another Hermes checkout.
+The update rebuilds the managed runtime and republishes the plain launcher.
 The maintainer cron keeps `fork/sid/opentui` fresh 2×/day + rebuilds `dist/`.
 
 ---
@@ -166,9 +155,7 @@ overrides for scripted installs.
 
 ## ROLLBACK (back to stock main install)
 ```bash
-cd ~/.hermes/hermes-agent && git checkout main && ~/.local/bin/uv sync
-bash ~/.hermes/hermes-agent/scripts/write-hermes-launcher.sh \
-  ~/.local/bin/hermes ~/.hermes/hermes-agent/venv/bin/hermes
+cd ~/.hermes/hermes-agent && git checkout main && hermes update
 cp ~/.config/systemd/user/hermes-gateway.service.bak-* ~/.config/systemd/user/hermes-gateway.service
 systemctl --user daemon-reload && systemctl --user restart hermes-gateway.service
 fnm default 25.9.0    # only if you want the old node default back
