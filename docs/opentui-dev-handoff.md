@@ -14,7 +14,7 @@ assumes NO prior transcript/memory.
   default, untouched by this campaign). The Python gateway is `tui_gateway/`, launcher
   `hermes_cli/main.py`.
 - **The global `hermes` never runs a worktree.** `~/.local/bin/hermes` is a plain launcher for the
-  managed install, from any directory. Run a worktree's code with `<worktree>/.venv/bin/hermes`;
+  managed install, from any directory. Run a worktree's code with `<worktree>/.hermes/bin/hermes`;
   after source changes, rebuild `dist/main.js` first.
 - Backups of pre-merge branch states exist as `backup/*` refs (recoverable via `git reset`).
 

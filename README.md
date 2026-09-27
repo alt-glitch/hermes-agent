@@ -54,8 +54,8 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 > **`hermes` command:** the installer writes a plain launcher at
 > `~/.local/bin/hermes` (or the platform command directory) that always runs
 > the managed install, whatever directory you are in. To run a checkout's own
-> code, call that checkout's launcher explicitly, e.g.
-> `<checkout>/.venv/bin/hermes`.
+> code, call that checkout's own launcher, `<checkout>/.hermes/bin/hermes`
+> (published by `./setup-hermes.sh`), or `source ./activate` in it.
 >
 > Everything below is the **upstream** install (NousResearch/main — the Ink TUI).
 
@@ -253,7 +253,8 @@ for activation, daily use, dependency changes, and leaving the environment.
 
 The installed `~/.local/bin/hermes` launcher always runs the managed
 installation, from any directory. To run a development checkout's code, call
-its own launcher explicitly (`<checkout>/.venv/bin/hermes`).
+its own launcher explicitly (`<checkout>/.hermes/bin/hermes`, published by
+`./setup-hermes.sh`).
 
 ---
 

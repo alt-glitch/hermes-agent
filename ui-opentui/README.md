@@ -60,10 +60,11 @@ hermes --tui --dev --yolo -w
 ```
 
 The installed `~/.local/bin/hermes` always runs the managed install, from any
-directory. To run this checkout's code, call its own launcher explicitly:
+directory. To run this checkout's code, call the launcher `./setup-hermes.sh`
+publishes inside it (or `source ./activate` first):
 
 ```bash
-./.venv/bin/hermes --tui --dev --yolo -w
+./.hermes/bin/hermes --tui --dev --yolo -w
 ```
 
 `-w` separately creates an isolated worktree for the _project workspace_; it

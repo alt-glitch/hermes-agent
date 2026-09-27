@@ -99,11 +99,15 @@ ls -la ui-opentui/dist/main.js                            # confirm built
 
 ## STEP 4 — Publish the `hermes` launcher
 `install.sh` and `hermes update` publish `~/.local/bin/hermes` as a plain
-launcher for the managed install; it runs the same code from any directory. To
-run a checkout's own code, call its launcher explicitly:
+launcher for the managed install; it runs the same code from any directory. An
+older worktree-aware launcher there is replaced by this publication. Run it
+through the managed install's own launcher, so an old `~/.local/bin/hermes`
+is not involved:
 ```bash
+~/.hermes/hermes-agent/.hermes/bin/hermes update   # republishes ~/.local/bin/hermes
+hash -r
 hermes --version                                   # managed install
-/path/to/a/hermes-worktree/.venv/bin/hermes --version
+/path/to/a/hermes-worktree/.hermes/bin/hermes --version
 ```
 `~/.local/bin/hermes` is intentionally a regular script, not a symlink. If
 `/usr/local/bin/hermes` shadows it, ensure `~/.local/bin` is earlier on PATH.
