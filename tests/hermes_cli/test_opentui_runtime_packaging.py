@@ -16,7 +16,7 @@ import pytest
 import hermes_cli.main as main_mod
 from hermes_cli import main_tui_launch as launch
 from hermes_cli import opentui_runtime as runtime
-from hermes_cli import update_cmd_deps
+from hermes_cli import source_build
 
 
 TEST_IDENTITY = runtime.NodeIdentity(
@@ -1733,24 +1733,24 @@ class TestMainIntegration:
         assert "ci" not in calls[0]
         assert (app / "dist" / "main.js").read_text() == "updated source bundle"
 
-    def test_update_wrapper_always_includes_standalone_package(self, monkeypatch):
+    def test_update_products_always_include_standalone_package(
+        self, tmp_path, monkeypatch
+    ):
+        """The OpenTUI engine refresh runs after the shared source products."""
         calls = []
-        monkeypatch.setattr(
-            update_cmd_deps,
-            "_update_workspace_node_dependencies",
-            lambda: calls.append("workspaces") or [],
-        )
+        _write(tmp_path / "ui-opentui" / "package.json", "{}")
+        _stub_shared_update_products(monkeypatch, calls)
         monkeypatch.setattr(
             launch,
             "_update_opentui_package",
             lambda: calls.append("opentui") or launch._OpenTUIUpdateStatus.READY,
         )
 
-        assert update_cmd_deps._update_node_dependencies() == []
+        source_build.build_update_products(tmp_path, desktop=False)
 
-        assert calls == ["workspaces", "opentui"]
+        assert calls == ["deps", "tui", "web", "opentui"]
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     @pytest.mark.parametrize("missing_prerequisite", ["node", "npm"])
     def test_update_boundary_treats_missing_optional_prerequisite_as_skip(
         self, tmp_path, monkeypatch, missing_prerequisite
@@ -1761,11 +1761,6 @@ class TestMainIntegration:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(launch, "_is_termux_startup_environment", lambda: False)
-        monkeypatch.setattr(
-            update_cmd_deps,
-            "_update_workspace_node_dependencies",
-            lambda: [],
-        )
         if missing_prerequisite == "node":
             monkeypatch.setattr(launch, "_node26_bin_or_none", lambda: None)
         else:
@@ -1773,25 +1768,18 @@ class TestMainIntegration:
             monkeypatch.setattr(
                 launch._opentui_runtime, "npm_command", lambda _node: None
             )
+        stages = []
 
-        assert update_cmd_deps._update_node_dependencies() == []
+        # An explicit skip must not fail the update.
+        source_build._refresh_opentui_engine(tmp_path, stages.append)
+
+        assert stages == ["Updating the OpenTUI engine"]
         assert (app / "dist" / "main.js").read_text() == "old bundle"
 
-    @pytest.mark.linux_only
-    @pytest.mark.parametrize(
-        ("refresh_ok", "workspace_failures", "expected_failures"),
-        [
-            (True, ["ui-tui, web workspaces"], ["ui-tui, web workspaces"]),
-            (False, [], ["OpenTUI engine"]),
-        ],
-    )
-    def test_update_boundary_reports_refresh_failure_independently(
-        self,
-        tmp_path,
-        monkeypatch,
-        refresh_ok,
-        workspace_failures,
-        expected_failures,
+    @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize("refresh_ok", [True, False])
+    def test_update_boundary_reports_refresh_failure(
+        self, tmp_path, monkeypatch, refresh_ok
     ):
         app = _make_runtime(tmp_path)
         os.utime(app / "src" / "runtime" / "old.ts", (300, 300))
@@ -1805,11 +1793,6 @@ class TestMainIntegration:
             "npm_command",
             lambda _node: ["/node-26", "/npm-cli.js"],
         )
-        monkeypatch.setattr(
-            update_cmd_deps,
-            "_update_workspace_node_dependencies",
-            lambda: list(workspace_failures),
-        )
 
         def runner(command, **_kwargs):
             if refresh_ok:
@@ -1821,6 +1804,34 @@ class TestMainIntegration:
 
         monkeypatch.setattr(launch, "_run_opentui_build_command", runner)
 
-        assert update_cmd_deps._update_node_dependencies() == expected_failures
+        if refresh_ok:
+            source_build._refresh_opentui_engine(tmp_path, lambda _stage: None)
+        else:
+            # An attempted refresh that fails must not report a complete update.
+            with pytest.raises(RuntimeError, match="OpenTUI engine refresh failed"):
+                source_build._refresh_opentui_engine(tmp_path, lambda _stage: None)
         expected_bundle = "updated source bundle" if refresh_ok else "old bundle"
         assert (app / "dist" / "main.js").read_text() == expected_bundle
+
+
+def _stub_shared_update_products(monkeypatch, calls: list[str]) -> None:
+    """Record the shared (Ink/web) product steps of ``build_update_products``."""
+    import hermes_cli.main_install_repair as install_repair
+    import hermes_cli.memory_provider_migration as memory_migration
+    import hermes_cli.update_stage as update_stage
+
+    monkeypatch.setattr(install_repair, "_warn_configured_features_missing_deps", lambda: None)
+    monkeypatch.setattr(update_stage, "publish_stage", lambda _stage: None)
+    monkeypatch.setattr(memory_migration, "migrate_all_homes", lambda: None)
+    monkeypatch.setattr(source_build, "source_frontends", lambda _root: ("ui-tui", "web"))
+    monkeypatch.setattr(source_build, "source_build_env", lambda **_kwargs: {"PATH": ""})
+    monkeypatch.setattr(
+        source_build, "prepare_source_dependencies",
+        lambda *_args, **_kwargs: calls.append("deps"),
+    )
+    monkeypatch.setattr(
+        source_build, "build_source_tui", lambda *_args, **_kwargs: calls.append("tui")
+    )
+    monkeypatch.setattr(
+        source_build, "build_source_web", lambda *_args, **_kwargs: calls.append("web")
+    )

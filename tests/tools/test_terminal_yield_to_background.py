@@ -20,7 +20,7 @@ from tools import interrupt as interrupt_mod
 from tools.process_registry import process_registry
 from tools.terminal_tool import terminal_tool
 
-pytestmark = pytest.mark.linux_only
+pytestmark = pytest.mark.platforms("linux")
 
 
 def _wait_for_path(path: Path, timeout: float = 10.0) -> None:

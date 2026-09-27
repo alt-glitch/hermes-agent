@@ -19,7 +19,6 @@ import pytest
 
 from run_agent import AIAgent
 
-
 def _make_agent_openrouter():
     """Agent on openrouter (openai-compatible) with sentinel client + kwargs."""
     agent = AIAgent.__new__(AIAgent)
@@ -50,7 +49,6 @@ def _make_agent_openrouter():
 
     return agent
 
-
 def _make_agent_anthropic():
     """Agent on native anthropic with a sentinel anthropic client."""
     agent = AIAgent.__new__(AIAgent)
@@ -77,7 +75,6 @@ def _make_agent_anthropic():
     agent.runtime_capabilities = {"native_compaction": False}
 
     return agent
-
 
 def test_openai_client_rebuild_failure_rolls_back_to_original_state():
     """When OpenAI client construction fails, every mutated field must restore."""
@@ -121,7 +118,6 @@ def test_openai_client_rebuild_failure_rolls_back_to_original_state():
     assert agent._turn_base_usage_anchor is anchor
     agent._session_db.patch_session_model_config.assert_not_called()
 
-
 def test_anthropic_client_rebuild_failure_rolls_back_to_original_state():
     """When build_anthropic_client raises, every mutated field must restore."""
     agent = _make_agent_anthropic()
@@ -163,7 +159,6 @@ def test_anthropic_client_rebuild_failure_rolls_back_to_original_state():
     assert agent.api_mode == "anthropic_messages"
     assert agent.api_key == "sk-ant-original"
 
-
 def test_cross_branch_anthropic_to_openai_rebuild_failure_rolls_back():
     """Switching from anthropic_messages to chat_completions: failure must
     restore the anthropic state, not leave the agent half-converted."""
@@ -192,7 +187,6 @@ def test_cross_branch_anthropic_to_openai_rebuild_failure_rolls_back():
     assert agent.provider == "anthropic"
     assert agent.api_mode == "anthropic_messages"
     assert agent.base_url == "https://api.anthropic.com"
-
 
 def test_successful_switch_still_works_after_rollback_refactor():
     """Sanity check: the try/except wrapper hasn't broken the happy path."""
@@ -226,7 +220,6 @@ def test_successful_switch_still_works_after_rollback_refactor():
         agent.session_id,
         {"_usage_anchor": None},
     )
-
 
 def test_noop_switch_preserves_current_runtime_usage_anchor():
     """Refreshing an unchanged runtime must retain its still-compatible anchor."""

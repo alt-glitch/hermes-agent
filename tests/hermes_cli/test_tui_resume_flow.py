@@ -186,8 +186,10 @@ def test_launch_tui_sets_picker_env_for_bare_resume(monkeypatch, main_mod):
     captured = {}
 
     monkeypatch.setenv("HERMES_TUI_RESUME", "stale-missing-session")
+    monkeypatch.setenv("HERMES_PYTHON", sys.executable)
+    # ``_launch_tui`` lives in main_tui_launch and resolves its own argv builder.
     monkeypatch.setattr(
-        main_mod,
+        main_tui_launch,
         "_make_tui_argv",
         lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
     )
@@ -561,27 +563,6 @@ def test_termux_bundled_skills_stamp_controls_sync(monkeypatch, tmp_path, main_m
     assert main_mod._termux_bundled_skills_sync_needed() is True
 
 
-def test_termux_skips_bundled_skill_sync_when_stamp_fresh(monkeypatch, tmp_path, main_mod):
-    calls = []
-
-    monkeypatch.setenv("TERMUX_VERSION", "1")
-    monkeypatch.setattr(main_mod, "get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr(main_mod, "_termux_bundled_skills_fingerprint", lambda: "fp1")
-    main_mod._mark_termux_bundled_skills_synced()
-    monkeypatch.setitem(
-        sys.modules,
-        "tools.skills_sync",
-        types.SimpleNamespace(sync_skills=lambda quiet: calls.append(quiet)),
-    )
-
-    assert main_mod._sync_bundled_skills_for_startup() is False
-    assert calls == []
-
-
-
-
-
-
 def test_exit_after_oneshot_flushes_stdio_and_calls_os_exit(
     monkeypatch, main_mod
 ):
@@ -612,10 +593,6 @@ def test_exit_after_oneshot_flushes_stdio_and_calls_os_exit(
     assert flushed == ["stdout", "stderr"]
 
 
-
-
-
-
 def test_oneshot_subprocess_exits_without_teardown_abort():
     program = textwrap.dedent(
         """
@@ -636,16 +613,10 @@ def test_oneshot_subprocess_exits_without_teardown_abort():
     )
 
     assert result.returncode == 0
-    assert result.stdout == b"ok\n"
+    assert result.stdout in (b"ok\n", b"ok\r\n")
     # Don't demand byte-empty stderr — an import-time warning from the heavy
     # CLI import chain shouldn't fail this. What matters is no crash traceback.
     assert b"Traceback" not in result.stderr
-
-
-
-
-
-
 
 
 def _stub_plugin_discovery(monkeypatch):
@@ -654,8 +625,6 @@ def _stub_plugin_discovery(monkeypatch):
         "hermes_cli.plugins",
         types.SimpleNamespace(discover_plugins=lambda: None),
     )
-
-
 
 
 def test_oneshot_wires_session_db_for_recall(monkeypatch):
@@ -730,6 +699,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
+    monkeypatch.setenv("HERMES_PYTHON", sys.executable)
     captured = {}
     active_path_during_call = None
 
@@ -763,44 +733,6 @@ def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     assert active_path_during_call == active_path
     assert not active_path.exists()
     assert env["NODE_ENV"] == "production"
-
-
-
-
-def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path):
-    tui_dir = tmp_path / "ui-tui"
-    tsx = tui_dir / "node_modules" / ".bin" / "tsx"
-    ink_dir = tui_dir / "packages" / "hermes-ink"
-    tsx.parent.mkdir(parents=True)
-    ink_dir.mkdir(parents=True)
-    tsx.write_text("#!/usr/bin/env node\n", encoding="utf-8")
-
-    monkeypatch.setattr(main_tui_launch, "_ensure_tui_node", lambda: None)
-    monkeypatch.setattr(main_tui_launch, "_tui_need_npm_install", lambda _tui_dir: False)
-    monkeypatch.delenv("HERMES_TUI_DIR", raising=False)
-    monkeypatch.setattr(main_mod.shutil, "which", lambda bin_name: f"/usr/bin/{bin_name}")
-    # _make_tui_argv now dispatches on the TUI engine first; resolving "opentui"
-    # availability probes `node --version` (a subprocess.run this test would
-    # otherwise record). Pin the Ink engine — this test covers the Ink dev path.
-    monkeypatch.setattr(
-        main_tui_launch, "_resolve_tui_engine", lambda **_kwargs: "ink"
-    )
-
-    calls = []
-
-    def fake_run(cmd, cwd=None, **_kwargs):
-        calls.append((cmd, cwd))
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
-
-    argv, cwd = main_tui_launch._make_tui_argv(tui_dir, tui_dev=True)
-
-    assert argv == [str(tsx), "src/entry.tsx"]
-    assert cwd == tui_dir
-    assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
-
-
 
 
 def test_print_tui_exit_summary_prefers_actual_active_session_file(

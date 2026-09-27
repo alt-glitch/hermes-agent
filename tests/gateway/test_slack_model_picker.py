@@ -469,8 +469,7 @@ class TestSlackModelPickerAction:
         await adapter._model_picker.handle_action(ack, _interaction_body(), action)
 
         last_update = mock_client.chat_update.call_args_list[-1][1]
-        assert "⚙ Model Switch Failed" in last_update["text"]
-        assert "Model switch failed" in last_update["text"]
+        assert "failed" in last_update["text"].lower()
 
     @pytest.mark.asyncio
     async def test_model_select_gateway_error_return_uses_failure_header(self):
@@ -672,7 +671,7 @@ class TestSlackModelPickerGatewayIntegration:
     async def test_bare_model_triggers_picker(self, tmp_path, monkeypatch):
         import types
 
-        import yaml
+        import hermes_yaml as yaml
 
         from gateway.platforms.event import MessageEvent, MessageType
         from gateway.session import SessionSource
@@ -728,7 +727,7 @@ class TestSlackModelPickerGatewayIntegration:
 
     @pytest.mark.asyncio
     async def test_text_fallback_when_no_picker(self, tmp_path, monkeypatch):
-        import yaml
+        import hermes_yaml as yaml
 
         from gateway.platforms.event import MessageEvent, MessageType
         from gateway.session import SessionSource

@@ -33,37 +33,7 @@ import logging
 
 from hermes_cli.auth import (
     DEFAULT_NOUS_PORTAL_URL,
-    _NOUS_PORTAL_ALLOWED_HOSTS,
-    _nous_portal_env_override,
 )
-
-
-class TestPortalEnvOverrideHelper:
-    def test_none_when_unset(self, monkeypatch):
-        monkeypatch.delenv("HERMES_PORTAL_BASE_URL", raising=False)
-        monkeypatch.delenv("NOUS_PORTAL_BASE_URL", raising=False)
-        assert _nous_portal_env_override() is None
-
-
-    def test_env_override_not_gated_by_allowlist(self, monkeypatch):
-        """The whole point: an env-set staging host is NOT in
-        _NOUS_PORTAL_ALLOWED_HOSTS, and the helper must return it anyway —
-        gating happens only for network-provenance values."""
-        # A host deliberately NOT in the allowlist: the property under test is
-        # that env provenance bypasses gating entirely. (Staging itself is now
-        # allowlisted as a first-party host — the allowlist also re-validates
-        # PERSISTED state, so keeping staging out would make a stored staging
-        # portal_base_url silently fall back to prod on the next run.)
-        monkeypatch.setenv(
-            "HERMES_PORTAL_BASE_URL", "https://portal.preview-example-nousresearch.com"
-        )
-        assert (
-            "portal.preview-example-nousresearch.com" not in _NOUS_PORTAL_ALLOWED_HOSTS
-        )
-        assert (
-            _nous_portal_env_override()
-            == "https://portal.preview-example-nousresearch.com"
-        )
 
 
 class TestResolveAccessTokenEnvOverrideWins:

@@ -528,11 +528,17 @@ describe('useVirtualHistory offset cache reuse', () => {
     })
 
     try {
-      await delay(20)
+      // Generous settle windows: the unmount-measurement callback must fire
+      // before the assertion, and under CI load a 20-40ms sleep is not
+      // enough (flaked as "adjustScrollTop called 0 times").
+      await delay(50)
       const scroll = expose.current!.scroll!
 
+      // act() flushes the React commit deterministically; the settle windows
+      // stay as headroom for the ScrollBox's own async render work.
       await act(async () => scroll.scrollTo(0))
       expect(expose.current!.virtualHistory.start).toBe(0)
+      await delay(50)
 
       scroll.scrollTo(5)
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
@@ -542,6 +548,7 @@ describe('useVirtualHistory offset cache reuse', () => {
       await act(async () =>
         instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
       )
+      await delay(400)
 
       expect(adjustScrollTop).toHaveBeenCalledOnce()
       expect(adjustScrollTop).toHaveBeenCalledWith(1)

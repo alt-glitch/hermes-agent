@@ -10,8 +10,19 @@ def gateway_tools(monkeypatch):
     from tui_gateway import server
     import model_tools
 
+    from agent.skill_utils import parse_config_string_list
+
     cfg = {"agent": {"disabled_toolsets": '["search"]'}}
     monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+
+    # _make_agent and cold tools.show read agent.disabled_toolsets through upstream's helper, which
+    # loads config.yaml directly; fake it over the same mutable cfg (same parsing as the helper) so
+    # the later config edits below still prove live/detached agents keep their own policy.
+    def disabled_from_cfg():
+        disabled = parse_config_string_list((cfg.get("agent") or {}).get("disabled_toolsets"))
+        return [str(ts) for ts in disabled] or None
+
+    monkeypatch.setattr(server, "_load_disabled_toolsets", disabled_from_cfg)
     # `debugging` survives config pruning because it also contains file/terminal tools.
     monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_: ["debugging"])
 
