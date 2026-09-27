@@ -2,8 +2,10 @@
 
 Three tables, filled by the ``contracts.*`` topic modules at import time and read by
 ``tui_gateway/server.py`` (runtime validation) and ``scripts/gen_gateway_contracts.py``
-(TypeScript + OpenRPC rendering). A handler registered with ``@method`` for a name that has
-no contract here fails at import: the wire has no undeclared surface.
+(TypeScript + OpenRPC rendering). ``tui_gateway.server.register_method`` (behind ``@method`` and
+``HandlerRegistry.install``) raises for a name that has no contract here, so an undeclared handler
+fails at import. ``tests/tui_gateway/contracts/test_generated.py::test_catalog_covers_the_whole_wire``
+checks the other direction (no orphaned contract, every emitted event / sent request declared).
 """
 
 from __future__ import annotations

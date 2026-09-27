@@ -62,6 +62,10 @@ export const LiveSessionSnapshotSchema = Schema.StructWithRest(
     info: opt(Schema.Record(Str, Schema.Unknown)),
     message_count: opt(Num),
     messages: Schema.Array(Schema.Unknown),
+    // Server→client requests still waiting on this session (`OpenRequestEntry`), oldest first.
+    open_requests: opt(
+      Schema.NullOr(Schema.Array(Schema.Struct({ id: Str, method: Str, params: Schema.Record(Str, Schema.Unknown) })))
+    ),
     resumed: opt(Str),
     running: opt(Bool),
     session_id: Str,

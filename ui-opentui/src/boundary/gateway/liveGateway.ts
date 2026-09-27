@@ -26,7 +26,13 @@ import {
   decodeSessionResumeResponse
 } from '../schema/SessionOrchestratorResponses.ts'
 import { GatewayService, type GatewayTransport } from './GatewayService.ts'
-import { RawGatewayClient, RawGatewayRequestError } from './client.ts'
+import {
+  RawGatewayClient,
+  RawGatewayRequestError,
+  type ServerRequest,
+  type ServerRequestDisposition
+} from './client.ts'
+import type { RpcMethod, RpcParams } from './rpc.ts'
 
 const COALESCE_MS = 16
 
@@ -41,9 +47,7 @@ export function gatewayEventRequiresImmediateFlush(event: GatewayEvent): boolean
     event.type === 'message.start' ||
     event.type === 'message.complete' ||
     event.type === 'error' ||
-    event.type === 'approval.request' ||
-    event.type === 'approval.resolved' ||
-    event.type === 'clarify.expire' ||
+    event.type === 'request.cancel' ||
     event.type === 'session.info' ||
     event.type === 'gateway.ready' ||
     event.type === 'gateway.exited'
@@ -211,10 +215,17 @@ function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
     }, delay)
   }
 
+  // Backend→client requests open a prompt directly (not through the event queue); flush first so a
+  // request never overtakes the events the backend wrote before it.
+  let serverRequestHandler: ((request: ServerRequest) => ServerRequestDisposition) | undefined
   const client = new RawGatewayClient({
     log,
     onEvent: onRawEvent,
-    onExit
+    onExit,
+    onServerRequest: request => {
+      flush()
+      return serverRequestHandler?.(request) ?? 'method-not-found'
+    }
   })
 
   const service: GatewayTransport = {
@@ -228,9 +239,9 @@ function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
         }
       }),
 
-    request: <A>(method: string, params: unknown) =>
+    request: <M extends RpcMethod>(method: M, params: RpcParams<M>) =>
       Effect.tryPromise({
-        try: () => client.request<A>(method, params),
+        try: () => client.request(method, params),
         catch: cause => gatewayErrorFromRawFailure(method, cause)
       }).pipe(
         // Keep the live routing id aligned with create/resume/close so prompts,
@@ -253,6 +264,18 @@ function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
           })
         )
       ),
+
+    serveRequests: handler => {
+      serverRequestHandler = handler
+      return () => {
+        if (serverRequestHandler === handler) serverRequestHandler = undefined
+      }
+    },
+
+    replayRequests: entries => {
+      flush()
+      client.replayServerRequests(entries)
+    },
 
     sessionId: () => sessionId,
     logTail: limit => client.getLogTail(limit)

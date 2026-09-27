@@ -1301,6 +1301,9 @@ class SessionSessionsMixin:
             # rows; MAX over the chain gives effective_last_active in SQL. Do NOT
             # require child.started_at >= parent.ended_at: races insert the
             # continuation before ended_at is written.
+            # ``page`` picks the ids first: ORDER BY is on a computed column, so with the preview
+            # subquery in the same SELECT SQLite evaluated it for every eligible session before
+            # LIMIT (11-21 s on a 25k-session DB). Preview and last_active run only on page rows.
             outer_where, id_params = self._chain_search_where(
                 where_sql, (id_query or "").strip().lower(), (search_query or "").strip().lower(),
             )
@@ -1324,15 +1327,22 @@ class SessionSessionsMixin:
                         MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
                     FROM chain
                     GROUP BY root_id
+                ),
+                page AS (
+                    SELECT s.id AS id,
+                        COALESCE(cm.effective_last_active, {_sql_in_window("s.started_at")}) AS _effective_last_active
+                    FROM sessions s
+                    LEFT JOIN chain_max cm ON cm.root_id = s.id
+                    {outer_where}
+                    ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                    LIMIT ? OFFSET ?
                 )
                 {select_head}{_sql_session_last_active("s")} AS last_active,
-                    COALESCE(cm.effective_last_active, {_sql_in_window("s.started_at")}) AS _effective_last_active
-                FROM sessions s
-                LEFT JOIN chain_max cm ON cm.root_id = s.id
+                    page._effective_last_active AS _effective_last_active
+                FROM page
+                JOIN sessions s ON s.id = page.id
                 {prompt_join}
-                {outer_where}
-                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
-                LIMIT ? OFFSET ?
+                ORDER BY page._effective_last_active DESC, s.started_at DESC, s.id DESC
             """
             params = params + params + id_params + [limit, offset]  # WHERE binds twice (seed + outer)
         else:

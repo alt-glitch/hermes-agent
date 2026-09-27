@@ -27,6 +27,7 @@ import type { BusyInputMode } from '../logic/busyQueue.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from '../logic/replay.ts'
 import { clientCommandNames, dispatchSlash, type SlashContext } from '../logic/slash.ts'
 import type { Message, Part } from '../logic/store.ts'
+import { scriptedRpc } from './lib/scriptedRpc.ts'
 
 // The utility commands under test are DIAGNOSTIC commands — gated behind
 // HERMES_TUI_DIAGNOSTICS (logic/env.ts). This suite tests the commands
@@ -160,10 +161,10 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     pushSystem: text => system.push(text),
     quit: () => {},
     redraw: () => {},
-    request: (method, params) => {
+    request: scriptedRpc((method, params) => {
       calls.push({ method, params })
       return request(method, params)
-    },
+    }),
     sessionId: () => sessionId.value,
     sessionOwnerId: () => 'sid-1',
     submit: () => {},

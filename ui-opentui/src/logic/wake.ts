@@ -5,6 +5,7 @@
  * for the OpenTUI engine: transport-free logic here, the entry injects the
  * RPC/session/store capabilities through {@link WakeHost}.
  */
+import type { RpcRequest } from '../boundary/gateway/rpc.ts'
 import type {
   WakeStartResponse,
   WakeStatusResponse,
@@ -120,7 +121,7 @@ export function planWakeDetected(
 
 /** The entry-injected capabilities the wake.detected flow needs. */
 export interface WakeHost {
-  readonly request: (method: string, params: Record<string, unknown>) => Promise<unknown>
+  readonly request: RpcRequest
   readonly sessionId: () => string | undefined
   readonly ownProfile: () => string | undefined
   /** Close the live session and adopt a fresh one; resolves false on refusal/failure. */

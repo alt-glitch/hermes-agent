@@ -875,8 +875,12 @@ def _err(rid, code: int, msg: str, data=None) -> dict:
 
 def register_method(name: str, fn) -> None:
     """The ONE registration seam (``@method`` here and ``HandlerRegistry.install`` for the split
-    modules). ``tests/tui_gateway/contracts/test_generated.py::test_every_method_has_a_contract`` and the
-    generator's ``assert_complete`` fail when a registered name has no contract."""
+    modules). Raises for a name with no ``tui_gateway/contracts`` entry, so an undeclared handler
+    fails at import. Orphaned contracts (declared, never registered) are caught by
+    ``tests/tui_gateway/contracts/test_generated.py::test_catalog_covers_the_whole_wire``."""
+    if name not in _contracts.METHODS:
+        raise RuntimeError(f"RPC method {name!r} has no contract: declare it in tui_gateway/contracts/ "
+                           "(a Params + Result model and a method(...) entry) before registering a handler")
     _methods[name] = fn
 
 

@@ -1,14 +1,13 @@
 /**
- * PromptOverlay — renders the active blocking prompt and binds each answer/cancel
- * to the matching `*.respond` RPC (spec §4 reply contract; §8 #6 deadlock fix):
- *   clarify.respond {answer, request_id} · approval.respond {choice, request_id, session_id} ·
- *   sudo.respond {password, request_id} · secret.respond {value, request_id} ·
- *   vault.unlock.respond {password, request_id}.
+ * PromptOverlay — renders the active blocking prompt and answers the backend→client
+ * request that opened it (result shapes per tui_gateway/contracts/server_requests.py):
+ *   clarify {answer} · approval {choice} · sudo / secret / vault.unlock_prompt {value};
+ *   a batch clarify locks one answer at a time through the `clarify.lock` RPC.
  * Idle Esc/Ctrl+C sends the deny/empty reply. While delivery is pending or
  * uncertain, `r` deliberately retries that exact response while Esc/Ctrl+C
  * dismisses locally without claiming it was received.
  *
- * `onRespond` is the entry-wired boundary callback (fires `gateway.request`); the
+ * `onRespond` is the entry-wired boundary callback (JSON-RPC response or clarify.lock); the
  * overlay also clears the store prompt so the composer returns. Narrowing is done
  * with reactive `as*()` accessors so each sub-prompt gets its typed payload.
  */
@@ -20,9 +19,10 @@ import { deferClose } from '../../logic/defer.ts'
 import type { ActivePrompt, PromptSettlement, SessionStore } from '../../logic/store.ts'
 import {
   promptTransportUncertain,
-  type PromptResponseDisposition,
-  type PromptResponseMethod
+  type PromptReply,
+  type PromptResponseDisposition
 } from '../../boundary/promptResponses.ts'
+import type { PromptAnswer } from '../../boundary/gateway/serverRequests.ts'
 import { useCloseLayer, usePromptRetryLayer } from '../keymap.tsx'
 import { ApprovalPrompt } from './approvalPrompt.tsx'
 import { ClarifyPrompt } from './clarifyPrompt.tsx'
@@ -31,19 +31,15 @@ import { MaskedPrompt } from './maskedPrompt.tsx'
 
 export interface PromptOverlayProps {
   readonly store: SessionStore
-  readonly onRespond: (
-    method: PromptResponseMethod,
-    params: Record<string, unknown>
-  ) => Promise<PromptResponseDisposition>
+  readonly onRespond: (reply: PromptReply) => Promise<PromptResponseDisposition>
 }
 
 type ResponseIntent = 'answer' | 'cancel'
 interface ResponseAttempt {
   readonly expected: ActivePrompt
   readonly intent: ResponseIntent
-  readonly method: PromptResponseMethod
   readonly onAccepted: (() => boolean) | undefined
-  readonly params: Record<string, unknown>
+  readonly reply: PromptReply
   readonly sessionId: string | undefined
   readonly token: number
 }
@@ -57,38 +53,27 @@ type ResponsePhase =
 type GatewayPrompt = Exclude<ActivePrompt, { kind: 'confirm' }>
 type GatewayPromptKind = GatewayPrompt['kind']
 type GatewayPromptOf<K extends GatewayPromptKind> = Extract<GatewayPrompt, { kind: K }>
-interface CancelRequest {
-  readonly method: PromptResponseMethod
-  readonly params: Record<string, unknown>
-}
 
 /**
- * Masked (single hidden value) prompt kinds share one wire shape:
- * `{ [field]: value, request_id }` on `method`, with `''` as the cancellation.
- * Each kind is one row here — the card copy, the RPC method and the field name
- * are declared once, so submit, cancel and keyboard focus cannot drift apart.
+ * Masked (single hidden value) prompt kinds share one answer shape, `{value}`
+ * (ValueResult), with `''` as the cancellation. Each kind is one row here — the
+ * card copy is declared once, so submit, cancel and keyboard focus cannot drift apart.
  */
 type MaskedKind = 'sudo' | 'secret' | 'vaultUnlock'
 interface MaskedCard<K extends MaskedKind> {
-  readonly method: PromptResponseMethod
-  readonly field: 'password' | 'value'
   readonly icon: string
   readonly label: (prompt: GatewayPromptOf<K>) => string
   /** Secondary line; `''` renders nothing. */
   readonly sub: (prompt: GatewayPromptOf<K>) => string
 }
 const MASKED_CARDS = {
-  sudo: { method: 'sudo.respond', field: 'password', icon: '🔐', label: () => 'sudo password', sub: () => '' },
+  sudo: { icon: '🔐', label: () => 'sudo password', sub: () => '' },
   secret: {
-    method: 'secret.respond',
-    field: 'value',
     icon: '🔑',
     label: prompt => `Secret: ${prompt.envVar}`,
     sub: prompt => prompt.prompt
   },
   vaultUnlock: {
-    method: 'vault.unlock.respond',
-    field: 'password',
     icon: '🔐',
     label: prompt => `Unlock ${prompt.displayName} for this session`,
     sub: () => 'master password · goes to the manager CLI only · Esc keeps it locked'
@@ -97,32 +82,21 @@ const MASKED_CARDS = {
 
 const isMasked = (prompt: ActivePrompt): prompt is GatewayPromptOf<MaskedKind> => prompt.kind in MASKED_CARDS
 
-function maskedRequest(prompt: GatewayPromptOf<MaskedKind>, value: string): CancelRequest {
-  const card = MASKED_CARDS[prompt.kind]
-  return { method: card.method, params: { [card.field]: value, request_id: prompt.requestId } }
-}
+const answer = (prompt: GatewayPrompt, result: PromptAnswer): PromptReply => ({
+  kind: 'answer',
+  requestId: prompt.requestId,
+  result
+})
 
-const CANCEL_REQUEST_BUILDERS = {
-  approval: (prompt: GatewayPromptOf<'approval'>): CancelRequest => ({
-    method: 'approval.respond',
-    params: { choice: 'deny', request_id: prompt.requestId, session_id: prompt.sessionId }
-  }),
-  clarify: (prompt: GatewayPromptOf<'clarify'>): CancelRequest => ({
-    method: 'clarify.respond',
-    params: { answer: '', request_id: prompt.requestId }
-  }),
-  secret: (prompt: GatewayPromptOf<'secret'>): CancelRequest => maskedRequest(prompt, ''),
-  sudo: (prompt: GatewayPromptOf<'sudo'>): CancelRequest => maskedRequest(prompt, ''),
-  vaultUnlock: (prompt: GatewayPromptOf<'vaultUnlock'>): CancelRequest => maskedRequest(prompt, '')
-} satisfies { [K in GatewayPromptKind]: (prompt: GatewayPromptOf<K>) => CancelRequest }
-
-function cancelRequestFor<K extends GatewayPromptKind>(prompt: GatewayPromptOf<K>): CancelRequest {
-  // TypeScript cannot retain the correlation between a union's discriminant
-  // and an indexed mapped-table callback; the table's `satisfies` constraint
-  // proves that correlation once at declaration time.
-  const builder = CANCEL_REQUEST_BUILDERS[prompt.kind] as (value: GatewayPromptOf<K>) => CancelRequest
-  return builder(prompt)
-}
+/** Esc/Ctrl+C answer per kind: deny for approval, empty for the rest (a clarify
+ *  `{answer:''}` is a skip, and a cancel-all for a batch — no `answers` key). */
+const CANCEL_RESULTS = {
+  approval: { choice: 'deny' },
+  clarify: { answer: '' },
+  secret: { value: '' },
+  sudo: { value: '' },
+  vaultUnlock: { value: '' }
+} as const satisfies Record<GatewayPromptKind, PromptAnswer>
 
 export function PromptOverlay(props: PromptOverlayProps) {
   const prompt = () => props.store.state.prompt
@@ -169,7 +143,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
     if (!attemptIsCurrent(attempt)) return
     setPhase({ attempt, kind: 'sending', manualRetry })
     void props
-      .onRespond(attempt.method, attempt.params)
+      .onRespond(attempt.reply)
       .then(disposition => {
         if (!attemptIsCurrent(attempt)) return
         if (disposition.kind === 'uncertain') {
@@ -194,21 +168,15 @@ export function PromptOverlay(props: PromptOverlayProps) {
       })
   }
 
-  const respond = (
-    method: PromptResponseMethod,
-    params: Record<string, unknown>,
-    intent: ResponseIntent = 'answer',
-    onAccepted?: () => boolean
-  ): void => {
+  const respond = (reply: PromptReply, intent: ResponseIntent = 'answer', onAccepted?: () => boolean): void => {
     if (phase().kind !== 'idle') return
     const expected = prompt()
     if (!expected) return
     dispatchAttempt({
       expected,
       intent,
-      method,
       onAccepted,
-      params,
+      reply,
       sessionId: props.store.state.sessionId,
       token: generation
     })
@@ -225,8 +193,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
       clearSoon()
       return
     }
-    const request = cancelRequestFor(current)
-    respond(request.method, request.params, 'cancel')
+    respond(answer(current, CANCEL_RESULTS[current.kind]), 'cancel')
   }
 
   const closeOrCancel = (): void => {
@@ -312,13 +279,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
               command={p().command}
               description={p().description}
               statusHint={responseHint()}
-              onChoose={choice =>
-                respond('approval.respond', {
-                  choice: secureApprovalChoice(choice, p().allowPermanent),
-                  request_id: p().requestId,
-                  session_id: p().sessionId
-                })
-              }
+              onChoose={choice => respond(answer(p(), { choice: secureApprovalChoice(choice, p().allowPermanent) }))}
             />
           )}
         </Match>
@@ -330,15 +291,14 @@ export function PromptOverlay(props: PromptOverlayProps) {
               questions={p().questions}
               answers={p().answers}
               statusHint={responseHint()}
-              onAnswer={answer => respond('clarify.respond', { answer, request_id: p().requestId })}
-              onQuestionAnswer={(qid, answer) =>
+              onAnswer={text => respond(answer(p(), { answer: text }))}
+              onQuestionAnswer={(qid, text) =>
                 // Per-question lock: the prompt stays open until no questions
-                // remain. Only an accepted exact RPC updates the local mirror.
+                // remain. Only an accepted clarify.lock updates the local mirror.
                 respond(
-                  'clarify.respond',
-                  { answer, question_id: qid, request_id: p().requestId },
+                  { kind: 'lock', requestId: p().requestId, questionId: qid, answer: text },
                   'answer',
-                  () => props.store.recordClarifyAnswer(qid, answer) === 0
+                  () => props.store.recordClarifyAnswer(qid, text) === 0
                 )
               }
             />
@@ -355,10 +315,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
                 label={card().label(p())}
                 sub={card().sub(p())}
                 statusHint={responseHint()}
-                onSubmit={value => {
-                  const request = maskedRequest(p(), value)
-                  respond(request.method, request.params)
-                }}
+                onSubmit={value => respond(answer(p(), { value }))}
               />
             )
           }}

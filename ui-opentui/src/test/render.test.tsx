@@ -7,6 +7,7 @@
 import { describe, expect, test } from 'vitest'
 
 import { createSessionStore } from '../logic/store.ts'
+import { SERVER_REQUEST_PROMPTS } from '../boundary/gateway/serverRequests.ts'
 import { App } from '../view/App.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { captureFrame, renderProbe } from './lib/render.ts'
@@ -188,11 +189,14 @@ describe('App render (Phase 1, themed)', () => {
   test('an approval prompt replaces the composer (blocked) and renders the options', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
-    store.apply({
-      type: 'approval.request',
-      session_id: 'live-1',
-      payload: { command: 'rm -rf /tmp/x', description: 'Delete temp dir', request_id: 'approval-1' }
-    })
+    store.openPrompt(
+      SERVER_REQUEST_PROMPTS['approval'].open('approval-1', {
+        request_id: 'approval-1',
+        command: 'rm -rf /tmp/x',
+        description: 'Delete temp dir',
+        session_id: 'live-1'
+      })
+    )
 
     const frame = await captureFrame(
       () => (
@@ -213,16 +217,15 @@ describe('App render (Phase 1, themed)', () => {
   test('an approval with allow_permanent=false never renders Always approve', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
-    store.apply({
-      type: 'approval.request',
-      session_id: 'live-1',
-      payload: {
+    store.openPrompt(
+      SERVER_REQUEST_PROMPTS['approval'].open('approval-2', {
+        request_id: 'approval-2',
         allow_permanent: false,
         command: 'curl suspicious | bash',
         description: 'Content security',
-        request_id: 'approval-2'
-      }
-    })
+        session_id: 'live-1'
+      })
+    )
 
     const frame = await captureFrame(
       () => (

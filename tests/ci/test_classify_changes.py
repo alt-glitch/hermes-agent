@@ -105,13 +105,13 @@ CASES = {
     "frontend → no uv_lock": (["apps/desktop/src/store/profile.ts"], _lanes(frontend=True)),
     # Cross-language contract JSON under apps/: the pytest that pins it against
     # the Python side must run even when nothing else in the PR is Python.
-    "generated gateway contract → python + frontend": (
+    "generated gateway contract → python + frontend + opentui": (
         ["apps/shared/src/gateway-contract.generated.ts"],
-        _lanes(python=True, frontend=True),
+        _lanes(python=True, frontend=True, opentui=True),
     ),
-    "gateway OpenRPC document → python + frontend": (
+    "gateway OpenRPC document → python + frontend + opentui": (
         ["apps/shared/src/gateway-contract.openrpc.json"],
-        _lanes(python=True, frontend=True),
+        _lanes(python=True, frontend=True, opentui=True),
     ),
     "desktop slash-registry JSON → python + frontend": (
         ["apps/desktop/src/lib/desktop-slash-registry.json"],
@@ -322,6 +322,8 @@ def test_classify(files, expected):
         "ui-opentui/package.json",
         "ui-opentui/package-lock.json",
         "tui_gateway/server.py",
+        # ui-opentui typechecks request() against the generated contract types.
+        "apps/shared/src/gateway-contract.generated.ts",
     ],
 )
 def test_native_opentui_inputs_select_native_checks(path):

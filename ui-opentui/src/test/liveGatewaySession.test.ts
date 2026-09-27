@@ -91,21 +91,11 @@ describe('live gateway session tracking', () => {
     expect(gatewayEventRequiresImmediateFlush({ type: 'error' })).toBe(true)
     expect(
       gatewayEventRequiresImmediateFlush({
-        type: 'approval.request',
+        type: 'request.cancel',
         session_id: 'live-1',
-        payload: { command: 'echo safe', description: 'test', request_id: 'approval-1' }
+        payload: { id: 'srq-1', method: 'clarify', reason: 'timeout' }
       })
     ).toBe(true)
-    expect(
-      gatewayEventRequiresImmediateFlush({
-        type: 'approval.resolved',
-        session_id: 'live-1',
-        payload: { request_id: 'approval-1', status: 'expired' }
-      })
-    ).toBe(true)
-    expect(gatewayEventRequiresImmediateFlush({ type: 'clarify.expire', payload: { request_id: 'clarify-1' } })).toBe(
-      true
-    )
     expect(gatewayEventRequiresImmediateFlush({ type: 'session.info', payload: { running: true } })).toBe(true)
     expect(gatewayEventRequiresImmediateFlush({ type: 'gateway.ready' })).toBe(true)
     expect(gatewayEventRequiresImmediateFlush({ type: 'gateway.exited' })).toBe(true)

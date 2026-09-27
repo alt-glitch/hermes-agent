@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest'
 
 import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { createSessionStore, type Message } from '../logic/store.ts'
+import { SERVER_REQUEST_PROMPTS } from '../boundary/gateway/serverRequests.ts'
 
 describe('session-store replacement boundary', () => {
   test('committed-event side effects wait for buffer filtering and reject stale SIDs', () => {
@@ -225,7 +226,7 @@ describe('session-store replacement boundary', () => {
     store.adoptFreshSession('live', {})
     store.apply({ type: 'message.start', session_id: 'live' })
     store.apply({ type: 'message.delta', session_id: 'live', payload: { text: 'partial' } })
-    store.apply({ type: 'clarify.request', session_id: 'live', payload: { question: 'stale?', request_id: 'q1' } })
+    store.openPrompt(SERVER_REQUEST_PROMPTS['clarify'].open('q1', { question: 'stale?', session_id: 'live' }))
     store.setStatus('thinking')
 
     store.apply({ type: 'session.info', session_id: 'live', payload: { running: false } })

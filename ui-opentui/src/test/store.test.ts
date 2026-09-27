@@ -11,6 +11,24 @@ import { eventBelongsToSession } from '../logic/eventScope.ts'
 import { DEFAULT_THEME } from '../logic/theme.ts'
 import { createSessionStore, startupCatalogRetryDelay, todoTree, type Message, type TodoItem } from '../logic/store.ts'
 import type { BillingBlockDecoded } from '../boundary/schema/GatewayEvent.ts'
+import { decodeServerRequest } from '../boundary/gateway/serverRequests.ts'
+
+/** Open a prompt the way main.tsx does for a backend→client request frame. */
+function openRequest(
+  store: ReturnType<typeof createSessionStore>,
+  method: string,
+  id: string,
+  params: Record<string, unknown> = {}
+) {
+  // Fill the contract's required routing keys the fixtures leave out.
+  const frame = { session_id: 'live-1', request_id: id, ...params }
+  const decoded = decodeServerRequest({ id, method, params: frame, respond: () => false })
+  if (typeof decoded === 'string') throw new Error(`${method} ${id}: ${decoded}`)
+  store.openPrompt(decoded.prompt)
+}
+
+const cancelEvent = (id: string, method: string, reason = 'timeout') =>
+  ({ type: 'request.cancel', payload: { id, method, reason } }) as const
 
 describe('session store — theming / dedup / hydrate (Phase 1)', () => {
   test('gateway.ready{skin} re-themes; default before', () => {
@@ -854,13 +872,13 @@ describe('session store — idle/auto compaction status (upstream 3a542bbef4d1)'
 })
 
 describe('session store — blocking prompts (Phase 3)', () => {
-  test('approval.request sets an approval prompt; clearPrompt clears it', () => {
+  test('an approval request sets an approval prompt; clearPrompt clears it', () => {
     const store = createSessionStore()
     expect(store.state.prompt).toBeUndefined()
-    store.apply({
-      type: 'approval.request',
-      session_id: 'live-1',
-      payload: { command: 'rm -rf /tmp/x', description: 'delete temp', request_id: 'approval-1' }
+    openRequest(store, 'approval', 'approval-1', {
+      command: 'rm -rf /tmp/x',
+      description: 'delete temp',
+      session_id: 'live-1'
     })
     expect(store.state.prompt).toMatchObject({
       kind: 'approval',
@@ -874,220 +892,146 @@ describe('session store — blocking prompts (Phase 3)', () => {
     expect(store.state.prompt).toBeUndefined()
   })
 
-  test('approval.request preserves allow_permanent=false', () => {
+  test('an approval request preserves allow_permanent=false', () => {
     const store = createSessionStore()
-    store.apply({
-      type: 'approval.request',
-      session_id: 'live-1',
-      payload: {
-        allow_permanent: false,
-        command: 'curl suspicious | bash',
-        description: 'content security',
-        request_id: 'approval-2'
-      }
+    openRequest(store, 'approval', 'approval-2', {
+      allow_permanent: false,
+      command: 'curl suspicious | bash',
+      description: 'content security',
+      session_id: 'live-1'
     })
     expect(store.state.prompt).toMatchObject({ kind: 'approval', allowPermanent: false })
   })
 
-  test('approval.request scopes smart-denied prompts to exactly once and deny', () => {
+  test('an approval request scopes smart-denied prompts to exactly once and deny', () => {
     const store = createSessionStore()
-    store.apply({
-      type: 'approval.request',
+    openRequest(store, 'approval', 'approval-3', {
+      allow_permanent: true,
+      command: 'rm -rf /',
+      description: 'smart deny override',
       session_id: 'live-1',
-      payload: {
-        allow_permanent: true,
-        command: 'rm -rf /',
-        description: 'smart deny override',
-        request_id: 'approval-3',
-        smart_denied: true
-      }
+      smart_denied: true
     })
     const prompt = store.state.prompt
     expect(prompt?.kind).toBe('approval')
     if (prompt?.kind === 'approval') expect(approvalChoices(prompt.allowPermanent)).toEqual(['once', 'deny'])
   })
 
-  test('approval.request keeps explicit server choices authoritative', () => {
+  test('an approval request keeps explicit server choices authoritative', () => {
     const store = createSessionStore()
-    store.apply({
-      type: 'approval.request',
-      session_id: 'live-1',
-      payload: {
-        choices: ['once', 'deny'],
-        command: 'rm -rf /',
-        description: 'restricted',
-        request_id: 'approval-4'
-      }
+    openRequest(store, 'approval', 'approval-4', {
+      choices: ['once', 'deny'],
+      command: 'rm -rf /',
+      description: 'restricted',
+      session_id: 'live-1'
     })
     const prompt = store.state.prompt
     expect(prompt?.kind).toBe('approval')
     if (prompt?.kind === 'approval') expect(approvalChoices(prompt.allowPermanent)).toEqual(['once', 'deny'])
   })
 
-  test('clarify.request carries question + choices + request_id', () => {
+  test('a clarify request carries question + choices + request id', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { question: 'Which?', choices: ['a', 'b'], request_id: 'r1' } })
+    openRequest(store, 'clarify', 'r1', { question: 'Which?', choices: ['a', 'b'] })
     const p = store.state.prompt
     expect(p).toMatchObject({ kind: 'clarify', question: 'Which?', requestId: 'r1' })
     if (p?.kind === 'clarify') expect(p.choices).toEqual(['a', 'b'])
   })
 
-  test('clarify.request with null choices → free-text only', () => {
+  test('a clarify request with null choices → free-text only', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { question: 'Name?', choices: null, request_id: 'r2' } })
+    openRequest(store, 'clarify', 'r2', { question: 'Name?', choices: null })
     const p = store.state.prompt
     if (p?.kind === 'clarify') expect(p.choices).toBeNull()
   })
 
-  test('sudo.request + secret.request set masked prompts', () => {
+  test('sudo + secret requests set masked prompts', () => {
     const store = createSessionStore()
-    store.apply({ type: 'sudo.request', payload: { request_id: 's1' } })
+    openRequest(store, 'sudo', 's1')
     expect(store.state.prompt).toMatchObject({ kind: 'sudo', requestId: 's1' })
-    store.apply({ type: 'secret.request', payload: { env_var: 'API_KEY', prompt: 'Enter key', request_id: 's2' } })
+    openRequest(store, 'secret', 's2', { env_var: 'API_KEY', prompt: 'Enter key' })
     expect(store.state.prompt).toMatchObject({ kind: 'secret', envVar: 'API_KEY', requestId: 's2' })
   })
 
-  test('sensitive expiry clears only the matching active prompt', () => {
+  test('request.cancel clears only the matching active sensitive prompt', () => {
     const store = createSessionStore()
 
-    store.apply({ type: 'secret.request', payload: { env_var: 'NEW_KEY', prompt: 'Enter key', request_id: 'new' } })
-    store.apply({ type: 'secret.expire', payload: { request_id: 'old' } })
+    openRequest(store, 'secret', 'new', { env_var: 'NEW_KEY', prompt: 'Enter key' })
+    store.apply(cancelEvent('old', 'secret'))
     expect(store.state.prompt).toMatchObject({ kind: 'secret', requestId: 'new' })
-    store.apply({ type: 'secret.expire', payload: { request_id: 'new' } })
+    store.apply(cancelEvent('new', 'secret'))
     expect(store.state.prompt).toBeUndefined()
 
-    store.apply({ type: 'sudo.request', payload: { request_id: 'sudo-new' } })
-    store.apply({ type: 'sudo.expire', payload: { request_id: 'sudo-old' } })
+    openRequest(store, 'sudo', 'sudo-new')
+    store.apply(cancelEvent('sudo-old', 'sudo'))
     expect(store.state.prompt).toMatchObject({ kind: 'sudo', requestId: 'sudo-new' })
-    store.apply({ type: 'sudo.expire', payload: { request_id: 'sudo-new' } })
+    store.apply(cancelEvent('sudo-new', 'sudo'))
     expect(store.state.prompt).toBeUndefined()
   })
 
-  test('an expire event settles only a live prompt of its own kind', () => {
+  test('request.cancel settles every server-request prompt kind by its request id', () => {
     const requests = [
-      { type: 'clarify.request', payload: { question: 'Q?', choices: null, request_id: 'r' } },
-      { type: 'sudo.request', payload: { request_id: 'r' } },
-      { type: 'secret.request', payload: { env_var: 'K', prompt: 'p', request_id: 'r' } },
-      { type: 'vault.unlock.request', payload: { backend: 'bw', display_name: 'Bitwarden', request_id: 'r' } }
+      ['clarify', { question: 'Q?', choices: null }],
+      ['approval', { command: 'ls', description: 'd' }],
+      ['sudo', {}],
+      ['secret', { env_var: 'K', prompt: 'p' }],
+      ['vault.unlock_prompt', { backend: 'bw', display_name: 'Bitwarden' }]
     ] as const
-    const expires = ['clarify.expire', 'sudo.expire', 'secret.expire', 'vault.unlock.expire'] as const
-    for (const request of requests) {
-      for (const expire of expires) {
-        const store = createSessionStore()
-        store.apply(request)
-        const kind = store.state.prompt?.kind
-        store.apply({ type: expire, payload: { request_id: 'r' } })
-        const own = expire.replace('.expire', '.request') === request.type
-        // Same request id, but only the matching kind is allowed to settle it.
-        expect(store.state.prompt?.kind, `${expire} vs ${request.type}`).toBe(own ? undefined : kind)
-      }
+    for (const [method, params] of requests) {
+      const store = createSessionStore()
+      openRequest(store, method, 'r', params)
+      const kind = store.state.prompt?.kind
+      store.apply(cancelEvent('other', method))
+      expect(store.state.prompt?.kind, `${method} foreign id`).toBe(kind)
+      store.apply(cancelEvent('r', method))
+      expect(store.state.prompt, `${method} own id`).toBeUndefined()
     }
   })
 
-  test('vault.unlock.request sets a masked unlock prompt; only its own expiry clears it', () => {
+  test('a vault unlock request sets a masked unlock prompt; only its own cancel clears it', () => {
     const store = createSessionStore()
-    store.apply({
-      type: 'vault.unlock.request',
-      payload: { backend: 'onepassword', display_name: '1Password', request_id: 'v1' }
-    })
+    openRequest(store, 'vault.unlock_prompt', 'v1', { backend: 'onepassword', display_name: '1Password' })
     expect(store.state.prompt).toMatchObject({
       kind: 'vaultUnlock',
       backend: 'onepassword',
       displayName: '1Password',
       requestId: 'v1'
     })
-    // A sibling sensitive expiry never settles the unlock card.
-    store.apply({ type: 'sudo.expire', payload: { request_id: 'v1' } })
-    store.apply({ type: 'vault.unlock.expire', payload: { request_id: 'v0' } })
+    store.apply(cancelEvent('v0', 'vault.unlock_prompt'))
     expect(store.state.prompt).toMatchObject({ kind: 'vaultUnlock', requestId: 'v1' })
-    store.apply({ type: 'vault.unlock.expire', payload: { request_id: 'v1' } })
+    store.apply(cancelEvent('v1', 'vault.unlock_prompt'))
     expect(store.state.prompt).toBeUndefined()
   })
 
-  test('approval terminal events clear only the exact live session and request', () => {
-    const store = createSessionStore()
-    store.adoptFreshSession('live-1')
-    store.apply({
-      type: 'approval.request',
-      session_id: 'live-1',
-      payload: { command: 'rm -rf /tmp/x', description: 'delete temp', request_id: 'approval-new' }
+  test('request.cancel on an approval: timeout reads as expired, resolved as answered elsewhere', () => {
+    const expired = createSessionStore()
+    expired.adoptFreshSession('live-1')
+    openRequest(expired, 'approval', 'approval-new', {
+      command: 'rm -rf /tmp/x',
+      description: 'delete temp',
+      session_id: 'live-1'
     })
+    expired.apply(cancelEvent('approval-old', 'approval'))
+    expect(expired.state.prompt).toMatchObject({ kind: 'approval', requestId: 'approval-new' })
+    expired.apply(cancelEvent('approval-new', 'approval'))
+    expect(expired.state.prompt).toBeUndefined()
+    expect(expired.state.messages.at(-1)?.text).toBe('approval expired — no consent was granted')
 
-    store.apply({
-      type: 'approval.resolved',
-      session_id: 'live-1',
-      payload: { request_id: 'approval-old', status: 'expired' }
-    })
-    store.apply({
-      type: 'approval.resolved',
-      session_id: 'old-session',
-      payload: { request_id: 'approval-new', status: 'expired' }
-    })
-    store.apply({
-      type: 'approval.resolved',
-      session_id: 'live-1',
-      payload: { request_id: 'approval-new', session_id: 'old-session', status: 'expired' }
-    })
-    expect(store.state.prompt).toMatchObject({ kind: 'approval', requestId: 'approval-new' })
-
-    store.apply({
-      type: 'approval.resolved',
-      session_id: 'live-1',
-      payload: { request_id: 'approval-new', status: 'expired' }
-    })
-    expect(store.state.prompt).toBeUndefined()
-    expect(store.state.messages.at(-1)?.text).toBe('approval expired — no consent was granted')
+    const resolved = createSessionStore()
+    openRequest(resolved, 'approval', 'approval-elsewhere', { command: 'ls', description: 'd' })
+    resolved.apply(cancelEvent('approval-elsewhere', 'approval', 'resolved'))
+    expect(resolved.state.prompt).toBeUndefined()
+    expect(resolved.state.messages.at(-1)?.text).toContain('no longer pending')
   })
 
-  test('clarify expiry clears only the exact request', () => {
+  test('clarify request.cancel clears only the exact request', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { question: 'New?', request_id: 'clarify-new' } })
-    store.apply({ type: 'clarify.expire', payload: { request_id: 'clarify-old' } })
+    openRequest(store, 'clarify', 'clarify-new', { question: 'New?' })
+    store.apply(cancelEvent('clarify-old', 'clarify'))
     expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'clarify-new' })
-    store.apply({ type: 'clarify.expire', payload: { request_id: 'clarify-new' } })
+    store.apply(cancelEvent('clarify-new', 'clarify'))
     expect(store.state.prompt).toBeUndefined()
     expect(store.state.messages.at(-1)?.text).toBe('clarification expired — no response was accepted')
-  })
-
-  test('reconnect pending approval reconciliation is fenced by session, request, and generation', () => {
-    const pending = {
-      command: 'echo pending',
-      description: 'pending approval',
-      request_id: 'approval-pending'
-    }
-    const store = createSessionStore()
-    store.adoptFreshSession('live-1')
-    const emptyRevision = store.getPromptRevision()
-
-    expect(store.reconcilePendingApprovals('old-session', emptyRevision, undefined, [pending])).toBe(false)
-    expect(store.reconcilePendingApprovals('live-1', emptyRevision, 'wrong-request', [pending])).toBe(false)
-    expect(store.state.prompt).toBeUndefined()
-    expect(store.reconcilePendingApprovals('live-1', emptyRevision, undefined, [pending])).toBe(true)
-    expect(store.state.prompt).toMatchObject({
-      kind: 'approval',
-      requestId: 'approval-pending',
-      sessionId: 'live-1'
-    })
-
-    const approvalRevision = store.getPromptRevision()
-    store.apply({ type: 'clarify.request', payload: { question: 'replacement', request_id: 'clarify-new' } })
-    expect(store.reconcilePendingApprovals('live-1', approvalRevision, 'approval-pending', [])).toBe(false)
-    expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'clarify-new' })
-  })
-
-  test('an empty reconnect snapshot retires the exact still-visible approval as obsolete', () => {
-    const store = createSessionStore()
-    store.adoptFreshSession('live-1')
-    store.apply({
-      type: 'approval.request',
-      session_id: 'live-1',
-      payload: { command: 'echo stale', description: 'old approval', request_id: 'approval-stale' }
-    })
-    const revision = store.getPromptRevision()
-
-    expect(store.reconcilePendingApprovals('live-1', revision, 'approval-stale', [])).toBe(true)
-    expect(store.state.prompt).toBeUndefined()
-    expect(store.state.messages.at(-1)?.text).toContain('no longer pending')
   })
 })
 
@@ -1096,8 +1040,7 @@ describe('session store — batch (multi-question) clarify', () => {
     questions: [
       { choices: ['a', 'b'], qid: 'q0', question: 'One?' },
       { choices: null, qid: 'q1', question: 'Two?' }
-    ],
-    request_id: 'req-batch'
+    ]
   }
 
   /** The active clarify prompt, asserted into its narrowed shape. */
@@ -1107,9 +1050,9 @@ describe('session store — batch (multi-question) clarify', () => {
     return prompt
   }
 
-  test('a batch clarify.request sets a questions prompt with an empty answers map', () => {
+  test('a batch clarify request sets a questions prompt with an empty answers map', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: BATCH })
+    openRequest(store, 'clarify', 'req-batch', BATCH)
     const p = clarifyPrompt(store)
     expect(p.requestId).toBe('req-batch')
     expect(p.questions).toHaveLength(2)
@@ -1118,25 +1061,21 @@ describe('session store — batch (multi-question) clarify', () => {
     expect(p.answers).toEqual({})
   })
 
-  test('a reconnect-replay batch clarify.request seeds the locked answers', () => {
+  test('a reconnect-replay batch clarify request seeds the locked answers', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { ...BATCH, answers: { q0: 'a' }, request_id: 'req-replay' } })
+    openRequest(store, 'clarify', 'req-replay', { ...BATCH, answers: { q0: 'a' } })
     expect(clarifyPrompt(store).answers).toEqual({ q0: 'a' })
   })
 
   test('malformed batch entries are dropped; single-question shape wins when none survive', () => {
     const store = createSessionStore()
-    store.apply({
-      type: 'clarify.request',
-      payload: {
-        choices: ['x', 'y'],
-        question: 'Fallback?',
-        questions: [
-          { qid: '', question: 'no qid' },
-          { qid: 'q1', question: '   ' }
-        ],
-        request_id: 'req-bad'
-      }
+    openRequest(store, 'clarify', 'req-bad', {
+      choices: ['x', 'y'],
+      question: 'Fallback?',
+      questions: [
+        { qid: '', question: 'no qid' },
+        { qid: 'q1', question: '   ' }
+      ]
     })
     const p = clarifyPrompt(store)
     expect(p.questions).toBeUndefined()
@@ -1146,7 +1085,7 @@ describe('session store — batch (multi-question) clarify', () => {
 
   test('recordClarifyAnswer locks answers one at a time and reports the remaining count', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: BATCH })
+    openRequest(store, 'clarify', 'req-batch', BATCH)
     // out-of-order lock (Tab affordance) — q1 first
     expect(store.recordClarifyAnswer('q1', 'beta')).toBe(1)
     expect(clarifyPrompt(store).answers).toEqual({ q1: 'beta' })
@@ -1158,7 +1097,7 @@ describe('session store — batch (multi-question) clarify', () => {
 
   test('re-locking a question overwrites its earlier answer (revisit edit)', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: BATCH })
+    openRequest(store, 'clarify', 'req-batch', BATCH)
     store.recordClarifyAnswer('q0', 'first')
     expect(store.recordClarifyAnswer('q0', 'changed')).toBe(1)
     expect(clarifyPrompt(store).answers).toEqual({ q0: 'changed' })
@@ -1166,7 +1105,7 @@ describe('session store — batch (multi-question) clarify', () => {
 
   test('an abandoned batch persists its locked partials on the clarify tool.complete', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-timeout' } })
+    openRequest(store, 'clarify', 'req-timeout', BATCH)
     store.recordClarifyAnswer('q0', 'alpha')
     // server-side deadline: the clarify tool settles while the prompt is open
     store.apply({ type: 'tool.complete', payload: { name: 'clarify', tool_id: 'clar-b' } })
@@ -1188,7 +1127,7 @@ describe('session store — batch (multi-question) clarify', () => {
 
   test('message.complete is the backstop flush when no clarify tool.complete arrived', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-backstop' } })
+    openRequest(store, 'clarify', 'req-backstop', BATCH)
     store.apply({ type: 'message.complete' })
     expect(store.state.prompt).toBeUndefined()
     const record = store.state.messages.find(
@@ -1199,7 +1138,7 @@ describe('session store — batch (multi-question) clarify', () => {
 
   test('flushAbandonedClarify("cancelled") records the Esc cancel-all with its partials', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-cancel' } })
+    openRequest(store, 'clarify', 'req-cancel', BATCH)
     store.recordClarifyAnswer('q0', 'kept')
     store.flushAbandonedClarify('cancelled')
     const record = store.state.messages.find(
@@ -1210,11 +1149,11 @@ describe('session store — batch (multi-question) clarify', () => {
     expect(store.state.prompt).toBeUndefined()
   })
 
-  test('clarify.expire preserves locked batch partials with an expired record', () => {
+  test('request.cancel preserves locked batch partials with an expired record', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { ...BATCH, request_id: 'req-expired' } })
+    openRequest(store, 'clarify', 'req-expired', BATCH)
     store.recordClarifyAnswer('q0', 'kept')
-    store.apply({ type: 'clarify.expire', payload: { request_id: 'req-expired' } })
+    store.apply(cancelEvent('req-expired', 'clarify'))
     const record = store.state.messages.find(
       message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
     )
@@ -1226,7 +1165,7 @@ describe('session store — batch (multi-question) clarify', () => {
 
   test('a single-question clarify prompt is never batch-flushed (behavior preserved)', () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { choices: ['a'], question: 'One?', request_id: 'r-single' } })
+    openRequest(store, 'clarify', 'r-single', { choices: ['a'], question: 'One?' })
     store.apply({ type: 'tool.complete', payload: { name: 'clarify', tool_id: 'clar-s' } })
     store.apply({ type: 'message.complete' })
     expect(store.state.prompt).toMatchObject({ kind: 'clarify', question: 'One?' })

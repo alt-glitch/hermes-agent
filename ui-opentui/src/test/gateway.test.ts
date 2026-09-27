@@ -28,7 +28,7 @@ describe('GatewayService via FakeGateway (Phase 0)', () => {
       // Emit after subscribing (synchronous fan-out in the fake).
       controller.emit({ type: 'gateway.ready' })
       controller.emit({ type: 'message.start' })
-      yield* gateway.request('prompt.submit', { text: 'hi' })
+      yield* gateway.request('prompt.submit', { session_id: 'sid-test', text: 'hi' })
       unsubscribe()
       controller.emit({ type: 'message.complete' }) // dropped: unsubscribed
 
@@ -37,7 +37,9 @@ describe('GatewayService via FakeGateway (Phase 0)', () => {
         received.map(e => e.type),
         ['gateway.ready', 'message.start']
       )
-      assert.deepStrictEqual(controller.calls, [{ method: 'prompt.submit', params: { text: 'hi' } }])
+      assert.deepStrictEqual(controller.calls, [
+        { method: 'prompt.submit', params: { session_id: 'sid-test', text: 'hi' } }
+      ])
     }).pipe(Effect.provide(fakeGatewayLayerWith(controller)))
   })
 })
