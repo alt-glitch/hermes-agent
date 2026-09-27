@@ -69,6 +69,12 @@ import sys
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 _OPENTUI = ("ui-opentui/", "tui_gateway/")
+# ui-opentui's request() is typed against these generated contract files (type-only
+# import via its tsconfig paths alias), so a contract-only change must run its tsc.
+_OPENTUI_FILES = {
+    "apps/shared/src/gateway-contract.generated.ts",
+    "apps/shared/src/gateway-contract.openrpc.json",
+}
 # Shipped page outside those packages, exercised by the desktop Electron suite.
 _FRONTEND_FILES = {"scripts/desktop-update/ui.html"}
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
@@ -212,7 +218,7 @@ def _is_rust(p: str) -> bool:
 
 
 def _is_opentui(p: str) -> bool:
-    return p.startswith(_OPENTUI) and not _is_docs(p)
+    return (p.startswith(_OPENTUI) or p in _OPENTUI_FILES) and not _is_docs(p)
 
 
 def _is_ci_review(p: str) -> bool:
