@@ -75,10 +75,11 @@ jobs:
             runner: macos-15
           - label: darwin-x64
             runner: macos-15-intel
+          # Forks have no larger runners: fall back to the hosted images.
           - label: win32-x64
-            runner: windows-latest-32-core
+            runner: ${{ github.repository_owner == 'NousResearch' && 'windows-latest-32-core' || 'windows-latest' }}
           - label: win32-arm64
-            runner: windows-latest-32-arm-core
+            runner: ${{ github.repository_owner == 'NousResearch' && 'windows-latest-32-arm-core' || 'windows-11-arm' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:

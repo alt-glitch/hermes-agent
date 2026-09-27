@@ -29,7 +29,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [windows-latest-32-arm-core, windows-latest-32-arm-core]
+        # Forks have no larger runners: windows-11-arm is the hosted arm64 image.
+        runner: ${{ github.repository_owner == 'NousResearch' && fromJSON('["windows-latest-32-arm-core", "windows-latest-32-arm-core"]') || fromJSON('["windows-11-arm", "windows-11-arm"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
