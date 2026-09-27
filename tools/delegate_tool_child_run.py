@@ -301,6 +301,10 @@ class _Heartbeat:
         touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
         if not touch:
             return None
+        if self.stale_threshold_seconds is not None:
+            # The child did not unwind within one cycle of the stale verdict's interrupt: abandon its wait.
+            self.settled.set()
+            return False
         desc = f"delegate_task: subagent {task_index} working"
         try:
             child_summary = child.get_activity_summary()
@@ -327,12 +331,13 @@ class _Heartbeat:
                     "interrupting child and abandoning its wait",
                     task_index, last_seen["stale"], child_tool or "<none>",
                 )
-                # A finite/-Q turn has no gateway watchdog behind this; end the wait and preserve the fork's immediate
-                # cooperative interrupt. await_child repeats the signal while building the authoritative timeout entry.
+                # Interrupt now and give the child one heartbeat cycle to unwind: a child that honours it is joined
+                # with its own interrupted result. Setting ``settled`` here too raced that unwind against
+                # await_child's done() check, so the same stall read as interrupted or timeout by scheduling luck.
+                # The next tick still ends the wait (a finite/-Q turn has no gateway watchdog behind this).
                 self.stale_threshold_seconds = stale_cycles * _HEARTBEAT_INTERVAL
                 _signal_child_stop(child, reason)
-                self.settled.set()
-                return False
+                return None
             if child_tool:
                 desc = f"delegate_task: subagent running {child_tool} (iteration {child_iter}/{child_max})"
             elif child_summary.get("last_activity_desc", ""):
