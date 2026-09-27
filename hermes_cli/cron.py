@@ -235,6 +235,7 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
         ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
          if job.get("no_agent") else ""),
         ("Workdir", job.get("workdir")),
+        ("Python", job.get("interpreter")),
         ("Agent idle limit", "unlimited" if job.get("inactivity_timeout_seconds") == 0
          else f"{job['inactivity_timeout_seconds']}s"
          if "inactivity_timeout_seconds" in job else ""),
@@ -675,6 +676,7 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
+                   ("interpreter", "interpreter"),
                    ("inactivity_timeout_seconds", "inactivity_timeout_seconds"))
 
 
@@ -689,7 +691,8 @@ _JOB_DETAIL_LINES = (
     ("monitor_url", "  Monitor: {} (agent runs only on output change)"),
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
-    ("workdir", "  Workdir: {}"))
+    ("workdir", "  Workdir: {}"),
+    ("interpreter", "  Python: {}"))
 
 
 def _print_job_details(job_data: Dict[str, Any]) -> None:

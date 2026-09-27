@@ -154,6 +154,9 @@ def _git_checkout_fake(branch, *, remote_branches, commit_count="2"):
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{state['branch']}\n", stderr="")
         if "fetch" in args:
             fetched = args[-1]
+            if fetched.startswith("+refs/heads/"):
+                # Upstream's narrow-clone refspec fetch: reduce to the branch name.
+                fetched = fetched[len("+refs/heads/"):].split(":", 1)[0]
             if fetched in remote_branches:
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             return subprocess.CompletedProcess(

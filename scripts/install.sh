@@ -566,15 +566,20 @@ stage_repository() {
         fi
         # Fork: older installs are single-branch (--depth 1) clones whose fetch
         # refspec covers only the branch they were cloned on; without it
-        # origin/$BRANCH is never recorded and a switch onto a fork branch
-        # cannot check it out. Track $BRANCH as well (never narrow the refspec).
+        # origin/$BRANCH is never recorded on later by-name fetches and the
+        # branch created below gets no upstream. Track $BRANCH as well (never
+        # narrow the refspec).
         if ! git -C "$INSTALL_DIR" config --get-all remote.origin.fetch 2>/dev/null \
             | grep -Fqx -e "+refs/heads/*:refs/remotes/origin/*" \
                 -e "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"; then
             git -C "$INSTALL_DIR" remote set-branches --add origin "$BRANCH" \
                 || fail "cannot track origin/$BRANCH in $INSTALL_DIR"
         fi
-        run_logged "Fetching origin/$BRANCH" git -C "$INSTALL_DIR" fetch origin "$BRANCH" || fail "git fetch failed"
+        # Explicit refspec: a tag-pinned --single-branch checkout from an older
+        # installer maps only the tag, so a by-name fetch writes FETCH_HEAD and
+        # never the origin/$BRANCH everything below resolves (#125112).
+        run_logged "Fetching origin/$BRANCH" git -C "$INSTALL_DIR" fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" \
+            || fail "git fetch failed"
         local stamp
         stamp="$(date -u +%Y%m%d-%H%M%S)"
         # Park local work BEFORE switching branches: checkout refuses a dirty
@@ -594,7 +599,15 @@ stage_repository() {
                 || fail "could not stash local changes in $INSTALL_DIR; commit or move them aside, then rerun"
             log_warn "local changes stashed as hermes-install-autostash-$stamp"
         fi
-        run_logged "Checking out $BRANCH" git -C "$INSTALL_DIR" checkout "$BRANCH" || fail "git checkout failed"
+        # checkout's branch guess only sees remote refs the refspec maps, so a
+        # narrow checkout (detached at its tag, no local branch) gets the branch
+        # created at the fetched tip.
+        if git -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+            run_logged "Checking out $BRANCH" git -C "$INSTALL_DIR" checkout "$BRANCH" || fail "git checkout failed"
+        else
+            run_logged "Checking out $BRANCH" git -C "$INSTALL_DIR" checkout -b "$BRANCH" "origin/$BRANCH" \
+                || fail "git checkout failed"
+        fi
         if ! run_logged --may-fail "Fast-forwarding to origin/$BRANCH" \
             git -C "$INSTALL_DIR" merge --ff-only "origin/$BRANCH"; then
             # A release cut off the main line, a force-pushed remote, or the

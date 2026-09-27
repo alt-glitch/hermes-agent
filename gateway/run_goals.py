@@ -676,7 +676,7 @@ class GatewayGoalsMixin:
         Each hit uses ``_fire_due_loop_wakeups_once`` so canonical session origins, adapter ownership,
         Relay fallback, stale-claim recovery, and claim IDs stay identical to a direct scan.
         """
-        from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
+        from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
         from gateway.run_idle_gates import profile_has_active_loop
 
         await asyncio.sleep(5)  # let platforms finish connecting
@@ -691,7 +691,9 @@ class GatewayGoalsMixin:
         while self._running:
             try:
                 scan_now = time.time()
-                for profile_name, profile_home in _handoff_watch_scopes(self):
+                # Multiplex resolution walks the filesystem off-loop; a stalled walk on the loop
+                # trips the loop-liveness watchdog (exit 75).
+                for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
                     # Idle gate skips secondary scope setup when no active loop exists. The root
                     # scan stays cheap and binds the launch profile once multiplexing is active.
                     if profile_home is not None and not await self._run_in_executor_with_context(
