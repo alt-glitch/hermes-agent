@@ -410,3 +410,75 @@ test('the final clarify.lock forgets the batch request', async () => {
   expect(gateway.responsesFor('srq-batch')).toEqual([])
   client.stop()
 })
+
+test('a request.cancel that lands before the activation response keeps the replayed id closed', async () => {
+  const cancelled = { id: 'srq-gone', method: 'clarify', params: { session_id: 's1', question: 'Still there?' } }
+  const gateway = mockGateway({
+    // The backend listed srq-gone in open_requests, then cancelled it before this response was written.
+    'session.activate': params => {
+      gateway.send({
+        jsonrpc: '2.0',
+        method: 'event',
+        params: {
+          type: 'request.cancel',
+          session_id: 's1',
+          payload: { id: 'srq-gone', method: 'clarify', reason: 'timeout' }
+        }
+      })
+      return { session_id: params['session_id'], messages: [], open_requests: [cancelled] }
+    }
+  })
+  const { store, router, client, transport } = startClient(gateway)
+
+  await Effect.runPromise(activateSession(transport, store, { targetSessionId: 's1' }))
+  expect(store.state.sessionId).toBe('s1')
+  expect(store.state.prompt).toBeUndefined()
+  expect(router.pending()).toEqual([])
+  expect(router.answer('srq-gone', { answer: 'late' })).toBe('closed')
+  await new Promise(resolve => setTimeout(resolve, 10))
+  expect(gateway.responsesFor('srq-gone')).toEqual([])
+  client.stop()
+})
+
+/** Just enough of a WebSocket for the client to attach to: records what is sent on it. */
+class RecordingWebSocket extends EventTarget {
+  static last: RecordingWebSocket | undefined
+  readyState = 1
+  readonly sent: string[] = []
+  constructor(readonly url: string) {
+    super()
+    RecordingWebSocket.last = this
+  }
+  send(frame: string): void {
+    this.sent.push(frame)
+  }
+  close(): void {
+    this.readyState = 3
+  }
+}
+
+test('replacing the transport withdraws held requests: the prompt expires and nothing reaches the new connection', async () => {
+  const gateway = mockGateway()
+  const { store, router, client } = startClient(gateway, 's')
+  gateway.send(clarify('srq-held', 's', 'Name?'))
+  await vi.waitFor(() => expect(store.state.prompt).toMatchObject({ requestId: 'srq-held' }))
+
+  vi.stubGlobal('WebSocket', RecordingWebSocket)
+  vi.stubEnv('HERMES_TUI_GATEWAY_URL', 'ws://new.test/api/ws')
+  try {
+    // The attach URL changed: the client switches from the stdio child to the new socket.
+    client.start()
+    const socket = RecordingWebSocket.last
+    expect(socket?.url).toBe('ws://new.test/api/ws')
+    expect(store.state.prompt).toBeUndefined()
+    expect(store.state.messages.map(m => m.text)).toContain('clarification expired — no response was accepted')
+    expect(router.pending()).toEqual([])
+    expect(router.answer('srq-held', { answer: 'late' })).toBe('closed')
+    expect(socket?.sent).toEqual([])
+    expect(gateway.written.filter(f => !('method' in f))).toEqual([])
+  } finally {
+    client.stop()
+    vi.unstubAllEnvs()
+    vi.unstubAllGlobals()
+  }
+})

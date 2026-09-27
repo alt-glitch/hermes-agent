@@ -1156,7 +1156,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         // After the store settled the withdrawn prompt (expired notice, batch record): the router
         // then drops the id and, when it was the shown one, opens the next queued request.
         if (event.type === 'request.cancel') serverRequests.forget(event.payload.id)
-        // A crashed gateway never sends request.cancel, and the respawned one never issued the held
+        // A crashed or replaced gateway never sends request.cancel, and the next one never issued the held
         // ids: withdraw them all (the shown prompt settles with the expired notice).
         else if (event.type === 'gateway.exited') serverRequests.withdrawAll('gateway-exited')
       })

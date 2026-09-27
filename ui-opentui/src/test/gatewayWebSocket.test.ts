@@ -283,7 +283,8 @@ describe('RawGatewayClient dashboard websocket attachment', () => {
     await vi.advanceTimersByTimeAsync(WS_HEARTBEAT_DEAD_MS + WS_HEARTBEAT_INTERVAL_MS)
     expect(first.sent).toHaveLength(1)
     expect(replacement.sent).toEqual([])
-    expect(onExit).not.toHaveBeenCalled()
+    // The replacement itself is the only exit; the old socket's heartbeat never adds a second one.
+    expect(onExit.mock.calls).toEqual([['gateway attach url changed']])
 
     client.stop()
     expect(vi.getTimerCount()).toBe(0)

@@ -117,7 +117,8 @@ export interface ServerRequestRouter {
   /** The backend settled `id` without this answer (`request.cancel`, final `clarify.lock`): drop it and,
    *  when it was the shown one, open the next. True when it was held. */
   readonly forget: (id: string) => boolean
-  /** The gateway process is gone (`gateway.exited`): it will never answer or cancel what it asked,
+  /** The gateway connection is gone (`gateway.exited`: the process exited, or the client replaced the
+   *  transport because the attach URL changed): it will never answer or cancel what it asked,
    *  and a respawned one never issued these ids. Drop every held request and settle each through
    *  `settleWithdrawn` with `reason`, the same store path as a `request.cancel`. */
   readonly withdrawAll: (reason: string) => void
@@ -143,10 +144,22 @@ export interface ServerRequestRouterOptions {
  * session's oldest request is shown. When the displayed session changes, its oldest held request
  * opens, so a request that arrived for a session before it was displayed is shown as soon as it is,
  * whether it came before or after the hydration's `open_requests`. A replayed id that is already held
- * keeps its place.
+ * keeps its place. A replayed id that was already answered or settled stays closed: `open_requests` is
+ * a snapshot taken when the backend handled session.activate / session.resume, and a `request.cancel`
+ * (or our answer) for one of its ids can land before that response does.
  */
+/** Closed ids kept for replays; far more than can settle while one hydration request is in flight. */
+const CLOSED_IDS_KEPT = 256
+
 export function createServerRequestRouter(options: ServerRequestRouterOptions): ServerRequestRouter {
   const held = new Map<string, DecodedServerRequest[]>()
+  // Ids answered or settled, oldest first. Backend ids are unique (`srq-<uuid>`), and an id only needs
+  // to stay here until the hydration response that may still list it has been replayed.
+  const closed = new Set<string>()
+  const close = (id: string): void => {
+    closed.add(id)
+    if (closed.size > CLOSED_IDS_KEPT) closed.delete(closed.values().next().value as string)
+  }
   const showHead = (sessionId: string | undefined): void => {
     const head = sessionId === undefined ? undefined : held.get(sessionId)?.[0]
     if (head) options.openPrompt(head.prompt)
@@ -165,6 +178,7 @@ export function createServerRequestRouter(options: ServerRequestRouterOptions): 
     return null
   }
   const remove = (id: string): boolean => {
+    close(id)
     const found = find(id)
     if (!found) return false
     found.queue.splice(found.index, 1)
@@ -180,6 +194,8 @@ export function createServerRequestRouter(options: ServerRequestRouterOptions): 
     handle: request => {
       const next = decodeServerRequest(request)
       if (typeof next === 'string') return next
+      // Already answered or settled: a replay from a snapshot older than that. Nothing to show or write.
+      if (closed.has(next.id)) return 'held'
       const queue = held.get(next.sessionId) ?? []
       held.set(next.sessionId, queue)
       const index = queue.findIndex(h => h.id === next.id)

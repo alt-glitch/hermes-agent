@@ -91,7 +91,8 @@ export interface RawClientOptions {
   readonly log: Log
   /** Called with each server-pushed event's `params` object (still unknown — decoded upstream). */
   readonly onEvent: (params: unknown) => void
-  /** Called when the child exits / errors (so the layer can reject pending + reconnect). */
+  /** Called when the child exits / errors, or the attach URL changes and the transport is replaced
+   *  (so the layer can reject pending + reconnect). */
   readonly onExit?: (reason: string) => void
   /** Called with each backend→client JSON-RPC request (`tui_gateway/server_requests.py`). The handler
    *  decodes it; a rejection is answered at once (-32601 / -32602) so the backend tool fails fast. */
@@ -574,7 +575,9 @@ export class RawGatewayClient {
     this.clearStartupWatchdog()
     this.clearCloseWatchdog()
     this.transportAccepting = false
-    this.rejectAll(reason)
+    // The old connection is gone for this client exactly as if it had exited: the same onExit, so
+    // what it asked (held server requests) is withdrawn and its pending RPCs are rejected.
+    notifyTransportExit(reason, this.onExit, failedReason => this.rejectAll(failedReason))
     this.closeSocket()
     const proc = this.proc
     this.proc = null
