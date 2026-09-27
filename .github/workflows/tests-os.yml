@@ -162,7 +162,9 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '2' || '8') || '' }}
+          # Fork x64 runs on the 4-vCPU hosted image, where 8 workers time out the
+          # PowerShell hand-off tests; use the arm64 row's 2 there too.
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && ((runner.arch == 'ARM64' || github.repository_owner != 'NousResearch') && '2' || '8') || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
