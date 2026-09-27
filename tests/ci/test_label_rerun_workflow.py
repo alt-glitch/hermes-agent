@@ -41,7 +41,7 @@ def test_label_recovery_targets_only_the_review_gate(
     script = workflow["jobs"]["rerun-review-labels"]["steps"][0]["run"]
     gh = tmp_path / "gh"
     gh.write_text(
-        r'''#!/bin/bash
+        r'''#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$CALLS"
 
 bad_args() {
@@ -128,7 +128,7 @@ esac
     calls = tmp_path / "calls"
     timeout = tmp_path / "timeout"
     timeout.write_text(
-        """#!/bin/bash
+        """#!/usr/bin/env bash
 printf 'timeout %s\\n' "$*" >> "$CALLS"
 [[ "$1" == 6000 ]] || exit 92
 [[ "$SCENARIO" != watch-timeout ]] || exit 124
