@@ -2,6 +2,7 @@ import { skillInvocationText } from '@hermes/shared'
 
 import { extractImageRefs } from '@/lib/embedded-images'
 import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
+import { isTodoToolName } from '@/lib/todos'
 import type { MessageReaction, SessionMessage } from '@/types/hermes'
 
 import {
@@ -23,6 +24,10 @@ import {
 import type { ChatMessage, ChatMessagePart } from './types'
 
 const ATTACHED_CONTEXT_MARKER_RE = /(?:^|\n)--- Attached Context ---\s*\n/
+// A background-process heartbeat wake persisted by a backend older than the
+// one that types those rows `display_kind=hidden`. It is model scaffolding,
+// not something the user wrote, so it never paints as a bubble.
+const LEGACY_HEARTBEAT_ROW_RE = /^\[Background process \S+ heartbeat #\d+ /
 const CONTEXT_WARNINGS_MARKER_RE = /(?:^|\n)--- Context Warnings ---[\s\S]*$/
 const CONTEXT_REF_RE = /@(file|folder|url|image|tool|terminal):(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\S+)/g
 
@@ -136,8 +141,16 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
   return [missing.join('\n'), visibleText].filter(Boolean).join('\n\n') || visibleText
 }
 
-function transcriptContent(displayKind: SessionMessage['display_kind'], content: string): string | null {
-  return displayKind === 'hidden' ? null : content
+function transcriptContent(
+  displayKind: SessionMessage['display_kind'],
+  role: SessionMessage['role'],
+  content: string
+): string | null {
+  if (displayKind === 'hidden') {
+    return null
+  }
+
+  return role === 'user' && LEGACY_HEARTBEAT_ROW_RE.test(content.trim()) ? null : content
 }
 
 /**
@@ -274,6 +287,37 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   // (see ChatMessage.serverRowSpan).
   let pendingToolRows = 0
   let activeAssistantIndex: null | number = null
+  // Todo history is stateful. Only a result from the nearest prior assistant
+  // call in this turn may update it; a display-only orphan can still render.
+  let nearestAssistant: null | SessionMessage = null
+
+  const pairedTodoResult = (toolMessage: SessionMessage): boolean => {
+    const id = toolMessage.tool_call_id
+
+    if (!id || !Array.isArray(nearestAssistant?.tool_calls)) {
+      return false
+    }
+
+    return nearestAssistant.tool_calls.some((call, index) => {
+      const part = toolPartFromStoredCall(call, index)
+
+      if (part.type !== 'tool-call' || part.toolCallId !== id) {
+        return false
+      }
+
+      if (isTodoToolName(part.toolName)) {
+        return true
+      }
+
+      const args = part.args as { calls?: unknown }
+
+      return (
+        part.toolName === 'tool_call' &&
+        Array.isArray(args?.calls) &&
+        args.calls.some(inner => inner && typeof inner === 'object' && isTodoToolName(inner.name))
+      )
+    })
+  }
 
   const clearPendingTools = () => {
     pendingToolParts = []
@@ -336,7 +380,21 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   }
 
   messages.forEach((message, index) => {
+    if (message.role === 'assistant') {
+      nearestAssistant = message
+    } else if (message.role === 'user' || message.role === 'system') {
+      nearestAssistant = null
+    }
+
     if (message.role === 'tool') {
+      if (isTodoToolName(message.tool_name) && !pairedTodoResult(message)) {
+        pendingToolParts = [...pendingToolParts, storedToolMessagePart(message, index)]
+        pendingToolTimestamp ??= message.timestamp
+        pendingToolRows += 1
+
+        return
+      }
+
       const updatedPendingToolParts = applyStoredToolResultToParts(pendingToolParts, message)
 
       if (updatedPendingToolParts) {
@@ -364,6 +422,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     const rawDisplayContent = transcriptContent(
       message.display_kind,
+      message.role,
       timelineDisplayContent(message, displayContentForMessage(message.role, content))
     )
 

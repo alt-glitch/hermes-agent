@@ -576,6 +576,14 @@ def _history_profile_home(profile):
     return get_hermes_home()
 
 
+def _session_files_dir(profile) -> Path:
+    """Transcript dir of the profile whose store a delete targets: ``SessionDB.delete_session`` only
+    unlinks the session's on-disk artifacts when handed this, and a row-only delete leaves the
+    (secret-bearing) ``session_<id>.json`` snapshots and ``request_dump_<id>_*.json`` readable after
+    the user removed the session (#55088, #60207)."""
+    return _history_profile_home(profile) / "sessions"
+
+
 def _project_for_display(messages: list, *, home=None) -> list:
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
@@ -717,7 +725,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
         sid = _resolve_session_id(db, session_id)
         if not sid:
             return {"ok": True, "already_absent": True}
-        db.delete_session(sid)
+        db.delete_session(sid, sessions_dir=_session_files_dir(profile))
         return {"ok": True}
 
     return await asyncio.to_thread(_with_db, profile, _delete, read_only=False)

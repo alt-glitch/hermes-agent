@@ -21721,6 +21721,7 @@
         "enum": [
           "connected",
           "app_not_running",
+          "hermes_not_connected",
           "endpoint_unavailable",
           "no_interactive_session",
           "version_too_old",
@@ -39462,7 +39463,7 @@
     },
     {
       "name": "projects.changed",
-      "summary": "projects.db moved; refetch the Projects sidebar.",
+      "summary": "projects.db moved; refetch the project list + tree.",
       "params": [
         {
           "name": "payload",
