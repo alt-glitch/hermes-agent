@@ -100,7 +100,8 @@ jobs:
   bundled-e2e:
     name: packaged bundle (open-app-update)
     if: inputs.install-method == 'packaged-app' && inputs.update-method == 'open-app-update'
-    runs-on: ${{ inputs.bundle-arch == 'arm64' && 'windows-latest-32-arm-core' || 'windows-latest-32-core' }}
+    # Forks have no larger runners; windows-11-arm / windows-latest are the hosted equivalents.
+    runs-on: ${{ github.repository_owner != 'NousResearch' && (inputs.bundle-arch == 'arm64' && 'windows-11-arm' || 'windows-latest') || (inputs.bundle-arch == 'arm64' && 'windows-latest-32-arm-core' || 'windows-latest-32-core') }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -170,7 +171,8 @@ jobs:
         || (contains(fromJSON('["installer-script+desktop", "hermes-desktop-app-update", "desktop-installer@latest"]'), inputs.update-method) && inputs.tag-has-desktop)
         || (inputs.update-method == 'open-app-update' && inputs.tag-has-desktop
             && contains(fromJSON('["desktop-installer@latest", "installer-script+desktop"]'), inputs.install-method)))
-    runs-on: windows-latest-32-core
+    # Forks have no larger runners; fall back to the 4-vCPU image (tests-os.yml precedent).
+    runs-on: ${{ github.repository_owner == 'NousResearch' && 'windows-latest-32-core' || 'windows-latest' }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     env:
