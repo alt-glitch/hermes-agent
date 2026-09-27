@@ -308,9 +308,9 @@ export interface CompletionPlan {
    * legacy slash/path plans, which continue replacing through buffer end. */
   end?: number
   /** Inline `/skill`-reference query (a whitespace-preceded `/token` in prose,
-   *  Ink `useCompletion` parity): `skills_only` makes the gateway enumerate
-   *  authoritative skill/bundle sources, and `from`/`end` bound the real
-   *  composer token rather than the synthetic `/query` sent in `params`. */
+   *  Ink `useCompletion` parity): the caller keeps only the gateway's
+   *  `kind === 'skill'` rows, and `from`/`end` bound the real composer token
+   *  rather than the synthetic `/query` sent in `params`. */
   skillsOnly?: boolean
 }
 
@@ -383,7 +383,7 @@ export function planCompletion(text: string, cursor: number = text.length): Comp
         end,
         from: pos - query.length,
         method: 'complete.slash',
-        params: { skills_only: true, text: `/${query}` },
+        params: { text: `/${query}` },
         skillsOnly: true
       }
     }
@@ -728,14 +728,11 @@ function mapSkills(result: unknown): PickerItem[] {
   return items
 }
 
-/** Lightweight OpenTUI model-options request. The gateway defaults stay fully
- * enriched for desktop/Ink callers; this picker does not consume pricing or
- * capability fields and passive hydration must not probe a live custom endpoint. */
+/** `model.options` params for the picker. The handler reads only `session_id`,
+ * `explicit_only`, `include_unconfigured` and `refresh`; a normal open already
+ * probes only the current custom provider (hermes_cli/inventory.py). */
 export function modelOptionsParams(sessionId: string | undefined, refresh = false): Record<string, unknown> {
   return {
-    capabilities: false,
-    pricing: false,
-    probe_current_custom_provider: false,
     session_id: sessionId,
     ...(refresh ? { refresh: true } : {})
   }

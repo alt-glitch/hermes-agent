@@ -3500,7 +3500,6 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       case 'approval.resolved':
         if (
-          (event.payload.session_id === undefined || event.payload.session_id === event.session_id) &&
           state.sessionId === event.session_id &&
           state.prompt?.kind === 'approval' &&
           state.prompt.sessionId === event.session_id &&

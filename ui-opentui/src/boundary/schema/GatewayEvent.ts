@@ -263,10 +263,9 @@ const ApprovalResolved = Schema.Struct({
   type: Schema.Literal('approval.resolved'),
   session_id: Schema.NonEmptyString,
   payload: Schema.Struct({
+    // The envelope `session_id` routes the event; the payload carries only
+    // request_id + status (tui_gateway/server.py _emit_approval_lifecycle).
     request_id: Schema.NonEmptyString,
-    // The envelope is authoritative. Some gateways also duplicate the live
-    // session id here; the reducer requires equality when that field is present.
-    session_id: opt(Schema.NonEmptyString),
     status: Schema.Literals(['resolved', 'expired', 'cancelled'])
   })
 })

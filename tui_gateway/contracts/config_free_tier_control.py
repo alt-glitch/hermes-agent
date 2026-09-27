@@ -271,10 +271,27 @@ class ModelOptionProvider(OpenModel):
     unavailable_models: list[str] | None = None
 
 
+class ModelPickerUsageRow(Result):
+    """One ``recent_models`` / ``frequent_models`` row: a ``hermes_state_usage._list_picker_models``
+    row (``provider_id`` … ``activation_count``) plus the ``provider`` / ``provider_name`` of the
+    picker row it matched. The synthesized current-model row (methods_complete ``model.options``)
+    carries no ``provider_id``."""
+
+    provider: str
+    provider_name: str
+    model: str
+    base_url: str | None = None
+    last_used_at: float | None = None
+    activation_count: int = 0
+    provider_id: str | None = None
+
+
 class ModelOptionsResult(Result):
     providers: list[ModelOptionProvider]
     model: str = ""
     provider: str = ""
+    recent_models: list[ModelPickerUsageRow] = Field(default_factory=list)
+    frequent_models: list[ModelPickerUsageRow] = Field(default_factory=list)
 
 
 method("model.options", params=ModelOptionsParams, result=ModelOptionsResult,
@@ -403,7 +420,10 @@ class SessionControlReadParams(ProfileParams):
 
 
 class SessionControlReadResult(Result):
+    """``event_seq`` is the replay sequence the snapshot was read at (``event_replay.latest_seq``)."""
+
     control: SessionControlSnapshot
+    event_seq: int
 
 
 method("session.control.read", params=SessionControlReadParams, result=SessionControlReadResult,
@@ -453,8 +473,12 @@ class SessionControlDispatch(Result):
 
 
 class SessionControlResult(Result):
+    """``event_seq`` is the replay sequence of the published ``session.control.update`` (or the
+    latest sequence when ``command.dispatch`` already published it)."""
+
     control: SessionControlSnapshot
     dispatch: SessionControlDispatch
+    event_seq: int
 
 
 method("session.control", params=SessionControlParams, result=SessionControlResult,

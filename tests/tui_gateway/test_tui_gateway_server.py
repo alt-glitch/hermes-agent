@@ -18874,8 +18874,8 @@ def test_model_save_key_uses_credential_lifecycle_and_picker_context(monkeypatch
 
 def test_model_save_key_reconciles_the_launch_profiles_stale_setup_record(monkeypatch):
     """The gated picker's own chat waits on ``setup.status``, which answers from the boot record:
-    a key saved for the launch profile must flip a ``False`` record (+ ``setup.ready``) at once;
-    a key saved for another profile (``profile`` param) must leave the launch record alone."""
+    a saved key must flip a ``False`` record (+ ``setup.ready``) at once. ``ModelSaveKeyParams``
+    declares no ``profile`` (the handler is not profile-scoped), so every save is a launch-profile save."""
     from hermes_cli import free_tier_bootstrap as fb
 
     monkeypatch.setattr("hermes_cli.auth.PROVIDER_REGISTRY", {"test-provider": types.SimpleNamespace(
@@ -18896,8 +18896,6 @@ def test_model_save_key_reconciles_the_launch_profiles_stale_setup_record(monkey
         fb._done.set()
     try:
         params = {"slug": "test-provider", "api_key": "k-" + "1"}
-        assert "result" in server._methods["model.save_key"](104, {**params, "profile": "other"})
-        assert fb.current_record() is stale and broadcasts == [], "another profile's key is not ours"
         assert "result" in server._methods["model.save_key"](105, params)
         record = fb.current_record()
         assert record.provider_configured is True and record.inference_provider == "test-provider"

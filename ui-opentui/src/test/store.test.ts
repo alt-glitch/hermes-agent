@@ -1023,11 +1023,6 @@ describe('session store — blocking prompts (Phase 3)', () => {
       session_id: 'old-session',
       payload: { request_id: 'approval-new', status: 'expired' }
     })
-    store.apply({
-      type: 'approval.resolved',
-      session_id: 'live-1',
-      payload: { request_id: 'approval-new', session_id: 'old-session', status: 'expired' }
-    })
     expect(store.state.prompt).toMatchObject({ kind: 'approval', requestId: 'approval-new' })
 
     store.apply({

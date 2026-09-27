@@ -170,7 +170,7 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
         decode({
           type: 'approval.resolved',
           session_id: 'session-1',
-          payload: { request_id: 'approval-1', session_id: 'session-1', status: 'cancelled' }
+          payload: { request_id: 'approval-1', status: 'cancelled' }
         })
       )
     ).toBe(true)

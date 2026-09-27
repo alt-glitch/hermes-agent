@@ -2223,9 +2223,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             gateway.request('session.list', {
               limit: 200,
               offset: 0,
-              query: '',
-              scope: 'all',
-              sort: 'recent'
+              query: ''
             })
           ),
         refresh: () => activeSessionsRefresher.refresh(true).then(() => undefined),
