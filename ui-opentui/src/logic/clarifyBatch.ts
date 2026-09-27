@@ -3,12 +3,11 @@
  * the ClarifyPrompt view (Ink parity: ui-tui text.ts clarifyBatchRevisitState /
  * formatAbandonedClarifyBatch + createGatewayEventHandler's entry filter).
  *
- * Wire contract (tui_gateway `_clarify_block` / `_respond`):
- *   clarify.request  → payload.questions[{qid, question, choices, multi_select}]
- *                      (+ payload.answers{qid: answer} on a reconnect replay)
- *   clarify.respond  → {request_id, question_id, answer} locks ONE answer; the
- *                      prompt stays open until every qid is locked. A respond
- *                      WITHOUT question_id cancels the whole batch.
+ * Wire contract (tui_gateway `_clarify_block`, contracts/server_requests.py):
+ *   `clarify` server request → params.questions[{qid, question, choices, multi_select}]
+ *   clarify.lock RPC         → {request_id, question_id, answer} locks ONE answer; the
+ *                              prompt stays open until every qid is locked. The request's
+ *                              JSON-RPC response WITHOUT `answers` cancels the whole batch.
  *
  * multi_select is preserved on state (it rides the wire) but the prompt does
  * not render checkbox UX yet — same deliberate gap as Ink.

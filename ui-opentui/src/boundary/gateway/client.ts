@@ -26,6 +26,7 @@ import { getHeapStatistics } from 'node:v8'
 
 import type { Log } from '../log.ts'
 import { resolvePython, resolveSrcRoot } from './python.ts'
+import type { RpcMethod, RpcParams, RpcResult, ServerRequestMethod, ServerRequestResult } from './rpc.ts'
 
 interface Pending {
   resolve: (result: unknown) => void
@@ -90,8 +91,37 @@ export interface RawClientOptions {
   readonly log: Log
   /** Called with each server-pushed event's `params` object (still unknown — decoded upstream). */
   readonly onEvent: (params: unknown) => void
-  /** Called when the child exits / errors (so the layer can reject pending + reconnect). */
+  /** Called when the child exits / errors, or the attach URL changes and the transport is replaced
+   *  (so the layer can reject pending + reconnect). */
   readonly onExit?: (reason: string) => void
+  /** Called with each backend→client JSON-RPC request (`tui_gateway/server_requests.py`). The handler
+   *  decodes it; a rejection is answered at once (-32601 / -32602) so the backend tool fails fast. */
+  readonly onServerRequest?: (request: ServerRequest) => ServerRequestDisposition
+}
+
+/** One backend→client JSON-RPC request frame `{jsonrpc, id, method, params}` (id is `srq-<hex>`).
+ *  `params` is the raw frame value; the handler decodes it against `ServerRequestMap`. */
+export interface ServerRequest {
+  readonly id: string
+  readonly method: string
+  readonly params: unknown
+  /** Write `{jsonrpc, id, result}`. False when the transport is down (nothing written). */
+  readonly respond: (result: ServerRequestResult<ServerRequestMethod>) => boolean
+}
+
+/** How the handler took a request: held (answered later through `respond`), or rejected. */
+export type ServerRequestDisposition = 'held' | 'method-not-found' | 'invalid-params'
+
+const SERVER_REQUEST_REJECTIONS = {
+  'method-not-found': { code: -32601, message: 'method not handled' },
+  'invalid-params': { code: -32602, message: 'invalid params' }
+} as const satisfies Record<Exclude<ServerRequestDisposition, 'held'>, { code: number; message: string }>
+
+/** One `open_requests` entry: a request the backend is still waiting on (`OpenRequestEntry` contract). */
+export interface OpenRequestEntry {
+  readonly id: string
+  readonly method: string
+  readonly params: unknown
 }
 
 /** Machine-readable request failure provenance. Delivery-sensitive callers
@@ -252,12 +282,14 @@ export class RawGatewayClient {
   private readonly log: Log
   private readonly onEvent: (params: unknown) => void
   private readonly onExit?: (reason: string) => void
+  private readonly onServerRequest: ((request: ServerRequest) => ServerRequestDisposition) | undefined
   private readonly transportLog = new TransportLogRing()
 
   constructor(options: RawClientOptions) {
     this.log = options.log
     this.onEvent = options.onEvent
     if (options.onExit) this.onExit = options.onExit
+    this.onServerRequest = options.onServerRequest
   }
 
   private pushTransportLog(line: string): void {
@@ -543,7 +575,9 @@ export class RawGatewayClient {
     this.clearStartupWatchdog()
     this.clearCloseWatchdog()
     this.transportAccepting = false
-    this.rejectAll(reason)
+    // The old connection is gone for this client exactly as if it had exited: the same onExit, so
+    // what it asked (held server requests) is withdrawn and its pending RPCs are rejected.
+    notifyTransportExit(reason, this.onExit, failedReason => this.rejectAll(failedReason))
     this.closeSocket()
     const proc = this.proc
     this.proc = null
@@ -882,6 +916,11 @@ export class RawGatewayClient {
       if ('type' in frame.params && frame.params.type === 'gateway.ready') {
         this.clearStartupWatchdog(generation)
         this.pushTransportLog('[gateway] ready')
+        // Tell the backend this connection answers server→client requests (it fails them fast
+        // for WebSocket peers that never say so; stdio is always treated as answering).
+        if (this.onServerRequest) {
+          void this.request('client.capabilities', { server_requests: true }).catch(() => undefined)
+        }
         const payload = 'payload' in frame.params ? frame.params.payload : undefined
         if (
           payload &&
@@ -897,12 +936,75 @@ export class RawGatewayClient {
       return
     }
 
+    // Backend→client request: id + method (not 'event'). Answered with a JSON-RPC response frame.
+    if (typeof frame.id === 'string' && typeof frame.method === 'string' && frame.method !== 'event') {
+      this.routeServerRequest(frame.id, frame.method, frame.params)
+      return
+    }
+
     this.log.warn('gateway', 'unroutable frame', { preview: line.slice(0, 120) })
     this.pushTransportLog(`[protocol] unroutable frame: ${line.slice(0, 120)}`)
   }
 
-  /** Send a JSON-RPC request; resolves with `result` (long handlers reply async). */
-  request<A = unknown>(method: string, params: unknown): Promise<A> {
+  /**
+   * Re-deliver a hydration's `open_requests` (session.activate / session.resume): each entry takes the
+   * same path as a live request frame, so it is answered with the original id.
+   */
+  replayServerRequests(entries: readonly OpenRequestEntry[]): void {
+    for (const entry of entries) this.routeServerRequest(entry.id, entry.method, entry.params)
+  }
+
+  private routeServerRequest(id: string, method: string, params: unknown): void {
+    this.pushTransportLog(`[server-request] ${method} ${id}`)
+    const request: ServerRequest = {
+      id,
+      method,
+      params,
+      respond: result => this.writeFrame({ id, jsonrpc: '2.0', result })
+    }
+    let disposition: ServerRequestDisposition = 'method-not-found'
+    try {
+      disposition = this.onServerRequest?.(request) ?? 'method-not-found'
+    } catch (cause) {
+      this.log.warn('gateway', 'server request handler threw', { cause: String(cause), method })
+    }
+    if (disposition === 'held') return
+    if (disposition === 'invalid-params') this.log.warn('gateway', 'server request params invalid', { id, method })
+    const { code, message } = SERVER_REQUEST_REJECTIONS[disposition]
+    this.writeFrame({ error: { code, message: `${message}: ${method}` }, id, jsonrpc: '2.0' })
+  }
+
+  /** Write one frame on the live transport (stdio child or attached socket). False when down. */
+  private writeFrame(frame: Record<string, unknown>): boolean {
+    const text = JSON.stringify(frame)
+    try {
+      if (this.ws) {
+        if (this.ws.readyState !== WS_OPEN) return false
+        this.ws.send(text)
+        return true
+      }
+      const stdin = this.proc?.stdin
+      if (!stdin || !this.transportAccepting) return false
+      stdin.write(text + '\n')
+      return true
+    } catch (cause) {
+      this.pushTransportLog(`[server-request] write failed: ${String(cause)}`)
+      return false
+    }
+  }
+
+  /**
+   * Send a JSON-RPC request typed against the generated contract: `params`
+   * must match the method's declared Params model and the promise carries its
+   * declared Result type. The wire result is not validated here; decoders in
+   * boundary/schema remain the runtime check.
+   */
+  request<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
+    return this.send<RpcResult<M>>(method, params)
+  }
+
+  /** Untyped JSON-RPC send; resolves with `result` (long handlers reply async). */
+  private send<A>(method: string, params: unknown): Promise<A> {
     const requestedAttachUrl = resolveGatewayAttachUrl()
     if (requestedAttachUrl) {
       if (requestedAttachUrl !== this.attachUrl) {

@@ -84,9 +84,11 @@ event("setup.ready", SetupReadyPayload,
 
 
 class ErrorPayload(Payload):
-    """Every ``_emit("error", …)`` site sets exactly ``message``."""
+    """Every ``_emit("error", …)`` site sets ``message``; a failed turn (``prompt_turn``) also names
+    the client submissions it retires."""
 
     message: str
+    client_submission_ids: list[str] | None = None
 
 
 event("error", ErrorPayload, doc="A session-level failure outside a turn (agent init, model switch, compression, resume).")
@@ -297,6 +299,8 @@ class ToolCompletePayload(Payload):
     summary: str | None = None
     result_text: str | None = None
     inline_diff: str | None = None
+    diff_unified: str | None = None
+    error: str | None = None
     todos: list[JsonValue] | None = None
     revision: int | None = None
     labels: list[ToolLabel] | None = None

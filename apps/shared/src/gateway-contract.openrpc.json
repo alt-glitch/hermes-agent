@@ -11839,11 +11839,26 @@
       },
       "ErrorPayload": {
         "additionalProperties": false,
-        "description": "Every ``_emit(\"error\", \u2026)`` site sets exactly ``message``.",
+        "description": "Every ``_emit(\"error\", \u2026)`` site sets ``message``; a failed turn (``prompt_turn``) also names\nthe client submissions it retires.",
         "properties": {
           "message": {
             "title": "Message",
             "type": "string"
+          },
+          "client_submission_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Submission Ids"
           }
         },
         "required": [
@@ -17438,12 +17453,92 @@
             "default": "",
             "title": "Provider",
             "type": "string"
+          },
+          "recent_models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelPickerUsageRow"
+            },
+            "title": "Recent Models",
+            "type": "array"
+          },
+          "frequent_models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelPickerUsageRow"
+            },
+            "title": "Frequent Models",
+            "type": "array"
           }
         },
         "required": [
           "providers"
         ],
         "title": "ModelOptionsResult",
+        "type": "object"
+      },
+      "ModelPickerUsageRow": {
+        "additionalProperties": false,
+        "description": "One ``recent_models`` / ``frequent_models`` row: a ``hermes_state_usage._list_picker_models``\nrow (``provider_id`` \u2026 ``activation_count``) plus the ``provider`` / ``provider_name`` of the\npicker row it matched. The synthesized current-model row (methods_complete ``model.options``)\ncarries no ``provider_id``.",
+        "properties": {
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "provider_name": {
+            "title": "Provider Name",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Base Url"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Last Used At"
+          },
+          "activation_count": {
+            "default": 0,
+            "title": "Activation Count",
+            "type": "integer"
+          },
+          "provider_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Provider Id"
+          }
+        },
+        "required": [
+          "provider",
+          "provider_name",
+          "model"
+        ],
+        "title": "ModelPickerUsageRow",
         "type": "object"
       },
       "ModelPricing": {
@@ -26921,30 +27016,42 @@
       },
       "SessionControlReadResult": {
         "additionalProperties": false,
+        "description": "``event_seq`` is the replay sequence the snapshot was read at (``event_replay.latest_seq``).",
         "properties": {
           "control": {
             "$ref": "#/components/schemas/SessionControlSnapshot"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
           }
         },
         "required": [
-          "control"
+          "control",
+          "event_seq"
         ],
         "title": "SessionControlReadResult",
         "type": "object"
       },
       "SessionControlResult": {
         "additionalProperties": false,
+        "description": "``event_seq`` is the replay sequence of the published ``session.control.update`` (or the\nlatest sequence when ``command.dispatch`` already published it).",
         "properties": {
           "control": {
             "$ref": "#/components/schemas/SessionControlSnapshot"
           },
           "dispatch": {
             "$ref": "#/components/schemas/SessionControlDispatch"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
           }
         },
         "required": [
           "control",
-          "dispatch"
+          "dispatch",
+          "event_seq"
         ],
         "title": "SessionControlResult",
         "type": "object"
@@ -33225,6 +33332,30 @@
             ],
             "default": null,
             "title": "Inline Diff"
+          },
+          "diff_unified": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Diff Unified"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
           },
           "todos": {
             "anyOf": [

@@ -25,13 +25,13 @@ describe('eventBelongsToSession', () => {
     expect(eventBelongsToSession(skin, undefined)).toBe(true)
   })
 
-  test('stale blocking prompts are fenced before they can replace the composer', () => {
-    const approval = {
-      type: 'approval.request',
+  test('a stale session request.cancel is fenced before it can close a live prompt', () => {
+    const cancel = {
+      type: 'request.cancel',
       session_id: 'old-1',
-      payload: { command: 'rm -rf /tmp/x', description: 'remove temp data', request_id: 'approval-old' }
+      payload: { id: 'srq-old', method: 'approval', reason: 'session_closed' }
     } satisfies GatewayEvent
-    expect(eventBelongsToSession(approval, 'live-1')).toBe(false)
+    expect(eventBelongsToSession(cancel, 'live-1')).toBe(false)
   })
 
   test('a stale session.title cannot retitle successor chrome (entry-gate scoping)', () => {

@@ -72,7 +72,7 @@ export const createSession = Effect.fn('SessionLifecycle.create')(function* (
   gateway: GatewayTransport,
   options: CreateSessionOptions
 ) {
-  const createdRaw = yield* gateway.request<unknown>('session.create', {
+  const createdRaw = yield* gateway.request('session.create', {
     cols: options.cols,
     ...(options.cwd ? { cwd: options.cwd } : {})
   })
@@ -120,7 +120,7 @@ export const replaceSession = Effect.fn('SessionLifecycle.replace')(function* (
   gateway: GatewayTransport,
   options: ReplaceSessionOptions
 ) {
-  const setupRaw = yield* gateway.request<unknown>('setup.status', {})
+  const setupRaw = yield* gateway.request('setup.status', {})
   const setup = decodeSetupStatus(setupRaw)
   if (Option.isNone(setup)) {
     return yield* new SessionProtocolError({
@@ -283,7 +283,7 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
   store.beginBuffer()
   const t0 = Date.now()
   return yield* Effect.gen(function* () {
-    const raw = yield* gateway.request<unknown>('session.resume', {
+    const raw = yield* gateway.request('session.resume', {
       cols: options.cols,
       session_id: options.targetSessionId,
       with_ui_chrome: true,
@@ -318,6 +318,8 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
       liveSnapshotStartedAtMs(response),
       response.todo_state
     )
+    // After the commit (it clears the prompt): pending backend questions reappear.
+    gateway.replayRequests?.(response.open_requests ?? [])
     for (const text of preservedQueue) store.enqueuePrompt(text)
     for (const image of preservedImages) store.restorePendingImage(image)
     if (preservedDraft) store.replaceComposerDraft(preservedDraft)
@@ -364,7 +366,7 @@ export const activateSession = Effect.fn('SessionLifecycle.activate')(function* 
   let committed = false
   store.beginBuffer()
   return yield* Effect.gen(function* () {
-    const raw = yield* gateway.request<unknown>('session.activate', {
+    const raw = yield* gateway.request('session.activate', {
       session_id: options.targetSessionId,
       with_ui_chrome: true
     })
@@ -388,6 +390,8 @@ export const activateSession = Effect.fn('SessionLifecycle.activate')(function* 
       liveSnapshotStartedAtMs(response),
       response.todo_state
     )
+    // After the commit (it clears the prompt): pending backend questions reappear.
+    gateway.replayRequests?.(response.open_requests ?? [])
     committed = true
     return {
       messageCount: snapshot.length,
@@ -418,7 +422,7 @@ export const branchSession = Effect.fn('SessionLifecycle.branch')(function* (
   let committed = false
   store.beginBuffer()
   return yield* Effect.gen(function* () {
-    const raw = yield* gateway.request<unknown>('session.branch', {
+    const raw = yield* gateway.request('session.branch', {
       name: options.name,
       session_id: parentSessionId
     })
@@ -450,7 +454,7 @@ export const branchSession = Effect.fn('SessionLifecycle.branch')(function* (
     if (preservedDraft) store.replaceComposerDraft(preservedDraft)
     committed = true
     let closeFailed = false
-    yield* gateway.request<unknown>('session.close', { session_id: parentSessionId }).pipe(
+    yield* gateway.request('session.close', { session_id: parentSessionId }).pipe(
       Effect.tap(raw =>
         Effect.sync(() => {
           const closed = decodeSessionCloseResponse(raw)

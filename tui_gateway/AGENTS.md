@@ -36,7 +36,8 @@ in an existing topical sibling, registered in the table — no `if method == ...
 **The wire is declared in Python and generated for TypeScript** (`tui_gateway/contracts/`). Every method
 has a `Params` + `Result` model, every server→client request a `Params` + `Result`, every event a
 `Payload` — one Pydantic class each, `extra="forbid"` by default (`OpenModel` for producer-owned dicts).
-`register_method` refuses an undeclared name at import; the dispatcher rejects unknown param keys
+`register_method` (`server.py`, behind `@method` and `HandlerRegistry.install`) raises `RuntimeError` for a
+name with no contract, so the module fails at import; the dispatcher rejects unknown param keys
 (`4000` + key path) and, under `HERMES_TEST_ISOLATION=1`, raises `ContractViolation` when a handler's
 result or an emitted payload does not match its model (production only logs). `apps/shared/src/
 gateway-contract.generated.ts` (`RpcMethods`, `ServerRequestMap`, `BackendGatewayEventMap` + every value

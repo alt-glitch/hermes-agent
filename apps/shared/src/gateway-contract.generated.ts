@@ -659,6 +659,8 @@ export interface ModelOptionsResult {
   providers: ModelOptionProvider[]
   model?: string
   provider?: string
+  recent_models?: ModelPickerUsageRow[]
+  frequent_models?: ModelPickerUsageRow[]
 }
 /** One ``hermes_cli/inventory.py::build_models_payload`` provider row (the union of every field the builder sets; ``pricing_pending`` / ``free_tier_pending`` mark the cached-only path). */
 export interface ModelOptionProvider {
@@ -701,6 +703,16 @@ export interface ModelPricing {
   was_input?: string | null
   was_output?: string | null
 }
+/** One ``recent_models`` / ``frequent_models`` row: a ``hermes_state_usage._list_picker_models`` row (``provider_id`` … ``activation_count``) plus the ``provider`` / ``provider_name`` of the picker row it matched. The synthesized current-model row (methods_complete ``model.options``) carries no ``provider_id``. */
+export interface ModelPickerUsageRow {
+  provider: string
+  provider_name: string
+  model: string
+  base_url?: string | null
+  last_used_at?: number | null
+  activation_count?: number
+  provider_id?: string | null
+}
 export interface ImageGenerateParams {
   prompt?: string | null
   aspect_ratio?: string | null
@@ -719,8 +731,10 @@ export interface SessionControlReadParams {
   profile?: string | null
   session_id: string
 }
+/** ``event_seq`` is the replay sequence the snapshot was read at (``event_replay.latest_seq``). */
 export interface SessionControlReadResult {
   control: SessionControlSnapshot
+  event_seq: number
 }
 /** ``_snapshot_control`` — ``revision`` is a hash of the visible state (``""`` when empty); ``updated_at`` is the newest persisted timestamp (``0`` when none). */
 export interface SessionControlSnapshot {
@@ -810,9 +824,11 @@ export interface SessionControlArgs {
   text?: string | null
   index?: number | null
 }
+/** ``event_seq`` is the replay sequence of the published ``session.control.update`` (or the latest sequence when ``command.dispatch`` already published it). */
 export interface SessionControlResult {
   control: SessionControlSnapshot
   dispatch: SessionControlDispatch
+  event_seq: number
 }
 /** ``_dispatch_envelope`` — the command result's user-visible envelope, every key always present. */
 export interface SessionControlDispatch {
@@ -4206,9 +4222,10 @@ export interface SetupReadyPayload {
   finished_at: number
   [key: string]: unknown
 }
-/** Every ``_emit("error", …)`` site sets exactly ``message``. */
+/** Every ``_emit("error", …)`` site sets ``message``; a failed turn (``prompt_turn``) also names the client submissions it retires. */
 export interface ErrorPayload {
   message: string
+  client_submission_ids?: string[] | null
 }
 /** ``tui_gateway/model_switch.py`` capability-refresh notice. */
 export interface NoticePayload {
@@ -4319,6 +4336,8 @@ export interface ToolCompletePayload {
   summary?: string | null
   result_text?: string | null
   inline_diff?: string | null
+  diff_unified?: string | null
+  error?: string | null
   todos?: unknown[] | null
   revision?: number | null
   labels?: ToolLabel[] | null

@@ -91,3 +91,12 @@ def test_catalog_covers_the_whole_wire():
     from tui_gateway.contracts import registry
 
     registry.assert_complete(server._methods, emitted_event_names(), sent_server_requests())
+
+
+def test_registering_an_undeclared_method_raises():
+    """A handler for a name with no contract cannot enter the dispatch table."""
+    from tui_gateway import server
+
+    with pytest.raises(RuntimeError, match="has no contract"):
+        server.register_method("undeclared.method.for_test", lambda rid, params: server._ok(rid, {}))
+    assert "undeclared.method.for_test" not in server._methods

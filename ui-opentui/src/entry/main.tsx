@@ -34,13 +34,8 @@ import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } fr
 import { GatewayService, type GatewayTransport } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
-import {
-  classifyPromptResponse,
-  promptTransportUncertain,
-  reconcilePendingApprovalSnapshot,
-  type PromptResponseDisposition,
-  type PromptResponseMethod
-} from '../boundary/promptResponses.ts'
+import { createPromptResponder } from '../boundary/promptResponses.ts'
+import { createServerRequestRouter } from '../boundary/gateway/serverRequests.ts'
 import { startMemlog } from '../boundary/memlog.ts'
 import { startMemoryMonitor } from '../boundary/memoryMonitor.ts'
 import { startProactiveGc } from '../boundary/proactiveGc.ts'
@@ -49,6 +44,7 @@ import { acquireRenderer, redrawRenderer, selectionCopyText } from '../boundary/
 import { createAgentInterrupts } from '../boundary/agentInterrupts.ts'
 import { decodeImageAttachResponse, decodeSetupStatusResponse } from '../boundary/schema/ExternalInputResponses.ts'
 import { decodeVoiceRecordResponse } from '../boundary/schema/VoiceResponses.ts'
+import type { GatewayEvent } from '../boundary/schema/GatewayEvent.ts'
 import { decodeSubagentSteerResponse, decodeSubagentTailResponse } from '../boundary/schema/Delegation.ts'
 import { decodePetGalleryResponse, decodePetSelectResponse } from '../boundary/schema/PetResponses.ts'
 import {
@@ -304,25 +300,6 @@ const writeActiveSession = (sid: string | undefined) => {
   }
 }
 
-/** Reconcile missed approval terminal events without blocking session resume. */
-const schedulePendingApprovalReconciliation = (
-  gateway: GatewayTransport,
-  store: SessionStore,
-  sessionId: string
-): void => {
-  void reconcilePendingApprovalSnapshot(
-    () => Effect.runPromise(gateway.request<unknown>('approval.pending', { session_id: sessionId })),
-    store,
-    sessionId
-  )
-    .then(outcome => {
-      if (outcome === 'invalid') getLog().warn('approval', 'invalid pending snapshot', { session_id: sessionId })
-    })
-    .catch(cause =>
-      getLog().warn('approval', 'pending snapshot failed', { cause: String(cause), session_id: sessionId })
-    )
-}
-
 const resumeInto = (
   gateway: GatewayTransport,
   store: SessionStore,
@@ -346,7 +323,6 @@ const resumeInto = (
       resumed: resumed.resumedId,
       sid: resumed.sessionId
     })
-    schedulePendingApprovalReconciliation(gateway, store, resumed.sessionId)
     if (resumed.previousSessionId) {
       Effect.runFork(
         gateway
@@ -375,7 +351,7 @@ const scheduleStartupCatalogRetry = (
   if (delay === undefined || !isActive()) return
   const timer = setTimeout(() => {
     if (!isActive()) return
-    Effect.runPromise(gateway.request<unknown>('startup.catalog', { session_id: sid }))
+    Effect.runPromise(gateway.request('startup.catalog', { session_id: sid }))
       .then(raw => {
         if (!isActive()) return
         const refreshed = store.setCatalog(raw)
@@ -422,7 +398,7 @@ const postSessionSetup = (
       sid,
       Effect.runPromise(
         gateway
-          .request<unknown>('model.options', modelOptionsParams(sid))
+          .request('model.options', modelOptionsParams(sid))
           .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
       ),
       modelOpts => {
@@ -432,7 +408,7 @@ const postSessionSetup = (
     )
 
     const catalog = yield* gateway
-      .request<unknown>('startup.catalog', { session_id: sid })
+      .request('startup.catalog', { session_id: sid })
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
     if (catalog !== undefined && isActive()) {
       const decoded = store.setCatalog(catalog)
@@ -448,7 +424,7 @@ const postSessionSetup = (
     // instead of only after its completion batch was browsed earlier. Best-effort
     // — a failure just leaves the old lazy-learn behavior.
     const cmdCatalog = yield* gateway
-      .request<unknown>('commands.catalog', {})
+      .request('commands.catalog', {})
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
     const decodedCommandCatalog = decodeCommandsCatalogResponse(cmdCatalog)
     if (isActive() && decodedCommandCatalog) {
@@ -466,7 +442,7 @@ const postSessionSetup = (
     // `queue` on failure/malformed data, and the revision captured above keeps
     // a late hydration reply from overwriting an early `/busy` command.
     const busyConfig = yield* gateway
-      .request<unknown>('config.get', { key: 'full' })
+      .request('config.get', { key: 'full' })
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
     const decodedBusyConfig = decodeConfigFullResponse(busyConfig)
     if (isActive() && decodedBusyConfig) {
@@ -586,8 +562,8 @@ const bootstrapSession = (
     if (input.resumeId) {
       let sid: string | undefined = input.resumeId
       if (sid === 'recent' || sid === 'last') {
-        const recent = yield* gateway.request<{ session_id?: string }>('session.most_recent', {})
-        sid = recent.session_id
+        const recent = yield* gateway.request('session.most_recent', {})
+        sid = recent.session_id ?? undefined
       }
       if (!sid) {
         log.warn('bootstrap', 'no session to resume', { resumeId: input.resumeId })
@@ -741,7 +717,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const spawnTreeSaveDrainer = createSpawnTreeSaveDrainer({
         next: () => store.nextSpawnTreeSaveIntent(),
         settle: id => store.settleSpawnTreeSaveIntent(id),
-        save: request => Effect.runPromise(gateway.request('spawn_tree.save', request)),
+        save: request =>
+          Effect.runPromise(gateway.request('spawn_tree.save', { ...request, subagents: [...request.subagents] })),
         onSaveFailure: (id, cause) =>
           getLog().warn('agents', 'spawn-tree persistence failed', {
             cause: String(cause),
@@ -1119,7 +1096,18 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
-      yield* gateway.subscribe(event => {
+      // Backend→client requests (clarify, approval, sudo, secret, vault.unlock_prompt) open
+      // store prompts; the answer goes back as the JSON-RPC response (see `respond`).
+      const serverRequests = createServerRequestRouter({
+        openPrompt: store.openPrompt,
+        displayedSessionId: () => store.state.sessionId,
+        settleWithdrawn: cancel => store.apply({ type: 'request.cancel', payload: cancel })
+      })
+      yield* Effect.addFinalizer(() => Effect.sync(serverRequests.dispose))
+      const stopServingRequests = gateway.serveRequests?.(serverRequests.handle)
+      if (stopServingRequests) yield* Effect.addFinalizer(() => Effect.sync(stopServingRequests))
+
+      const applyGatewayEvent = (event: GatewayEvent): void => {
         if (!eventMayEnterStore(event, gateway.sessionId(), store.isBuffering())) return
         const liveSessionId = gateway.sessionId()
         const eventSessionId = event.session_id ?? liveSessionId
@@ -1161,6 +1149,16 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           gatewayUnavailable = false
           if (!sessionTransitionInFlight) activeTransitionOwner = undefined
         }
+      }
+
+      yield* gateway.subscribe(event => {
+        applyGatewayEvent(event)
+        // After the store settled the withdrawn prompt (expired notice, batch record): the router
+        // then drops the id and, when it was the shown one, opens the next queued request.
+        if (event.type === 'request.cancel') serverRequests.forget(event.payload.id)
+        // A crashed or replaced gateway never sends request.cancel, and the next one never issued the held
+        // ids: withdraw them all (the shown prompt settles with the expired notice).
+        else if (event.type === 'gateway.exited') serverRequests.withdrawAll('gateway-exited')
       })
 
       // Match Ink's live config sync: poll the config file mtime every five
@@ -1176,7 +1174,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               const sid = gateway.sessionId()
               if (!store.state.ready || !sid || store.state.sessionId !== sid) return
               const rawMtime = yield* gateway
-                .request<unknown>('config.get', { key: 'mtime' })
+                .request('config.get', { key: 'mtime' })
                 .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
               const decodedMtime = decodeConfigMtimeResponse(rawMtime)
               const nextMtime = decodedMtime?.mtime ?? 0
@@ -1200,7 +1198,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
               if (plan.reload) {
                 const reload = yield* gateway
-                  .request<unknown>('reload.mcp', {
+                  .request('reload.mcp', {
                     confirm: true,
                     session_id: sid,
                     ...(plan.mcpRev ? { rev: plan.mcpRev } : {})
@@ -1211,7 +1209,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               }
 
               const rawConfig = yield* gateway
-                .request<unknown>('config.get', { key: 'full' })
+                .request('config.get', { key: 'full' })
                 .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
               const decodedConfig = decodeConfigFullResponse(rawConfig)
               const active = gateway.sessionId() === sid && store.state.sessionId === sid
@@ -1463,7 +1461,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           imageAttachInFlight = true
           try {
             const raw = await Effect.runPromise(
-              gateway.request<unknown>('clipboard.paste', {
+              gateway.request('clipboard.paste', {
                 session_id: sid
               })
             )
@@ -1735,7 +1733,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
         return Effect.runPromise(
           gateway
-            .request<unknown>('prompt.submit', {
+            .request('prompt.submit', {
               client_submission_id: current.submissionId,
               session_id: current.sessionId,
               text: current.text
@@ -1810,7 +1808,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           pendingSteers.set(sequence, { clientMessageId, front, resolve, submissionId, text })
           void Effect.runPromise(
             gateway
-              .request<unknown>('session.steer', {
+              .request('session.steer', {
                 client_submission_id: submissionId,
                 session_id: sessionId,
                 text
@@ -2142,7 +2140,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         if (!cmd) return
         store.pushLocalUser(`!${cmd}`, 'shell')
         Effect.runFork(
-          gateway.request<{ stdout?: string; stderr?: string; code?: number }>('shell.exec', { command: cmd }).pipe(
+          gateway.request('shell.exec', { command: cmd }).pipe(
             Effect.tap(r =>
               Effect.sync(() => {
                 const out = [r.stdout, r.stderr].filter(Boolean).join('\n').trimEnd()
@@ -2223,9 +2221,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             gateway.request('session.list', {
               limit: 200,
               offset: 0,
-              query: '',
-              scope: 'all',
-              sort: 'recent'
+              query: ''
             })
           ),
         refresh: () => activeSessionsRefresher.refresh(true).then(() => undefined),
@@ -2430,7 +2426,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             if (requestedTitle) {
               Effect.runFork(
                 gateway
-                  .request<{ pending?: boolean; title?: string }>('session.title', {
+                  .request('session.title', {
                     session_id: result.sessionId,
                     title: requestedTitle
                   })
@@ -2789,9 +2785,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('no active session')
           return
         }
-        const raw = await Effect.runPromise(
-          gateway.request<unknown>('image.attach', { path: inputText, session_id: sid })
-        )
+        const raw = await Effect.runPromise(gateway.request('image.attach', { path: inputText, session_id: sid }))
         const response = decodeImageAttachResponse(raw)
         if (!response) {
           store.pushSystem('error: invalid response: image.attach')
@@ -2830,7 +2824,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.setHint('setup required')
           return
         }
-        const raw = await Effect.runPromise(gateway.request<unknown>('setup.status', {}))
+        const raw = await Effect.runPromise(gateway.request('setup.status', {}))
         const setup = decodeSetupStatusResponse(raw)
         if (!setup) {
           store.pushSystem('error: invalid response: setup.status')
@@ -3293,21 +3287,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           })
       }
 
-      // Blocking prompts retain UI ownership until a decoded gateway ack.
-      const respond = async (
-        method: PromptResponseMethod,
-        params: Record<string, unknown>
-      ): Promise<PromptResponseDisposition> => {
-        try {
-          const raw = await Effect.runPromise(gateway.request(method, params))
-          const disposition = classifyPromptResponse(method, raw)
-          if (disposition.kind === 'uncertain') getLog().warn('respond', disposition.message, { method })
-          return disposition
-        } catch (cause) {
-          getLog().warn('respond', 'failed', { cause: String(cause), method })
-          return promptTransportUncertain(cause)
-        }
-      }
+      // Blocking prompts: answers go back through the router (JSON-RPC response); batch-clarify
+      // locks through the clarify.lock RPC.
+      const respond = createPromptResponder({
+        router: serverRequests,
+        lock: params => Effect.runPromise(gateway.request('clarify.lock', params)),
+        warn: (message, fields) => getLog().warn('respond', message, fields)
+      })
 
       // Live backend: drive a session (create + optional initial prompt)
       // concurrently, but acquire the same transition lock BEFORE rendering so

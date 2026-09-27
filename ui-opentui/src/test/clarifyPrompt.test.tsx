@@ -13,7 +13,8 @@ import { describe, expect, test } from 'vitest'
 
 import { ClarifyPrompt } from '../view/prompts/clarifyPrompt.tsx'
 import { PromptOverlay } from '../view/prompts/promptOverlay.tsx'
-import type { PromptResponseDisposition, PromptResponseMethod } from '../boundary/promptResponses.ts'
+import type { PromptReply, PromptResponseDisposition } from '../boundary/promptResponses.ts'
+import { decodeServerRequest } from '../boundary/gateway/serverRequests.ts'
 import { clarifyRevisitState, type ClarifyBatchQuestion } from '../logic/clarifyBatch.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
@@ -22,6 +23,20 @@ const LONG =
   'Just analyze for now — give me the implementation plan doc (code-path refs + line numbers, screen-by-screen), no code yet.'
 
 const theme = createSessionStore().state.theme
+
+/** Open a prompt the way main.tsx does for a backend→client request frame. */
+function openRequest(
+  store: ReturnType<typeof createSessionStore>,
+  method: string,
+  id: string,
+  params: Record<string, unknown> = {}
+) {
+  // Fill the contract's required routing keys the fixtures leave out.
+  const frame = { session_id: 'live-1', request_id: id, ...params }
+  const decoded = decodeServerRequest({ id, method, params: frame, respond: () => false })
+  if (typeof decoded === 'string') throw new Error(`${method} ${id}: ${decoded}`)
+  store.openPrompt(decoded.prompt)
+}
 const ACCEPTED = { kind: 'accepted' } as const satisfies PromptResponseDisposition
 const EXPIRED = { kind: 'terminal', reason: 'expired' } as const satisfies PromptResponseDisposition
 
@@ -37,7 +52,7 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
 
 async function mountOverlay(
   store: ReturnType<typeof createSessionStore>,
-  onRespond: (method: PromptResponseMethod, params: Record<string, unknown>) => Promise<PromptResponseDisposition>
+  onRespond: (reply: PromptReply) => Promise<PromptResponseDisposition>
 ): Promise<RenderProbe> {
   return renderProbe(
     () => (
@@ -72,10 +87,10 @@ async function mount(
 describe('PromptOverlay acknowledgement ownership', () => {
   test.each(['escape', 'ctrl-c'] as const)('retains %s cancellation after leaving custom input', async key => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-focus' } })
-    const replies: Record<string, unknown>[] = []
-    const h = await mountOverlay(store, (_method, params) => {
-      replies.push(params)
+    openRequest(store, 'clarify', 'req-focus', { question: 'Choose', choices: ['A'] })
+    const replies: PromptReply[] = []
+    const h = await mountOverlay(store, reply => {
+      replies.push(reply)
       return Promise.resolve(ACCEPTED)
     })
     try {
@@ -86,7 +101,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
       if (key === 'escape') h.keys.pressEscape()
       else h.keys.pressKey('c', { ctrl: true })
       await h.settle()
-      expect(replies).toEqual([expect.objectContaining({ request_id: 'req-focus', answer: '' })])
+      expect(replies).toEqual([{ kind: 'answer', requestId: 'req-focus', result: { answer: '' } }])
       await expect.poll(() => store.state.prompt).toBeUndefined()
     } finally {
       h.destroy()
@@ -95,7 +110,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('stays mounted while pending and prevents duplicate submit', async () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-1' } })
+    openRequest(store, 'clarify', 'req-1', { question: 'Choose', choices: ['A'] })
     let calls = 0
     let resolveResponse: ((value: PromptResponseDisposition) => void) | undefined
     const response = new Promise<PromptResponseDisposition>(resolve => (resolveResponse = resolve))
@@ -123,10 +138,10 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('an uncertain response retries only after the visible manual action', async () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-2' } })
-    const sent: Record<string, unknown>[] = []
-    const h = await mountOverlay(store, (_method, params) => {
-      sent.push(params)
+    openRequest(store, 'clarify', 'req-2', { question: 'Choose', choices: ['A'] })
+    const sent: PromptReply[] = []
+    const h = await mountOverlay(store, reply => {
+      sent.push(reply)
       return sent.length === 1
         ? Promise.reject(new Error('socket closed before acknowledgement'))
         : Promise.resolve(ACCEPTED)
@@ -141,7 +156,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
       // automatic replay or permission to submit a newly selected answer.
       h.keys.pressEnter()
       await h.settle()
-      expect(sent).toEqual([{ answer: 'A', request_id: 'req-2' }])
+      expect(sent).toEqual([{ kind: 'answer', requestId: 'req-2', result: { answer: 'A' } }])
       expect(store.state.prompt?.kind).toBe('clarify')
 
       h.keys.pressKey('r')
@@ -155,10 +170,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('a manual retry reports a terminal result without inferring whether the first delivery was accepted', async () => {
     const store = createSessionStore()
-    store.apply({
-      type: 'clarify.request',
-      payload: { question: 'Choose', choices: ['A'], request_id: 'req-lost-ack' }
-    })
+    openRequest(store, 'clarify', 'req-lost-ack', { question: 'Choose', choices: ['A'] })
     let calls = 0
     const h = await mountOverlay(store, () => {
       calls += 1
@@ -182,7 +194,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('Esc dismisses a locally stalled response without waiting for the RPC', async () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-stalled' } })
+    openRequest(store, 'clarify', 'req-stalled', { question: 'Choose', choices: ['A'] })
     const stalled = new Promise<PromptResponseDisposition>(() => {})
     const h = await mountOverlay(store, () => stalled)
     try {
@@ -201,7 +213,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('Ctrl+C dismisses an errored response without claiming cancellation was delivered', async () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-error' } })
+    openRequest(store, 'clarify', 'req-error', { question: 'Choose', choices: ['A'] })
     const h = await mountOverlay(store, () => Promise.reject(new Error('transport disconnected')))
     try {
       h.keys.pressEnter()
@@ -220,7 +232,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('a terminal obsolete response closes the blocking prompt', async () => {
     const store = createSessionStore()
-    store.apply({ type: 'clarify.request', payload: { question: 'Choose', choices: ['A'], request_id: 'req-expired' } })
+    openRequest(store, 'clarify', 'req-expired', { question: 'Choose', choices: ['A'] })
     const h = await mountOverlay(store, () => Promise.resolve(EXPIRED))
     try {
       h.keys.pressEnter()
@@ -234,10 +246,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('a terminal response remains locally closable before its deferred teardown', async () => {
     const store = createSessionStore()
-    store.apply({
-      type: 'clarify.request',
-      payload: { question: 'Choose', choices: ['A'], request_id: 'req-terminal' }
-    })
+    openRequest(store, 'clarify', 'req-terminal', { question: 'Choose', choices: ['A'] })
     const response = deferred<PromptResponseDisposition>()
     const h = await mountOverlay(store, () => response.promise)
     try {
@@ -258,7 +267,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
   test('a retry is fenced by its presenting session and cannot close a replacement prompt', async () => {
     const store = createSessionStore()
     store.setSessionId('session-old')
-    store.apply({ type: 'clarify.request', payload: { question: 'Old?', choices: ['A'], request_id: 'req-old' } })
+    openRequest(store, 'clarify', 'req-old', { question: 'Old?', choices: ['A'] })
     const retry = deferred<PromptResponseDisposition>()
     let calls = 0
     const h = await mountOverlay(store, () => {
@@ -280,7 +289,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
       h.keys.pressKey('r')
       await expect.poll(() => calls).toBe(2)
       store.setSessionId('session-new')
-      store.apply({ type: 'clarify.request', payload: { question: 'New?', choices: ['B'], request_id: 'req-new' } })
+      openRequest(store, 'clarify', 'req-new', { question: 'New?', choices: ['B'] })
       await h.settle()
       retry.resolve(ACCEPTED)
       await new Promise(resolve => setTimeout(resolve, 0))
@@ -291,25 +300,22 @@ describe('PromptOverlay acknowledgement ownership', () => {
     }
   })
 
-  test('approval responses carry the exact request and session identities', async () => {
+  test('approval responses answer the exact request with the chosen scope', async () => {
     const store = createSessionStore()
-    store.apply({
-      type: 'approval.request',
-      session_id: 'live-session',
-      payload: { command: 'echo safe', description: 'test command', request_id: 'approval-exact' }
+    openRequest(store, 'approval', 'approval-exact', {
+      command: 'echo safe',
+      description: 'test command',
+      session_id: 'live-session'
     })
-    const sent: Array<{ method: PromptResponseMethod; params: Record<string, unknown> }> = []
-    const h = await mountOverlay(store, (method, params) => {
-      sent.push({ method, params })
+    const sent: PromptReply[] = []
+    const h = await mountOverlay(store, reply => {
+      sent.push(reply)
       return Promise.resolve(ACCEPTED)
     })
     try {
       h.keys.pressEnter()
       await expect.poll(() => sent).toHaveLength(1)
-      expect(sent[0]).toEqual({
-        method: 'approval.respond',
-        params: { choice: 'once', request_id: 'approval-exact', session_id: 'live-session' }
-      })
+      expect(sent[0]).toEqual({ kind: 'answer', requestId: 'approval-exact', result: { choice: 'once' } })
     } finally {
       h.destroy()
     }
@@ -666,24 +672,19 @@ describe('clarifyRevisitState (pure restore helper)', () => {
 })
 
 describe('PromptOverlay — batch clarify per-question locks', () => {
-  const BATCH_EVENT = {
-    payload: {
-      questions: [
-        { choices: ['a', 'b'], qid: 'q0', question: 'One?' },
-        { choices: null, qid: 'q1', question: 'Two?' }
-      ],
-      request_id: 'req-batch'
-    },
-    type: 'clarify.request'
-  } as const
+  const BATCH = {
+    questions: [
+      { choices: ['a', 'b'], qid: 'q0', question: 'One?' },
+      { choices: null, qid: 'q1', question: 'Two?' }
+    ]
+  }
 
   test('manual retry preserves the exact batch question identity after navigation', async () => {
     const store = createSessionStore()
-    store.apply(BATCH_EVENT)
-    const sent: Record<string, unknown>[] = []
-    const h = await mountOverlay(store, (method, params) => {
-      expect(method).toBe('clarify.respond')
-      sent.push(params)
+    openRequest(store, 'clarify', 'req-batch', BATCH)
+    const sent: PromptReply[] = []
+    const h = await mountOverlay(store, reply => {
+      sent.push(reply)
       return Promise.resolve(
         sent.length === 1 ? { kind: 'uncertain', message: 'socket closed before acknowledgement' } : ACCEPTED
       )
@@ -693,7 +694,7 @@ describe('PromptOverlay — batch clarify per-question locks', () => {
       // its outcome is uncertain. Manual retry must still carry q0 exactly.
       h.keys.pressEnter()
       await expect.poll(() => sent.length).toBe(1)
-      expect(sent[0]).toEqual({ answer: 'a', question_id: 'q0', request_id: 'req-batch' })
+      expect(sent[0]).toEqual({ kind: 'lock', requestId: 'req-batch', questionId: 'q0', answer: 'a' })
       await expect.poll(() => h.frame()).toContain('r retry same response')
       h.keys.pressTab()
       await h.settle()
@@ -710,7 +711,7 @@ describe('PromptOverlay — batch clarify per-question locks', () => {
       await h.settle()
       h.keys.pressEnter()
       await expect.poll(() => sent.length).toBe(3)
-      expect(sent[2]).toEqual({ answer: 'freeform', question_id: 'q1', request_id: 'req-batch' })
+      expect(sent[2]).toEqual({ kind: 'lock', requestId: 'req-batch', questionId: 'q1', answer: 'freeform' })
       // final lock resolves the batch — the prompt closes
       await expect.poll(() => store.state.prompt).toBeUndefined()
     } finally {
@@ -718,19 +719,19 @@ describe('PromptOverlay — batch clarify per-question locks', () => {
     }
   })
 
-  test('Esc cancel-all responds WITHOUT question_id and persists the partial record', async () => {
+  test('Esc cancel-all answers the whole request and persists the partial record', async () => {
     const store = createSessionStore()
-    store.apply(BATCH_EVENT)
+    openRequest(store, 'clarify', 'req-batch', BATCH)
     store.recordClarifyAnswer('q0', 'a')
-    const sent: Record<string, unknown>[] = []
-    const h = await mountOverlay(store, (_method, params) => {
-      sent.push(params)
+    const sent: PromptReply[] = []
+    const h = await mountOverlay(store, reply => {
+      sent.push(reply)
       return Promise.resolve(ACCEPTED)
     })
     try {
       h.keys.pressEscape()
       await expect.poll(() => sent.length).toBe(1)
-      expect(sent[0]).toEqual({ answer: '', request_id: 'req-batch' })
+      expect(sent[0]).toEqual({ kind: 'answer', requestId: 'req-batch', result: { answer: '' } })
       await expect.poll(() => store.state.prompt).toBeUndefined()
       const record = store.state.messages.find(
         message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
@@ -745,17 +746,14 @@ describe('PromptOverlay — batch clarify per-question locks', () => {
 })
 
 describe('PromptOverlay — password-manager unlock card', () => {
-  const UNLOCK = {
-    type: 'vault.unlock.request',
-    payload: { backend: 'onepassword', display_name: '1Password', request_id: 'vault-1' }
-  } as const
+  const UNLOCK = { backend: 'onepassword', display_name: '1Password' }
 
-  test('renders a masked card naming the manager and submits the master password to vault.unlock.respond', async () => {
+  test('renders a masked card naming the manager and answers the request with the master password', async () => {
     const store = createSessionStore()
-    store.apply(UNLOCK)
-    const sent: [PromptResponseMethod, Record<string, unknown>][] = []
-    const h = await mountOverlay(store, (method, params) => {
-      sent.push([method, params])
+    openRequest(store, 'vault.unlock_prompt', 'vault-1', UNLOCK)
+    const sent: PromptReply[] = []
+    const h = await mountOverlay(store, reply => {
+      sent.push(reply)
       return Promise.resolve(ACCEPTED)
     })
     try {
@@ -767,7 +765,7 @@ describe('PromptOverlay — password-manager unlock card', () => {
       expect(h.frame()).toContain('*******')
       h.keys.pressEnter()
       await expect.poll(() => sent.length).toBe(1)
-      expect(sent[0]).toEqual(['vault.unlock.respond', { password: 'hunter2', request_id: 'vault-1' }])
+      expect(sent[0]).toEqual({ kind: 'answer', requestId: 'vault-1', result: { value: 'hunter2' } })
       await expect.poll(() => store.state.prompt).toBeUndefined()
     } finally {
       h.destroy()
@@ -776,32 +774,35 @@ describe('PromptOverlay — password-manager unlock card', () => {
 
   test('Esc keeps the manager locked: an empty password goes back to the same request', async () => {
     const store = createSessionStore()
-    store.apply(UNLOCK)
-    const sent: [PromptResponseMethod, Record<string, unknown>][] = []
-    const h = await mountOverlay(store, (method, params) => {
-      sent.push([method, params])
+    openRequest(store, 'vault.unlock_prompt', 'vault-1', UNLOCK)
+    const sent: PromptReply[] = []
+    const h = await mountOverlay(store, reply => {
+      sent.push(reply)
       return Promise.resolve(ACCEPTED)
     })
     try {
       h.keys.pressEscape()
       await expect.poll(() => sent.length).toBe(1)
-      expect(sent[0]).toEqual(['vault.unlock.respond', { password: '', request_id: 'vault-1' }])
+      expect(sent[0]).toEqual({ kind: 'answer', requestId: 'vault-1', result: { value: '' } })
       await expect.poll(() => store.state.prompt).toBeUndefined()
     } finally {
       h.destroy()
     }
   })
 
-  test('a late expiry for the same request closes the card without any response', async () => {
+  test('a request.cancel for the same request closes the card without any response', async () => {
     const store = createSessionStore()
-    store.apply(UNLOCK)
-    const sent: unknown[] = []
-    const h = await mountOverlay(store, (_method, params) => {
-      sent.push(params)
+    openRequest(store, 'vault.unlock_prompt', 'vault-1', UNLOCK)
+    const sent: PromptReply[] = []
+    const h = await mountOverlay(store, reply => {
+      sent.push(reply)
       return Promise.resolve(EXPIRED)
     })
     try {
-      store.apply({ type: 'vault.unlock.expire', payload: { request_id: 'vault-1' } })
+      store.apply({
+        type: 'request.cancel',
+        payload: { id: 'vault-1', method: 'vault.unlock_prompt', reason: 'timeout' }
+      })
       await expect.poll(() => store.state.prompt).toBeUndefined()
       expect(sent).toEqual([])
     } finally {
@@ -812,32 +813,21 @@ describe('PromptOverlay — password-manager unlock card', () => {
 
 describe('PromptOverlay — masked cards share one wire shape', () => {
   const cases = [
+    { method: 'sudo', params: {}, heading: 'sudo password' },
+    { method: 'secret', params: { env_var: 'API_KEY', prompt: 'paste it' }, heading: 'Secret: API_KEY' },
     {
-      event: { type: 'sudo.request', payload: { request_id: 'm-1' } },
-      method: 'sudo.respond',
-      field: 'password',
-      heading: 'sudo password'
-    },
-    {
-      event: { type: 'secret.request', payload: { env_var: 'API_KEY', prompt: 'paste it', request_id: 'm-1' } },
-      method: 'secret.respond',
-      field: 'value',
-      heading: 'Secret: API_KEY'
-    },
-    {
-      event: { type: 'vault.unlock.request', payload: { backend: 'bw', display_name: 'Bitwarden', request_id: 'm-1' } },
-      method: 'vault.unlock.respond',
-      field: 'password',
+      method: 'vault.unlock_prompt',
+      params: { backend: 'bw', display_name: 'Bitwarden' },
       heading: 'Unlock Bitwarden for this session'
     }
   ] as const
 
-  test.each(cases)('$event.type: Enter sends the typed value, Esc sends an empty one', async c => {
+  test.each(cases)('$method: Enter sends the typed value, Esc sends an empty one', async c => {
     const store = createSessionStore()
-    store.apply(c.event)
-    const sent: [PromptResponseMethod, Record<string, unknown>][] = []
-    const h = await mountOverlay(store, (method, params) => {
-      sent.push([method, params])
+    openRequest(store, c.method, 'm-1', c.params)
+    const sent: PromptReply[] = []
+    const h = await mountOverlay(store, reply => {
+      sent.push(reply)
       return Promise.resolve(ACCEPTED)
     })
     try {
@@ -847,22 +837,22 @@ describe('PromptOverlay — masked cards share one wire shape', () => {
       expect(h.frame()).not.toContain('s3cret')
       h.keys.pressEnter()
       await expect.poll(() => sent.length).toBe(1)
-      expect(sent[0]).toEqual([c.method, { [c.field]: 's3cret', request_id: 'm-1' }])
+      expect(sent[0]).toEqual({ kind: 'answer', requestId: 'm-1', result: { value: 's3cret' } })
       await expect.poll(() => store.state.prompt).toBeUndefined()
     } finally {
       h.destroy()
     }
 
-    const cancelled: [PromptResponseMethod, Record<string, unknown>][] = []
-    store.apply(c.event)
-    const h2 = await mountOverlay(store, (method, params) => {
-      cancelled.push([method, params])
+    const cancelled: PromptReply[] = []
+    openRequest(store, c.method, 'm-1', c.params)
+    const h2 = await mountOverlay(store, reply => {
+      cancelled.push(reply)
       return Promise.resolve(ACCEPTED)
     })
     try {
       h2.keys.pressEscape()
       await expect.poll(() => cancelled.length).toBe(1)
-      expect(cancelled[0]).toEqual([c.method, { [c.field]: '', request_id: 'm-1' }])
+      expect(cancelled[0]).toEqual({ kind: 'answer', requestId: 'm-1', result: { value: '' } })
     } finally {
       h2.destroy()
     }

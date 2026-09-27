@@ -44,6 +44,7 @@ import { isWakeUserDisabled, setWakeUserDisabled } from '../logic/wake.ts'
 import type { ConfirmRequest, Message, PickerItem } from '../logic/store.ts'
 import type { BillingOverlayState, BillingStateResponse, SubscriptionOverlayState } from '../boundary/billing.ts'
 import type { SessionCompressResponse } from '../boundary/compression.ts'
+import { scriptedRpc } from './lib/scriptedRpc.ts'
 
 // the picker-refresh/tabs/prefetch seams are module-level state — never leak them across tests
 afterEach(() => {
@@ -339,7 +340,7 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
       end: 15,
       from: 12, // absolute buffer offset just past the `/` — NOT an offset into the synthetic query
       method: 'complete.slash',
-      params: { skills_only: true, text: '/cle' },
+      params: { text: '/cle' },
       skillsOnly: true
     })
     // the plan's `from` replaces exactly the typed name, leaving the prose intact
@@ -353,7 +354,7 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
       end: 12,
       from: 12,
       method: 'complete.slash',
-      params: { skills_only: true, text: '/' },
+      params: { text: '/' },
       skillsOnly: true
     })
   })
@@ -363,7 +364,7 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
       end: 11,
       from: 6,
       method: 'complete.slash',
-      params: { skills_only: true, text: '/skill' },
+      params: { text: '/skill' },
       skillsOnly: true
     })
   })
@@ -373,7 +374,7 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
       end: 11,
       from: 6,
       method: 'complete.slash',
-      params: { skills_only: true, text: '/skill' },
+      params: { text: '/skill' },
       skillsOnly: true
     })
   })
@@ -400,7 +401,7 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
       end: 8,
       from: 5,
       method: 'complete.slash',
-      params: { skills_only: true, text: '/cle' },
+      params: { text: '/cle' },
       skillsOnly: true
     })
     // same position but the cursor past the following space → the token ended
@@ -413,7 +414,7 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
       end: 10,
       from: 5,
       method: 'complete.slash',
-      params: { skills_only: true, text: '/cl' },
+      params: { text: '/cl' },
       skillsOnly: true
     })
   })
@@ -435,7 +436,7 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
       end: 10,
       from: 7,
       method: 'complete.slash',
-      params: { skills_only: true, text: '/cle' },
+      params: { text: '/cle' },
       skillsOnly: true
     })
     // a bare trailing inline slash browses skills, same as in prose
@@ -443,7 +444,7 @@ describe('planCompletion — inline skill references (Ink useCompletion parity)'
       end: 7,
       from: 7,
       method: 'complete.slash',
-      params: { skills_only: true, text: '/' },
+      params: { text: '/' },
       skillsOnly: true
     })
   })
@@ -752,10 +753,10 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     redraw: () => {
       redraws.value += 1
     },
-    request: (method, params) => {
+    request: scriptedRpc((method, params) => {
       calls.push({ method, params })
       return request(method, params)
-    },
+    }),
     sessionId: () => session.value,
     sessionOwnerId: () => session.value,
     submit: text => {
