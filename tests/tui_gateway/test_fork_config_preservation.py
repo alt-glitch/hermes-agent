@@ -1,7 +1,7 @@
 """Fork configuration choices survive the extracted upstream setter pipeline."""
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from tui_gateway import server
 

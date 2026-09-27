@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 
 @pytest.mark.parametrize(
