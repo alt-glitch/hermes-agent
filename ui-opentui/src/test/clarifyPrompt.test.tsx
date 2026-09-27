@@ -14,7 +14,7 @@ import { describe, expect, test } from 'vitest'
 import { ClarifyPrompt } from '../view/prompts/clarifyPrompt.tsx'
 import { PromptOverlay } from '../view/prompts/promptOverlay.tsx'
 import type { PromptReply, PromptResponseDisposition } from '../boundary/promptResponses.ts'
-import { SERVER_REQUEST_PROMPTS } from '../boundary/gateway/serverRequests.ts'
+import { decodeServerRequest } from '../boundary/gateway/serverRequests.ts'
 import { clarifyRevisitState, type ClarifyBatchQuestion } from '../logic/clarifyBatch.ts'
 import { createSessionStore } from '../logic/store.ts'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
@@ -31,9 +31,11 @@ function openRequest(
   id: string,
   params: Record<string, unknown> = {}
 ) {
-  const toPrompt = SERVER_REQUEST_PROMPTS[method]
-  if (!toPrompt) throw new Error(`no prompt for ${method}`)
-  store.openPrompt(toPrompt(id, params))
+  // Fill the contract's required routing keys the fixtures leave out.
+  const frame = { session_id: 'live-1', request_id: id, ...params }
+  const decoded = decodeServerRequest({ id, method, params: frame, respond: () => false })
+  if (typeof decoded === 'string') throw new Error(`${method} ${id}: ${decoded}`)
+  store.openPrompt(decoded.prompt)
 }
 const ACCEPTED = { kind: 'accepted' } as const satisfies PromptResponseDisposition
 const EXPIRED = { kind: 'terminal', reason: 'expired' } as const satisfies PromptResponseDisposition

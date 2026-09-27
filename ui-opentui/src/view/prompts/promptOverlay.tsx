@@ -22,7 +22,7 @@ import {
   type PromptReply,
   type PromptResponseDisposition
 } from '../../boundary/promptResponses.ts'
-import type { ServerRequestResult } from '../../boundary/gateway/serverRequests.ts'
+import type { PromptAnswer } from '../../boundary/gateway/serverRequests.ts'
 import { useCloseLayer, usePromptRetryLayer } from '../keymap.tsx'
 import { ApprovalPrompt } from './approvalPrompt.tsx'
 import { ClarifyPrompt } from './clarifyPrompt.tsx'
@@ -82,7 +82,7 @@ const MASKED_CARDS = {
 
 const isMasked = (prompt: ActivePrompt): prompt is GatewayPromptOf<MaskedKind> => prompt.kind in MASKED_CARDS
 
-const answer = (prompt: GatewayPrompt, result: ServerRequestResult): PromptReply => ({
+const answer = (prompt: GatewayPrompt, result: PromptAnswer): PromptReply => ({
   kind: 'answer',
   requestId: prompt.requestId,
   result
@@ -96,7 +96,7 @@ const CANCEL_RESULTS = {
   secret: { value: '' },
   sudo: { value: '' },
   vaultUnlock: { value: '' }
-} as const satisfies Record<GatewayPromptKind, ServerRequestResult>
+} as const satisfies Record<GatewayPromptKind, PromptAnswer>
 
 export function PromptOverlay(props: PromptOverlayProps) {
   const prompt = () => props.store.state.prompt

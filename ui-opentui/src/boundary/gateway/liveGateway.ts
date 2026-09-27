@@ -26,7 +26,12 @@ import {
   decodeSessionResumeResponse
 } from '../schema/SessionOrchestratorResponses.ts'
 import { GatewayService, type GatewayTransport } from './GatewayService.ts'
-import { RawGatewayClient, RawGatewayRequestError, type ServerRequest } from './client.ts'
+import {
+  RawGatewayClient,
+  RawGatewayRequestError,
+  type ServerRequest,
+  type ServerRequestDisposition
+} from './client.ts'
 import type { RpcMethod, RpcParams } from './rpc.ts'
 
 const COALESCE_MS = 16
@@ -212,14 +217,14 @@ function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
 
   // Backend→client requests open a prompt directly (not through the event queue); flush first so a
   // request never overtakes the events the backend wrote before it.
-  let serverRequestHandler: ((request: ServerRequest) => boolean) | undefined
+  let serverRequestHandler: ((request: ServerRequest) => ServerRequestDisposition) | undefined
   const client = new RawGatewayClient({
     log,
     onEvent: onRawEvent,
     onExit,
     onServerRequest: request => {
       flush()
-      return serverRequestHandler?.(request) ?? false
+      return serverRequestHandler?.(request) ?? 'method-not-found'
     }
   })
 

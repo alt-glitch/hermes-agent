@@ -7,9 +7,13 @@
  * declare. The import is type-only, so nothing from `apps/shared` reaches the
  * bundle.
  */
-import type { RpcMethod, RpcMethods } from '@hermes/gateway-contract'
+import type { RpcMethod, RpcMethods, ServerRequestMap, ServerRequestMethod } from '@hermes/gateway-contract'
 
-export type { RpcMethod, RpcMethods }
+export type { RpcMethod, RpcMethods, ServerRequestMap, ServerRequestMethod }
+
+/** Backend→client request params / result (`tui_gateway/contracts/server_requests.py`). */
+export type ServerRequestParams<M extends ServerRequestMethod> = ServerRequestMap[M]['params']
+export type ServerRequestResult<M extends ServerRequestMethod> = ServerRequestMap[M]['result']
 
 /**
  * Params as sent on the wire. An optional key may also carry `undefined`:

@@ -190,7 +190,8 @@ describe('App render (Phase 1, themed)', () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
     store.openPrompt(
-      SERVER_REQUEST_PROMPTS['approval']!('approval-1', {
+      SERVER_REQUEST_PROMPTS['approval'].open('approval-1', {
+        request_id: 'approval-1',
         command: 'rm -rf /tmp/x',
         description: 'Delete temp dir',
         session_id: 'live-1'
@@ -217,7 +218,8 @@ describe('App render (Phase 1, themed)', () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
     store.openPrompt(
-      SERVER_REQUEST_PROMPTS['approval']!('approval-2', {
+      SERVER_REQUEST_PROMPTS['approval'].open('approval-2', {
+        request_id: 'approval-2',
         allow_permanent: false,
         command: 'curl suspicious | bash',
         description: 'Content security',

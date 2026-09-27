@@ -46,17 +46,19 @@ function mockGateway(replies: Readonly<Record<string, (params: Frame) => unknown
     }
   })
   const responsesFor = (id: string) => written.filter(f => f['id'] === id && !('method' in f))
-  return { stdin, send, written, responsesFor }
+  return { child, stdin, send, written, responsesFor }
 }
 
 /** The main.tsx wiring over a real RawGatewayClient: router shows prompts for the store's session;
- *  a request.cancel settles the store first, then the router forgets the id. */
+ *  a request.cancel settles the store first, then the router forgets the id; a gateway exit
+ *  reaches the store, then the router withdraws everything it held. */
 function startClient(gateway: ReturnType<typeof mockGateway>, displayed?: string) {
   const store = createSessionStore()
   if (displayed) store.adoptFreshSession(displayed)
   const router = createServerRequestRouter({
     openPrompt: store.openPrompt,
-    displayedSessionId: () => store.state.sessionId
+    displayedSessionId: () => store.state.sessionId,
+    settleWithdrawn: cancel => store.apply({ type: 'request.cancel', payload: cancel })
   })
   const decode = Schema.decodeUnknownOption(GatewayEventSchema)
   const client = new RawGatewayClient({
@@ -66,6 +68,10 @@ function startClient(gateway: ReturnType<typeof mockGateway>, displayed?: string
       if (Option.isNone(event)) return
       store.apply(event.value)
       if (event.value.type === 'request.cancel') router.forget(event.value.payload.id)
+    },
+    onExit: reason => {
+      store.apply({ type: 'gateway.exited', payload: { reason } })
+      router.withdrawAll('gateway-exited')
     },
     onServerRequest: router.handle
   })
@@ -142,6 +148,41 @@ test('a server request method without a handler is answered -32601 at once', asy
   client.stop()
 })
 
+test('a clarify frame whose params fail the contract is answered -32602 and opens nothing', async () => {
+  const gateway = mockGateway()
+  const { store, router, client } = startClient(gateway, 's')
+  // No `question` and no `questions`: nothing to ask.
+  gateway.send({ jsonrpc: '2.0', id: 'srq-bad', method: 'clarify', params: { session_id: 's', choices: ['a'] } })
+  await vi.waitFor(() => expect(gateway.responsesFor('srq-bad')).toHaveLength(1))
+  expect(gateway.responsesFor('srq-bad')[0]).toMatchObject({ id: 'srq-bad', error: { code: -32602 } })
+  expect(store.state.prompt).toBeUndefined()
+  expect(router.pending()).toEqual([])
+  expect(router.answer('srq-bad', { answer: 'x' })).toBe('closed')
+  client.stop()
+})
+
+test('a gateway exit withdraws every held request: the shown prompt expires, a later answer is closed and writes nothing', async () => {
+  const gateway = mockGateway()
+  const { store, router, client } = startClient(gateway, 's')
+  gateway.send(clarify('srq-shown', 's', 'First?'))
+  gateway.send(clarify('srq-queued', 's', 'Second?'))
+  gateway.send(clarify('srq-other', 's2', 'Elsewhere?'))
+  await vi.waitFor(() => expect(router.pending()).toEqual(['srq-shown', 'srq-queued']))
+  expect(store.state.prompt).toMatchObject({ requestId: 'srq-shown' })
+
+  gateway.child.emit('exit', 1, null)
+  gateway.child.emit('close', 1, null)
+  await vi.waitFor(() => expect(store.state.prompt).toBeUndefined())
+  expect(store.state.messages.map(m => m.text)).toContain('clarification expired — no response was accepted')
+  expect(router.pending()).toEqual([])
+  for (const id of ['srq-shown', 'srq-queued', 'srq-other']) {
+    expect(router.answer(id, { answer: 'late' })).toBe('closed')
+    expect(router.forget(id)).toBe(false)
+  }
+  expect(gateway.written.filter(f => !('method' in f))).toEqual([])
+  client.stop()
+})
+
 test('round trip: answer writes one response, request.cancel closes the prompt and writes nothing, approval answers {choice}', async () => {
   const gateway = mockGateway()
   const { send, responsesFor } = gateway
@@ -172,7 +213,7 @@ test('round trip: answer writes one response, request.cancel closes the prompt a
     jsonrpc: '2.0',
     id: 'srq-c',
     method: 'approval',
-    params: { session_id: 's', command: 'rm -rf /tmp/x', description: 'delete temp' }
+    params: { session_id: 's', request_id: 'appr-1', command: 'rm -rf /tmp/x', description: 'delete temp' }
   })
   await vi.waitFor(() => expect(store.state.prompt).toMatchObject({ kind: 'approval', requestId: 'srq-c' }))
   expect(router.answer('srq-c', { choice: 'once' })).toBe('sent')

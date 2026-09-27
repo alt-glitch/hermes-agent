@@ -1,8 +1,10 @@
 /**
  * Backend→client JSON-RPC requests (`tui_gateway/server_requests.py`, contracts in
- * `tui_gateway/contracts/server_requests.py`). One handler per request method turns the request
- * params into the store's `ActivePrompt`; the prompt overlay renders it and answers through
- * `answer(id, result)`, which writes the JSON-RPC response `{jsonrpc, id, result}`.
+ * `tui_gateway/contracts/server_requests.py`). Each frame is decoded once, against its method's
+ * decoder (`schema/ServerRequestParams.ts`, typed by the generated `ServerRequestMap`); params that
+ * fail are answered -32602. One row per method turns the decoded params into the store's
+ * `ActivePrompt`; the prompt overlay renders it and answers through `answer(id, result)`, which
+ * writes the JSON-RPC response `{jsonrpc, id, result}`.
  * Methods without a row (desktop GUI bridges: preview.*, window.read, terminal.read, tour,
  * vault.save_login, vault.code) are not handled; the client answers -32601 so the tool fails fast.
  */
@@ -11,67 +13,96 @@ import { createEffect, createRoot, on } from 'solid-js'
 import type { ActivePrompt } from '../../logic/store.ts'
 import { approvalPolicy } from '../../logic/approval.ts'
 import { normalizeClarifyQuestions } from '../../logic/clarifyBatch.ts'
-import type { ServerRequest } from './client.ts'
+import { type PromptMethod, SERVER_REQUEST_DECODERS } from '../schema/ServerRequestParams.ts'
+import type { ServerRequest, ServerRequestDisposition } from './client.ts'
+import type { ServerRequestParams, ServerRequestResult } from './rpc.ts'
 
-type Params = Record<string, unknown>
+/** What the prompt overlay answers: ClarifyResult, ApprovalResult or ValueResult. */
+export type PromptAnswer = ServerRequestResult<PromptMethod>
 
-const str = (v: unknown): string => (typeof v === 'string' ? v : '')
-const strList = (v: unknown): string[] | null =>
-  Array.isArray(v) && v.length > 0 ? v.filter((c): c is string => typeof c === 'string') : null
-const strRecord = (v: unknown): Record<string, string> =>
-  v && typeof v === 'object'
-    ? Object.fromEntries(
-        Object.entries(v as Record<string, unknown>).filter((e): e is [string, string] => typeof e[1] === 'string')
-      )
-    : {}
+interface PromptRow<M extends PromptMethod> {
+  /** The prompt for decoded params (SERVER_REQUEST_DECODERS already checked the frame). */
+  readonly open: (id: string, params: ServerRequestParams<M>) => ActivePrompt
+  /** True when an overlay answer is this method's result shape; only then is it written. */
+  readonly accepts: (answer: PromptAnswer) => answer is ServerRequestResult<M>
+}
 
-/** Result shapes per `contracts/server_requests.py`: ClarifyResult, ApprovalResult, ValueResult. */
-export type ServerRequestResult =
-  | { readonly answer: string }
-  | { readonly answers: Record<string, string> }
-  | { readonly choice: 'once' | 'session' | 'always' | 'deny'; readonly all?: boolean }
-  | { readonly value: string }
+const isValue = (answer: PromptAnswer): answer is ServerRequestResult<'sudo'> => 'value' in answer
 
-export const SERVER_REQUEST_PROMPTS: Readonly<Record<string, (id: string, params: Params) => ActivePrompt>> = {
-  clarify: (id, p) => {
-    const questions = normalizeClarifyQuestions(
-      (Array.isArray(p['questions']) ? (p['questions'] as unknown[]) : []).map(raw => {
-        const q = raw && typeof raw === 'object' ? (raw as Params) : {}
-        return {
-          choices: strList(q['choices']),
-          multi_select: q['multi_select'] === true,
-          qid: str(q['qid']),
-          question: str(q['question'])
-        }
-      })
-    )
-    return questions.length
-      ? { kind: 'clarify', question: '', choices: null, requestId: id, questions, answers: strRecord(p['answers']) }
-      : { kind: 'clarify', question: str(p['question']), choices: strList(p['choices']), requestId: id }
+export const SERVER_REQUEST_PROMPTS: { readonly [M in PromptMethod]: PromptRow<M> } = {
+  clarify: {
+    open: (id, p) => {
+      const questions = normalizeClarifyQuestions(p.questions ?? undefined)
+      if (questions.length > 0) {
+        return { kind: 'clarify', question: '', choices: null, requestId: id, questions, answers: { ...p.answers } }
+      }
+      // The decoder requires `question` when there is no batch; '' only when every batch entry was blank.
+      const choices = p.choices?.length ? [...p.choices] : null
+      return { kind: 'clarify', question: p.question ?? '', choices, requestId: id }
+    },
+    accepts: (answer): answer is ServerRequestResult<'clarify'> => !('choice' in answer) && !('value' in answer)
   },
-  approval: (id, p) => {
-    const choices = strList(p['choices'])
-    return {
+  approval: {
+    open: (id, p) => ({
       kind: 'approval',
       allowPermanent: approvalPolicy({
-        ...(typeof p['allow_permanent'] === 'boolean' ? { allowPermanent: p['allow_permanent'] } : {}),
-        ...(choices ? { choices } : {}),
-        ...(typeof p['smart_denied'] === 'boolean' ? { smartDenied: p['smart_denied'] } : {})
+        ...(p.allow_permanent != null ? { allowPermanent: p.allow_permanent } : {}),
+        ...(p.choices ? { choices: p.choices } : {}),
+        ...(p.smart_denied != null ? { smartDenied: p.smart_denied } : {})
       }),
-      command: str(p['command']),
-      description: str(p['description']) || 'dangerous command',
+      // `command` / `description` default to "" in the contract.
+      command: p.command ?? '',
+      description: p.description || 'dangerous command',
       requestId: id,
-      sessionId: str(p['session_id'])
-    }
+      sessionId: p.session_id
+    }),
+    accepts: (answer): answer is ServerRequestResult<'approval'> => 'choice' in answer
   },
-  sudo: id => ({ kind: 'sudo', requestId: id }),
-  secret: (id, p) => ({ kind: 'secret', envVar: str(p['env_var']), prompt: str(p['prompt']), requestId: id }),
-  'vault.unlock_prompt': (id, p) => ({
-    kind: 'vaultUnlock',
-    backend: str(p['backend']),
-    displayName: str(p['display_name']),
-    requestId: id
-  })
+  sudo: { open: id => ({ kind: 'sudo', requestId: id }), accepts: isValue },
+  secret: {
+    open: (id, p) => ({ kind: 'secret', envVar: p.env_var, prompt: p.prompt, requestId: id }),
+    accepts: isValue
+  },
+  'vault.unlock_prompt': {
+    open: (id, p) => ({ kind: 'vaultUnlock', backend: p.backend, displayName: p.display_name, requestId: id }),
+    accepts: isValue
+  }
+}
+
+/** One request decoded against its method's contract. */
+export interface DecodedServerRequest {
+  readonly id: string
+  readonly method: PromptMethod
+  readonly sessionId: string
+  readonly prompt: ActivePrompt
+  /** Write the JSON-RPC response. False when nothing was written (transport down, or `answer` is
+   *  not this method's result shape). */
+  readonly respond: (answer: PromptAnswer) => boolean
+}
+
+const isPromptMethod = (method: string): method is PromptMethod => Object.hasOwn(SERVER_REQUEST_PROMPTS, method)
+
+function decodeAs<M extends PromptMethod>(method: M, request: ServerRequest): DecodedServerRequest | undefined {
+  const params = SERVER_REQUEST_DECODERS[method](request.params)
+  if (params === undefined) return undefined
+  const row: PromptRow<M> = SERVER_REQUEST_PROMPTS[method]
+  const send: (result: ServerRequestResult<M>) => boolean = request.respond
+  return {
+    id: request.id,
+    method,
+    sessionId: params.session_id,
+    prompt: row.open(request.id, params),
+    respond: answer => row.accepts(answer) && send(answer)
+  }
+}
+
+/** Decode a raw request frame once: unknown method → 'method-not-found', params that fail the
+ *  method's decoder → 'invalid-params'. */
+export function decodeServerRequest(
+  request: ServerRequest
+): DecodedServerRequest | Exclude<ServerRequestDisposition, 'held'> {
+  if (!isPromptMethod(request.method)) return 'method-not-found'
+  return decodeAs(request.method, request) ?? 'invalid-params'
 }
 
 /** How `answer` ended: written, not written (transport down — the request stays open for a retry),
@@ -80,12 +111,16 @@ export type AnswerOutcome = 'sent' | 'not-sent' | 'closed'
 
 export interface ServerRequestRouter {
   /** RawClientOptions.onServerRequest; also the replay path for a hydration's `open_requests`. */
-  readonly handle: (request: ServerRequest) => boolean
+  readonly handle: (request: ServerRequest) => ServerRequestDisposition
   /** Answer held request `id`. On 'sent' the next request of the displayed session opens. */
-  readonly answer: (id: string, result: ServerRequestResult) => AnswerOutcome
+  readonly answer: (id: string, result: PromptAnswer) => AnswerOutcome
   /** The backend settled `id` without this answer (`request.cancel`, final `clarify.lock`): drop it and,
    *  when it was the shown one, open the next. True when it was held. */
   readonly forget: (id: string) => boolean
+  /** The gateway process is gone (`gateway.exited`): it will never answer or cancel what it asked,
+   *  and a respawned one never issued these ids. Drop every held request and settle each through
+   *  `settleWithdrawn` with `reason`, the same store path as a `request.cancel`. */
+  readonly withdrawAll: (reason: string) => void
   /** Held request ids for the displayed session, shown one first. */
   readonly pending: () => readonly string[]
   /** Stop following the displayed session. */
@@ -98,11 +133,8 @@ export interface ServerRequestRouterOptions {
   /** The session whose transcript is on screen (store.state.sessionId). A reactive accessor: the
    *  router follows it and opens the new session's oldest held request when it changes. */
   readonly displayedSessionId: () => string | undefined
-}
-
-interface Held {
-  readonly request: ServerRequest
-  readonly prompt: ActivePrompt
+  /** Settle a withdrawn request's prompt the way a `request.cancel` event does (store.apply). */
+  readonly settleWithdrawn: (cancel: { readonly id: string; readonly method: string; readonly reason: string }) => void
 }
 
 /**
@@ -114,15 +146,20 @@ interface Held {
  * keeps its place.
  */
 export function createServerRequestRouter(options: ServerRequestRouterOptions): ServerRequestRouter {
-  const held = new Map<string, Held[]>()
-  const sessionOf = (request: ServerRequest): string => str(request.params['session_id'])
+  const held = new Map<string, DecodedServerRequest[]>()
   const showHead = (sessionId: string | undefined): void => {
     const head = sessionId === undefined ? undefined : held.get(sessionId)?.[0]
     if (head) options.openPrompt(head.prompt)
   }
-  const find = (id: string): { readonly sessionId: string; readonly queue: Held[]; readonly index: number } | null => {
+  const find = (
+    id: string
+  ): {
+    readonly sessionId: string
+    readonly queue: DecodedServerRequest[]
+    readonly index: number
+  } | null => {
     for (const [sessionId, queue] of held) {
-      const index = queue.findIndex(h => h.request.id === id)
+      const index = queue.findIndex(h => h.id === id)
       if (index >= 0) return { sessionId, queue, index }
     }
     return null
@@ -141,32 +178,35 @@ export function createServerRequestRouter(options: ServerRequestRouterOptions): 
   })
   return {
     handle: request => {
-      const toPrompt = SERVER_REQUEST_PROMPTS[request.method]
-      if (!toPrompt) return false
-      const sessionId = sessionOf(request)
-      const queue = held.get(sessionId) ?? []
-      held.set(sessionId, queue)
-      const next = { request, prompt: toPrompt(request.id, request.params) }
-      const index = queue.findIndex(h => h.request.id === request.id)
+      const next = decodeServerRequest(request)
+      if (typeof next === 'string') return next
+      const queue = held.get(next.sessionId) ?? []
+      held.set(next.sessionId, queue)
+      const index = queue.findIndex(h => h.id === next.id)
       // A replay of a held request takes its place (it carries the batch answers locked so far).
       if (index >= 0) queue[index] = next
       else queue.push(next)
       // The shown one re-opens too: hydration cleared the store prompt.
-      if (queue[0] === next && sessionId === options.displayedSessionId()) options.openPrompt(next.prompt)
-      return true
+      if (queue[0] === next && next.sessionId === options.displayedSessionId()) options.openPrompt(next.prompt)
+      return 'held'
     },
     answer: (id, result) => {
       const found = find(id)
-      const request = found?.queue[found.index]?.request
+      const request = found?.queue[found.index]
       if (!request) return 'closed'
-      if (!request.respond({ ...result })) return 'not-sent'
+      if (!request.respond(result)) return 'not-sent'
       remove(id)
       return 'sent'
     },
     forget: remove,
+    withdrawAll: reason => {
+      const dropped = [...held.values()].flat()
+      held.clear()
+      for (const { id, method } of dropped) options.settleWithdrawn({ id, method, reason })
+    },
     pending: () => {
       const displayed = options.displayedSessionId()
-      return displayed === undefined ? [] : (held.get(displayed) ?? []).map(h => h.request.id)
+      return displayed === undefined ? [] : (held.get(displayed) ?? []).map(h => h.id)
     },
     dispose
   }

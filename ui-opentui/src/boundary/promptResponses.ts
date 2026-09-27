@@ -1,7 +1,7 @@
 /** Blocking-prompt replies (answer a backend→client request) and their decoded dispositions. */
 import { Option, Schema } from 'effect'
 
-import type { AnswerOutcome, ServerRequestResult, ServerRequestRouter } from './gateway/serverRequests.ts'
+import type { AnswerOutcome, PromptAnswer, ServerRequestRouter } from './gateway/serverRequests.ts'
 
 /**
  * What the prompt overlay asks the entry to deliver:
@@ -9,7 +9,7 @@ import type { AnswerOutcome, ServerRequestResult, ServerRequestRouter } from './
  *   lock   — one batch-clarify answer through the `clarify.lock` RPC (the request stays open).
  */
 export type PromptReply =
-  | { readonly kind: 'answer'; readonly requestId: string; readonly result: ServerRequestResult }
+  | { readonly kind: 'answer'; readonly requestId: string; readonly result: PromptAnswer }
   | { readonly kind: 'lock'; readonly requestId: string; readonly questionId: string; readonly answer: string }
 
 export type PromptResponseDisposition =

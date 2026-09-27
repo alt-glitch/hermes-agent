@@ -1100,7 +1100,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // store prompts; the answer goes back as the JSON-RPC response (see `respond`).
       const serverRequests = createServerRequestRouter({
         openPrompt: store.openPrompt,
-        displayedSessionId: () => store.state.sessionId
+        displayedSessionId: () => store.state.sessionId,
+        settleWithdrawn: cancel => store.apply({ type: 'request.cancel', payload: cancel })
       })
       yield* Effect.addFinalizer(() => Effect.sync(serverRequests.dispose))
       const stopServingRequests = gateway.serveRequests?.(serverRequests.handle)
@@ -1155,6 +1156,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         // After the store settled the withdrawn prompt (expired notice, batch record): the router
         // then drops the id and, when it was the shown one, opens the next queued request.
         if (event.type === 'request.cancel') serverRequests.forget(event.payload.id)
+        // A crashed gateway never sends request.cancel, and the respawned one never issued the held
+        // ids: withdraw them all (the shown prompt settles with the expired notice).
+        else if (event.type === 'gateway.exited') serverRequests.withdrawAll('gateway-exited')
       })
 
       // Match Ink's live config sync: poll the config file mtime every five

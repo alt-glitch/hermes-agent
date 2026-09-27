@@ -26,7 +26,7 @@ import { getHeapStatistics } from 'node:v8'
 
 import type { Log } from '../log.ts'
 import { resolvePython, resolveSrcRoot } from './python.ts'
-import type { RpcMethod, RpcParams, RpcResult } from './rpc.ts'
+import type { RpcMethod, RpcParams, RpcResult, ServerRequestMethod, ServerRequestResult } from './rpc.ts'
 
 interface Pending {
   resolve: (result: unknown) => void
@@ -93,25 +93,34 @@ export interface RawClientOptions {
   readonly onEvent: (params: unknown) => void
   /** Called when the child exits / errors (so the layer can reject pending + reconnect). */
   readonly onExit?: (reason: string) => void
-  /** Called with each backend→client JSON-RPC request (`tui_gateway/server_requests.py`).
-   *  Returns false when this client has no handler for `method`; the client then answers -32601. */
-  readonly onServerRequest?: (request: ServerRequest) => boolean
+  /** Called with each backend→client JSON-RPC request (`tui_gateway/server_requests.py`). The handler
+   *  decodes it; a rejection is answered at once (-32601 / -32602) so the backend tool fails fast. */
+  readonly onServerRequest?: (request: ServerRequest) => ServerRequestDisposition
 }
 
-/** One backend→client JSON-RPC request frame `{jsonrpc, id, method, params}` (id is `srq-<hex>`). */
+/** One backend→client JSON-RPC request frame `{jsonrpc, id, method, params}` (id is `srq-<hex>`).
+ *  `params` is the raw frame value; the handler decodes it against `ServerRequestMap`. */
 export interface ServerRequest {
   readonly id: string
   readonly method: string
-  readonly params: Record<string, unknown>
+  readonly params: unknown
   /** Write `{jsonrpc, id, result}`. False when the transport is down (nothing written). */
-  readonly respond: (result: Record<string, unknown>) => boolean
+  readonly respond: (result: ServerRequestResult<ServerRequestMethod>) => boolean
 }
+
+/** How the handler took a request: held (answered later through `respond`), or rejected. */
+export type ServerRequestDisposition = 'held' | 'method-not-found' | 'invalid-params'
+
+const SERVER_REQUEST_REJECTIONS = {
+  'method-not-found': { code: -32601, message: 'method not handled' },
+  'invalid-params': { code: -32602, message: 'invalid params' }
+} as const satisfies Record<Exclude<ServerRequestDisposition, 'held'>, { code: number; message: string }>
 
 /** One `open_requests` entry: a request the backend is still waiting on (`OpenRequestEntry` contract). */
 export interface OpenRequestEntry {
   readonly id: string
   readonly method: string
-  readonly params: Readonly<Record<string, unknown>>
+  readonly params: unknown
 }
 
 /** Machine-readable request failure provenance. Delivery-sensitive callers
@@ -272,7 +281,7 @@ export class RawGatewayClient {
   private readonly log: Log
   private readonly onEvent: (params: unknown) => void
   private readonly onExit?: (reason: string) => void
-  private readonly onServerRequest: ((request: ServerRequest) => boolean) | undefined
+  private readonly onServerRequest: ((request: ServerRequest) => ServerRequestDisposition) | undefined
   private readonly transportLog = new TransportLogRing()
 
   constructor(options: RawClientOptions) {
@@ -942,11 +951,7 @@ export class RawGatewayClient {
     for (const entry of entries) this.routeServerRequest(entry.id, entry.method, entry.params)
   }
 
-  private routeServerRequest(id: string, method: string, rawParams: unknown): void {
-    const params =
-      rawParams && typeof rawParams === 'object' && !Array.isArray(rawParams)
-        ? (rawParams as Record<string, unknown>)
-        : {}
+  private routeServerRequest(id: string, method: string, params: unknown): void {
     this.pushTransportLog(`[server-request] ${method} ${id}`)
     const request: ServerRequest = {
       id,
@@ -954,16 +959,16 @@ export class RawGatewayClient {
       params,
       respond: result => this.writeFrame({ id, jsonrpc: '2.0', result })
     }
-    let handled = false
+    let disposition: ServerRequestDisposition = 'method-not-found'
     try {
-      handled = this.onServerRequest?.(request) ?? false
+      disposition = this.onServerRequest?.(request) ?? 'method-not-found'
     } catch (cause) {
       this.log.warn('gateway', 'server request handler threw', { cause: String(cause), method })
     }
-    if (!handled) {
-      // No handler: answer at once so the backend tool fails fast instead of waiting out its deadline.
-      this.writeFrame({ error: { code: -32601, message: `method not handled: ${method}` }, id, jsonrpc: '2.0' })
-    }
+    if (disposition === 'held') return
+    if (disposition === 'invalid-params') this.log.warn('gateway', 'server request params invalid', { id, method })
+    const { code, message } = SERVER_REQUEST_REJECTIONS[disposition]
+    this.writeFrame({ error: { code, message: `${message}: ${method}` }, id, jsonrpc: '2.0' })
   }
 
   /** Write one frame on the live transport (stdio child or attached socket). False when down. */

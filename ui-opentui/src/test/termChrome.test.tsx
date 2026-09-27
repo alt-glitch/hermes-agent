@@ -216,7 +216,9 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
     const { dispose, notifications, store } = mount()
     try {
       expect(notifications).toEqual([])
-      store.openPrompt(SERVER_REQUEST_PROMPTS['clarify']!('r1', { choices: null, question: 'which one?' }))
+      store.openPrompt(
+        SERVER_REQUEST_PROMPTS['clarify'].open('r1', { choices: null, question: 'which one?', session_id: 's' })
+      )
       expect(notifications).toEqual(['needs an answer to continue'])
       // clearing the prompt does not notify again
       store.clearPrompt()
@@ -230,7 +232,9 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
     const { bells, dispose, store } = mount()
     try {
       store.setBellOnPrompt(true)
-      store.openPrompt(SERVER_REQUEST_PROMPTS['clarify']!('r1', { choices: null, question: 'first?' }))
+      store.openPrompt(
+        SERVER_REQUEST_PROMPTS['clarify'].open('r1', { choices: null, question: 'first?', session_id: 's' })
+      )
       expect(bells).toEqual([BEL])
 
       // Unrelated reactive work while the same prompt remains open cannot ring again.
@@ -238,7 +242,9 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
       expect(bells).toEqual([BEL])
 
       store.clearPrompt()
-      store.openPrompt(SERVER_REQUEST_PROMPTS['secret']!('r2', { env_var: 'TOKEN', prompt: 'token?' }))
+      store.openPrompt(
+        SERVER_REQUEST_PROMPTS['secret'].open('r2', { env_var: 'TOKEN', prompt: 'token?', session_id: 's' })
+      )
       expect(bells).toEqual([BEL, BEL])
     } finally {
       dispose()
