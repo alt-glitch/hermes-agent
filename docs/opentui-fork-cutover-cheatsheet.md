@@ -47,7 +47,7 @@ canonical install at `~/.hermes/hermes-agent` with the fork's `sid/opentui`.**
 
 **What "replace" means here:** point `~/.hermes/hermes-agent` at the fork's
 `sid/opentui`, rebuild it, and keep the gateway unit on that managed checkout.
-The launcher selects it outside development worktrees. After this, one managed
+Bare `hermes` always runs it, from any directory. After this, one managed
 install, one fork branch.
 
 > We do NOT delete `~/.hermes/hermes-agent` and re-clone — it has linked worktrees
@@ -173,8 +173,9 @@ fnm default 25.9.0    # only if you want the old node default back
    both end up on the fork. That's the intent of model B.
 2. **`~/.hermes` data is untouched** — auth, sessions, skills, cron all survive (only
    the *code* checkout's branch + venv change).
-3. **The quiet-quill worktree is NOT touched** — the launcher selects it only
-   while your shell is inside that worktree; elsewhere it uses the managed install.
+3. **The quiet-quill worktree is NOT touched** — bare `hermes` always runs the
+   managed install, from any directory. To run the worktree's code, invoke its own
+   `<worktree>/.hermes/bin/hermes` or `source ./activate` inside it.
 <!-- no-tmp: ok — historical worktree path reference from the cutover run, not a command to run -->
 4. **Linked worktree `/tmp/fable-fix`** shares this repo's `.git`. Switching branches
    in `~/.hermes/hermes-agent` is fine (worktrees are independent checkouts), but
