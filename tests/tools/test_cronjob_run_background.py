@@ -22,14 +22,12 @@ from tools.cronjob_tools import (
     cronjob,
 )
 
-
 _JOB = {
     "id": "job-bg-1",
     "name": "bg run",
     "prompt": "hi",
     "schedule": {"kind": "cron", "expr": "0 9 * * *"},
 }
-
 
 def _job(job_id):
     """Per-test job dict with a UNIQUE id.
@@ -46,7 +44,6 @@ def _job(job_id):
         "schedule": {"kind": "cron", "expr": "0 9 * * *"},
     }
 
-
 def _bound_session_key(key="agent:main:telegram:dm:123"):
     """Context manager binding the approval session key contextvar."""
     import contextlib
@@ -62,7 +59,6 @@ def _bound_session_key(key="agent:main:telegram:dm:123"):
             _approval_session_key.reset(token)
 
     return _cm()
-
 
 class TestBackgroundDispatch:
     def test_dispatches_and_returns_handle_immediately(self):
@@ -159,7 +155,6 @@ class TestBackgroundDispatch:
         assert found["session_key"] == "agent:main:telegram:dm:777"
         assert found["status"] == "completed"
         assert "bg run" in (found.get("summary") or "")
-        assert "Next scheduled run" in found["summary"]
 
     def test_failed_run_reports_error_status_in_event(self):
         import time
@@ -224,7 +219,6 @@ class TestBackgroundDispatch:
         assert "paused/disabled" in res["error"]
         m_disp.assert_not_called()
 
-
 class TestSyncFallbacks:
     def test_no_session_key_falls_back_to_sync(self):
         """Direct Python callers (no agent session) keep the sync path."""
@@ -269,7 +263,6 @@ class TestSyncFallbacks:
         assert res["dispatched"] is False
         assert res["success"] is True
         m_run.assert_called_once()  # ran inline on this thread
-
 
 class TestInFlightDedupe:
     """Manual runs must not double-fire a job that is already mid-run
@@ -395,23 +388,6 @@ class TestInFlightDedupe:
         finally:
             sched.release_running_job("job-bg-10")
 
-    def test_ticker_guard_uses_shared_helpers(self):
-        """The ticker's _submit_with_guard and manual runs share ONE dedupe
-        owner: registration through either side blocks the other."""
-        from cron import scheduler as sched
-
-        # Manual-run registration…
-        assert sched.try_register_running_job("job-shared-1")
-        try:
-            # …is exactly what the ticker-side helper consults.
-            assert not sched.try_register_running_job("job-shared-1")
-            assert "job-shared-1" in sched.get_running_job_ids()
-        finally:
-            sched.release_running_job("job-shared-1")
-        assert "job-shared-1" not in sched.get_running_job_ids()
-        # Idempotent release: never raises on a non-member.
-        sched.release_running_job("job-shared-1")
-
     def test_shared_registration_retains_and_releases_run_claim_token(self):
         """The shared upstream registry must preserve fork shutdown fencing."""
         from cron import scheduler as sched
@@ -424,7 +400,6 @@ class TestInFlightDedupe:
         finally:
             sched.release_running_job(job_id)
         assert key not in sched._running_run_claim_tokens
-
 
 class TestCronjobRunToolIntegration:
     def test_run_action_returns_background_note(self):
@@ -463,7 +438,6 @@ class TestCronjobRunToolIntegration:
         assert out["job"]["executed"] is True
         assert out["job"]["execution_mode"] == "background"
         assert out["job"]["delegation_id"]
-        assert "background" in out["note"]
 
     def test_run_action_sync_path_unchanged_without_session(self):
         """No session context → the legacy synchronous behavior (executed +

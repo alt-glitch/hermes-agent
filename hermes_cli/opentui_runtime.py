@@ -209,6 +209,8 @@ def probe_node_identity(node_bin: str) -> NodeIdentity | None:
             [node_bin, "-p", expression],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             check=False,
         )
@@ -325,7 +327,7 @@ def refresh_backoff_remaining(
         state_dir / FAILED_REFRESH_FILE,
     ):
         try:
-            candidate = json.loads(marker.read_text(encoding="utf-8"))
+            candidate = json.loads(marker.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if (
@@ -372,7 +374,7 @@ def record_refresh_failure(
         # other installations sharing this profile remain independent.
         for old_marker in marker_dir.glob("*.json"):
             try:
-                old_payload = json.loads(old_marker.read_text(encoding="utf-8"))
+                old_payload = json.loads(old_marker.read_text(encoding="utf-8-sig"))
                 old_failed_at = float(old_payload["failed_at"])
                 expired = (
                     old_failed_at > failed_at
@@ -432,7 +434,7 @@ def clear_refresh_failure(state_dir: Path, key: str | None = None) -> None:
         legacy = state_dir / FAILED_REFRESH_FILE
         if key is not None and legacy.is_file():
             try:
-                payload = json.loads(legacy.read_text(encoding="utf-8"))
+                payload = json.loads(legacy.read_text(encoding="utf-8-sig"))
             except (OSError, UnicodeError, json.JSONDecodeError):
                 payload = None
             if isinstance(payload, dict) and payload.get("key") == key:
@@ -466,12 +468,12 @@ def _installed_lock_matches(root: Path, identity: NodeIdentity) -> bool:
     stamp offline instead of attempting ``npm ci`` on every launch.
     """
     try:
-        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        package = json.loads((root / "package.json").read_text(encoding="utf-8-sig"))
         expected_lock = json.loads(
-            (root / "package-lock.json").read_text(encoding="utf-8")
+            (root / "package-lock.json").read_text(encoding="utf-8-sig")
         )
         installed_lock = json.loads(
-            (root / "node_modules" / ".package-lock.json").read_text(encoding="utf-8")
+            (root / "node_modules" / ".package-lock.json").read_text(encoding="utf-8-sig")
         )
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
@@ -524,7 +526,7 @@ def _installed_lock_matches(root: Path, identity: NodeIdentity) -> bool:
         if expected_version is not None:
             try:
                 installed_manifest = json.loads(
-                    (root / package_path / "package.json").read_text(encoding="utf-8")
+                    (root / package_path / "package.json").read_text(encoding="utf-8-sig")
                 )
             except (OSError, UnicodeError, json.JSONDecodeError):
                 return False
@@ -600,7 +602,7 @@ def _manifest_version(root: Path, package_name: str) -> str | None:
 def runtime_payload_present(root: Path, identity: NodeIdentity) -> bool:
     """Version-independent guard for whether a prior bundle is safe to launch."""
     try:
-        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        package = json.loads((root / "package.json").read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
 
@@ -658,8 +660,8 @@ def runtime_sentinels_current(
     if not payload_present:
         return False
     try:
-        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
-        lock = json.loads((root / "package-lock.json").read_text(encoding="utf-8"))
+        package = json.loads((root / "package.json").read_text(encoding="utf-8-sig"))
+        lock = json.loads((root / "package-lock.json").read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     if not isinstance(package, dict) or not isinstance(lock, dict):
@@ -706,7 +708,7 @@ def runtime_sentinels_current(
 def build_toolchain_available(root: Path) -> bool:
     """Whether the exact dev packages imported by scripts/build.mjs exist."""
     try:
-        lock = json.loads((root / "package-lock.json").read_text(encoding="utf-8"))
+        lock = json.loads((root / "package-lock.json").read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     if not isinstance(lock, dict):
@@ -967,7 +969,7 @@ def packaged_runtime_current(location: RuntimeLocation) -> bool:
         return True
     stamp = location.runtime_dir / PACKAGED_SEED_STAMP
     try:
-        payload = json.loads(stamp.read_text(encoding="utf-8"))
+        payload = json.loads(stamp.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     if not isinstance(payload, dict):

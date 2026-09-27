@@ -1,10 +1,15 @@
-"""Coverage for _run_with_idle_timeout — the streaming subprocess helper.
+"""Coverage for _run_build_with_idle_timeout — the fork's streaming build runner.
+
+``main_web_build._run_with_idle_timeout`` is upstream's frozen old-updater shim
+(it stops for relaunch; see ``test_old_updater_shims.py``). The live runner the
+OpenTUI refresh uses (``main_tui_launch._run_opentui_build_command``) is
+``_run_build_with_idle_timeout``: it streams output, idle-kills the process, and
+isolates + registers the process group so TERM/HUP and dashboard shutdown reap
+the whole tree.
 
 Kept in a dedicated test file because the tests spawn real ``subprocess.Popen``
 instances; pytest-isolate runs each test file in its own worker process, so
-isolating these here prevents real-Popen state from racing with the
-``subprocess.run`` / ``_run_with_idle_timeout`` patches used by
-``test_web_ui_build.py``.
+real-Popen state never races with subprocess patches in other files.
 
 Added for issue #33788: ``hermes update`` got stuck at "webui-build" because
 ``npm run build`` ran with ``capture_output=True`` and no timeout. The helper
@@ -20,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.main_web_build import _run_with_idle_timeout
+from hermes_cli.main_web_build import _run_build_with_idle_timeout
 
 
 def _process_exited(pid: int) -> bool:
@@ -36,7 +41,7 @@ def _process_exited(pid: int) -> bool:
 def test_streams_output_and_returns_zero_on_success(tmp_path):
     script = tmp_path / "ok.py"
     script.write_text("print('line one'); print('line two')\n")
-    result = _run_with_idle_timeout(
+    result = _run_build_with_idle_timeout(
         [_sys.executable, str(script)], cwd=tmp_path, idle_timeout_seconds=10
     )
     assert result.returncode == 0
@@ -47,7 +52,7 @@ def test_streams_output_and_returns_zero_on_success(tmp_path):
 def test_propagates_nonzero_exit(tmp_path):
     script = tmp_path / "fail.py"
     script.write_text("import sys; print('boom', file=sys.stderr); sys.exit(7)\n")
-    result = _run_with_idle_timeout(
+    result = _run_build_with_idle_timeout(
         [_sys.executable, str(script)], cwd=tmp_path, idle_timeout_seconds=10
     )
     assert result.returncode == 7
@@ -62,7 +67,7 @@ def test_kills_process_on_idle_timeout(tmp_path):
     script.write_text("import time; time.sleep(30)\n")
 
     start = time.monotonic()
-    result = _run_with_idle_timeout(
+    result = _run_build_with_idle_timeout(
         [_sys.executable, str(script)],
         cwd=tmp_path,
         idle_timeout_seconds=1,
@@ -89,7 +94,7 @@ def test_idle_timeout_kills_the_whole_process_tree(tmp_path):
         "time.sleep(30)\n"
     )
 
-    result = _run_with_idle_timeout(
+    result = _run_build_with_idle_timeout(
         [_sys.executable, str(script), str(grandchild_pid)],
         cwd=tmp_path,
         idle_timeout_seconds=0.3,
@@ -125,7 +130,7 @@ def test_normal_leader_exit_reaps_background_descendant(tmp_path):
 
     pid = None
     try:
-        result = _run_with_idle_timeout(
+        result = _run_build_with_idle_timeout(
             [_sys.executable, str(script), str(grandchild_pid)],
             cwd=tmp_path,
             idle_timeout_seconds=10,
@@ -168,8 +173,8 @@ def test_parent_termination_reaps_silent_isolated_tree(
     parent_script.write_text(
         "import sys\n"
         "from pathlib import Path\n"
-        "from hermes_cli.main_web_build import _run_with_idle_timeout\n"
-        "_run_with_idle_timeout([sys.executable, sys.argv[1], sys.argv[2]], "
+        "from hermes_cli.main_web_build import _run_build_with_idle_timeout\n"
+        "_run_build_with_idle_timeout([sys.executable, sys.argv[1], sys.argv[2]], "
         "cwd=Path(sys.argv[3]), idle_timeout_seconds=30)\n"
     )
     env = os.environ.copy()
@@ -244,10 +249,10 @@ def test_signal_fence_reaps_tree_started_from_worker_thread(
     parent_script.write_text(
         "import sys, threading\n"
         "from pathlib import Path\n"
-        "from hermes_cli.main_web_build import _run_with_idle_timeout\n"
+        "from hermes_cli.main_web_build import _run_build_with_idle_timeout\n"
         "from hermes_cli.subprocess_lifecycle import install_signal_cleanup\n"
         "cleanup = install_signal_cleanup()\n"
-        "thread = threading.Thread(target=_run_with_idle_timeout, "
+        "thread = threading.Thread(target=_run_build_with_idle_timeout, "
         "args=([sys.executable, sys.argv[1], sys.argv[2]], Path(sys.argv[3])), "
         "kwargs={'idle_timeout_seconds': 30})\n"
         "thread.start()\n"
@@ -365,7 +370,7 @@ def test_signal_fence_chains_and_restores_existing_handler():
 
 
 def test_returns_127_when_binary_missing(tmp_path):
-    result = _run_with_idle_timeout(
+    result = _run_build_with_idle_timeout(
         ["/nonexistent/binary/does/not/exist"],
         cwd=tmp_path,
         idle_timeout_seconds=5,

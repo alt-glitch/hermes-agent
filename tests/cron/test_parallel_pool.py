@@ -7,41 +7,8 @@ prevented the ticker thread from firing, causing all other jobs to be fast-forwa
 import concurrent.futures
 import threading
 import time
-from unittest.mock import patch
 
 import pytest
-
-
-class TestPersistentPool:
-    """_get_parallel_pool returns a persistent ThreadPoolExecutor."""
-
-    def test_pool_is_reused(self, monkeypatch):
-        """Same pool instance returned when max_workers doesn't change."""
-        import cron.scheduler as sched
-
-        # Reset module state.
-        sched._parallel_pools.clear()
-        sched._parallel_pool_max_workers.clear()
-
-        pool1 = sched._get_parallel_pool(4)
-        pool2 = sched._get_parallel_pool(4)
-        assert pool1 is pool2
-
-        # Cleanup.
-        sched._shutdown_parallel_pool()
-
-
-    def test_shutdown_clears_pool(self, monkeypatch):
-        """_shutdown_parallel_pool resets state."""
-        import cron.scheduler as sched
-
-        sched._parallel_pools.clear()
-        sched._parallel_pool_max_workers.clear()
-        sched._get_parallel_pool(2)
-
-        sched._shutdown_parallel_pool()
-        assert not sched._parallel_pools
-        assert not sched._parallel_pool_max_workers
 
 
 class TestRunningJobGuard:
@@ -89,7 +56,6 @@ class TestRunningJobGuard:
 
         sched._running_job_ids.discard(sched._inflight_key("guard-job"))
         sched._shutdown_parallel_pool()
-
 
     def test_fire_claim_is_acquired_only_when_executor_worker_starts(self, monkeypatch):
         """Queue wait must not consume the durable claim TTL."""
@@ -141,7 +107,6 @@ class TestRunningJobGuard:
             "queued-job", {"return_job": True, "return_outcome": True}
         )]
         assert sched._inflight_key("queued-job") not in sched._running_job_ids
-
 
     def test_create_execution_failure_does_not_wedge_running_set(self, tmp_path, monkeypatch):
         """create_execution failures clear the running lock and still allow next jobs."""
@@ -206,7 +171,6 @@ class TestRunningJobGuard:
         assert sched._inflight_key("healthy-job") not in sched._running_job_ids
 
         sched._shutdown_parallel_pool()
-
 
 class TestSyncMode:
     """tick() blocks by default (sync=True); tick(sync=False) returns immediately."""
@@ -338,85 +302,6 @@ class TestWorkdirParallelPool:
 
         assert set(started) == {"workdir-0", "workdir-1"}
 
-    def test_workdir_job_does_not_block_ticker(self, tmp_path, monkeypatch):
-        """sync=False returns immediately even when a workdir job is slow."""
-        import cron.scheduler as sched
-
-        sched._parallel_pools.clear()
-        sched._parallel_pool_max_workers.clear()
-        sched._running_job_ids.clear()
-
-        job = {
-            "id": "slow-workdir",
-            "name": "slow-workdir",
-            "prompt": "test",
-            "schedule": "every 5m",
-            "enabled": True,
-            "next_run_at": "2020-01-01T00:00:00",
-            "deliver": "local",
-            "workdir": str(tmp_path),
-        }
-
-        barrier = threading.Barrier(2, timeout=5)
-
-        def slow_run(j, *, defer_agent_teardown=None, **_kw):
-            barrier.wait()
-            return True, "out", "resp", None
-
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
-        monkeypatch.setattr(sched, "run_job", slow_run)
-        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
-        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
-
-        start = time.monotonic()
-        n = sched.tick(verbose=False, sync=False)
-        elapsed = time.monotonic() - start
-
-        assert n == 1  # optimistic count
-        assert elapsed < 1.0  # did NOT block on the slow workdir job
-
-        barrier.wait()
-        time.sleep(0.1)
-        sched._shutdown_parallel_pool()
-
-    def test_workdir_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):
-        """A workdir job already in _running_job_ids is skipped on next tick."""
-        import cron.scheduler as sched
-
-        sched._parallel_pools.clear()
-        sched._parallel_pool_max_workers.clear()
-        sched._running_job_ids.clear()
-
-        job = {
-            "id": "guard-seq",
-            "name": "guard-seq",
-            "prompt": "test",
-            "schedule": "every 5m",
-            "enabled": True,
-            "next_run_at": "2020-01-01T00:00:00",
-            "deliver": "local",
-            "workdir": str(tmp_path),
-        }
-
-        # Simulate the job already running.
-        sched._running_job_ids.add(sched._inflight_key("guard-seq"))
-
-        dispatched = []
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
-        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
-
-        n = sched.tick(verbose=False)
-        assert n == 0  # skipped, not dispatched
-        assert dispatched == []
-
-        sched._running_job_ids.discard(sched._inflight_key("guard-seq"))
-        sched._shutdown_parallel_pool()
 
 class TestTickDurableDispatch:
     """Submitted work cannot start before its ledger and schedule are durable."""

@@ -1,22 +1,50 @@
-"""Reload-safety contracts for the extracted update command wrapper."""
+"""Reload-safety contracts for the fork's OpenTUI engine refresh during updates.
+
+The fork's OpenTUI refresh lives in ``source_build._refresh_opentui_engine``,
+which ``build_update_products`` runs after the shared (Ink/web) products. The
+old updater's ``_update_node_dependencies`` name is a retired shim and must stay
+one: the live refresh never moves back under it.
+"""
 
 from __future__ import annotations
 
 import importlib
-from unittest.mock import MagicMock
 
 import pytest
 
 import hermes_cli.main as main_mod
-from hermes_cli import main_tui_launch, update_cmd, update_cmd_deps
+from hermes_cli import main_tui_launch, old_updater_deps, source_build, update_cmd
 
 
-def test_update_node_dependencies_survives_repeated_reload(
-    tmp_path, monkeypatch
-) -> None:
+def _stub_shared_update_products(monkeypatch, calls: list[str]) -> None:
+    """Record the shared (Ink/web) product steps of ``build_update_products``."""
+    import hermes_cli.main_install_repair as install_repair
+    import hermes_cli.memory_provider_migration as memory_migration
+    import hermes_cli.update_stage as update_stage
+
+    monkeypatch.setattr(install_repair, "_warn_configured_features_missing_deps", lambda: None)
+    monkeypatch.setattr(update_stage, "publish_stage", lambda _stage: None)
+    monkeypatch.setattr(memory_migration, "migrate_all_homes", lambda: None)
+    monkeypatch.setattr(source_build, "source_frontends", lambda _root: ("ui-tui", "web"))
+    monkeypatch.setattr(source_build, "source_build_env", lambda **_kwargs: {"PATH": ""})
+    monkeypatch.setattr(
+        source_build, "prepare_source_dependencies",
+        lambda *_args, **_kwargs: calls.append("deps"),
+    )
+    monkeypatch.setattr(
+        source_build, "build_source_tui", lambda *_args, **_kwargs: calls.append("tui")
+    )
+    monkeypatch.setattr(
+        source_build, "build_source_web", lambda *_args, **_kwargs: calls.append("web")
+    )
+
+
+def test_opentui_refresh_survives_repeated_reload(tmp_path, monkeypatch) -> None:
     for _ in range(3):
         importlib.reload(main_mod)
 
+    (tmp_path / "ui-opentui").mkdir()
+    (tmp_path / "ui-opentui" / "package.json").write_text("{}", encoding="utf-8")
     opentui_calls: list[str] = []
     monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(
@@ -28,48 +56,53 @@ def test_update_node_dependencies_survives_repeated_reload(
         ),
     )
 
-    assert update_cmd._update_node_dependencies() == []
-    assert opentui_calls == ["opentui"]
+    source_build._refresh_opentui_engine(tmp_path, lambda _stage: None)
 
     # Reloading the CLI facade must not remove or multiply OpenTUI hydration.
-    # The extracted dependency module owns the wrapper used by the updater.
+    assert opentui_calls == ["opentui"]
+    # The old updater's hook stays the retired shim; the live refresh never
+    # moves back under the shimmed name.
     assert (
         update_cmd._update_node_dependencies
-        is update_cmd_deps._update_node_dependencies
+        is old_updater_deps._update_node_dependencies
     )
 
 
-@pytest.mark.parametrize("workspace_failures", [[], ["ui-tui, web workspaces"]])
 @pytest.mark.parametrize(
-    ("opentui_status", "opentui_failures"),
+    ("opentui_status", "fails"),
     [
-        (main_tui_launch._OpenTUIUpdateStatus.READY, []),
-        (main_tui_launch._OpenTUIUpdateStatus.SKIPPED, []),
-        (main_tui_launch._OpenTUIUpdateStatus.FAILED, ["OpenTUI engine"]),
+        (main_tui_launch._OpenTUIUpdateStatus.READY, False),
+        (main_tui_launch._OpenTUIUpdateStatus.SKIPPED, False),
+        (main_tui_launch._OpenTUIUpdateStatus.FAILED, True),
     ],
 )
 def test_update_keeps_both_engines_failure_reporting(
-    monkeypatch, workspace_failures, opentui_status, opentui_failures
+    tmp_path, monkeypatch, opentui_status, fails
 ):
-    monkeypatch.setattr(
-        update_cmd_deps,
-        "_update_workspace_node_dependencies",
-        lambda: list(workspace_failures),
-    )
+    """Ink/web products are built before the OpenTUI refresh, so its failure never
+    withholds them; only an attempted-and-failed OpenTUI refresh fails the update."""
+    (tmp_path / "ui-opentui").mkdir()
+    (tmp_path / "ui-opentui" / "package.json").write_text("{}", encoding="utf-8")
+    calls: list[str] = []
+    _stub_shared_update_products(monkeypatch, calls)
     monkeypatch.setattr(
         main_tui_launch,
         "_update_opentui_package",
-        lambda: opentui_status,
+        lambda: calls.append("opentui") or opentui_status,
     )
 
-    failures = update_cmd._update_node_dependencies()
+    if fails:
+        with pytest.raises(RuntimeError, match="OpenTUI engine refresh failed"):
+            source_build.build_update_products(tmp_path, desktop=False)
+    else:
+        source_build.build_update_products(tmp_path, desktop=False)
 
-    assert failures == workspace_failures + opentui_failures
+    assert calls == ["deps", "tui", "web", "opentui"]
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 @pytest.mark.parametrize("opentui_failure", [False, True])
-def test_current_checkout_continues_only_after_optional_opentui_skip(
+def test_update_continues_only_after_optional_opentui_skip(
     tmp_path, monkeypatch, opentui_failure
 ):
     hermes_home = tmp_path / "home"
@@ -80,9 +113,6 @@ def test_current_checkout_continues_only_after_optional_opentui_skip(
     monkeypatch.setenv("HOME", str(hermes_home))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setattr(main_mod, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(
-        update_cmd_deps, "_update_workspace_node_dependencies", lambda: []
-    )
     monkeypatch.setattr(
         main_tui_launch, "_is_termux_startup_environment", lambda: False
     )
@@ -98,31 +128,13 @@ def test_current_checkout_continues_only_after_optional_opentui_skip(
             "_opentui_runtime_location",
             lambda **_kwargs: location,
         )
-
-    updater = MagicMock()
-    updater.PROJECT_ROOT = tmp_path
-    completion = MagicMock(return_value=True)
-    monkeypatch.setattr(update_cmd, "_m", lambda: updater)
-    monkeypatch.setattr(update_cmd, "_check_and_apply_config_migration", MagicMock())
-    monkeypatch.setattr(
-        update_cmd,
-        "_rebuild_desktop_after_update",
-        MagicMock(return_value=True),
-    )
-
-    result = update_cmd._repair_node_deps_on_current_checkout(completion)
+    stages: list[str] = []
 
     if opentui_failure:
-        assert not result
-        updater._build_web_ui.assert_not_called()
-        update_cmd._check_and_apply_config_migration.assert_not_called()
-        update_cmd._rebuild_desktop_after_update.assert_not_called()
-        completion.assert_called_once_with(
-            "⚠ Checkout is current, but Node.js dependencies could not be repaired."
-        )
+        # An incomplete packaged seed is a failure, not an optional skip.
+        with pytest.raises(RuntimeError, match="OpenTUI engine refresh failed"):
+            source_build._refresh_opentui_engine(tmp_path, stages.append)
     else:
-        assert result
-        updater._build_web_ui.assert_called_once_with(tmp_path / "web")
-        update_cmd._check_and_apply_config_migration.assert_called_once()
-        update_cmd._rebuild_desktop_after_update.assert_called_once()
-        completion.assert_called_once_with("✓ Already up to date!")
+        # Missing Node 26 is an explicit skip: the update continues.
+        source_build._refresh_opentui_engine(tmp_path, stages.append)
+    assert stages == ["Updating the OpenTUI engine"]

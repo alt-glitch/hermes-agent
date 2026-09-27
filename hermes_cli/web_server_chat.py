@@ -270,7 +270,12 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            _stamp_identity(consume_ticket(ticket))
+            info = consume_ticket(ticket)
+            if info.get("provider") == "bot-desktop":
+                # A display ticket admits one RFB bridge on /api/display/ws (a watch-only
+                # capability handed to a screen viewer); it must not double as a login here.
+                raise TicketInvalid("display ticket presented as a gateway login")
+            _stamp_identity(info)
             if protocol_ticket:
                 # Select only the stable public protocol during accept. The
                 # ticket-bearing protocol is a credential and must never be
@@ -300,6 +305,7 @@ def _resolve_chat_argv(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    workspace_cwd: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -335,6 +341,13 @@ def _resolve_chat_argv(
     ``HERMES_TUI_GATEWAY_URL`` attach is SKIPPED for scoped chats: the
     dashboard's in-memory gateway runs under the dashboard's own profile,
     so a profile-scoped chat must spawn its own gateway subprocess.
+
+    ``workspace_cwd`` (an already-validated host directory,
+    ``chat_workspaces.resolve_chat_cwd``) is the workspace the user picked for
+    a FRESH chat: it becomes ``HERMES_CWD`` (where a self-spawned gateway
+    starts) and ``HERMES_TUI_CWD`` (what the TUI passes as the explicit
+    ``cwd`` of ``session.create`` when attached to the in-memory gateway,
+    whose own cwd is the dashboard's launch dir).
     """
     from hermes_cli.web_server_profiles import _resolve_profile_dir
     from hermes_cli.web_server_sessions import _open_session_db_for_profile, _session_latest_descendant
@@ -407,6 +420,9 @@ def _resolve_chat_argv(
     finally:
         if profile_token is not None:
             reset_hermes_home_override(profile_token)
+    if workspace_cwd:
+        env["HERMES_CWD"] = workspace_cwd
+        env["HERMES_TUI_CWD"] = workspace_cwd
     _apply_tui_python_env(env)
     _apply_opentui_native_env(argv, cwd, env)
     env.setdefault("NODE_ENV", "production")
@@ -514,7 +530,8 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
 
 async def _resolve_chat_argv_async(
     resume: Optional[str] = None, sidecar_url: Optional[str] = None, profile: Optional[str] = None,
-    active_session_file: Optional[str] = None) -> tuple[list[str], Optional[str], Optional[dict]]:
+    active_session_file: Optional[str] = None,
+    workspace_cwd: Optional[str] = None) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve chat argv off the event loop (it may run ``npm run build``); the
     async lock keeps one-build-at-a-time without parking worker threads."""
     from hermes_cli import subprocess_lifecycle as _subprocess_lifecycle
@@ -524,6 +541,8 @@ async def _resolve_chat_argv_async(
     kwargs = {"resume": resume, "sidecar_url": sidecar_url, "profile": profile}
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
+    if workspace_cwd is not None:
+        kwargs["workspace_cwd"] = workspace_cwd
 
     scope = _subprocess_lifecycle.ProcessScope()
     scopes = _get_chat_argv_scopes(app)

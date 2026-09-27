@@ -20,13 +20,15 @@ target_dir="$(dirname "$target")"
 trust_file="${target}.trusted-roots"
 mkdir -p "$target_dir"
 
+# macOS ships bash 3.2, where expanding an empty array under `set -u` is an
+# "unbound variable" error; expand it as ${arr[@]+"${arr[@]}"}.
 trusted_roots=()
 
 add_trusted_common_dir() {
     local value="$1"
     local existing
     [ -n "$value" ] && [ -d "$value" ] || return 0
-    for existing in "${trusted_roots[@]}"; do
+    for existing in ${trusted_roots[@]+"${trusted_roots[@]}"}; do
         [ "$existing" = "$value" ] && return 0
     done
     trusted_roots+=("$value")
@@ -66,7 +68,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for common_dir in "${trusted_roots[@]}"; do
+for common_dir in ${trusted_roots[@]+"${trusted_roots[@]}"}; do
     printf '%s\n' "$common_dir"
 done > "$tmp_trust"
 chmod 600 "$tmp_trust"

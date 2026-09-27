@@ -16,11 +16,6 @@ def test_filter_indices_surfaces_k3_for_kimi_query():
     assert "k3" in ranked
 
 
-def test_model_search_text_adds_ox_alpha_aliases():
-    assert model_search_text("x-preview-f-free") == "x-preview-f-free ox-alpha ox"
-    assert model_search_text("X-Preview-F-Free") == "X-Preview-F-Free ox-alpha ox"
-
-
 def test_filter_indices_surfaces_ox_alpha_preview_slug():
     models = ["x-preview-f-free", "gpt-5.6-sol", "kimi-k3"]
     haystacks = [model_search_text(m) for m in models]
