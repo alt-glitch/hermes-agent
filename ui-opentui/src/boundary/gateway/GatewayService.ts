@@ -9,7 +9,7 @@ import { Context, type Effect } from 'effect'
 
 import type { GatewayError } from '../errors.ts'
 import type { GatewayEvent } from '../schema/GatewayEvent.ts'
-import type { ServerRequest } from './client.ts'
+import type { OpenRequestEntry, ServerRequest } from './client.ts'
 import type { RpcMethod, RpcParams, RpcResult } from './rpc.ts'
 
 export interface GatewayTransport {
@@ -21,6 +21,8 @@ export interface GatewayTransport {
    *  uninstall fn. The handler returns false for methods it does not serve (the client answers -32601).
    *  Absent on transports with no backend (fake gateway, test doubles). */
   readonly serveRequests?: (handler: (request: ServerRequest) => boolean) => () => void
+  /** Re-deliver a hydration's `open_requests` to the installed handler, as if each had just arrived. */
+  readonly replayRequests?: (entries: readonly OpenRequestEntry[]) => void
   /** The active live session id; undefined before a session exists. */
   readonly sessionId: () => string | undefined
   /** Bounded low-level transport diagnostics used by the local `/logs` pager. */

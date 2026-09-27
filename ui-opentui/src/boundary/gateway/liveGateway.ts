@@ -267,6 +267,11 @@ function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
       }
     },
 
+    replayRequests: entries => {
+      flush()
+      client.replayServerRequests(entries)
+    },
+
     sessionId: () => sessionId,
     logTail: limit => client.getLogTail(limit)
   }

@@ -318,6 +318,8 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
       liveSnapshotStartedAtMs(response),
       response.todo_state
     )
+    // After the commit (it clears the prompt): pending backend questions reappear.
+    gateway.replayRequests?.(response.open_requests ?? [])
     for (const text of preservedQueue) store.enqueuePrompt(text)
     for (const image of preservedImages) store.restorePendingImage(image)
     if (preservedDraft) store.replaceComposerDraft(preservedDraft)
@@ -388,6 +390,8 @@ export const activateSession = Effect.fn('SessionLifecycle.activate')(function* 
       liveSnapshotStartedAtMs(response),
       response.todo_state
     )
+    // After the commit (it clears the prompt): pending backend questions reappear.
+    gateway.replayRequests?.(response.open_requests ?? [])
     committed = true
     return {
       messageCount: snapshot.length,

@@ -107,6 +107,13 @@ export interface ServerRequest {
   readonly respond: (result: Record<string, unknown>) => boolean
 }
 
+/** One `open_requests` entry: a request the backend is still waiting on (`OpenRequestEntry` contract). */
+export interface OpenRequestEntry {
+  readonly id: string
+  readonly method: string
+  readonly params: Readonly<Record<string, unknown>>
+}
+
 /** Machine-readable request failure provenance. Delivery-sensitive callers
  * must never infer transport admission from human-readable error copy. */
 export type RawGatewayFailureReason = 'rpc-error' | 'timeout' | 'transport-down'
@@ -925,6 +932,14 @@ export class RawGatewayClient {
 
     this.log.warn('gateway', 'unroutable frame', { preview: line.slice(0, 120) })
     this.pushTransportLog(`[protocol] unroutable frame: ${line.slice(0, 120)}`)
+  }
+
+  /**
+   * Re-deliver a hydration's `open_requests` (session.activate / session.resume): each entry takes the
+   * same path as a live request frame, so it is answered with the original id.
+   */
+  replayServerRequests(entries: readonly OpenRequestEntry[]): void {
+    for (const entry of entries) this.routeServerRequest(entry.id, entry.method, entry.params)
   }
 
   private routeServerRequest(id: string, method: string, rawParams: unknown): void {

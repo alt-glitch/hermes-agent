@@ -34,14 +34,7 @@ import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } fr
 import { GatewayService, type GatewayTransport } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
-import {
-  classifyClarifyLock,
-  PROMPT_ACCEPTED,
-  PROMPT_EXPIRED,
-  promptTransportUncertain,
-  type PromptReply,
-  type PromptResponseDisposition
-} from '../boundary/promptResponses.ts'
+import { createPromptResponder } from '../boundary/promptResponses.ts'
 import { createServerRequestRouter } from '../boundary/gateway/serverRequests.ts'
 import { startMemlog } from '../boundary/memlog.ts'
 import { startMemoryMonitor } from '../boundary/memoryMonitor.ts'
@@ -51,6 +44,7 @@ import { acquireRenderer, redrawRenderer, selectionCopyText } from '../boundary/
 import { createAgentInterrupts } from '../boundary/agentInterrupts.ts'
 import { decodeImageAttachResponse, decodeSetupStatusResponse } from '../boundary/schema/ExternalInputResponses.ts'
 import { decodeVoiceRecordResponse } from '../boundary/schema/VoiceResponses.ts'
+import type { GatewayEvent } from '../boundary/schema/GatewayEvent.ts'
 import { decodeSubagentSteerResponse, decodeSubagentTailResponse } from '../boundary/schema/Delegation.ts'
 import { decodePetGalleryResponse, decodePetSelectResponse } from '../boundary/schema/PetResponses.ts'
 import {
@@ -1104,12 +1098,14 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
       // Backend→client requests (clarify, approval, sudo, secret, vault.unlock_prompt) open
       // store prompts; the answer goes back as the JSON-RPC response (see `respond`).
-      const serverRequests = createServerRequestRouter(store.openPrompt)
+      const serverRequests = createServerRequestRouter({
+        openPrompt: store.openPrompt,
+        displayedSessionId: () => store.state.sessionId
+      })
       const stopServingRequests = gateway.serveRequests?.(serverRequests.handle)
       if (stopServingRequests) yield* Effect.addFinalizer(() => Effect.sync(stopServingRequests))
 
-      yield* gateway.subscribe(event => {
-        if (event.type === 'request.cancel') serverRequests.forget(event.payload.id)
+      const applyGatewayEvent = (event: GatewayEvent): void => {
         if (!eventMayEnterStore(event, gateway.sessionId(), store.isBuffering())) return
         const liveSessionId = gateway.sessionId()
         const eventSessionId = event.session_id ?? liveSessionId
@@ -1151,6 +1147,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           gatewayUnavailable = false
           if (!sessionTransitionInFlight) activeTransitionOwner = undefined
         }
+      }
+
+      yield* gateway.subscribe(event => {
+        applyGatewayEvent(event)
+        // After the store settled the withdrawn prompt (expired notice, batch record): the router
+        // then drops the id and, when it was the shown one, opens the next queued request.
+        if (event.type === 'request.cancel') serverRequests.forget(event.payload.id)
       })
 
       // Match Ink's live config sync: poll the config file mtime every five
@@ -3279,30 +3282,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           })
       }
 
-      // Blocking prompts: an answer is the JSON-RPC response to the open
-      // server request (false = no longer open or transport down → expired);
-      // a batch-clarify lock is the clarify.lock RPC and keeps the request open.
-      const respond = async (reply: PromptReply): Promise<PromptResponseDisposition> => {
-        if (reply.kind === 'answer') {
-          return serverRequests.answer(reply.requestId, reply.result) ? PROMPT_ACCEPTED : PROMPT_EXPIRED
-        }
-        try {
-          const raw = await Effect.runPromise(
-            gateway.request('clarify.lock', {
-              answer: reply.answer,
-              question_id: reply.questionId,
-              request_id: reply.requestId
-            })
-          )
-          const disposition = classifyClarifyLock(raw)
-          if (disposition.kind === 'uncertain')
-            getLog().warn('respond', disposition.message, { method: 'clarify.lock' })
-          return disposition
-        } catch (cause) {
-          getLog().warn('respond', 'failed', { cause: String(cause), method: 'clarify.lock' })
-          return promptTransportUncertain(cause)
-        }
-      }
+      // Blocking prompts: answers go back through the router (JSON-RPC response); batch-clarify
+      // locks through the clarify.lock RPC.
+      const respond = createPromptResponder({
+        router: serverRequests,
+        lock: params => Effect.runPromise(gateway.request('clarify.lock', params)),
+        warn: (message, fields) => getLog().warn('respond', message, fields)
+      })
 
       // Live backend: drive a session (create + optional initial prompt)
       // concurrently, but acquire the same transition lock BEFORE rendering so
