@@ -38,5 +38,7 @@ def test_stale_reasoning_request_never_mutates_display_or_effort(tmp_path, monke
         "params": {"session_id": "no-longer-live", "key": "reasoning", "value": value},
     })
 
-    assert response["error"]["code"] == 4006
+    # Upstream's config.set seam (6c2a94f4b6) refuses a named stale id for every
+    # session-scoped key with 4001 (resume), before the fork's 4006 handler guard.
+    assert response["error"]["code"] == 4001
     assert path.read_bytes() == before

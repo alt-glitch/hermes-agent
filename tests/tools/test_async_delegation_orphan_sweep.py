@@ -256,7 +256,13 @@ def test_offer_dropped_by_a_session_that_cannot_own_it_is_re_offered_to_the_owne
     registry = type("Registry", (), {"completion_queue": q, "is_completion_consumed": lambda self, sid: False})()
     started = []
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda rid, sid, session, text, **kw: started.append(sid))
+
+    def submit(rid, sid, session, text, **kw):
+        # Fork (b3895f8e4d): delivery settles on the turn's history commit, which the real submit reports.
+        started.append(sid)
+        kw["history_commit_callback"](server._HistoryCommitOutcome(True, True, True))
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
 
     def drain(sid, session):
         server._notif_handle_ready(sid, session, _drain(q), session["_notification_emitted"], registry,

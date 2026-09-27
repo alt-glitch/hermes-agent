@@ -11,7 +11,7 @@ import pytest
 
 import tools.delegate_tool as dt
 import tools.delegate_tool_progress as dt_progress
-from tools.delegate_tool import _build_child_progress_callback, format_batch_tag
+from tools.delegate_tool import _batch_prefix, _build_child_progress_callback, format_batch_tag
 
 
 @pytest.fixture(autouse=True)

@@ -209,6 +209,8 @@ def probe_node_identity(node_bin: str) -> NodeIdentity | None:
             [node_bin, "-p", expression],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             check=False,
         )

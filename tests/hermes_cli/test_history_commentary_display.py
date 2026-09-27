@@ -261,6 +261,7 @@ def test_cold_resume_uses_the_resumed_session_home(monkeypatch, tmp_path):
     resume = _Resume.__new__(_Resume)
     resume.omit_messages = False
     resume.profile_home = home
+    resume.params = {}  # fork (ae15cc5bba): messages() reads with_tool_output/with_ui_chrome from params
 
     assert resume.messages([_row()])[0]["display_commentary"] == []
 

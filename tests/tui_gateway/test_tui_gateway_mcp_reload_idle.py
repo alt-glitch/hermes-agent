@@ -40,14 +40,19 @@ def test_reload_mcp_rejects_live_turns_before_mutation_then_retries(monkeypatch)
 
     refreshed: list[object] = []
 
-    def refresh(live_agent, *, enabled_override, quiet_mode):
+    # reload.mcp refreshes through upstream's _refresh_live_sessions: it resolves
+    # toolsets per agent platform and also passes disabled_override/preserve_prefix.
+    def refresh(live_agent, *, enabled_override, disabled_override, quiet_mode, preserve_prefix):
         assert enabled_override == ["hermes"]
+        assert disabled_override == []
         assert quiet_mode is True
+        assert preserve_prefix is False
         refreshed.append(live_agent)
         calls.append("refresh")
 
     monkeypatch.setattr(mcp_tool_agent, "refresh_agent_mcp_tools", refresh)
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["hermes"])
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda platform=None: ["hermes"])
+    monkeypatch.setattr(server, "_load_disabled_toolsets", lambda: [])
     monkeypatch.setattr(
         server,
         "_session_info",
@@ -230,7 +235,9 @@ def test_reload_mcp_pool_keeps_prompt_rejection_and_interrupt_responsive(monkeyp
         assert interrupt["result"] == {"status": "interrupted"}
 
         release_reload.set()
-        assert transport.written.wait(1)
+        # Upstream's reload now refreshes live sessions through _refresh_live_sessions
+        # (per-session profile scope binding); that takes >1s on a loaded host.
+        assert transport.written.wait(10)
         assert transport.frames[-1]["result"]["status"] == "reloaded"
     finally:
         release_reload.set()
@@ -272,14 +279,16 @@ def test_slash_reload_mcp_fence_rejects_other_session_prompt_while_mutating(
         mcp_tool_discovery, "discover_mcp_tools", lambda: calls.append("discover")
     )
 
-    def refresh(live_agent, *, enabled_override, quiet_mode):
+    def refresh(live_agent, *, enabled_override, disabled_override, quiet_mode):
         assert live_agent is slash_agent
         assert enabled_override == ["hermes"]
+        assert disabled_override == []
         assert quiet_mode is True
         calls.append("refresh")
 
     monkeypatch.setattr(mcp_tool_agent, "refresh_agent_mcp_tools", refresh)
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["hermes"])
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda platform=None: ["hermes"])
+    monkeypatch.setattr(server, "_load_disabled_toolsets", lambda: [])
     monkeypatch.setattr(server, "_session_info", lambda *_args: {"running": False})
     monkeypatch.setattr(server, "_emit", lambda *_args: None)
 

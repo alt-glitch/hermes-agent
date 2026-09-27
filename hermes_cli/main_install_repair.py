@@ -329,6 +329,8 @@ def _resolve_update_branch(args) -> str:
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
         current = result.stdout.strip()

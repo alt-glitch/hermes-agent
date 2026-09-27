@@ -10,6 +10,22 @@ import pytest
 from tui_gateway import server
 
 
+def _fake_pop_session_by_id(session, reaped):
+    """Stand-in for ``_pop_session_by_id`` that records claims.
+
+    The fork passes ``predicate`` (re-checked under the registry lock right
+    before the claim), so the fake honours it the same way.
+    """
+
+    def _pop(sid, *, predicate=None):
+        if predicate is not None and not predicate(session):
+            return None
+        reaped.append(sid)
+        return session
+
+    return _pop
+
+
 @pytest.mark.parametrize("phase", ["before_callback", "before_continuation", "before_initial_timer", "cold_resume_claim"])
 def test_obsolete_orphan_cannot_replace_new_detachment(monkeypatch, phase):
     timers = []
@@ -313,7 +329,7 @@ def test_ws_orphan_reap_rearms_after_system_sleep(monkeypatch):
     monkeypatch.setattr(server.time, "monotonic", lambda: clocks["monotonic"])
     monkeypatch.setattr(server.time, "time", lambda: clocks["wall"])
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 20)
-    monkeypatch.setattr(server, "_pop_session_by_id", lambda s: reaped.append(s) or session)
+    monkeypatch.setattr(server, "_pop_session_by_id", _fake_pop_session_by_id(session, reaped))
 
     server._schedule_ws_orphan_reap(sid)
     assert len(timers) == 1
@@ -366,7 +382,7 @@ def test_ws_orphan_reap_rearm_spares_post_wake_reconnect(monkeypatch):
     monkeypatch.setattr(server.time, "monotonic", lambda: clocks["monotonic"])
     monkeypatch.setattr(server.time, "time", lambda: clocks["wall"])
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 20)
-    monkeypatch.setattr(server, "_pop_session_by_id", lambda s: reaped.append(s) or session)
+    monkeypatch.setattr(server, "_pop_session_by_id", _fake_pop_session_by_id(session, reaped))
 
     server._schedule_ws_orphan_reap(sid)
     clocks["monotonic"] += 2.0

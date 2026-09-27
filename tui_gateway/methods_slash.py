@@ -364,7 +364,10 @@ def _mirror_reload_mcp(sid, session, agent, arg) -> str:
             mcp_agent.reprobe_tool_availability()
             mcp_discovery.discover_mcp_tools()
             mcp_agent.refresh_agent_mcp_tools(
-                agent, enabled_override=_load_enabled_toolsets(), quiet_mode=True)
+                agent,
+                enabled_override=_load_enabled_toolsets(getattr(agent, "platform", None)),
+                disabled_override=_load_disabled_toolsets(),
+                quiet_mode=True)
             _emit("session.info", sid, _session_info(agent, session))
     except Exception as exc:
         logger.warning("Failed to refresh live agent tools after /reload-mcp: %s", exc)

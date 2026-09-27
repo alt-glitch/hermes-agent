@@ -16,6 +16,7 @@ chosen ``user_peer_id`` can be asserted without touching the network.
 
 import hashlib
 import json
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -554,7 +555,10 @@ class TestPinTransition:
 
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "old"}}}))
         sig_old = provider.identity_signature()["workspace"]
+        mtime_ns = cfg_path.stat().st_mtime_ns
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "new"}}}))
+        # Same size rewrite: coarse (jiffy) fs timestamps can repeat the old mtime, which is the memo key.
+        os.utime(cfg_path, ns=(mtime_ns + 1_000_000_000, mtime_ns + 1_000_000_000))
         sig_new = provider.identity_signature()["workspace"]
 
         assert (sig_old, sig_new) == ("old", "new")
