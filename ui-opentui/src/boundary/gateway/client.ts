@@ -93,6 +93,18 @@ export interface RawClientOptions {
   readonly onEvent: (params: unknown) => void
   /** Called when the child exits / errors (so the layer can reject pending + reconnect). */
   readonly onExit?: (reason: string) => void
+  /** Called with each backend→client JSON-RPC request (`tui_gateway/server_requests.py`).
+   *  Returns false when this client has no handler for `method`; the client then answers -32601. */
+  readonly onServerRequest?: (request: ServerRequest) => boolean
+}
+
+/** One backend→client JSON-RPC request frame `{jsonrpc, id, method, params}` (id is `srq-<hex>`). */
+export interface ServerRequest {
+  readonly id: string
+  readonly method: string
+  readonly params: Record<string, unknown>
+  /** Write `{jsonrpc, id, result}`. False when the transport is down (nothing written). */
+  readonly respond: (result: Record<string, unknown>) => boolean
 }
 
 /** Machine-readable request failure provenance. Delivery-sensitive callers
@@ -253,12 +265,14 @@ export class RawGatewayClient {
   private readonly log: Log
   private readonly onEvent: (params: unknown) => void
   private readonly onExit?: (reason: string) => void
+  private readonly onServerRequest: ((request: ServerRequest) => boolean) | undefined
   private readonly transportLog = new TransportLogRing()
 
   constructor(options: RawClientOptions) {
     this.log = options.log
     this.onEvent = options.onEvent
     if (options.onExit) this.onExit = options.onExit
+    this.onServerRequest = options.onServerRequest
   }
 
   private pushTransportLog(line: string): void {
@@ -883,6 +897,11 @@ export class RawGatewayClient {
       if ('type' in frame.params && frame.params.type === 'gateway.ready') {
         this.clearStartupWatchdog(generation)
         this.pushTransportLog('[gateway] ready')
+        // Tell the backend this connection answers server→client requests (it fails them fast
+        // for WebSocket peers that never say so; stdio is always treated as answering).
+        if (this.onServerRequest) {
+          void this.request('client.capabilities', { server_requests: true }).catch(() => undefined)
+        }
         const payload = 'payload' in frame.params ? frame.params.payload : undefined
         if (
           payload &&
@@ -898,8 +917,57 @@ export class RawGatewayClient {
       return
     }
 
+    // Backend→client request: id + method (not 'event'). Answered with a JSON-RPC response frame.
+    if (typeof frame.id === 'string' && typeof frame.method === 'string' && frame.method !== 'event') {
+      this.routeServerRequest(frame.id, frame.method, frame.params)
+      return
+    }
+
     this.log.warn('gateway', 'unroutable frame', { preview: line.slice(0, 120) })
     this.pushTransportLog(`[protocol] unroutable frame: ${line.slice(0, 120)}`)
+  }
+
+  private routeServerRequest(id: string, method: string, rawParams: unknown): void {
+    const params =
+      rawParams && typeof rawParams === 'object' && !Array.isArray(rawParams)
+        ? (rawParams as Record<string, unknown>)
+        : {}
+    this.pushTransportLog(`[server-request] ${method} ${id}`)
+    const request: ServerRequest = {
+      id,
+      method,
+      params,
+      respond: result => this.writeFrame({ id, jsonrpc: '2.0', result })
+    }
+    let handled = false
+    try {
+      handled = this.onServerRequest?.(request) ?? false
+    } catch (cause) {
+      this.log.warn('gateway', 'server request handler threw', { cause: String(cause), method })
+    }
+    if (!handled) {
+      // No handler: answer at once so the backend tool fails fast instead of waiting out its deadline.
+      this.writeFrame({ error: { code: -32601, message: `method not handled: ${method}` }, id, jsonrpc: '2.0' })
+    }
+  }
+
+  /** Write one frame on the live transport (stdio child or attached socket). False when down. */
+  private writeFrame(frame: Record<string, unknown>): boolean {
+    const text = JSON.stringify(frame)
+    try {
+      if (this.ws) {
+        if (this.ws.readyState !== WS_OPEN) return false
+        this.ws.send(text)
+        return true
+      }
+      const stdin = this.proc?.stdin
+      if (!stdin || !this.transportAccepting) return false
+      stdin.write(text + '\n')
+      return true
+    } catch (cause) {
+      this.pushTransportLog(`[server-request] write failed: ${String(cause)}`)
+      return false
+    }
   }
 
   /**

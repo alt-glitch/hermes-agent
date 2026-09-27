@@ -4259,6 +4259,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     duplicate,
     clearPrompt,
     settlePrompt,
+    /** Open a prompt from a backend→client request (boundary/gateway/serverRequests.ts). */
+    openPrompt: replacePrompt,
     getPromptRevision,
     getPromptRequestId,
     reconcilePendingApprovals,
