@@ -2262,6 +2262,33 @@ def test_tool_complete_emits_full_unified_diff(monkeypatch):
     assert "inline_diff" in payload
 
 
+def test_tool_complete_executor_path_carries_diff_unified_and_pops_stash(monkeypatch):
+    # The real executor prepares metadata first (agent_callbacks
+    # ``tool_result_metadata_callback``), then _on_tool_complete runs. The live
+    # diff must survive that hand-off and the stash must be consumed.
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "diff-exec-test",
+        {"tool_progress_mode": "concise", "tool_started_at": {}, "edit_snapshots": {}},
+    )
+
+    diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a = 1\n+a = 2\n"
+    result = json.dumps({"success": True, "diff": diff})
+    prepared = server._prepare_tool_result_metadata(
+        "diff-exec-test", "tool-1", "patch", {"mode": "replace", "path": "x.py"}, result
+    )
+    assert prepared  # sidecar preview was prepared
+    server._on_tool_complete("diff-exec-test", "tool-1", "patch", {"mode": "replace", "path": "x.py"}, result)
+
+    assert events and events[0][0] == "tool.complete"
+    assert events[0][2]["diff_unified"] == diff
+    assert server._sessions["diff-exec-test"]["tool_result_metadata"] == {}
+
+
 def test_verbose_result_text_drops_diff_echo_when_diff_unified_ships(monkeypatch):
     # A tall edit's result JSON embeds the WHOLE diff; tail-capping that echo
     # yields an unparseable JSON-looking fragment the TUI can't suppress
