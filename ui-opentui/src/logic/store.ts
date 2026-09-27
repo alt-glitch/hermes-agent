@@ -11,6 +11,7 @@
  * User/system rows stay flat `text` (no parts). Carried from Phase 1: streaming
  * concat (prefer `payload.text`), skin→theme, LRU dedup, hydrate-while-buffering.
  */
+import type { RpcRequest } from '../boundary/gateway/rpc.ts'
 import { Option } from 'effect'
 import { createStore, produce } from 'solid-js/store'
 
@@ -361,7 +362,7 @@ export interface PickerState {
 }
 
 export interface CustomModelSetupState {
-  request: (method: string, params: Record<string, unknown>) => Promise<unknown>
+  request: RpcRequest
   onSaved: (switchValue: string) => void
 }
 

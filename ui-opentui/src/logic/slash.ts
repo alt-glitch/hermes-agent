@@ -11,6 +11,7 @@
  *      (exec/plugin → system · alias → re-dispatch · skill/send → submit a turn ·
  *       prefill → notice). Long output routes to the pager (Phase 5a).
  */
+import type { RpcParams, RpcRequest } from '../boundary/gateway/rpc.ts'
 import { Option } from 'effect'
 
 import { decodeSessionCompressResponse } from '../boundary/compression.ts'
@@ -145,7 +146,7 @@ export function classifySubmit(text: string): SubmitRoute {
 /** The host capabilities the dispatcher needs (wired by the entry boundary). */
 export interface SlashContext {
   /** Server RPC (resolves with the result, rejects on GatewayError). */
-  readonly request: (method: string, params: Record<string, unknown>) => Promise<unknown>
+  readonly request: RpcRequest
   readonly sessionId: () => string | undefined
   /** Stable durable conversation id (unlike the gateway's ephemeral live SID). */
   readonly sessionOwnerId: () => string | undefined
@@ -300,16 +301,20 @@ const titleCase = (name: string) => name.charAt(0).toUpperCase() + name.slice(1)
 
 /** A planned completion query (item 5/13): which RPC + params, and where an
  *  accepted item replaces from if the RPC omits its own `replace_from`. */
-export interface CompletionPlan {
-  method: 'complete.slash' | 'complete.path'
-  params: Record<string, unknown>
+export type CompletionPlan = CompletionPlanFields &
+  (
+    | { method: 'complete.slash'; params: RpcParams<'complete.slash'> }
+    | { method: 'complete.path'; params: RpcParams<'complete.path'> }
+  )
+
+interface CompletionPlanFields {
   from: number
   /** Exclusive buffer offset for an inline token replacement. Omitted on
    * legacy slash/path plans, which continue replacing through buffer end. */
   end?: number
   /** Inline `/skill`-reference query (a whitespace-preceded `/token` in prose,
-   *  Ink `useCompletion` parity): `skills_only` makes the gateway enumerate
-   *  authoritative skill/bundle sources, and `from`/`end` bound the real
+   *  Ink `useCompletion` parity): the caller keeps only `kind === 'skill'`
+   *  items from the reply, and `from`/`end` bound the real
    *  composer token rather than the synthetic `/query` sent in `params`. */
   skillsOnly?: boolean
 }
@@ -383,7 +388,7 @@ export function planCompletion(text: string, cursor: number = text.length): Comp
         end,
         from: pos - query.length,
         method: 'complete.slash',
-        params: { skills_only: true, text: `/${query}` },
+        params: { text: `/${query}` },
         skillsOnly: true
       }
     }
@@ -731,7 +736,7 @@ function mapSkills(result: unknown): PickerItem[] {
 /** Lightweight OpenTUI model-options request. The gateway defaults stay fully
  * enriched for desktop/Ink callers; this picker does not consume pricing or
  * capability fields and passive hydration must not probe a live custom endpoint. */
-export function modelOptionsParams(sessionId: string | undefined, refresh = false): Record<string, unknown> {
+export function modelOptionsParams(sessionId: string | undefined, refresh = false): RpcParams<'model.options'> {
   return {
     capabilities: false,
     pricing: false,
@@ -1503,6 +1508,10 @@ const replayCmd: ClientHandler = async (arg, ctx, flight) => {
 }
 const usageCmd: ClientHandler = async (_arg, ctx, flight) => {
   const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('usage: no active session')
+    return
+  }
   const response = decodeSessionUsageResponse(await ctx.request('session.usage', { session_id: sid }))
   if (!currentSessionIs(ctx, sid, flight)) return
   if (!response) return ctx.pushSystem('error: invalid response: session.usage')
@@ -1627,6 +1636,10 @@ const pluginsCmd: ClientHandler = async (arg, ctx, flight) => {
     return
   }
   const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('plugins: no active session')
+    return
+  }
   const raw = await ctx.request('slash.exec', { command: `plugins ${command}`, session_id: sid })
   if (!currentSessionIs(ctx, sid, flight)) return
   const output = readStr(raw, 'output') || '/plugins: no output'
@@ -1643,6 +1656,10 @@ const petCmd: ClientHandler = async (arg, ctx, flight) => {
     return
   }
   const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('pet: no active session')
+    return
+  }
   const raw = await ctx.request('slash.exec', { command: `pet${command ? ` ${command}` : ''}`, session_id: sid })
   if (!currentSessionIs(ctx, sid, flight)) return
   const output = readStr(raw, 'output') || '/pet: no output'
@@ -1989,8 +2006,13 @@ const toolsCmd: ClientHandler = async (arg, ctx) => {
   }
 
   const command = arg.trim() ? `tools ${arg.trim()}` : 'tools'
+  const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('tools: no active session')
+    return
+  }
   try {
-    const r = await ctx.request('slash.exec', { command, session_id: ctx.sessionId() })
+    const r = await ctx.request('slash.exec', { command, session_id: sid })
     const output = readStr(r, 'output') || '/tools: no output'
     const warning = readStr(r, 'warning')
     present(ctx, 'Tools', warning ? `warning: ${warning}\n${output}` : output)
@@ -2149,6 +2171,10 @@ const backgroundCmd: ClientHandler = async (arg, ctx, flight) => {
     return
   }
   const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('bg: no active session')
+    return
+  }
   try {
     const r = await ctx.request('prompt.background', { session_id: sid, text })
     // A late ack belongs to the session it was sent on: commitSessionSnapshot reset
@@ -2178,6 +2204,10 @@ const btwCmd: ClientHandler = async (arg, ctx, flight) => {
     return
   }
   const sid = ctx.sessionId()
+  if (!sid) {
+    ctx.pushSystem('btw: no active session')
+    return
+  }
   try {
     const response = await ctx.request('prompt.btw', { session_id: sid, text })
     if (!currentSessionIs(ctx, sid, flight)) return
@@ -3203,6 +3233,10 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
     }
   }
 
+  if (!sid) {
+    ctx.pushSystem(`/${parsed.name}: no active session`)
+    return
+  }
   try {
     const result = await ctx.request('slash.exec', { command: input.slice(1), session_id: sid })
     if (!currentSessionIs(ctx, sid, flight)) return

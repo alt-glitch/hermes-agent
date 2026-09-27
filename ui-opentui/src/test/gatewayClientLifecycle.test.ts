@@ -38,14 +38,6 @@ interface FakeChildOptions {
   readonly killResult?: boolean
 }
 
-interface LargeHistoryMessage {
-  readonly text: string
-}
-
-interface LargeHistoryResponse {
-  readonly messages: readonly LargeHistoryMessage[]
-}
-
 function fakeChild(options: FakeChildOptions = {}): FakeChild {
   const stdin = new PassThrough()
   const stdout = new PassThrough()
@@ -186,10 +178,10 @@ describe('RawGatewayClient child lifecycle isolation', () => {
     const bodyChars = STDOUT_FRAME_MAX_BYTES + 1024
     const chunk = 'h'.repeat(1024 * 1024)
     let requestIndex = 0
-    const methods: readonly string[] = ['session.resume', 'session.history']
+    const methods = ['session.resume', 'session.history'] as const
     for (const method of methods) {
       requestIndex += 1
-      const pending = client.request<LargeHistoryResponse>(method, { session_id: 'large' })
+      const pending = client.request(method, { session_id: 'large' })
       child.stdout.write(
         method === 'session.resume'
           ? `{"jsonrpc": "2.0", "id": "r${requestIndex}", "result": {"messages": [{"text": "`
@@ -205,7 +197,7 @@ describe('RawGatewayClient child lifecycle isolation', () => {
 
       const result = await pending
       expect(result.messages).toHaveLength(1)
-      expect(result.messages[0]?.text.length).toBe(bodyChars)
+      expect(result.messages[0]?.text?.length).toBe(bodyChars)
     }
 
     expect(eventTypes(events)).toEqual(['gateway.ready'])
@@ -227,13 +219,13 @@ describe('RawGatewayClient child lifecycle isolation', () => {
     })
 
     client.start()
-    const pending = client.request<{ hydrated: boolean }>('session.resume', { session_id: 'session-1' })
+    const pending = client.request('session.resume', { session_id: 'session-1' })
     first.stdout.write('{"jsonrpc":"2.0","id":"r1","result":')
     first.process.emit('exit', 1, null)
 
     // New writes are fenced once the process is known dead, but data already
     // buffered in its stdout remains authoritative until the stdio close.
-    await expect(client.request('session.status', {})).rejects.toThrow('gateway not running')
+    await expect(client.request('session.status', { session_id: 'session-1' })).rejects.toThrow('gateway not running')
     first.stdout.write('{"hydrated":true}}\n')
     await expect(pending).resolves.toEqual({ hydrated: true })
     expect(exits).toEqual([])
@@ -448,7 +440,7 @@ describe('RawGatewayClient child lifecycle isolation', () => {
 
     client.start()
     first.stdout.write(readyFrame())
-    const pending = client.request('session.status', {})
+    const pending = client.request('session.status', { session_id: 'session-1' })
     const rejection = expect(pending).rejects.toThrow('stdio close timed out')
 
     first.process.emit('exit', 1, null)
@@ -493,7 +485,7 @@ describe('RawGatewayClient child lifecycle isolation', () => {
 
     client.start()
     first.stdout.write(readyFrame())
-    const pending = client.request('session.status', {})
+    const pending = client.request('session.status', { session_id: 'session-1' })
     const rejection = expect(pending).rejects.toThrow(expected)
     fail(first)
 
@@ -525,7 +517,7 @@ describe('RawGatewayClient child lifecycle isolation', () => {
     })
 
     client.start()
-    const pending = client.request('session.status', {})
+    const pending = client.request('session.status', { session_id: 'session-1' })
     const rejection = expect(pending).rejects.toThrow('gateway startup timeout')
     vi.advanceTimersByTime(STARTUP_TIMEOUT_MS)
 

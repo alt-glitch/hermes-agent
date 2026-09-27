@@ -10,6 +10,7 @@
 import { Effect, Layer } from 'effect'
 
 import { GatewayService, type GatewayTransport } from '../boundary/gateway/GatewayService.ts'
+import type { RpcMethod, RpcParams, RpcResult } from '../boundary/gateway/rpc.ts'
 import type { GatewayEvent } from '../boundary/schema/GatewayEvent.ts'
 
 export interface FakeGatewayController {
@@ -33,10 +34,12 @@ export function makeFakeGateway(initialSessionId = 'fake-session'): FakeGatewayC
           handlers.delete(handler)
         }
       }),
-    request: <A>(method: string, params: unknown) =>
+    request: <M extends RpcMethod>(method: M, params: RpcParams<M>) =>
       Effect.sync(() => {
         calls.push({ method, params })
-        return undefined as A
+        // Render harness: no backend, so every call resolves empty. Callers
+        // decode results defensively; the cast is the harness boundary.
+        return undefined as unknown as RpcResult<M>
       }),
     sessionId: () => initialSessionId,
     logTail: () => []

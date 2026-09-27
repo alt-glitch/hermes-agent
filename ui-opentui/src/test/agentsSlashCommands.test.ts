@@ -11,6 +11,7 @@ import {
   type SlashContext
 } from '../logic/slash.ts'
 import { emptySpawnHistory, loadSpawnTree, type SpawnHistoryState, type SpawnSnapshot } from '../logic/spawnHistory.ts'
+import { scriptedRpc } from './lib/scriptedRpc.ts'
 
 interface RpcCall {
   readonly method: string
@@ -144,10 +145,10 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     redraw: () => {},
     refreshCommandCatalog: () => {},
     renderableCount: () => undefined,
-    request: (method, params) => {
+    request: scriptedRpc((method, params) => {
       calls.push({ method, params })
       return responder(method, params)
-    },
+    }),
     resetAfterToolsConfigure: () => {},
     replaceConversationSnapshot: () => {},
     setCompressedSessionKey: () => {},

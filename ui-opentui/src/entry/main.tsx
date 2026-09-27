@@ -311,7 +311,7 @@ const schedulePendingApprovalReconciliation = (
   sessionId: string
 ): void => {
   void reconcilePendingApprovalSnapshot(
-    () => Effect.runPromise(gateway.request<unknown>('approval.pending', { session_id: sessionId })),
+    () => Effect.runPromise(gateway.request('approval.pending', { session_id: sessionId })),
     store,
     sessionId
   )
@@ -375,7 +375,7 @@ const scheduleStartupCatalogRetry = (
   if (delay === undefined || !isActive()) return
   const timer = setTimeout(() => {
     if (!isActive()) return
-    Effect.runPromise(gateway.request<unknown>('startup.catalog', { session_id: sid }))
+    Effect.runPromise(gateway.request('startup.catalog', { session_id: sid }))
       .then(raw => {
         if (!isActive()) return
         const refreshed = store.setCatalog(raw)
@@ -422,7 +422,7 @@ const postSessionSetup = (
       sid,
       Effect.runPromise(
         gateway
-          .request<unknown>('model.options', modelOptionsParams(sid))
+          .request('model.options', modelOptionsParams(sid))
           .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
       ),
       modelOpts => {
@@ -432,7 +432,7 @@ const postSessionSetup = (
     )
 
     const catalog = yield* gateway
-      .request<unknown>('startup.catalog', { session_id: sid })
+      .request('startup.catalog', { session_id: sid })
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
     if (catalog !== undefined && isActive()) {
       const decoded = store.setCatalog(catalog)
@@ -448,7 +448,7 @@ const postSessionSetup = (
     // instead of only after its completion batch was browsed earlier. Best-effort
     // — a failure just leaves the old lazy-learn behavior.
     const cmdCatalog = yield* gateway
-      .request<unknown>('commands.catalog', {})
+      .request('commands.catalog', {})
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
     const decodedCommandCatalog = decodeCommandsCatalogResponse(cmdCatalog)
     if (isActive() && decodedCommandCatalog) {
@@ -466,7 +466,7 @@ const postSessionSetup = (
     // `queue` on failure/malformed data, and the revision captured above keeps
     // a late hydration reply from overwriting an early `/busy` command.
     const busyConfig = yield* gateway
-      .request<unknown>('config.get', { key: 'full' })
+      .request('config.get', { key: 'full' })
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
     const decodedBusyConfig = decodeConfigFullResponse(busyConfig)
     if (isActive() && decodedBusyConfig) {
@@ -586,8 +586,8 @@ const bootstrapSession = (
     if (input.resumeId) {
       let sid: string | undefined = input.resumeId
       if (sid === 'recent' || sid === 'last') {
-        const recent = yield* gateway.request<{ session_id?: string }>('session.most_recent', {})
-        sid = recent.session_id
+        const recent = yield* gateway.request('session.most_recent', {})
+        sid = recent.session_id ?? undefined
       }
       if (!sid) {
         log.warn('bootstrap', 'no session to resume', { resumeId: input.resumeId })
@@ -741,7 +741,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const spawnTreeSaveDrainer = createSpawnTreeSaveDrainer({
         next: () => store.nextSpawnTreeSaveIntent(),
         settle: id => store.settleSpawnTreeSaveIntent(id),
-        save: request => Effect.runPromise(gateway.request('spawn_tree.save', request)),
+        save: request =>
+          Effect.runPromise(gateway.request('spawn_tree.save', { ...request, subagents: [...request.subagents] })),
         onSaveFailure: (id, cause) =>
           getLog().warn('agents', 'spawn-tree persistence failed', {
             cause: String(cause),
@@ -1176,7 +1177,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               const sid = gateway.sessionId()
               if (!store.state.ready || !sid || store.state.sessionId !== sid) return
               const rawMtime = yield* gateway
-                .request<unknown>('config.get', { key: 'mtime' })
+                .request('config.get', { key: 'mtime' })
                 .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
               const decodedMtime = decodeConfigMtimeResponse(rawMtime)
               const nextMtime = decodedMtime?.mtime ?? 0
@@ -1200,7 +1201,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
               if (plan.reload) {
                 const reload = yield* gateway
-                  .request<unknown>('reload.mcp', {
+                  .request('reload.mcp', {
                     confirm: true,
                     session_id: sid,
                     ...(plan.mcpRev ? { rev: plan.mcpRev } : {})
@@ -1211,7 +1212,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               }
 
               const rawConfig = yield* gateway
-                .request<unknown>('config.get', { key: 'full' })
+                .request('config.get', { key: 'full' })
                 .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
               const decodedConfig = decodeConfigFullResponse(rawConfig)
               const active = gateway.sessionId() === sid && store.state.sessionId === sid
@@ -1463,7 +1464,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           imageAttachInFlight = true
           try {
             const raw = await Effect.runPromise(
-              gateway.request<unknown>('clipboard.paste', {
+              gateway.request('clipboard.paste', {
                 session_id: sid
               })
             )
@@ -1735,7 +1736,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
         return Effect.runPromise(
           gateway
-            .request<unknown>('prompt.submit', {
+            .request('prompt.submit', {
               client_submission_id: current.submissionId,
               session_id: current.sessionId,
               text: current.text
@@ -1810,7 +1811,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           pendingSteers.set(sequence, { clientMessageId, front, resolve, submissionId, text })
           void Effect.runPromise(
             gateway
-              .request<unknown>('session.steer', {
+              .request('session.steer', {
                 client_submission_id: submissionId,
                 session_id: sessionId,
                 text
@@ -2142,7 +2143,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         if (!cmd) return
         store.pushLocalUser(`!${cmd}`, 'shell')
         Effect.runFork(
-          gateway.request<{ stdout?: string; stderr?: string; code?: number }>('shell.exec', { command: cmd }).pipe(
+          gateway.request('shell.exec', { command: cmd }).pipe(
             Effect.tap(r =>
               Effect.sync(() => {
                 const out = [r.stdout, r.stderr].filter(Boolean).join('\n').trimEnd()
@@ -2223,9 +2224,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             gateway.request('session.list', {
               limit: 200,
               offset: 0,
-              query: '',
-              scope: 'all',
-              sort: 'recent'
+              query: ''
             })
           ),
         refresh: () => activeSessionsRefresher.refresh(true).then(() => undefined),
@@ -2430,7 +2429,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
             if (requestedTitle) {
               Effect.runFork(
                 gateway
-                  .request<{ pending?: boolean; title?: string }>('session.title', {
+                  .request('session.title', {
                     session_id: result.sessionId,
                     title: requestedTitle
                   })
@@ -2789,9 +2788,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.pushSystem('no active session')
           return
         }
-        const raw = await Effect.runPromise(
-          gateway.request<unknown>('image.attach', { path: inputText, session_id: sid })
-        )
+        const raw = await Effect.runPromise(gateway.request('image.attach', { path: inputText, session_id: sid }))
         const response = decodeImageAttachResponse(raw)
         if (!response) {
           store.pushSystem('error: invalid response: image.attach')
@@ -2830,7 +2827,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           store.setHint('setup required')
           return
         }
-        const raw = await Effect.runPromise(gateway.request<unknown>('setup.status', {}))
+        const raw = await Effect.runPromise(gateway.request('setup.status', {}))
         const setup = decodeSetupStatusResponse(raw)
         if (!setup) {
           store.pushSystem('error: invalid response: setup.status')
@@ -3299,6 +3296,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         params: Record<string, unknown>
       ): Promise<PromptResponseDisposition> => {
         try {
+          // @ts-expect-error contract drift: clarify.respond, secret.respond, sudo.respond, vault.unlock.respond are not registered methods (I4)
           const raw = await Effect.runPromise(gateway.request(method, params))
           const disposition = classifyPromptResponse(method, raw)
           if (disposition.kind === 'uncertain') getLog().warn('respond', disposition.message, { method })

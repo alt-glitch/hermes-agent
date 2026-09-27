@@ -5,9 +5,12 @@
 import { useKeyboard } from '@opentui/solid'
 import { createSignal, For, Match, Show, Switch } from 'solid-js'
 
+import type { RpcParams } from '../../boundary/gateway/rpc.ts'
 import { deferClose } from '../../logic/defer.ts'
 import type { CustomModelSetupState } from '../../logic/store.ts'
 import { MaskedPrompt } from '../prompts/maskedPrompt.tsx'
+
+type CustomProviderApiMode = NonNullable<RpcParams<'model.custom.probe'>['api_mode']>
 import { useTheme } from '../theme.tsx'
 
 type Stage = 'endpoint' | 'protocol' | 'key' | 'probing' | 'models' | 'manual' | 'name' | 'saving'
@@ -71,11 +74,11 @@ function TextStep(props: {
   )
 }
 
-function ChoiceStep(props: {
+function ChoiceStep<V extends string>(props: {
   title: string
   help: string
-  choices: readonly { label: string; description: string; value: string }[]
-  onPick: (value: string) => void
+  choices: readonly { label: string; description: string; value: V }[]
+  onPick: (value: V) => void
   onCancel: () => void
 }) {
   const theme = useTheme()
@@ -130,7 +133,7 @@ export function CustomModelSetup(props: { setup: CustomModelSetupState; onClose:
   const theme = useTheme()
   const [stage, setStage] = createSignal<Stage>('endpoint')
   const [baseUrl, setBaseUrl] = createSignal('')
-  const [apiMode, setApiMode] = createSignal('chat_completions')
+  const [apiMode, setApiMode] = createSignal<CustomProviderApiMode>('chat_completions')
   const [apiKey, setApiKey] = createSignal('')
   const [models, setModels] = createSignal<string[]>([])
   const [model, setModel] = createSignal('')

@@ -9,12 +9,13 @@ import { Context, type Effect } from 'effect'
 
 import type { GatewayError } from '../errors.ts'
 import type { GatewayEvent } from '../schema/GatewayEvent.ts'
+import type { RpcMethod, RpcParams, RpcResult } from './rpc.ts'
 
 export interface GatewayTransport {
   /** Push decoded gateway events into the Solid store. Returns an unsubscribe fn. */
   readonly subscribe: (handler: (event: GatewayEvent) => void) => Effect.Effect<() => void>
   /** Typed JSON-RPC request to the Python gateway. Fails with a typed GatewayError, never throws. */
-  readonly request: <A>(method: string, params: unknown) => Effect.Effect<A, GatewayError>
+  readonly request: <M extends RpcMethod>(method: M, params: RpcParams<M>) => Effect.Effect<RpcResult<M>, GatewayError>
   /** The active live session id; undefined before a session exists. */
   readonly sessionId: () => string | undefined
   /** Bounded low-level transport diagnostics used by the local `/logs` pager. */

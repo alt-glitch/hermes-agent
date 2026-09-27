@@ -27,6 +27,7 @@ import {
 } from '../schema/SessionOrchestratorResponses.ts'
 import { GatewayService, type GatewayTransport } from './GatewayService.ts'
 import { RawGatewayClient, RawGatewayRequestError } from './client.ts'
+import type { RpcMethod, RpcParams } from './rpc.ts'
 
 const COALESCE_MS = 16
 
@@ -228,9 +229,9 @@ function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
         }
       }),
 
-    request: <A>(method: string, params: unknown) =>
+    request: <M extends RpcMethod>(method: M, params: RpcParams<M>) =>
       Effect.tryPromise({
-        try: () => client.request<A>(method, params),
+        try: () => client.request(method, params),
         catch: cause => gatewayErrorFromRawFailure(method, cause)
       }).pipe(
         // Keep the live routing id aligned with create/resume/close so prompts,

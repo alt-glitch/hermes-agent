@@ -89,7 +89,7 @@ describe('RawGatewayClient dashboard websocket attachment', () => {
     expect(socket).toBeDefined()
     expect(spawnMock).not.toHaveBeenCalled()
 
-    const response = client.request<{ ok: boolean }>('session.create', { cols: 80 })
+    const response = client.request('session.create', { cols: 80 })
     expect(socket?.sent).toEqual([])
     socket?.open()
     await vi.waitFor(() => expect(socket?.sent).toHaveLength(1))
@@ -147,7 +147,7 @@ describe('RawGatewayClient dashboard websocket attachment', () => {
     await vi.waitFor(() => expect(oldSocket.sent).toHaveLength(1))
 
     process.env.HERMES_TUI_GATEWAY_URL = 'ws://new.test/api/ws?token=new-secret'
-    const fresh = client.request<{ ok: boolean }>('session.create', {})
+    const fresh = client.request('session.create', {})
     await expect(stale).rejects.toMatchObject({ reason: 'transport-down', message: 'gateway attach url changed' })
     expect(FakeWebSocket.instances).toHaveLength(2)
     const newSocket = FakeWebSocket.instances[1]!
