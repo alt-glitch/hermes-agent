@@ -732,10 +732,9 @@ function mapSkills(result: unknown): PickerItem[] {
  * enriched for desktop/Ink callers; this picker does not consume pricing or
  * capability fields and passive hydration must not probe a live custom endpoint. */
 export function modelOptionsParams(sessionId: string | undefined, refresh = false): Record<string, unknown> {
+  // Contract (tui_gateway/contracts/config_free_tier_control.py ModelOptionsParams):
+  // session_id / explicit_only / include_unconfigured / refresh only — extra keys 4000.
   return {
-    capabilities: false,
-    pricing: false,
-    probe_current_custom_provider: false,
     session_id: sessionId,
     ...(refresh ? { refresh: true } : {})
   }
