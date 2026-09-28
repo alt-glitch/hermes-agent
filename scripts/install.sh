@@ -858,7 +858,15 @@ stage_desktop() {
 NODE_DEPS_TIMEOUT="${NODE_DEPS_TIMEOUT:-600}"
 
 opentui_node_satisfies() {
-    "$1" -e 'const p=process.versions.node.split(".").map(Number); process.exit(p[0]>26||(p[0]===26&&p[1]>=3)?0:1)' 2>/dev/null
+    # `node --version` only (no `node -e`): upstream's installer e2e allows the
+    # user's node solely for version probes, and the parse below is equivalent.
+    local v maj min
+    v="$("$1" --version 2>/dev/null)" || return 1
+    v="${v#v}"
+    maj="${v%%.*}"
+    min="${v#*.}"; min="${min%%.*}"
+    [ -n "$maj" ] && [ -n "$min" ] || return 1
+    [ "$((10#$maj))" -gt 26 ] || { [ "$((10#$maj))" -eq 26 ] && [ "$((10#$min))" -ge 3 ]; }
 }
 
 # Match the launcher's Node precedence: HERMES_NODE > node on PATH > PM's store

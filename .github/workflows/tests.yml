@@ -261,6 +261,14 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Fetch upstream release tags (fork)
+        if: github.repository_owner != 'NousResearch'
+        # The fork pushes no release tags of its own; the upgrade suite's N-1
+        # baseline is upstream's release line, and every tag commit is an
+        # ancestor of the merged HEAD. Fetch the tags into the CI checkout
+        # only -- the fork repository itself stays tag-free.
+        run: git fetch https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'
+
       - name: Set up Node
         # `hermes update` builds the web UI / TUI workspaces.
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
