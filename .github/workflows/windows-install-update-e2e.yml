@@ -28,7 +28,7 @@ jobs:
     # Forks have no larger runners: fall back to windows-latest with 2x time.
     runs-on: ${{ github.repository_owner == 'NousResearch' && 'windows-latest-32-core' || 'windows-latest' }}
     # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 50 || 100 }}
+    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 50 || 180 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -52,6 +52,9 @@ jobs:
             -m "platforms and integration" -v --tb=short -rA
         env:
           HERMES_E2E_WINDOWS_INSTALL: '1'
+          # Fork: the hosted windows-latest runner is ~4x slower than upstream's
+          # 32-core; a cold install alone takes ~22 min there (run 36361896645).
+          HERMES_E2E_WINDOWS_INSTALL_TIMEOUT: '3600'
           # Machine work dirs (serve.git, transcripts) stay short under runner.temp. The fake
           # user profiles live in C:\Users itself, where a real one does: the checkout carries
           # 159-character paths, so a deeper profile hits MAX_PATH where no user would (the
