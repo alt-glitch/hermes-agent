@@ -47,13 +47,10 @@ def _write_executable(path: Path, body: str) -> Path:
 
 
 def _fake_node(path: Path, version: str) -> Path:
-    """A node that reports ``version`` and answers the floor probe (``-e``) for it."""
-    major, minor = (int(part) for part in version.split(".")[:2])
-    probe_rc = 0 if (major, minor) >= OPENTUI_FLOOR else 1
+    """A node that reports ``version`` for ``--version`` (the only probe the floor uses)."""
     return _write_executable(
         path,
         f'if [ "$1" = --version ]; then printf \'v{version}\\n\'; exit 0; fi\n'
-        f'if [ "$1" = -e ]; then exit {probe_rc}; fi\n'
         "exit 0",
     )
 
@@ -97,17 +94,8 @@ def test_pm_pinned_node_satisfies_the_opentui_floor() -> None:
     ],
 )
 def test_opentui_node_floor_is_26_3(tmp_path: Path, version: str, accepted: bool) -> None:
-    real_node = shutil.which("node")
-    if real_node is None:
-        pytest.skip("the floor probe is JavaScript; needs a real node on PATH")
-    preload = tmp_path / "version.cjs"
-    preload.write_text(
-        "Object.defineProperty(process, 'versions', "
-        f"{{value: {{...process.versions, node: {json.dumps(version)}}}}});\n",
-        encoding="utf-8",
-    )
     node = _write_executable(
-        tmp_path / "node", f'exec {shlex.quote(real_node)} --require {shlex.quote(str(preload))} "$@"'
+        tmp_path / "node", f'if [ "$1" = --version ]; then printf \'{version}\\n\'; fi\n'
     )
 
     result = _bash('opentui_node_satisfies "$1"', str(node))
