@@ -865,7 +865,11 @@ opentui_node_satisfies() {
     v="${v#v}"
     maj="${v%%.*}"
     min="${v#*.}"; min="${min%%.*}"
-    [ -n "$maj" ] && [ -n "$min" ] || return 1
+    # Reject non-decimal fields before the base-10 arithmetic: 10#$maj on a
+    # non-numeric word is a FATAL expansion error ("value too great for base")
+    # that kills this non-interactive shell instead of rejecting the candidate.
+    case "$maj" in ""|*[!0-9]*) return 1 ;; esac
+    case "$min" in ""|*[!0-9]*) return 1 ;; esac
     [ "$((10#$maj))" -gt 26 ] || { [ "$((10#$maj))" -eq 26 ] && [ "$((10#$min))" -ge 3 ]; }
 }
 
