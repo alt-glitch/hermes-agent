@@ -53,8 +53,14 @@ jobs:
         env:
           HERMES_E2E_WINDOWS_INSTALL: '1'
           # Fork: the hosted windows-latest runner is ~4x slower than upstream's
-          # 32-core; a cold install alone takes ~22 min there (run 36361896645).
-          HERMES_E2E_WINDOWS_INSTALL_TIMEOUT: '3600'
+          # 32-core and its network/disk is shared by all parallel journeys: with
+          # 6 workers every install (~250 MB of tool downloads each) starved past
+          # the per-file timeout (run 36376359555: all 6 files SIGKILLed at 2400s
+          # mid-download; run 36369188253: every install unfinished at 1500s while
+          # still progressing). 3 workers halves the contention, and the install
+          # timeout stays BELOW the file timeout so a wedged install fails with a
+          # real error + transcript instead of a silent SIGKILL.
+          HERMES_E2E_WINDOWS_INSTALL_TIMEOUT: ${{ github.repository_owner == 'NousResearch' && '1500' || '2400' }}
           # Machine work dirs (serve.git, transcripts) stay short under runner.temp. The fake
           # user profiles live in C:\Users itself, where a real one does: the checkout carries
           # 159-character paths, so a deeper profile hits MAX_PATH where no user would (the
@@ -63,8 +69,9 @@ jobs:
           HERMES_E2E_PROFILES_ROOT: C:\Users
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
           # One journey per file, all in parallel (each is mostly network + subprocess wait).
-          HERMES_TEST_WORKERS: '6'
-          HERMES_TEST_FILE_TIMEOUT: '2400'
+          # Fork: 3 workers on the hosted runner (see the install-timeout note above).
+          HERMES_TEST_WORKERS: ${{ github.repository_owner == 'NousResearch' && '6' || '3' }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ github.repository_owner == 'NousResearch' && '2400' || '3600' }}
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''

@@ -214,9 +214,18 @@ jobs:
           else
             # Fork: no release tags are pushed to this repository, so the
             # tag-sampling picker cannot run here. Degrade to an empty tag
-            # list: the matrix then runs only the HEAD->NEXT legs instead of
-            # failing the whole install-e2e workflow.
-            tags="$(scripts/sandbox/pick-release-tags.sh --count "$TAG_COUNT" || echo '[]')"
+            # list (the matrix then runs only the HEAD->NEXT legs) ONLY when
+            # the checkout genuinely has no release tags; any other picker
+            # failure fails the job instead of silently dropping the
+            # release->HEAD coverage.
+            if ! tags="$(scripts/sandbox/pick-release-tags.sh --count "$TAG_COUNT")"; then
+              if [ -z "$(git tag --list 'v[0-9][0-9][0-9][0-9].[0-9]*.[0-9]*' | head -1)" ]; then
+                tags='[]'
+              else
+                echo "pick-release-tags.sh failed though release tags exist" >&2
+                exit 1
+              fi
+            fi
           fi
           echo "Testing updates from: $tags"
           # Annotate each tag with what its own tree supports, so run
