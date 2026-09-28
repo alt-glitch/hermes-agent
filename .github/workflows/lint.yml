@@ -31,7 +31,8 @@ jobs:
     name: ruff + ty diff
     if: inputs.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Fork: cold PM-tools cache makes setup ~9 min; upstream's 10m cap only fits warm.
+    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 10 || 25 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -124,7 +125,7 @@ jobs:
     # the diff comment even when enforcement fails.
     name: ruff enforcement (blocking)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 5 || 15 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -152,7 +153,8 @@ jobs:
     # See scripts/check-windows-footguns.py for the full rule list.
     name: Windows footguns (blocking)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Fork: cold PM-tools cache makes setup ~4-5 min; upstream's 5m cap only fits warm.
+    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 5 || 15 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
