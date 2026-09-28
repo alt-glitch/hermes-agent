@@ -499,6 +499,15 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
                 session["_kanban_pending"] = batch + list(session.get("_kanban_pending") or [])
 
 
+def _background_notifications_off(session: dict) -> bool:
+    """Whether the owning profile set ``display.background_process_notifications: off``. Same
+    gate the messaging gateway applies to its process-event injection; only ``off`` matters
+    here (the other modes shape gateway chat receipts, not agent wakes)."""
+    with _session_profile_runtime_scope(session):
+        raw = (_load_cfg().get("display") or {}).get("background_process_notifications")
+    return raw is False or str(raw or "").strip().lower() == "off"
+
+
 def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
     """Dispatch a claimed turn; acknowledge only after its history commit."""
     from tools.async_delegation import claim_event_delivery, release_event_delivery
@@ -634,6 +643,10 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         render_notification(lambda: _emit("status.update", sid, {"kind": kind, "text": display_text}),
                             platform="tui", diagnostic=diagnostic_process_event(evt))
         emitted.add(dedup_key)
+    if evt_type != "async_delegation" and _background_notifications_off(session):
+        # The user opted out of process-driven agent wakes: the status row above is the whole
+        # delivery. Subagent results are not process notifications and still land.
+        return True
     if evt_type == "completion" and completions is not None:
         completions.append((evt, text))
         return True
@@ -1072,6 +1085,12 @@ def _notification_turn_display(evt: dict, detail: str, sid: str = "") -> dict:
             **({} if already_shown else {
                 "display_notification": _async_delegation_notice(evt, detail)}),
         }
+    if evt.get("type") == "heartbeat":
+        # Model-facing scaffolding: the process row on the status stack already says it is running,
+        # so the wake never paints as a user bubble (Desktop, TUI and the transcript preview all
+        # honour ``hidden``). Only what the agent says about the new output is visible.
+        from tools.process_registry_notifications import HEARTBEAT_DISPLAY_KIND
+        return {"display_kind": HEARTBEAT_DISPLAY_KIND}
     if evt.get("type", "completion") == "completion":
         notice = _process_completion_notice(evt, detail)
         return {

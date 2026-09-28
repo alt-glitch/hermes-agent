@@ -47,13 +47,10 @@ def _write_executable(path: Path, body: str) -> Path:
 
 
 def _fake_node(path: Path, version: str) -> Path:
-    """A node that reports ``version`` and answers the floor probe (``-e``) for it."""
-    major, minor = (int(part) for part in version.split(".")[:2])
-    probe_rc = 0 if (major, minor) >= OPENTUI_FLOOR else 1
+    """A node that reports ``version`` for ``--version`` (the only probe the floor uses)."""
     return _write_executable(
         path,
         f'if [ "$1" = --version ]; then printf \'v{version}\\n\'; exit 0; fi\n'
-        f'if [ "$1" = -e ]; then exit {probe_rc}; fi\n'
         "exit 0",
     )
 
@@ -97,22 +94,33 @@ def test_pm_pinned_node_satisfies_the_opentui_floor() -> None:
     ],
 )
 def test_opentui_node_floor_is_26_3(tmp_path: Path, version: str, accepted: bool) -> None:
-    real_node = shutil.which("node")
-    if real_node is None:
-        pytest.skip("the floor probe is JavaScript; needs a real node on PATH")
-    preload = tmp_path / "version.cjs"
-    preload.write_text(
-        "Object.defineProperty(process, 'versions', "
-        f"{{value: {{...process.versions, node: {json.dumps(version)}}}}});\n",
-        encoding="utf-8",
-    )
     node = _write_executable(
-        tmp_path / "node", f'exec {shlex.quote(real_node)} --require {shlex.quote(str(preload))} "$@"'
+        tmp_path / "node", f'if [ "$1" = --version ]; then printf \'{version}\\n\'; fi\n'
     )
 
     result = _bash('opentui_node_satisfies "$1"', str(node))
 
     assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("version", ["abc.3.0", "2a.9.0", "26.x", "26..3"])
+def test_opentui_node_floor_rejects_malformed_versions_without_dying(
+    tmp_path: Path, version: str
+) -> None:
+    """A malformed ``--version`` must reject the candidate, not kill the shell.
+
+    ``10#$maj`` on a non-numeric field is a fatal bash arithmetic error; the
+    stage is best-effort, so the function has to return 1 and let the script
+    continue to the next candidate / the Ink fallback.
+    """
+    node = _write_executable(
+        tmp_path / "node", f'if [ "$1" = --version ]; then printf \'{version}\\n\'; fi\n'
+    )
+
+    result = _bash('opentui_node_satisfies "$1"; echo "survived rc=$?"', str(node))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "survived rc=1" in result.stdout, result.stdout + result.stderr
 
 
 def _precedence_layout(tmp_path: Path) -> dict[str, Path]:
