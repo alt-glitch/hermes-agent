@@ -38,7 +38,8 @@ def _completed_execution_record():
         yield
 
 class TestCronjobRunExecutesImmediately:
-    @pytest.mark.parametrize("failure", ["registration_refused", "registration_raised", "heartbeat"])
+    @pytest.mark.parametrize(
+        "failure", ["registration_refused", "registration_raised", "owner_resolution", "heartbeat"])
     def test_unstarted_one_shot_releases_its_claim_without_recording_a_run(
         self, tmp_path, monkeypatch, failure
     ):
@@ -60,6 +61,13 @@ class TestCronjobRunExecutesImmediately:
                 def fail_heartbeat(_name):
                     raise RuntimeError("setup failed")
                 monkeypatch.setattr(tool, "_run_heartbeat", fail_heartbeat)
+            elif failure == "owner_resolution":
+                def fail_owner(_profile):
+                    raise RuntimeError("profile adapters unavailable")
+                runner = SimpleNamespace(
+                    adapters={"telegram": object()}, _gateway_loop=None, _adapters_for_profile=fail_owner)
+                monkeypatch.setitem(
+                    sys.modules, "gateway.run", SimpleNamespace(_gateway_runner_ref=lambda: runner))
             else:
                 def register(*args, **kwargs):
                     if failure == "registration_raised":
@@ -69,6 +77,8 @@ class TestCronjobRunExecutesImmediately:
             with patch.object(scheduler, "run_one_job") as run:
                 result = tool._run_claimed_job(claimed)
             assert result["success"] is False
+            if failure == "owner_resolution":
+                assert "profile adapters unavailable" in result["error"]
             run.assert_not_called()
             after = jobs.get_job(job["id"])
             assert after["last_run_at"] == before["last_run_at"]
@@ -355,8 +365,8 @@ class TestCronjobRunExecutesImmediately:
         assert adapters.get("telegram") is None
 
     def test_execute_job_now_fails_instead_of_falling_back_when_owner_resolution_raises(self):
-        """Fail closed: if the owner profile cannot be resolved, the run is marked failed with the
-        error surfaced — it must NOT silently fall back to ``runner.adapters`` (the default bot)."""
+        """Fail closed: if the owner profile cannot be resolved, the run fails with the error
+        surfaced — it must NOT silently fall back to ``runner.adapters`` (the default bot)."""
         default_adapters = {"telegram": object()}
 
         def boom(profile):
@@ -376,8 +386,10 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         assert "profile adapters unavailable" in res["error"]
         m_run.assert_not_called()
-        m_mark.assert_called_once()
-        assert m_mark.call_args.args[1] is False
+        # Fork contract: the run never started, so no run is recorded; the claim is released and the
+        # execution ledgered failed instead (pinned end-to-end by the "owner_resolution" case of
+        # test_unstarted_one_shot_releases_its_claim_without_recording_a_run).
+        m_mark.assert_not_called()
 
     def test_execute_job_now_remains_standalone_without_gateway(self):
         """CLI-only runs retain the standalone delivery path."""

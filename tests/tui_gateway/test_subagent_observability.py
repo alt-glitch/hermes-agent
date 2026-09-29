@@ -84,9 +84,17 @@ def test_branch_stream_preserves_owner_identity_and_child_mirror(monkeypatch, mo
     assert unrelated_wire.frames == []
     assert len({f["seq"] for f in frames}) == len(frames)
 
+    # Reasoning follows display.show_reasoning (no session key -> config default on), never
+    # tool_progress (upstream #126479), so it lands in both modes. Tool chrome (output_risk) is the
+    # control that still follows the mode, as in test_tool_progress_off_keeps_reasoning_blocks.
     before = len(frames)
-    server._on_tool_progress("parent", "reasoning.available", "_thinking", "ordinary chrome")
-    assert len(frames) == before + (mode != "off")
+    server._on_tool_progress("parent", "reasoning.available", "_thinking", "ordinary reasoning")
+    server._on_tool_progress(
+        "parent", "tool.output_risk", "terminal", None, None,
+        tool_call_id="t1", risk_metadata={"risk": "high", "findings": []},
+    )
+    chrome = ["tool.output_risk"] if mode != "off" else []
+    assert [f["type"] for f in frames[before:]] == ["reasoning.available", *chrome]
 
 
 def test_timed_out_worker_cannot_reopen_child_mirror(monkeypatch):
@@ -149,7 +157,8 @@ def test_timed_out_worker_cannot_reopen_child_mirror(monkeypatch):
         assert observed["superseded"] is False  # stop != newer stream attempt
         assert len(parent_wire.frames) == parent_count
         assert len(child_wire.frames) == child_count
-        assert not server._child_run_active(watch["session_key"])
+        # The parent session has no profile_home: the child runs under the launch profile (None).
+        assert not server._child_run_active(watch["session_key"], None)
         assert not server._child_mirrors
 
         # A fresh owner for the same session remains free to stream and complete.
@@ -159,10 +168,10 @@ def test_timed_out_worker_cannot_reopen_child_mirror(monkeypatch):
         )
         fresh("subagent.start")
         fresh("subagent.reasoning", preview="New reasoning")
-        assert server._child_run_active(watch["session_key"])
+        assert server._child_run_active(watch["session_key"], None)
         fresh("subagent.complete", status="completed", summary="New answer")
         assert child_wire.frames[-1]["payload"]["text"] == "New answer"
-        assert not server._child_run_active(watch["session_key"])
+        assert not server._child_run_active(watch["session_key"], None)
     finally:
         release.set()
         if "child" in observed:

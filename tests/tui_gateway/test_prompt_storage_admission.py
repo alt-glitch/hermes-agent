@@ -9,6 +9,14 @@ import pytest
 
 from tui_gateway import server
 
+# Deadlock/liveness guards only, never the subject: every event is set in a
+# ``finally`` and every thread terminates on the passing path, so a generous
+# bound costs nothing there. The concurrent queued submit and the first RPC's
+# pre-persistence admission run real SessionDB work (schema init + fsync in
+# tmp_path/state.db), which took >3s under the parallel gate's I/O load and
+# tripped the old 2-3s bounds into a false 5071.
+_LIVENESS_TIMEOUT = 30
+
 
 @pytest.fixture
 def registered_session(monkeypatch, tmp_path):
@@ -35,7 +43,7 @@ def registered_session(monkeypatch, tmp_path):
         ready.set()
         worker = session.get("_run_thread")
         if worker is not None:
-            worker.join(2)
+            worker.join(_LIVENESS_TIMEOUT)
         with server._sessions_lock:
             server._sessions.pop(sid, None)
 
@@ -60,7 +68,7 @@ def test_interrupt_after_ready_check_still_settles_accepted_submit(
 
     def paused_admission(*args, **kwargs):
         entered.set()
-        assert release.wait(3), "test did not release turn admission"
+        assert release.wait(_LIVENESS_TIMEOUT), "test did not release turn admission"
         return actual_submit(*args, **kwargs)
 
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
@@ -72,12 +80,12 @@ def test_interrupt_after_ready_check_still_settles_accepted_submit(
     response = server.handle_request({"id": "accepted", "method": "prompt.submit", "params": params})
     try:
         assert response["result"]["status"] == "streaming"
-        assert entered.wait(2)
+        assert entered.wait(_LIVENESS_TIMEOUT)
         interrupt = server.handle_request({"id": "stop", "method": "session.interrupt", "params": {"session_id": sid}})
         assert "error" not in interrupt
     finally:
         release.set()
-        session["_run_thread"].join(2)
+        session["_run_thread"].join(_LIVENESS_TIMEOUT)
 
     assert not session["_run_thread"].is_alive()
     assert not any(kind == "message.start" for kind, _, _ in events)
@@ -103,7 +111,7 @@ def test_storage_rejection_settles_concurrent_queue_without_retaining_rejected_t
         attempts.append(True)
         if len(attempts) == 1:
             entered.set()
-            assert release.wait(3), "test did not release storage admission"
+            assert release.wait(_LIVENESS_TIMEOUT), "test did not release storage admission"
             if isinstance(failure, Exception):
                 raise failure
             return failure
@@ -121,14 +129,14 @@ def test_storage_rejection_settles_concurrent_queue_without_retaining_rejected_t
     worker = threading.Thread(target=first_submit, daemon=True)
     worker.start()
     try:
-        assert entered.wait(2), "first RPC did not reach persistence"
+        assert entered.wait(_LIVENESS_TIMEOUT), "first RPC did not reach persistence"
         if with_queued_input:
             queued = _submit(sid, "queued", queued=True)
             assert queued["result"]["status"] == "queued"
             assert not responses
     finally:
         release.set()
-        worker.join(2)
+        worker.join(_LIVENESS_TIMEOUT)
 
     assert not worker.is_alive()
     assert not errors
@@ -151,7 +159,7 @@ def test_storage_rejection_settles_concurrent_queue_without_retaining_rejected_t
 
     retry = _submit(sid, "retry")
     assert retry["result"]["status"] == "streaming"
-    session["_run_thread"].join(2)
+    session["_run_thread"].join(_LIVENESS_TIMEOUT)
     assert not session["_run_thread"].is_alive()
     run.assert_called_once()
     assert run.call_args.args[3] == "synthetic retry"
@@ -177,7 +185,7 @@ def test_agent_ready_cancellation_settles_original_and_queued_receipts(
         else:
             session["running"] = False
     session["agent_ready"].set()
-    session["_run_thread"].join(2)
+    session["_run_thread"].join(_LIVENESS_TIMEOUT)
 
     assert not session["_run_thread"].is_alive()
     run.assert_not_called()

@@ -383,7 +383,9 @@ def _run_claimed_job(
         # ``runner.adapters`` is the LAUNCH profile's map; under multiplex the run executes with
         # HERMES_HOME bound to the owning profile, so resolve that profile's adapters the way the
         # ticker (``tick_adapters_for``) does — fail closed, never the default bot (#124248). A
-        # resolution error propagates to the ``except`` below and marks the run failed.
+        # resolution error propagates to the ``except`` below and fails the run before it starts:
+        # like a heartbeat-setup failure, the execution is ledgered failed and the claim released
+        # without recording a run (an unstarted one-shot must stay claimable, not be consumed).
         if runner is not None and hasattr(runner, "_adapters_for_profile"):
             from hermes_constants import get_hermes_home, profile_name_for_home
 

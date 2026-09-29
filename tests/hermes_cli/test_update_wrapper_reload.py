@@ -22,7 +22,7 @@ def _stub_shared_update_products(monkeypatch, calls: list[str]) -> None:
     import hermes_cli.memory_provider_migration as memory_migration
     import hermes_cli.update_stage as update_stage
 
-    monkeypatch.setattr(install_repair, "_warn_configured_features_missing_deps", lambda: None)
+    monkeypatch.setattr(install_repair, "_install_configured_features_missing_deps", lambda _root: None)
     monkeypatch.setattr(update_stage, "publish_stage", lambda _stage: None)
     monkeypatch.setattr(memory_migration, "migrate_all_homes", lambda: None)
     monkeypatch.setattr(source_build, "source_frontends", lambda _root: ("ui-tui", "web"))
