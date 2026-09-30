@@ -71,7 +71,7 @@ def is_mapped(email: str) -> bool:
     # add_contributor.py refuses case variants.
     emails_dir = REPO_ROOT / "contributors" / "emails"
     folded = email.casefold()
-    if any(entry.name.casefold() == folded for entry in emails_dir.iterdir()):
+    if emails_dir.is_dir() and any(entry.name.casefold() == folded for entry in emails_dir.iterdir()):
         return True
     authors_py = REPO_ROOT / "scripts" / "releases" / "authors_legacy.py"
     try:
