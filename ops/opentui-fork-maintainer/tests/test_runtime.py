@@ -1648,6 +1648,109 @@ def test_recovered_request_records_hashed_prior_gate_context(tmp_path: Path) -> 
         assert item["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def resume_request(
+    *, base_sha: str = "c" * 40, candidate_sha: str = "d" * 40
+) -> dict[str, object]:
+    return {
+        "mode": "resume",
+        "source_run": "retained-source-run",
+        "manifest_sha256": "a" * 64,
+        "packet_sha256": "b" * 64,
+        "pr": 42,
+        "base_sha": base_sha,
+        "candidate_sha": candidate_sha,
+    }
+
+
+def test_refused_request_is_deferred_until_the_runtime_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    refusing = state / "runs" / "20260911T213026Z-6b94c16b"
+    again = state / "runs" / "run-after-refusal"
+    deployed = state / "runs" / "run-after-deploy"
+    for run in (refusing, again, deployed):
+        run.mkdir(parents=True)
+    request = resume_request()
+    (state / "run-request.json").write_text(json.dumps(request), encoding="utf-8")
+
+    assert runtime.claim_request(state, refusing) == request
+    outcome = runtime.finalize_failure(
+        state, refusing, stage="publish", reason_code="publish-refused"
+    )
+    assert outcome["request_recovered"] is True
+    assert json.loads((state / "run-request.json").read_text()) == request
+
+    deferred = runtime.claim_request(state, again)
+
+    assert deferred["status"] == "deferred"
+    assert deferred["reason"] == (
+        "runtime unchanged since refusal by run 20260911T213026Z-6b94c16b"
+    )
+    assert deferred["refused_by"] == refusing.name
+    assert deferred["stage"] == "publish"
+    # No run is consumed: no claim evidence, no in-flight ownership, and the
+    # request stays queued for the deploy that can actually change the verdict.
+    assert not (again / "request.claimed.json").exists()
+    assert not (state / "run-request.inflight.json").exists()
+    assert json.loads((state / "run-request.json").read_text()) == request
+    record = json.loads((state / "request-deferred.json").read_text())
+    assert record["request_sha256"] == runtime._canonical_json_sha256(request)
+    assert record["runtime_sha256"] == runtime._runtime_fingerprint()
+    assert record["deferred_count"] == 1
+
+    # A redeployed runtime is a different runtime, so the same request retries.
+    monkeypatch.setattr(runtime, "_runtime_fingerprint", lambda: "f" * 64)
+
+    assert runtime.claim_request(state, deployed) == request
+    assert (deployed / "request.claimed.json").is_file()
+    assert (state / "run-request.inflight.json").is_file()
+
+
+def test_operator_resubmission_releases_a_refusal(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    refusing = state / "runs" / "run-refusing"
+    again = state / "runs" / "run-after-resubmit"
+    refusing.mkdir(parents=True)
+    again.mkdir()
+    request = resume_request()
+    (state / "run-request.json").write_text(json.dumps(request), encoding="utf-8")
+
+    assert runtime.claim_request(state, refusing) == request
+    runtime.finalize_failure(
+        state, refusing, stage="publish", reason_code="publish-refused"
+    )
+    assert (state / "request-deferred.json").is_file()
+
+    assert runtime.submit_request(state, request)["status"] == "queued"
+    assert not (state / "request-deferred.json").exists()
+
+    assert runtime.claim_request(state, again) == request
+
+
+def test_recovered_backport_work_is_never_suppressed(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    refusing = state / "runs" / "run-refusing"
+    again = state / "runs" / "run-after-refusal"
+    refusing.mkdir(parents=True)
+    again.mkdir()
+    request = {"mode": "backport", "commits": ["abcdef1"]}
+    (state / "run-request.json").write_text(json.dumps(request), encoding="utf-8")
+
+    assert runtime.claim_request(state, refusing) == request
+    assert (
+        runtime.finalize_failure(
+            state, refusing, stage="integration", reason_code="integration-failed"
+        )["request_recovered"]
+        is True
+    )
+
+    # A fresh owner can still make progress on recovered implementation work:
+    # only a refused publication continuation is deterministic and doomed.
+    assert not (state / "request-deferred.json").exists()
+    assert runtime.claim_request(state, again) == request
+
+
 def test_missing_invalid_and_failed_gates_never_move_remote(tmp_path: Path) -> None:
     repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
     state = tmp_path / "state"
@@ -1784,6 +1887,169 @@ def test_dirty_checked_out_daily_driver_is_not_mutated(tmp_path: Path) -> None:
     assert (repo / "file").read_text() == "user work\n"
     assert git(repo, "rev-parse", "refs/heads/sid/opentui") == base
     assert remote_sha(repo) == candidate
+
+
+def test_ship_candidate_observes_remote_before_opening_post_publish_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state = tmp_path / "state"
+    write_live_lease(state, expires_unix=4_000_000_000)
+    gate = tmp_path / "gate.json"
+    manifest(gate, gate_worktree, base, candidate)
+    journal = state / "publish-journal.json"
+    lease = state / "run.lease.json"
+    real_run = subprocess.run
+    observed: list[dict[str, object]] = []
+    failed = False
+
+    def run(argv, *args, **kwargs):
+        nonlocal failed
+        if "ls-remote" in argv:
+            # The remote observation happens while the pre-publish lease and
+            # journal state is still intact, so a failed read can never strand
+            # a prepared publication.
+            observed.append(
+                {
+                    "journal_exists": journal.exists(),
+                    "lease_expires_unix": json.loads(lease.read_text())[
+                        "expires_unix"
+                    ],
+                }
+            )
+            if not failed:
+                failed = True
+                return subprocess.CompletedProcess(argv, 128, "", "transient")
+        return real_run(argv, *args, **kwargs)
+
+    main_thread = threading.current_thread()
+    waits: list[float] = []
+
+    def record(seconds: float) -> None:
+        # Only the retry under test sleeps on this thread; a background poller
+        # left behind by another test must not pollute the schedule.
+        if threading.current_thread() is main_thread:
+            waits.append(seconds)
+
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    monkeypatch.setattr(runtime.time, "sleep", record)
+
+    runtime.ship_candidate(
+        repo,
+        gate,
+        state_dir=state,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+
+    assert remote_sha(repo) == candidate
+    assert waits == [2]
+    assert observed[0] == {
+        "journal_exists": False,
+        "lease_expires_unix": 4_000_000_000,
+    }
+    assert json.loads(journal.read_text())["phase"] == "published"
+    assert json.loads(lease.read_text())["expires_unix"] != 4_000_000_000
+
+
+def test_unobserved_remote_fails_closed_without_a_prepared_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state = tmp_path / "state"
+    write_live_lease(state, expires_unix=4_000_000_000)
+    gate = tmp_path / "gate.json"
+    manifest(gate, gate_worktree, base, candidate)
+    real_run = subprocess.run
+    attempts = 0
+
+    def run(argv, *args, **kwargs):
+        nonlocal attempts
+        if "ls-remote" in argv:
+            attempts += 1
+            return subprocess.CompletedProcess(argv, 128, "", "unreachable")
+        return real_run(argv, *args, **kwargs)
+
+    waits: list[float] = []
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    monkeypatch.setattr(runtime.time, "sleep", waits.append)
+
+    with pytest.raises(runtime.ControlError, match="ls-remote"):
+        runtime.ship_candidate(
+            repo,
+            gate,
+            state_dir=state,
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+        )
+
+    assert attempts == runtime.REMOTE_OBSERVE_ATTEMPTS
+    assert waits == list(runtime.REMOTE_OBSERVE_BACKOFF_SECONDS)
+    assert not (state / "publish-journal.json").exists()
+    assert (
+        json.loads((state / "run.lease.json").read_text())["expires_unix"]
+        == 4_000_000_000
+    )
+    # The faked transport cannot answer reads either, so observe the remote
+    # through the captured real runner.
+    assert (
+        real_run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "ls-remote",
+                "--heads",
+                "origin",
+                "refs/heads/sid/opentui",
+            ],
+            capture_output=True,
+            text=True,
+        ).stdout.split()[0]
+        == base
+    )
+
+
+def test_refused_guarded_push_is_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    state = tmp_path / "state"
+    write_live_lease(state, expires_unix=4_000_000_000)
+    gate = tmp_path / "gate.json"
+    manifest(gate, gate_worktree, base, candidate)
+    real_run = subprocess.run
+    pushes = 0
+
+    def run(argv, *args, **kwargs):
+        nonlocal pushes
+        if "push" in argv:
+            pushes += 1
+            return subprocess.CompletedProcess(argv, 1, "", "stale info")
+        return real_run(argv, *args, **kwargs)
+
+    waits: list[float] = []
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    monkeypatch.setattr(runtime.time, "sleep", waits.append)
+
+    with pytest.raises(
+        runtime.ControlError, match="guarded remote fast-forward was refused"
+    ):
+        runtime.ship_candidate(
+            repo,
+            gate,
+            state_dir=state,
+            base_sha=base,
+            candidate_sha=candidate,
+            token="test-token",
+        )
+
+    assert pushes == 1
+    assert waits == []
+    assert remote_sha(repo) == base
+    assert json.loads((state / "publish-journal.json").read_text())["phase"] == "prepared"
 
 
 def file_hash(path: Path) -> str:
@@ -3884,6 +4150,185 @@ def test_reconcile_finalizes_published_candidate_after_remote_advances(
     outcome = json.loads((state / "last-run.json").read_text())
     assert outcome["published"] is True
     assert outcome["remote_head_sha"] == descendant
+
+
+def test_reconcile_records_unshipped_prepared_publication_as_publish_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "test-run"
+    repo, _, base, candidate, gate_worktree = make_repo(
+        tmp_path, worktree_name="state/runs/test-run/integration"
+    )
+    write_live_lease(state)
+    claim_backport(state, evidence, base, candidate)
+    packet, _ = make_gate_packet(evidence, gate_worktree, base, candidate)
+    install_success_mocks(monkeypatch)
+    manifest_path = evidence / "gate.json"
+    runtime.gate_and_ship(
+        repo,
+        packet,
+        manifest_path,
+        state_dir=state,
+        cwd=gate_worktree,
+        base_sha=base,
+        candidate_sha=candidate,
+        token="test-token",
+    )
+    # Reproduce the incident shape: the publication journal stopped at
+    # ``prepared``, the lease had already been widened to the post-publish TTL,
+    # and nothing ever reached the remote.
+    git(repo, "push", "--force", "origin", f"{base}:refs/heads/sid/opentui")
+    journal_path = state / "publish-journal.json"
+    journal = json.loads(journal_path.read_text())
+    journal.update({"phase": "prepared", "prepared_unix": int(runtime.time.time())})
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease.update({"expires_unix": 1, "max_expires_unix": 1})
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    outcome = runtime.reconcile_run(
+        state, evidence, token="test-token", allow_expired=True
+    )
+
+    assert (outcome["stage"], outcome["reason_code"]) == ("publish", "publish-refused")
+    assert outcome["published"] is False
+    assert outcome["needs_finalization"] is False
+    assert outcome["request_recovered"] is True
+    aborted = runtime._load_publish_journal(state, require_manifest_evidence=False)
+    assert aborted is not None and aborted["phase"] == "aborted"
+    assert not lease_path.exists()
+    assert (state / "run-request.json").exists()
+    assert remote_sha(repo) == base
+
+    manifest_value = runtime._load_gate(manifest_path)
+
+    def accepted(value: dict[str, object]) -> bool:
+        return runtime._terminal_unshipped_outcome(
+            value,
+            state_dir=state,
+            source_root=evidence,
+            manifest_path=manifest_path,
+            manifest=manifest_value,
+        )
+
+    # The reconciler's own verdict is an accepted terminal unshipped source...
+    assert accepted(outcome)
+    # ...and the historical shape stays accepted for runs closed before the
+    # distinction existed.
+    assert accepted(
+        {**outcome, "stage": "external", "reason_code": "external-blocker"}
+    )
+    assert not accepted({**outcome, "stage": "external"})
+
+
+def test_reconciler_closed_run_defers_its_recovered_request(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "test-run"
+    repo, _, base, candidate, gate_worktree = make_repo(tmp_path)
+    request = resume_request(base_sha=base, candidate_sha=candidate)
+    write_live_lease(state)
+    (state / "run-request.json").write_text(json.dumps(request), encoding="utf-8")
+    assert runtime.claim_request(state, evidence) == request
+    context_path = evidence / "run-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": evidence.name,
+                "execution_id": "test-execution",
+                "lease_token_sha256": hashlib.sha256(b"test-token").hexdigest(),
+                "base_sha": base,
+                "upstream_sha": base,
+            }
+        ),
+        encoding="utf-8",
+    )
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease.update(
+        run_id=evidence.name,
+        evidence_dir=str(evidence.resolve()),
+        captured_base=base,
+        captured_upstream=base,
+        run_context_sha256=file_hash(context_path),
+    )
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+    # The incident shape: a publication was prepared against the captured base,
+    # nothing was pushed, and the widened lease has already expired.
+    journal_path = state / "publish-journal.json"
+    journal_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "phase": "prepared",
+                "repo": str(repo.resolve()),
+                "remote": "origin",
+                "branch": runtime.BRANCH,
+                "base_sha": base,
+                "candidate_sha": candidate,
+                "manifest_path": str((evidence / "gate.json").resolve()),
+                "manifest_sha256": "a" * 64,
+                "evidence_dir": str(evidence.resolve()),
+                "worktree": str(gate_worktree.resolve()),
+                "upstream_sha": base,
+                "run_binding": {"mode": "resume"},
+                "prepared_unix": 100,
+            }
+        ),
+        encoding="utf-8",
+    )
+    lease = json.loads(lease_path.read_text())
+    lease.update({"expires_unix": 1, "max_expires_unix": 1})
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    outcome = runtime.reconcile_run(
+        state, evidence, token="test-token", allow_expired=True
+    )
+    assert (outcome["stage"], outcome["reason_code"]) == ("publish", "publish-refused")
+    assert outcome["request_recovered"] is True
+
+    # The next tick must not spend a whole run re-proving the same refusal.
+    next_run = state / "runs" / "next-tick"
+    next_run.mkdir()
+    deferred = runtime.claim_request(state, next_run)
+
+    assert deferred["status"] == "deferred"
+    assert deferred["refused_by"] == evidence.name
+    assert deferred["reason"] == (
+        f"runtime unchanged since refusal by run {evidence.name}"
+    )
+    assert not (next_run / "request.claimed.json").exists()
+    assert not (state / "run-request.inflight.json").exists()
+    assert (state / "run-request.json").exists()
+
+
+def test_reconcile_without_a_publication_journal_stays_external_blocker(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    evidence = state / "runs" / "test-run"
+    repo, _, base, candidate, _ = make_repo(tmp_path)
+    write_live_lease(state)
+    claim_backport(state, evidence, base, candidate)
+    lease_path = state / "run.lease.json"
+    lease = json.loads(lease_path.read_text())
+    lease.update({"expires_unix": 1, "max_expires_unix": 1})
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    outcome = runtime.reconcile_run(
+        state, evidence, token="test-token", allow_expired=True
+    )
+
+    assert (outcome["stage"], outcome["reason_code"]) == (
+        "external",
+        "external-blocker",
+    )
+    assert not (state / "publish-journal.json").exists()
+    assert not lease_path.exists()
+    assert (state / "run-request.json").exists()
+    assert remote_sha(repo) == base
 
 
 def test_finalize_failure_recognizes_published_candidate_under_remote_descendant(
