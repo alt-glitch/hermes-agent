@@ -14,7 +14,7 @@
  * the input returns to the list. Enter on a choice answers it; Enter in the
  * input submits the typed text. The parent overlay owns Esc/Ctrl+C. When there
  * are no choices the input is the only control and is focused immediately.
- * Answered with the `clarify` request's JSON-RPC response `{answer}` (the caller wires onAnswer).
+ * Answered with the `clarify` request's JSON-RPC response `{answers: {[qid]: …}}` (the caller wires onAnswer).
  *
  * BATCH mode (`questions` non-empty — multi-question clarify): a compact status
  * list — every question on its own row (✓ answered / ▸ active / · pending),

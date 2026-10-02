@@ -930,18 +930,20 @@ describe('session store — blocking prompts (Phase 3)', () => {
     if (prompt?.kind === 'approval') expect(approvalChoices(prompt.allowPermanent)).toEqual(['once', 'deny'])
   })
 
-  test('a clarify request carries question + choices + request id', () => {
+  test('a one-question clarify request carries question + choices + qid + request id', () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'r1', { question: 'Which?', choices: ['a', 'b'] })
+    openRequest(store, 'clarify', 'r1', { questions: [{ qid: 'q0', question: 'Which?', choices: ['a', 'b'] }] })
     const p = store.state.prompt
-    expect(p).toMatchObject({ kind: 'clarify', question: 'Which?', requestId: 'r1' })
+    expect(p).toMatchObject({ kind: 'clarify', question: 'Which?', qid: 'q0', requestId: 'r1' })
     if (p?.kind === 'clarify') expect(p.choices).toEqual(['a', 'b'])
+    if (p?.kind === 'clarify') expect(p.questions).toBeUndefined()
   })
 
   test('a clarify request with null choices → free-text only', () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'r2', { question: 'Name?', choices: null })
+    openRequest(store, 'clarify', 'r2', { questions: [{ qid: 'q0', question: 'Name?', choices: null }] })
     const p = store.state.prompt
+    expect(p?.kind).toBe('clarify')
     if (p?.kind === 'clarify') expect(p.choices).toBeNull()
   })
 
@@ -971,7 +973,7 @@ describe('session store — blocking prompts (Phase 3)', () => {
 
   test('request.cancel settles every server-request prompt kind by its request id', () => {
     const requests = [
-      ['clarify', { question: 'Q?', choices: null }],
+      ['clarify', { questions: [{ qid: 'q0', question: 'Q?', choices: null }] }],
       ['approval', { command: 'ls', description: 'd' }],
       ['sudo', {}],
       ['secret', { env_var: 'K', prompt: 'p' }],
@@ -1026,7 +1028,7 @@ describe('session store — blocking prompts (Phase 3)', () => {
 
   test('clarify request.cancel clears only the exact request', () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'clarify-new', { question: 'New?' })
+    openRequest(store, 'clarify', 'clarify-new', { questions: [{ qid: 'q0', question: 'New?' }] })
     store.apply(cancelEvent('clarify-old', 'clarify'))
     expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'clarify-new' })
     store.apply(cancelEvent('clarify-new', 'clarify'))
@@ -1067,20 +1069,46 @@ describe('session store — batch (multi-question) clarify', () => {
     expect(clarifyPrompt(store).answers).toEqual({ q0: 'a' })
   })
 
-  test('malformed batch entries are dropped; single-question shape wins when none survive', () => {
+  test('a replayed skip (null on the wire) seeds as an empty lock', () => {
+    const store = createSessionStore()
+    openRequest(store, 'clarify', 'req-replay-skip', { ...BATCH, answers: { q0: null } })
+    expect(clarifyPrompt(store).answers).toEqual({ q0: '' })
+    // the skipped question is locked: only q1 remains
+    expect(store.recordClarifyAnswer('q1', 'x')).toBe(0)
+  })
+
+  test('malformed batch entries are dropped; one surviving question opens the single-question card', () => {
     const store = createSessionStore()
     openRequest(store, 'clarify', 'req-bad', {
-      choices: ['x', 'y'],
-      question: 'Fallback?',
       questions: [
         { qid: '', question: 'no qid' },
-        { qid: 'q1', question: '   ' }
+        { qid: 'q1', question: '   ' },
+        { choices: ['x', 'y'], qid: 'q2', question: 'Survivor?' }
       ]
     })
     const p = clarifyPrompt(store)
     expect(p.questions).toBeUndefined()
-    expect(p.question).toBe('Fallback?')
-    expect(p.choices).toEqual(['x', 'y'])
+    expect(p).toMatchObject({ choices: ['x', 'y'], qid: 'q2', question: 'Survivor?' })
+  })
+
+  test('a clarify request with no askable question (or the removed single-question shape) is refused', () => {
+    const decode = (params: Record<string, unknown>) =>
+      decodeServerRequest({
+        id: 'req-bad',
+        method: 'clarify',
+        params: { session_id: 'live-1', ...params },
+        respond: () => false
+      })
+    expect(decode({ questions: [] })).toBe('invalid-params')
+    expect(
+      decode({
+        questions: [
+          { qid: '', question: 'no qid' },
+          { qid: 'q1', question: '   ' }
+        ]
+      })
+    ).toBe('invalid-params')
+    expect(decode({ question: 'Legacy?', choices: ['x'] })).toBe('invalid-params')
   })
 
   test('recordClarifyAnswer locks answers one at a time and reports the remaining count', () => {
@@ -1165,7 +1193,7 @@ describe('session store — batch (multi-question) clarify', () => {
 
   test('a single-question clarify prompt is never batch-flushed (behavior preserved)', () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'r-single', { choices: ['a'], question: 'One?' })
+    openRequest(store, 'clarify', 'r-single', { questions: [{ choices: ['a'], qid: 'q0', question: 'One?' }] })
     store.apply({ type: 'tool.complete', payload: { name: 'clarify', tool_id: 'clar-s' } })
     store.apply({ type: 'message.complete' })
     expect(store.state.prompt).toMatchObject({ kind: 'clarify', question: 'One?' })

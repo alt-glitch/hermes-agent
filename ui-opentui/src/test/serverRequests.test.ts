@@ -97,15 +97,19 @@ const clarify = (id: string, sessionId: string, question: string) => ({
   jsonrpc: '2.0',
   id,
   method: 'clarify',
-  params: { session_id: sessionId, question }
+  params: { session_id: sessionId, questions: [{ qid: 'q0', question }] }
 })
 
-// Recorded from the worktree gateway (tui_gateway.entry + server._clarify_block, stdio) on 2026-09-27.
+// Recorded from the worktree gateway (tools.clarify_tool → server._clarify_block → server_requests.send,
+// in-process) on 2026-10-02.
 const RECORDED_CLARIFY_FRAME = {
   jsonrpc: '2.0',
-  id: 'srq-83c17576c465',
+  id: 'srq-73b6fa63520e',
   method: 'clarify',
-  params: { session_id: '68b3763a', question: 'Pick one', choices: ['alpha', 'beta'] }
+  params: {
+    session_id: '68b3763a',
+    questions: [{ qid: 'q0', question: 'Pick one', choices: ['alpha (Recommended)', 'beta'], multi_select: false }]
+  }
 }
 
 test('a clarify server request opens the prompt and the answer is a JSON-RPC response with the request id', async () => {
@@ -118,24 +122,25 @@ test('a clarify server request opens the prompt and the answer is a JSON-RPC res
   expect(store.state.prompt).toEqual({
     kind: 'clarify',
     question: 'Pick one',
-    choices: ['alpha', 'beta'],
-    requestId: 'srq-83c17576c465'
+    choices: ['alpha (Recommended)', 'beta'],
+    qid: 'q0',
+    requestId: 'srq-73b6fa63520e'
   })
   // gateway.ready → the client advertises that it answers server requests.
   await vi.waitFor(() =>
     expect(written.find(f => f['method'] === 'client.capabilities')?.['params']).toEqual({ server_requests: true })
   )
 
-  expect(router.answer('srq-83c17576c465', { answer: 'beta' })).toBe('sent')
-  await vi.waitFor(() => expect(written.some(f => f['id'] === 'srq-83c17576c465')).toBe(true))
-  // ClarifyResult (tui_gateway/contracts/server_requests.py): {answer?: str, answers?: dict}.
-  expect(written.find(f => f['id'] === 'srq-83c17576c465')).toEqual({
+  expect(router.answer('srq-73b6fa63520e', { answers: { q0: 'beta' } })).toBe('sent')
+  await vi.waitFor(() => expect(written.some(f => f['id'] === 'srq-73b6fa63520e')).toBe(true))
+  // ClarifyResult (tui_gateway/contracts/server_requests.py): {answers?: {qid: str | null} | null}.
+  expect(written.find(f => f['id'] === 'srq-73b6fa63520e')).toEqual({
     jsonrpc: '2.0',
-    id: 'srq-83c17576c465',
-    result: { answer: 'beta' }
+    id: 'srq-73b6fa63520e',
+    result: { answers: { q0: 'beta' } }
   })
   // A second answer for the same id writes nothing: the request is no longer open.
-  expect(router.answer('srq-83c17576c465', { answer: 'alpha' })).toBe('closed')
+  expect(router.answer('srq-73b6fa63520e', { answers: { q0: 'alpha' } })).toBe('closed')
   client.stop()
 })
 
@@ -151,13 +156,33 @@ test('a server request method without a handler is answered -32601 at once', asy
 test('a clarify frame whose params fail the contract is answered -32602 and opens nothing', async () => {
   const gateway = mockGateway()
   const { store, router, client } = startClient(gateway, 's')
-  // No `question` and no `questions`: nothing to ask.
-  gateway.send({ jsonrpc: '2.0', id: 'srq-bad', method: 'clarify', params: { session_id: 's', choices: ['a'] } })
-  await vi.waitFor(() => expect(gateway.responsesFor('srq-bad')).toHaveLength(1))
-  expect(gateway.responsesFor('srq-bad')[0]).toMatchObject({ id: 'srq-bad', error: { code: -32602 } })
+  // The removed single-question shape (no `questions`), and a list with no askable entry: nothing to ask.
+  gateway.send({
+    jsonrpc: '2.0',
+    id: 'srq-bad',
+    method: 'clarify',
+    params: { session_id: 's', question: 'Legacy?', choices: ['a'] }
+  })
+  gateway.send({
+    jsonrpc: '2.0',
+    id: 'srq-blank',
+    method: 'clarify',
+    params: {
+      session_id: 's',
+      questions: [
+        { qid: '', question: 'no qid' },
+        { qid: 'q1', question: '   ' }
+      ]
+    }
+  })
+  await vi.waitFor(() => expect(gateway.responsesFor('srq-blank')).toHaveLength(1))
+  for (const id of ['srq-bad', 'srq-blank']) {
+    expect(gateway.responsesFor(id)).toHaveLength(1)
+    expect(gateway.responsesFor(id)[0]).toMatchObject({ id, error: { code: -32602 } })
+    expect(router.answer(id, { answers: { q0: 'x' } })).toBe('closed')
+  }
   expect(store.state.prompt).toBeUndefined()
   expect(router.pending()).toEqual([])
-  expect(router.answer('srq-bad', { answer: 'x' })).toBe('closed')
   client.stop()
 })
 
@@ -176,7 +201,7 @@ test('a gateway exit withdraws every held request: the shown prompt expires, a l
   expect(store.state.messages.map(m => m.text)).toContain('clarification expired — no response was accepted')
   expect(router.pending()).toEqual([])
   for (const id of ['srq-shown', 'srq-queued', 'srq-other']) {
-    expect(router.answer(id, { answer: 'late' })).toBe('closed')
+    expect(router.answer(id, { answers: { q0: 'late' } })).toBe('closed')
     expect(router.forget(id)).toBe(false)
   }
   expect(gateway.written.filter(f => !('method' in f))).toEqual([])
@@ -189,15 +214,15 @@ test('round trip: answer writes one response, request.cancel closes the prompt a
   const { store, router, client } = startClient(gateway, 's')
 
   // 1. clarify frame → prompt; the answer is exactly one response frame with that id.
-  send({ jsonrpc: '2.0', id: 'srq-a', method: 'clarify', params: { session_id: 's', question: 'Name?' } })
+  send(clarify('srq-a', 's', 'Name?'))
   await vi.waitFor(() => expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'srq-a' }))
-  expect(router.answer('srq-a', { answer: 'Ada' })).toBe('sent')
+  expect(router.answer('srq-a', { answers: { q0: 'Ada' } })).toBe('sent')
   await vi.waitFor(() => expect(responsesFor('srq-a')).toHaveLength(1))
-  expect(responsesFor('srq-a')[0]).toEqual({ jsonrpc: '2.0', id: 'srq-a', result: { answer: 'Ada' } })
+  expect(responsesFor('srq-a')[0]).toEqual({ jsonrpc: '2.0', id: 'srq-a', result: { answers: { q0: 'Ada' } } })
 
   // 2. request.cancel for an open clarify closes its prompt; a late answer writes nothing.
   store.clearPrompt()
-  send({ jsonrpc: '2.0', id: 'srq-b', method: 'clarify', params: { session_id: 's', question: 'Again?' } })
+  send(clarify('srq-b', 's', 'Again?'))
   await vi.waitFor(() => expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'srq-b' }))
   send({
     jsonrpc: '2.0',
@@ -206,7 +231,7 @@ test('round trip: answer writes one response, request.cancel closes the prompt a
   })
   await vi.waitFor(() => expect(store.state.prompt).toBeUndefined())
   expect(store.state.messages.at(-1)?.text).toBe('clarification expired — no response was accepted')
-  expect(router.answer('srq-b', { answer: 'too late' })).toBe('closed')
+  expect(router.answer('srq-b', { answers: { q0: 'too late' } })).toBe('closed')
 
   // 3. approval frame answered → {choice}.
   send({
@@ -232,7 +257,13 @@ test('an open_requests replay on session activation opens the prompt; the answer
     'session.activate': params => ({
       session_id: params['session_id'],
       messages: [],
-      open_requests: [{ id: 'srq-replay', method: 'clarify', params: { session_id: 's1', question: 'Still there?' } }]
+      open_requests: [
+        {
+          id: 'srq-replay',
+          method: 'clarify',
+          params: { session_id: 's1', questions: [{ qid: 'q0', question: 'Still there?' }] }
+        }
+      ]
     })
   })
   const { store, client, transport, respond } = startClient(gateway)
@@ -241,11 +272,15 @@ test('an open_requests replay on session activation opens the prompt; the answer
   expect(store.state.sessionId).toBe('s1')
   expect(store.state.prompt).toMatchObject({ kind: 'clarify', question: 'Still there?', requestId: 'srq-replay' })
 
-  expect(await respond({ kind: 'answer', requestId: 'srq-replay', result: { answer: 'yes' } })).toEqual({
+  expect(await respond({ kind: 'answer', requestId: 'srq-replay', result: { answers: { q0: 'yes' } } })).toEqual({
     kind: 'accepted'
   })
   await vi.waitFor(() => expect(gateway.responsesFor('srq-replay')).toHaveLength(1))
-  expect(gateway.responsesFor('srq-replay')[0]).toEqual({ jsonrpc: '2.0', id: 'srq-replay', result: { answer: 'yes' } })
+  expect(gateway.responsesFor('srq-replay')[0]).toEqual({
+    jsonrpc: '2.0',
+    id: 'srq-replay',
+    result: { answers: { q0: 'yes' } }
+  })
   client.stop()
 })
 
@@ -271,14 +306,14 @@ test('a request for a session that is not displayed is held; switching to that s
   await Effect.runPromise(activateSession(transport, store, { targetSessionId: 's2' }))
   expect(store.state.prompt).toMatchObject({ kind: 'clarify', question: 'For s2?', requestId: 'srq-other' })
   expect(router.pending()).toEqual(['srq-other', 'srq-late'])
-  expect(router.answer('srq-other', { answer: 'ok' })).toBe('sent')
+  expect(router.answer('srq-other', { answers: { q0: 'ok' } })).toBe('sent')
   expect(store.state.prompt).toMatchObject({ question: 'Also for s2?', requestId: 'srq-late' })
   await vi.waitFor(() => expect(gateway.responsesFor('srq-other')).toHaveLength(1))
   client.stop()
 })
 
 test('a replay of a held request does not duplicate it: the answer writes exactly one frame', async () => {
-  const pending = { id: 'srq-other', method: 'clarify', params: { session_id: 's2', question: 'For s2?' } }
+  const pending = { id: 'srq-other', method: 'clarify', params: clarify('srq-other', 's2', 'For s2?').params }
   const gateway = mockGateway({
     'session.activate': params => ({ session_id: params['session_id'], messages: [], open_requests: [pending] })
   })
@@ -291,11 +326,13 @@ test('a replay of a held request does not duplicate it: the answer writes exactl
   await Effect.runPromise(activateSession(transport, store, { targetSessionId: 's2' }))
   expect(store.state.prompt).toMatchObject({ requestId: 'srq-other' })
   expect(router.pending()).toEqual(['srq-other'])
-  expect(router.answer('srq-other', { answer: 'ok' })).toBe('sent')
-  expect(router.answer('srq-other', { answer: 'again' })).toBe('closed')
+  expect(router.answer('srq-other', { answers: { q0: 'ok' } })).toBe('sent')
+  expect(router.answer('srq-other', { answers: { q0: 'again' } })).toBe('closed')
   await vi.waitFor(() => expect(gateway.responsesFor('srq-other')).toHaveLength(1))
   await new Promise(resolve => setTimeout(resolve, 10))
-  expect(gateway.responsesFor('srq-other')).toEqual([{ jsonrpc: '2.0', id: 'srq-other', result: { answer: 'ok' } }])
+  expect(gateway.responsesFor('srq-other')).toEqual([
+    { jsonrpc: '2.0', id: 'srq-other', result: { answers: { q0: 'ok' } } }
+  ])
   expect(router.pending()).toEqual([])
   client.stop()
 })
@@ -324,7 +361,7 @@ test('request.cancel for a held request of a session that is not displayed drops
   expect(store.state.sessionId).toBe('s2')
   expect(store.state.prompt).toBeUndefined()
   expect(router.pending()).toEqual([])
-  expect(router.answer('srq-other', { answer: 'late' })).toBe('closed')
+  expect(router.answer('srq-other', { answers: { q0: 'late' } })).toBe('closed')
   expect(gateway.responsesFor('srq-other')).toEqual([])
   client.stop()
 })
@@ -338,7 +375,7 @@ test('requests queue: answering the shown one writes one frame and shows the nex
   await vi.waitFor(() => expect(router.pending()).toEqual(['srq-1', 'srq-2', 'srq-3']))
   expect(store.state.prompt).toMatchObject({ requestId: 'srq-1' })
 
-  expect(router.answer('srq-1', { answer: 'one' })).toBe('sent')
+  expect(router.answer('srq-1', { answers: { q0: 'one' } })).toBe('sent')
   expect(store.state.prompt).toMatchObject({ question: 'Second?', requestId: 'srq-2' })
   await vi.waitFor(() => expect(gateway.responsesFor('srq-1')).toHaveLength(1))
 
@@ -365,7 +402,7 @@ test('an answer that could not be written keeps the request open; the retry writ
   vi.spyOn(gateway.stdin, 'write').mockImplementationOnce(() => {
     throw new Error('write EPIPE')
   })
-  const reply = { kind: 'answer', requestId: 'srq-w', result: { answer: 'Ada' } } as const
+  const reply = { kind: 'answer', requestId: 'srq-w', result: { answers: { q0: 'Ada' } } } as const
   expect(await respond(reply)).toMatchObject({ kind: 'uncertain', message: expect.stringContaining('not sent') })
   expect(router.pending()).toEqual(['srq-w'])
   expect(store.state.prompt).toMatchObject({ requestId: 'srq-w' })
@@ -373,7 +410,7 @@ test('an answer that could not be written keeps the request open; the retry writ
   expect(await respond(reply)).toEqual({ kind: 'accepted' })
   await vi.waitFor(() => expect(gateway.responsesFor('srq-w')).toHaveLength(1))
   await new Promise(resolve => setTimeout(resolve, 10))
-  expect(gateway.responsesFor('srq-w')).toEqual([{ jsonrpc: '2.0', id: 'srq-w', result: { answer: 'Ada' } }])
+  expect(gateway.responsesFor('srq-w')).toEqual([{ jsonrpc: '2.0', id: 'srq-w', result: { answers: { q0: 'Ada' } } }])
   expect(router.pending()).toEqual([])
   client.stop()
 })
@@ -403,8 +440,8 @@ test('the final clarify.lock forgets the batch request', async () => {
   expect(router.pending()).toEqual(['srq-batch'])
   expect(await lock('q2')).toEqual({ kind: 'accepted' })
   expect(router.pending()).toEqual([])
-  // Nothing is left to answer: a late response is refused and nothing is written.
-  expect(router.answer('srq-batch', { answer: '' })).toBe('closed')
+  // Nothing is left to answer: a late response (even a cancel-all) is refused and nothing is written.
+  expect(router.answer('srq-batch', {})).toBe('closed')
   expect(router.forget('srq-batch')).toBe(false)
   await new Promise(resolve => setTimeout(resolve, 10))
   expect(gateway.responsesFor('srq-batch')).toEqual([])
@@ -412,7 +449,11 @@ test('the final clarify.lock forgets the batch request', async () => {
 })
 
 test('a request.cancel that lands before the activation response keeps the replayed id closed', async () => {
-  const cancelled = { id: 'srq-gone', method: 'clarify', params: { session_id: 's1', question: 'Still there?' } }
+  const cancelled = {
+    id: 'srq-gone',
+    method: 'clarify',
+    params: { session_id: 's1', questions: [{ qid: 'q0', question: 'Still there?' }] }
+  }
   const gateway = mockGateway({
     // The backend listed srq-gone in open_requests, then cancelled it before this response was written.
     'session.activate': params => {
@@ -434,7 +475,7 @@ test('a request.cancel that lands before the activation response keeps the repla
   expect(store.state.sessionId).toBe('s1')
   expect(store.state.prompt).toBeUndefined()
   expect(router.pending()).toEqual([])
-  expect(router.answer('srq-gone', { answer: 'late' })).toBe('closed')
+  expect(router.answer('srq-gone', { answers: { q0: 'late' } })).toBe('closed')
   await new Promise(resolve => setTimeout(resolve, 10))
   expect(gateway.responsesFor('srq-gone')).toEqual([])
   client.stop()
@@ -473,7 +514,7 @@ test('replacing the transport withdraws held requests: the prompt expires and no
     expect(store.state.prompt).toBeUndefined()
     expect(store.state.messages.map(m => m.text)).toContain('clarification expired — no response was accepted')
     expect(router.pending()).toEqual([])
-    expect(router.answer('srq-held', { answer: 'late' })).toBe('closed')
+    expect(router.answer('srq-held', { answers: { q0: 'late' } })).toBe('closed')
     expect(socket?.sent).toEqual([])
     expect(gateway.written.filter(f => !('method' in f))).toEqual([])
   } finally {

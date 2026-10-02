@@ -217,7 +217,10 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
     try {
       expect(notifications).toEqual([])
       store.openPrompt(
-        SERVER_REQUEST_PROMPTS['clarify'].open('r1', { choices: null, question: 'which one?', session_id: 's' })
+        SERVER_REQUEST_PROMPTS['clarify'].open('r1', {
+          questions: [{ choices: null, qid: 'q0', question: 'which one?' }],
+          session_id: 's'
+        })
       )
       expect(notifications).toEqual(['needs an answer to continue'])
       // clearing the prompt does not notify again
@@ -233,7 +236,10 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
     try {
       store.setBellOnPrompt(true)
       store.openPrompt(
-        SERVER_REQUEST_PROMPTS['clarify'].open('r1', { choices: null, question: 'first?', session_id: 's' })
+        SERVER_REQUEST_PROMPTS['clarify'].open('r1', {
+          questions: [{ choices: null, qid: 'q0', question: 'first?' }],
+          session_id: 's'
+        })
       )
       expect(bells).toEqual([BEL])
 

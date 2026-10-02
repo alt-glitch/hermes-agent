@@ -87,7 +87,7 @@ async function mount(
 describe('PromptOverlay acknowledgement ownership', () => {
   test.each(['escape', 'ctrl-c'] as const)('retains %s cancellation after leaving custom input', async key => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'req-focus', { question: 'Choose', choices: ['A'] })
+    openRequest(store, 'clarify', 'req-focus', { questions: [{ qid: 'q0', question: 'Choose', choices: ['A'] }] })
     const replies: PromptReply[] = []
     const h = await mountOverlay(store, reply => {
       replies.push(reply)
@@ -101,7 +101,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
       if (key === 'escape') h.keys.pressEscape()
       else h.keys.pressKey('c', { ctrl: true })
       await h.settle()
-      expect(replies).toEqual([{ kind: 'answer', requestId: 'req-focus', result: { answer: '' } }])
+      expect(replies).toEqual([{ kind: 'answer', requestId: 'req-focus', result: {} }])
       await expect.poll(() => store.state.prompt).toBeUndefined()
     } finally {
       h.destroy()
@@ -110,7 +110,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('stays mounted while pending and prevents duplicate submit', async () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'req-1', { question: 'Choose', choices: ['A'] })
+    openRequest(store, 'clarify', 'req-1', { questions: [{ qid: 'q0', question: 'Choose', choices: ['A'] }] })
     let calls = 0
     let resolveResponse: ((value: PromptResponseDisposition) => void) | undefined
     const response = new Promise<PromptResponseDisposition>(resolve => (resolveResponse = resolve))
@@ -138,7 +138,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('an uncertain response retries only after the visible manual action', async () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'req-2', { question: 'Choose', choices: ['A'] })
+    openRequest(store, 'clarify', 'req-2', { questions: [{ qid: 'q0', question: 'Choose', choices: ['A'] }] })
     const sent: PromptReply[] = []
     const h = await mountOverlay(store, reply => {
       sent.push(reply)
@@ -156,7 +156,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
       // automatic replay or permission to submit a newly selected answer.
       h.keys.pressEnter()
       await h.settle()
-      expect(sent).toEqual([{ kind: 'answer', requestId: 'req-2', result: { answer: 'A' } }])
+      expect(sent).toEqual([{ kind: 'answer', requestId: 'req-2', result: { answers: { q0: 'A' } } }])
       expect(store.state.prompt?.kind).toBe('clarify')
 
       h.keys.pressKey('r')
@@ -170,7 +170,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('a manual retry reports a terminal result without inferring whether the first delivery was accepted', async () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'req-lost-ack', { question: 'Choose', choices: ['A'] })
+    openRequest(store, 'clarify', 'req-lost-ack', { questions: [{ qid: 'q0', question: 'Choose', choices: ['A'] }] })
     let calls = 0
     const h = await mountOverlay(store, () => {
       calls += 1
@@ -194,7 +194,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('Esc dismisses a locally stalled response without waiting for the RPC', async () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'req-stalled', { question: 'Choose', choices: ['A'] })
+    openRequest(store, 'clarify', 'req-stalled', { questions: [{ qid: 'q0', question: 'Choose', choices: ['A'] }] })
     const stalled = new Promise<PromptResponseDisposition>(() => {})
     const h = await mountOverlay(store, () => stalled)
     try {
@@ -213,7 +213,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('Ctrl+C dismisses an errored response without claiming cancellation was delivered', async () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'req-error', { question: 'Choose', choices: ['A'] })
+    openRequest(store, 'clarify', 'req-error', { questions: [{ qid: 'q0', question: 'Choose', choices: ['A'] }] })
     const h = await mountOverlay(store, () => Promise.reject(new Error('transport disconnected')))
     try {
       h.keys.pressEnter()
@@ -232,7 +232,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('a terminal obsolete response closes the blocking prompt', async () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'req-expired', { question: 'Choose', choices: ['A'] })
+    openRequest(store, 'clarify', 'req-expired', { questions: [{ qid: 'q0', question: 'Choose', choices: ['A'] }] })
     const h = await mountOverlay(store, () => Promise.resolve(EXPIRED))
     try {
       h.keys.pressEnter()
@@ -246,7 +246,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
 
   test('a terminal response remains locally closable before its deferred teardown', async () => {
     const store = createSessionStore()
-    openRequest(store, 'clarify', 'req-terminal', { question: 'Choose', choices: ['A'] })
+    openRequest(store, 'clarify', 'req-terminal', { questions: [{ qid: 'q0', question: 'Choose', choices: ['A'] }] })
     const response = deferred<PromptResponseDisposition>()
     const h = await mountOverlay(store, () => response.promise)
     try {
@@ -267,7 +267,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
   test('a retry is fenced by its presenting session and cannot close a replacement prompt', async () => {
     const store = createSessionStore()
     store.setSessionId('session-old')
-    openRequest(store, 'clarify', 'req-old', { question: 'Old?', choices: ['A'] })
+    openRequest(store, 'clarify', 'req-old', { questions: [{ qid: 'q0', question: 'Old?', choices: ['A'] }] })
     const retry = deferred<PromptResponseDisposition>()
     let calls = 0
     const h = await mountOverlay(store, () => {
@@ -289,7 +289,7 @@ describe('PromptOverlay acknowledgement ownership', () => {
       h.keys.pressKey('r')
       await expect.poll(() => calls).toBe(2)
       store.setSessionId('session-new')
-      openRequest(store, 'clarify', 'req-new', { question: 'New?', choices: ['B'] })
+      openRequest(store, 'clarify', 'req-new', { questions: [{ qid: 'q0', question: 'New?', choices: ['B'] }] })
       await h.settle()
       retry.resolve(ACCEPTED)
       await new Promise(resolve => setTimeout(resolve, 0))
@@ -297,6 +297,42 @@ describe('PromptOverlay acknowledgement ownership', () => {
       expect(store.state.prompt).toMatchObject({ kind: 'clarify', requestId: 'req-new' })
     } finally {
       h.destroy()
+    }
+  })
+
+  test('a single question answers {answers} keyed by its qid; a blank submit is a skip (null)', async () => {
+    const answered = createSessionStore()
+    openRequest(answered, 'clarify', 'req-typed', { questions: [{ qid: 'q0', question: 'Name?' }] })
+    const sent: PromptReply[] = []
+    const typed = await mountOverlay(answered, reply => {
+      sent.push(reply)
+      return Promise.resolve(ACCEPTED)
+    })
+    try {
+      await typed.keys.typeText('Ada')
+      await typed.settle()
+      typed.keys.pressEnter()
+      await expect.poll(() => sent).toHaveLength(1)
+      expect(sent[0]).toEqual({ kind: 'answer', requestId: 'req-typed', result: { answers: { q0: 'Ada' } } })
+    } finally {
+      typed.destroy()
+    }
+
+    const skipped = createSessionStore()
+    openRequest(skipped, 'clarify', 'req-skip', { questions: [{ qid: 'q0', question: 'Name?' }] })
+    const blank = await mountOverlay(skipped, reply => {
+      sent.push(reply)
+      return Promise.resolve(ACCEPTED)
+    })
+    try {
+      await blank.keys.typeText('   ')
+      await blank.settle()
+      blank.keys.pressEnter()
+      await expect.poll(() => sent).toHaveLength(2)
+      expect(sent[1]).toEqual({ kind: 'answer', requestId: 'req-skip', result: { answers: { q0: null } } })
+      await expect.poll(() => skipped.state.prompt).toBeUndefined()
+    } finally {
+      blank.destroy()
     }
   })
 
@@ -731,7 +767,8 @@ describe('PromptOverlay — batch clarify per-question locks', () => {
     try {
       h.keys.pressEscape()
       await expect.poll(() => sent.length).toBe(1)
-      expect(sent[0]).toEqual({ kind: 'answer', requestId: 'req-batch', result: { answer: '' } })
+      // A ClarifyResult without `answers` is the cancel-all.
+      expect(sent[0]).toEqual({ kind: 'answer', requestId: 'req-batch', result: {} })
       await expect.poll(() => store.state.prompt).toBeUndefined()
       const record = store.state.messages.find(
         message => message.role === 'system' && message.text.startsWith('ask (2 questions)')
