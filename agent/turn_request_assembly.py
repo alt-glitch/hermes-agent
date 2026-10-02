@@ -13,7 +13,10 @@ from dataclasses import dataclass
 import logging
 from typing import Any
 
-from agent.message_sanitization import _sanitize_messages_surrogates
+from agent.message_sanitization import (
+    _sanitize_messages_surrogates,
+    native_anthropic_accounting_projection,
+)
 from agent.usage_anchor import anchored_context_tokens
 from agent.prompt_caching import build_prompt_cache_plan, effective_cache_ttl
 from agent.turn_context import build_api_messages
@@ -143,6 +146,12 @@ def assemble_api_request(
         agent, api_messages, messages, _sel_incoming, logger=request_logger
     )
 
+    # Context selection may replace the request with a fresh clone of canonical history.
+    # Re-apply durable rejection suppression after that final replacement hook.
+    from agent.anthropic_thinking_replay import apply_rejected_thinking_suppression
+
+    apply_rejected_thinking_suppression(agent, api_messages)
+
     # Runs unconditionally (not gated on context_compressor) so orphaned tool
     # results from session loading or manual message edits are always caught.
     api_messages = agent._sanitize_api_messages(api_messages)
@@ -235,7 +244,15 @@ def assemble_api_request(
     from agent.turn_context import _agent_stale_thinking_on_wire
 
     if _agent_stale_thinking_on_wire(agent):
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        _estimate_messages = api_messages
+        if getattr(agent, "api_mode", "") == "anthropic_messages":
+            from agent.anthropic_thinking_policy import native_anthropic_preserves_prior_thinking
+
+            if native_anthropic_preserves_prior_thinking(
+                getattr(agent, "base_url", ""), getattr(agent, "model", "")
+            ):
+                _estimate_messages = native_anthropic_accounting_projection(api_messages)
+        approx_tokens = estimate_messages_tokens_rough(_estimate_messages)
     else:
         approx_tokens = estimate_messages_tokens_rough(api_messages, charge_stale_thinking=False)
     # Route-aware: native Responses compaction prunes the wire payload, so the raw
