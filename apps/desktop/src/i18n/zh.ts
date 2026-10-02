@@ -1212,7 +1212,7 @@ export const zh = defineLocale({
       fileReadMaxChars: 'Hermes 单次文件读取可读取的最大字符数。',
       approvals: {
         mode: 'Hermes 如何处理需要显式审批的命令。',
-        timeout: '消息平台上的审批提示在超时前等待的时长。应用和终端会一直等到你回复。'
+        timeout: '审批提示在超时前等待的时长。'
       },
       security: {
         redactSecrets: '尽可能从模型可见内容中隐藏检测到的密钥。'
@@ -3442,6 +3442,7 @@ export const zh = defineLocale({
       reveal: '在文件夹中显示',
       copyPath: '复制路径',
       removeFromSidebar: '从侧边栏移除',
+      createdInPreviousContext: '项目已在之前的连接或配置文件中创建。请切换回去；IDEA.md 尚未写入。',
       createFailed: '无法创建项目',
       staleBackend: '请更新 Hermes 后端以创建项目——当前后端比桌面应用旧（设置 → 更新 → 后端）。',
       deleteConfirm: '这会从 Hermes 中移除已保存的项目。文件、git 仓库和工作树保持不变。',
@@ -3675,7 +3676,7 @@ export const zh = defineLocale({
       '/init': '扫描仓库并生成或更新 AGENTS.md 项目指引',
       '/suggestions': '查看建议的自动化项目（接受或跳过）',
       '/blueprint': '使用 blueprint 模板设置自动化',
-      '/browser': '管理浏览器 CDP 连接 [connect|disconnect|status]（仅限本地 gateway）',
+      '/browser': '管理智能体浏览器 [connect|disconnect|status|use]',
       '/palette': '打开模糊搜索命令面板（也可使用 Ctrl+P）',
       '/usage': '显示 Token 用量与速率限制；`reset` 可兑换保留的 Codex 限额重置',
       '/subscription': '查看你的 Nous 方案，并在浏览器中更改',
@@ -4588,6 +4589,7 @@ export const zh = defineLocale({
     editing: '编辑中',
     unsavedChanges: '未保存的更改',
     saveFailed: message => `无法保存：${message}`,
+    saveScopeChanged: '请切换回原来的连接和配置文件以保存此草稿。',
     diskChangedTitle: '文件已在磁盘上更改',
     diskChangedBody: '此文件自打开以来已更改。用你的版本覆盖，还是放弃你的编辑并重新加载？',
     overwrite: '覆盖',

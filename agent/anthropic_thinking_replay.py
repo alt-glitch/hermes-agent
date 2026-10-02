@@ -1,140 +1,141 @@
-"""Durable suppression of Anthropic thinking blocks rejected by signature validation.
+"""Durable request-local suppression for Anthropic thinking rejected by signature validation.
 
-A signature failure is request-specific evidence about opaque replay blocks, not a reason
-to erase canonical reasoning history. Store only hashes of rejected signatures in the
-session model config, filter every replay carrier on retry, and reapply the suppression
-when a later request (or resumed process) rebuilds the wire copy.
+Canonical history stays untouched. We persist only fingerprints of rejected opaque
+signature/data values, then filter those blocks from each rebuilt request copy. This is
+needed beyond the immediate retry because context selection and process resume can rebuild
+from canonical history later. The state belongs to one session (and is carried onto its
+compression continuation); it applies only where Anthropic signs the blocks.
+
+The fingerprinting is deliberately coarse: one signature 400 marks every signed block in the
+rejected request, so the session falls back to stripping that history (one cache miss, then
+stable) while blocks produced later still replay. The 400's ``messages.N.content.M`` path indexes
+the converted wire, but recovery only sees the pre-conversion ``api_messages``; system extraction,
+tool-result folding and same-role merges shift both indexes, so targeting one block from that path
+could suppress a valid block and resend the bad one.
+
+Recovery covers every native model, including last-turn-only ones: their latest turn still carries
+signed blocks in ordered carriers, which the old ``reasoning_details``-only repair left in place.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-from typing import Any, Iterable
+from typing import Any
 
 
 logger = logging.getLogger(__name__)
 
 _MODEL_CONFIG_KEY = "_anthropic_rejected_thinking"
 _THINKING_TYPES = frozenset({"thinking", "redacted_thinking"})
-
-
-def _opaque_value(block: Any) -> Any:
-    if not isinstance(block, dict):
-        return None
-    if block.get("type") == "thinking":
-        return block.get("signature")
-    if block.get("type") == "redacted_thinking":
-        return block.get("data")
-    return None
+_CARRIERS = ("reasoning_details", "anthropic_content_blocks", "_anthropic_content_blocks")
 
 
 def _fingerprint(block: Any) -> str | None:
-    value = _opaque_value(block)
+    if not isinstance(block, dict) or block.get("type") not in _THINKING_TYPES:
+        return None
+    kind = block["type"]
+    value = block.get("signature" if kind == "thinking" else "data")
     if value in (None, "", b""):
         return None
-    try:
-        payload = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
-    except (TypeError, ValueError):
-        payload = repr(value)
-    kind = str(block.get("type") if isinstance(block, dict) else "")
+    payload = value if isinstance(value, str) else repr(value)
     return hashlib.sha256(f"{kind}\0{payload}".encode("utf-8", "replace")).hexdigest()
 
 
-def _carrier_lists(message: Any) -> Iterable[list]:
-    if not isinstance(message, dict):
-        return
-    for key in ("reasoning_details", "anthropic_content_blocks", "_anthropic_content_blocks"):
-        value = message.get(key)
-        if isinstance(value, list):
-            yield value
+def tracks_rejected_thinking(agent: Any) -> bool:
+    """Native Anthropic signatures only: Kimi, DeepSeek and third-party routes keep their own replay
+    contract and the one-request ``reasoning_details`` repair."""
+    from agent.anthropic_thinking_policy import anthropic_thinking_route
+
+    return getattr(agent, "api_mode", None) == "anthropic_messages" and anthropic_thinking_route(
+        getattr(agent, "base_url", None), getattr(agent, "model", None)
+    ) == "native"
 
 
-def _collect_fingerprints(messages: Any) -> set[str]:
-    found: set[str] = set()
-    if not isinstance(messages, list):
-        return found
-    for message in messages:
-        for blocks in _carrier_lists(message):
-            for block in blocks:
-                if isinstance(block, dict) and block.get("type") in _THINKING_TYPES:
-                    if fp := _fingerprint(block):
-                        found.add(fp)
-    return found
+def rejected_thinking_fingerprints(session_db: Any, session_id: Any) -> set[str]:
+    """The persisted rejection fingerprints of ``session_id``."""
+    getter = getattr(session_db, "get_session_model_config_value", None)
+    if not session_id or not callable(getter):
+        return set()
+    try:
+        raw = getter(session_id, _MODEL_CONFIG_KEY, [])
+    except Exception:
+        logger.debug("Anthropic thinking suppression restore failed", exc_info=True)
+        return set()
+    return {value for value in raw if isinstance(value, str) and value} if isinstance(raw, list) else set()
 
 
-def _decode_state(raw: Any) -> tuple[set[str], bool]:
-    if isinstance(raw, list):
-        return ({v for v in raw if isinstance(v, str) and v}, False)
-    if not isinstance(raw, dict):
-        return set(), False
-    values = raw.get("fingerprints")
-    fingerprints = {
-        value for value in (values if isinstance(values, list) else [])
-        if isinstance(value, str) and value
-    }
-    return fingerprints, bool(raw.get("strip_all"))
+def session_rejected_thinking(holder: Any, session_db: Any, session_id: Any) -> set[str]:
+    """``holder``'s in-memory fingerprints for ``session_id``, else the persisted ones. The in-memory
+    set is authoritative: it outlives a failed or disabled persist."""
+    cached = getattr(holder, "_anthropic_rejected_thinking", None)
+    if isinstance(cached, tuple) and cached[0] == session_id:
+        return cached[1]
+    return rejected_thinking_fingerprints(session_db, session_id)
 
 
-def _load_state(agent: Any) -> tuple[set[str], bool]:
-    if getattr(agent, "_anthropic_rejected_thinking_loaded", False):
-        return (
-            set(getattr(agent, "_anthropic_rejected_thinking_fingerprints", set()) or set()),
-            bool(getattr(agent, "_anthropic_rejected_thinking_strip_all", False)),
-        )
+def _bind(agent: Any, session_id: Any, rejected: set[str]) -> None:
+    # The compressor's tail walk must price the same replay as the agent's preflight, so it shares
+    # the agent's set object (later in-place updates reach both).
+    agent._anthropic_rejected_thinking = (session_id, rejected)
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        compressor._anthropic_rejected_thinking = agent._anthropic_rejected_thinking
 
-    fingerprints: set[str] = set()
-    strip_all = False
-    getter = getattr(getattr(agent, "_session_db", None), "get_session_model_config_value", None)
+
+def _rejected(agent: Any) -> set[str]:
+    # Keyed by session: /new, /resume, /branch and compression rotate ``session_id`` on a live agent.
     session_id = getattr(agent, "session_id", None)
-    if session_id and callable(getter):
-        try:
-            fingerprints, strip_all = _decode_state(getter(session_id, _MODEL_CONFIG_KEY, None))
-        except Exception:
-            logger.debug("Anthropic thinking suppression restore failed", exc_info=True)
+    rejected = session_rejected_thinking(agent, getattr(agent, "_session_db", None), session_id)
+    _bind(agent, session_id, rejected)
+    return rejected
 
-    agent._anthropic_rejected_thinking_fingerprints = fingerprints
-    agent._anthropic_rejected_thinking_strip_all = strip_all
-    agent._anthropic_rejected_thinking_loaded = True
-    return fingerprints, strip_all
-def _persist_state(agent: Any, fingerprints: set[str], strip_all: bool) -> None:
+
+def _persist(agent: Any, rejected: set[str]) -> None:
     if getattr(agent, "_persist_disabled", False):
         return
     patcher = getattr(getattr(agent, "_session_db", None), "patch_session_model_config", None)
     session_id = getattr(agent, "session_id", None)
     if not session_id or not callable(patcher):
         return
-    value = {
-        "fingerprints": sorted(fingerprints),
-        "strip_all": bool(strip_all),
-    }
     try:
-        patcher(session_id, {_MODEL_CONFIG_KEY: value})
+        patcher(session_id, {_MODEL_CONFIG_KEY: sorted(rejected)})
     except Exception:
         logger.debug("Anthropic thinking suppression persist failed", exc_info=True)
 
 
-def _should_remove(block: Any, fingerprints: set[str], strip_all: bool) -> bool:
-    if not isinstance(block, dict) or block.get("type") not in _THINKING_TYPES:
-        return False
-    if strip_all:
-        return True
-    fp = _fingerprint(block)
-    return fp is not None and fp in fingerprints
+def _mirrored_readable_thinking(message: dict) -> str | None:
+    from agent.anthropic_message_convert import assistant_replay_carrier
+
+    _, carrier = assistant_replay_carrier(message)
+    readable = [
+        block["thinking"]
+        for block in carrier
+        if block.get("type") == "thinking" and isinstance(block.get("thinking"), str) and block["thinking"]
+    ]
+    return "\n\n".join(readable) if readable else None
 
 
-def _filter_message(message: Any, fingerprints: set[str], strip_all: bool) -> int:
+def strip_rejected_thinking(message: Any, rejected: set[str] | None) -> int:
+    """Drop rejected thinking blocks (every thinking block when ``rejected`` is None) from one request
+    copy. Rebinds carrier keys on ``message`` only; the nested canonical lists are never mutated."""
     if not isinstance(message, dict):
         return 0
+
+    mirror = _mirrored_readable_thinking(message) if message.get("role") == "assistant" else None
     removed = 0
-    for key in ("reasoning_details", "anthropic_content_blocks", "_anthropic_content_blocks"):
+    for key in _CARRIERS:
         blocks = message.get(key)
         if not isinstance(blocks, list):
             continue
         kept = []
         for block in blocks:
-            if _should_remove(block, fingerprints, strip_all):
+            fingerprint = _fingerprint(block)
+            if (
+                isinstance(block, dict)
+                and block.get("type") in _THINKING_TYPES
+                and (rejected is None or (fingerprint is not None and fingerprint in rejected))
+            ):
                 removed += 1
             else:
                 kept.append(block)
@@ -142,41 +143,64 @@ def _filter_message(message: Any, fingerprints: set[str], strip_all: bool) -> in
             message[key] = kept
         else:
             message.pop(key, None)
+
+    # Once a signed carrier is rejected, do not let its canonical readable mirror
+    # re-enter native conversion as unsigned reasoning after context replacement.
+    if removed and mirror is not None:
+        for key in ("reasoning", "reasoning_content"):
+            if message.get(key) == mirror:
+                message.pop(key, None)
     return removed
 
 
 def apply_rejected_thinking_suppression(agent: Any, messages: Any) -> int:
-    """Filter previously rejected thinking from a freshly built request copy."""
-    if getattr(agent, "api_mode", None) != "anthropic_messages" or not isinstance(messages, list):
+    """Filter rejected thinking from a request copy rebuilt from canonical history."""
+    if not isinstance(messages, list) or not tracks_rejected_thinking(agent):
         return 0
-    fingerprints, strip_all = _load_state(agent)
-    if not fingerprints and not strip_all:
+    rejected = _rejected(agent)
+    if not rejected:
         return 0
-    return sum(_filter_message(message, fingerprints, strip_all) for message in messages)
+    return sum(strip_rejected_thinking(message, rejected) for message in messages)
 
 
 def remember_rejected_thinking(agent: Any, api_messages: Any) -> int:
-    """Remember signed blocks from a rejected request and remove them from every carrier.
-
-    The provider error generally does not identify which signed block failed, so all signed
-    thinking blocks in that rejected request become suppressed suspects. New blocks produced
-    later have different signatures and continue to replay normally.
-    """
+    """Fingerprint the rejected request and repair its retry copy without mutating history."""
     if not isinstance(api_messages, list):
         return 0
 
-    current = _collect_fingerprints(api_messages)
-    fingerprints, strip_all = _load_state(agent)
-    if current:
-        fingerprints.update(current)
+    current = {
+        fingerprint
+        for message in api_messages
+        if isinstance(message, dict)
+        for key in _CARRIERS
+        for block in (message.get(key) if isinstance(message.get(key), list) else ())
+        if (fingerprint := _fingerprint(block)) is not None
+    }
+    # The provider-visible history changed while the canonical content fingerprint did
+    # not, so a previous prompt-token anchor is no longer valid for this request shape.
+    from agent.usage_anchor import set_usage_anchor
+
+    set_usage_anchor(agent, None)
+    if not current:
+        # Nothing to fingerprint: repair this retry copy only. A persisted strip-all would also
+        # drop every valid signature the session produces later.
+        return sum(strip_rejected_thinking(message, None) for message in api_messages)
+    rejected = _rejected(agent)
+    rejected.update(current)
+    _persist(agent, rejected)
+    return sum(strip_rejected_thinking(message, rejected) for message in api_messages)
+
+
+def carry_rejected_thinking_to_session(agent: Any, old_session_id: str) -> None:
+    """Compression publishes the child with the session's initial model_config while its retained
+    tail still holds the rejected canonical rows; carry the fingerprints onto ``agent.session_id``."""
+    cached = getattr(agent, "_anthropic_rejected_thinking", None)
+    if isinstance(cached, tuple) and cached[0] == old_session_id:
+        rejected = set(cached[1])
     else:
-        # Defensive fallback: a signature-classified error without an inspectable signature
-        # must still change the retry request instead of burning the one-shot on identical bytes.
-        strip_all = True
-
-    agent._anthropic_rejected_thinking_fingerprints = fingerprints
-    agent._anthropic_rejected_thinking_strip_all = strip_all
-    agent._anthropic_rejected_thinking_loaded = True
-    _persist_state(agent, fingerprints, strip_all)
-
-    return sum(_filter_message(message, fingerprints, strip_all) for message in api_messages)
+        rejected = rejected_thinking_fingerprints(getattr(agent, "_session_db", None), old_session_id)
+    if not rejected:
+        return
+    rejected |= _rejected(agent)
+    _bind(agent, getattr(agent, "session_id", None), rejected)
+    _persist(agent, rejected)

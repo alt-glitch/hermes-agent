@@ -72,9 +72,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS-only tests
+          # Two slices on the free standard runner (3 cores, 3 workers): one lane ran
+          # ~7.5 min and became the slowest required job once the Linux suite split.
+          - name: macOS-only tests (1/2)
             runner: macos-latest
             marker: macos
+            slice: 1/2
+          - name: macOS-only tests (2/2)
+            runner: macos-latest
+            marker: macos
+            slice: 2/2
           - name: Windows-only tests
             runner: ${{ github.repository_owner == 'NousResearch' && 'windows-latest-32-core' || 'windows-latest' }}
             marker: windows
@@ -180,6 +187,7 @@ jobs:
           # where 8 workers time out the PowerShell hand-off tests and the arm64
           # row passed with 2; keep 2 there. NousResearch takes upstream's value.
           HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (github.repository_owner != 'NousResearch' && '2' || (runner.arch == 'ARM64' && '16' || '16')) || '' }}
+          HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
