@@ -184,8 +184,18 @@ def _admit_prompt_turn(
             _refuse_prompt_turn_locked(sid, session, "session closed before turn start", client_submission_ids)
         return None
 
-    # Every fresh turn source crosses this ownership admission chokepoint.
-    if (ownership_refusal := _ensure_active_session_slot(sid, session)) is not None:
+    # Every fresh turn source crosses this ownership admission chokepoint. A closing session claims
+    # no lease (the claim can block on durable registry I/O while close finalizes underneath it).
+    held_lease = session.get("active_session_lease")
+
+    def _release_lease_claimed_while_closing() -> None:
+        # Close stops waiting for this thread after a grace and then finalizes. A lease this
+        # admission claimed after that finalize has no other code path that releases it; one
+        # the session already held stays for close's own handoff (_settle_isolated_turn_before_close).
+        if session.get("_closing") and session.get("active_session_lease") is not held_lease:
+            _release_active_session_slot(session)
+
+    if not session.get("_closing") and (ownership_refusal := _ensure_active_session_slot(sid, session)) is not None:
         logger.info(
             "Refusing turn for session %s at _run_prompt_submit: %s",
             session.get("session_key") or sid,
@@ -211,6 +221,7 @@ def _admit_prompt_turn(
         ):
             with session["history_lock"]:
                 _refuse_prompt_turn_locked(sid, session, "session replaced before turn start", client_submission_ids)
+                _release_lease_claimed_while_closing()
             return None
         agent = session.get("agent")
         if agent is None:
@@ -228,6 +239,7 @@ def _admit_prompt_turn(
                     sid, session, reason,
                     error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
                     client_submission_ids=client_submission_ids, history_lock_owned=True)
+                _release_lease_claimed_while_closing()
             return None
         with session["history_lock"]:
             if (
@@ -236,10 +248,12 @@ def _admit_prompt_turn(
             ):
                 session["_turn_cancel_requested"] = False
                 _refuse_prompt_turn_locked(sid, session, "turn cancelled before it started", client_submission_ids)
+                _release_lease_claimed_while_closing()
                 return None
             if (queued_prompt_generation is not None
                     and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation):
                 _refuse_prompt_turn_locked(sid, session, "queued turn cancelled before it started", client_submission_ids)
+                _release_lease_claimed_while_closing()
                 return None
             session["_steer_admission_closed"] = False
             images = list(session.get("attached_images", []) if image_paths is None else image_paths)
@@ -646,24 +660,30 @@ def _adopt_out_of_band_turns(session: dict) -> None:
     this turn's own user row, which ``_persist_submit_user_row`` already wrote (#111868). When a foreign
     row is a compaction summary the other surface rewrote the transcript under us, so the in-memory history
     is stale from the root and is re-hydrated from the DB the way ``session.resume`` does. Nothing stamped
-    yet (seeded branch before its first turn) means nothing to adopt; a cold resume arrives stamped."""
+    yet (seeded branch before its first turn) means nothing to adopt; a cold resume arrives stamped — but a
+    record whose list was rebuilt from provider-format messages carries no stamp at all, so the row-id
+    boundary cannot key on anything and the store-ahead fallback takes over (#81951)."""
     with session["history_lock"]:
         history, version = list(session.get("history") or ()), int(session.get("history_version", 0))
     seen = max((rid for m in history if isinstance(m, dict) and (rid := _message_row_id(m)) is not None),
                default=None)
-    if seen is None:
-        return
     ceiling = _message_row_id(session.get("_submit_user_row") or {})
 
     def _below_ceiling(rid) -> bool:
         return isinstance(rid, int) and (ceiling is None or rid < ceiling)
+    if seen is None:
+        _adopt_store_tail_without_row_ids(session, history, version, _below_ceiling)
+        return
 
     def _foreign(rid) -> bool:
         return _below_ceiling(rid) and rid > seen
     # Keyset probe first: the common turn has nothing to adopt and must not pay a full transcript decode.
+    # Address the live session, not session_key: a rotation moves the tip mid-session, so the parent
+    # holds none of the foreign rows (Telegram reply, cron) this function exists to adopt and the model
+    # silently never sees them (#123545).
     with _session_db(session) as db:
         try:
-            newer = db.get_messages(session["session_key"], after_id=seen) if db is not None else []
+            newer = db.get_messages(_submit_row_target_key(session), after_id=seen) if db is not None else []
         except Exception:
             logger.debug("out-of-band history probe failed; turn runs on the in-memory history", exc_info=True)
             return
@@ -680,6 +700,55 @@ def _adopt_out_of_band_turns(session: dict) -> None:
         if int(session.get("history_version", 0)) != version:
             return  # /compress, a rewind or a pivot marker landed meanwhile; the next turn re-derives
         session["history"] = tail if rewritten else history + tail
+        session["history_version"] = version + 1
+
+
+def _adopt_store_tail_without_row_ids(session: dict, history: list, version: int, below_ceiling) -> None:
+    """Catch a live record up with the store when its in-memory messages carry NO durable ``_row_id``.
+
+    ``_adopt_out_of_band_turns`` keys off the highest ``_row_id`` in memory; a record whose list was
+    rebuilt from provider-format messages (the unstamped shape ``_resolve_truncate_row_id`` heals for
+    rewind — #82959) carries none. A writer in ANOTHER process (the messaging gateway appending to the
+    same session while the desktop's serve record holds it) was then silently dropped and the next
+    provider request truncated to the early snapshot while the UI showed the full transcript (#81951).
+
+    With no row ids there is no boundary to key on, so adoption is gated on proof instead: the durable
+    lineage (below this turn's own user row, which ``_persist_submit_user_row`` already wrote and the turn
+    appends itself) must be STRICTLY longer and its head must equal the in-memory view entry for entry.
+    A diverged view (prefix mismatch, e.g. a rewind that has not landed locally), a store that is not
+    ahead (an unflushed local tail is the fresher record) and an empty in-memory history (no head to
+    prove against) are left alone.
+
+    A compaction by another surface is the one rewrite that is NOT an append: the store then holds a
+    ``_compressed_summary`` row the in-memory view has never seen, so the view is stale from the root and
+    is re-hydrated from the DB like the stamped path does — a positional check alone would keep it because
+    the compacted store is shorter.
+    """
+    rows = [m for m in _load_durable_truncation_history(session, repair_alternation=True) or []
+            if below_ceiling(_message_row_id(m))]
+    if not history:
+        return
+    known = {m.get("content") for m in history if isinstance(m, dict) and m.get("_compressed_summary")}
+    if any(m.get("_compressed_summary") and m.get("content") not in known for m in rows):
+        tail = canonicalize_replay_history(rows)
+        with session["history_lock"]:
+            if tail and int(session.get("history_version", 0)) == version:
+                session["history"] = tail
+                session["history_version"] = version + 1
+        return
+    if len(rows) <= len(history):
+        return
+    if not all(isinstance(mem, dict) and mem.get("role") == stored.get("role")
+               and mem.get("content") == stored.get("content")
+               for mem, stored in zip(history, rows)):
+        return
+    tail = canonicalize_replay_history(rows[len(history):])
+    if not tail:
+        return
+    with session["history_lock"]:
+        if int(session.get("history_version", 0)) != version:
+            return  # a local rewrite landed meanwhile; the next turn re-derives
+        session["history"] = history + tail
         session["history_version"] = version + 1
 
 

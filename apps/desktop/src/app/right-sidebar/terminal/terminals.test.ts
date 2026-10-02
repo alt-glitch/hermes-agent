@@ -269,4 +269,107 @@ describe('shared WebGL atlas refresh fan-out', () => {
     expect(caller.refresh).not.toHaveBeenCalled()
     expect(sibling.refresh).toHaveBeenCalledTimes(1)
   })
+
+  it('clears all atlases before refreshing any terminal (two-phase ordering)', async () => {
+    const { redrawAllTerminals, registerWebglRefresh } = await loadTerminalStore()
+
+    // Track operation order across terminals sharing one atlas.
+    const ops: string[] = []
+    const sharedAtlas = { clearTextureAtlas: () => ops.push('clear') }
+    const getWebgl = () => sharedAtlas as never
+
+    const termA = {
+      refresh: () => ops.push('refresh-A'),
+      rows: 24
+    }
+
+    const termB = {
+      refresh: () => ops.push('refresh-B'),
+      rows: 24
+    }
+
+    registerWebglRefresh(termA as never, getWebgl)
+    registerWebglRefresh(termB as never, getWebgl)
+
+    redrawAllTerminals()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => resolve())
+    })
+
+    // Both clears must precede both refreshes. If a clear ran after a refresh,
+    // that terminal's rebuilt model would reference freed atlas rows.
+    const clearIndices = ops.map((op, i) => (op === 'clear' ? i : -1)).filter(i => i >= 0)
+    const refreshIndices = ops.map((op, i) => (op.startsWith('refresh-') ? i : -1)).filter(i => i >= 0)
+
+    expect(clearIndices).toHaveLength(2)
+    expect(refreshIndices).toHaveLength(2)
+    expect(Math.max(...clearIndices)).toBeLessThan(Math.min(...refreshIndices))
+  })
+
+  it('keeps refreshing siblings when one terminal atlas clear throws', async () => {
+    const { redrawAllTerminals, registerWebglRefresh } = await loadTerminalStore()
+
+    const broken = { refresh: vi.fn(), rows: 24 }
+    const healthy = { refresh: vi.fn(), rows: 24 }
+    const getWebgl = () => ({ clearTextureAtlas: vi.fn() }) as never
+
+    const getDeadWebgl = () =>
+      ({
+        clearTextureAtlas: () => {
+          throw new Error('webgl context lost')
+        }
+      }) as never
+
+    registerWebglRefresh(broken as never, getDeadWebgl)
+    registerWebglRefresh(healthy as never, getWebgl)
+
+    // A post-context-loss clear must not abort the fan-out: the sibling still
+    // needs its rebuild, and the thrower still needs its own repaint.
+    redrawAllTerminals()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => resolve())
+    })
+
+    expect(broken.refresh).toHaveBeenCalledTimes(1)
+    expect(healthy.refresh).toHaveBeenCalledTimes(1)
+  })
+
+  it('rebuilds every registered terminal after a system resume', async () => {
+    let powerResumed: (() => void) | undefined
+
+    // The store subscribes to the main process's powerMonitor broadcast at
+    // import time (same pattern as store/power.ts), so the mock must exist
+    // before the module loads.
+    window.hermesDesktop = {
+      onPowerResume: vi.fn((callback: () => void) => {
+        powerResumed = callback
+
+        return () => {}
+      })
+    } as never
+
+    try {
+      await loadTerminalStore()
+
+      const termA = { refresh: vi.fn(), rows: 24 }
+      const termB = { refresh: vi.fn(), rows: 24 }
+      const getWebgl = () => ({ clearTextureAtlas: vi.fn() }) as never
+      const { registerWebglRefresh } = await import('./terminals')
+
+      registerWebglRefresh(termA as never, getWebgl)
+      registerWebglRefresh(termB as never, getWebgl)
+
+      // macOS can evict the glyph textures on wake WITHOUT firing
+      // webglcontextlost; the resume broadcast must trigger a full rebuild.
+      powerResumed!()
+      await new Promise<void>(resolve => {
+        requestAnimationFrame(() => resolve())
+      })
+
+      expect(termA.refresh).toHaveBeenCalledTimes(1)
+      expect(termB.refresh).toHaveBeenCalledTimes(1)
+    } finally {
+      Reflect.deleteProperty(window, 'hermesDesktop')
+    }
+  })
 })

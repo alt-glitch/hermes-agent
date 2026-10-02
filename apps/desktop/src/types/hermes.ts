@@ -59,6 +59,8 @@ export interface AudioSttLeaseResponse {
   leases: null | number
   /** Warm-up outcome: `loaded` | `cached` | `noop` | `error`. Release carries no action. */
   action?: string
+  /** Whether the configured engine was actually warmed (`noop` for cloud providers carries false). */
+  warmed?: boolean
   provider?: string
   error?: string
 }
@@ -500,6 +502,7 @@ export interface HermesConfig {
     auto_tts?: boolean
     stop_phrases?: unknown
     thinking_sound?: unknown
+    barge_in?: unknown
     barge_in_threshold_multiplier?: unknown
     silence_duration?: unknown
   }

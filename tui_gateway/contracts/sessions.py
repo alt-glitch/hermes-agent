@@ -233,6 +233,7 @@ class SessionListRow(Result):
     preview: str = ""
     started_at: float = 0
     message_count: int = 0
+    live_message_count: int | None = None
     source: str = ""
     cwd: str | None = None
     last_active: float = 0
