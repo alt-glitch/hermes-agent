@@ -52,11 +52,14 @@ def test_post_turn_completion_is_admitted_or_requeued(monkeypatch, tmp_path, ref
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
 
     server._run_post_turn_followups("turn", sid, session, {}, None)
-    if refusal != "previous_stop":
-        assert not accepted
-        assert session["running"] is False
-        assert process_registry.completion_queue.qsize() == 1
-        server._run_post_turn_followups("retry", sid, session, {}, None)
+    assert not accepted
+    assert session["running"] is False
+    assert process_registry.completion_queue.qsize() == 1
+    if refusal == "previous_stop":
+        # Upstream Stop latch: a completion is held until the next user prompt
+        # clears _turn_cancel_requested (methods_prompt.py), never dropped.
+        session["_turn_cancel_requested"] = False
+    server._run_post_turn_followups("retry", sid, session, {}, None)
 
     assert len(accepted) == 1
     assert "synthetic result" in accepted[0][0]

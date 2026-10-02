@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from agent.i18n import t
 from gateway.platforms.base import SendResult
 
 try:
@@ -26,7 +27,12 @@ _MODEL_PICKER_CANCEL_ACTION = "hermes_model_cancel"
 # Rendered when a live-looking picker message can no longer resolve (gateway
 # restart, aged-out state entry, or a value the stored state no longer
 # covers): the message is rewritten to this so the control visibly dies.
-_MODEL_PICKER_EXPIRED_NOTICE = "⏳ This model picker expired — please run /model again."
+
+
+def _model_picker_expired_notice() -> str:
+    return t("platform.shared.model_picker_expired")
+
+
 _MODEL_PICKER_ACTION_IDS = (
     _MODEL_PICKER_PROVIDER_ACTION,
     _MODEL_PICKER_MODEL_ACTION,
@@ -66,16 +72,14 @@ class SlackModelPicker:
                 "value": str(idx),
             })
         extra = (
-            f"\n*{len(providers) - 100} more available — type `/model <name>` directly*"
+            t("platform.slack.picker.more_available", count=str(len(providers) - 100))
             if len(providers) > 100
             else ""
         )
-        section_text = (
-            f"*⚙ Model Configuration*\n"
-            f"Current model: `{current_model or 'unknown'}`\n"
-            f"Provider: {provider_label}\n\n"
-            f"Select a provider:{extra}"
-        )
+        section_text = t(
+            "platform.slack.picker.provider_header",
+            model=current_model or t("platform.shared.unknown"),
+            provider=provider_label, extra=extra)
         return [
             {"type": "section", "text": {"type": "mrkdwn", "text": section_text[:3000]}},
             {
@@ -83,13 +87,13 @@ class SlackModelPicker:
                 "elements": [
                     {
                         "type": "static_select",
-                        "placeholder": {"type": "plain_text", "text": "Choose a provider…", "emoji": True},
+                        "placeholder": {"type": "plain_text", "text": t("platform.slack.picker.choose_provider")[:150], "emoji": True},
                         "action_id": _MODEL_PICKER_PROVIDER_ACTION,
                         "options": options,
                     },
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                        "text": {"type": "plain_text", "text": t("platform.slack.picker.cancel")[:75], "emoji": True},
                         "style": "danger",
                         "action_id": _MODEL_PICKER_CANCEL_ACTION,
                         "value": "cancel",
@@ -119,15 +123,15 @@ class SlackModelPicker:
             })
         total = (provider or {}).get("total_models", len(models))
         extra = (
-            f"\n*{total - len(models)} more available — type `/model <name>` directly*"
+            t("platform.slack.picker.more_available", count=str(total - len(models)))
             if total > len(models)
             else ""
         )
-        section_text = f"*⚙ Model Configuration*\n\nProvider: *{pname}*\nSelect a model:{extra}"
+        section_text = t("platform.slack.picker.model_header", provider=pname, extra=extra)
         elements = [
             {
                 "type": "static_select",
-                "placeholder": {"type": "plain_text", "text": f"Choose a model from {pname}…"[:150], "emoji": True},
+                "placeholder": {"type": "plain_text", "text": t("platform.slack.picker.choose_model", provider=pname)[:150], "emoji": True},
                 "action_id": _MODEL_PICKER_MODEL_ACTION,
                 "options": options,
             },
@@ -135,13 +139,13 @@ class SlackModelPicker:
         if provider_slug:
             elements.append({
                 "type": "button",
-                "text": {"type": "plain_text", "text": "◀ Back", "emoji": True},
+                "text": {"type": "plain_text", "text": t("platform.slack.picker.back")[:75], "emoji": True},
                 "action_id": _MODEL_PICKER_BACK_ACTION,
                 "value": provider_slug,
             })
         elements.append({
             "type": "button",
-            "text": {"type": "plain_text", "text": "Cancel", "emoji": True},
+            "text": {"type": "plain_text", "text": t("platform.slack.picker.cancel")[:75], "emoji": True},
             "style": "danger",
             "action_id": _MODEL_PICKER_CANCEL_ACTION,
             "value": "cancel",
@@ -192,7 +196,7 @@ class SlackModelPicker:
 
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
-                "text": "⚙ Model Configuration — select a provider",
+                "text": t("platform.slack.picker.fallback_provider"),
                 "blocks": sanitize_blocks(blocks),
             }
             if thread_ts:
@@ -293,7 +297,7 @@ class SlackModelPicker:
             # control visibly instead of silently swallowing clicks
             # (mirrors the clarify handler's expiry notice).
             await self._update_picker_message(
-                channel_id, team_id, msg_ts, _MODEL_PICKER_EXPIRED_NOTICE
+                channel_id, team_id, msg_ts, _model_picker_expired_notice()
             )
             return
 
@@ -304,7 +308,7 @@ class SlackModelPicker:
         if action_id == _MODEL_PICKER_CANCEL_ACTION:
             self.state.pop(marker, None)
             await self._update_picker_message(
-                channel_id, team_id, msg_ts, "❌ Model selection cancelled."
+                channel_id, team_id, msg_ts, t("platform.slack.picker.cancelled")
             )
             return
 
@@ -326,14 +330,14 @@ class SlackModelPicker:
                 logger.warning("[Slack] Invalid provider picker index token: %r", idx_token)
                 self.state.pop(marker, None)
                 await self._update_picker_message(
-                    channel_id, team_id, msg_ts, _MODEL_PICKER_EXPIRED_NOTICE
+                    channel_id, team_id, msg_ts, _model_picker_expired_notice()
                 )
                 return
             provider_slug = provider.get("slug", "")
             if not provider.get("models"):
                 await self._update_picker_message(
                     channel_id, team_id, msg_ts,
-                    f"No models available for `{provider_slug}`.",
+                    t("platform.slack.picker.no_models_for_provider", provider=provider_slug),
                 )
                 self.state.pop(marker, None)
                 return
@@ -345,7 +349,7 @@ class SlackModelPicker:
                 await self._adapter._get_client(channel_id, team_id=team_id or None).chat_update(
                     channel=channel_id,
                     ts=msg_ts,
-                    text=f"⚙ Model Configuration — {provider.get('name', provider_slug)}",
+                    text=t("platform.slack.picker.fallback_model", provider=provider.get('name', provider_slug)),
                     blocks=sanitize_blocks(blocks),
                 )
             except Exception as e:
@@ -370,7 +374,7 @@ class SlackModelPicker:
                 await self._adapter._get_client(channel_id, team_id=team_id or None).chat_update(
                     channel=channel_id,
                     ts=msg_ts,
-                    text="⚙ Model Configuration — select a provider",
+                    text=t("platform.slack.picker.fallback_provider"),
                     blocks=sanitize_blocks(blocks),
                 )
             except Exception as e:
@@ -395,21 +399,21 @@ class SlackModelPicker:
                 logger.warning("[Slack] Invalid model picker index token: %r", idx_token)
                 self.state.pop(marker, None)
                 await self._update_picker_message(
-                    channel_id, team_id, msg_ts, _MODEL_PICKER_EXPIRED_NOTICE
+                    channel_id, team_id, msg_ts, _model_picker_expired_notice()
                 )
                 return
 
             if not on_model_selected:
                 self.state.pop(marker, None)
                 await self._update_picker_message(
-                    channel_id, team_id, msg_ts, _MODEL_PICKER_EXPIRED_NOTICE
+                    channel_id, team_id, msg_ts, _model_picker_expired_notice()
                 )
                 return
 
             # Pop the state up-front (double-click guard, mirrors approval).
             self.state.pop(marker, None)
             await self._update_picker_message(
-                channel_id, team_id, msg_ts, f"⚙ Switching to `{model_id}`…"
+                channel_id, team_id, msg_ts, t("platform.slack.picker.switching", model=model_id)
             )
 
             switch_failed = False
@@ -422,19 +426,18 @@ class SlackModelPicker:
                 # Compare against the same i18n prefix so both failure
                 # shapes get the failed header.
                 try:
-                    from agent.i18n import t as _t
-
-                    _error_prefix = _t("gateway.model.error_prefix", error="").strip()
+                    _error_prefix = t("gateway.model.error_prefix", error="").strip()
                 except Exception:
                     _error_prefix = "Error:"
                 if _error_prefix and str(confirmation).startswith(_error_prefix):
                     switch_failed = True
             except Exception as exc:
                 logger.error("[Slack] Model picker callback failed: %s", exc, exc_info=True)
-                confirmation = f"❌ Model switch failed: {exc}"
+                confirmation = t("platform.slack.picker.switch_failed", error=str(exc))
                 switch_failed = True
 
-            header = "⚙ Model Switch Failed" if switch_failed else "⚙ Model Switched"
+            header = t("platform.slack.picker.switch_failed_header" if switch_failed
+                       else "platform.slack.picker.switched_header")
             await self._update_picker_message(
                 channel_id, team_id, msg_ts, f"{header}\n\n{confirmation}"
             )

@@ -34,6 +34,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from agent.compression_marker import ELISION_MARKER_MAX_LEN, elide
+from agent.i18n import t
 from agent.retry_utils import parse_retry_after_seconds
 from agent.secret_scope import get_secret
 from gateway.config import Platform, PlatformConfig
@@ -43,7 +44,6 @@ from gateway.platforms._shared import (
     platform_gate_env as _scoped_gate_env, send_error
 )
 from gateway.platforms.helpers import MessageDeduplicator
-from gateway.platforms.base_exec_approval import EA_HEADER_TEXT
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt,
     SendResult, SUPPORTED_DOCUMENT_TYPES, SUPPORTED_VIDEO_TYPES, _TEXT_INJECT_EXTENSIONS,
@@ -1479,8 +1479,7 @@ class SlackAdapter(BasePlatformAdapter):
             dropped = len(chunks) - 5
             chunks = chunks[:5]
             chunks[-1] = (
-                chunks[-1].rstrip() + f"\n\n_[Reply truncated: {dropped} more part(s) exceeded "
-                "Slack's ephemeral reply limit.]_")
+                chunks[-1].rstrip() + t("platform.slack.slash.reply_truncated", count=str(dropped)))
         try:
             async with aiohttp.ClientSession(trust_env=gateway_trust_env()) as session:
                 for idx, chunk in enumerate(chunks):
@@ -1653,7 +1652,7 @@ class SlackAdapter(BasePlatformAdapter):
         @self._app.command(_slash_pattern)
         async def handle_hermes_command(ack, command):
             slash = (command.get("command") or "").lstrip("/")
-            await ack(response_type="ephemeral", text=f"Running `/{slash}`…")
+            await ack(response_type="ephemeral", text=t("platform.slack.slash.running", command=slash))
             await self._handle_slash_command(command)
 
         # Approval buttons, slash-confirm buttons (tools/slash_confirm.py), feedback.
@@ -1865,7 +1864,8 @@ class SlackAdapter(BasePlatformAdapter):
             client = self._get_client(parent_chat_id)
             if client is None:
                 return None
-            seed_text = f":thread: Hermes handoff — *{(name or 'session').strip()[:80]}*"
+            seed_text = t("platform.slack.handoff.seed",
+                          name=(name or t("platform.shared.handoff.default_name")).strip()[:80])
             result = await client.chat_postMessage(channel=parent_chat_id, text=seed_text)
             ts = _slack_response_payload(result).get("ts")
             return str(ts) if ts else None
@@ -2048,10 +2048,11 @@ class SlackAdapter(BasePlatformAdapter):
         return self._native_task_card_key(chat_id, reply_to, metadata) is not None
 
     async def send_native_task_card_progress(
-        self, chat_id: str, tasks: List[Dict[str, str]], *, title: str = "Hermes is working",
+        self, chat_id: str, tasks: List[Dict[str, str]], *, title: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
         fallback_text: Optional[str] = None) -> SendResult:
         """Start or update a Slack-native plan/task progress stream."""
+        title = title or t("platform.slack.task_card.title")
         if not self._app:
             return SendResult(success=False, error="Not connected")
         if not tasks:
@@ -2748,9 +2749,10 @@ class SlackAdapter(BasePlatformAdapter):
         as stuck (live-status phrases and ``typing_status_text`` always win over this)."""
         elapsed = int(time.monotonic() - started) if started is not None else 0
         if elapsed < 30:
-            return "is thinking..."
+            return t("platform.slack.status.thinking")
         mins, secs = divmod(elapsed, 60)
-        return f"still working… ({f'{mins}m{secs:02d}s' if mins else f'{secs}s'})"
+        return t("platform.slack.status.still_working",
+                 elapsed=f"{mins}m{secs:02d}s" if mins else f"{secs}s")
 
     async def stop_typing(self, chat_id: str, metadata=None) -> None:
         """Clear the assistant thread status indicator."""
@@ -3089,12 +3091,12 @@ class SlackAdapter(BasePlatformAdapter):
                     "type": "feedback_buttons",
                     "action_id": "hermes_feedback",
                     "positive_button": {
-                        "text": {"type": "plain_text", "text": "Good Response"},
-                        "accessibility_label": ("Submit positive feedback on this response"),
+                        "text": {"type": "plain_text", "text": t("platform.slack.feedback.good")[:75]},
+                        "accessibility_label": t("platform.slack.feedback.good_a11y")[:75],
                         "value": "positive"},
                     "negative_button": {
-                        "text": {"type": "plain_text", "text": "Bad Response"},
-                        "accessibility_label": ("Submit negative feedback on this response"),
+                        "text": {"type": "plain_text", "text": t("platform.slack.feedback.bad")[:75]},
+                        "accessibility_label": t("platform.slack.feedback.bad_a11y")[:75],
                         "value": "negative"}}]}
 
     def _append_feedback_block(self, blocks: Optional[list]) -> Optional[list]:
@@ -3426,7 +3428,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "[%s] Failed to send local Slack image %s: %s", self.name, image_path, e, exc_info=True
             )
             return await self._send_failure_notice(
-                chat_id, caption, "⚠️ Couldn't deliver the image attachment.", reply_to, metadata)
+                chat_id, caption, t("platform.shared.media.image_failed"), reply_to, metadata)
 
     async def _send_failure_notice(
         self, chat_id: str, caption: Optional[str], notice: str, reply_to: Optional[str],
@@ -3495,7 +3497,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Send a video file to Slack."""
         return await self._send_local_file(
             chat_id, video_path, caption, reply_to, metadata, "video", os.path.basename(video_path),
-            f"Video file not found: {video_path}", "⚠️ Couldn't deliver the video attachment.")
+            f"Video file not found: {video_path}", t("platform.shared.media.video_failed"))
 
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None,
@@ -3506,7 +3508,7 @@ class SlackAdapter(BasePlatformAdapter):
         display_name = file_name or os.path.basename(file_path)
         return await self._send_local_file(
             chat_id, file_path, caption, reply_to, metadata, "document", display_name,
-            f"File not found: {file_path}", f"⚠️ Couldn't deliver the file attachment ({display_name}).",
+            f"File not found: {file_path}", t("platform.shared.media.file_failed", name=display_name),
         )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -4917,10 +4919,21 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] %s failed: %s", label, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
-    _EA_HEADER = f":warning: *{EA_HEADER_TEXT}*\n"
     _EA_CODE_OPEN = "```"
     _EA_CODE_CLOSE = "```\n"
-    _EA_SMART_DENY_LINE = "\n*Smart DENY:* owner override applies to this one operation only."
+
+    # Resolved per call (not at class-body time) so the active language applies; the budget
+    # below measures ``len()`` of these resolved strings against the 3000-char section cap.
+    @property
+    def _EA_HEADER(self) -> str:  # noqa: N802 — base class attr name
+        return f":warning: *{t('gateway.exec_approval.header')}*\n"
+
+    @property
+    def _EA_SMART_DENY_LINE(self) -> str:  # noqa: N802
+        line = t("gateway.exec_approval.smart_deny_line")
+        label, sep, rest = line.partition(":")
+        return "\n" + (f"*{label}{sep}*{rest}" if sep else line)
+
     _EA_REASON_BUDGET = 500
     _EA_SECTION_CAP = 3000  # a longer section text → invalid_blocks → no buttons at all
     _EA_ACTION_IDS = {"once": "hermes_approve_once", "session": "hermes_approve_session",
@@ -4944,7 +4957,7 @@ class SlackAdapter(BasePlatformAdapter):
             blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": prompt.text}},
                 {"type": "actions", "elements": actions}]
-            return f"⚠️ Command approval required: {prompt.command[:100]}", blocks
+            return t("platform.slack.approval.fallback_text", command=prompt.command[:100]), blocks
 
         return await self._send_interactive_prompt(
             prompt.chat_id, prompt.metadata, _build, "send_exec_approval",
@@ -4958,7 +4971,7 @@ class SlackAdapter(BasePlatformAdapter):
         def _build() -> Tuple[str, list]:
             # Same 3000-char section cap as send_exec_approval: budget the body
             # against the rendered title.
-            _title = (title or "Confirm")[:150]
+            _title = (title or t("platform.slack.confirm.default_title"))[:150]
             budget = 3000 - len(f"*{_title}*\n\n") - len("...")
             body = message[:budget] + "..." if len(message) > budget else message
             # session_key|confirm_id in the button value lets the callback resolve
@@ -4969,10 +4982,13 @@ class SlackAdapter(BasePlatformAdapter):
                 {
                     "type": "actions",
                     "elements": [
-                        self._button("Approve Once", "hermes_confirm_once", value, style="primary"),
-                        self._button("Always Approve", "hermes_confirm_always", value),
-                        self._button("Cancel", "hermes_confirm_cancel", value, style="danger")]}]
-            return f"{title or 'Confirm'}: {body[:100]}", blocks
+                        self._button(t("platform.slack.confirm.approve_once")[:75],
+                                     "hermes_confirm_once", value, style="primary"),
+                        self._button(t("platform.slack.confirm.always_approve")[:75],
+                                     "hermes_confirm_always", value),
+                        self._button(t("platform.slack.confirm.cancel")[:75],
+                                     "hermes_confirm_cancel", value, style="danger")]}]
+            return f"{_title}: {body[:100]}", blocks
 
         return await self._send_interactive_prompt(chat_id, metadata, _build, "send_slash_confirm")
 
@@ -5009,13 +5025,14 @@ class SlackAdapter(BasePlatformAdapter):
             # chunk anyway so larger lists degrade gracefully instead of 400ing.
             elements = []
             for idx, choice in enumerate(choices):
-                label = str(choice).strip() or f"Option {idx + 1}"
+                label = str(choice).strip() or t("platform.slack.clarify.option_n", n=str(idx + 1))
                 elements.append(
                     self._button(
                         label[:75], f"hermes_clarify_choice_{idx}",
                         f"{clarify_id}|{idx}", emoji=True))
             elements.append(
-                self._button("✏️ Other…", "hermes_clarify_other", f"{clarify_id}|other", emoji=True)
+                self._button(t("platform.slack.clarify.other")[:75], "hermes_clarify_other",
+                             f"{clarify_id}|other", emoji=True)
             )
             blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
             for start in range(0, len(elements), 5):
@@ -5141,15 +5158,16 @@ class SlackAdapter(BasePlatformAdapter):
     _APPROVAL_CHOICES: ClassVar[Dict[str, str]] = {
         "hermes_approve_once": "once", "hermes_approve_session": "session",
         "hermes_approve_always": "always", "hermes_deny": "deny"}
-    _APPROVAL_DECISIONS: ClassVar[Dict[str, str]] = {
-        "once": "✅ Approved once by {user}", "session": "✅ Approved for session by {user}",
-        "always": "✅ Approved permanently by {user}", "deny": "❌ Denied by {user}"}
+    # choice → catalog key; resolved through ``t()`` at click time so the active language applies.
+    _APPROVAL_DECISION_KEYS: ClassVar[Dict[str, str]] = {
+        "once": "platform.slack.approval.resolved_once", "session": "platform.slack.approval.resolved_session",
+        "always": "platform.slack.approval.resolved_always", "deny": "platform.slack.approval.resolved_deny"}
     _CONFIRM_CHOICES: ClassVar[Dict[str, str]] = {
         "hermes_confirm_once": "once", "hermes_confirm_always": "always",
         "hermes_confirm_cancel": "cancel"}
-    _CONFIRM_DECISIONS: ClassVar[Dict[str, str]] = {
-        "once": "✅ Approved once by {user}", "always": "🔒 Always approved by {user}",
-        "cancel": "❌ Cancelled by {user}"}
+    _CONFIRM_DECISION_KEYS: ClassVar[Dict[str, str]] = {
+        "once": "platform.slack.approval.resolved_once", "always": "platform.slack.confirm.resolved_always",
+        "cancel": "platform.slack.confirm.resolved_cancel"}
 
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""
@@ -5162,7 +5180,7 @@ class SlackAdapter(BasePlatformAdapter):
             return
         session_key, confirm_id = value.split("|", 1)
         choice = self._CONFIRM_CHOICES.get(action_id, "cancel")
-        decision_text = self._CONFIRM_DECISIONS[choice].format(user=user_name)
+        decision_text = t(self._CONFIRM_DECISION_KEYS[choice], user=user_name)
         await self._finalize_interactive_message(
             channel_id, msg_ts, self._section_text(message), decision_text,
             "Confirmation prompt", "slash-confirm", team_id or None)
@@ -5219,11 +5237,9 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
             count = 0
-        decision_text = self._APPROVAL_DECISIONS[choice].format(user=user_name)
+        decision_text = t(self._APPROVAL_DECISION_KEYS[choice], user=user_name)
         if not count:
-            decision_text = (
-                "⌛ Approval expired — command was not run (already timed out or resolved elsewhere)"
-            )
+            decision_text = t("platform.shared.approval_expired")
         await self._finalize_interactive_message(
             channel_id, msg_ts, self._section_text(message), decision_text,
             "Command approval request", "approval", team_id or None)
@@ -5268,7 +5284,7 @@ class SlackAdapter(BasePlatformAdapter):
         from tools import clarify_gateway as _clarify_mod
         # "Other" → text-capture mode: mark_awaiting_text flips the entry and the
         # gateway's text-intercept resolves it from the user's next message.
-        expired_text = f"⏳ This prompt expired — please send a new request. (by {user_name})"
+        expired_text = t("platform.slack.clarify.expired", user=user_name)
         if action_id == "hermes_clarify_other" or token == "other":
             if not _clarify_mod.mark_awaiting_text(clarify_id):
                 # Entry evicted/gateway restarted — a typed answer would go nowhere.
@@ -5278,7 +5294,7 @@ class SlackAdapter(BasePlatformAdapter):
             # Not terminal: the clarify stays pending for typed text, so keep the card entry —
             # the gateway still has to retire it on timeout / reset / typed answer.
             await self._update_clarify_message(
-                channel_id, msg_ts, original_text, f"✏️ Awaiting typed answer from {user_name}…")
+                channel_id, msg_ts, original_text, t("platform.slack.clarify.awaiting", user=user_name))
             return
         try:
             idx = int(token)
@@ -5295,11 +5311,14 @@ class SlackAdapter(BasePlatformAdapter):
                 resolved_text = str(entry.choices[idx])
         except Exception:
             resolved_text = None
+        display_text = resolved_text
         if resolved_text is None:
-            resolved_text = f"choice {idx + 1}"
+            resolved_text = f"choice {idx + 1}"  # model-facing fallback; stays English
+            display_text = t("platform.slack.clarify.choice_n", n=str(idx + 1))
         if _clarify_mod.resolve_gateway_clarify(clarify_id, resolved_text):
             await self._update_clarify_message(
-                channel_id, msg_ts, original_text, f"✅ {user_name}: {resolved_text}")
+                channel_id, msg_ts, original_text,
+                t("platform.slack.clarify.resolved", user=user_name, choice=display_text))
             # Privacy: choice text may carry user context — INFO gets metadata only.
             logger.info(
                 "Slack button resolved clarify (id=%s, choice_index=%d, user=%s)", clarify_id, idx,
