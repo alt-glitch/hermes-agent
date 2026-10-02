@@ -38,8 +38,12 @@ tool_describe(names)           load the full schemas for one or more tools
 tool_call(calls)               invoke deferred tools; `calls` is an array of {name, arguments}
 ```
 
-`calls` takes one entry per invocation and may mix local deferred tools with
-`connectors__` names. A single call is an array of one.
+`calls` takes one entry per invocation; a single call is an array of one.
+Independent calls may be batched (up to 10 entries). The agent splits a
+batch containing local tools into one tool call per entry, so each entry
+gets its own scope check, schema validation, hooks, approval and result,
+and runs under that tool's normal concurrency policy. A batch of only
+`connectors__` names goes to the hosted connector gateway as one dispatch.
 
 A typical interaction looks like:
 

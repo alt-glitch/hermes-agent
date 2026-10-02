@@ -2781,6 +2781,8 @@ export const ru = defineLocale({
       reveal: 'Показать в папке',
       copyPath: 'Копировать путь',
       removeFromSidebar: 'Скрыть из боковой панели',
+      createdInPreviousContext:
+        'Проект создан в прежнем подключении или профиле. Вернитесь к нему; файл IDEA.md не был записан.',
       createFailed: 'Не удалось создать проект',
       staleBackend:
         'Обновите бэкенд Hermes, чтобы создавать проекты — ваш бэкенд старше этого desktop-приложения (Настройки → Обновления → Бэкенд).',
@@ -3008,7 +3010,7 @@ export const ru = defineLocale({
       '/init': 'Просканировать репозиторий и создать или обновить инструкции AGENTS.md',
       '/suggestions': 'Просмотреть, принять или отклонить предложенные автоматизации',
       '/blueprint': 'Настроить автоматизацию по шаблону',
-      '/browser': 'Управлять CDP-подключением браузера [connect|disconnect|status] (только локальный шлюз)',
+      '/browser': 'Управлять браузером агента [connect|disconnect|status|use]',
       '/palette': 'Открыть палитру команд',
       '/usage': 'Показать расход токенов и лимиты; reset использует накопленный сброс лимита Codex',
       '/subscription': 'Показать план Nous и изменить его в браузере',
@@ -3809,6 +3811,8 @@ export const ru = defineLocale({
   },
   preview: {
     tab: 'Предпросмотр',
+    pin: 'Закрепить в рабочем пространстве',
+    unpin: 'Открепить от рабочего пространства',
     closePane: 'Закрыть панель предпросмотра',
     loading: 'Загрузка предпросмотра',
     unavailable: 'Предпросмотр недоступен',
@@ -3834,6 +3838,7 @@ export const ru = defineLocale({
     editing: 'Изменение',
     unsavedChanges: 'Несохранённые изменения',
     saveFailed: message => `Не удалось сохранить: ${message}`,
+    saveScopeChanged: 'Чтобы сохранить этот черновик, вернитесь к исходному подключению и профилю.',
     diskChangedTitle: 'Файл изменился на диске',
     diskChangedBody:
       'Этот файл изменился с момента открытия. Перезаписать его вашей версией или сбросить правки и перезагрузить?',
@@ -4064,6 +4069,8 @@ export const ru = defineLocale({
       skipped: 'Пропущено',
       noAnswer: 'Нет ответа',
       confirmAndContinueLabel: 'Подтвердить и продолжить',
+      singleSelectHint: 'Выберите один',
+      multiSelectHint: 'Выберите все подходящие',
       questionProgress: (answered, total) => `Ответ дан на ${answered} из ${total}`,
       notDelivered:
         'Этот вопрос не дошёл до приложения, поэтому ответить здесь нельзя. Нажмите «Стоп», чтобы завершить ход, и ответьте в чате.'

@@ -30,6 +30,7 @@ import hermes_yaml as yaml
         ("job-cancelled", False, False),
         ("job-skipped", False, False),
         ("rerun-error", False, True),
+        ("head-moved", True, False),
     ],
 )
 def test_label_recovery_targets_only_the_review_gate(
@@ -48,6 +49,20 @@ bad_args() {
   printf 'unexpected arguments: %s\n' "$*" >&2
   exit 90
 }
+
+# The head-moved guard resolves the PR's current head before any rerun.
+if [[ "$1" == pr ]]; then
+  [[ "$2" == view && "$#" -eq 9 && "$3" == "$PR" && "$4" == --repo && \
+    "$5" == "$REPO" && "$6" == --json && "$7" == headRefOid && \
+    "$8" == --jq && "$9" == .headRefOid \
+  ]] || bad_args "$@"
+  if [[ "$SCENARIO" == head-moved ]]; then
+    printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+  else
+    printf '%s\n' "$HEAD_SHA"
+  fi
+  exit 0
+fi
 
 [[ "$1" == run ]] || bad_args "$@"
 case "$2" in
@@ -145,6 +160,7 @@ exec "$@"
             "CALLS": str(calls),
             "REPO": "example/fork",
             "HEAD_SHA": "a" * 40,
+            "PR": "42",
         },
         text=True,
         capture_output=True,
@@ -164,6 +180,8 @@ exec "$@"
 
     if scenario == "pending":
         assert "recovery pending" in result.stdout
+    if scenario == "head-moved":
+        assert "not rerunning superseded run" in result.stdout
     if scenario == "failed-producer-label-success":
         assert "Review label gate already succeeded" in result.stdout
         assert "CI conclusion: failure" in result.stdout

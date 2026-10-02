@@ -3673,6 +3673,8 @@ export const en: Translations = {
       reveal: 'Reveal in folder',
       copyPath: 'Copy path',
       removeFromSidebar: 'Hide from sidebar',
+      createdInPreviousContext:
+        "Project created on the previous connection or profile. Switch back to find it; IDEA.md wasn't written.",
       createFailed: 'Could not create project',
       staleBackend:
         'Update the Hermes backend to create projects — your backend is older than this desktop app (Settings → Updates → Backend).',
@@ -3909,7 +3911,7 @@ export const en: Translations = {
       '/init': 'Generate or update AGENTS.md project instructions from a repo scan',
       '/suggestions': 'Review suggested automations (accept/dismiss)',
       '/blueprint': 'Set up an automation from a blueprint template',
-      '/browser': 'Manage browser CDP connection [connect|disconnect|status] (local gateway only)',
+      '/browser': 'Manage the agent browser [connect|disconnect|status|use]',
       '/palette': 'Open the fuzzy command palette (also Ctrl+P)',
       '/usage': 'Show token usage and rate limits; `reset` redeems a banked Codex limit reset',
       '/subscription': 'View your Nous plan and change it in the browser',
@@ -3958,6 +3960,11 @@ export const en: Translations = {
     queueDroppedTitle: 'Queued prompt dropped',
     queueDroppedBody:
       'This background queue entry was dropped because its session could not be resumed after repeated attempts. Nothing else in the queue was affected.',
+    terminalSelectionMissingTitle: 'Terminal selection unavailable',
+    terminalSelectionMissingBody:
+      'Re-select the terminal lines (Ctrl/Cmd+L) before sending — this chip has no original text.',
+    queuedTerminalSelectionExpiredBody:
+      'This queued terminal selection is no longer available. Re-select the lines (Ctrl/Cmd+L) and queue the message again.',
     previewUnavailable: 'Preview unavailable',
     previewLabel: label => `Preview ${label}`,
     couldNotPreview: label => `Could not preview ${label}`,
@@ -4173,6 +4180,7 @@ export const en: Translations = {
       scopeUncommitted: 'Uncommitted',
       scopeBranch: 'Branch',
       scopeLastTurn: 'Last turn',
+      readOnlyScope: 'Read-only view — stage, revert, and commit apply to Uncommitted',
       commit: 'Commit',
       commitAndPush: 'Commit & Push',
       commitPlaceholder: shortcut => `Message (${shortcut} to commit)`,
@@ -4854,10 +4862,15 @@ export const en: Translations = {
 
   preview: {
     tab: 'Preview',
+    pin: 'Pin to workspace',
+    unpin: 'Unpin from workspace',
     closePane: 'Close preview pane',
     loading: 'Loading preview',
     unavailable: 'Preview unavailable',
     missingTarget: 'That path does not exist on this computer',
+    missingTitle: 'File no longer exists',
+    missingBody: label =>
+      `${label} was deleted, moved, or its temporary location was cleared. This tab will not be restored on the next launch.`,
     opening: 'Opening...',
     hide: 'Hide',
     openPreview: 'Open preview',
@@ -4883,6 +4896,7 @@ export const en: Translations = {
     editing: 'Editing',
     unsavedChanges: 'Unsaved changes',
     saveFailed: message => `Couldn't save: ${message}`,
+    saveScopeChanged: 'Switch back to the original connection and profile to save this draft.',
     diskChangedTitle: 'File changed on disk',
     diskChangedBody:
       'This file changed since you opened it. Overwrite it with your version, or discard your edits and reload?',
@@ -5076,6 +5090,7 @@ export const en: Translations = {
       branchNewChat: 'Branch in new chat',
       react: 'React',
       dismissError: 'Dismiss error',
+      responseStopped: 'Response stopped',
       errorLayers: {
         auth: 'Sign-in problem',
         billing: 'Out of credits',
@@ -5327,6 +5342,8 @@ export const en: Translations = {
       skipped: 'Skipped',
       noAnswer: 'No answer',
       confirmAndContinueLabel: 'Confirm and continue',
+      singleSelectHint: 'Pick one',
+      multiSelectHint: 'Select all that apply',
       questionProgress: (answered, total) => `${answered} of ${total} answered`,
       notDelivered:
         "This question didn't reach the app, so it can't be answered here. Press Stop to end the turn, then reply in chat."
@@ -5528,6 +5545,9 @@ export const en: Translations = {
       'This window was behind another view of the same chat. Latest messages were loaded. Send again if you still want to.',
     providerCredentialRequired: 'Add a provider credential before sending your first message.',
     emptySlashCommand: 'empty slash command',
+    slashCommandIgnoredTitle: 'Command not sent',
+    slashCommandIgnoredBody:
+      'Slash commands cannot be combined with attachments. Remove the attachment or send the command separately.',
     desktopCommands: 'Desktop commands',
     skillCommandsAvailable: count => `${count} skill commands available.`,
     warningLine: message => `warning: ${message}`,
@@ -5592,6 +5612,9 @@ export const en: Translations = {
     openImage: 'Open image',
     downloadImage: 'Download image',
     savingImage: 'Saving image',
+    zoomIn: 'Zoom in',
+    zoomOut: 'Zoom out',
+    resetZoom: 'Reset zoom',
     imagePreviewFailed: 'Image preview failed',
     imageAttach: 'Image attach',
     imageWriteFailed: 'Failed to write image to disk.',

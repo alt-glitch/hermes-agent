@@ -2580,7 +2580,7 @@ websocket triggers) cannot starve the messaging gateway that shares this cap.
 
 When the cap is reached, Hermes returns a direct limit message naming which
 surfaces hold the slots. Existing active sessions keep their normal behavior.
-Run `hermes status` to see the current slot usage and every holder.
+Run `hermes status --full` to see the current slot usage and every holder.
 
 This is the only cap on concurrent gateway turns: the gateway runs each turn body
 on its own thread, so with the default (unset) every accepted turn starts
@@ -2986,7 +2986,7 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 
 ## Clarify
 
-Configure how long Hermes waits for a response to a clarifying question. One value covers every surface — the classic CLI modal, the TUI/Desktop card, and the messaging gateway. The canonical key is `agent.clarify_timeout` (default `3600` seconds; `0` or less = unlimited). An explicitly configured legacy `clarify.timeout` takes precedence; otherwise Hermes uses `agent.clarify_timeout`:
+Configure how long Hermes waits for a response to a clarifying question. One value covers every surface — the classic CLI modal, the TUI/Desktop card, and the messaging gateway. The canonical key is `agent.clarify_timeout` (default `3600` seconds; `0` or less = unlimited); a legacy top-level `clarify.timeout` is still honored if explicitly set:
 
 ```yaml
 agent:
