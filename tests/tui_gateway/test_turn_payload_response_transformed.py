@@ -26,7 +26,7 @@ def test_complete_turn_payload_forwards_response_transformed_only_when_set(monke
                "agent": SimpleNamespace(_session_title_hint="Scratch")}
 
     transformed = {"final_response": "example-service.internal", "response_transformed": True}
-    payload, _, _ = srv._complete_turn_payload("sid", session, _turn(transformed), None, 80)
+    payload, _, _ = srv._complete_turn_payload(session, _turn(transformed), None, 80, sid="sid")
     assert payload["text"] == "example-service.internal"
     assert payload.get("response_transformed") is True
     # The real emit path validates against the wire contract (extra="forbid"); under
@@ -34,5 +34,5 @@ def test_complete_turn_payload_forwards_response_transformed_only_when_set(monke
     frame = srv._event_frame("message.complete", "sid", payload)
     assert frame["params"]["payload"]["response_transformed"] is True
 
-    payload, _, _ = srv._complete_turn_payload("sid", session, _turn({"final_response": "TOKEN_1"}), None, 80)
+    payload, _, _ = srv._complete_turn_payload(session, _turn({"final_response": "TOKEN_1"}), None, 80, sid="sid")
     assert "response_transformed" not in payload

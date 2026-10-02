@@ -126,7 +126,7 @@ def test_completion_receipt_covers_only_committed_current_turn_rows(monkeypatch,
         st = _TurnRun(agent, None, None, False, history=old, compression_count=0,
                       result={"messages": messages, "final_response": "same"})
         agent._flush_messages_to_session_db(messages, old)
-        payload, _, _ = server._complete_turn_payload(sid, session, st, None, 80)
+        payload, _, _ = server._complete_turn_payload(session, st, None, 80, sid=sid)
         rows = db.get_messages_as_conversation(key, include_row_ids=True)
         assert payload.get("persisted_turn") == {
             "user_row_id": rows[-2]["_row_id"],
@@ -136,22 +136,22 @@ def test_completion_receipt_covers_only_committed_current_turn_rows(monkeypatch,
         }
         # Compression can discard an already-streamed segment even while the old prefix survives.
         agent.context_compressor = SimpleNamespace(compression_count=1)
-        compressed, _, _ = server._complete_turn_payload(sid, session, st, None, 80)
+        compressed, _, _ = server._complete_turn_payload(session, st, None, 80, sid=sid)
         assert compressed["persisted_turn"]["complete"] is False
         # The row address alone does not assert that a subsequently mutated body was committed.
         current[-1].pop("_db_persisted")
         current[-1]["content"] = "not flushed"
-        partial, _, _ = server._complete_turn_payload(sid, session, st, None, 80)
+        partial, _, _ = server._complete_turn_payload(session, st, None, 80, sid=sid)
         assert partial["persisted_turn"] == {
             "user_row_id": rows[-2]["_row_id"], "row_ids": [rows[-2]["_row_id"]], "complete": False}
         # No authoritative current-turn anchor: never infer from matching text or positions in old history.
         agent._persist_user_message_idx = None
-        missing, _, _ = server._complete_turn_payload(sid, session, st, None, 80)
+        missing, _, _ = server._complete_turn_payload(session, st, None, 80, sid=sid)
         assert "persisted_turn" not in missing
         # A preflight failure may return only old history while the agent still carries its old cursor.
         agent._persist_user_message_idx = 0
         st.result["messages"] = old
-        stale, _, _ = server._complete_turn_payload(sid, session, st, None, 80)
+        stale, _, _ = server._complete_turn_payload(session, st, None, 80, sid=sid)
         assert "persisted_turn" not in stale
     finally:
         server._sessions.pop(sid, None)

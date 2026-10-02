@@ -788,7 +788,13 @@ def test_busy_prompt_rpc_reuses_the_admission_lock_without_deadlock(monkeypatch)
     worker = threading.Thread(target=submit, daemon=True)
     try:
         worker.start()
-        worker.join(timeout=1)
+        # Deadlock guard only: a history_lock re-entry never returns, so a
+        # generous bound costs nothing on the passing path. The steer path runs
+        # the real compression-in-flight check, which opens (and on a fresh
+        # sandbox, schema-inits) state.db; under the parallel gate's I/O load
+        # that exceeded 1s, failed here, and the still-running worker's MCP
+        # turn admission then 4009'd the next test.
+        worker.join(timeout=10)
         assert not worker.is_alive(), "prompt.submit reacquired its history lock"
         assert response["result"]["status"] == "steered"
         assert session["_pending_steer_submission_ids"] == ["send-lock"]

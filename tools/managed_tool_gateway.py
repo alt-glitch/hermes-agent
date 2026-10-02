@@ -203,10 +203,10 @@ def is_managed_tool_gateway_ready(
     return resolve_managed_tool_gateway(vendor, gateway_builder=gateway_builder, token_reader=token_reader or peek_nous_access_token) is not None
 
 
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# ---- BEGIN PLUGIN-COMPAT ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
+# Kept on the fork past upstream's #126164 removal; pinned by tests/tools/test_managed_tool_gateway.py.
+# Internal code must not use these: connector origins/auth live in tools/managed_gateway_auth.py.
 
 def is_managed_nous_gateway_url(
     url: object,

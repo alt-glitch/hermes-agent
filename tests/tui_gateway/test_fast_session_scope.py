@@ -197,8 +197,14 @@ class TestConfigSetFastSessionScope:
         }
         result = {}
 
+        # _emit_session_info builds a full session.info (MCP status, live tool
+        # discovery) before _emit; that real work is not under test and blew
+        # the join bound on a loaded gate box, so stub it with the emitter.
+        # The waits are deadlock guards only: a real lock re-entry never
+        # finishes, so generous bounds cost nothing on the passing path.
         with patch.dict(server._sessions, {"s-race": session}, clear=False), \
                 patch.object(server, "_persist_live_session_runtime"), \
+                patch.object(server, "_emit_session_info"), \
                 patch.object(server, "_emit"):
             backing_lock.acquire()
             thread = threading.Thread(
@@ -216,13 +222,13 @@ class TestConfigSetFastSessionScope:
             )
             thread.start()
             try:
-                assert attempted.wait(timeout=1)
+                assert attempted.wait(timeout=10)
                 # Simulate deferred publication after config.set's initial
                 # agent snapshot but before it acquires the runtime lock.
                 session["agent"] = built_agent
             finally:
                 backing_lock.release()
-            thread.join(timeout=2)
+            thread.join(timeout=10)
 
         assert not thread.is_alive()
         assert result["response"]["result"]["value"] == "normal"

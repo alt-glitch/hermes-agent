@@ -1062,7 +1062,7 @@ def _persisted_turn_receipt(st: _TurnRun, raw: Any, status: str) -> dict | None:
 
 
 def _complete_turn_payload(
-    sid: str, session: dict, st: _TurnRun, status_note: str | None, cols: int
+    session: dict, st: _TurnRun, status_note: str | None, cols: int, sid: str | None = None
 ):
     """``(payload, raw, status)`` for message.complete; retains/clears the inflight turn and
     settles the hosted-room terminal receipt."""
@@ -1089,11 +1089,14 @@ def _complete_turn_payload(
     if status_note:
         payload["warning"] = status_note
     result_fields = result if isinstance(result, dict) else {}
-    if result_fields.get("response_previewed"):
+    # A runtime that delivers its final message as an interim (the Codex app-server bridge routes every
+    # completed agentMessage there) never sets response_previewed; the client would render it twice (#125951).
+    was_delivered = getattr(agent, "_interim_text_was_delivered", None)
+    if result_fields.get("response_previewed") or (callable(was_delivered) and was_delivered(raw) is True):
         payload["response_previewed"] = True
     # transform_llm_output may rewrite the final after streaming: the renderer must treat
     # this payload as the authoritative replacement even without a prefix relationship.
-    if result.get("response_transformed"):
+    if result_fields.get("response_transformed"):
         payload["response_transformed"] = True
     # Structured billing-wall descriptor: the client renders recovery without re-parsing text.
     if _billing_block := result_fields.get("billing_block"):
@@ -1122,6 +1125,7 @@ def _complete_turn_payload(
         else:
             _clear_inflight_turn(session)
     if leftover_steer_retained:
+        sid = sid or session.get("session_key", "")
         _emit("error", sid, {"message": (
             "accepted steer retained in the agent because the next-turn queue "
             "is at its 4 MiB safety limit")})
@@ -1377,7 +1381,7 @@ def _run_prompt_submit(
                 sid, session, st, text, display_kind, display_metadata)
             _report_history_commit(history_commit_callback, history_outcome)
             history_commit_reported = True
-            payload, raw, status = _complete_turn_payload(sid, session, st, status_note, cols)
+            payload, raw, status = _complete_turn_payload(session, st, status_note, cols, sid=sid)
             _emit("message.complete", sid, payload)
             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
             _settle_loop_claim(sid, session, raw, status, loop_claim_id)

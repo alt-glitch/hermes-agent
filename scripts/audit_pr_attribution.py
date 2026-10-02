@@ -66,7 +66,12 @@ def is_mapped(email: str) -> bool:
         return True
     if ID_NOREPLY_RE.search(email):
         return True
-    if (REPO_ROOT / "contributors" / "emails" / email).is_file():
+    # Fold case like the CI gate (contributor-check.yml greps -ixF): emails
+    # differing only in case are one file on macOS/Windows, and
+    # add_contributor.py refuses case variants.
+    emails_dir = REPO_ROOT / "contributors" / "emails"
+    folded = email.casefold()
+    if emails_dir.is_dir() and any(entry.name.casefold() == folded for entry in emails_dir.iterdir()):
         return True
     authors_py = REPO_ROOT / "scripts" / "releases" / "authors_legacy.py"
     try:

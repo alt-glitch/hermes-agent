@@ -15,45 +15,54 @@ from .method_ctx import bind_module
 # Child-session live mirror: a delegated child's activity reaches the gateway only as
 # relayed ``subagent.*`` events on the PARENT sid; translate them into native stream
 # events on the CHILD sid (write_json routes by sid) so its own window is not silent.
-_child_mirrors: dict[str, dict] = {}
+# Both dicts are keyed on (profile_home, child key): stored ids are timestamps that exist in
+# several profiles' stores, and a child runs under its PARENT's profile — a bare-key hit let
+# profile B's lazy resume bind to A's in-flight run and receive its mirror (#120212).
+_child_mirrors: dict[tuple[str | None, str], dict] = {}
 _child_mirrors_lock = threading.Lock()
 # Child sids with a run in flight (refreshed per relayed event, popped on complete) so a
 # lazy watch resume reports running=true during a silent long tool.
-_active_child_runs: dict[str, float] = {}
+_active_child_runs: dict[tuple[str | None, str], float] = {}
 # Anything quiet this long lost its completion event — don't pin "running".
 _CHILD_RUN_STALE_S = 3600.0
 _CHILD_DELTA_EVENTS = {"subagent.thinking": "thinking.delta", "subagent.reasoning": "reasoning.delta", "subagent.text": "message.delta",
                        "subagent.start": "message.delta"}
 
 
-def _child_run_active(child_key: str) -> bool:
-    ts = _active_child_runs.get(child_key)
+def _child_run_active(child_key: str, profile_home) -> bool:
+    """``profile_home`` is the caller's resolved home (Path / str / None = launch profile), never omitted."""
+    ts = _active_child_runs.get((str(profile_home) if profile_home else None, child_key))
     return ts is not None and (time.time() - ts) < _CHILD_RUN_STALE_S
 
 
-def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
+def _mirror_subagent_to_child(event_type: str, payload: dict, profile_home) -> None:
     child_key = str(payload.get("child_session_id") or "")
     if not child_key:
         return
     owner = str(payload.get("subagent_id") or "")
+    key = (str(profile_home) if profile_home else None, child_key)
     with _child_mirrors_lock:
-        current = _child_mirrors.get(child_key)
+        current = _child_mirrors.get(key)
         if current is not None and owner and current.get("owner") not in (None, owner):
             return
         # Completion closes this owner's mirror before any late callback can
         # recreate it. A fresh owner may still start a later run for the same key.
+        # Liveness registry first: accurate with no window open (one opened mid-run knows busy).
         if event_type == "subagent.complete":
-            _active_child_runs.pop(child_key, None)
+            _active_child_runs.pop(key, None)
         else:
-            _active_child_runs[child_key] = time.time()
-        live = _find_live_session_by_key(child_key)
+            _active_child_runs[key] = time.time()
+        # Mirror only into a live watch session of the OWNING profile that is NOT upgraded to a full
+        # agent (an upgraded one owns a real native stream). Either way drop state so a reopened
+        # window starts fresh.
+        live = _find_live_session_by_key(child_key, key[0])
         if live is None or live[1].get("agent") is not None:
-            _child_mirrors.pop(child_key, None)
+            _child_mirrors.pop(key, None)
             return
         csid = live[0]
         text = str(payload.get("text") or "")
         st = _child_mirrors.setdefault(
-            child_key,
+            key,
             {"seq": 0, "open_tool": None, "started": False, "owner": owner or None},
         )
         if owner and st.get("owner") is None:
@@ -73,7 +82,7 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
         if st["open_tool"]:
             open_tool = st["open_tool"]
             st["open_tool"] = None
-            if _process_tool_chrome_enabled(csid) or _tool_lifecycle_required_for_ui(str(open_tool.get("name") or "")):
+            if _tool_progress_enabled(csid) or _tool_lifecycle_required_for_ui(str(open_tool.get("name") or "")):
                 # Fork: the completion frame carries only the tool identity + args, not the start preview.
                 _emit("tool.complete", csid, {
                     "tool_id": open_tool["tool_id"], "name": open_tool["name"], "args": open_tool.get("args") or {}})
@@ -84,14 +93,14 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
                     "tool_id": f"submirror:{child_key}:{st['seq']}", "args": {}}
             if preview := str(payload.get("tool_preview") or payload.get("text") or ""):
                 tool["preview"] = preview
-            if not _process_tool_chrome_enabled(csid) and not _tool_lifecycle_required_for_ui(tool_name):
+            if not _tool_progress_enabled(csid) and not _tool_lifecycle_required_for_ui(tool_name):
                 return
             st["open_tool"] = tool
             _emit("tool.start", csid, tool)
         else:
             summary = str(payload.get("summary") or payload.get("text") or "")
             _emit("message.complete", csid, {"text": summary})
-            _child_mirrors.pop(child_key, None)
+            _child_mirrors.pop(key, None)
 
 
 def _agent_presentation_enabled(sid: str, *, diagnostic: bool) -> bool:
@@ -155,7 +164,7 @@ def _agent_cbs(sid: str) -> dict:
             sid, tc_id, name, args, result),
         "tool_progress_callback": lambda event_type, name=None, preview=None, args=None, **kwargs: _on_tool_progress(
             sid, event_type, name, preview, args, **kwargs),
-        "tool_gen_callback": lambda name: _process_tool_chrome_enabled(sid) and _emit("tool.generating", sid, {"name": name}),
+        "tool_gen_callback": lambda name: _tool_progress_enabled(sid) and _emit("tool.generating", sid, {"name": name}),
         "thinking_callback": lambda text: _agent_thinking_update(sid, text),
         # Affection reaction (ily / <3 / good bot) → hearts; core-detected so TUI/desktop share it.
         "reaction_callback": lambda kind: _emit("reaction", sid, {"kind": kind}),
