@@ -372,9 +372,13 @@ def test_startup_catalog_recovers_when_agent_settles_at_timeout_boundary(monkeyp
     assert result["tools"]["total"] == 1
 
 
-def test_session_create_retry_is_best_effort_not_idempotent(monkeypatch):
+def test_session_create_retry_with_idempotency_key_dedupes(monkeypatch):
+    """A retried ``session.create`` with the SAME idempotency_key returns the SAME
+    session (upstream's create-side ``_idempotency_keys`` registry): a retry after
+    a lost response must not mint a duplicate."""
     previous_sessions = dict(server._sessions)
     server._sessions.clear()
+    server._idempotency_keys.clear()
     monkeypatch.setattr(
         server,
         "_claim_active_session_slot",
@@ -391,10 +395,12 @@ def test_session_create_retry_is_best_effort_not_idempotent(monkeypatch):
         created = list(server._sessions.values())
         server._sessions.clear()
         server._sessions.update(previous_sessions)
+        server._idempotency_keys.clear()
         for session in created:
             server._teardown_session(session)
 
-    assert first["result"]["session_id"] != retry["result"]["session_id"]
+    assert first["result"]["session_id"] == retry["result"]["session_id"]
+    assert first["result"]["stored_session_id"] == retry["result"]["stored_session_id"]
 
 
 @pytest.fixture(autouse=True)
