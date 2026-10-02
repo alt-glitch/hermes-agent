@@ -630,10 +630,12 @@ def test_runtime_provenance_is_independent_of_aliases_and_virtual_env(child_env,
     from pm.environments import runtime_facts_path
     payload = child_env / "payload"
     runtime = payload / "state/environments/candidate/venv"
-    site = runtime / ("Lib/site-packages" if os.name == "nt" else
-                      f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
+    # pm.environments.site_packages dates the tree from pyvenv.cfg, not the caller's
+    # interpreter, so the layout must use the same declared version on any test Python.
+    runtime_version = "3.14"
+    site = runtime / ("Lib/site-packages" if os.name == "nt" else f"lib/python{runtime_version}/site-packages")
     site.mkdir(parents=True)
-    (runtime / "pyvenv.cfg").write_text("version = 3.14\n", encoding="utf-8")
+    (runtime / "pyvenv.cfg").write_text(f"version = {runtime_version}\n", encoding="utf-8")
     (payload / "tools").mkdir()
     (payload / "manifest.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr("pm.environments.install_state_dir", lambda repo: payload / "state")

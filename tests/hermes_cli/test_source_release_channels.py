@@ -47,6 +47,10 @@ def releases(tmp_path, monkeypatch, request):
     git(checkout, "config", "commit.gpgsign", "false")
     git(checkout, "checkout", "--detach", commits[0])
     monkeypatch.setattr(main, "PROJECT_ROOT", checkout)
+    # cmd_update runs on a tmp PROJECT_ROOT, but the test interpreter's venv belongs to
+    # the developer's checkout, so the owning-install handoff would re-exec that checkout's
+    # updater with pytest's argv. The handoff has its own tests (test_update_owning_install).
+    monkeypatch.setattr("hermes_cli.update_owning_install.retarget_to_owning_install", lambda *_: None)
     monkeypatch.setenv("HERMES_INSTALL_ROOT", str(checkout))
     monkeypatch.delenv("HERMES_MANAGED", raising=False)
 

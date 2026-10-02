@@ -56,6 +56,10 @@ def update_tree(tmp_path, monkeypatch):
     newer = git(origin, 'rev-parse', 'HEAD')
 
     monkeypatch.setattr(cli_main, 'PROJECT_ROOT', clone)
+    # cmd_update runs on a tmp PROJECT_ROOT, but the test interpreter's venv belongs to
+    # the developer's checkout, so the owning-install handoff would re-exec that checkout's
+    # updater with pytest's argv. The handoff has its own tests (test_update_owning_install).
+    monkeypatch.setattr('hermes_cli.update_owning_install.retarget_to_owning_install', lambda *_: None)
     monkeypatch.setattr(update_receipt, '_code_identity', lambda **_: {'commit': base})
     monkeypatch.setattr(cli_main, '_run_pre_update_backup', lambda *_: 'release-snapshot')
     monkeypatch.setattr(cli_main, '_pause_windows_gateways_for_update', lambda: None)
