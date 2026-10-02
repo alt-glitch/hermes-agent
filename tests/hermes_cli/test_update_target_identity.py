@@ -128,7 +128,10 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
     pushes = []
 
     def fault(command, *args, **kwargs):
-        assert Path(command[0]).name.lower() in {'git', 'git.exe'} or command[0] == sys.executable, command
+        # The stash-restore import-health probe runs the managed-runtime python, not
+        # sys.executable (pm envs resolve a PM interpreter); any python binary is legit.
+        name = Path(command[0]).name.lower()
+        assert name in {'git', 'git.exe'} or name.startswith('python') or command[0] == sys.executable, command
         assert Path(kwargs['cwd']).resolve() in {t.clone, t.origin}, command
         if 'merge' in command and '--ff-only' in command:
             if case == 'no-move':
