@@ -233,9 +233,11 @@ export type ActivePrompt =
       question: string
       choices: string[] | null
       requestId: string
+      /** Single question: its id, the key of the `{answers}` result. A batch's ids ride `questions`. */
+      qid?: string
       /** Batch (multi-question) clarify — present instead of question/choices. */
       questions?: ClarifyBatchQuestion[]
-      /** Answers locked server-side (qid → answer): seeded from the reconnect
+      /** Answers locked server-side (qid → answer; '' = skipped): seeded from the reconnect
        *  replay, extended by recordClarifyAnswer as each lock is acknowledged. */
       answers?: Record<string, string>
     }

@@ -56,6 +56,10 @@ def update_tree(tmp_path, monkeypatch):
     newer = git(origin, 'rev-parse', 'HEAD')
 
     monkeypatch.setattr(cli_main, 'PROJECT_ROOT', clone)
+    # cmd_update runs on a tmp PROJECT_ROOT, but the test interpreter's venv belongs to
+    # the developer's checkout, so the owning-install handoff would re-exec that checkout's
+    # updater with pytest's argv. The handoff has its own tests (test_update_owning_install).
+    monkeypatch.setattr('hermes_cli.update_owning_install.retarget_to_owning_install', lambda *_: None)
     monkeypatch.setattr(update_receipt, '_code_identity', lambda **_: {'commit': base})
     monkeypatch.setattr(cli_main, '_run_pre_update_backup', lambda *_: 'release-snapshot')
     monkeypatch.setattr(cli_main, '_pause_windows_gateways_for_update', lambda: None)
@@ -124,7 +128,10 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
     pushes = []
 
     def fault(command, *args, **kwargs):
-        assert Path(command[0]).name.lower() in {'git', 'git.exe'} or command[0] == sys.executable, command
+        # The stash-restore import-health probe runs the managed-runtime python, not
+        # sys.executable (pm envs resolve a PM interpreter); any python binary is legit.
+        name = Path(command[0]).name.lower()
+        assert name in {'git', 'git.exe'} or name.startswith('python') or command[0] == sys.executable, command
         assert Path(kwargs['cwd']).resolve() in {t.clone, t.origin}, command
         if 'merge' in command and '--ff-only' in command:
             if case == 'no-move':

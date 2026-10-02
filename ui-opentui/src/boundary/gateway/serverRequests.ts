@@ -12,7 +12,7 @@ import { createEffect, createRoot, on } from 'solid-js'
 
 import type { ActivePrompt } from '../../logic/store.ts'
 import { approvalPolicy } from '../../logic/approval.ts'
-import { normalizeClarifyQuestions } from '../../logic/clarifyBatch.ts'
+import { lockedClarifyAnswers, normalizeClarifyQuestions } from '../../logic/clarifyBatch.ts'
 import { type PromptMethod, SERVER_REQUEST_DECODERS } from '../schema/ServerRequestParams.ts'
 import type { ServerRequest, ServerRequestDisposition } from './client.ts'
 import type { ServerRequestParams, ServerRequestResult } from './rpc.ts'
@@ -32,13 +32,16 @@ const isValue = (answer: PromptAnswer): answer is ServerRequestResult<'sudo'> =>
 export const SERVER_REQUEST_PROMPTS: { readonly [M in PromptMethod]: PromptRow<M> } = {
   clarify: {
     open: (id, p) => {
-      const questions = normalizeClarifyQuestions(p.questions ?? undefined)
-      if (questions.length > 0) {
-        return { kind: 'clarify', question: '', choices: null, requestId: id, questions, answers: { ...p.answers } }
+      // The decoder guarantees at least one askable entry, so `questions` is never empty here.
+      const questions = normalizeClarifyQuestions(p.questions)
+      const [only] = questions
+      // One question keeps the single-question card; its answer is `{answers: {[qid]: …}}`.
+      if (questions.length === 1 && only) {
+        return { kind: 'clarify', question: only.question, choices: only.choices, qid: only.qid, requestId: id }
       }
-      // The decoder requires `question` when there is no batch; '' only when every batch entry was blank.
-      const choices = p.choices?.length ? [...p.choices] : null
-      return { kind: 'clarify', question: p.question ?? '', choices, requestId: id }
+      // A batch locks one answer at a time (clarify.lock); a replay carries the locks so far.
+      const answers = lockedClarifyAnswers(p.answers)
+      return { kind: 'clarify', question: '', choices: null, requestId: id, questions, answers }
     },
     accepts: (answer): answer is ServerRequestResult<'clarify'> => !('choice' in answer) && !('value' in answer)
   },

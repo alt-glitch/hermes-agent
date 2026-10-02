@@ -108,6 +108,7 @@ import type { PaginatedSessions, UsageStats } from '@/types/hermes'
 
 import { pluginDecisions, profiles, skills, toolsets } from './bridge'
 import { composerHost } from './composer'
+import { i18nHost } from './i18n'
 import { planPluginOpenSession } from './plugin-open-session-plan'
 import { sessionsHost } from './sessions'
 import { desktopSettings } from './settings'
@@ -209,6 +210,8 @@ const $focusedSessionProfile = computed(
 export interface PluginProfileRoute {
   connectionId: string
   mode: 'local' | 'remote'
+  /** Electron's authoritative registry primary. Absent on older shells. */
+  primary?: true
   /** Desktop profile used to select the connection route. */
   profile: string
   /** Backend Hermes profile served by that route. */
@@ -1632,7 +1635,12 @@ export const host = {
    *  active instance changes on a profile swap. */
   getGateway: (): HermesGateway | null => $gateway.get(),
 
-  composer: composerHost
+  composer: composerHost,
+
+  /** Language packs: `host.i18n.registerAppLocale(id, { endonym, rtl?,
+   *  translations })` adds a whole UI language at runtime (see `sdk/i18n.ts`);
+   *  `host.i18n.languageOptions()` lists what the switcher shows. */
+  i18n: i18nHost
 }
 
 // -- react bridge -------------------------------------------------------------
@@ -1890,6 +1898,9 @@ export { type GrabScroll, useGrabScroll } from '@/hooks/use-grab-scroll'
  *  pane whose label must track the locale pairs that `title` with
  *  `data.tabTitle: () => <LocalizedTabTitle select={t => ...} />`. */
 export {
+  type AppLocaleRegistration,
+  type BundledLocale,
+  type LanguageOption,
   type Locale,
   LocalizedTabTitle,
   type PluginI18n,
@@ -2043,6 +2054,8 @@ export type { StatusResponse } from '@/types/hermes'
 export type { GatewayEvent as RpcEvent } from '@hermes/shared'
 /** Bot Screen wire shapes, generated from `tui_gateway/contracts/display.py`. */
 export type { DisplayLease, DisplayObserveResult, DisplayStatus, DisplayThumbnailResult } from '@hermes/shared'
+/** `session.list` / `profiles.list` session rows, generated from `tui_gateway/contracts`. */
+export type { ProfileSessionPreview, SessionListRow } from '@hermes/shared'
 /** THE compact-number formatter — every user-facing count/token figure goes
  *  through here (1230 → "1.2k", 1_500_000 → "1.5M"). Don't hand-roll `/1000`. */
 export { compactNumber } from '@hermes/shared'

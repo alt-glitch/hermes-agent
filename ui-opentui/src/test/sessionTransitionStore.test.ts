@@ -226,7 +226,12 @@ describe('session-store replacement boundary', () => {
     store.adoptFreshSession('live', {})
     store.apply({ type: 'message.start', session_id: 'live' })
     store.apply({ type: 'message.delta', session_id: 'live', payload: { text: 'partial' } })
-    store.openPrompt(SERVER_REQUEST_PROMPTS['clarify'].open('q1', { question: 'stale?', session_id: 'live' }))
+    store.openPrompt(
+      SERVER_REQUEST_PROMPTS['clarify'].open('q1', {
+        questions: [{ qid: 'q0', question: 'stale?' }],
+        session_id: 'live'
+      })
+    )
     store.setStatus('thinking')
 
     store.apply({ type: 'session.info', session_id: 'live', payload: { running: false } })

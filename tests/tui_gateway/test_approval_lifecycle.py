@@ -162,8 +162,13 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
     sid, session_key = "ui-clarify", "stored-clarify"
     other_sid = "ui-other-clarify"
     frames: list[dict] = []
-    result: dict[str, str] = {}
-    other_result: dict[str, str] = {}
+    result: dict[str, dict] = {}
+    other_result: dict[str, dict] = {}
+    cancelled = {"answers": {}, "outcome": "cancelled"}
+
+    def questions(text: str) -> list[dict]:
+        return [{"qid": "q0", "question": text, "choices": ["Yes", "No"], "multi_select": False}]
+
     monkeypatch.setattr(server_requests, "_write", lambda frame: frames.append(frame))
     monkeypatch.setattr(server, "_TURN_SETTLE_BEFORE_CLOSE_SECONDS", 0.05)
     monkeypatch.setattr(server, "_finalize_session", lambda *_args, **_kwargs: None)
@@ -180,9 +185,7 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
             return None
 
     agent = InterruptibleAgent()
-    captured_clarify = lambda question: server._clarify_block(
-        sid, question, ["Yes", "No"]
-    )
+    captured_clarify = lambda question: server._clarify_block(sid, questions(question))
 
     def run_turn():
         result["first"] = captured_clarify("Continue?")
@@ -192,9 +195,7 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
     waiter = threading.Thread(target=run_turn)
     other_waiter = threading.Thread(
         target=lambda: other_result.update(
-            answer=server._clarify_block(
-                other_sid, "Other session?", ["Yes", "No"]
-            )
+            answer=server._clarify_block(other_sid, questions("Other session?"))
         )
     )
     session = {
@@ -228,13 +229,17 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
         assert response["result"] == {"closed": True}
         assert not waiter.is_alive()
         assert agent.interrupted.is_set()
-        assert result == {"first": ""}
+        assert result == {"first": cancelled}
         own_frames = [
             frame for frame in frames
             if frame.get("method") == "clarify"
             and frame.get("params", {}).get("session_id") == sid
         ]
-        assert [frame["params"]["question"] for frame in own_frames] == ["Continue?"]
+        assert [
+            question["question"]
+            for frame in own_frames
+            for question in frame["params"]["questions"]
+        ] == ["Continue?"]
         assert other_waiter.is_alive()
         assert [request["method"] for request in server_requests.open_requests(other_sid)] == ["clarify"]
     finally:
@@ -242,7 +247,7 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
         other_waiter.join(timeout=1)
         server_requests.reset_for_tests()
 
-    assert other_result == {"answer": ""}
+    assert other_result == {"answer": cancelled}
 
 
 def test_approval_fallback_requires_request_and_session_to_match():

@@ -20,17 +20,15 @@ const ClarifyQuestion = Schema.Struct({
   multi_select: opt(Bool)
 })
 
-// The contract makes both shapes optional; a request with neither asks nothing.
+// One shape for 1-5 questions. `answers` rides only on a reconnect replay (null = skipped).
+// A list with no askable entry (non-empty qid and question) asks nothing: -32602.
 const ClarifyParams = Schema.Struct({
   session_id: Str,
-  question: opt(Schema.NullOr(Str)),
-  choices: opt(Schema.NullOr(StrList)),
-  multi_select: opt(Schema.NullOr(Bool)),
-  questions: opt(Schema.NullOr(Schema.mutable(Schema.Array(ClarifyQuestion)))),
-  answers: opt(Schema.NullOr(Schema.Record(Str, Str)))
+  questions: Schema.mutable(Schema.Array(ClarifyQuestion)),
+  answers: opt(Schema.NullOr(Schema.Record(Str, Schema.NullOr(Str))))
 }).check(
-  Schema.makeFilter(p => typeof p.question === 'string' || (p.questions?.length ?? 0) > 0, {
-    expected: 'a question or a non-empty questions list'
+  Schema.makeFilter(p => p.questions.some(q => q.qid !== '' && q.question.trim() !== ''), {
+    expected: 'a questions list with at least one non-empty qid and question'
   })
 )
 

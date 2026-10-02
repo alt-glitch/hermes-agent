@@ -233,6 +233,7 @@ class SessionListRow(Result):
     preview: str = ""
     started_at: float = 0
     message_count: int = 0
+    live_message_count: int | None = None
     source: str = ""
     cwd: str | None = None
     last_active: float = 0
@@ -437,8 +438,14 @@ method("session.branch_whole", params=SessionBranchWholeParams, result=SessionBr
        doc="session.branch of the whole history without echoing the copied transcript back.")
 
 
+class UndoIntent(WireEnum):
+    RETRY = "retry"
+    UNDO = "undo"
+
+
 class SessionUndoParams(SessionParams):
-    pass
+    # ``retry``: the client resends the dropped turn (Ink /retry), so metrics count a retry, not an undo.
+    intent: UndoIntent | None = None
 
 
 class SessionUndoResult(Result):

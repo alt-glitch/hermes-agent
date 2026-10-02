@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
-from agent.message_metadata import append_message
+from agent.message_metadata import append_message, without_persistence_fields
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
 from agent.process_bootstrap import _install_safe_stdio
@@ -34,6 +34,7 @@ from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
+from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
@@ -782,6 +783,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 pass
             _refresh_bot_chat_tools(agent)
             agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            record_cache_break(agent, "toolset_change")
             stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
             # Persist so the NEXT turn restores the new bytes verbatim (cache break is
             # once per capability change). Tools re-pin too: without it the next
@@ -845,6 +847,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # persisted over the pin below. Pinned first, so the prompt describes the tools sent.
     built_for_this_surface = _restore_pinned_tools(agent, session_row)
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    if conversation_history:
+        record_prompt_rebuild(agent, stored_prompt, stored_state, agent._cached_system_prompt)
 
     # The rebuilt prompt describes the CURRENT surface, but a surface note left in the
     # transcript by an earlier switch does not — retire it here too, or a rebuild for an
@@ -1312,7 +1316,11 @@ def _apply_context_engine_selection(
     # Require a NON-EMPTY list of dicts: ``all([])`` is ``True``, so a ``[]`` from a
     # buggy engine would otherwise replace the request instead of failing open.
     if isinstance(selected, list) and selected and all(isinstance(m, dict) for m in selected):
-        return selected
+        # The engine may hand back the ``conversation_messages`` clones (or its own dicts) that still
+        # carry persistence-only fields; the request copy was stripped BEFORE this hook, so strip the
+        # selection too or those fields reach the provider. Dicts without them pass through as-is.
+        stripped = [without_persistence_fields(m) for m in selected]
+        return selected if all(a is b for a, b in zip(stripped, selected)) else stripped
     logger.warning(
         "Context engine select_context returned an invalid value "
         "(not a non-empty list of dicts); ignoring (session=%s)", session_label,
@@ -1536,12 +1544,16 @@ def _run_conversation_turn(
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    title_user_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
     ``stream_callback``: per-text-delta callback (TTS). ``persist_user_message``: clean text to
     store when ``user_message`` carries API-only synthetic prefixes; timestamp / platform id are
-    stored as metadata (platform id lets restart drain recovery dedup). ``persist_user_display_*``:
+    stored as metadata (platform id lets restart drain recovery dedup).
+    ``title_user_message``: optional pre-injection text for titles only (None uses the
+    model-facing message; an empty string suppresses titling for this turn).
+    ``persist_user_display_*``:
     display-only event rendering; the model still receives the message unchanged."""
     if moa_config is None:
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
@@ -1580,6 +1592,7 @@ def _run_conversation_turn(
             # MoA turns append per-call aggregated context to the API copy of the
             # user message, so no byte-stable api_content sidecar can be stamped.
             moa_active=bool(moa_config),
+            title_user_message=title_user_message,
         )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
@@ -1693,6 +1706,7 @@ def run_conversation(
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    title_user_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
@@ -1721,6 +1735,7 @@ def run_conversation(
             persist_user_platform_id=persist_user_platform_id,
             moa_config=moa_config,
             turn_author=turn_author,
+            title_user_message=title_user_message,
         )
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)

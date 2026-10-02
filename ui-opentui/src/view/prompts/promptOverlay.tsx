@@ -1,8 +1,9 @@
 /**
  * PromptOverlay — renders the active blocking prompt and answers the backend→client
  * request that opened it (result shapes per tui_gateway/contracts/server_requests.py):
- *   clarify {answer} · approval {choice} · sudo / secret / vault.unlock_prompt {value};
- *   a batch clarify locks one answer at a time through the `clarify.lock` RPC.
+ *   clarify {answers} · approval {choice} · sudo / secret / vault.unlock_prompt {value};
+ *   a single-question clarify answers `{answers: {[qid]: text | null}}` (null = skipped); a
+ *   batch clarify locks one answer at a time through the `clarify.lock` RPC.
  * Idle Esc/Ctrl+C sends the deny/empty reply. While delivery is pending or
  * uncertain, `r` deliberately retries that exact response while Esc/Ctrl+C
  * dismisses locally without claiming it was received.
@@ -88,11 +89,16 @@ const answer = (prompt: GatewayPrompt, result: PromptAnswer): PromptReply => ({
   result
 })
 
+/** A single-question clarify's ClarifyResult: its answer keyed by qid, a blank one a skip (null). */
+const clarifyAnswers = (prompt: GatewayPromptOf<'clarify'>, text: string): PromptAnswer => ({
+  answers: prompt.qid === undefined ? {} : { [prompt.qid]: text.trim() ? text : null }
+})
+
 /** Esc/Ctrl+C answer per kind: deny for approval, empty for the rest (a clarify
- *  `{answer:''}` is a skip, and a cancel-all for a batch — no `answers` key). */
+ *  response without `answers` cancels every question, single or batch). */
 const CANCEL_RESULTS = {
   approval: { choice: 'deny' },
-  clarify: { answer: '' },
+  clarify: {},
   secret: { value: '' },
   sudo: { value: '' },
   vaultUnlock: { value: '' }
@@ -291,7 +297,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
               questions={p().questions}
               answers={p().answers}
               statusHint={responseHint()}
-              onAnswer={text => respond(answer(p(), { answer: text }))}
+              onAnswer={text => respond(answer(p(), clarifyAnswers(p(), text)))}
               onQuestionAnswer={(qid, text) =>
                 // Per-question lock: the prompt stays open until no questions
                 // remain. Only an accepted clarify.lock updates the local mirror.

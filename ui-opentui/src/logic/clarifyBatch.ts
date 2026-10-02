@@ -21,7 +21,7 @@ export interface ClarifyBatchQuestion {
   multiSelect: boolean
 }
 
-/** The raw wire shape of one batch entry (all fields optional at the boundary). */
+/** The raw wire shape of one batch entry (contracts/server_requests.py ClarifyQuestion). */
 export interface ClarifyBatchQuestionWire {
   readonly qid?: string
   readonly question?: string
@@ -31,8 +31,8 @@ export interface ClarifyBatchQuestionWire {
 
 /**
  * Filter + normalize the wire question list: entries without a non-blank qid
- * AND question are dropped (Ink parity — a fully malformed list falls back to
- * the single-question payload fields). Choices collapse to null when empty.
+ * AND question are dropped (Ink parity; the decoder refuses a list with none
+ * left). Choices collapse to null when empty.
  */
 export function normalizeClarifyQuestions(
   raw: readonly ClarifyBatchQuestionWire[] | undefined
@@ -48,6 +48,16 @@ export function normalizeClarifyQuestions(
       question: q.question.trim()
     })
   }
+  return out
+}
+
+/** The replayed locks (`params.answers`, reconnect only) as the local answers map. The wire's null
+ *  (skipped) reads as '' — the same empty lock this prompt records for a skip (Ink parity). */
+export function lockedClarifyAnswers(
+  raw: Readonly<Record<string, string | null>> | null | undefined
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [qid, answer] of Object.entries(raw ?? {})) out[qid] = answer ?? ''
   return out
 }
 
