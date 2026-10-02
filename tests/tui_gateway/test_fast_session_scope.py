@@ -122,7 +122,7 @@ class TestConfigSetFastSessionScope:
                 ) as resolve:
             _set({"key": "fast", "session_id": "s4", "value": "fast"})
         resolve.assert_called_once_with(
-            "session-model", provider=None, base_url=None
+            "session-model", provider=None, base_url=None, tier=None
         )
 
     def test_auto_and_cold_are_session_scoped_tier_pins(self) -> None:
