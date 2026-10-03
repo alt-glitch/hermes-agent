@@ -1988,6 +1988,8 @@ def create_job(
         "last_delivery_error": None,
         # Targets acked without message_id/raw_response (accepted but UNVERIFIED).
         "last_delivery_unverified": None,
+        # Most recent failed run ({at, detail}); NOT cleared by a later success (#118354).
+        "last_failure": None,
         "failure_streak": 0,
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -2481,6 +2483,12 @@ def _record_run_outcome(
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge).
         job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+        # Sticky last-failure stamp (#118354): the next success resets last_status and
+        # failure_streak, which erases the only job-level trace that a run ever failed —
+        # a monitor sampling jobs.json then sees a permanently green job. last_failure
+        # survives success (latest failure wins); the recency window is the consumer's
+        # call. Delivery failures keep their own sticky last_delivery_error.
+        job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
     job["last_delivery_error"] = delivery_error
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
@@ -2489,9 +2497,19 @@ def _record_run_outcome(
         job["run_claim"] = None
 
 
-def _advance_after_run(job: Dict[str, Any], now: str, *, dispatch_preclaimed: bool = False) -> None:
+def _advance_after_run(
+    job: Dict[str, Any], now: str, *, ladder_rung: bool = False, dispatch_preclaimed: bool = False,
+) -> None:
     """Bump ``repeat.completed`` and recompute ``next_run_at``; retire the record as a terminal
-    completion when the repeat limit is reached or a one-shot has no further run."""
+    completion when the repeat limit is reached or a one-shot has no further run.
+
+    ``ladder_rung``: this run re-ran an occurrence that already counted (an unreachable-model
+    re-run, ``cron.unreachable_retry.is_retry_run``), so ``repeat.completed`` is left as is.
+
+    ``dispatch_preclaimed``: a distinct case — this finite recurring run is settling its own
+    ``claim_dispatch`` reservation (``job["dispatch_claim"]``, matched by execution/fire owner in
+    ``mark_job_run``), which already counted the attempt before execution, so
+    ``repeat.completed`` is left as is. A ladder re-run of a finite recurring job can carry both."""
     # If no next run, decide whether this is terminal completion (one-shot) or a transient failure
     # (recurring schedule couldn't compute — e.g. 'croniter' missing from the runtime env). Recurring jobs
     # must NEVER be silently disabled: that turns a missing runtime dep into "job completed" and the user's
@@ -2505,9 +2523,12 @@ def _advance_after_run(job: Dict[str, Any], now: str, *, dispatch_preclaimed: bo
         times = repeat.get("times")
         finite = times is not None and times > 0
         completed = repeat.get("completed", 0)
-        # Finite one-shots were pre-claimed by claim_dispatch() (completed already incremented) —
-        # do not double-count; recurring jobs and direct callers still get the increment.
-        if not (dispatch_preclaimed or (kind == "once" and finite and completed > 0)):
+        # Count each occurrence once. A ladder re-run's occurrence already counted
+        # (``ladder_rung``); a finite recurring run settling its claim_dispatch() reservation was
+        # counted when that attempt was reserved (``dispatch_preclaimed``); and finite one-shots
+        # were pre-claimed by claim_dispatch() (completed already incremented). Every other run,
+        # recurring or direct, gets the increment.
+        if not (ladder_rung or dispatch_preclaimed or (kind == "once" and finite and completed > 0)):
             completed += 1
             repeat["completed"] = completed
         if finite and completed >= times:
@@ -2547,6 +2568,7 @@ def mark_job_run(
     expected_run_claim_token: Optional[str] = None,
     expected_execution_id: Optional[str] = None,
     model_unreachable: bool = False,
+    ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
 ) -> bool:
@@ -2561,7 +2583,9 @@ def mark_job_run(
     ``model_unreachable``: this failed run never reached the model (transient network/DNS error,
     zero API calls). Recurring jobs then get a bounded automatic re-run — ``next_run_at`` is pulled
     earlier per ``cron.unreachable_retry.RETRY_DELAYS_SECONDS`` — instead of waiting a full period
-    (Cowork-style; see cron/unreachable_retry.py).
+    (Cowork-style; see cron/unreachable_retry.py). ``ladder_rung``: this run IS one of those
+    re-runs (``is_retry_run``); its occurrence already counted, so ``repeat.completed`` is not
+    bumped again.
 
     ``quota_hold_seconds``: the provider said it stays closed for this long (a quota 429 with
     ``retry after <N>s``). Recurring jobs are parked through the window instead of re-firing into
@@ -2607,7 +2631,7 @@ def mark_job_run(
                 return False  # An unidentified completion cannot settle someone else's spent attempt.
         now = _hermes_now().isoformat()
         _record_run_outcome(job, success, error, delivery_error, status, now)
-        _advance_after_run(job, now, dispatch_preclaimed=dispatch_preclaimed)
+        _advance_after_run(job, now, ladder_rung=ladder_rung, dispatch_preclaimed=dispatch_preclaimed)
         if dispatch_preclaimed:
             reservation["settled"] = True
         from cron import quota_hold
@@ -2702,6 +2726,7 @@ def _write_missed_oneshot_diagnostic(job: Dict[str, Any], next_run: str) -> None
 
 def claim_dispatch(
     job_id: str, *, execution_id: Optional[str] = None, expected_fire_owner: Optional[str] = None,
+    ladder_rung: bool = False,
 ) -> bool:
     """Reserve a finite attempt before execution, surviving crashes and completion-lock refusal.
 
@@ -2709,6 +2734,10 @@ def claim_dispatch(
     execution ID and fire owner so completion can settle that exact reservation without counting
     twice. A crash after reservation can spend an attempt without running user code; exhausted
     recurring records remain inspectable, never silently removed or replayed.
+
+    ``ladder_rung``: the recurring execution re-runs an occurrence that already counted (an
+    unreachable-model re-run, ``cron.unreachable_retry.is_retry_run``). It still gets a
+    reservation, so completion stays fenced to this execution, but spends no repeat slot.
     """
     def apply(jobs, i, job):
         repeat = job.get("repeat") or {}
@@ -2723,7 +2752,8 @@ def claim_dispatch(
                 return reservation.get("fire_owner") == expected_fire_owner and not reservation.get("settled")
             if repeat.get("completed", 0) >= times:
                 return False
-            repeat["completed"] = repeat.get("completed", 0) + 1
+            if not ladder_rung:  # a ladder re-run's occurrence already holds its slot
+                repeat["completed"] = repeat.get("completed", 0) + 1
             job["dispatch_claim"] = {
                 "execution_id": execution_id, "fire_owner": expected_fire_owner, "settled": False}
             save_jobs(jobs)
