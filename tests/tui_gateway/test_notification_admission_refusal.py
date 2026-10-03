@@ -165,7 +165,8 @@ def test_admitted_event_retries_after_history_failure_without_a_second_card(
 
     monkeypatch.setattr(server, "_prepare_turn_input", prepare)
     monkeypatch.setattr(server, "_recover_turn_exception", lambda *_: None)
-    monkeypatch.setattr(server, "_finish_turn", lambda *_: None)
+    monkeypatch.setattr(server, "_release_turn_scopes", lambda *_: None)
+    monkeypatch.setattr(server, "_post_turn_housekeeping", lambda *_: None)
     monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_: None)
     monkeypatch.setattr(server, "_run_post_turn_followups", lambda *_: None)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *_args, **_kwargs: None)
@@ -345,7 +346,8 @@ def test_invoked_notification_settles_without_replaying_for_display_repair(
     monkeypatch.setattr(server, "_settle_loop_claim", lambda *_: None)
     monkeypatch.setattr(server, "_after_complete_turn", lambda *_: None)
     monkeypatch.setattr(server, "_publish_session_control_snapshot", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(server, "_finish_turn", lambda *_: None)
+    monkeypatch.setattr(server, "_release_turn_scopes", lambda *_: None)
+    monkeypatch.setattr(server, "_post_turn_housekeeping", lambda *_: None)
     monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_: None)
     monkeypatch.setattr(server, "_run_post_turn_followups", lambda *_: None)
 

@@ -2941,14 +2941,20 @@ def run_one_job(
             owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
             delivery_error = delivery_outcome = None
             try:
+                from cron.unreachable_retry import is_retry_run
+                ladder_rung = is_retry_run(job)
                 mark_kwargs: dict = {"expected_fire_owner": owner} if owner else {}
+                if ladder_rung:
+                    # A ladder re-run's occurrence already counted toward repeat.
+                    mark_kwargs["ladder_rung"] = True
                 reserved = True
                 if _finite_recurring_job(job):
                     # Failed handoffs already count as attempts. Bind that accounting to this
                     # execution too, without settling a previous owner's unfinished reservation.
                     mark_kwargs["expected_execution_id"] = execution_id
                     reserved = claim_dispatch(
-                        job["id"], execution_id=execution_id, expected_fire_owner=owner or None)
+                        job["id"], execution_id=execution_id, expected_fire_owner=owner or None,
+                        ladder_rung=ladder_rung)
                 if reserved:
                     # A pre-handoff dispatch failure is a job failure like any other: it
                     # must open an incident and leave through the job's failure lane
@@ -3010,12 +3016,21 @@ def run_one_job(
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
 
 
-def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], execution_id: str) -> None:
+def _record_fire_ownership_lost(
+    job: dict, fire_owner: Optional[str], execution_id: str,
+) -> None:
     """Bookkeeping after fire-claim ownership loss. A transport-level cancel (dashboard drain) is
     not a real loss — we still own the claim, so record the interruption via the owner-fenced
-    terminal write instead of leaving fire_claim/last_status stale; otherwise discard."""
+    terminal write instead of leaving fire_claim/last_status stale; otherwise discard.
+    An interrupted ladder re-run re-ran an occurrence that already counted, so its terminal
+    write must not spend another repeat slot (same as every other terminal path)."""
+    from cron.unreachable_retry import is_retry_run
+    job_id = job["id"]
     if fire_owner is not None and heartbeat_fire_claim(job_id, expected_owner=fire_owner):
-        mark_job_run(job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner)
+        mark_job_run(
+            job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
+            **({"ladder_rung": True} if is_retry_run(job) else {}),
+        )
         finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
     else:
         finish_execution(
@@ -3317,6 +3332,10 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
         mark_kwargs["model_unreachable"] = True
+    from cron.unreachable_retry import is_retry_run
+    if is_retry_run(job):
+        # A re-run of an occurrence that already counted: must not spend another repeat slot.
+        mark_kwargs["ladder_rung"] = True
     _hold_s = job.pop("_quota_hold_seconds", None)
     if not d.success and _hold_s:
         # Provider window closed for a known duration: park past it (cron/quota_hold.py, #89376).
@@ -3460,7 +3479,11 @@ def _run_one_job_body(
         if _finite_recurring_job(job):
             if not external_owner and mark_execution_running(execution_id) is None:
                 return True
-            dispatch_kwargs = {"execution_id": execution_id, "expected_fire_owner": fire_owner}
+            from cron.unreachable_retry import is_retry_run
+            dispatch_kwargs = {
+                "execution_id": execution_id, "expected_fire_owner": fire_owner,
+                # A ladder re-run's occurrence already counted: reserve it without a slot.
+                "ladder_rung": is_retry_run(job)}
         if not claim_dispatch(job["id"], **dispatch_kwargs):
             logger.info(
                 "Job '%s': dispatch claim rejected — skipping",
@@ -3535,7 +3558,7 @@ def _run_one_job_body(
 
         if _fire_claim_ownership_lost():
             _teardown_deferred()
-            _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+            _record_fire_ownership_lost(job, fire_owner, execution_id)
             return True
 
         # An agent can finish its own turn after a delegated child has failed. Let it explicitly
@@ -3563,7 +3586,7 @@ def _run_one_job_body(
 
         if d.side_effect_ownership_lost:
             # The claim died inside a side-effect fence: the side effect did NOT complete.
-            _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+            _record_fire_ownership_lost(job, fire_owner, execution_id)
             return True
 
         # Empty final_response is a soft failure so last_status is not "ok".
@@ -3588,7 +3611,7 @@ def _run_one_job_body(
                         "Job '%s': transport cancellation arrived before terminal completion; "
                         "recording the interrupted run",
                         job["id"])
-                _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+                _record_fire_ownership_lost(job, fire_owner, execution_id)
                 return True
 
         if _consume_interrupted_flag(job["id"], execution_token):
@@ -3640,6 +3663,10 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
+                from cron.unreachable_retry import is_retry_run
+                if is_retry_run(job):
+                    # A crashed ladder re-run: its occurrence already counted toward repeat.
+                    mark_kwargs["ladder_rung"] = True
                 mark_job_run(job["id"], False, _err_text, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
