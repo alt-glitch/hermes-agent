@@ -1,20 +1,9 @@
 name: Label rerun
 
-# When the ``ci-reviewed`` label is added to a PR, recover the review-labels
-# job in the latest CI run. A targeted rerun re-evaluates the label and its
-# dependent ``all-checks-pass`` gate without restarting unrelated failures.
-#
 # When the ``run-e2e`` label is added, rerun the head commit's CI, Docker and
 # Nix runs in full. Their ``detect`` job reads the PR's labels through the API
 # (a rerun replays the original event payload), so the rerun turns every slow
 # lane on (scripts/ci/classify_changes.py).
-#
-# ``gh run rerun`` only works on a completed run. Thus this waits when the
-# run is still in progress. A completed successful run needs no recovery and
-# exits without asking GitHub to rerun an empty failed-job set. Python CI
-# permits 90 minutes; observation must not report success before a needed
-# rerun was submitted. Re-run this helper to recover a timed-out observation;
-# do not restart an active CI run.
 #
 # The review comment updates without help. The poller in
 # ci-review-comment.yml watches the CI run through the API. It gets the
@@ -28,120 +17,11 @@ permissions:
   actions: write
   pull-requests: read
 
-# Keyed by label so one label's job does not cancel the other's.
 concurrency:
   group: label-rerun-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
   cancel-in-progress: true
 
 jobs:
-  rerun-review-labels:
-    name: Rerun review-labels job
-    if: github.event.label.name == 'ci-reviewed'
-    runs-on: ubuntu-latest
-    timeout-minutes: 110
-    steps:
-      - name: Wait for CI run to finish, then recover the review label gate
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-
-          # Find the latest CI run for this PR's head SHA.
-          RUN_INFO=$(gh run list \
-            --repo "$REPO" \
-            --commit "$HEAD_SHA" \
-            --workflow ci.yaml \
-            --limit 1 \
-            --json databaseId,status,conclusion \
-            --jq '.[0] | select(. != null) | "\(.databaseId) \(.status) \(.conclusion // "unknown")"')
-
-          if [ -z "$RUN_INFO" ]; then
-            echo "CI run not yet available; rerun this helper after CI starts."
-            exit 1
-          fi
-
-          read -r RUN_ID STATUS CONCLUSION <<< "$RUN_INFO"
-
-          echo "Latest CI run: $RUN_ID (status: $STATUS, conclusion: $CONCLUSION)"
-
-          # If the run is still in progress, wait for it to finish.
-          # gh run rerun only works on completed runs — if we try while it's
-          # running, GitHub rejects with "cannot be rerun; This workflow is
-          # already running".
-          if [ "$STATUS" != "completed" ]; then
-            echo "Run is $STATUS — waiting for completion (this may take a while)..."
-            # Without --exit-status, a completed failed run is still a
-            # successful observation. Transport errors and timeouts remain
-            # failures and must not be mistaken for completion.
-            timeout 6000 gh run watch "$RUN_ID" --repo "$REPO" --interval 15
-
-            # Verify it's actually completed now.
-            FINAL_INFO=$(gh run view "$RUN_ID" \
-              --repo "$REPO" \
-              --json status,conclusion \
-              --jq '"\(.status) \(.conclusion // "unknown")"')
-            read -r STATUS CONCLUSION <<< "$FINAL_INFO"
-            if [ "$STATUS" != "completed" ]; then
-              echo "Run is still $STATUS; recovery pending. Rerun this helper, not the active CI run."
-              exit 1
-            fi
-          fi
-
-          # A push while we waited cancelled this run (that is the "completed"
-          # we saw). Rerunning it would rejoin the PR's CI concurrency group and
-          # cancel the new head's run, which already sees the label.
-          CURRENT_HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid || true)
-          if [ "$CURRENT_HEAD" != "$HEAD_SHA" ]; then
-            echo "PR head moved to $CURRENT_HEAD; not rerunning superseded run $RUN_ID."
-            exit 0
-          fi
-
-          case "$CONCLUSION" in
-          success|failure) ;;
-          *)
-            echo "CI run completed with unexpected conclusion $CONCLUSION; refusing recovery."
-            exit 1
-            ;;
-          esac
-
-          LABEL_JOBS=$(gh run view "$RUN_ID" \
-            --repo "$REPO" \
-            --json jobs \
-            --jq '.jobs[] | select(.name == "Review label gate / Review label gate") | [.databaseId, .status, (.conclusion // "unknown")] | @tsv')
-          JOB_COUNT=$(printf '%s\n' "$LABEL_JOBS" | awk 'NF { count++ } END { print count + 0 }')
-          if [ "$JOB_COUNT" -ne 1 ]; then
-            echo "Expected exactly one Review label gate / Review label gate job; found $JOB_COUNT."
-            exit 1
-          fi
-
-          IFS=$'\t' read -r LABEL_JOB_ID LABEL_STATUS LABEL_CONCLUSION EXTRA <<< "$LABEL_JOBS"
-          if [ -n "${EXTRA:-}" ] || [[ "$LABEL_JOB_ID" == *[!0-9]* ]]; then
-            echo "Review label gate job data was malformed."
-            exit 1
-          fi
-          if [ "$LABEL_STATUS" != "completed" ]; then
-            echo "Review label gate job is $LABEL_STATUS; recovery pending."
-            exit 1
-          fi
-
-          case "$LABEL_CONCLUSION" in
-          success)
-            echo "Review label gate already succeeded; no label recovery needed (CI conclusion: $CONCLUSION)."
-            ;;
-          failure)
-            echo "Review label gate failed; rerunning job $LABEL_JOB_ID and its required dependents."
-            gh run rerun "$RUN_ID" --repo "$REPO" --job "$LABEL_JOB_ID"
-            echo "Targeted review label recovery submitted (CI conclusion: $CONCLUSION)."
-            ;;
-          *)
-            echo "Review label gate completed with unexpected conclusion $LABEL_CONCLUSION; refusing recovery."
-            exit 1
-            ;;
-          esac
-
   rerun-with-e2e:
     name: Rerun CI with every E2E lane
     if: github.event.label.name == 'run-e2e'
