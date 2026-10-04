@@ -7,6 +7,7 @@ import logging
 import sys
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -353,6 +354,9 @@ def _run_claimed_job(
                 clear_run_claim(
                     job_id, expected_token=run_token, expected_fire_owner=fire_owner)
 
+    registration_owner = object()
+    running_future = Future()
+    running_future.set_running_or_notify_cancel()
     try:
         from cron.scheduler import (
             release_running_job, run_one_job, try_register_running_job, _finish_execution_best_effort)
@@ -363,7 +367,9 @@ def _run_claimed_job(
         # In-flight dedupe (idea from #53395 by @izumi0uu): the fire claim's TTL (300s) is routinely
         # outlived by real jobs, so it alone cannot stop a manual run from double-firing a job the ticker
         # (or another manual run) is still executing.
-        if not try_register_running_job(job_id, run_claim_token=run_token):
+        if not try_register_running_job(
+            job_id, run_claim_token=run_token, owner=registration_owner, future=running_future,
+        ):
             release_unstarted_claim()
             if execution_id:
                 _finish_execution_best_effort(
@@ -407,7 +413,7 @@ def _run_claimed_job(
                 processed = run_one_job(job, adapters=adapters, loop=gateway_loop, extra_prompt=extra_prompt)
         finally:
             _registered = False
-            release_running_job(job_id)
+            release_running_job(job_id, owner=registration_owner)
         refreshed = get_job(job_id) or {}
         execution = None
         execution_id = execution_id or job.get("execution_id")
@@ -437,17 +443,25 @@ def _run_claimed_job(
                 from cron.executions import finish_execution
                 finish_execution(execution_id, success=False, error=str(e))
         if _registered:
-            # Raised before the run's own release (e.g. heartbeat setup): don't leave the
-            # job marked in-flight. Only release registrations WE took — a bare discard
-            # could erase a ticker-owned entry.
+            # Raised before the run's own release (e.g. heartbeat setup, adapter resolution):
+            # don't leave the job marked in-flight while the claim is released below. Owner-scoped,
+            # so it never erases a ticker-owned entry; the outer ``finally`` then skips its release.
+            _registered = False
             with contextlib.suppress(Exception):
-                release_running_job(job_id)
+                release_running_job(job_id, owner=registration_owner)
         if started:
             with contextlib.suppress(Exception):
                 mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)
         else:
+            # Unstarted: release the claim and ledger the execution failed WITHOUT recording a
+            # run, so a one-shot stays claimable instead of being consumed.
             release_unstarted_claim()
         return {"claimed": True, "success": False, "error": str(e)}
+    finally:
+        # Setup failures and BaseException must release only our registration.
+        if _registered:
+            release_running_job(job_id, owner=registration_owner)
+        running_future.set_result(None)
 
 
 def execute_job_for_event(
