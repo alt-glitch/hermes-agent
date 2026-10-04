@@ -13,6 +13,14 @@ Branched from `NousResearch/hermes-agent` `main` at `8b66a51036` (2026-10-04). E
   (`v2/idioms/ruff.sh && uv run --no-project python v2/idioms/sweep.py`) and commit the summary.
 - Do not run the test suite or CI locally (Sid's standing rule); static analysis is fine.
 
+## Pushing
+
+v2 lives on Sid's public fork: remote `alt` = `alt-glitch/hermes-agent`, branch `v2`. Always push with
+an explicit destination: `git push alt v2/<topic>:refs/heads/v2/<topic>`. This checkout sets
+`push.default = upstream`, and a branch created from `origin/main` tracks `main`, so a bare
+`git push -u alt <branch>` updates the fork's `main` instead (it happened once while seeding v2 and
+was reverted).
+
 ## What is here
 
 | Path | What |
