@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Run your normal `hermes` with the v2 trace lab on, e.g.:
+#   V2_TRACE_TAG=tui-skill-run hermes-traced --tui
+#   V2_TRACE_TAG=mcp-list      hermes-traced mcp list
+# Each Python process of the run writes one JSONL file under ~/.hermes/v2-traces/<stamp>-<tag>/.
+# Then: uv run --no-project python v2/lab/trace/analyze.py   (in the v2 worktree)
+set -euo pipefail
+lab="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+export V2_TRACE_LAB="$lab/hermes_trace_lab.py"
+export V2_TRACE_DIR="${V2_TRACE_ROOT:-$HOME/.hermes/v2-traces}/$(date +%Y%m%d-%H%M%S)-${V2_TRACE_TAG:-session}"
+mkdir -p "$V2_TRACE_DIR"
+echo "v2 trace -> $V2_TRACE_DIR" >&2
+exec "${HERMES_BIN:-hermes}" "$@"

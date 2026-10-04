@@ -1,0 +1,1019 @@
+{
+ "seam": "pm-core",
+ "nn": "02",
+ "title": "PM core (package manager internals)",
+ "prefix": "PMC",
+ "tldr": [
+  "PM has three separate generation stores (app venv, PM runtime, side environments) with their own selection file, lock, lease and collector; side environments are never collected (PMC-01).",
+  "Biggest kill: the hand-mirrored worker IPC (pm/client.py wrappers, pm/worker_operations.py string table, per-op branches in pm/worker.py) plus package-definition marshalling with no production consumer (PMC-02, PMC-08).",
+  "Biggest simplification: one frozen Install layout value replaces pm/paths.py, six manifest.json probes and the worker's runtime monkeypatch of pm.paths (PMC-03).",
+  "Low-hanging (high severity, effort S/M): 4 — PMC-02, PMC-03, PMC-04, PMC-06.",
+  "pm/ is several overlapping mechanisms around a good core (pinned store + one uv engine); its API is wide: 42 facade names plus 176 imports into 25 submodules."
+ ],
+ "scope": {
+  "paths": [
+   "pm/",
+   "hermes_cli/runtime_state.py",
+   "pyproject.toml [tool.hermes]",
+   "pyproject.toml:902-908"
+  ],
+  "loc": 11851,
+  "files": 48
+ },
+ "modules": [
+  {
+   "path": "pm/packages.py",
+   "loc": 1247,
+   "owns": "built-in package catalog (19 Package subclasses incl. Venv)"
+  },
+  {
+   "path": "pm/install.py",
+   "loc": 983,
+   "owns": "tool-store installs, app-venv sync, PATH activation, drift"
+  },
+  {
+   "path": "pm/cli.py",
+   "loc": 872,
+   "owns": "hermes pm subcommands; re-exec into the PM runtime"
+  },
+  {
+   "path": "pm/downloader.py",
+   "loc": 652,
+   "owns": "resumable ranged downloader (also LLM model files)"
+  },
+  {
+   "path": "pm/environments.py",
+   "loc": 512,
+   "owns": "install layout, selected venv, boot activation, shell exports"
+  },
+  {
+   "path": "pm/update.py",
+   "loc": 487,
+   "owns": "upstream index scrapers for pm update"
+  },
+  {
+   "path": "pm/store.py",
+   "loc": 450,
+   "owns": "content store of published entries, fetch, extract, digests"
+  },
+  {
+   "path": "pm/environment.py",
+   "loc": 440,
+   "owns": "PythonEnvironment: the single uv argv builder"
+  },
+  {
+   "path": "pm/client.py",
+   "loc": 421,
+   "owns": "caller-side proxy to the per-call worker"
+  },
+  {
+   "path": "pm/workspace.py",
+   "loc": 382,
+   "owns": "plugin discovery to uv workspace; npm sidecar"
+  },
+  {
+   "path": "pm/operations.py",
+   "loc": 330,
+   "owns": "build ops and side environments"
+  },
+  {
+   "path": "pm/receipt.py",
+   "loc": 328,
+   "owns": "ContextVar-held operation receipts"
+  },
+  {
+   "path": "pm/lock.py",
+   "loc": 306,
+   "owns": "Lockfile (lock.json) and Facts (two facts.json files)"
+  },
+  {
+   "path": "pm/runtime.py",
+   "loc": 274,
+   "owns": "PM's own isolated interpreter: prepare, lease, collect, launch"
+  },
+  {
+   "path": "hermes_cli/runtime_state.py",
+   "loc": 243,
+   "owns": "PM install lock, publication journal, leases, app-generation GC"
+  }
+ ],
+ "flows": [
+  {
+   "id": "lazy-extra",
+   "title": "A feature first needs an optional Python extra and PM installs it",
+   "trigger": "agent/trace_upload.py:189 calls pm.ensure_import('trace-upload')",
+   "inputs": [
+    {
+     "name": "extra_installed",
+     "type": "bool",
+     "default": false,
+     "meaning": "the extra's anchor modules are already importable"
+    },
+    {
+     "name": "interactive_tty",
+     "type": "bool",
+     "default": false,
+     "meaning": "stdin/stdout are a TTY and no prompt_toolkit app is running"
+    },
+    {
+     "name": "in_pm_runtime",
+     "type": "bool",
+     "default": false,
+     "meaning": "this process is PM's own runtime (is_runtime()); otherwise a worker is spawned"
+    },
+    {
+     "name": "lazy_installs_allowed",
+     "type": "bool",
+     "default": true,
+     "meaning": "security.allow_lazy_installs and no HERMES_DISABLE_LAZY_INSTALLS"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "pm/__init__.py::__getattr__",
+     "loc": "pm/__init__.py:45",
+     "does": "lazily imports pm.extras and binds ensure_import",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 2,
+     "where": "pm/extras.py::ensure_import",
+     "loc": "pm/extras.py:186",
+     "does": "returns at once when every anchor resolves via find_spec (available, extras.py:91)",
+     "when": {
+      "input": "extra_installed",
+      "equals": true
+     },
+     "finding": null
+    },
+    {
+     "n": 3,
+     "where": "pm/extras.py::ensure_import",
+     "loc": "pm/extras.py:210",
+     "does": "asks 'Install it now?' on a TTY",
+     "when": {
+      "input": "interactive_tty",
+      "equals": true
+     },
+     "finding": null
+    },
+    {
+     "n": 4,
+     "where": "pm/client.py::sync_venv",
+     "loc": "pm/client.py:205",
+     "does": "refuses a lazy extra from a foreign interpreter, then picks direct vs worker",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 5,
+     "where": "pm/client.py::_request",
+     "loc": "pm/client.py:91",
+     "does": "builds the JSON request including package_definitions",
+     "when": {
+      "input": "in_pm_runtime",
+      "equals": false
+     },
+     "finding": "PMC-08"
+    },
+    {
+     "n": 6,
+     "where": "pm/runtime.py::prepare_runtime",
+     "loc": "pm/runtime.py:126",
+     "does": "resolves or stages a PM runtime generation for the worker",
+     "when": {
+      "input": "in_pm_runtime",
+      "equals": false
+     },
+     "finding": "PMC-01"
+    },
+    {
+     "n": 7,
+     "where": "pm/worker.py::main",
+     "loc": "pm/worker.py:72",
+     "does": "rebinds pm.paths.repo_root/lockfile_path with lambdas from the request",
+     "when": {
+      "input": "in_pm_runtime",
+      "equals": false
+     },
+     "finding": "PMC-03"
+    },
+    {
+     "n": 8,
+     "where": "pm/worker.py::main",
+     "loc": "pm/worker.py:100",
+     "does": "resolves OPERATIONS['sync_venv'] by string; special-cases plugin decoding",
+     "when": {
+      "input": "in_pm_runtime",
+      "equals": false
+     },
+     "finding": "PMC-02"
+    },
+    {
+     "n": 9,
+     "where": "pm/install.py::_venv_install_lock",
+     "loc": "pm/install.py:694",
+     "does": "takes hermes_cli.runtime_state.runtime_lock (hermes_cli/runtime_state.py:40)",
+     "when": null,
+     "finding": "PMC-04"
+    },
+    {
+     "n": 10,
+     "where": "pm/install.py::lazy_installs_allowed",
+     "loc": "pm/install.py:161",
+     "does": "reads security.allow_lazy_installs through hermes_cli.config inside the worker; refuses when off",
+     "when": null,
+     "finding": "PMC-07"
+    },
+    {
+     "n": 11,
+     "where": "pm/packages.py::Venv.apply",
+     "loc": "pm/packages.py:393",
+     "does": "creates environments/<uuid>, runs uv venv, builds the workspace",
+     "when": {
+      "input": "lazy_installs_allowed",
+      "equals": true
+     },
+     "finding": "PMC-06"
+    },
+    {
+     "n": 12,
+     "where": "pm/environment.py::PythonEnvironment.sync",
+     "loc": "pm/environment.py:351",
+     "does": "uv lock (if not frozen) then uv sync --all-packages via _run (environment.py:271)",
+     "when": {
+      "input": "lazy_installs_allowed",
+      "equals": true
+     },
+     "finding": null
+    },
+    {
+     "n": 13,
+     "where": "pm/lock.py::Facts.record_state",
+     "loc": "pm/lock.py:263",
+     "does": "durably writes the new selection into per-install facts.json",
+     "when": {
+      "input": "lazy_installs_allowed",
+      "equals": true
+     },
+     "finding": "PMC-01"
+    },
+    {
+     "n": 14,
+     "where": "pm/extras.py::ensure_import",
+     "loc": "pm/extras.py:230",
+     "does": "adopts the new generation into sys.path if safe, else raises 'restart Hermes'",
+     "when": {
+      "input": "lazy_installs_allowed",
+      "equals": true
+     },
+     "finding": null
+    }
+   ]
+  },
+  {
+   "id": "tool-binary",
+   "title": "A tool binary (bws) is needed and PM installs it from the pinned store",
+   "trigger": "agent/secret_sources/bitwarden.py:91 calls pm.ensure('bws')",
+   "inputs": [
+    {
+     "name": "installed",
+     "type": "bool",
+     "default": false,
+     "meaning": "the pinned entry and its deps are recorded and present"
+    },
+    {
+     "name": "in_pm_runtime",
+     "type": "bool",
+     "default": false,
+     "meaning": "this process is PM's own runtime"
+    },
+    {
+     "name": "lazy_installs_allowed",
+     "type": "bool",
+     "default": true,
+     "meaning": "on-demand installs permitted"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "pm/client.py::ensure",
+     "loc": "pm/client.py:185",
+     "does": "inside the PM runtime, calls pm.install.ensure directly",
+     "when": {
+      "input": "in_pm_runtime",
+      "equals": true
+     },
+     "finding": "PMC-02"
+    },
+    {
+     "n": 2,
+     "where": "pm/client.py::_missing_or_refuse",
+     "loc": "pm/client.py:19",
+     "does": "walks the closure; when nothing is missing returns Runner(env_for(...))",
+     "when": {
+      "input": "installed",
+      "equals": true
+     },
+     "finding": null
+    },
+    {
+     "n": 3,
+     "where": "pm/client.py::ensure",
+     "loc": "pm/client.py:201",
+     "does": "spawns the worker with operation 'ensure'",
+     "when": {
+      "input": "installed",
+      "equals": false
+     },
+     "finding": "PMC-02"
+    },
+    {
+     "n": 4,
+     "where": "pm/install.py::ensure",
+     "loc": "pm/install.py:534",
+     "does": "StatePackage branch, then deps walk and _installed_location per package",
+     "when": null,
+     "finding": "PMC-06"
+    },
+    {
+     "n": 5,
+     "where": "pm/install.py::ensure",
+     "loc": "pm/install.py:558",
+     "does": "refuses when something is missing and lazy installs are off",
+     "when": {
+      "input": "lazy_installs_allowed",
+      "equals": false
+     },
+     "finding": "PMC-07"
+    },
+    {
+     "n": 6,
+     "where": "pm/install.py::_install",
+     "loc": "pm/install.py:418",
+     "does": "takes the store install lock and settles a leftover .previous-* entry",
+     "when": {
+      "input": "installed",
+      "equals": false
+     },
+     "finding": null
+    },
+    {
+     "n": 7,
+     "where": "pm/store.py::Store.fetch_many",
+     "loc": "pm/store.py:363",
+     "does": "downloads pinned archives through pm.downloader.Download",
+     "when": {
+      "input": "installed",
+      "equals": false
+     },
+     "finding": "PMC-09"
+    },
+    {
+     "n": 8,
+     "where": "pm/install.py::_publish_entry",
+     "loc": "pm/install.py:320",
+     "does": "renames the staged tree into the store (Store.publish, store.py:414) and verifies it",
+     "when": {
+      "input": "installed",
+      "equals": false
+     },
+     "finding": null
+    },
+    {
+     "n": 9,
+     "where": "pm/lock.py::Facts.record",
+     "loc": "pm/lock.py:235",
+     "does": "read-merge-writes the tool fact durably (_merge_and_write, lock.py:225)",
+     "when": {
+      "input": "installed",
+      "equals": false
+     },
+     "finding": "PMC-06"
+    },
+    {
+     "n": 10,
+     "where": "pm/install.py::env_for",
+     "loc": "pm/install.py:572",
+     "does": "composes PATH/env from installed facts (compose_env, package.py:23) into a Runner",
+     "when": null,
+     "finding": null
+    }
+   ]
+  }
+ ],
+ "findings": [
+  {
+   "id": "PMC-01",
+   "title": "Three generation stores (app venv, PM runtime, side environments) implement the same select-last protocol three ways; side environments are never collected",
+   "severity": "high",
+   "effort": "L",
+   "kind": "collapse",
+   "low_hanging": false,
+   "evidence": [
+    "pm/packages.py:408",
+    "pm/install.py:756",
+    "pm/lock.py:263",
+    "pm/environments.py:259",
+    "pm/runtime.py:126",
+    "pm/runtime.py:182",
+    "pm/operations.py:133",
+    "pm/operations.py:248",
+    "hermes_cli/runtime_state.py:139",
+    "hermes_cli/runtime_state.py:184",
+    "hermes_cli/venv_sync.py:130"
+   ],
+   "problem": "The app venv (<installs>/<key>/environments/<uuid>, selected by the venv fact in per-install facts.json), PM's runtime (pm-runtime/generations/<uuid>, selected.json, .prepare.lock) and side environments ($HERMES_HOME/environments/<name>/gen-<hex>, active.json, .install.lock) each implement build-fresh, flush, write-record-last, keep-previous, lease, collect. Three record shapes, three identity hashes, two collectors with different age rules, and no collector for side environments (rg finds only the validator at pm/operations.py:141), so every requirement change leaves a whole venv behind. GC is invoked from two copies (pm/cli.py:518-523, hermes_cli/venv_sync.py:139-145). Durability and Windows-hold fixes must land three times.",
+   "move": "Add pm/generations.py::Generations(root) with build(identity, builder) -> Path, selected(), lease(), collect(min_age) and one frozen Selection record (generation, identity, meta). App venv, PM runtime and side environments become three Generations roots. Lease/GC code from hermes_cli/runtime_state.py moves in. The venv fact in per-install facts.json becomes the app root's selection record.",
+   "reference": {
+    "repo": "attrs",
+    "path": "src/attr/_next_gen.py:431",
+    "pattern": "frozen value class for the Selection record"
+   },
+   "loc_delta": -250,
+   "risk": "Boot activation reads the selection before imports (pm/environments.py:380-438): the record must stay stdlib-readable and the lock/lease ordering in activate_dependencies must hold. Old installs keep the venv selection in facts.json: one release of read-compat.",
+   "depends_on": [
+    "PMC-03"
+   ]
+  },
+  {
+   "id": "PMC-02",
+   "title": "The worker IPC boundary is hand-mirrored in three files, with a second direct code path per operation that diverges",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": true,
+   "evidence": [
+    "pm/client.py:265",
+    "pm/client.py:273",
+    "pm/worker_operations.py:23",
+    "pm/worker.py:102",
+    "pm/client.py:74",
+    "pm/client.py:185",
+    "pm/client.py:209",
+    "pm/client.py:226",
+    "pm/cli.py:314"
+   ],
+   "problem": "Each operation exists as an implementation (pm/install.py, pm/operations.py, pm/build_operations.py), a client wrapper restating its full signature with hand Path->str conversion (11 near-identical wrappers, client.py:273-421), and a string row in worker_operations.py resolved by getattr(import_module). worker.py special-cases operations by name (102-111). Errors cross a hard-coded 7-type map (client.py:74-76). Eight `if is_runtime(): direct(...)` sites give every operation a second path; the paths diverge: client.sync_venv's foreign-interpreter guard (client.py:209-220) is absent on the direct path and pm/cli.py::_install_python_environments calls pm.install.sync_venv directly. One parameter change touches three files and two transports.",
+   "move": "One @operation(needs=..., bootstrap=...) decorator on implementations records function objects in a registry; one generic proxy pm._remote.call(fn, **kwargs) serializes from inspect.signature (one codec for Path and plugin inputs); the worker calls registry[name](**kwargs) with no per-op branches; InstallError family gets to_wire/from_wire. Delete pm/client.py wrappers and pm/worker_operations.py; the facade exports the decorated functions.",
+   "reference": {
+    "repo": "jupyter_client",
+    "path": "jupyter_client/session.py:651",
+    "pattern": "one typed message envelope (msg_header/msg/serialize) for every message type"
+   },
+   "loc_delta": -300,
+   "risk": "Worker must keep running on the PM runtime's stdlib + 4 deps; facade must stay lazy (PEP 562) so pm.environments boot stays cheap. Tests monkeypatching pm.client.X break.",
+   "depends_on": []
+  },
+  {
+   "id": "PMC-03",
+   "title": "Install layout is rediscovered per call by free functions split over two modules, and the worker monkeypatches pm.paths at runtime",
+   "severity": "high",
+   "effort": "M",
+   "kind": "restructure",
+   "low_hanging": true,
+   "evidence": [
+    "pm/worker.py:72",
+    "pm/paths.py:41",
+    "pm/paths.py:67",
+    "pm/environments.py:150",
+    "pm/environments.py:168",
+    "pm/install.py:206",
+    "pm/lock.py:56",
+    "pm/runtime.py:61",
+    "pm/environments.py:41"
+   ],
+   "problem": "Source checkout, sealed payload (manifest.json), Nix/Docker resident runtime (install-stamp.json) and borrowed HERMES_HOME are re-derived on every call by functions in pm/paths.py that delegate back into pm/environments.py. Six sites probe manifest.json with two different anchors. HERMES_RUNTIME_DIR and HERMES_INSTALL_ROOT override pieces. The worker injects its context by assigning lambdas over pm.paths.repo_root and lockfile_path (worker.py:72-73), a process-global rebinding. Owner/borrower resolution (environments.py:41-91) drew 3 fixes in the latest week of history.",
+   "move": "A frozen Install value (kind: source|payload|resident; repo, lockfile, store, writable_store, state_dir, tool_facts, selection) built once by Install.discover(project_root), passed explicitly to Store/Generations/operations and carried in the worker request. Delete pm/paths.py; pm/environments.py keeps only boot activation.",
+   "reference": {
+    "repo": "attrs",
+    "path": "src/attr/_make.py:589",
+    "pattern": "frozen value + evolve for derived layouts"
+   },
+   "loc_delta": -150,
+   "risk": "pm.environments must stay importable with stdlib + hermes_constants at boot. 15 hermes_cli imports of pm.paths move to Install. Resolve HERMES_HOME at call time (profile-scope rule).",
+   "depends_on": []
+  },
+  {
+   "id": "PMC-04",
+   "title": "PM and hermes_cli import each other; PM's own lock, lease and publication journal live in hermes_cli/runtime_state.py",
+   "severity": "high",
+   "effort": "M",
+   "kind": "boundary",
+   "low_hanging": true,
+   "evidence": [
+    "hermes_cli/runtime_state.py:17",
+    "pm/install.py:179",
+    "pm/install.py:697",
+    "pm/environments.py:77",
+    "pm/environments.py:390",
+    "pm/publication.py:145",
+    "pm/receipt.py:113",
+    "pm/update.py:204",
+    "pm/cli.py:766",
+    "pm/packages.py:894",
+    "pm/security_packages.py:116",
+    "pm/plugins_state.py:38"
+   ],
+   "problem": "PM claims independence from the application graph (pm/runtime.py:1-5; Dockerfile:202-207 copies only pm/ + hermes_constants.py), yet the worker imports hermes_cli.config (lazy policy), hermes_cli.runtime_state (its own install lock/journal/leases), private hermes_cli.auth._file_lock and hermes_cli._launchers._launcher_python, hermes_cli.update_receipt, urllib_security, plugins_manifest, macos_signing, root utils, scripts.bundles.native, and tools/agent modules for package verification. Import matrix: pm->hermes_cli 26 lazy edges; hermes_cli->pm 24 eager + 144 lazy. hermes_cli/runtime_state.py imports only pm + stdlib: it is PM code filed under the app. Each pm-only bootstrap stage breaks on whichever path first reaches one of these imports, and only on that install kind.",
+   "move": "Move the body of hermes_cli/runtime_state.py into pm/ (pm/generations.py, PMC-01) and keep a forwarder at the old path (tests/compat/old_updater_surface.json pins the file). Lazy policy arrives as request data (PMC-07). _file_lock and _launcher_python move into pm or are passed in; package verify hooks needing agent/tools take a caller-supplied callable. Add an import-linter contract: pm imports only stdlib, its 4 runtime deps, hermes_constants, hermes_platform.",
+   "reference": {
+    "repo": "home-assistant-core",
+    "path": "homeassistant/requirements.py:96",
+    "pattern": "install manager imports only util.package; config passed in via pip_kwargs()"
+   },
+   "loc_delta": -20,
+   "risk": "Old updaters import hermes_cli.runtime_state mid-swap; the forwarder must re-export every current name. Tests patch hermes_cli.runtime_state._atomic_bytes.",
+   "depends_on": [
+    "PMC-07"
+   ]
+  },
+  {
+   "id": "PMC-05",
+   "title": "The package manager parses and writes every profile's config.yaml plugin selection and replaces plugin trees, duplicating the plugin loader's enablement rules",
+   "severity": "high",
+   "effort": "L",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "pm/publication.py:62",
+    "pm/publication.py:104",
+    "pm/plugin_eviction.py:77",
+    "pm/plugin_eviction.py:143",
+    "pm/plugins_state.py:22",
+    "pm/plugins_state.py:118",
+    "hermes_cli/runtime_state.py:62",
+    "hermes_cli/plugins_discovery.py:112",
+    "pm/plugin_inputs.py:13"
+   ],
+   "problem": "PM re-parses config.yaml with its own validator and enablement rules (plugins_state.py:22-79), separately from hermes_cli/plugins_discovery.py:112-122; writes plugins.enabled/disabled and memory.provider via ruamel round-trip (publication.py:76-101, plugin_eviction.py:90-125); swaps plugin directories and .install-metadata.json (publication.py:142-175); and recovers from a journal whose two row shapes are handled in hermes_cli/runtime_state.py:62-136. Four mutually exclusive PluginInput kinds select the behaviour. The memory-provider rule is encoded twice. Two definitions of 'enabled' can disagree.",
+   "move": "Keep the atomic guarantee, make it generic: PM sync takes members: list[Path] and an optional Publication(files: dict[Path, bytes], trees: list[(target, staged)]) of opaque bytes prepared by the plugin layer; PM journals and commits them with the selection and never parses YAML. Enablement reading and eviction policy move to hermes_cli/plugins_*. PluginInput collapses to members + publication; pm/plugins_state.py and the YAML editing in publication.py/plugin_eviction.py leave pm/.",
+   "reference": {
+    "repo": "home-assistant-core",
+    "path": "homeassistant/requirements.py:139",
+    "pattern": "loader asks the requirements manager for installs only; it never writes config entries"
+   },
+   "loc_delta": -100,
+   "risk": "Commit must stay atomic across config bytes, plugin tree and selection; recover_publication must still run before activation (pm/environments.py:394-396). Shared with seams 11-plugins and 03-pm-flows.",
+   "depends_on": [
+    "PMC-01",
+    "PMC-04"
+   ]
+  },
+  {
+   "id": "PMC-06",
+   "title": "The app venv is forced into the Package hierarchy as a StatePackage; one Facts class stores two record types across two files with a legacy fallback",
+   "severity": "high",
+   "effort": "M",
+   "kind": "boundary",
+   "low_hanging": true,
+   "evidence": [
+    "pm/package.py:289",
+    "pm/packages.py:351",
+    "pm/client.py:58",
+    "pm/client.py:189",
+    "pm/install.py:534",
+    "pm/registry.py:66",
+    "pm/lock.py:169",
+    "pm/lock.py:205",
+    "pm/install.py:195",
+    "pm/install.py:831"
+   ],
+   "problem": "Venv subclasses Package yet uses none of url/fetch/unpack/stage/verify/env, and overrides expected_stamp with a different signature. Four isinstance(StatePackage) branches and a 'state' bootstrap tier paper over it; pm.ensure('venv') silently becomes sync_venv. Facts mixes tool records (entry/version/env/artifacts/digest) and the venv record (stamp/extras/environment/resolved_lock), told apart by 'entry' in fact. The venv record is read with a fallback to the store facts file at 4 sites. pm/install.py (983 lines) holds both engines.",
+   "move": "Venv stops being a Package: delete StatePackage, the isinstance branches and the 'state' tier. Split pm/install.py into pm/tools.py (store installs, PATH) and pm/appenv.py (venv sync). Two frozen records, ToolFact and EnvSelection (= PMC-01 Selection). Drop the store-file venv fallback after one migration.",
+   "reference": {
+    "repo": "attrs",
+    "path": "src/attr/_next_gen.py:23",
+    "pattern": "define(frozen=True) typed records instead of shape-sniffed dicts"
+   },
+   "loc_delta": -120,
+   "risk": "Sealed payload facts.json files keep the old shape and must still read. hermes_cli/doctor_platform.py:420 imports pm.packages.Venv.",
+   "depends_on": [
+    "PMC-01"
+   ]
+  },
+  {
+   "id": "PMC-07",
+   "title": "Install consent is decided in 19 places from an explicit bool, a repair flag, a bootstrap tier, an env var used as IPC, and a config read inside the PM worker",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "boundary",
+   "low_hanging": false,
+   "evidence": [
+    "pm/install.py:161",
+    "pm/client.py:67",
+    "pm/worker_operations.py:17",
+    "pm/operations.py:21",
+    "pm/install.py:558",
+    "pm/install.py:840",
+    "pm/workspace.py:321",
+    "pm/runtime.py:156"
+   ],
+   "problem": "rg 'lazy_installs_allowed\\(\\)|_refuse_lazy\\(' pm finds 19 decision sites; `explicit` appears 128 times across pm/. The worker reads security.allow_lazy_installs through hermes_cli.config (install.py:179-190) and the client forwards policy by setting HERMES_DISABLE_LAZY_INSTALLS=1 in the child env (client.py:67). No single place says which operations may download.",
+   "move": "One Consent value (explicit | lazy_allowed | lazy_refused | repair) decided once at the entry point (CLI, or the ensure_import caller in the app process) and carried in the request. The worker never reads config or env for policy; Operation.bootstrap folds into the same check.",
+   "reference": {
+    "repo": "home-assistant-core",
+    "path": "homeassistant/requirements.py:285",
+    "pattern": "skip_pip policy applied in one place, pip_kwargs computed once"
+   },
+   "loc_delta": -60,
+   "risk": "Docker and the hermetic test harness set HERMES_DISABLE_LAZY_INSTALLS; it stays an entry-point input.",
+   "depends_on": [
+    "PMC-02"
+   ]
+  },
+  {
+   "id": "PMC-08",
+   "title": "Package-definition marshalling across the worker seam has no production consumer",
+   "severity": "medium",
+   "effort": "S",
+   "kind": "kill",
+   "low_hanging": false,
+   "evidence": [
+    "pm/registry.py:69",
+    "pm/registry.py:106",
+    "pm/client.py:105",
+    "pm/worker.py:98",
+    "pm/__init__.py:37"
+   ],
+   "problem": "Every worker request serializes module/qualname/file/namespace paths for non-pm.packages Package classes and the worker re-imports them with a spec_from_file_location fallback and synthetic namespace modules (~90 lines). No production code registers a Package outside pm/packages.py and pm/security_packages.py (only tests and an unregistered scripts/termux/stage_runtime_libs.py:54 subclass). pm.security_packages is already a built-in module (registry.py:17) yet is marshalled on every request. The facade exports register/Package publicly. Root AGENTS.md rejects extension points without a consumer.",
+   "move": "Delete package_definitions, load_package_definitions, the request 'packages' field and the worker call; stop exporting register from the facade. If plugin-defined packages are ever needed, discover them by entry point inside the worker.",
+   "reference": {
+    "repo": "jupyter_client",
+    "path": "jupyter_client/provisioning/factory.py:164",
+    "pattern": "entry-point discovery instead of shipping class identities over IPC"
+   },
+   "loc_delta": -110,
+   "risk": "tests/pm/test_worker_registry.py and tests/pm/test_runtime_bootstrap_tls.py:140 fixtures go; they test only this mechanism.",
+   "depends_on": []
+  },
+  {
+   "id": "PMC-09",
+   "title": "Two urllib client configurations with divergent redirect/TLS policy, per-site timeouts, nested retries, and upstream scrapers split from their packages",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": false,
+   "evidence": [
+    "pm/downloader.py:51",
+    "pm/store.py:174",
+    "pm/update.py:214",
+    "pm/network.py:62",
+    "pm/downloader.py:464",
+    "pm/update.py:335",
+    "pm/update.py:422",
+    "pm/update.py:470",
+    "hermes_cli/web_routers/local_models.py:440"
+   ],
+   "problem": "Opener A (downloader, https-only redirects, stdlib TLS) and opener B (hermes_cli.urllib_security, follows https->http with header stripping, truststore) differ; store.hash_url imports the downloader's private _OPENER/_UA. Timeouts are literals (60/120/600/60/60). Ranged fetch downgrades inside retry_network inside a per-mirror loop; sources are probed twice. Three Windows-hold retry loops use three schedules. Single-consumer scrapers (node, martin-riedl, btbn, pbs, llama) live in update.py apart from Package.latest_versions; GitHub pagination is copied 3 times. Download also serves dashboard model downloads with no sha256.",
+   "move": "One stdlib pm/http.py client object (one opener, https-only redirects, truststore, one UA, a Timeout value, one retry policy with jitter) used by the downloader, hash_url and scrapers; one replace_with_retry helper; move single-consumer scrapers onto their Package classes; one GitHub pagination helper. Keep the range/resume core.",
+   "reference": {
+    "repo": "httpx",
+    "path": "httpx/_client.py:594",
+    "pattern": "one long-lived client with a typed Timeout (httpx/_config.py:72); retries as in stamina/_core.py:119"
+   },
+   "loc_delta": -120,
+   "risk": "Mirror fallback, pause semantics and Windows AV holds must be preserved. pm must stay stdlib-only: copy the shape, not the dependency.",
+   "depends_on": []
+  },
+  {
+   "id": "PMC-10",
+   "title": "Eleven build/CI operations ship in the runtime facade and route through the per-call worker; four different ways reach the PM runtime",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "pm/__init__.py:28",
+    "pm/worker_operations.py:26",
+    "pm/build_env.py:64",
+    "pm/cli.py:853",
+    "pm/runtime.py:271",
+    "pm/client.py:304"
+   ],
+   "problem": "build_environment, lock_project, stage_manager_runtime, ensure_environment, ensure_project_environment, check_project_lock, export_requirements, build_requirements_environment, prepare_tools, stage_tools and prune_cache have no in-scope runtime caller (rg per name: callers are scripts/, CI, Dockerfile, pm/build_env.py, pm/cli.py). The PM runtime is reached by CLI re-exec (run_cli, parsing argv twice), per-call worker, direct is_runtime() calls, and the always-direct stage_manager_runtime.",
+   "move": "One rule: PM code runs inside the PM runtime. CLIs (pm.cli, pm.build_env) re-exec once via run_cli; only the app-facing runtime API (ensure, sync_venv, venv_is_current, ensure_python_tool, ensure_import) uses the worker. Build ops move to pm/build/ and leave the facade and worker table.",
+   "reference": {
+    "repo": "llm",
+    "path": "llm/cli.py:3321",
+    "pattern": "install is one in-process call owned by the CLI"
+   },
+   "loc_delta": -150,
+   "risk": "scripts/ callers switch from pm.build_environment etc. to pm.build.",
+   "depends_on": [
+    "PMC-02"
+   ]
+  },
+  {
+   "id": "PMC-11",
+   "title": "Receipts are ambient ContextVar state with copy-on-write and cross-process correlation glue",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "pm/receipt.py:54",
+    "pm/receipt.py:104",
+    "pm/receipt.py:158",
+    "pm/receipt.py:186",
+    "pm/client.py:41",
+    "pm/client.py:166",
+    "pm/worker.py:96",
+    "pm/install.py:811"
+   ],
+   "problem": "Four ContextVars, deep-copy-on-write records, a correlation id read from hermes_cli.update_receipt, a worker context and a client-side accept_worker_receipt re-filing step; record_* calls scattered across install.py, client.py, plugin_eviction.py; a 35-line docstring explaining the hazards. The plugin update cadence also writes into PM receipts (record_plugin_checks).",
+   "move": "sync_venv creates a Receipt object, passes it explicitly to the helpers that record, and returns it (the worker already returns it). The updater attaches the returned receipt to its own. record_plugin_checks moves to the plugin cadence's receipt.",
+   "reference": {
+    "repo": "home-assistant-core",
+    "path": "homeassistant/requirements.py:126",
+    "pattern": "explicit manager instance state (install_failure_history) instead of ambient globals"
+   },
+   "loc_delta": -100,
+   "risk": "The updater embeds sync sections by correlation id; that contract becomes a return value.",
+   "depends_on": [
+    "PMC-02"
+   ]
+  },
+  {
+   "id": "PMC-12",
+   "title": "No narrow public API: 176 imports reach 25 pm submodules; TID251 bans name modules that do not exist and are bypassed by a re-export",
+   "severity": "medium",
+   "effort": "S",
+   "kind": "boundary",
+   "low_hanging": false,
+   "evidence": [
+    "pyproject.toml:902",
+    "pm/workspace.py:33",
+    "hermes_cli/plugins_admission.py:76",
+    "hermes_cli/memory_setup.py:59",
+    "pm/store.py:174",
+    "pm/__init__.py:22"
+   ],
+   "problem": "Beside the 42-name facade, consumers import 25 submodules directly (scripts/pmc_consumers.py). TID251 bans pm.uv, pm.client.uv, pm.install.uv (none exist) plus pm._uv, pm.environment, pm.runtime_stage; the pm.environment ban is bypassed by pm/workspace.py:33 re-exporting ResolutionConflict, consumed at hermes_cli/plugins_admission.py:76. Private names cross module lines (_is_member_candidate, _refuse_lazy, downloader._OPENER, update._get_json).",
+   "move": "Public surface = facade (runtime API) + pm.environments (boot). Replace the six TID251 entries with one import-linter forbidden contract: outside pm/, import only pm and pm.environments. Delete the workspace.py:33 re-export.",
+   "reference": {
+    "repo": "attrs",
+    "path": "src/attrs/__init__.py:1",
+    "pattern": "single public package over private implementation modules"
+   },
+   "loc_delta": -10,
+   "risk": "Mechanical import rewrites in ~50 files.",
+   "depends_on": []
+  }
+ ],
+ "kill_list": [
+  {
+   "target": "pm/registry.py::package_definitions + ::load_package_definitions",
+   "why": "marshals external Package classes; none exist in production",
+   "callers": 2,
+   "evidence": "pm/client.py:105, pm/worker.py:98"
+  },
+  {
+   "target": "pm/worker_operations.py",
+   "why": "string routing table restating function names",
+   "callers": 2,
+   "evidence": "pm/client.py:16, pm/worker.py:69"
+  },
+  {
+   "target": "pm/client.py wrappers build_environment..prune_cache",
+   "why": "11 signature copies of the implementations",
+   "callers": 0,
+   "evidence": "pm/client.py:273-421 (reached only via the facade)"
+  },
+  {
+   "target": "pm/paths.py",
+   "why": "delegates to pm/environments.py; replaced by Install",
+   "callers": 17,
+   "evidence": "scripts/pmc_consumers.py: pm.paths 17 imports outside pm"
+  },
+  {
+   "target": "pm/package.py::StatePackage",
+   "why": "app venv is not a package; 4 isinstance branches exist only for it",
+   "callers": 4,
+   "evidence": "pm/client.py:58, pm/client.py:189, pm/install.py:534, pm/registry.py:66"
+  },
+  {
+   "target": "pm/workspace.py:33 re-export",
+   "why": "bypasses the TID251 ban on pm.environment",
+   "callers": 2,
+   "evidence": "hermes_cli/plugins_admission.py:76, pm/client.py:82"
+  },
+  {
+   "target": "pm/store.py::Store.fetch",
+   "why": "test-only wrapper; production uses fetch_many",
+   "callers": 0,
+   "evidence": "notes/02-sub-download.md section 6"
+  },
+  {
+   "target": "pyproject.toml TID251 entries pm.uv, pm.client.uv, pm.install.uv",
+   "why": "ban modules/attributes that do not exist",
+   "callers": 0,
+   "evidence": "pyproject.toml:903-905"
+  },
+  {
+   "target": "pm/install.py store-file venv fallback _facts().get('venv')",
+   "why": "legacy record location read at 4 sites",
+   "callers": 4,
+   "evidence": "pm/install.py:195, :653, :831, :836"
+  },
+  {
+   "target": "HERMES_DISABLE_LAZY_INSTALLS as client-to-worker IPC",
+   "why": "env var used as an internal message field",
+   "callers": 1,
+   "evidence": "pm/client.py:67"
+  }
+ ],
+ "simplify_list": [
+  {
+   "from": [
+    "pm/runtime.py prepare/collect",
+    "pm/operations.py _ensure_generation/_selection",
+    "hermes_cli/runtime_state.py leases/collect",
+    "pm/packages.py Venv.apply generation"
+   ],
+   "to": "pm/generations.py::Generations",
+   "loc_saved": 250,
+   "evidence": "PMC-01"
+  },
+  {
+   "from": [
+    "pm/client.py wrappers",
+    "pm/worker_operations.py",
+    "pm/worker.py per-op branches"
+   ],
+   "to": "@operation registry + one generic proxy",
+   "loc_saved": 300,
+   "evidence": "PMC-02"
+  },
+  {
+   "from": [
+    "pm/paths.py",
+    "pm/environments.py layout functions",
+    "6 manifest.json probes"
+   ],
+   "to": "frozen Install value",
+   "loc_saved": 150,
+   "evidence": "PMC-03"
+  },
+  {
+   "from": [
+    "Facts tool records",
+    "Facts venv record",
+    "two facts.json files"
+   ],
+   "to": "ToolFact + EnvSelection records",
+   "loc_saved": 120,
+   "evidence": "PMC-06"
+  },
+  {
+   "from": [
+    "19 consent decision sites",
+    "Operation.bootstrap tiers",
+    "env IPC flag"
+   ],
+   "to": "Consent decided at the entry point",
+   "loc_saved": 60,
+   "evidence": "PMC-07"
+  },
+  {
+   "from": [
+    "downloader opener",
+    "urllib_security opener",
+    "3 GH pagination loops",
+    "3 Windows-hold retries"
+   ],
+   "to": "pm/http.py client + one retry helper",
+   "loc_saved": 120,
+   "evidence": "PMC-09"
+  },
+  {
+   "from": [
+    "run_cli re-exec",
+    "per-call worker",
+    "direct is_runtime calls",
+    "always-direct stage_manager_runtime"
+   ],
+   "to": "re-exec for CLIs, worker for 5 runtime ops",
+   "loc_saved": 150,
+   "evidence": "PMC-10"
+  },
+  {
+   "from": [
+    "4 receipt ContextVars",
+    "correlation glue"
+   ],
+   "to": "explicit Receipt object",
+   "loc_saved": 100,
+   "evidence": "PMC-11"
+  }
+ ],
+ "reference_patterns": [
+  {
+   "repo": "attrs",
+   "path": "src/attr/_next_gen.py:431",
+   "pattern": "frozen value classes",
+   "applies_to": "Install, Selection, ToolFact (PMC-01/03/06)"
+  },
+  {
+   "repo": "attrs",
+   "path": "src/attr/_make.py:589",
+   "pattern": "evolve for derived values",
+   "applies_to": "Install for a borrowed home (PMC-03)"
+  },
+  {
+   "repo": "jupyter_client",
+   "path": "jupyter_client/session.py:651",
+   "pattern": "one typed message envelope for every request",
+   "applies_to": "worker protocol (PMC-02)"
+  },
+  {
+   "repo": "jupyter_client",
+   "path": "jupyter_client/provisioning/factory.py:164",
+   "pattern": "entry-point discovery",
+   "applies_to": "plugin-defined packages if ever needed (PMC-08)"
+  },
+  {
+   "repo": "home-assistant-core",
+   "path": "homeassistant/requirements.py:96",
+   "pattern": "install manager with config passed in; explicit failure history",
+   "applies_to": "PMC-04, PMC-07, PMC-11"
+  },
+  {
+   "repo": "httpx",
+   "path": "httpx/_client.py:594",
+   "pattern": "one long-lived client with typed Timeout (httpx/_config.py:72)",
+   "applies_to": "pm/http.py (PMC-09)"
+  },
+  {
+   "repo": "stamina",
+   "path": "src/stamina/_core.py:119",
+   "pattern": "one retry context with typed on=",
+   "applies_to": "network and Windows-hold retries (PMC-09)"
+  },
+  {
+   "repo": "llm",
+   "path": "llm/cli.py:3321",
+   "pattern": "install is one in-process call owned by the CLI",
+   "applies_to": "PMC-10"
+  }
+ ],
+ "seam_answer": "pm/ is not one package manager with one model. It has a good core: a pinned, hash-verified tool store (Lockfile, Store, Facts, Download) and a single clean uv engine (PythonEnvironment). Around it sit four layers that each re-implement an idea: three generation stores (PMC-01), a hand-mirrored IPC layer with two code paths per operation (PMC-02, PMC-10), a plugin-config transaction system that belongs to the plugin layer (PMC-05), and a path model rediscovered per call and patched at runtime (PMC-03). The API is wide: 42 facade names plus 176 imports into 25 submodules; 'environment' names four modules, 'operations' three, plugin logic five. A simonw/hynek-quality version: one Install value, one Store of pinned tools, one Generations primitive for app venv/PM runtime/side environments, one @operation registry behind one transport, a six-name runtime facade (ensure, ensure_import, sync_venv, venv_is_current, ensure_python_tool, env_for), pm.environments for boot, pm.build for CI; plugin config edits arrive as opaque bytes committed with a selection. Deletable: definition marshalling, client wrappers and routing table, pm/paths.py, StatePackage, the legacy facts fallback, stale bans; about -1,300 lines in pm/ before tests.",
+ "cross_seam": [
+  {
+   "seam": "03-pm-flows",
+   "note": "PM's boot/update half lives in hermes_cli (venv_sync 626, _early_recovery 684, boot_bootstrap 247, update_completion 313); generation GC duplicated with pm/cli.py:518-523",
+   "evidence": "hermes_cli/venv_sync.py:139"
+  },
+  {
+   "seam": "11-plugins",
+   "note": "PM re-implements plugins.enabled/disabled semantics and the memory.provider union separately from the plugin loader",
+   "evidence": "pm/plugins_state.py:64"
+  },
+  {
+   "seam": "07-config",
+   "note": "PM writes user config.yaml via ruamel round-trip outside the config system",
+   "evidence": "pm/publication.py:76"
+  },
+  {
+   "seam": "12-cli",
+   "note": "hermes pm bypasses argparse registration by sniffing sys.argv[1:2] == ['pm']",
+   "evidence": "hermes_cli/main.py:677"
+  },
+  {
+   "seam": "09-concurrency",
+   "note": "worker Popen, run_cli and the Windows PowerShell native-build spawn have no overall timeout",
+   "evidence": "pm/client.py:116"
+  },
+  {
+   "seam": "14-errors-obs",
+   "note": "any marker-evaluation failure reads as 'supported'; any config error reads as 'lazy installs refused'",
+   "evidence": "pm/extras.py:158"
+  },
+  {
+   "seam": "01-layout",
+   "note": "runtime package pm imports scripts.bundles.native",
+   "evidence": "pm/cli.py:766"
+  },
+  {
+   "seam": "06-tools",
+   "note": "package definitions import tools/agent modules for env and provenance checks",
+   "evidence": "pm/packages.py:894"
+  },
+  {
+   "seam": "10-gateway",
+   "note": "dashboard model downloads use pm.downloader.Download without a sha256",
+   "evidence": "hermes_cli/web_routers/local_models.py:440"
+  }
+ ],
+ "unverified": [
+  "Side environments are never collected: based on rg 'gen-\\[|glob(\"gen' finding only the validator at pm/operations.py:141; a collector under a name not searched would refute it.",
+  "Whether a pm-only bootstrap stage (Dockerfile COPY pm/ + hermes_constants.py) reaches a hermes_cli import at runtime; verify by running python -I -m pm.cli install from a tree with only those paths.",
+  "TLS trust store used by pm/downloader.py when PM runs standalone (child note section 1).",
+  "loc_delta figures are estimates from function spans, not a prototype.",
+  "Exact hermes_cli.runtime_state names in-flight old updaters import: tests/compat/old_updater_surface.json:693,873 pins the file path only.",
+  "How many PM fix commits a single Generations primitive would have prevented; commits were not classified one by one."
+ ]
+}

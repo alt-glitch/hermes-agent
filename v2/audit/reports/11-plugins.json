@@ -1,0 +1,940 @@
+{
+ "seam": "plugins",
+ "nn": "11",
+ "title": "Plugin system and extension points",
+ "prefix": "PLG",
+ "tldr": [
+  "7 separate systems find and import plugin code, each with its own directory walk, import-by-path, entry-point scan, host-isolation branch and precedence rule (4 different rules). PluginManager is only one of them (PLG-01).",
+  "Biggest simplification: one kind table (kind -> base class, registry, selector key, precedence) on one loader. Memory, context engine, cron, model providers, dashboard plugins and gateway hooks never joined the pieces that exist. Est. -1,500 lines.",
+  "Biggest kill: the gateway HOOK.yaml hook bus (gateway/hooks.py), a second event vocabulary that fires next to the plugin hook and bypasses plugin-host isolation. Also 4 in-tree vendor plugins (~5.6k LOC) the repo's own rule puts out of tree (PLG-03, PLG-07).",
+  "Low-hanging (S/M and high+): 3 - PLG-02 (isolation by copy, gateway hooks bypass it), PLG-03 (two hook vocabularies), PLG-04 (registrars outside the unload ledger; context references are process-global).",
+  "Seam answer: 7 code-loading discovery systems, 2 entry-point groups, ~31 registries, 7 dispatch channels. pluggy would replace hook dispatch and entry-point loading (~400 lines), not the hard parts. Collapse discovery and registries first; pluggy is optional after that."
+ ],
+ "scope": {
+  "paths": [
+   "hermes_cli/plugins*.py",
+   "hermes_cli/plugin_*.py",
+   "hermes_cli/agent_plugins.py",
+   "hermes_cli/middleware.py",
+   "hermes_cli/lifecycle.py",
+   "plugins/ (excluding plugins/platforms/)",
+   "agent/*_registry.py",
+   "agent/provider_registry.py",
+   "agent/provider_base.py",
+   "agent/memory_provider.py",
+   "agent/memory_manager.py",
+   "agent/context_engine.py",
+   "agent/shell_hooks.py",
+   "agent/outbound_webhooks.py",
+   "agent/plugin_stream_hooks.py",
+   "agent/auxiliary_hooks.py",
+   "providers/__init__.py",
+   "gateway/hooks.py",
+   "gateway/platform_registry.py",
+   "hermes_cli/web_server_dashboard.py",
+   "registration_lifecycle.py",
+   "dashboard-auth and secret-source registries"
+  ],
+  "loc": 50771,
+  "files": 216
+ },
+ "modules": [
+  {
+   "path": "hermes_cli/plugins.py",
+   "loc": 2331,
+   "owns": "VALID_HOOKS (41 names), PluginContext (854-line class, ~45 methods), PluginManager, per-home manager cache, module-level hook helpers"
+  },
+  {
+   "path": "hermes_cli/plugins_discovery.py",
+   "loc": 311,
+   "owns": "directory + entry-point scan, gate_manifest (kind -> load/defer/park), later-wins winner selection"
+  },
+  {
+   "path": "hermes_cli/plugins_loader.py",
+   "loc": 717,
+   "owns": "import-by-path, load deadline, deferred platforms, host routing, portable (Agent Plugin) load"
+  },
+  {
+   "path": "hermes_cli/plugins_dispatch.py",
+   "loc": 602,
+   "owns": "invoke_hook (signature-filtered kwargs, timeouts, fail-closed pre_tool_call), event bus, prompt sections, middleware"
+  },
+  {
+   "path": "hermes_cli/plugins_ledger.py + registration_lifecycle.py",
+   "loc": 398,
+   "owns": "per-registration leases so force reload / disable unwinds registries"
+  },
+  {
+   "path": "hermes_cli/plugin_host*.py, hermes_cli/plugin_isolation*.py",
+   "loc": 2016,
+   "owns": "plugins.isolation: host - user plugins in a per-profile child process"
+  },
+  {
+   "path": "plugins/memory/__init__.py, plugins/context_engine/__init__.py, plugins/cron_providers/__init__.py, plugins/plugin_loader.py",
+   "loc": 986,
+   "owns": "three 'exclusive' kinds with their own discovery (bundled-first) and a shared import-by-path helper (568 + 126 + 101 + 191)"
+  },
+  {
+   "path": "providers/__init__.py",
+   "loc": 647,
+   "owns": "model-provider discovery (last-writer-wins, per-home layers)"
+  },
+  {
+   "path": "hermes_cli/web_server_dashboard.py",
+   "loc": 934,
+   "owns": "dashboard plugin discovery (*/dashboard/manifest.json, first-name-wins, launch home)"
+  },
+  {
+   "path": "gateway/hooks.py",
+   "loc": 181,
+   "owns": "~/.hermes/hooks/<name>/HOOK.yaml + handler.py event hooks"
+  },
+  {
+   "path": "agent/provider_registry.py",
+   "loc": 204,
+   "owns": "generic scoped registry behind 7 agent/*_registry.py"
+  }
+ ],
+ "flows": [
+  {
+   "id": "pre-tool-call-block",
+   "title": "A user plugin blocks a tool call (pre_tool_call)",
+   "trigger": "any entry point imports model_tools; later the agent runs a tool call",
+   "inputs": [
+    {
+     "name": "plugin_enabled",
+     "type": "bool",
+     "default": false,
+     "meaning": "the user plugin is listed in plugins.enabled"
+    },
+    {
+     "name": "isolation_host",
+     "type": "bool",
+     "default": false,
+     "meaning": "plugins.isolation: host is set, so user plugins import in a per-profile child process"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "model_tools.py (module import)",
+     "loc": "model_tools.py:162",
+     "does": "calls discover_plugins() as a side effect of importing model_tools",
+     "when": null,
+     "finding": "PLG-10"
+    },
+    {
+     "n": 2,
+     "where": "hermes_cli/plugins.py::discover_plugins",
+     "loc": "hermes_cli/plugins.py:1824",
+     "does": "module-level entry; resolves the manager and starts discovery",
+     "when": null,
+     "finding": "PLG-10"
+    },
+    {
+     "n": 3,
+     "where": "hermes_cli/plugins.py::get_plugin_manager",
+     "loc": "hermes_cli/plugins.py:1768",
+     "does": "returns the PluginManager for the active home (one per profile)",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 4,
+     "where": "hermes_cli/plugins.py::PluginManager.discover_and_load",
+     "loc": "hermes_cli/plugins.py:1350",
+     "does": "takes the discovery lock and binds the home scope; returns early when a plugin's register() re-enters discovery (:1355-1359)",
+     "when": null,
+     "finding": "PLG-10"
+    },
+    {
+     "n": 5,
+     "where": "hermes_cli/plugins_discovery.py::collect_directory_manifests",
+     "loc": "hermes_cli/plugins_discovery.py:189",
+     "does": "scans bundled (skipping memory, context_engine, model-providers, cron_providers at :207-208), user and project directories",
+     "when": null,
+     "finding": "PLG-01"
+    },
+    {
+     "n": 6,
+     "where": "hermes_cli/plugins.py::PluginManager._discover_and_load_inner",
+     "loc": "hermes_cli/plugins.py:1491",
+     "does": "resolve_manifest_winners picks the later source when two manifests share a name (later-wins)",
+     "when": null,
+     "finding": "PLG-01"
+    },
+    {
+     "n": 7,
+     "where": "hermes_cli/plugins_discovery.py::gate_manifest",
+     "loc": "hermes_cli/plugins_discovery.py:257",
+     "does": "parks exclusive/model-provider kinds; a user plugin not in plugins.enabled is parked here (:297) and the flow ends",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 8,
+     "where": "hermes_cli/plugins_loader.py::_load_plugin_scoped",
+     "loc": "hermes_cli/plugins_loader.py:434",
+     "does": "builds a PluginContext for the manifest and decides in-process vs host (:458)",
+     "when": {
+      "input": "plugin_enabled",
+      "equals": true
+     },
+     "finding": "PLG-02"
+    },
+    {
+     "n": 9,
+     "where": "hermes_cli/plugins_loader.py::_load_plugin_scoped._import_and_register",
+     "loc": "hermes_cli/plugins_loader.py:466",
+     "does": "routes the import and register() to the plugin host (one of 9 copies of this host branch)",
+     "when": {
+      "input": "isolation_host",
+      "equals": true
+     },
+     "finding": "PLG-02"
+    },
+    {
+     "n": 10,
+     "where": "hermes_cli/plugins.py::PluginContext.register_hook",
+     "loc": "hermes_cli/plugins.py:974",
+     "does": "the plugin's register(ctx) adds a pre_tool_call callback; _track_callback leases it in the ledger (plugins_ledger.py:63)",
+     "when": {
+      "input": "plugin_enabled",
+      "equals": true
+     },
+     "finding": "PLG-04"
+    },
+    {
+     "n": 11,
+     "where": "agent/tool_executor.py (tool dispatch)",
+     "loc": "agent/tool_executor.py:671",
+     "does": "at tool time imports and calls _dispatch_pre_tool_call_hooks",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 12,
+     "where": "hermes_cli/plugins.py::_dispatch_pre_tool_call_hooks",
+     "loc": "hermes_cli/plugins.py:2150",
+     "does": "calls _get_pre_tool_call_directive_details (:2038)",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 13,
+     "where": "hermes_cli/lifecycle.py::invoke_hook",
+     "loc": "hermes_cli/lifecycle.py:26",
+     "does": "runs the first-party observability observer, then the plugin hooks",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 14,
+     "where": "hermes_cli/plugins_dispatch.py::invoke_hook",
+     "loc": "hermes_cli/plugins_dispatch.py:209",
+     "does": "calls each callback with kwargs filtered by _hook_callback_kwargs (:183), bounded by plugins.hook_callback_timeout; a timeout or raise on pre_tool_call becomes a block directive (fail-closed)",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 15,
+     "where": "hermes_cli/plugins.py::_get_pre_tool_call_directive_details",
+     "loc": "hermes_cli/plugins.py:2038",
+     "does": "applies precedence block > approve > none over the returned directives; the caller does this, not the dispatcher",
+     "when": null,
+     "finding": null
+    }
+   ]
+  },
+  {
+   "id": "memory-provider-activate",
+   "title": "memory.provider: mem0 activates a memory provider",
+   "trigger": "agent construction with memory.provider set to a non-core provider",
+   "inputs": [
+    {
+     "name": "provider_is_bundled",
+     "type": "bool",
+     "default": true,
+     "meaning": "the provider directory lives under the repo's plugins/memory/"
+    },
+    {
+     "name": "isolation_host",
+     "type": "bool",
+     "default": false,
+     "meaning": "plugins.isolation: host is set"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "agent/agent_init.py::init (memory setup)",
+     "loc": "agent/agent_init.py:1371",
+     "does": "reads memory.provider; for a non-core name imports plugins.memory.load_memory_provider and calls it (:1376)",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 2,
+     "where": "plugins/memory/__init__.py::load_memory_provider",
+     "loc": "plugins/memory/__init__.py:192",
+     "does": "module-level loader for the memory kind, separate from PluginManager",
+     "when": null,
+     "finding": "PLG-01"
+    },
+    {
+     "n": 3,
+     "where": "plugins/memory/__init__.py::find_provider_dir",
+     "loc": "plugins/memory/__init__.py:124",
+     "does": "searches bundled -> user -> project -> entry point (bundled-first, the reverse of PluginManager's later-wins)",
+     "when": null,
+     "finding": "PLG-01"
+    },
+    {
+     "n": 4,
+     "where": "plugins/memory/__init__.py::load_memory_provider (isolation check)",
+     "loc": "plugins/memory/__init__.py:237",
+     "does": "refuses a non-bundled provider when isolation is host and no host is available",
+     "when": {
+      "input": "isolation_host",
+      "equals": true
+     },
+     "finding": "PLG-02"
+    },
+    {
+     "n": 5,
+     "where": "plugins/memory/__init__.py::_load_provider_from_dir",
+     "loc": "plugins/memory/__init__.py:344",
+     "does": "for a non-bundled provider gets user_plugin_host() and routes the load there (another copy of the host branch)",
+     "when": {
+      "input": "provider_is_bundled",
+      "equals": false
+     },
+     "finding": "PLG-02"
+    },
+    {
+     "n": 6,
+     "where": "plugins/plugin_loader.py::load_plugin_module",
+     "loc": "plugins/plugin_loader.py:93",
+     "does": "imports the provider by path in-process (a separate import-by-path from plugins_loader.py)",
+     "when": {
+      "input": "provider_is_bundled",
+      "equals": true
+     },
+     "finding": "PLG-01"
+    },
+    {
+     "n": 7,
+     "where": "plugins/memory/__init__.py::_ProviderCollector",
+     "loc": "plugins/memory/__init__.py:374",
+     "does": "captures register_memory_provider and forwards other register_* calls to a real PluginContext",
+     "when": null,
+     "finding": "PLG-06"
+    },
+    {
+     "n": 8,
+     "where": "hermes_cli/plugins_ledger.py (dual-kind hook ownership)",
+     "loc": "hermes_cli/plugins_ledger.py:179",
+     "does": "hooks registered here go through the 'fallback hook' group (:179-201) because the same directory may also load through general discovery",
+     "when": null,
+     "finding": "PLG-06"
+    },
+    {
+     "n": 9,
+     "where": "agent/memory_manager.py::MemoryManager.add_provider",
+     "loc": "agent/memory_manager.py:379",
+     "does": "agent_init.py:1383 adds the loaded provider to the agent's MemoryManager",
+     "when": null,
+     "finding": null
+    }
+   ]
+  },
+  {
+   "id": "gateway-slash-command",
+   "title": "A gateway user types /model",
+   "trigger": "gateway inbound message that is a recognized slash command while no agent is running",
+   "inputs": [
+    {
+     "name": "hook_dir_present",
+     "type": "bool",
+     "default": false,
+     "meaning": "~/.hermes/hooks/<x>/HOOK.yaml declares command:model"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "gateway/run_inbound.py (command dispatch)",
+     "loc": "gateway/run_inbound.py:813",
+     "does": "calls fire_pre_command_hook for the plugin pre_command hook",
+     "when": null,
+     "finding": "PLG-03"
+    },
+    {
+     "n": 2,
+     "where": "hermes_cli/plugins.py::fire_pre_command_hook",
+     "loc": "hermes_cli/plugins.py:1992",
+     "does": "fires pre_command; observer-only, return values ignored (VALID_HOOKS comment at :197-203)",
+     "when": null,
+     "finding": "PLG-03"
+    },
+    {
+     "n": 3,
+     "where": "gateway/run_inbound.py (command dispatch)",
+     "loc": "gateway/run_inbound.py:827",
+     "does": "then calls self.hooks.emit_collect('command:model'); results can deny, handle or rewrite the command (:832-846)",
+     "when": null,
+     "finding": "PLG-03"
+    },
+    {
+     "n": 4,
+     "where": "gateway/hooks.py::HookRegistry.emit_collect",
+     "loc": "gateway/hooks.py:125",
+     "does": "second hook system; runs every handler registered for the event",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 5,
+     "where": "gateway/hooks.py::ProfileHookRegistries._active",
+     "loc": "gateway/hooks.py:157",
+     "does": "lazily builds a HookRegistry for the active home on first use",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 6,
+     "where": "gateway/hooks.py::HookRegistry.discover_and_load",
+     "loc": "gateway/hooks.py:89",
+     "does": "walks ~/.hermes/hooks/ for HOOK.yaml directories",
+     "when": null,
+     "finding": "PLG-01"
+    },
+    {
+     "n": 7,
+     "where": "gateway/hooks.py::_load_hook_dir",
+     "loc": "gateway/hooks.py:59",
+     "does": "executes handler.py with spec_from_file_location in the gateway process; no plugin-host routing even under plugins.isolation: host",
+     "when": {
+      "input": "hook_dir_present",
+      "equals": true
+     },
+     "finding": "PLG-02"
+    },
+    {
+     "n": 8,
+     "where": "gateway/hooks.py::HookRegistry.emit_collect (error path)",
+     "loc": "gateway/hooks.py:137",
+     "does": "handler errors are print()ed (:137-138), not logged",
+     "when": {
+      "input": "hook_dir_present",
+      "equals": true
+     },
+     "finding": "PLG-03"
+    }
+   ]
+  }
+ ],
+ "findings": [
+  {
+   "id": "PLG-01",
+   "title": "Seven plugin discovery systems with four precedence rules; kinds are systems instead of rows",
+   "severity": "high",
+   "effort": "L",
+   "kind": "collapse",
+   "low_hanging": false,
+   "evidence": [
+    "hermes_cli/plugins_discovery.py:207-208",
+    "hermes_cli/plugins_discovery.py:221",
+    "plugins/memory/__init__.py:4-7",
+    "plugins/memory/__init__.py:95-109",
+    "plugins/context_engine/__init__.py:32-57",
+    "plugins/cron_providers/__init__.py:39-54",
+    "providers/__init__.py:575-643",
+    "hermes_cli/web_server_dashboard.py:465-506",
+    "hermes_cli/web_server_dashboard.py:549",
+    "gateway/hooks.py:89-111",
+    "hermes_cli/plugins_manifest.py:268",
+    "hermes_cli/plugins_manifest.py:502-521"
+   ],
+   "problem": "Code-loading discovery is done today by PluginManager, plugins/memory, plugins/context_engine, plugins/cron_providers, providers/__init__.py, the dashboard scanner and gateway/hooks.py. Each has its own directory walk, its own spec_from_file_location sequence (6 copies), its own entry-point code (2 groups, the hasattr(eps,'select') shim 3x) and its own precedence: PluginManager later-wins, model providers last-writer-wins, memory/context/cron bundled-first, dashboard user-first. The same directory under ~/.hermes/plugins/foo therefore means different things by kind. Kind is partly guessed by substring-sniffing __init__.py (plugins_manifest.py:268, plus 3 copies in memory/context/cron). Every cross-cutting rule must be re-implemented N times; the dashboard copy already diverged into two security advisories (GHSA-5qr3-c538-wm9j env truthiness and the absolute-path api RCE, recorded at web_server_dashboard.py:495-502). A contributor adding a kind has no single pattern to follow.",
+   "move": "Add hermes_cli/plugin_kinds.py with one frozen table PluginKind(name, base_class, registry, select_key, precedence, cardinality, load). Rows: standalone; backend:<category> (image_gen, video_gen, web, browser, tts, stt, terminal_env, secret_source - today's _SCOPED_PROVIDER_REGISTRARS); exclusive:memory (memory.provider, bundled-first, load on select); exclusive:context_engine (context.engine); exclusive:cron (cron.provider); model-provider (last-writer-wins); platform (deferred); dashboard (manifest.json). PluginManager scans each source once, reads kind: from the manifest (no sniffing; a manifest without kind defaults to standalone and warns with the fix) and asks the kind row for precedence. Delete the discovery halves of plugins/memory/__init__.py, plugins/context_engine/__init__.py, plugins/cron_providers/__init__.py, plugins/plugin_loader.py, the dashboard scanner (web_server_dashboard.py:465-575) and providers/__init__.py::_scan_home_layer/_discover_entry_point_providers; each keeps a ~20-line selector select(kind, name). One entry-point group with the kind in the manifest; hermes_agent.memory_providers stays an alias group for one deprecation window.",
+   "reference": {
+    "repo": "jupyter_client",
+    "path": "jupyter_client/provisioning/factory.py:165-170",
+    "pattern": "entry-point group per extension type, one factory resolves by name (see also inspect_ai src/inspect_ai/_util/registry.py:621-627 registry_key(type, name); pluggy src/pluggy/_manager.py:482 load_setuptools_entrypoints once)"
+   },
+   "loc_delta": -1500,
+   "risk": "Precedence is a documented contract per kind (plugins/memory/__init__.py:7: 'Changing this order is a breaking change'); the kind row must keep each rule, not unify it. Model-provider discovery runs while hermes_cli.config/auth import (plugins/AGENTS.md:101-103); the unified loader must stay callable at that point without importing user code. Tests that patch plugins.memory._iter_provider_dirs and friends move.",
+   "depends_on": []
+  },
+  {
+   "id": "PLG-02",
+   "title": "Plugin-host isolation is enforced by copy in 7 files; gateway HOOK.yaml handlers bypass it",
+   "severity": "high",
+   "effort": "M",
+   "kind": "boundary",
+   "low_hanging": true,
+   "evidence": [
+    "plugins/AGENTS.md:99-104",
+    "hermes_cli/plugins_loader.py:458",
+    "hermes_cli/plugins_loader.py:543-546",
+    "providers/__init__.py:402-412",
+    "hermes_cli/web_server_dashboard.py:881-885",
+    "plugins/context_engine/__init__.py:78-80",
+    "plugins/cron_providers/__init__.py:82-84",
+    "plugins/memory/__init__.py:237",
+    "plugins/memory/__init__.py:344",
+    "plugins/memory/config_schema.py:106",
+    "gateway/hooks.py:43-72",
+    "gateway/hooks.py:142-170"
+   ],
+   "problem": "plugins/AGENTS.md:99-104 states 'Every user-code import path routes to the host or refuses ... A new user-code loader MUST do the same.' The rule is kept by hand: each loader has its own isolation_mode() == ISOLATION_HOST / user_plugin_host() branch (rg -n \"user_plugin_host\\(\\)|isolation_mode\\(\\)\" -g '!tests/**': 9 loader sites in 7 files). gateway/hooks.py::_load_hook_dir has none: it exec_modules ~/.hermes/hooks/<name>/handler.py in the gateway process, once per served profile (ProfileHookRegistries, gateway/hooks.py:142). Under plugins.isolation: host plus multiplex, a profile's hook handler runs inside the gateway process - the exposure the host exists to remove ('a host sees only its own profile's secrets', plugins/AGENTS.md:115-116). The invariant cannot be checked statically because there is no single choke point.",
+   "move": "One function hermes_cli/plugin_isolation.py::import_user_code(path, *, module_name, capture, base_ref) -> object, the only place allowed to call spec_from_file_location on a non-bundled path; it routes to the host or refuses. All loaders call it (falls out of PLG-01, but can land first). Gateway hooks either go through it or are folded into the plugin bus by PLG-03. Add 'spec_from_file_location outside plugin_isolation.py' to the gist's Phase-1 engine as an AST rule: one rule, zero violations after the move.",
+   "reference": {
+    "repo": "pluggy",
+    "path": "src/pluggy/_manager.py:482",
+    "pattern": "one loader for all external plugins (see also home-assistant-core homeassistant/loader.py:349 async_get_custom_components, one entry for all custom code)"
+   },
+   "loc_delta": -150,
+   "risk": "The host returns proxies (RemotePluginContext); gateway handlers are handle(event_type, context) functions, so the host needs a callable proxy for them or they are refused under host. Preserve: bundled plugins import in-process; HERMES_PLUGIN_HOST_PROCESS=1 never spawns a nested host.",
+   "depends_on": []
+  },
+  {
+   "id": "PLG-03",
+   "title": "Two hook vocabularies for the same lifecycle points: plugin VALID_HOOKS and gateway HOOK.yaml events",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": true,
+   "evidence": [
+    "gateway/run_inbound.py:813-817",
+    "gateway/run_inbound.py:827",
+    "gateway/run_inbound.py:832-846",
+    "hermes_cli/plugins.py:1992-2003",
+    "gateway/hooks.py:1-10",
+    "gateway/hooks.py:121-139",
+    "gateway/run_turn.py:537",
+    "run_agent.py:409",
+    "agent/shell_hooks.py:170",
+    "agent/outbound_webhooks.py:94",
+    "gateway/hooks.py:86-87"
+   ],
+   "problem": "For a gateway slash command, run_inbound.py:813 fires the plugin pre_command hook (observer-only, returns ignored) and 14 lines later :827 fires the gateway command:<name> hook, which can deny, handle or rewrite. The same split exists for session start (session:start at gateway/run_turn.py:537 vs on_session_start at run_agent.py:409), agent start/end and reactions. A plugin author who wants to veto a command must ship a HOOK.yaml directory instead of a plugin; a HOOK.yaml author gets no host isolation (PLG-02), no timeouts, print error handling (gateway/hooks.py:137) and a dict payload instead of kwargs. Shell hooks and outbound webhooks already show the right shape: config-driven adapters that append onto the one plugin hook bus (agent/shell_hooks.py:170, agent/outbound_webhooks.py:94). gateway/builtin_hooks/ is an empty package and _register_builtin_hooks an empty method.",
+   "move": "Delete HookRegistry.emit/emit_collect and the 8 self.hooks.emit* call sites. Keep HOOK.yaml directories as a third config adapter, shaped like agent/shell_hooks.py: at discovery each declared gateway event maps to a VALID_HOOKS name (session:start->on_session_start, agent:end->post_llm_call, command:*->pre_command, reaction:*->gateway_platform_event) and handle() is wrapped to receive (event_type, context). Promote pre_command from observer to a decision hook returning {\"decision\": deny|handled|rewrite} (the parser exists at run_inbound.py:832-846), giving plugins the power HOOK.yaml has today. Delete gateway/builtin_hooks/.",
+   "reference": {
+    "repo": "pluggy",
+    "path": "src/pluggy/_hooks.py",
+    "pattern": "HookspecMarker with firstresult: one spec per event, many impl sources (see also blinker src/blinker/base.py named signals)"
+   },
+   "loc_delta": -250,
+   "risk": "Existing HOOK.yaml users depend on event names and the context dict; the adapter keeps both. command:* handlers may be async; invoke_hook resolves coroutine results via resolve_plugin_command_result (plugins_dispatch.py:199-207). The running-agent path must keep NOT firing command hooks (run_inbound.py:806-808).",
+   "depends_on": []
+  },
+  {
+   "id": "PLG-04",
+   "title": "Registrars outside the unload ledger; context references are process-global and refuse re-registration",
+   "severity": "high",
+   "effort": "M",
+   "kind": "boundary",
+   "low_hanging": true,
+   "evidence": [
+    "hermes_cli/plugins.py:738-752",
+    "agent/context_references.py:29",
+    "agent/context_references.py:58-69",
+    "hermes_cli/plugins.py:858-873",
+    "hermes_cli/plugins.py:917-929",
+    "hermes_cli/plugins_ledger.py:227-253",
+    "hermes_cli/plugins_ledger.py:288-296",
+    "gateway/platforms/base.py:2316-2319",
+    "hermes_cli/plugins.py:1251-1267"
+   ],
+   "problem": "Unload correctness depends on every register_* method remembering to call _track*. An AST scan of PluginContext registrars (scripts/plg_untracked_registrars.py) finds three that record no lease: register_context_reference, register_platform_handler, register_redaction_patterns. Read from code: (1) agent/context_references.py:58-69 stores providers in a module dict keyed by prefix, not by profile scope, and raises ValueError('already registered') on a second registration. A force re-discovery unloads and re-registers; the re-register raises, is logged as 'registration failed' (plugins.py:749-750), and the provider object from the previous module generation stays live. In a multiplexed process the second profile's manager gets the first profile's provider instance. (2) register_platform_handler appends to _platform_handler_factories without a lease, so a targeted unload (hermes plugins disable, plugins_ledger.py:250-252) leaves the factory wired into the next adapter connect() (gateway/platforms/base.py:2316-2319); only unload-all clears it (plugins_ledger.py:294). (3) Redaction patterns are additive for the life of the process. Profile-scope leaks are the #1 bug class in the gist (366 fix commits); this is that class, made possible by a missing structural choke point.",
+   "move": "Make the ledger impossible to skip: PluginContext writes every registration through one method _put(kind, key, value, adapter) where adapter is a small protocol {put(scope, key, value) -> previous; restore(scope, key, current, previous)}. Port agent/context_references.py to ProviderRegistry (scoped; same-owner re-registration overwrites; identity-conditional restore). Give register_platform_handler and register_redaction_patterns adapters. Then the abandoned-load guard moves into _put (PLG-09).",
+   "reference": {
+    "repo": "inspect_ai",
+    "path": "src/inspect_ai/_util/registry.py:127-148",
+    "pattern": "registry_add: one write path into one keyed store (see also pluggy src/pluggy/_manager.py:278-300 unregister removes every impl because every registration went through one place)"
+   },
+   "loc_delta": -50,
+   "risk": "Built-in prefix rejection and cross-plugin duplicate-prefix rejection must stay; only same-owner re-registration becomes an overwrite. Runtime behaviour of (1) and (2) was read from code, not executed (UNVERIFIED).",
+   "depends_on": []
+  },
+  {
+   "id": "PLG-05",
+   "title": "Four hand-rolled scoped registries next to the generic ProviderRegistry, plus 18 manager-local containers",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": false,
+   "evidence": [
+    "agent/provider_registry.py:27-170",
+    "hermes_cli/dashboard_auth/registry.py:15-16",
+    "agent/secret_sources/registry.py:33-35",
+    "gateway/platform_registry.py:119",
+    "gateway/platform_registry.py:414",
+    "providers/__init__.py:54-89",
+    "hermes_cli/plugins.py:1251-1267",
+    "hermes_cli/plugins_ledger.py:288-296"
+   ],
+   "problem": "ProviderRegistry (global map + per-scope maps + generation + snapshot/restore) backs 7 registries. Dashboard auth, secret sources, platforms and model-provider profiles reimplement the same shape by hand (128, 434, 414 and ~90 lines). Inside PluginManager another 18 containers (listed at plugins_ledger.py:288-295) hold manager-local registrations, each with its own restore lambda. A reader must learn 5 registry implementations to answer 'what does plugin X own in profile Y'.",
+   "move": "Port the four hand-rolled registries to ProviderRegistry, keeping their module-level names through the class's existing export() (provider_registry.py:8-9) so test seams stay. Replace the 18 manager-local dicts with one RegistrationStore keyed (kind, key) -> ordered [(owner, value)]; readers become store.values(kind). get_plugin_toolsets (plugins.py:2304-2331) and listings become queries instead of joins over three structures.",
+   "reference": {
+    "repo": "inspect_ai",
+    "path": "src/inspect_ai/_util/registry.py:621-627",
+    "pattern": "registry_key(type, name) over one _registry dict"
+   },
+   "loc_delta": -400,
+   "risk": "The platform registry carries deferred loaders and enum aliasing (gateway/config.py:280); secret sources carry orchestrator-owned ordering (plugins.py:1121-1124). Both need extra fields, not a different registry class. Many tests patch the hand-rolled module dicts.",
+   "depends_on": [
+    "PLG-04"
+   ]
+  },
+  {
+   "id": "PLG-06",
+   "title": "Exclusive kinds load the same directory twice; the ledger carries a special case for it",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "hermes_cli/plugins_ledger.py:179-201",
+    "hermes_cli/plugins.py:1253-1254",
+    "hermes_cli/plugins.py:754-764",
+    "plugins/memory/__init__.py:374-377",
+    "plugins/context_engine/__init__.py:90-123",
+    "agent/agent_init.py:1934-1942",
+    "hermes_cli/plugins.py:717-736",
+    "hermes_cli/plugins.py:2245"
+   ],
+   "problem": "A memory-provider directory can be imported by general discovery AND by plugins/memory, so register() runs twice against one manager. The ledger keeps a second ownership structure (_memory_hook_registrations, 'dual-kind hook ownership') so hooks are not doubled, and PluginContext.register_memory_provider exists only as an inert recorder because 'without this method its register() would fail' (plugins.py:755-757). Context engines have two load paths in sequence: plugins.context_engine.load_context_engine, then whatever a general plugin registered via ctx.register_context_engine (agent_init.py:1934-1942). Each exclusive kind has its own collector class (_ProviderCollector x2, _EngineCollector).",
+   "move": "With PLG-01, exclusive-kind plugins load once through PluginManager; register_memory_provider / register_context_engine / a new register_cron_scheduler put candidates into the kind's registry; the selector picks by memory.provider / context.engine / cron.provider. Delete _memory_hook_registrations, _register_fallback_hook, _drop_fallback_hooks, the three collector classes and the context-engine double path.",
+   "reference": {
+    "repo": "llm",
+    "path": "llm/hookspecs.py:12-14",
+    "pattern": "register_models(register): plugins contribute candidates; selection by name is the host's job (see also llm/plugins.py:15-30)"
+   },
+   "loc_delta": -300,
+   "risk": "Memory activation must still import only the ACTIVE provider (plugins/AGENTS.md:62: 'Enumerates without importing', so hermes --help stays clean). Eagerly loading all candidates would import every memory SDK; the kind row needs load: on_select.",
+   "depends_on": [
+    "PLG-01"
+   ]
+  },
+  {
+   "id": "PLG-07",
+   "title": "Core hardcodes in-tree vendor plugins; 4 vendor plugins sit in-tree against the repo's own rule",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "kill",
+   "low_hanging": false,
+   "evidence": [
+    "AGENTS.md:97-102",
+    "plugins/AGENTS.md:28-33",
+    "gateway/run.py:2890-2893",
+    "gateway/run.py:3876-3884",
+    "gateway/run_startup.py:1638",
+    "gateway/run_profile_reconcile.py:260",
+    "toolsets.py:178-182",
+    "hermes_cli/auth_spotify.py:1",
+    "hermes_cli/tools_config.py:382-386",
+    "tools/send_message_senders.py:131"
+   ],
+   "problem": "The rubric says vendor SaaS connectors and observability backends ship as standalone plugin repos. In-tree today: spotify (508 LOC, plus 390 in core hermes_cli/auth_spotify.py and a core spotify toolset at toolsets.py:178), google_meet (2,042), teams_pipeline (1,634, wired by name into gateway/run.py:3876-3884 with its own enable check at :2890-2893), observability/langfuse (1,044, plus a 'Langfuse Cloud' row in core hermes_cli/tools_config.py:382-386). All predate the June 2026 rule (spotify 2026-04-24 8d12fb1e6b, google_meet 2026-04-27 df3c9593f8, teams_pipeline 2026-05-08 07bbd93337); only observability/ is named as precedent, and the gist (section 5) lists this as a contradiction to settle. Core also imports specific plugins: gateway/run_profile_reconcile.py:260 imports plugins.memory.holographic.store; tools/send_message_senders.py imports telegram 6x. Each is plugin-specific logic in core, which plugins/AGENTS.md:9-15 forbids.",
+   "move": "Move spotify, google_meet, teams_pipeline and observability/langfuse to standalone repos in plugin-catalog/, with the auto-migration already used for honcho/hindsight/supermemory (hermes_cli/memory_provider_migration.py). Replace _wire_teams_pipeline_runtime with the generic surface the plugin can already reach (on_plugin_loaded, ctx.inject_message, platform handlers). Move auth_spotify.py and the spotify toolset into the plugin. Replace the holographic import with a MemoryProvider.release_home(home) ABC method (default no-op).",
+   "reference": {
+    "repo": "llm",
+    "path": "llm/plugins.py:10-13",
+    "pattern": "DEFAULT_PLUGINS holds only first-party defaults; vendor models ship as separate llm-* packages"
+   },
+   "loc_delta": -5600,
+   "risk": "Users with these enabled need the catalog auto-install path on hermes update; their tests under tests/plugins/ move to the plugin repos. This is a maintainer policy decision as much as a code one. loc_delta is in-tree lines moved out; about -120 in core.",
+   "depends_on": []
+  },
+  {
+   "id": "PLG-08",
+   "title": "Extension surface with no in-tree consumer",
+   "severity": "medium",
+   "effort": "S",
+   "kind": "kill",
+   "low_hanging": false,
+   "evidence": [
+    "hermes_cli/plugins.py:109-205",
+    "hermes_cli/kanban_db.py:269",
+    "hermes_cli/kanban_db.py:2372",
+    "agent/plugin_stream_hooks.py:101-108",
+    "hermes_cli/middleware.py:20-26",
+    "hermes_cli/plugin_events.py:66-88",
+    "hermes_cli/plugins_dispatch.py:99-100",
+    "gateway/builtin_hooks/__init__.py:1",
+    "plugins/plugin_utils.py:1-14",
+    "AGENTS.md:77-79"
+   ],
+   "problem": "Of 41 VALID_HOOKS, 26 have no subscriber in plugins/ or in the built-in observability map (child scan, notes/11-sub-hooks.md 'Hooks with no invoke site or no consumer'), including all 8 kanban hooks (added together in 5e10351683) and the 4 stream hooks, which start one daemon thread per registered callback (agent/plugin_stream_hooks.py:101-108). Middleware's only in-tree consumer was the removed nemo_relay plugin (git log -S register_middleware: 2e0c9083db, 0c8cf21882). broadcast_plugin_event has no callers; the event bus reserves the hermes: namespace but core never publishes to it; gateway/builtin_hooks/ is a docstring; plugins/plugin_utils.py has no importers. The root rubric rejects 'hooks/callbacks/extension points with no concrete consumer'; the compat contract (plugins/AGENTS.md:125, :132-133) forbids removing PluginContext methods without a two-minor deprecation.",
+   "move": "Internal-only, delete now: gateway/builtin_hooks/, HookRegistry._register_builtin_hooks. Public surface: check the catalog pins (plugin-catalog/*.yaml) for users of middleware, broadcast_plugin_event, plugin_utils, the kanban and stream hooks; deprecate the unused ones per the contract. Make each VALID_HOOKS entry name its consumer in the table, so a hook without one is visible in review.",
+   "reference": {
+    "repo": "datasette",
+    "path": "datasette/hookspecs.py:7-33",
+    "pattern": "each hookspec has an in-tree default implementation in datasette/default_*"
+   },
+   "loc_delta": -400,
+   "risk": "External plugins may use these (UNVERIFIED: catalog repos not cloned). Removal is gated by the compat contract; loc_delta applies after the deprecation window.",
+   "depends_on": []
+  },
+  {
+   "id": "PLG-09",
+   "title": "PluginContext public API is assembled by setattr loops at import; static tools cannot see it",
+   "severity": "medium",
+   "effort": "S",
+   "kind": "hygiene",
+   "low_hanging": false,
+   "evidence": [
+    "hermes_cli/plugins.py:1087-1169",
+    "hermes_cli/plugins.py:1189-1194",
+    "hermes_cli/plugins.py:231",
+    "hermes_cli/plugins.py:839-879",
+    "hermes_cli/plugins.py:38-61"
+   ],
+   "problem": "Eight public registrars (register_image_gen_provider ... register_transcription_provider) do not exist in source: a table of 7-tuples is turned into methods by a setattr loop (:1167-1168), and a second loop wraps every register_* by name with the abandoned-load guard (:1191-1193). Pyright/ty, IDE completion and rg 'def register_web_search_provider' cannot find them. PluginContext is an 854-line class that also carries platform-specific registrars (register_slack_action_handler, register_telegram_handler) on the generic surface. The facade re-exports ~40 sibling names under # noqa: F401 (:38-61).",
+   "move": "Write the 8 registrars as explicit 3-line methods that call _register_scoped_provider with a row from the table (data stays a table; methods become greppable and typed). Move the abandoned-load guard into the single registration choke point from PLG-04 instead of a by-name wrapper. Move PluginContext to hermes_cli/plugin_context.py. Keep register_slack_action_handler/register_telegram_handler as documented aliases of register_platform_handler (the contract forbids removal).",
+   "reference": {
+    "repo": "llm",
+    "path": "llm/hookspecs.py:7-33",
+    "pattern": "the whole plugin surface is six explicit functions in one ~30-line file"
+   },
+   "loc_delta": 40,
+   "risk": "Whether the docs build reads docstrings off the generated methods (UNVERIFIED). Tests calling the generated methods keep working.",
+   "depends_on": [
+    "PLG-04"
+   ]
+  },
+  {
+   "id": "PLG-10",
+   "title": "Plugin discovery is an import side effect, with lazy catch-up calls scattered across readers",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "model_tools.py:158-164",
+    "plugins/AGENTS.md:67-69",
+    "hermes_cli/plugins.py:1835",
+    "hermes_cli/plugins.py:1914",
+    "hermes_cli/plugins.py:2238",
+    "hermes_cli/plugins.py:1355-1359",
+    "providers/__init__.py:575"
+   ],
+   "problem": "discover_plugins() runs because something imported model_tools.py (:162). plugins/AGENTS.md:67-69 lists this as a pitfall: code that reads plugin state without importing model_tools must call discover_plugins() itself. The code compensates with _ensure_plugins_discovered (:2238), _delivery_manager (:1914), a background discovery thread (:1835) and a re-entrancy escape for plugins whose register() imports model_tools (:1355-1359). Model providers discover lazily on first get_provider_profile(). Startup order is implicit and differs per entry point (CLI, gateway, TUI, ACP, cron worker).",
+   "move": "Each entry point calls one explicit hermes_cli.plugin_boot.boot(home) stage after config load and before the first agent build; registry readers assert booted(home) instead of discovering. Remove the model_tools import side effect and _ensure_plugins_discovered.",
+   "reference": {
+    "repo": "home-assistant-core",
+    "path": "homeassistant/bootstrap.py:311",
+    "pattern": "async_setup_hass and _async_set_up_integrations (:890): explicit staged setup with timeouts"
+   },
+   "loc_delta": -60,
+   "risk": "Tests and embedders rely on 'import model_tools -> plugins loaded'. Background discovery exists for CLI startup latency; the boot stage must keep it off the critical path where it is today.",
+   "depends_on": []
+  }
+ ],
+ "kill_list": [
+  {
+   "target": "gateway/hooks.py::HookRegistry.emit/emit_collect + 8 self.hooks.emit* sites",
+   "why": "second hook bus; replaced by an adapter onto VALID_HOOKS (PLG-03)",
+   "callers": 8,
+   "evidence": "gateway/hooks.py:121-139; rg -n \"hooks.emit\\(|hooks.emit_collect\\(\" -g '!tests/**' = 8"
+  },
+  {
+   "target": "gateway/builtin_hooks/ + gateway/hooks.py::HookRegistry._register_builtin_hooks",
+   "why": "empty package, empty extension point",
+   "callers": 0,
+   "evidence": "gateway/builtin_hooks/__init__.py:1; gateway/hooks.py:86-87"
+  },
+  {
+   "target": "plugins/plugin_loader.py",
+   "why": "third import-by-path + collector; folds into one loader (PLG-01)",
+   "callers": 3,
+   "evidence": "plugins/plugin_loader.py:93; plugins/plugin_loader.py:144-150 (callers: memory, context_engine, cron)"
+  },
+  {
+   "target": "hermes_cli/plugins_ledger.py::_register_fallback_hook, _drop_fallback_hooks, PluginManager._memory_hook_registrations",
+   "why": "exist only because memory dirs load twice (PLG-06)",
+   "callers": 1,
+   "evidence": "hermes_cli/plugins_ledger.py:179-201; hermes_cli/plugins.py:1253-1254 (caller: memory loader)"
+  },
+  {
+   "target": "hermes_cli/plugins_manifest.py::_detect_kind_from_source + 3 _is_*_dir text sniffers",
+   "why": "kind guessed from a substring of __init__.py",
+   "callers": 4,
+   "evidence": "hermes_cli/plugins_manifest.py:268; plugins/memory/__init__.py:64; plugins/context_engine/__init__.py:22; plugins/cron_providers/__init__.py:21"
+  },
+  {
+   "target": "plugins/spotify, plugins/google_meet, plugins/teams_pipeline, plugins/observability (+ hermes_cli/auth_spotify.py, gateway/run.py::_wire_teams_pipeline_runtime)",
+   "why": "vendor products in-tree against AGENTS.md:97-102 (move out, PLG-07)",
+   "callers": 4,
+   "evidence": "PLG-07; core touchpoints: 1 import, 1 toolset, 1 auth module, 1 setup row"
+  },
+  {
+   "target": "plugins/plugin_utils.py",
+   "why": "0 in-tree importers; documented author helper (deprecate, don't delete)",
+   "callers": 0,
+   "evidence": "rg plugin_utils -g '!tests/**'; website/docs/developer-guide/plugins/index.md:1025"
+  }
+ ],
+ "simplify_list": [
+  {
+   "from": [
+    "PluginManager",
+    "plugins/memory",
+    "plugins/context_engine",
+    "plugins/cron_providers",
+    "providers/__init__.py (model providers)",
+    "dashboard scanner",
+    "gateway/hooks.py"
+   ],
+   "to": "one PluginManager scan + PluginKind table (hermes_cli/plugin_kinds.py)",
+   "loc_saved": 1500,
+   "evidence": "PLG-01"
+  },
+  {
+   "from": [
+    "6 import-by-path copies",
+    "9 host-routing branches"
+   ],
+   "to": "hermes_cli/plugin_isolation.py::import_user_code",
+   "loc_saved": 150,
+   "evidence": "PLG-02"
+  },
+  {
+   "from": [
+    "plugin VALID_HOOKS",
+    "gateway HOOK.yaml events"
+   ],
+   "to": "one hook bus with 3 config adapters (shell hooks, webhooks, HOOK.yaml)",
+   "loc_saved": 250,
+   "evidence": "PLG-03"
+  },
+  {
+   "from": [
+    "agent/provider_registry.py",
+    "hermes_cli/dashboard_auth/registry.py",
+    "agent/secret_sources/registry.py",
+    "gateway/platform_registry.py",
+    "providers/__init__.py profile registry",
+    "18 manager-local containers"
+   ],
+   "to": "ProviderRegistry + one RegistrationStore",
+   "loc_saved": 400,
+   "evidence": "PLG-05"
+  },
+  {
+   "from": [
+    "plugins/memory::_ProviderCollector",
+    "second _ProviderCollector",
+    "plugins/context_engine::_EngineCollector",
+    "dual-load ledger special case"
+   ],
+   "to": "exclusive kinds loaded once, selected by name",
+   "loc_saved": 300,
+   "evidence": "PLG-06"
+  },
+  {
+   "from": [
+    "hermes_cli/plugins_discovery.py:63",
+    "plugins/memory/__init__.py:116-118",
+    "providers/__init__.py:502-505"
+   ],
+   "to": "one entry-point group, kind in the manifest",
+   "loc_saved": 40,
+   "evidence": "hermes_cli/plugins_discovery.py:63; plugins/memory/__init__.py:116-118; providers/__init__.py:502-505"
+  }
+ ],
+ "reference_patterns": [
+  {
+   "repo": "jupyter_client",
+   "path": "jupyter_client/provisioning/factory.py:165-170",
+   "pattern": "one entry-point group per extension type, resolved by name via one factory",
+   "applies_to": "PLG-01 exclusive kinds"
+  },
+  {
+   "repo": "inspect_ai",
+   "path": "src/inspect_ai/_util/registry.py:127-148",
+   "pattern": "one keyed registry registry_key(type, name) (:621-627), one write path",
+   "applies_to": "PLG-04, PLG-05"
+  },
+  {
+   "repo": "pluggy",
+   "path": "src/pluggy/_manager.py:482",
+   "pattern": "register/unregister a plugin object once (:185, :278-300); entry-point loading in one call",
+   "applies_to": "PLG-02, PLG-04; optional dispatch engine"
+  },
+  {
+   "repo": "llm",
+   "path": "llm/hookspecs.py:7-33",
+   "pattern": "small explicit hookspec file; plugins contribute candidates via register(...) (llm/plugins.py:10-52); defaults are first-party only",
+   "applies_to": "PLG-06, PLG-07, PLG-09"
+  },
+  {
+   "repo": "datasette",
+   "path": "datasette/plugins.py:36-66",
+   "pattern": "one pm, each hookspec (datasette/hookspecs.py:7-33) with an in-tree default implementation",
+   "applies_to": "PLG-08"
+  },
+  {
+   "repo": "home-assistant-core",
+   "path": "homeassistant/bootstrap.py:311",
+   "pattern": "explicit staged boot (:890); per-entry state machine with async_unload (homeassistant/config_entries.py:151, :1075)",
+   "applies_to": "PLG-10; unload ledger shape"
+  }
+ ],
+ "seam_answer": "How many extension mechanisms, counted from code: (a) 7 systems that discover and import plugin code - PluginManager (standalone/backend/platform kinds, hermes_agent.plugins entry points, portable Agent Plugins), plugins/memory (with its own hermes_agent.memory_providers group), plugins/context_engine, plugins/cron_providers, providers/__init__.py (model providers), the dashboard scanner (*/dashboard/manifest.json) and gateway/hooks.py - plus a name-only scan of plugins/platforms in gateway/config.py:280. They use 4 precedence rules. (b) ~31 registries plugins write into: 18 manager-local containers, 7 ProviderRegistry instances, and hand-rolled ones for secret sources, dashboard auth, platforms, model-provider profiles, tools, context references, redaction patterns and locale packs. (c) 7 dispatch channels: VALID_HOOKS (41 names) with shell hooks and outbound webhooks as config adapters onto it; middleware (4 kinds); the plugin event bus; the plugin->desktop broadcast; gateway HOOK.yaml events (9 names + command:*, reaction:*); the per-callback stream observer queue; ~20 single-slot callback setters. (d) 3 non-code mechanisms: skills, MCP servers, toolsets. Could one pluggy-style hookspec/hookimpl + entry-point registry replace the bespoke ones? Partly, and pluggy is not the first move. pluggy matches dispatch semantics Hermes already hand-built: argument-name subset matching is _hook_callback_kwargs (plugins_dispatch.py:183), firstresult covers the first-wins hooks, hook wrappers cover middleware, unregister covers the ledger for hooks, and load_setuptools_entrypoints replaces the entry-point code written three times. That is ~400 lines. It does not cover what makes this subsystem large: one manager per profile home, lease-based unload of ~31 registries for force reload, the plugin-host process boundary, callback timeouts with fail-closed policy hooks, manifests/catalog/consent. It would also move the plugin API from ctx.register_hook(name, fn) to @hookimpl functions, which the compat contract allows only as an addition. The code-judo move is upstream of pluggy: collapse the 7 discovery systems into one loader with a kind table (PLG-01), put every registration through one choke point (PLG-04/05), and fold gateway hooks into the one bus (PLG-03). After that, swapping invoke_hook for a pluggy hook relay is a contained, optional change.",
+ "cross_seam": [
+  {
+   "seam": "03-pm-flows",
+   "note": "the install/update/catalog lifecycle is ~5k LOC (plugins_cmd*.py ~4.0k, plugins_transaction.py, plugins_provenance.py, plugins_updates.py, plugins_cadence.py, pm/plugin_*.py); one plugin's state lives in plugins.enabled, plugins.entries.<id>, .install-metadata.json, plugin state JSON and PM receipts",
+   "evidence": "hermes_cli/plugins_provenance.py:1-6"
+  },
+  {
+   "seam": "05-providers",
+   "note": "providers/__init__.py has its own discovery plus hermes_cli/plugin_host_profiles.py (153) for isolation; PROVIDER_REGISTRY (hermes_cli/auth.py:250) mirrors plugin providers via hermes_cli/auth_plugin_providers.py:45",
+   "evidence": "providers/__init__.py:575-643"
+  },
+  {
+   "seam": "06-tools",
+   "note": "tools import specific plugins directly: send_message_senders imports plugins.platforms.telegram (lines 131,141,203,214,253,264); tools/web_tools.py:19 imports firecrawl; tools/image_generation_tool.py:178 imports fal",
+   "evidence": "tools/send_message_senders.py:131"
+  },
+  {
+   "seam": "08-state",
+   "note": "dashboard plugins resolve user plugins from the process launch home while PluginManager is per active home (hermes_cli/plugins.py:1768)",
+   "evidence": "hermes_cli/web_server_dashboard.py:487-494"
+  },
+  {
+   "seam": "10-gateway",
+   "note": "teams_pipeline wiring by name (gateway/run.py:2890-2893, :3876-3884); gateway/config.py:280 rescans plugins/platforms for enum names, duplicating the PM category recursion; gateway/run_profile_reconcile.py:260 imports plugins.memory.holographic.store",
+   "evidence": "gateway/run.py:3876-3884"
+  },
+  {
+   "seam": "13-tui-cron",
+   "note": "8 kanban hooks fired from hermes_cli/kanban_db.py have no in-tree consumer; kanban is core (~18.4k LOC) with a 1.8k-line dashboard plugin",
+   "evidence": "hermes_cli/kanban_db.py:269"
+  },
+  {
+   "seam": "14-errors-obs",
+   "note": "gateway/hooks.py reports errors with print (:101, :137); hermes_cli/lifecycle.py:26-29 runs the built-in observability observer before plugins on every hook",
+   "evidence": "gateway/hooks.py:137"
+  },
+  {
+   "seam": "15-kill",
+   "note": "hermes_cli/plugin_compat.py (22 lines, inert stubs kept for pre-removal updaters); plugins/__init__.py is a one-line comment",
+   "evidence": "hermes_cli/plugin_compat.py:1"
+  }
+ ],
+ "unverified": [
+  "Runtime effect of PLG-04 (context-reference re-registration failing on force reload; stale platform-handler factory after a targeted disable) is read from code, not executed. Verify with a temp HERMES_HOME, a plugin that calls register_context_reference, then discover_plugins(force=True) and an identity check on get_context_reference_providers().",
+  "Whether external catalog plugins use middleware, broadcast_plugin_event, plugins.plugin_utils, kanban hooks or stream hooks (PLG-08). Verify by cloning each plugin-catalog/*.yaml pin and grepping.",
+  "Whether pluggy is already a runtime dependency (it appears in uv.lock, likely via pytest). Verify from the lock entry's dependents.",
+  "Per-hook invoke-site counts and the '26 hooks with no in-tree consumer' figure come from a child regex scan (notes/11-sub-hooks.md); only plugins.py:1992-2003, :2038-2060, run_inbound.py:806-846, kanban_db.py:269, :2372 were re-opened.",
+  "LOC deltas are estimates from file sizes, not drafted patches.",
+  "Whether website docs are generated from the setattr-built registrar docstrings (PLG-09 risk).",
+  "The exposure in PLG-02 under multiplex (what a handler.py loaded for profile B can read inside the gateway process) was not exercised. Verified: gateway/hooks.py:59-65 imports it in-process and gateway/hooks.py has no isolation check.",
+  "The '~31 registries' count combines plugins_ledger.py:288-295 (18 containers) with the child's registry table; context-reference, redaction and locale registries were opened, transports and streaming TTS were not."
+ ]
+}

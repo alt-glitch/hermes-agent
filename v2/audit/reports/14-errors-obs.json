@@ -1,0 +1,1021 @@
+{
+ "seam": "errors-obs",
+ "nn": "14",
+ "title": "Errors, logging, retries, HTTP clients, redaction, observability",
+ "prefix": "ERR",
+ "tldr": [
+  "Failures become strings at every boundary and are re-parsed: one typed classifier (FailoverReason) plus 9+ substring classifiers with 5 vocabularies (ERR-01, ERR-02, ERR-12).",
+  "Biggest kill: ~1,800 first-party import guards and 379 wrappers around config reads that already fail open (ERR-11); the in-tree Langfuse plugin (ERR-10); unused tenacity core dep (ERR-03).",
+  "Biggest simplification: one event bus; shared metrics is fed by the hook bus AND 110 direct imports in 69 core files, beside a separate monitoring emitter and the Relay coordinator (ERR-09).",
+  "Low-hanging (S/M, high): 7 — ERR-01, ERR-02, ERR-03, ERR-04, ERR-05, ERR-07, ERR-12.",
+  "One logging pipeline (mostly) and one provider error model; no shared retry policy (~95 loops), no shared HTTP client outside provider calls (4 stacks, 3 proxy policies), one redaction engine with ~10 failure policies."
+ ],
+ "scope": {
+  "paths": [
+   "hermes_logging.py",
+   "agent/redact.py",
+   "agent/error_classifier.py",
+   "agent/error_surface.py",
+   "agent/retry_utils.py",
+   "hermes_state_errors.py",
+   "tools/bot_failure_reasons.py",
+   "agent/process_bootstrap.py",
+   "gateway/platforms/base.py",
+   "hermes_cli/observability/",
+   "agent/monitoring/",
+   "plugins/observability/",
+   "hermes_cli/debug_redaction.py",
+   "hermes_cli/lifecycle.py",
+   "hermes_cli/logs.py",
+   "hermes_cli/config_read_errors.py"
+  ],
+  "loc": 18573,
+  "files": 49
+ },
+ "modules": [
+  {
+   "path": "hermes_logging.py",
+   "loc": 980,
+   "owns": "setup_logging, queue + QueueListener, rotating handlers, multiplex profile routing, session tag"
+  },
+  {
+   "path": "agent/redact.py",
+   "loc": 1353,
+   "owns": "secret-pattern engine, redact_for_egress, terminal/file modes, vault-value scrub, RedactingFormatter"
+  },
+  {
+   "path": "agent/error_classifier.py",
+   "loc": 1495,
+   "owns": "provider error taxonomy: FailoverReason, ClassifiedError, classify_api_error"
+  },
+  {
+   "path": "agent/error_surface.py",
+   "loc": 234,
+   "owns": "failed turn result -> UI error surface"
+  },
+  {
+   "path": "agent/retry_utils.py",
+   "loc": 174,
+   "owns": "jittered_backoff, Retry-After and reset-time parsing"
+  },
+  {
+   "path": "hermes_state_errors.py",
+   "loc": 305,
+   "owns": "SQLite error predicates and persistence-error classes"
+  },
+  {
+   "path": "tools/bot_failure_reasons.py",
+   "loc": 150,
+   "owns": "second failure vocabulary for bot-mode retries (regex over text)"
+  },
+  {
+   "path": "agent/process_bootstrap.py",
+   "loc": null,
+   "owns": "build_keepalive_http_client: the only shared HTTP client (provider SDK calls)"
+  },
+  {
+   "path": "hermes_cli/observability/",
+   "loc": 10029,
+   "owns": "Nous opt-in shared-metrics telemetry: store, sender, Relay subscriber, consent"
+  },
+  {
+   "path": "agent/monitoring/",
+   "loc": 1478,
+   "owns": "gateway/cron health events, own emitter queue + thread, OTLP export"
+  },
+  {
+   "path": "plugins/observability/langfuse/__init__.py",
+   "loc": 1044,
+   "owns": "third-party Langfuse tracing plugin"
+  }
+ ],
+ "flows": [
+  {
+   "id": "log-record",
+   "title": "A log line from a gateway turn reaches agent.log",
+   "trigger": "agent or tool code calls logger.info(...) during a gateway turn",
+   "inputs": [
+    {
+     "name": "multiplex_secondary_profile",
+     "type": "bool",
+     "default": false,
+     "meaning": "the record belongs to a profile other than the process launch profile"
+    },
+    {
+     "name": "on_tool_worker_thread",
+     "type": "bool",
+     "default": false,
+     "meaning": "the line is logged from a parallel tool worker thread"
+    },
+    {
+     "name": "redact_secrets",
+     "type": "bool",
+     "default": true,
+     "meaning": "security.redact_secrets for the record's profile"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "agent/turn_context.py::build_turn_context",
+     "loc": "agent/turn_context.py:1055",
+     "does": "sets the logging session id in a threading.local; never cleared",
+     "when": null,
+     "finding": "ERR-05"
+    },
+    {
+     "n": 2,
+     "where": "tools/thread_context.py::propagate_context_to_thread",
+     "loc": "tools/thread_context.py:43",
+     "does": "copies ContextVars into the worker; the threading.local session tag is not copied",
+     "when": {
+      "input": "on_tool_worker_thread",
+      "equals": true
+     },
+     "finding": "ERR-05"
+    },
+    {
+     "n": 3,
+     "where": "hermes_logging.py::_install_session_record_factory",
+     "loc": "hermes_logging.py:250",
+     "does": "record factory adds session_tag and an uncached get_hermes_home().resolve() per record",
+     "when": null,
+     "finding": "ERR-06"
+    },
+    {
+     "n": 4,
+     "where": "hermes_logging.py::_NonFormattingQueueHandler.prepare",
+     "loc": "hermes_logging.py:746",
+     "does": "enqueues an unformatted copy; formatting and redaction deferred to the listener",
+     "when": null,
+     "finding": "ERR-06"
+    },
+    {
+     "n": 5,
+     "where": "hermes_logging.py::_start_queue_listener_locked",
+     "loc": "hermes_logging.py:768",
+     "does": "one QueueListener thread dispatches to every file handler",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 6,
+     "where": "hermes_logging.py::_ProfileRoutingFileHandler._home_for_record",
+     "loc": "hermes_logging.py:633",
+     "does": "resolves the record's home again and rechecks profile liveness every 2 s",
+     "when": {
+      "input": "multiplex_secondary_profile",
+      "equals": true
+     },
+     "finding": "ERR-06"
+    },
+    {
+     "n": 7,
+     "where": "hermes_logging.py::_ProfileRoutingFileHandler.emit",
+     "loc": "hermes_logging.py:685",
+     "does": "re-binds set_hermes_home_override so the formatter uses that profile's policy",
+     "when": {
+      "input": "multiplex_secondary_profile",
+      "equals": true
+     },
+     "finding": "ERR-06"
+    },
+    {
+     "n": 8,
+     "where": "hermes_logging.py::_ManagedRotatingFileHandler.emit",
+     "loc": "hermes_logging.py:506",
+     "does": "stats the file for external rotation, then writes",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 9,
+     "where": "agent/redact.py::RedactingFormatter.format",
+     "loc": "agent/redact.py:1352",
+     "does": "formats then calls redact_sensitive_text (agent/redact.py:880)",
+     "when": null,
+     "finding": "ERR-04"
+    },
+    {
+     "n": 10,
+     "where": "agent/redact.py::_redact_enabled",
+     "loc": "agent/redact.py:107",
+     "does": "under a home override with no live scope, reads the profile's .env/config once and caches",
+     "when": {
+      "input": "multiplex_secondary_profile",
+      "equals": true
+     },
+     "finding": "ERR-06"
+    }
+   ]
+  },
+  {
+   "id": "gateway-send-failure",
+   "title": "The gateway sends a reply and the platform API fails",
+   "trigger": "agent produces a reply; adapter.send raises or returns a failed SendResult",
+   "inputs": [
+    {
+     "name": "failure",
+     "type": "enum[network,rate_limit,timeout,format]",
+     "default": "network",
+     "meaning": "what the platform API actually did"
+    },
+    {
+     "name": "retry_after_over_60s",
+     "type": "bool",
+     "default": false,
+     "meaning": "server asked for a wait longer than the 60 s inline cap"
+    },
+    {
+     "name": "partial_delivery",
+     "type": "bool",
+     "default": false,
+     "meaning": "part of a split payload is already visible"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "gateway/platforms/base.py::BasePlatformAdapter._send_with_retry",
+     "loc": "gateway/platforms/base.py:3649",
+     "does": "sends via the adapter",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 2,
+     "where": "gateway/platforms/base.py::SendResult",
+     "loc": "gateway/platforms/base.py:1703",
+     "does": "failure carried as error str + retryable bool + retry_after + error_kind",
+     "when": null,
+     "finding": "ERR-02"
+    },
+    {
+     "n": 3,
+     "where": "gateway/platforms/base.py::classify_send_error",
+     "loc": "gateway/platforms/base.py:1769",
+     "does": "rate-limit decision by substring on the flattened text (called from :3675)",
+     "when": null,
+     "finding": "ERR-02"
+    },
+    {
+     "n": 4,
+     "where": "gateway/platforms/base.py::BasePlatformAdapter._is_retryable_error",
+     "loc": "gateway/platforms/base.py:3567",
+     "does": "OR of retryable, rate-limit substring, retry_after, retryable substring (:3676-3681); error_kind unread",
+     "when": null,
+     "finding": "ERR-02"
+    },
+    {
+     "n": 5,
+     "where": "gateway/platforms/base.py::BasePlatformAdapter._is_timeout_error",
+     "loc": "gateway/platforms/base.py:3583",
+     "does": "timeout substring -> return without retry",
+     "when": {
+      "input": "failure",
+      "equals": "timeout"
+     },
+     "finding": "ERR-02"
+    },
+    {
+     "n": 6,
+     "where": "gateway/platforms/base.py::BasePlatformAdapter._send_with_retry",
+     "loc": "gateway/platforms/base.py:3692",
+     "does": "server wait over the cap -> return typed failure for the delivery ledger",
+     "when": {
+      "input": "retry_after_over_60s",
+      "equals": true
+     },
+     "finding": null
+    },
+    {
+     "n": 7,
+     "where": "gateway/platforms/base.py::BasePlatformAdapter._send_with_retry",
+     "loc": "gateway/platforms/base.py:3688",
+     "does": "hand-rolled exponential backoff with uniform jitter and asyncio.sleep",
+     "when": null,
+     "finding": "ERR-03"
+    },
+    {
+     "n": 8,
+     "where": "gateway/platforms/base.py::BasePlatformAdapter._send_with_retry",
+     "loc": "gateway/platforms/base.py:3727",
+     "does": "re-runs the substring classification on every attempt",
+     "when": null,
+     "finding": "ERR-02"
+    },
+    {
+     "n": 9,
+     "where": "gateway/platforms/base.py::BasePlatformAdapter._send_with_retry",
+     "loc": "gateway/platforms/base.py:3750",
+     "does": "retries exhausted: sends a delivery-failure notice",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 10,
+     "where": "gateway/platforms/base.py::BasePlatformAdapter._send_with_retry",
+     "loc": "gateway/platforms/base.py:3766",
+     "does": "plain-text fallback",
+     "when": {
+      "input": "failure",
+      "equals": "format"
+     },
+     "finding": null
+    }
+   ]
+  },
+  {
+   "id": "bot-turn-failure",
+   "title": "A bot-mode turn fails at the provider; the supervisor decides whether to retry",
+   "trigger": "provider call raises inside a delegated/bot turn",
+   "inputs": [
+    {
+     "name": "lane",
+     "type": "enum[in_process,child_process]",
+     "default": "in_process",
+     "meaning": "turn ran in this process or in a child hermes process"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "agent/error_classifier.py::classify_api_error",
+     "loc": "agent/error_classifier.py:965",
+     "does": "returns ClassifiedError with typed FailoverReason and recovery hints",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 2,
+     "where": "agent/error_surface.py::build_error_surface_from_exception",
+     "loc": "agent/error_surface.py:222",
+     "does": "flattens to {'error': message, 'failure_reason': reason.value}",
+     "when": null,
+     "finding": "ERR-01"
+    },
+    {
+     "n": 3,
+     "where": "agent/error_surface.py::build_error_surface_from_result",
+     "loc": "agent/error_surface.py:165",
+     "does": "reads failure_reason / failure_retryable / failure_resets_at / billing_block / free_tier back",
+     "when": null,
+     "finding": "ERR-01"
+    },
+    {
+     "n": 4,
+     "where": "tools/bot_failure_reasons.py::result_retry_action",
+     "loc": "tools/bot_failure_reasons.py:107",
+     "does": "joins error + failure_reason into text",
+     "when": {
+      "input": "lane",
+      "equals": "in_process"
+     },
+     "finding": "ERR-01"
+    },
+    {
+     "n": 5,
+     "where": "tools/bot_mode_dm.py",
+     "loc": "tools/bot_mode_dm.py:440",
+     "does": "rebuilds the failure text from child stdout + stderr",
+     "when": {
+      "input": "lane",
+      "equals": "child_process"
+     },
+     "finding": "ERR-01"
+    },
+    {
+     "n": 6,
+     "where": "tools/bot_failure_reasons.py::classify_agent_error",
+     "loc": "tools/bot_failure_reasons.py:122",
+     "does": "regex-matches the text into a second vocabulary (:35-41)",
+     "when": null,
+     "finding": "ERR-01"
+    },
+    {
+     "n": 7,
+     "where": "tools/bot_failure_reasons.py::retry_action",
+     "loc": "tools/bot_failure_reasons.py:61",
+     "does": "maps that vocabulary to resume / compress-then-resume / none",
+     "when": null,
+     "finding": null
+    }
+   ]
+  }
+ ],
+ "findings": [
+  {
+   "id": "ERR-01",
+   "title": "Failures are flattened to strings and re-classified by 9+ substring classifiers with 5 vocabularies",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": true,
+   "evidence": [
+    "agent/error_classifier.py:34",
+    "agent/error_classifier.py:70",
+    "agent/error_surface.py:165",
+    "agent/error_surface.py:222",
+    "tools/bot_failure_reasons.py:35",
+    "tools/bot_failure_reasons.py:107",
+    "tools/bot_failure_reasons.py:122",
+    "agent/monitoring/cron_health.py:46",
+    "agent/monitoring/gateway_health.py:53",
+    "gateway/platforms/base.py:1769",
+    "gateway/dead_targets.py:31",
+    "hermes_state_errors.py:272"
+   ],
+   "problem": "The provider path has a typed model (FailoverReason + ClassifiedError with recovery hints). It is lost at the first boundary: error_surface writes reason.value into a dict key and later code parses text again. tools/bot_failure_reasons.py keeps a second 14-code vocabulary and regex-classifies error + failure_reason text even when the typed reason is in the same dict (:119). classify_cron_error and classify_gateway_error are two more substring tables with their own labels; the gateway rule _contains_any('auth','token',...) labels any message containing 'token' as auth_failed. 30+ hand-written _is_transient_/_is_retryable_/_looks_like_ predicates do the same per module. Every new provider or platform error string means editing several drifting tables, and a wrong classification decides whether a turn is re-run.",
+   "move": "Create agent/failure.py with a frozen Failure value type (kind: FailureKind = FailoverReason extended with disk_full, network, delivery_timeout, cancelled, runtime_offline, missing_config; retryable; retry_after; resets_at; message; to_dict/from_dict). Turn results carry result['failure'] instead of five loose keys; child processes print one 'HERMES_FAILURE {json}' stderr line. retry_action, error_surface, cron_health and gateway_health become dict[FailureKind, X] lookups; the three text classifiers merge into one legacy-text fallback in agent/failure.py.",
+   "reference": {
+    "repo": "stamina",
+    "path": "src/stamina/_core.py:119",
+    "pattern": "retry_context(on=...): retry policy keyed on a typed exception/predicate, never on text"
+   },
+   "loc_delta": -350,
+   "risk": "Bot relay, desktop error cards and cron incident labels change if a mapping is wrong. Preserve the RETRY_* decision for every existing reason, failure_resets_at card text (#98852), billing/free-tier surfaces.",
+   "depends_on": []
+  },
+  {
+   "id": "ERR-02",
+   "title": "Gateway send retry decides 'retryable' by OR-ing four signals, two of them substring parses; error_kind is ignored",
+   "severity": "high",
+   "effort": "M",
+   "kind": "boundary",
+   "low_hanging": true,
+   "evidence": [
+    "gateway/platforms/base.py:1703",
+    "gateway/platforms/base.py:1718",
+    "gateway/platforms/base.py:1854",
+    "gateway/platforms/base.py:3567",
+    "gateway/platforms/base.py:3675",
+    "gateway/platforms/base.py:3727",
+    "plugins/platforms/photon/adapter.py:1386"
+   ],
+   "problem": "The adapter holds the typed exception at its except, writes str(exc) into SendResult.error and only sometimes sets retryable=True or error_kind. _send_with_retry re-derives the decision from error.lower() substrings on every attempt; adapters override _is_retryable_error with more substrings (Photon matches the literal text 'retryable=false'). 55 adapter sites set retryable=True or override the predicate. A library that rewords its exception changes retry behaviour silently; the never-retry-timeouts rule is a substring check.",
+   "move": "Route every failure through SendResult.failed(exc, *, kind=None, retry_after=None), which runs classify_send_error once on the exception object at the adapter's except site and stores error_kind. _send_with_retry branches only on error_kind and retry_after. Delete SendResult.retryable, _is_retryable_error, _is_rate_limited_error, _is_timeout_error and the per-adapter overrides.",
+   "reference": {
+    "repo": "stamina",
+    "path": "src/stamina/_core.py:730",
+    "pattern": "retry(on=...) with a typed predicate"
+   },
+   "loc_delta": -150,
+   "risk": "Per-platform retry semantics (Photon sidecar markers, Telegram FloodWait). Preserve: no retry on timeouts, 60 s inline-wait cap (#91969), no notice inside a flood penalty, partial-delivery resume.",
+   "depends_on": [
+    "ERR-01"
+   ]
+  },
+  {
+   "id": "ERR-03",
+   "title": "No retry primitive: ~95 hand-rolled retry loops, a 174-line backoff helper, and tenacity pinned in core with zero importers",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": true,
+   "evidence": [
+    "pyproject.toml:53",
+    "pyproject.toml:858",
+    "agent/retry_utils.py:121",
+    "gateway/platforms/base.py:3688",
+    "pm/install.py:230",
+    "pm/store.py:419",
+    "hermes_cli/kanban_db_connect.py:1169",
+    "tools/environments/file_sync.py:321",
+    "tools/skills_hub_github.py:459",
+    "tools/fal_common.py:146",
+    "tools/microsoft_graph_client.py:128"
+   ],
+   "problem": "scripts/err_retry_loops.py finds 210 for/while loops with a try plus a sleep/backoff call or an attempt counter (plugins 50, gateway 48, hermes_cli 41, tools 31, root 16, agent 11, pm 7). A seeded sample of 22 had 10 real retry loops, so ~95 exist, each with its own attempts, delay curve, jitter, exception set and logging. Only 9 call agent.retry_utils.jittered_backoff. tenacity==9.1.4 is a pinned core dependency with no in-scope importer. Tests need an autouse stub to zero jittered_backoff (pyproject.toml:858); loops that sleep directly cannot be stubbed.",
+   "move": "Adopt stamina (a thin layer over the already-shipped tenacity): for attempt in stamina.retry_context(on=pred, attempts=N, timeout=T), with typed on= predicates from ERR-01/ERR-02/hermes_state_errors.is_sqlite_lock_error. stamina.set_testing(True) replaces the autouse stub. Keep parse_retry_after_seconds and reset parsing; delete jittered_backoff. If stamina is rejected, drop tenacity from core dependencies.",
+   "reference": {
+    "repo": "stamina",
+    "path": "src/stamina/_core.py:119",
+    "pattern": "retry_context with typed on=, attempts, timeout; set_testing in src/stamina/_config.py:174"
+   },
+   "loc_delta": -600,
+   "risk": "Retry timing users see (Telegram reconnect, SQLite busy). Preserve: server Retry-After beats backoff, inline wait caps, KeyboardInterrupt/CancelledError never retried, agent-loop credential rotation stays in the loop.",
+   "depends_on": [
+    "ERR-01"
+   ]
+  },
+  {
+   "id": "ERR-04",
+   "title": "One redaction engine, ~10 failure policies: 16 guarded call sites, two fail open, and 42 force=True egress calls bypass redact_for_egress",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": true,
+   "evidence": [
+    "agent/redact.py:880",
+    "agent/redact.py:1151",
+    "plugins/observability/langfuse/__init__.py:137",
+    "cron/incidents.py:119",
+    "tools/delegation_live_log.py:71",
+    "tui_gateway/tool_progress.py:36",
+    "tools/browser_supervisor.py:42",
+    "cron/scheduler_delivery.py:177",
+    "tools/mcp_tool_common.py:72",
+    "tools/send_message_senders.py:47",
+    "agent/monitoring/redaction.py:25",
+    "hermes_cli/debug_redaction.py:7"
+   ],
+   "problem": "redact_sensitive_text takes five boolean modes. redact_for_egress calls itself the one scrub for text leaving the process and fails closed, but has 4 callers while 42 sites pass force=True directly and skip its bearer sweep. 16 sites wrap 'from agent.redact import' in try/except Exception, each with its own fallback sentinel; two return the raw input: the Langfuse exporter (external service) and cron incidents (disk). tools/mcp_tool_common.py keeps a private credential regex, send_message_senders adds two more, monitoring and support redaction each add an e-mail regex, and debug_redaction imports private names from agent.redact. Gist: 145 secret_leak_redaction fix commits.",
+   "move": "Replace the flags with redact(text, purpose) where Purpose = MODEL|FILE_READ|TERMINAL|LOG|DISK|EGRESS|EXPORT|SUPPORT; one table row per purpose (passes, mask style, whether the user toggle applies). The function fails closed itself. Delete the 16 try-wrappers, the MCP regex, the send_message extras and the two PII copies.",
+   "reference": {
+    "repo": "structlog",
+    "path": "src/structlog/_config.py:202",
+    "pattern": "configure(processors=...): one ordered processor chain per output instead of flags at each call"
+   },
+   "loc_delta": -250,
+   "risk": "Over-redaction of tool output if a purpose maps to the wrong passes (#35519, #43025, #34029). Map each current flag combination to exactly one purpose before deleting flags.",
+   "depends_on": []
+  },
+  {
+   "id": "ERR-05",
+   "title": "The log session tag is a threading.local that is never cleared and never reaches tool worker threads",
+   "severity": "high",
+   "effort": "S",
+   "kind": "boundary",
+   "low_hanging": true,
+   "evidence": [
+    "hermes_logging.py:104",
+    "hermes_logging.py:229",
+    "hermes_logging.py:250",
+    "agent/turn_context.py:1055",
+    "tools/thread_context.py:43",
+    "agent/conversation_compression.py:1650",
+    "agent/compression_facade.py:208",
+    "gateway/session_context.py:34",
+    "hermes_cli/logs.py:119"
+   ],
+   "problem": "'hermes logs --session' filters by the [session] tag, which comes from a threading.local set at turn start. clear_session_context has zero callers, so a pooled executor thread keeps tagging unrelated records with the previous session. Parallel tool workers get ContextVars copied but not the threading.local, so tool log lines carry no tag. Compression needed explicit rebind calls to paper over it. gateway/session_context.py already binds HERMES_SESSION_ID as a ContextVar that every thread hop copies.",
+   "move": "Move the session ContextVars from gateway/ into a neutral leaf module (hermes_context.py) importable by hermes_logging; the record factory reads it. Delete set_session_context, clear_session_context, _session_context and the three call sites.",
+   "reference": {
+    "repo": "structlog",
+    "path": "src/structlog/contextvars.py:82",
+    "pattern": "merge_contextvars: log context read from ContextVars at emit time"
+   },
+   "loc_delta": -30,
+   "risk": "CLI and cron paths that never call set_session_vars must still bind the id. Preserve 'hermes logs --session' matching and HERMES_SESSION_ID subprocess env semantics.",
+   "depends_on": [
+    "CFG-01"
+   ]
+  },
+  {
+   "id": "ERR-06",
+   "title": "Multiplex log routing is built into the handler stack because formatting was moved off the caller's thread",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "hermes_logging.py:257",
+    "hermes_logging.py:607",
+    "hermes_logging.py:633",
+    "hermes_logging.py:685",
+    "hermes_logging.py:737",
+    "hermes_logging.py:824",
+    "hermes_logging.py:853",
+    "agent/redact.py:121"
+   ],
+   "problem": "_NonFormattingQueueHandler skips the stdlib prepare() that formats on the emitting thread, so formatting and redaction run on the listener thread where the profile scope is gone. That forces a per-record uncached get_hermes_home().resolve() on the caller, a second per-record resolve plus 2 s liveness probes in _ProfileRoutingFileHandler, per-record set_hermes_home_override re-binding, and _redact_enabled reading .env/config.yaml from the listener thread. About 400 of 980 lines are routing and queue lifecycle.",
+   "move": "Format and redact on the emitting thread (stdlib QueueHandler.prepare) and stamp record.hermes_home_key = hermes_home_key() (cached). The listener routes pre-rendered strings to files[key]. Delete the override re-binding, the listener-thread policy fallback and the per-record resolves.",
+   "reference": {
+    "repo": "cpython",
+    "path": "Lib/logging/handlers.py:1522",
+    "pattern": "QueueHandler.prepare formats on the producer thread; see also structlog src/structlog/stdlib.py:1012"
+   },
+   "loc_delta": -200,
+   "risk": "Redaction CPU moves to caller threads (measure). Preserve deleted-profile release (#103777, Windows lock files), managed 0660 perms, external-rotation reopen.",
+   "depends_on": [
+    "ERR-05"
+   ]
+  },
+  {
+   "id": "ERR-07",
+   "title": "tool_calls.log is a second, unqueued file-logging pipeline that writes every profile's tool calls into the launch profile's log",
+   "severity": "high",
+   "effort": "S",
+   "kind": "collapse",
+   "low_hanging": true,
+   "evidence": [
+    "gateway/run_turn.py:54",
+    "gateway/run_turn.py:63",
+    "gateway/run.py:1577",
+    "gateway/run_turn.py:3200",
+    "gateway/run_turn.py:3009",
+    "hermes_logging.py:75",
+    "hermes_logging.py:720"
+   ],
+   "problem": "With display.tool_progress: log the gateway writes tool calls through its own stdlib RotatingFileHandler on gateway.run._hermes_home, which is get_process_hermes_home() captured at import. Under multiplex a secondary profile's tool calls land in the launch profile's tool_calls.log (profile-scope leak class, 366 fix commits). It bypasses the queue (writes on the asyncio loop), the Windows rollover lock (#44873), managed perms and profile routing, and polls a queue every 0.3 s per turn.",
+   "move": "Add a tool_calls.log row to setup_logging's handler_specs with a component filter on 'hermes.tool_calls', exclude that logger from agent.log, and log directly from the producer. Delete _tool_call_logger, _tool_call_logger_lock, _run_agent_write_tool_log and the per-turn log_queue.",
+   "reference": {
+    "repo": "cpython",
+    "path": "Lib/logging/handlers.py:1567",
+    "pattern": "one QueueListener consumer thread for all file handlers"
+   },
+   "loc_delta": -45,
+   "risk": "Keep the '%(message)s' line format; agent.log must not double the lines; keep redaction.",
+   "depends_on": []
+  },
+  {
+   "id": "ERR-08",
+   "title": "Network policy is decided per call site: 4 HTTP stacks, 101 client constructors, 3 proxy policies",
+   "severity": "high",
+   "effort": "L",
+   "kind": "boundary",
+   "low_hanging": false,
+   "evidence": [
+    "agent/process_bootstrap.py:268",
+    "agent/process_bootstrap.py:176",
+    "gateway/platforms/base.py:279",
+    "gateway/platforms/base.py:327",
+    "tools/mcp_tool_transport.py:44",
+    "tools/microsoft_graph_client.py:136",
+    "hermes_cli/auth_nous.py:714",
+    "hermes_cli/auth_codex.py:411",
+    "pyproject.toml:51",
+    "pyproject.toml:57"
+   ],
+   "problem": "33 httpx.Client, 36 httpx.AsyncClient, 29 aiohttp.ClientSession, 2 requests.Session constructions plus 41 httpx, 23 requests and 49 urlopen one-shots (scripts/err_http_ast.py); files importing httpx 86, aiohttp 34, requests 25, urllib.request 6. Only provider SDK calls share a client, and it deliberately ignores the macOS system proxy; gateway adapters shell out to scutil --proxy and use it; MCP has a third resolver; ~200 other sites get library defaults. Behind a corporate proxy each subsystem behaves differently. Clients built inside retry loops redo the TLS handshake per attempt.",
+   "move": "One hermes_platform/net.py owning NetPolicy (proxy-for-URL with one NO_PROXY matcher, CA/verify, default httpx.Timeout/Limits, user agent) resolved per profile; http_client(purpose)/async_http_client(purpose) return long-lived httpx clients with event hooks for redacted debug logging. Migrate requests and urlopen sites; ban new requests/urllib.request imports outside the module via TID251. aiohttp only where an SDK requires it.",
+   "reference": {
+    "repo": "httpx",
+    "path": "httpx/_config.py:72",
+    "pattern": "Timeout and Limits (:159) as typed objects; event_hooks on a long-lived client (httpx/_client.py:199)"
+   },
+   "loc_delta": -400,
+   "risk": "Proxy behaviour changes for setups that work by accident; pick the policy once and document it. Preserve provider transport pooling, Codex happy-eyeballs, Telegram SOCKS, url_safety SSRF checks.",
+   "depends_on": []
+  },
+  {
+   "id": "ERR-09",
+   "title": "Telemetry is fed by two mechanisms and 110 direct imports from core into hermes_cli.observability; three in-process event pipelines coexist",
+   "severity": "high",
+   "effort": "L",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "hermes_cli/lifecycle.py:11",
+    "hermes_cli/lifecycle.py:26",
+    "hermes_cli/observability/__init__.py:11",
+    "hermes_cli/observability/relay_shared_metrics.py:1363",
+    "hermes_cli/observability/relay_shared_metrics.py:1397",
+    "tools/file_tools.py:1329",
+    "agent/tool_executor.py:60",
+    "agent/tool_executor.py:1079",
+    "agent/turn_api_request.py:16",
+    "agent/monitoring/emitter.py:20",
+    "agent/relay_runtime.py:1",
+    "hermes_cli/observability/shared_metrics_send_config.py:15"
+   ],
+   "problem": "Shared metrics is Nous's opt-in usage telemetry (consent module; posts to telemetry.nousresearch.com). It receives lifecycle events as a privileged first-party observer ahead of plugins in hermes_cli/lifecycle.py, and is also called directly: 110 import lines in 69 files (agent 15, tools 9, gateway 10, tui_gateway 6, cron 3, acp 2, hermes_cli 22, root 2) import record_*/observe_*/note_* from 15+ submodules; tool handlers run inside telemetry wrappers. agent/ and tools/ import hermes_cli for this. agent/monitoring/emitter.py runs its own queue and dispatcher thread, and agent/relay_runtime.py (1,440 lines) its own coordinator.",
+   "move": "One typed in-process event bus owned by agent/ (agent/events.py: frozen event dataclasses, emit() never raises, subscribers registered at startup). Core and tools only emit. Shared metrics, monitoring/OTLP and plugins subscribe. Move hermes_cli/observability/ to a top-level telemetry/ package that imports agent, never the reverse; the 110 direct imports become ~20 emit() calls at existing hook points.",
+   "reference": {
+    "repo": "blinker",
+    "path": "src/blinker/base.py",
+    "pattern": "named signals with decoupled receivers; structlog _config.py:202 configure-once"
+   },
+   "loc_delta": null,
+   "risk": "Telemetry schema (hermes.metrics.event.v3) and consent gating must not change; scope ordering (model call vs task run); the opted-out hot path must stay free (relay_shared_metrics.py:1319).",
+   "depends_on": [
+    "ERR-01"
+   ]
+  },
+  {
+   "id": "ERR-10",
+   "title": "Kill the in-tree Langfuse plugin: a third-party product plugin that fails open on export redaction and configures via non-secret env vars",
+   "severity": "medium",
+   "effort": "S",
+   "kind": "kill",
+   "low_hanging": false,
+   "evidence": [
+    "plugins/observability/langfuse/__init__.py:1",
+    "plugins/observability/langfuse/__init__.py:137",
+    "hermes_cli/tools_config_post_setup.py:180",
+    "pm/extras.py:27",
+    "AGENTS.md:97",
+    "AGENTS.md:80"
+   ],
+   "problem": "Root AGENTS.md:97-102 says observability backends do not land under plugins/; this one did (42cc905c13). Its redaction wrapper returns the raw value on failure for content exported to an external service. It is configured by non-secret HERMES_LANGFUSE_* env vars (BASE_URL, ENV, RELEASE, SAMPLE_RATE, MAX_CHARS, MAX_DEPTH, DEBUG, CAPTURE) against AGENTS.md:80-83, and core carries special cases for it. Gist 0-plan §5 lists it as an unsettled contradiction.",
+   "move": "Publish as a standalone plugin repo; delete plugins/observability/ and the two core touchpoints.",
+   "reference": null,
+   "loc_delta": -1100,
+   "risk": "Users with plugins.enabled: [langfuse] lose traces until they install the external package; show a one-line notice in 'hermes plugins' for that id.",
+   "depends_on": []
+  },
+  {
+   "id": "ERR-11",
+   "title": "Most broad excepts have two structural causes: first-party import guards and config reads that already fail open",
+   "severity": "high",
+   "effort": "L",
+   "kind": "kill",
+   "low_hanging": false,
+   "evidence": [
+    "hermes_cli/config_read_errors.py:1",
+    "agent/error_surface.py:122",
+    "hermes_cli/process_identity.py:139",
+    "gateway/run.py:1896",
+    "agent/moa_loop.py:1530",
+    "hermes_cli/status.py:206",
+    "gateway/run_voice.py:123",
+    "hermes_cli/mcp_startup.py:168",
+    "agent/display.py:101",
+    "tui_gateway/methods_profiles.py:146"
+   ],
+   "problem": "All 8,052 broad handlers by shape (scripts/err_except_shapes.py): logs 2,839; silent 1,986; import-only try 1,429; other 933; re-raise 486; config read 379. 1,795 of 1,933 import-guard tries guard only first-party modules (scripts/err_import_guard.py), which can only fail on a broken install or a real bug. Config readers already fail open (config_read_errors.py:1-7), so the 379 wrappers catch AttributeError/TypeError from walking an untyped dict. Seeded sample of 40: 15 legitimate boundary, 9 should be narrow, 12 hide a bug (5 config reads, 3 first-party import guards), 4 log-and-continue. Gist: swallowed exceptions are the top static fix class (106 strict / 669 by diff shape).",
+   "move": "(1) Delete try/except Exception around first-party imports; a broken install fails at the entry point and 'hermes doctor' reports it. (2) Typed config accessors (CFG-02) remove the config-read wrappers. (3) Name the boundaries (tool handler, JSON-RPC method, platform callback, plugin hook, thread/task top) with one decorator each that logs with exc_info and converts to the boundary's error type; anywhere else needs a reason comment.",
+   "reference": {
+    "repo": "structlog",
+    "path": "src/structlog/processors.py:374",
+    "pattern": "ExceptionRenderer: render exceptions once at the boundary"
+   },
+   "loc_delta": -4000,
+   "risk": "A removed guard can crash a path that relied on it for an optional extra; keep the 138 third-party import guards narrowed to ImportError. Preserve plugin isolation at the plugin-hook boundary.",
+   "depends_on": [
+    "CFG-02"
+   ]
+  },
+  {
+   "id": "ERR-12",
+   "title": "JSON-RPC errors are 89 magic numbers reused across meanings; clients decide by regex on message text",
+   "severity": "high",
+   "effort": "S",
+   "kind": "boundary",
+   "low_hanging": true,
+   "evidence": [
+    "tui_gateway/server.py:877",
+    "tui_gateway/methods_session_control.py:248",
+    "tui_gateway/methods_vault.py:57",
+    "tui_gateway/server_requests.py:100",
+    "ui-tui/src/app/userMessages.ts:14",
+    "ui-tui/src/app/userMessages.ts:127",
+    "ui-tui/src/app/userMessages.ts:192"
+   ],
+   "problem": "_err(rid, code: int, msg) is called at 349 sites with 89 distinct integer literals; two have names. The TUI documents that 4001 is reused for unrelated refusals and matches message text, and decides whether to re-dispatch a slash command that may mutate state by regex on the 4018 message. A reworded backend string changes client control flow. Messages are raw str(e) sent to a possibly remote client without redaction.",
+   "move": "tui_gateway/errors.py with class RpcError(IntEnum), one member per meaning (split 4001/4018); _err(rid, RpcError.X, msg); the contract generator emits the TS enum into gateway-contract.generated.ts; clients branch on code only; _err redacts msg with Purpose.EGRESS (ERR-04).",
+   "reference": null,
+   "loc_delta": 50,
+   "risk": "Old clients matching current numbers: keep numeric values for unchanged meanings, add codes only for the split cases.",
+   "depends_on": [
+    "ERR-04"
+   ]
+  }
+ ],
+ "kill_list": [
+  {
+   "target": "pyproject.toml tenacity core dependency",
+   "why": "pinned, zero in-scope importers (adopt via stamina or delete)",
+   "callers": 0,
+   "evidence": "pyproject.toml:53; rg tenacity"
+  },
+  {
+   "target": "hermes_logging.py::set_session_context / clear_session_context / _session_context",
+   "why": "wrong primitive (ERR-05); clear has 0 callers",
+   "callers": 3,
+   "evidence": "hermes_logging.py:104, :229-236"
+  },
+  {
+   "target": "16 try/except wrappers around 'from agent.redact import'",
+   "why": "import cannot fail; each invents a failure policy, two fail open (ERR-04)",
+   "callers": 16,
+   "evidence": "scripts/err_redact_guards.out.txt"
+  },
+  {
+   "target": "tools/mcp_tool_common.py::_CREDENTIAL_PATTERN / _sanitize_error",
+   "why": "private second secret list",
+   "callers": 11,
+   "evidence": "tools/mcp_tool_common.py:72-87"
+  },
+  {
+   "target": "gateway/platforms/base.py::_is_retryable_error / _is_rate_limited_error / _is_timeout_error, SendResult.retryable",
+   "why": "substring re-classification (ERR-02)",
+   "callers": 55,
+   "evidence": "gateway/platforms/base.py:3566-3586"
+  },
+  {
+   "target": "gateway/run_turn.py::_tool_call_logger, _run_agent_write_tool_log",
+   "why": "second file-logging pipeline (ERR-07)",
+   "callers": 1,
+   "evidence": "gateway/run_turn.py:54-75, :3200"
+  },
+  {
+   "target": "plugins/observability/langfuse/ + hermes_cli/tools_config_post_setup.py::_post_setup_langfuse + pm/extras.py entry",
+   "why": "third-party product in tree (ERR-10)",
+   "callers": 0,
+   "evidence": "plugins/observability/langfuse/__init__.py:1"
+  },
+  {
+   "target": "~1,795 first-party import guards",
+   "why": "hide broken installs and real bugs (ERR-11)",
+   "callers": 0,
+   "evidence": "scripts/err_import_guard.py"
+  },
+  {
+   "target": "duplicate PtyUnavailableError (3 definitions)",
+   "why": "one class in three modules",
+   "callers": 5,
+   "evidence": "hermes_cli/pty_bridge.py:59, hermes_cli/win_pty_bridge.py:39, hermes_cli/web_server_chat.py:41"
+  }
+ ],
+ "simplify_list": [
+  {
+   "from": [
+    "agent/error_classifier.py::FailoverReason",
+    "tools/bot_failure_reasons.py",
+    "agent/monitoring/cron_health.py::classify_cron_error",
+    "agent/monitoring/gateway_health.py::classify_gateway_error",
+    "gateway/platforms/base.py::classify_send_error"
+   ],
+   "to": "agent/failure.py::Failure + one table",
+   "loc_saved": 350,
+   "evidence": "ERR-01"
+  },
+  {
+   "from": [
+    "~95 retry loops",
+    "agent/retry_utils.py::jittered_backoff",
+    "tests autouse backoff stub"
+   ],
+   "to": "stamina.retry_context(on=...)",
+   "loc_saved": 600,
+   "evidence": "ERR-03"
+  },
+  {
+   "from": [
+    "redact_sensitive_text flags",
+    "redact_for_egress",
+    "agent/monitoring/redaction.py",
+    "hermes_cli/debug_redaction.py",
+    "16 wrappers"
+   ],
+   "to": "agent/redact.py::redact(text, purpose)",
+   "loc_saved": 250,
+   "evidence": "ERR-04"
+  },
+  {
+   "from": [
+    "hermes_logging.py threading.local session tag",
+    "gateway/session_context.py ContextVars"
+   ],
+   "to": "one ContextVar read by the record factory",
+   "loc_saved": 30,
+   "evidence": "ERR-05"
+  },
+  {
+   "from": [
+    "_ProfileRoutingFileHandler home-override re-binding",
+    "listener-side redaction policy reads"
+   ],
+   "to": "format on producer, route strings by home key",
+   "loc_saved": 200,
+   "evidence": "ERR-06"
+  },
+  {
+   "from": [
+    "gateway/run_turn.py tool_calls.log handler",
+    "hermes_logging handler_specs"
+   ],
+   "to": "one handler_specs row",
+   "loc_saved": 45,
+   "evidence": "ERR-07"
+  },
+  {
+   "from": [
+    "agent/process_bootstrap.py proxy",
+    "gateway/platforms/base.py::resolve_proxy_url",
+    "tools/mcp_tool_transport.py::_mcp_proxy_mounts",
+    "~200 per-site HTTP choices"
+   ],
+   "to": "hermes_platform/net.py::NetPolicy + http_client(purpose)",
+   "loc_saved": 400,
+   "evidence": "ERR-08"
+  },
+  {
+   "from": [
+    "hermes_cli/lifecycle.py observer",
+    "110 direct telemetry imports",
+    "agent/monitoring/emitter.py queue"
+   ],
+   "to": "agent/events.py bus with subscribers",
+   "loc_saved": null,
+   "evidence": "ERR-09"
+  }
+ ],
+ "reference_patterns": [
+  {
+   "repo": "stamina",
+   "path": "src/stamina/_core.py:119",
+   "pattern": "retry_context(on=, attempts=, timeout=) with typed on=",
+   "applies_to": "ERR-03, ERR-02"
+  },
+  {
+   "repo": "stamina",
+   "path": "src/stamina/_config.py:174",
+   "pattern": "set_testing() global test switch",
+   "applies_to": "replaces jittered_backoff autouse stub (pyproject.toml:858)"
+  },
+  {
+   "repo": "structlog",
+   "path": "src/structlog/contextvars.py:82",
+   "pattern": "merge_contextvars: log context from ContextVars at emit time",
+   "applies_to": "ERR-05"
+  },
+  {
+   "repo": "structlog",
+   "path": "src/structlog/_config.py:202",
+   "pattern": "configure the processor chain once",
+   "applies_to": "ERR-04, ERR-09"
+  },
+  {
+   "repo": "structlog",
+   "path": "src/structlog/stdlib.py:1012",
+   "pattern": "ProcessorFormatter renders in the producer context",
+   "applies_to": "ERR-06"
+  },
+  {
+   "repo": "cpython",
+   "path": "Lib/logging/handlers.py:1522",
+   "pattern": "QueueHandler.prepare formats on the producer thread",
+   "applies_to": "ERR-06"
+  },
+  {
+   "repo": "cpython",
+   "path": "Lib/logging/handlers.py:1567",
+   "pattern": "one QueueListener for all file handlers",
+   "applies_to": "ERR-07"
+  },
+  {
+   "repo": "httpx",
+   "path": "httpx/_config.py:72",
+   "pattern": "Timeout and Limits (:159) as typed objects",
+   "applies_to": "ERR-08 NetPolicy"
+  },
+  {
+   "repo": "httpx",
+   "path": "httpx/_client.py:199",
+   "pattern": "event_hooks on a long-lived client",
+   "applies_to": "ERR-08 redacted request logging"
+  },
+  {
+   "repo": "blinker",
+   "path": "src/blinker/base.py",
+   "pattern": "named signals, decoupled receivers",
+   "applies_to": "ERR-09"
+  }
+ ],
+ "seam_answer": "Logging: yes, mostly. hermes_logging.setup_logging feeds one queue and listener for every entry point; the exceptions are the gateway's tool_calls.log (ERR-07) and three basicConfig entry points without redaction (mcp_serve.py:713, hermes_cli/plugin_host_child.py:571, agent/transports/hermes_tools_mcp_server.py:140). The session context uses the wrong primitive (ERR-05) and multiplex routing costs ~400 lines (ERR-06). Error model: one good typed model for provider calls (FailoverReason), lost at the first boundary; 9+ string classifiers with 5 vocabularies do the rest (ERR-01, ERR-02, ERR-12); 308 custom exception classes with no common root, 113 subclassing RuntimeError directly. Retry policy: none; ~95 hand-rolled loops, a backoff helper used 9 times, and an unused tenacity (ERR-03). HTTP: one shared client for provider SDK calls; everything else builds its own across 4 stacks and 3 proxy policies (ERR-08). structlog's contextvars model would delete the threading.local session tag and its rebind calls, and its processor chain is the shape for redaction purposes; a wholesale structlog swap is not needed. stamina would delete ~95 loops, jittered_backoff and the test stub, on top of tenacity which already ships. A shared httpx client per purpose deletes three proxy resolvers and requests/urlopen on core paths. The observability package (10k lines) is Nous's own opt-in telemetry (consent, telemetry.nousresearch.com): first-party and gated, so it stays, but as a subscriber on one event bus outside hermes_cli rather than 110 imports from agent/tools/gateway (ERR-09). Langfuse is a third-party product and should leave the tree (ERR-10).",
+ "cross_seam": [
+  {
+   "seam": "08-state",
+   "note": "kanban DB has its own SQLite busy retry beside hermes_state_errors.is_sqlite_lock_error; 17 files handle 'database is locked'",
+   "evidence": "hermes_cli/kanban_db_connect.py:1156"
+  },
+  {
+   "seam": "07-config",
+   "note": "379 broad excepts wrap config reads that already fail open; typed config (CFG-02) deletes them",
+   "evidence": "hermes_cli/config_read_errors.py:1"
+  },
+  {
+   "seam": "07-config",
+   "note": "HERMES_REDACT_SECRETS import-time snapshot plus per-profile re-read of .env/config; env var bridged from security.redact_secrets in three entry points",
+   "evidence": "agent/redact.py:97"
+  },
+  {
+   "seam": "13-tui-cron",
+   "note": "RPC error codes reused across meanings; ui-tui decides re-dispatch of mutating commands by message regex (ERR-12)",
+   "evidence": "ui-tui/src/app/userMessages.ts:192"
+  },
+  {
+   "seam": "01-layout",
+   "note": "agent/error_classifier imports hermes_cli.anon_auth and hermes_cli.route_identity; 24 agent/tools files import hermes_cli.observability",
+   "evidence": "agent/error_classifier.py:977"
+  },
+  {
+   "seam": "10-gateway",
+   "note": "adapter base class shells out to scutil --proxy with a TTL cache; proxy policy belongs in hermes_platform (ERR-08)",
+   "evidence": "gateway/platforms/base.py:279"
+  },
+  {
+   "seam": "11-plugins",
+   "note": "lifecycle.invoke_hook hard-codes shared metrics as a privileged observer ahead of plugin hooks",
+   "evidence": "hermes_cli/lifecycle.py:11"
+  },
+  {
+   "seam": "06-tools",
+   "note": "tool handlers wrap execution in telemetry closures (record_file_edit)",
+   "evidence": "tools/file_tools.py:1329"
+  }
+ ],
+ "unverified": [
+  "~95 real retry loops is extrapolated from a seeded 22-site sample of 210 heuristic hits (10/22 real); verify by hand-classifying scripts/err_retry_loops.out.json.",
+  "ERR-07 cross-profile write needs a live multiplex run with display.tool_progress: log for a secondary profile (A->B->A, inspect both logs/tool_calls.log).",
+  "ERR-05 stale tag on pooled gateway threads assumes turns run on reused executor threads; verify by logging threading.get_ident() and the tag across two sessions.",
+  "ERR-06 assumes producer-side formatting is cheap enough; no measurement; microbenchmark RedactingFormatter.format.",
+  "Whether any tui_gateway _err(rid, ..., str(e)) message can carry a secret today (ERR-12); audit exception sources for the 5095/5031 sites.",
+  "Whether removing requests from core breaks a transitive dependency user; verify with 'uv tree --invert --package requests' in a lab copy.",
+  "classify_gateway_error false positives ('token' => auth_failed) are inferred from the rule table, not observed on real errors.",
+  "ERR-11 loc_delta -4,000 is an estimate (~1,800 guards x ~2 lines).",
+  "scripts/err_http_ast.py reports 0 one-shot HTTP calls without timeout=, but it counts **kwargs as having a timeout; the true number may be higher."
+ ]
+}

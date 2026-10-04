@@ -319,3 +319,10 @@ native/fts5_cjk/*.so
 /pm/.lock.json.lock
 
 apps/desktop/.dist-build*
+
+# v2 branch
+.repos
+.repos/
+.scratch/
+v2/idioms/hits/
+v2/idioms/ruff.json

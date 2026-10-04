@@ -1,0 +1,664 @@
+{
+ "synthesis": {
+  "lede": "This is a read-only audit of the parts of hermes-agent that a user's request actually runs through: about 804,000 lines of Python in 1,968 files, at origin/main ea81748579. Fifteen readers took one area each, compared it against reference projects (llm, datasette, attrs, structlog, svcs, stamina, httpx, pydantic-ai, pydantic-settings, pluggy, inspect_ai, anyio, Home Assistant core), and wrote findings with file:line evidence. The parent re-checked the claims that carry the conclusions. Desktop, tests, scripts, evals, environments and skills were left out on purpose.",
+  "verdict": "Most of the code's size comes from duplication around missing abstractions. There is no model interface, no single tool abstraction, no surface-independent command layer, no typed adapter contract, no profile object and no typed config. Each surface and subsystem therefore re-implements the same decisions, and the copies drift. The September facade-and-siblings split made files smaller but kept the god objects, and the import graph is one cycle. The work order that follows from this: delete what has no callers, fix the hazards the audit found, collapse the duplicates, then introduce the six missing types.",
+  "howToRead": "Start with the anti-patterns. Each one links to the findings that support it; clicking an id opens it in the findings explorer. The flow debugger walks one real request through the code; switch its inputs to see which branches run. Everything here is a snapshot of origin/main on 2026-10-04 and nothing on this page is saved.",
+  "themesIntro": "Twelve patterns explain most of the 173 findings. They are ranked by how much they cost: bug-fix volume from the maintainer's 22k-commit analysis where it exists, otherwise how many files every contributor has to hold in their head.",
+  "areasIntro": "Size and smell density by package, from the parent's AST pass and a wide ruff run. Bars show the selected measure; per-1k-line ratios normalise for size so small packages with dense problems stand out.",
+  "importsIntro": "Each cell counts import statements from the row package into the column package. Module-level imports and imports inside functions are counted separately. A red outline means both directions exist, so the two packages form a cycle. The stated layering in AGENTS.md (surfaces on top of runtime on top of core) is not visible here: most pairs import each other, and 14,018 imports are placed inside functions to keep the cycles from failing at import time.",
+  "flowsIntro": "Each flow is a real path through the code, written by the reader for that area and cited to the line. Pick a flow, set the inputs on the left, and step through. Steps that do not run for the chosen inputs are dimmed. Steps marked with a finding id are where the structural problem shows up on that path.",
+  "findingsIntro": "Every finding names the structural problem, the move that fixes it, the reference code that shows the target shape, the evidence, and the behaviour that must be preserved. Low-hanging means effort S or M and severity high or critical. Tick findings to assemble a prompt for an implementation session.",
+  "killIntro": "Three views of what goes away: code that can be deleted outright (with caller counts), groups of N implementations that become one, and the estimated net lines each finding removes.",
+  "filesIntro": "Type a path fragment to see the parent-computed metrics for matching files and every finding whose evidence cites them. The default query shows the 33 hermes_state modules that make up one SessionDB class.",
+  "roadmapIntro": "An order that keeps every step shippable and reviewable on its own. It assumes the maintainer's ratchet engine from the code-health gist lands first, so each step below is locked in by CI and cannot regress. Phases name finding ids; each id is one PR or a short PR train.",
+  "refsIntro": "The reference code each finding points at, by repo. Every path was opened by the reader that cited it. These are the target shapes, not libraries to adopt wholesale: stamina, structlog, anyio and pydantic-settings are candidates to depend on; the others are patterns to copy.",
+  "methodIntro": "How the audit was run, which claims the parent re-checked by hand, and what the readers could not settle. The lab directory holds every report, the scripts that produced the counts, and the raw outputs.",
+  "defaultFlow": "10:inbound-reply",
+  "themes": [
+   {
+    "id": "T1",
+    "title": "A profile is not an object, so scope travels through ambient state",
+    "cost": "#1 bug class: 366 fixes, 305 issues, 6 reverts",
+    "summary": "Which profile a piece of work belongs to is spread over 6 ContextVars, 3 process globals and os.environ. Seven hand-written binders each set a different subset. Config reaches tools through os.environ, threads lose scope unless one of four helpers is used, and the log session tag is a thread-local that is never cleared. Every leak fix adds one more binder call at one more site.",
+    "today": "9 ambient channels; 127 bare home overrides; ~12 functions answer 'which home'; 3 TERMINAL_* env maps that disagree; 229 undeclared HERMES_* names.",
+    "target": "One frozen ProfileScope value (home, config, secrets, terminal policy) built by one factory and bound by one ContextVar per activity. Code reads scope.config / scope.secret(name); os.environ is never a config channel.",
+    "reference": ".repos/svcs/src/svcs/_core.py (per-scope container), .repos/structlog/src/structlog/contextvars.py (one bind point)",
+    "findings": [
+     "CFG-01",
+     "CFG-04",
+     "CFG-05",
+     "CFG-09",
+     "CON-03",
+     "ERR-05",
+     "ERR-07",
+     "TLS-09",
+     "TUI-03",
+     "PLG-02",
+     "PLG-04",
+     "KIL-01"
+    ]
+   },
+   {
+    "id": "T2",
+    "title": "Config is an untyped dict read ad hoc in 496 places",
+    "cost": "496 load_config() calls, ~960 defensive .get chains",
+    "summary": "DEFAULT_CONFIG is a schema only by example. About ten side tables and hand validators fill the gaps, there are three loaders with different merge rules, the classic CLI has its own defaults table that already disagrees with the shared one, and a failed migration step is skipped while the version is stamped as current.",
+    "today": "3 loaders, 3 .env parsers, 18 read-modify-write migration steps, hermes_constants.py (1,411 lines) imported by 525 files.",
+    "target": "A pydantic HermesSettings model with ordered sources (defaults < config.yaml < managed overlay < explicit overrides). model_fields_set answers 'did the user set this', which removes the defaults-free loader. pydantic is already a core dependency.",
+    "reference": ".repos/pydantic-settings/pydantic_settings/main.py (settings_customise_sources), .repos/pydantic-settings/pydantic_settings/sources/",
+    "findings": [
+     "CFG-02",
+     "CFG-03",
+     "CFG-06",
+     "CFG-07",
+     "CFG-08",
+     "CFG-10",
+     "LAY-11"
+    ]
+   },
+   {
+    "id": "T3",
+    "title": "There are no layers: the import graph is one cycle and hermes_cli is the core library",
+    "cost": "16 of 17 package groups in one cycle; 14,018 function-level imports",
+    "summary": "Counting module-level imports only, 10 of 17 package groups form one strongly connected component; counting imports inside functions, 16 of 17 do. hermes_cli.config is imported from about 850 places and imports agent back. Storage imports the agent. 33 hermes_state modules, cli.py and 28 other generic names are installed as top-level modules, and 12 library modules rewrite sys.path when imported.",
+    "today": "63 top-level import names; 1,135 import edges point upward against a five-layer contract; only 23% of hermes_cli's 260k lines is CLI code.",
+    "target": "One hermes_agent package in a src layout with layers as subpackages (base, core, state and providers, runtime, surfaces), enforced by an import-linter contract that starts as a baseline and only shrinks.",
+    "reference": ".repos/httpx/httpx/__init__.py (private modules, curated public API), .repos/inspect_ai/src/inspect_ai/ (_util and private underscore modules at scale)",
+    "findings": [
+     "LAY-01",
+     "LAY-02",
+     "LAY-03",
+     "LAY-05",
+     "LAY-06",
+     "LAY-07",
+     "LAY-08",
+     "LAY-09",
+     "LAY-12",
+     "CLI-06",
+     "STA-03",
+     "PMC-04",
+     "PMF-02",
+     "KIL-08"
+    ]
+   },
+   {
+    "id": "T4",
+    "title": "The facade-and-siblings split kept the god objects",
+    "cost": "AIAgent 371 attributes; GatewayRunner 959 methods; HermesCLI 627; SessionDB 482",
+    "summary": "Each former god file became a facade plus topical siblings, but the class stayed one namespace assembled from mixins: GatewayRunner from 18, HermesCLI from 17, SessionDB from 15, and tui_gateway rebinds 44 modules' globals onto server.py. Between 40% and 53% of each mixin's self.X reads resolve to another mixin. The AGENTS.md rule that tests patch the facade is what keeps this shape: siblings late-import the facade so monkeypatching still works.",
+    "today": "AIAgent private attributes are read 1,614 times from 97 files outside the class; ~2,700 F821 undefined names in tui_gateway; 32 lazy forwarders exist only as test seams.",
+    "target": "Composed collaborators with typed state (attrs or dataclass state groups that init_agent already has as dicts), explicit dependencies passed in, and tests that patch the injected dependency instead of a facade global.",
+    "reference": ".repos/attrs/src/attr/_make.py (typed state), .repos/svcs/src/svcs/_core.py (explicit dependencies), .repos/pydantic-ai/pydantic_ai_slim/pydantic_ai/_agent_graph.py (state passed to nodes)",
+    "findings": [
+     "LAY-04",
+     "AGT-01",
+     "AGT-06",
+     "AGT-07",
+     "STA-02",
+     "GWY-06",
+     "CLI-09",
+     "TUI-01",
+     "TUI-02",
+     "TUI-11",
+     "TLS-06",
+     "PLG-09"
+    ]
+   },
+   {
+    "id": "T5",
+    "title": "The core concepts have no interface: model, tool, command, adapter",
+    "cost": "8 model wire paths, 7 tool sources, 4 command implementations of /help",
+    "summary": "The main loop picks the model wire with api_mode if-ladders at 102 sites; the auxiliary path, Gemini, ACP and MoA impersonate the OpenAI SDK instead. Tools come from 7 sources with two dispatch orders and three copies of the hook pipeline. Slash commands are printing methods on four surface objects. Platform adapters are probed with 113 getattr/hasattr checks because the base class offers hooks, not a contract.",
+    "today": "auxiliary_client.py (8,407 lines) is a second provider stack; 12 schema assembly stages; slash_exec.EXECUTORS covers 6 of 102 commands; 97 platform-identity branches in gateway core.",
+    "target": "A Model ABC with request()/stream() and one typed ResolvedRoute; a toolset abstraction with a run context and prepare hook; CommandDef.run(ctx) -> CommandReply with typed effects; a Transport protocol plus PlatformCapabilities for adapters.",
+    "reference": ".repos/pydantic-ai/pydantic_ai_slim/pydantic_ai/models/__init__.py (Model), .../toolsets/ (CombinedToolset, PreparedToolset), .repos/inspect_ai/src/inspect_ai/model/_model.py, .repos/llm/llm/models.py",
+    "findings": [
+     "PRV-01",
+     "PRV-02",
+     "PRV-03",
+     "PRV-05",
+     "PRV-11",
+     "TLS-01",
+     "TLS-02",
+     "TLS-05",
+     "AGT-12",
+     "AGT-13",
+     "CLI-01",
+     "CLI-04",
+     "GWY-02",
+     "GWY-04",
+     "GWY-05"
+    ]
+   },
+   {
+    "id": "T6",
+    "title": "Registries are restated by hand in parallel lists that drift",
+    "cost": "~26 slash-name lists, 7 provider alias tables, 3 toolset declarations, 7 plugin discovery systems",
+    "summary": "Where a registry exists, other code copies its contents into literals instead of deriving from it. The copies already disagree: ACP accepts /reset but not /new, the browser tools register under pseudo-toolsets that show up as 'Plugin toolset', 'openai' maps to openrouter on one path and to custom on another, and 17 of 23 hermes-* toolset bundles copy the core list.",
+    "today": "COMMAND_REGISTRY + ~26 collections; TOOLSETS + ToolEntry.toolset + _HERMES_CORE_TOOLS; 6+ model catalogs; 31 plugin registries; 6 argparse registration conventions.",
+    "target": "One registry per concept and generated views. Plugins add entries through register_* hooks; every list a surface needs is a function of the registry.",
+    "reference": ".repos/llm/llm/hookspecs.py and llm/plugins.py (register_models, register_commands, register_tools), .repos/pluggy/src/pluggy/_manager.py",
+    "findings": [
+     "TLS-03",
+     "TLS-04",
+     "TLS-10",
+     "CLI-02",
+     "CLI-03",
+     "CLI-07",
+     "PRV-04",
+     "PRV-10",
+     "GWY-08",
+     "PLG-01",
+     "PLG-03",
+     "PLG-05",
+     "PLG-06"
+    ]
+   },
+   {
+    "id": "T7",
+    "title": "Nothing owns threads, event loops or shutdown",
+    "cost": "476 hang issues; race/TOCTOU 245 fixes",
+    "summary": "There are 246 bare threading.Thread calls (243 daemon, 126 with no handle kept), about ten private event loops on daemon threads, eight separate sync-to-async bridges, five hang watchdogs and 41 atexit hooks. Each runtime hand-lists its teardown and then calls os._exit. Gateway stop is 2,300 lines of phase ordering with about 15 work counters. The sync agent core cannot be cancelled, so every layer adds an abandon path.",
+    "today": "4 hand-written shutdown lists; chained SIGTERM handlers whose order depends on import order; importing tui_gateway/server.py starts a thread pool.",
+    "target": "One lifecycle module (staged shutdown with timeouts, owned spawn, one signal owner per process) and one async portal. Adapters get a lifecycle state machine. A per-turn cancel token comes before any move to an async loop.",
+    "reference": ".repos/home-assistant-core/homeassistant/core.py (tracked tasks, shutdown stages), .repos/anyio/src/anyio/from_thread.py (blocking portal), .repos/cpython/Lib/asyncio/taskgroups.py",
+    "findings": [
+     "CON-01",
+     "CON-02",
+     "CON-03",
+     "CON-04",
+     "CON-05",
+     "CON-06",
+     "CON-07",
+     "CON-08",
+     "CON-09",
+     "CON-10",
+     "CON-11",
+     "GWY-07",
+     "TUI-12"
+    ]
+   },
+   {
+    "id": "T8",
+    "title": "Errors become strings; retries, HTTP and redaction are re-decided at every call site",
+    "cost": "swallowed exceptions 106 fixes; secret redaction 145; missing timeouts 85",
+    "summary": "One typed failure model exists (FailoverReason) and nine substring classifiers with five vocabularies redo its work downstream. There are about 95 hand-written retry loops while tenacity is pinned in core with zero importers, 101 HTTP client constructors over four stacks, and about ten failure policies around one redaction engine, two of which fail open. Most of the 8,014 broad excepts come from two causes: guards around first-party imports and wrappers around config reads that already fail open.",
+    "today": "89 JSON-RPC error codes reused across meanings; TUI picks control flow by regex on error text; gateway send retry is an OR of substring checks.",
+    "target": "A failure enum carried from raise site to renderer; one retry primitive; one HTTP client factory with typed timeouts and proxy policy; redact(text, purpose) with one failure policy.",
+    "reference": ".repos/stamina/src/stamina/_core.py, .repos/httpx/httpx/_config.py (Timeout, Limits), .repos/structlog/src/structlog/processors.py",
+    "findings": [
+     "ERR-01",
+     "ERR-02",
+     "ERR-03",
+     "ERR-04",
+     "ERR-06",
+     "ERR-08",
+     "ERR-09",
+     "ERR-11",
+     "ERR-12",
+     "PRV-06",
+     "PRV-07",
+     "PRV-08",
+     "PMC-09"
+    ]
+   },
+   {
+    "id": "T9",
+    "title": "Storage is defence machinery around a small data model",
+    "cost": "SQLite locking 131 fixes",
+    "summary": "The session store is about five tables, and 36% of its 20,228 lines is connection safety and recovery. The largest piece defends against SQLite deleting a live WAL file, a problem that one connection flag prevents on the 3.14 runtime. Hermes has 16 SQLite databases and at least 30 JSON state files; kanban and cron re-implement the store machinery, three write-transaction helpers disagree, and JSON state has ten private atomic writers.",
+    "today": "4 ways to open state.db; migrations as an if-version ladder plus per-open heals; lease reclaim by PID liveness; one cron fire writes to 2-5 stores in separate transactions.",
+    "target": "One store module per database with a single schema owner and versioned migrations; one write path per process; one atomic writer for JSON state; leases by TTL.",
+    "reference": ".repos/sqlite-utils/sqlite_utils/db.py, .repos/datasette/datasette/database.py (single write thread, read connections)",
+    "findings": [
+     "STA-01",
+     "STA-04",
+     "STA-05",
+     "STA-06",
+     "STA-07",
+     "STA-08",
+     "STA-09",
+     "TUI-04",
+     "TUI-05",
+     "TUI-08",
+     "TUI-10"
+    ]
+   },
+   {
+    "id": "T10",
+    "title": "The PM boundary runs backwards and the updater keeps accreting",
+    "cost": "updater failures: 398 closed issues (#4 issue class)",
+    "summary": "Every install, update, repair and lazy extra already ends in one engine (pm.sync_venv). Around it, PM's journal recovery, repair driver and GC live in hermes_cli, while hermes_cli writes PM-owned state without a PM transaction. The worker interface is written out three times. Two receipt engines replace the same latest.json, the update lock is check-then-write, and the frozen old-updater surface pins 562 names and 71 shims with no minimum supported release.",
+    "today": "~25 mechanisms over 5 jobs in 35k lines; 3 generation stores; 4 plugin install front-ends; 11 lock/receipt records track one update; hermes doctor disagrees with PM's own verdict.",
+    "target": "PM owns its state: one Install value, one Store, one Generations primitive, one @operation registry, a six-name public API. One receipt engine. A declared minimum updatable release so the compat surface can shrink.",
+    "reference": ".repos/home-assistant-core/homeassistant/requirements.py (install once, under a lock), .repos/llm/llm/cli.py (install as a thin command over one engine)",
+    "findings": [
+     "PMC-01",
+     "PMC-02",
+     "PMC-03",
+     "PMC-05",
+     "PMC-06",
+     "PMC-07",
+     "PMC-10",
+     "PMC-11",
+     "PMC-12",
+     "PMF-01",
+     "PMF-03",
+     "PMF-04",
+     "PMF-07",
+     "PMF-08",
+     "PMF-10",
+     "PMF-11",
+     "PMF-12",
+     "PMF-13"
+    ]
+   },
+   {
+    "id": "T12",
+    "title": "The same helper is re-implemented dozens of times",
+    "cost": "~1,600 duplicated lines across 11 helper categories",
+    "summary": "Canonical helpers exist, and most code does not use them. Atomic file writes are re-implemented about 53 times beside utils.atomic_write_*, most with fixed temp names and no fsync. Boolean env/config parsing has 31 private helpers, and 44 inline sites ignore 'on' (including an allow-all-users gate). PID liveness has about 17 implementations. 24 git subprocess wrappers bypass the shared one, three without a timeout. The A2A push callback re-implements the SSRF check without DNS resolution or redirect re-validation.",
+    "today": "53 atomic writers, 31 truthy parsers, 17 PID-liveness checks, 24 git wrappers, ~17 hand-rolled HERMES_HOME resolutions, 166 bare shutil.which calls around hermes_platform.",
+    "target": "Delete the copies and call the canonical helper; then a ratchet rule per helper (the gist's engine) keeps new copies out.",
+    "reference": ".repos/sqlite-utils and .repos/llm (small cores with one helper per job)",
+    "findings": [
+     "KIL-02",
+     "KIL-03",
+     "KIL-04",
+     "KIL-05",
+     "KIL-06",
+     "KIL-11",
+     "KIL-12",
+     "KIL-09"
+    ]
+   },
+   {
+    "id": "T11",
+    "title": "Code that should not be in this tree",
+    "cost": "off-path runners, dead code, vendor plugins",
+    "summary": "About 2,400 lines of research and data-generation runners (batch_runner, trajectory_compressor, mini_swe_runner and friends) are installed as top-level modules in every wheel, and AIAgent still carries their trajectory format. Four vendor plugins sit in-tree against the repo's own rule. The legacy hermes-agent entry point duplicates the CLI's one-shot runner. True dead code is small: 7 functions plus a few unimported modules, about 850 lines with the test-only code.",
+    "today": "KIL-10: 2,399 lines of RL/datagen code at the repo root; KIL-07: ~850 lines verified dead or test-only; PLG-07: ~5,600 lines of vendor plugins.",
+    "target": "Off-path code moves to its own repo or is deleted; third-party plugins ship as standalone repos; test-only seams are removed with the tests that need them rewritten against behaviour.",
+    "reference": null,
+    "findings": [
+     "KIL-10",
+     "KIL-07",
+     "PLG-07",
+     "PLG-08",
+     "ERR-10",
+     "CLI-10",
+     "PRV-09",
+     "TLS-07",
+     "TLS-08",
+     "PMC-08",
+     "GWY-09",
+     "GWY-12"
+    ]
+   }
+  ],
+  "roadmap": [
+   {
+    "phase": "0 \u00b7 before",
+    "title": "Land the ratchet engine from the code-health gist",
+    "why": "Every phase below deletes or collapses code. Without per-file and per-function caps that only go down, the next feature PR re-adds what was removed. The gist's Phase 1 is a prerequisite, not a parallel track.",
+    "items": []
+   },
+   {
+    "phase": "1 \u00b7 days",
+    "title": "Delete what has no callers",
+    "why": "Effort S, no design decisions, each one a small PR. Shrinks the surface the later phases have to move.",
+    "items": [
+     "PRV-09",
+     "TLS-08",
+     "TLS-09",
+     "CLI-10",
+     "LAY-08",
+     "LAY-09",
+     "PMC-08",
+     "PLG-08",
+     "ERR-10",
+     "PLG-07",
+     "KIL-07",
+     "KIL-10"
+    ]
+   },
+   {
+    "phase": "2 \u00b7 1-2 weeks",
+    "title": "Fix the hazards the audit found",
+    "why": "These are correctness problems, not style: receipts overwritten, a lock that is not a lock, a recalled plugin's deps still installable, a CLI turn cap that disagrees with every other surface, a migration that never re-runs, logs written into the wrong profile.",
+    "items": [
+     "PMF-01",
+     "PMF-07",
+     "PMF-03",
+     "PMF-06",
+     "PMF-09",
+     "CFG-03",
+     "CFG-07",
+     "ERR-05",
+     "ERR-07",
+     "PLG-02",
+     "STA-01",
+     "KIL-06",
+     "KIL-04",
+     "KIL-03"
+    ]
+   },
+   {
+    "phase": "3 \u00b7 2-4 weeks",
+    "title": "Collapse the duplicates",
+    "why": "N implementations become one. Each removes a drift source without changing the architecture, so each is reviewable alone.",
+    "items": [
+     "TLS-03",
+     "TLS-04",
+     "CLI-02",
+     "PRV-04",
+     "PRV-06",
+     "PRV-07",
+     "PRV-08",
+     "CFG-04",
+     "CFG-05",
+     "CFG-06",
+     "AGT-08",
+     "CON-01",
+     "CON-03",
+     "CON-04",
+     "CON-08",
+     "ERR-01",
+     "ERR-02",
+     "ERR-03",
+     "ERR-04",
+     "STA-04",
+     "STA-09",
+     "GWY-03",
+     "GWY-10",
+     "PMF-08",
+     "PLG-03",
+     "PMC-02",
+     "KIL-02",
+     "KIL-05",
+     "KIL-11",
+     "KIL-12"
+    ]
+   },
+   {
+    "phase": "4 \u00b7 month 2",
+    "title": "Introduce the typed boundaries",
+    "why": "ProfileScope, HermesSettings, the turn's typed request/result and loop state, the TUI context object, ResolvedRoute and PM's Install value. These are the six missing types; most later moves are mechanical once they exist.",
+    "items": [
+     "CFG-01",
+     "CFG-02",
+     "AGT-02",
+     "AGT-03",
+     "AGT-04",
+     "AGT-05",
+     "AGT-09",
+     "TUI-01",
+     "TUI-02",
+     "TUI-03",
+     "TUI-05",
+     "PRV-03",
+     "PMC-03",
+     "PMC-04",
+     "PMC-06",
+     "LAY-03",
+     "LAY-05",
+     "LAY-06",
+     "GWY-04",
+     "GWY-05",
+     "GWY-07",
+     "CLI-03",
+     "CLI-04",
+     "CLI-05",
+     "PMF-04"
+    ]
+   },
+   {
+    "phase": "5 \u00b7 quarter",
+    "title": "Re-architecture",
+    "why": "The large moves: one package with enforced layers, one Model interface, one tool abstraction, one command layer, the runner-owned chat lane, owned lifecycle, the SessionDB split. Each is a PR train, and each depends on the typed boundaries from phase 4.",
+    "items": [
+     "LAY-01",
+     "LAY-02",
+     "LAY-04",
+     "PRV-01",
+     "PRV-02",
+     "TLS-01",
+     "CLI-01",
+     "GWY-01",
+     "GWY-02",
+     "GWY-06",
+     "CON-06",
+     "CON-10",
+     "STA-02",
+     "PLG-01",
+     "AGT-01",
+     "PMC-01",
+     "PMF-10",
+     "KIL-01"
+    ]
+   }
+  ]
+ },
+ "system": {
+  "width": 980,
+  "height": 500,
+  "caption": "How a request reaches the agent today, and where the structure breaks. Six surfaces each build an AIAgent with their own callbacks and slash handling. The agent reaches the model through eight wire paths, tools through seven sources and storage through one 15-mixin class. Red nodes and dashed red edges are the two cross-cutting dependencies everything has: hermes_cli as the de facto core library, and profile scope carried in ambient state.",
+  "bands": [
+   {
+    "label": "surfaces (each re-implements slash commands and callbacks)",
+    "x": 10,
+    "y": 6,
+    "w": 960,
+    "h": 100
+   },
+   {
+    "label": "services the agent calls",
+    "x": 10,
+    "y": 286,
+    "w": 960,
+    "h": 100
+   }
+  ],
+  "nodes": [
+   {
+    "id": "cli",
+    "label": "CLI REPL",
+    "sub": "cli.py + 17 mixins",
+    "x": 20,
+    "y": 34,
+    "w": 145
+   },
+   {
+    "id": "tui",
+    "label": "TUI / Desktop",
+    "sub": "tui_gateway serve",
+    "x": 178,
+    "y": 34,
+    "w": 145
+   },
+   {
+    "id": "gw",
+    "label": "Messaging",
+    "sub": "gateway + 18 mixins",
+    "x": 336,
+    "y": 34,
+    "w": 145
+   },
+   {
+    "id": "cron",
+    "label": "Cron",
+    "sub": "cron/scheduler 4.5k",
+    "x": 494,
+    "y": 34,
+    "w": 145
+   },
+   {
+    "id": "dash",
+    "label": "Dashboard",
+    "sub": "284 HTTP routes",
+    "x": 652,
+    "y": 34,
+    "w": 145
+   },
+   {
+    "id": "acp",
+    "label": "ACP",
+    "sub": "acp_adapter",
+    "x": 810,
+    "y": 34,
+    "w": 145
+   },
+   {
+    "id": "core",
+    "label": "hermes_cli as core lib",
+    "sub": "config \u00b7 profiles \u00b7 plugins",
+    "x": 20,
+    "y": 172,
+    "w": 230,
+    "kind": "bad"
+   },
+   {
+    "id": "agent",
+    "label": "AIAgent",
+    "sub": "371 attrs \u00b7 22 callbacks",
+    "x": 360,
+    "y": 168,
+    "w": 260,
+    "h": 54,
+    "kind": "hot"
+   },
+   {
+    "id": "scope",
+    "label": "ambient profile scope",
+    "sub": "6 ContextVars \u00b7 3 globals \u00b7 env",
+    "x": 730,
+    "y": 172,
+    "w": 230,
+    "kind": "bad"
+   },
+   {
+    "id": "prov",
+    "label": "Model wire",
+    "sub": "8 paths \u00b7 aux stack 8.4k",
+    "x": 20,
+    "y": 316,
+    "w": 215
+   },
+   {
+    "id": "tools",
+    "label": "Tools",
+    "sub": "7 sources \u00b7 3 pipelines",
+    "x": 262,
+    "y": 316,
+    "w": 215
+   },
+   {
+    "id": "state",
+    "label": "Storage",
+    "sub": "SessionDB 15 mixins \u00b7 16 DBs",
+    "x": 504,
+    "y": 316,
+    "w": 215
+   },
+   {
+    "id": "plug",
+    "label": "Plugins",
+    "sub": "7 discovery systems",
+    "x": 746,
+    "y": 316,
+    "w": 215
+   },
+   {
+    "id": "pm",
+    "label": "PM + updater",
+    "sub": "pm/ 12k \u00b7 update 20k",
+    "x": 380,
+    "y": 432,
+    "w": 220
+   }
+  ],
+  "edges": [
+   {
+    "from": "cli",
+    "to": "agent",
+    "tx": 40
+   },
+   {
+    "from": "tui",
+    "to": "agent",
+    "tx": 80
+   },
+   {
+    "from": "gw",
+    "to": "agent",
+    "tx": 120,
+    "label": "build + run turn",
+    "ldy": -6
+   },
+   {
+    "from": "cron",
+    "to": "agent",
+    "tx": 150
+   },
+   {
+    "from": "dash",
+    "to": "agent",
+    "tx": 190
+   },
+   {
+    "from": "acp",
+    "to": "agent",
+    "tx": 225
+   },
+   {
+    "from": "agent",
+    "to": "core",
+    "kind": "bad",
+    "label": "imports config"
+   },
+   {
+    "from": "scope",
+    "to": "agent",
+    "kind": "bad",
+    "label": "reads scope"
+   },
+   {
+    "from": "agent",
+    "to": "prov",
+    "fx": 30,
+    "label": "api_mode ladders",
+    "ldx": -70
+   },
+   {
+    "from": "agent",
+    "to": "tools",
+    "fx": 90
+   },
+   {
+    "from": "agent",
+    "to": "state",
+    "fx": 215,
+    "tx": 110,
+    "label": "persist",
+    "ldx": 48,
+    "ldy": 0
+   },
+   {
+    "from": "state",
+    "to": "agent",
+    "fx": 40,
+    "tx": 165,
+    "kind": "bad",
+    "label": "imports agent",
+    "ldx": -62,
+    "ldy": 10
+   },
+   {
+    "from": "plug",
+    "to": "pm",
+    "label": "deps via sync_venv",
+    "ldy": 14
+   }
+  ]
+ }
+}

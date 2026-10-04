@@ -1,0 +1,947 @@
+{
+ "seam": "cli",
+ "nn": "12",
+ "title": "CLI, subcommands, slash commands, dashboard backend, ACP",
+ "prefix": "CLI",
+ "tldr": [
+  "Slash commands have no surface-independent layer: each is a printing method on HermesCLI, GatewayRunner mixins, TUI builtins (+ a shadow HermesCLI subprocess), or ACP _cmd_*; /help exists 4 times and TUI /model runs twice in two processes.",
+  "Biggest kill: the TUI slash worker (persistent HermesCLI subprocess per session) and its _SLASH_MIRRORS side-effect replay.",
+  "Biggest simplification: finish slash_exec.EXECUTORS (6/102 commands) so every CommandDef owns one executor returning a typed reply + effects; ~26 hand lists and 4 handler hosts collapse (~5k lines).",
+  "Low-hanging: 4 findings (CLI-02, CLI-03, CLI-04, CLI-05).",
+  "hermes_cli is 260k lines because only 23% is CLI; 31% is core library imported by agent/tools/gateway and 36% is servers/services."
+ ],
+ "scope": {
+  "paths": [
+   "hermes_cli/",
+   "cli.py",
+   "acp_adapter/",
+   "agent/legacy_cli.py"
+  ],
+  "loc": 266056,
+  "files": 660
+ },
+ "modules": [
+  {
+   "path": "hermes_cli/main.py",
+   "loc": 3731,
+   "owns": "entry main(), 4 argv fast paths, _build_cli_parser, 40 cmd_* handlers/forwarders, _BUILTIN_SUBCOMMANDS"
+  },
+  {
+   "path": "hermes_cli/subcommands/",
+   "loc": null,
+   "owns": "build_<group>_parser per group (66 files)"
+  },
+  {
+   "path": "hermes_cli/commands.py",
+   "loc": 567,
+   "owns": "CommandDef / COMMAND_REGISTRY (102), resolve_command, gateway help, menus"
+  },
+  {
+   "path": "hermes_cli/slash_exec.py",
+   "loc": 199,
+   "owns": "registry-owned executors, 6 commands"
+  },
+  {
+   "path": "cli.py + hermes_cli/cli_*",
+   "loc": 23153,
+   "owns": "HermesCLI REPL (17 mixins, 627 methods) and every CLI slash handler"
+  },
+  {
+   "path": "hermes_cli/console_engine.py",
+   "loc": 862,
+   "owns": "dashboard Hermes Console: curated re-wrap of argparse subcommands"
+  },
+  {
+   "path": "hermes_cli/web_server.py + web_server_*.py + web_routers/ + dashboard_auth/",
+   "loc": 25000,
+   "owns": "dashboard FastAPI backend, 284 routes"
+  },
+  {
+   "path": "acp_adapter/",
+   "loc": 4502,
+   "owns": "ACP server; own 9-command slash list"
+  },
+  {
+   "path": "agent/legacy_cli.py",
+   "loc": 94,
+   "owns": "hermes-agent console script argv layer over run_agent.main"
+  }
+ ],
+ "hermes_cli_topics": [
+  {
+   "topic": "dashboard backend (web server, routers, PTY bridge, dashboard auth)",
+   "loc": 31704,
+   "files": 72,
+   "cli_proper": false
+  },
+  {
+   "topic": "interactive classic CLI (HermesCLI mixins, render, input)",
+   "loc": 27349,
+   "files": 52,
+   "cli_proper": true
+  },
+  {
+   "topic": "update / install / release / source build",
+   "loc": 20234,
+   "files": 58,
+   "cli_proper": false
+  },
+  {
+   "topic": "auth / accounts / secrets",
+   "loc": 17377,
+   "files": 39,
+   "cli_proper": false
+  },
+  {
+   "topic": "models / providers / runtime provider resolution",
+   "loc": 17326,
+   "files": 34,
+   "cli_proper": false
+  },
+  {
+   "topic": "setup wizard / tools config / doctor / diagnostics",
+   "loc": 16853,
+   "files": 45,
+   "cli_proper": true
+  },
+  {
+   "topic": "plugins (loader, host, catalog, install)",
+   "loc": 16528,
+   "files": 43,
+   "cli_proper": false
+  },
+  {
+   "topic": "kanban (board DB, dispatcher, CLI)",
+   "loc": 15318,
+   "files": 18,
+   "cli_proper": false
+  },
+  {
+   "topic": "gateway service management (systemd/launchd/Windows, migrate, enroll)",
+   "loc": 14737,
+   "files": 22,
+   "cli_proper": false
+  },
+  {
+   "topic": "sessions / state / backup / worktrees",
+   "loc": 14424,
+   "files": 35,
+   "cli_proper": false
+  },
+  {
+   "topic": "command framework (entry, argparse tree, slash registry)",
+   "loc": 12683,
+   "files": 81,
+   "cli_proper": true
+  },
+  {
+   "topic": "config system",
+   "loc": 10704,
+   "files": 18,
+   "cli_proper": false
+  },
+  {
+   "topic": "agent features exposed as commands (skills hub, curator, goals, loops, cron, approvals, hooks, pets...)",
+   "loc": 10479,
+   "files": 24,
+   "cli_proper": false
+  },
+  {
+   "topic": "observability package",
+   "loc": 10029,
+   "files": 26,
+   "cli_proper": false
+  },
+  {
+   "topic": "desktop app / OS integration",
+   "loc": 9903,
+   "files": 33,
+   "cli_proper": false
+  },
+  {
+   "topic": "profiles",
+   "loc": 5125,
+   "files": 10,
+   "cli_proper": false
+  },
+  {
+   "topic": "one-shot migrations / retirements",
+   "loc": 3199,
+   "files": 12,
+   "cli_proper": true
+  },
+  {
+   "topic": "MCP config/catalog",
+   "loc": 2587,
+   "files": 5,
+   "cli_proper": false
+  },
+  {
+   "topic": "generic utilities",
+   "loc": 1596,
+   "files": 8,
+   "cli_proper": false
+  },
+  {
+   "topic": "local proxy",
+   "loc": 1508,
+   "files": 9,
+   "cli_proper": false
+  }
+ ],
+ "flows": [
+  {
+   "id": "tui-slash-model",
+   "title": "User types /model gpt-5 in the TUI or Desktop",
+   "trigger": "slash.exec JSON-RPC from ui-tui / Desktop composer",
+   "inputs": [
+    {
+     "name": "has_arg",
+     "type": "bool",
+     "default": true,
+     "meaning": "command has an argument (bare /model is answered live)"
+    },
+    {
+     "name": "worker_running",
+     "type": "bool",
+     "default": false,
+     "meaning": "session already has a slash worker subprocess"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "tui_gateway/methods_tools.py::slash.exec",
+     "loc": "tui_gateway/methods_tools.py:1118",
+     "does": "splits command into base/arg",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 2,
+     "where": "tui_gateway/methods_slash.py::_live_slash_command_output",
+     "loc": "tui_gateway/methods_slash.py:320",
+     "does": "answers bare /model from the live session and returns",
+     "when": {
+      "input": "has_arg",
+      "equals": false
+     },
+     "finding": "CLI-01"
+    },
+    {
+     "n": 3,
+     "where": "tui_gateway/methods_tools.py::slash.exec",
+     "loc": "tui_gateway/methods_tools.py:1140",
+     "does": "routes _PENDING_INPUT_COMMANDS/bundles to command.dispatch (model is not in the set)",
+     "when": null,
+     "finding": "CLI-02"
+    },
+    {
+     "n": 4,
+     "where": "tui_gateway/methods_tools.py::slash.exec",
+     "loc": "tui_gateway/methods_tools.py:1160",
+     "does": "spawns _SlashWorker under a per-session lock",
+     "when": {
+      "input": "worker_running",
+      "equals": false
+     },
+     "finding": "CLI-01"
+    },
+    {
+     "n": 5,
+     "where": "tui_gateway/server.py::_SlashWorker",
+     "loc": "tui_gateway/server.py:248",
+     "does": "persistent HermesCLI subprocess (python -m tui_gateway.slash_worker)",
+     "when": {
+      "input": "worker_running",
+      "equals": false
+     },
+     "finding": "CLI-01"
+    },
+    {
+     "n": 6,
+     "where": "tui_gateway/slash_worker.py::main",
+     "loc": "tui_gateway/slash_worker.py:183",
+     "does": "builds a full HermesCLI in the child, is_slash_worker=True",
+     "when": {
+      "input": "worker_running",
+      "equals": false
+     },
+     "finding": "CLI-09"
+    },
+    {
+     "n": 7,
+     "where": "tui_gateway/slash_worker.py::_run_command",
+     "loc": "tui_gateway/slash_worker.py:135",
+     "does": "redirects Rich console + stdout to StringIO and calls process_command",
+     "when": null,
+     "finding": "CLI-04"
+    },
+    {
+     "n": 8,
+     "where": "cli.py::HermesCLI.process_command",
+     "loc": "cli.py:1192",
+     "does": "resolve_command then _SLASH_DISPATCH['model'] -> _handle_model_switch",
+     "when": null,
+     "finding": "CLI-02"
+    },
+    {
+     "n": 9,
+     "where": "hermes_cli/cli_model_switch_mixin.py::_commit_model_switch",
+     "loc": "hermes_cli/cli_model_switch_mixin.py:250",
+     "does": "swaps the shadow CLI's model and prints; skips metrics because the mirror counts the real switch",
+     "when": null,
+     "finding": "CLI-01"
+    },
+    {
+     "n": 10,
+     "where": "tui_gateway/methods_tools.py::slash.exec",
+     "loc": "tui_gateway/methods_tools.py:1184",
+     "does": "calls _mirror_slash_side_effects with the captured text in hand",
+     "when": null,
+     "finding": "CLI-01"
+    },
+    {
+     "n": 11,
+     "where": "tui_gateway/methods_slash.py::_mirror_slash_side_effects",
+     "loc": "tui_gateway/methods_slash.py:474",
+     "does": "looks up _SLASH_MIRRORS['model'] under the session profile scope",
+     "when": null,
+     "finding": "CLI-01"
+    },
+    {
+     "n": 12,
+     "where": "tui_gateway/model_switch.py::_apply_model_switch",
+     "loc": "tui_gateway/model_switch.py:295",
+     "does": "switches the live agent again; both paths end in hermes_cli/model_switch.py:1740 switch_model",
+     "when": null,
+     "finding": "CLI-01"
+    }
+   ]
+  },
+  {
+   "id": "cli-cron-list",
+   "title": "hermes cron list, and the same command in the dashboard console",
+   "trigger": "shell `hermes cron list`, or `cron list` typed in the dashboard Hermes Console",
+   "inputs": [
+    {
+     "name": "surface",
+     "type": "enum[shell,dashboard_console]",
+     "default": "shell",
+     "meaning": "where the command is typed"
+    },
+    {
+     "name": "termux",
+     "type": "bool",
+     "default": false,
+     "meaning": "running under Termux (extra fast paths tried)"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "hermes_cli/main.py::main",
+     "loc": "hermes_cli/main.py:3674",
+     "does": "tries 4 argv fast paths; all bail because first token is cron",
+     "when": {
+      "input": "surface",
+      "equals": "shell"
+     },
+     "finding": "CLI-07"
+    },
+    {
+     "n": 2,
+     "where": "hermes_cli/main.py::_build_cli_parser",
+     "loc": "hermes_cli/main.py:3451",
+     "does": "builds all 72 groups / 426 parser nodes",
+     "when": {
+      "input": "surface",
+      "equals": "shell"
+     },
+     "finding": "CLI-07"
+    },
+    {
+     "n": 3,
+     "where": "hermes_cli/subcommands/cron.py::build_cron_parser",
+     "loc": "hermes_cli/subcommands/cron.py:14",
+     "does": "attaches cron parser with injected cmd_cron",
+     "when": {
+      "input": "surface",
+      "equals": "shell"
+     },
+     "finding": "CLI-03"
+    },
+    {
+     "n": 4,
+     "where": "hermes_cli/main.py::_register_plugin_cli_commands",
+     "loc": "hermes_cli/main.py:3415",
+     "does": "skipped: cron is in hand-kept _BUILTIN_SUBCOMMANDS (main.py:2897)",
+     "when": {
+      "input": "surface",
+      "equals": "shell"
+     },
+     "finding": "CLI-07"
+    },
+    {
+     "n": 5,
+     "where": "hermes_cli/main.py::_parse_cli_args",
+     "loc": "hermes_cli/main.py:3565",
+     "does": "parses with the bpo-9338 workaround",
+     "when": {
+      "input": "surface",
+      "equals": "shell"
+     },
+     "finding": null
+    },
+    {
+     "n": 6,
+     "where": "hermes_cli/main.py::_prepare_agent_startup",
+     "loc": "hermes_cli/main.py:3012",
+     "does": "returns early: not in _AGENT_COMMANDS/_AGENT_SUBCOMMANDS (main.py:2971)",
+     "when": {
+      "input": "surface",
+      "equals": "shell"
+     },
+     "finding": null
+    },
+    {
+     "n": 7,
+     "where": "hermes_cli/main.py::cmd_cron",
+     "loc": "hermes_cli/main.py:1973",
+     "does": "_forward_command closure imports hermes_cli.cron at call time",
+     "when": null,
+     "finding": "CLI-03"
+    },
+    {
+     "n": 8,
+     "where": "hermes_cli/cron.py::cron_command",
+     "loc": "hermes_cli/cron.py:948",
+     "does": "re-dispatches on args.cron_command string via _CRON_SUBCOMMANDS (cron.py:928)",
+     "when": null,
+     "finding": "CLI-03"
+    },
+    {
+     "n": 9,
+     "where": "hermes_cli/web_routers/chat_ws.py::console_ws",
+     "loc": "hermes_cli/web_routers/chat_ws.py:278",
+     "does": "dashboard WebSocket REPL hands the line to HermesConsoleEngine",
+     "when": {
+      "input": "surface",
+      "equals": "dashboard_console"
+     },
+     "finding": "CLI-03"
+    },
+    {
+     "n": 10,
+     "where": "hermes_cli/console_engine.py::_dispatch",
+     "loc": "hermes_cli/console_engine.py:236",
+     "does": "rebuilds the cron subparser from the _CLI_FAMILIES description (console_engine.py:269)",
+     "when": {
+      "input": "surface",
+      "equals": "dashboard_console"
+     },
+     "finding": "CLI-03"
+    },
+    {
+     "n": 11,
+     "where": "hermes_cli/console_engine.py::_capture_output",
+     "loc": "hermes_cli/console_engine.py:52",
+     "does": "runs the same handler under redirect_stdout, maps SystemExit to a result",
+     "when": {
+      "input": "surface",
+      "equals": "dashboard_console"
+     },
+     "finding": "CLI-04"
+    }
+   ]
+  }
+ ],
+ "findings": [
+  {
+   "id": "CLI-01",
+   "title": "Slash commands are methods on four surface objects; no surface-independent command layer",
+   "severity": "critical",
+   "effort": "L",
+   "kind": "restructure",
+   "evidence": [
+    "cli.py:1157",
+    "cli.py:1178-1186",
+    "gateway/run_busy.py:910-930",
+    "tui_gateway/methods_tools.py:1091",
+    "tui_gateway/methods_tools.py:1118-1190",
+    "tui_gateway/server.py:248",
+    "tui_gateway/slash_worker.py:135-186",
+    "tui_gateway/methods_slash.py:303-503",
+    "hermes_cli/cli_model_switch_mixin.py:262",
+    "acp_adapter/commands.py:48-131",
+    "hermes_cli/slash_exec.py:1-199"
+   ],
+   "problem": "Each slash command is a printing method on whichever surface object first needed it: HermesCLI (78 handler methods), GatewayRunner mixins (62 handlers, gateway/slash_commands*.py = 4,571 lines), TUI _SLASH_BUILTINS + _LIVE_SLASH_OUTPUT formatters, ACP _cmd_* (9). TUI/Desktop run CLI commands by spawning a persistent HermesCLI subprocess per session (the 'shadow CLI', cli_model_switch_mixin.py:262), scraping its Rich output, and replaying mutations onto the live agent via _SLASH_MIRRORS, so /model runs switch_model twice in two processes and each session can carry a second MCP fleet (methods_tools.py:1163). /help has 4 implementations; /queue, /steer, /compress 3-4. Every fix must find its twins (gist: 'missed sibling path' = largest rework class, 56 tags). The right shape exists twice in-repo (goal_command.dispatch_goal_command; slash_exec.EXECUTORS) but covers 6 of 102 commands.",
+   "move": "Make CommandDef executable: CommandDef.run = 'module:function' implementing run(ctx: CommandContext) -> CommandReply. CommandContext carries args plus a SessionPort protocol each surface implements once (agent, session_db, config, profile_scope(), is_running). CommandReply = text + data + typed effects (SwitchModel, QueueTurn, RebuildAgent, ExitRepl, ClearScreen, OpenPicker). CLI process_command, gateway _command_handler_table, TUI command.dispatch/slash.exec and ACP _handle_slash_command each become resolve -> busy policy from registry -> run -> render/apply effects. Delete slash_worker.py, _SlashWorker, _SLASH_MIRRORS, _PENDING_INPUT_COMMANDS, _WORKER_BLOCKED_COMMANDS, _SLASH_BUILTINS, ACP _cmd_*, gateway handler bodies as commands migrate; mutating commands first (model, compress, queue, steer, new).",
+   "reference": {
+    "repo": "textual",
+    "path": "src/textual/command.py:402",
+    "pattern": "Command = data + callback supplied by a Provider (system_commands.py:19); the palette only renders/invokes"
+   },
+   "loc_delta": -5000,
+   "risk": "Facade monkeypatch seams on cli.HermesCLI._handle_* and gateway mixins move to executors. Preserve deferred vs --now cache invalidation, per-surface busy semantics, off-turn profile scope binding (methods_slash.py:494, #122655), compute-host forwarding, prompt_toolkit pickers (as OpenPicker effects).",
+   "depends_on": [],
+   "low_hanging": false
+  },
+  {
+   "id": "CLI-02",
+   "title": "~26 hand-written slash-name collections restate COMMAND_REGISTRY data and have drifted",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "evidence": [
+    "gateway/run_busy.py:908-922",
+    "gateway/run_busy.py:952-954",
+    "gateway/run.py:4076",
+    "gateway/run_inbound.py:1044",
+    "tui_gateway/server.py:3531-3547",
+    "tui_gateway/methods_slash.py:348",
+    "acp_adapter/commands.py:40",
+    "acp_adapter/commands.py:48-70",
+    "cli.py:1158",
+    "hermes_cli/commands.py:45-73"
+   ],
+   "problem": "hermes_cli/AGENTS.md calls COMMAND_REGISTRY the single source; an AST scan finds ~26 parallel collections of command names (gateway _PLAIN_COMMANDS 22 / _IDLE_COMMANDS 35 / busy tables; TUI _PENDING_INPUT_COMMANDS, _TUI_HIDDEN, _TUI_EXTRA, _MUTATES_WHILE_RUNNING; ACP _COMMANDS, _MID_TURN_BLOCKED_COMMANDS). 'Blocked mid-turn' is defined 4 ways. Drift: ACP accepts /reset but not canonical /new, lacks /compact, advertises cli_only /tools, /queue only appends; _SLASH_DISPATCH['exit'] is unreachable. Surface visibility uses 7 mechanisms (cli_only, gateway_only, gateway_config_gate, desktop, desktop_subcommands, _TUI_HIDDEN, _TUI_EXTRA).",
+   "move": "Replace cli_only/gateway_only/desktop/_TUI_HIDDEN with CommandDef.surfaces: frozenset[Surface]; move _TUI_EXTRA into the registry. Derive gateway _PLAIN_COMMANDS and busy tables from busy_policy/busy_handler, ACP list from surfaces, ACP/TUI blocking from busy_policy=='reject'. One invariant test: every dispatch-table name resolves to a registry entry visible on that surface. Delete 'exit' key.",
+   "reference": {
+    "repo": "llm",
+    "path": "llm/cli.py:534-541",
+    "pattern": "click decorator: name, aliases, help, handler in one declaration; no second list to drift"
+   },
+   "loc_delta": -250,
+   "risk": "Gateway idle/busy membership must not change: diff derived sets vs today's tuples. /reset stays an alias.",
+   "depends_on": [],
+   "low_hanging": true
+  },
+  {
+   "id": "CLI-03",
+   "title": "argparse tree: 6 registration conventions, per-group string re-dispatch, main.py forward shims, console re-description",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "evidence": [
+    "hermes_cli/main.py:1949-1990",
+    "hermes_cli/main.py:3451-3562",
+    "hermes_cli/main.py:3402-3441",
+    "hermes_cli/cron.py:928-952",
+    "hermes_cli/plugins_cmd.py:1001-1006",
+    "hermes_cli/auth_commands.py:904",
+    "hermes_cli/console_engine.py:260-345"
+   ],
+   "problem": "Groups join `hermes` six ways (subcommands build_X_parser + main.cmd_X; register_cli(parent); build_parser().set_defaults; portal add_parser; register_send_subparser / lsp register_subparser; plugin dict descriptors + a separate memory-plugin path). console_engine re-describes 27 families as _CliSurface kinds with hand-typed subcommand lists and '*' mutating markers plus _BLOCKED_TOP/_BLOCKED_PAIRS. Inside groups the chosen leaf is stored as dest='<group>_action' (56 sites) and re-dispatched through per-module dicts (52 getattr sites), which is why AGENTS.md needs the alias-dest rule. main.py holds 24 _forward_command closures + 16 cmd_* only to inject handlers. A new subcommand touches 3-5 files with no check that they agree.",
+   "move": "One convention: each command module exports register(subparsers) and sets set_defaults(func='module:attr') on every leaf (resolved at call time: keeps laziness and patch seams). Delete <group>_action dicts and _forward_command. Console metadata on the parser (set_defaults(_console='read'|'mutating'|'blocked')); console_engine walks the real tree. Plugins get one register_commands(subparsers) hook (memory plugins included).",
+   "reference": {
+    "repo": "llm",
+    "path": "llm/hookspecs.py:8",
+    "pattern": "register_commands(cli) hook called once (llm/cli.py:4107); subgroups via @cli.group (llm/cli.py:1543)"
+   },
+   "loc_delta": -900,
+   "risk": "register_cli_command(name, help, setup_fn, handler_fn) is plugin API: keep as adapter. --help order = registration order (main.py:3454). Tests patching hermes_cli.main.cmd_X need new targets.",
+   "depends_on": [],
+   "low_hanging": true
+  },
+  {
+   "id": "CLI-04",
+   "title": "Operations print, prompt and sys.exit instead of returning results; other surfaces scrape stdout or spawn the CLI",
+   "severity": "high",
+   "effort": "M",
+   "kind": "boundary",
+   "evidence": [
+    "tui_gateway/slash_worker.py:135-150",
+    "hermes_cli/console_engine.py:52-62",
+    "hermes_cli/web_server_gateway.py:290-400",
+    "hermes_cli/backup.py:731-1052"
+   ],
+   "problem": "TUI/Desktop get slash output by scraping a subprocess Rich console; dashboard /api/console runs argparse handlers under redirect_stdout and maps SystemExit codes; dashboard gateway verbs spawn `hermes gateway <verb>`. backup.run_import (CC 56, 321 lines) interleaves validation, restore loop, overwrite prompt, ~60 prints and 5 sys.exit, so no other surface can call it. 17 redirect_stdout sites across hermes_cli + tui_gateway. Scraped text cannot carry structured warnings, so every new surface re-pays this.",
+   "move": "Split each operation into do_X(...) -> XReport (frozen dataclass, typed errors, no stdout) and a CLI renderer print_X(report). First: backup.run_import -> restore_backup(zip, target, *, overwrite) -> RestoreReport (prompt moves to the CLI caller); gateway start/stop/status callable in-process by the dashboard (subprocess kept only for update, which replaces code); console handlers once CLI-03 gives them leaf functions.",
+   "reference": {
+    "repo": "sqlite-utils",
+    "path": "sqlite_utils/cli.py:446-456",
+    "pattern": "click command is 3 lines over Database.vacuum() (db.py:2026); library returns, CLI prints"
+   },
+   "loc_delta": -300,
+   "risk": "Exit codes are a script contract (hermes import returns 1 on damaged archives). Dashboard gateway start keeps scrubbed per-profile child env.",
+   "depends_on": [],
+   "low_hanging": true
+  },
+  {
+   "id": "CLI-05",
+   "title": "Dashboard backend reimplements domain operations per router, against private helpers, in router + web_server_<domain> pairs",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "evidence": [
+    "hermes_cli/web_routers/config_env.py:118",
+    "hermes_cli/config.py:3611",
+    "tui_gateway/methods_config_set.py:107-489",
+    "hermes_cli/web_routers/mcp.py:100",
+    "hermes_cli/web_routers/mcp.py:127-131",
+    "hermes_cli/web_routers/mcp.py:190-195",
+    "hermes_cli/web_server_cron.py:19-70",
+    "hermes_cli/web_routers/tools.py:308",
+    "hermes_cli/web_routers/skills.py:343",
+    "hermes_cli/web_server.py:1010-1040"
+   ],
+   "problem": "284 routes in 24 routers + 17 web_server_* helpers (~25k lines). Sharing happens only at the bottom (SessionDB, load/save_config, switch_model, profiles.create_profile). Config set has 3 algorithms (dashboard whole-doc merge, CLI set_config_value, TUI per-key setters). Routers import private names (_find_all_skills, _save_platform_tools, _save_mcp_server, _remove_mcp_server) and reach upward into tui_gateway.mcp_rpc_helpers. MCP 409 ownership check is pasted twice; cron validation duplicates the cronjob tool. Each domain is split across web_routers/<d>.py and web_server_<d>.py. 0 response_model=, 148 `except Exception`.",
+   "move": "One public service function per operation in the owning domain module (config.apply_config_patch(patch, *, scope) -> ConfigChange used by dashboard, `config set`, TUI config.set; mcp_config.add_server/remove_server with the ownership check inside). Routers = parse -> call -> serialize with response_model=. Fold web_server_<d>.py into its router or the domain service. Move server_configs_with_sources into mcp_config.",
+   "reference": {
+    "repo": "sqlite-utils",
+    "path": "sqlite_utils/cli.py:446-456",
+    "pattern": "every front end calls one library method; front end owns only parsing and output"
+   },
+   "loc_delta": -1500,
+   "risk": "Config writes must stay on atomic_config_write/atomic_config_replace; dashboard whole-doc save (deletion-by-omission refused) preserved.",
+   "depends_on": [
+    "CLI-04"
+   ],
+   "low_hanging": true
+  },
+  {
+   "id": "CLI-06",
+   "title": "hermes_cli is the core library and four servers; only 23% of its 260k lines is CLI code",
+   "severity": "high",
+   "effort": "XL",
+   "kind": "restructure",
+   "evidence": [
+    "inputs/metrics/hermes_cli_topics.json",
+    "hermes_cli/config.py:1",
+    "hermes_cli/plugins.py:1",
+    "hermes_cli/profiles.py:1",
+    "hermes_cli/kanban_db.py:1",
+    "hermes_cli/web_server.py:1"
+   ],
+   "problem": "CLI proper (interactive CLI, command framework, setup wizard, migrations) is 60,084 lines. 81k lines are libraries other packages import at runtime (config imported by 239 outside files, plugins 57, profiles 47, observability 47, auth 44, models 39, runtime_provider 37); 93k are servers/services (dashboard 31.7k, updater 20.2k, kanban 15.3k, gateway service mgmt 14.7k, desktop host 9.9k, proxy 1.5k). Import matrix: agent->hermes_cli 41/420, tools->hermes_cli 39/266 edges. Path no longer says where code runs; hermes_cli/AGENTS.md (24k chars) must cover unrelated systems.",
+   "move": "Move by topic, one package per PR, no shims: hermes_dashboard/ (web_server*, web_routers, dashboard_auth, main_dashboard, dashboard_procs, console_engine); kanban/ (kanban_db*, dispatcher + tools/kanban_tools.py + plugins/kanban); gateway/service/ (gateway.py, gateway_launchd/windows/migrate/enroll); hermes_update/; hermes_observability/. config/auth/profiles/providers belong to seams 01/05/07. hermes_cli keeps main, subcommands, commands*, cli_*, setup, doctor.",
+   "reference": {
+    "repo": "datasette",
+    "path": "datasette/cli.py:125-127",
+    "pattern": "928-line CLI module over the importable Datasette app object; llm/cli.py is a client of llm.get_model (llm/__init__.py:347)"
+   },
+   "loc_delta": 0,
+   "risk": "Moves break monkeypatch targets and plugin imports of internal paths. hermes_cli/update_handoff.py and update_serve_obligations.py are a frozen compat surface for old updaters and must not move. Fix docs in the same PR.",
+   "depends_on": [
+    "01-layout"
+   ],
+   "low_hanging": false
+  },
+  {
+   "id": "CLI-07",
+   "title": "Eager full-tree parser forces four hand-rolled argv fast paths and a hand-kept builtin list",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "restructure",
+   "evidence": [
+    "hermes_cli/main.py:348-409",
+    "hermes_cli/main.py:2893-2918",
+    "hermes_cli/main.py:3205-3383",
+    "hermes_cli/main.py:3171-3177",
+    "hermes_cli/main.py:3220-3226",
+    "hermes_cli/main.py:3259-3264",
+    "hermes_cli/main.py:3688-3693"
+   ],
+   "problem": "main.py imports 61 builder modules at module level and builds all 426 nodes (~140ms per main.py:3247). main() first tries 4 fast paths that re-derive the chat/serve decision from argv and repeat preconditions (container routing x3, --yolo x3). Divergence caused #105892 (-z ignored --resume). _BUILTIN_SUBCOMMANDS is a 'keep in sync' copy of top-level names used only to decide plugin discovery.",
+   "move": "One lazy COMMANDS: dict[name, 'module:register'] table; build only the selected group's subparser (all groups only for --help/completion). _BUILTIN_SUBCOMMANDS = COMMANDS.keys(). Fast paths collapse into the now-cheap normal path. Container routing and --yolo run once before parsing.",
+   "reference": null,
+   "loc_delta": -350,
+   "risk": "Startup on Termux/Windows is why fast paths exist: measure cold hermes, hermes serve, hermes --tui before/after. bpo-9338 workaround needs all names (table provides them).",
+   "depends_on": [
+    "CLI-03"
+   ],
+   "low_hanging": false
+  },
+  {
+   "id": "CLI-08",
+   "title": "Four non-interactive 'run one prompt' runners (-q, -z, chat -Q, hermes-agent)",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "collapse",
+   "evidence": [
+    "hermes_cli/cli_single_query.py:483",
+    "hermes_cli/oneshot.py:238",
+    "hermes_cli/quiet_single_query.py:1-10",
+    "run_agent.py:1506",
+    "hermes_cli/main.py:100-132",
+    "hermes_cli/main.py:3174-3176"
+   ],
+   "problem": "Each builds an agent, runs one turn, prints, with its own resume handling, toolset defaults, exit codes and cleanup; main._ONESHOT_CLEANUPS hand-mirrors cli._run_cleanup. Sibling drift produced #105892 and the chat -Q session-key bug (quiet_single_query.py:3-9). agent/oneshot.py is an unrelated concept with the same name.",
+   "move": "hermes_cli/noninteractive.py::run_noninteractive(prompt, *, session: SessionArgs, output: Literal['final','quiet','stream-json'], usage_file) -> RunResult; every flag maps onto it; one process-global cleanup shared with the REPL; rename agent/oneshot.py -> agent/aux_oneshot.py.",
+   "reference": {
+    "repo": "llm",
+    "path": "llm/cli.py:895",
+    "pattern": "one prompt command resolves the model once and switches output by flags"
+   },
+   "loc_delta": -500,
+   "risk": "Bot Mode relies on chat -Q --query-file notify loop; -z stdout stays final-only; usage-file keys consumed by batch pipelines.",
+   "depends_on": [],
+   "low_hanging": false
+  },
+  {
+   "id": "CLI-09",
+   "title": "HermesCLI is one namespace spread over 17 mixins (627 methods, 241 attributes)",
+   "severity": "medium",
+   "effort": "L",
+   "kind": "restructure",
+   "evidence": [
+    "cli.py:891",
+    "hermes_cli/cli_commands_mixin.py:1",
+    "hermes_cli/cli_init_mixin.py:1",
+    "hermes_cli/AGENTS.md:16-18"
+   ],
+   "problem": "17 bases, 627 methods, 241 instance attributes (159 assigned in cli_init_mixin). Mixins read each other's attributes and siblings late-import the facade 263 times (`from cli import`) to keep patch seams; mutable state must stay in cli.py by rule. The split spread a class across files without narrowing any interface. HermesCLI doubles as the TUI's slash host (CLI-01), so REPL concerns and command logic cannot separate.",
+   "move": "After CLI-01, command mixins (commands, loops, info, session, model_switch, billing; ~7.5k lines) become registry executors over SessionPort. HermesCLI keeps prompt_toolkit concerns (tui, status bar, stream, modal, terminal input, voice), promoted to composed objects with explicit deps (StatusBar(state), StreamRenderer(console)).",
+   "reference": {
+    "repo": "textual",
+    "path": "src/textual/command.py:532",
+    "pattern": "CommandPalette is its own screen object fed by providers, not a mixin on App"
+   },
+   "loc_delta": -2000,
+   "risk": "Protected wrapper-CLI hooks in cli_tui_mixin.py are documented extension API; tests build HermesCLI via object.__new__.",
+   "depends_on": [
+    "CLI-01"
+   ],
+   "low_hanging": false
+  },
+  {
+   "id": "CLI-10",
+   "title": "Kill the hermes-agent legacy runner",
+   "severity": "medium",
+   "effort": "S",
+   "kind": "kill",
+   "evidence": [
+    "pyproject.toml:568",
+    "agent/legacy_cli.py:1-94",
+    "run_agent.py:1506-1586"
+   ],
+   "problem": "A second CLI builds AIAgent directly with its own flags (--save-trajectories, --log-prefix-chars) and an emoji banner (run_agent.py:1537). It has needed two fixes (f80977c0bd, 2fb564d2df: bare invocation ran a real model turn, #54648) and carries its own _early_recovery call (legacy_cli.py:18-23).",
+   "move": "Point hermes-agent at a 10-line shim mapping --query/-q/positional to `hermes -z` with a deprecation line for one release, then delete the console script, agent/legacy_cli.py and run_agent.main/_print_tool_listing.",
+   "reference": null,
+   "loc_delta": -200,
+   "risk": "Scripts using hermes-agent --save-trajectories lose the flag (UNVERIFIED how many).",
+   "depends_on": [],
+   "low_hanging": false
+  }
+ ],
+ "kill_list": [
+  {
+   "target": "tui_gateway/slash_worker.py + tui_gateway/server.py::_SlashWorker",
+   "why": "shadow HermesCLI subprocess per session, exists because commands print",
+   "callers": 1,
+   "evidence": "tui_gateway/methods_tools.py:1160-1176"
+  },
+  {
+   "target": "tui_gateway/methods_slash.py::_SLASH_MIRRORS/_mirror_slash_side_effects",
+   "why": "replays worker mutations onto the live agent",
+   "callers": 2,
+   "evidence": "tui_gateway/methods_tools.py:1184, tui_gateway/methods_slash.py:305"
+  },
+  {
+   "target": "acp_adapter/commands.py::_COMMANDS + _cmd_* (8 of 9)",
+   "why": "own command list with drift; reimplements CLI/gateway behaviour",
+   "callers": 1,
+   "evidence": "acp_adapter/commands.py:48-131"
+  },
+  {
+   "target": "cli.py::HermesCLI._SLASH_DISPATCH['exit']",
+   "why": "unreachable: resolve_command('exit') returns quit",
+   "callers": 0,
+   "evidence": "cli.py:1158"
+  },
+  {
+   "target": "hermes_cli/main.py::_forward_command + 24 forwarders",
+   "why": "indirection only to inject handlers",
+   "callers": 1,
+   "evidence": "hermes_cli/main.py:1949-1990"
+  },
+  {
+   "target": "hermes_cli/main.py::_BUILTIN_SUBCOMMANDS",
+   "why": "hand copy of parser top-level names",
+   "callers": 1,
+   "evidence": "hermes_cli/main.py:2897"
+  },
+  {
+   "target": "hermes_cli/main.py::_try_termux_fast_tui_launch/_try_termux_fast_cli_launch/_try_fast_serve_launch/_try_fast_chat_launch",
+   "why": "argv re-parsing that exists only because the parser is eager",
+   "callers": 1,
+   "evidence": "hermes_cli/main.py:3205-3383"
+  },
+  {
+   "target": "hermes_cli/console_engine.py::_CLI_FAMILIES/_CliSurface/_BLOCKED_TOP/_BLOCKED_PAIRS",
+   "why": "second description of the argparse tree",
+   "callers": 1,
+   "evidence": "hermes_cli/console_engine.py:260-345"
+  },
+  {
+   "target": "agent/legacy_cli.py + run_agent.py::main + hermes-agent console script",
+   "why": "duplicate of hermes -z",
+   "callers": 1,
+   "evidence": "pyproject.toml:568"
+  }
+ ],
+ "simplify_list": [
+  {
+   "from": [
+    "cli_*_mixin.py _handle_* (78)",
+    "gateway/slash_commands*.py _handle_* (62)",
+    "tui_gateway _SLASH_BUILTINS/_LIVE_SLASH_OUTPUT/_SLASH_MIRRORS",
+    "acp_adapter/commands.py _cmd_* (9)"
+   ],
+   "to": "one CommandDef.run executor per command + 4 thin surface adapters",
+   "loc_saved": 5000,
+   "evidence": "CLI-01"
+  },
+  {
+   "from": [
+    "~26 slash-name collections",
+    "7 visibility mechanisms"
+   ],
+   "to": "CommandDef.surfaces + busy_policy; everything else derived",
+   "loc_saved": 250,
+   "evidence": "CLI-02"
+  },
+  {
+   "from": [
+    "6 parser registration conventions",
+    "52 <group>_action re-dispatch sites",
+    "console_engine._CLI_FAMILIES"
+   ],
+   "to": "register(subparsers) with set_defaults(func='mod:attr') per leaf",
+   "loc_saved": 900,
+   "evidence": "CLI-03"
+  },
+  {
+   "from": [
+    "4 argv fast paths",
+    "_BUILTIN_SUBCOMMANDS",
+    "eager 426-node tree"
+   ],
+   "to": "one lazy COMMANDS name->module table",
+   "loc_saved": 350,
+   "evidence": "CLI-07"
+  },
+  {
+   "from": [
+    "hermes_cli/cli_single_query.py",
+    "hermes_cli/oneshot.py",
+    "hermes_cli/quiet_single_query.py",
+    "run_agent.py::main"
+   ],
+   "to": "hermes_cli/noninteractive.py::run_noninteractive",
+   "loc_saved": 500,
+   "evidence": "CLI-08"
+  },
+  {
+   "from": [
+    "web_routers/config_env.py:118",
+    "hermes_cli/config.py:3611",
+    "tui_gateway/methods_config_set.py:107-489"
+   ],
+   "to": "config.apply_config_patch",
+   "loc_saved": 400,
+   "evidence": "CLI-05"
+  },
+  {
+   "from": [
+    "web_routers/<d>.py",
+    "web_server_<d>.py (11 domains)"
+   ],
+   "to": "one router per domain over a domain service",
+   "loc_saved": 1000,
+   "evidence": "CLI-05"
+  }
+ ],
+ "reference_patterns": [
+  {
+   "repo": "llm",
+   "path": "llm/cli.py:534-541",
+   "pattern": "click group: name, aliases, help, handler in one declaration; subgroups at llm/cli.py:1543",
+   "applies_to": "CLI-02, CLI-03"
+  },
+  {
+   "repo": "llm",
+   "path": "llm/hookspecs.py:8",
+   "pattern": "register_commands(cli) plugin hook called once (llm/cli.py:4107)",
+   "applies_to": "CLI-03 plugin commands"
+  },
+  {
+   "repo": "datasette",
+   "path": "datasette/cli.py:125-127",
+   "pattern": "DefaultGroup default subcommand; pm.hook.register_commands at cli.py:895",
+   "applies_to": "CLI-03, CLI-07"
+  },
+  {
+   "repo": "sqlite-utils",
+   "path": "sqlite_utils/cli.py:446-456",
+   "pattern": "CLI command is 3 lines over Database.vacuum() (db.py:2026)",
+   "applies_to": "CLI-04, CLI-05"
+  },
+  {
+   "repo": "textual",
+   "path": "src/textual/command.py:402",
+   "pattern": "commands as data + callback from Providers (system_commands.py:19); palette renders",
+   "applies_to": "CLI-01, CLI-09"
+  },
+  {
+   "repo": "hermes-agent (in-repo)",
+   "path": "hermes_cli/slash_exec.py:20-35",
+   "pattern": "CommandContext -> CommandReply; goal_command.dispatch_goal_command shared by all surfaces",
+   "applies_to": "CLI-01 target shape"
+  }
+ ],
+ "seam_answer": "There are four command languages: the argparse tree (72 top-level commands, 426 nodes), the slash registry (102 commands), the dashboard REST/WS surface (284 routes), and ACP's own 9 slash commands; the dashboard also runs a fifth (console_engine, a curated argparse re-wrap). None is a single source. argparse is restated by _BUILTIN_SUBCOMMANDS, 40 main.py handler shims, ~52 per-group action dicts, _AGENT_COMMANDS/_AGENT_SUBCOMMANDS and console_engine's _CLI_FAMILIES/_BLOCKED_* (~8 lists). Slash commands are named by the registry plus ~26 hand collections across CLI, gateway, TUI and ACP, and implemented up to 4 times (in the TUI via a shadow HermesCLI subprocess). Dashboard routes use neither registry and reimplement domain operations against private helpers. A click-style argparse rewrite alone saves ~1.2k lines (CLI-03, CLI-07). The large win is making CommandDef executable: one run(ctx) -> CommandReply with typed effects per command and one SessionPort per surface deletes the slash worker, mirrors, ACP list, gateway handler tuples and most duplicated handler bodies (~5k lines) plus the twin-not-fixed bug class (CLI-01, CLI-02). The dashboard should call the same domain service functions as the CLI, not the slash registry (CLI-04, CLI-05). hermes_cli is 260k lines because it is also the core library and four servers; only 23% is CLI (CLI-06).",
+ "cross_seam": [
+  {
+   "seam": "04-agent-loop",
+   "note": "7 direct AIAgent(...) constructions, no shared factory (also tui_gateway/server.py:2665, methods_prompt.py:1012/1090, cron/scheduler.py:2505, gateway/slash_commands_session.py:607, hermes_cli/prompt_size.py:61)",
+   "evidence": "acp_adapter/session.py:571"
+  },
+  {
+   "seam": "13-tui-cron",
+   "note": "9 slash routing tables in tui_gateway; slash worker is a second agent process per session",
+   "evidence": "tui_gateway/server.py:3528-3547"
+  },
+  {
+   "seam": "10-gateway",
+   "note": "_PLAIN_COMMANDS/_IDLE_COMMANDS hand tuples derivable from busy_policy; curator has no gateway handler found (UNVERIFIED)",
+   "evidence": "gateway/run_busy.py:910-922"
+  },
+  {
+   "seam": "07-config",
+   "note": "three config-set implementations (dashboard, CLI, TUI)",
+   "evidence": "hermes_cli/web_routers/config_env.py:118"
+  },
+  {
+   "seam": "14-errors-obs",
+   "note": "hermes_cli/observability (10k lines) imported by 47 outside files; 148 except Exception in web_routers",
+   "evidence": "hermes_cli/observability/shared_metrics_contract.py:1"
+  },
+  {
+   "seam": "15-kill",
+   "note": "hermes-agent script + agent/legacy_cli.py + run_agent.main; one-shot migration modules 3,199 lines",
+   "evidence": "pyproject.toml:568"
+  },
+  {
+   "seam": "03-pm-flows",
+   "note": "updater runtime (20k lines) lives in hermes_cli; dashboard spawns it as a subprocess",
+   "evidence": "hermes_cli/web_server_gateway.py:290"
+  },
+  {
+   "seam": "01-layout",
+   "note": "gateway_setup_wizard.py calls the facade via _gw() 192 times, gateway_launchd.py 108: facade split did not narrow the interface",
+   "evidence": "hermes_cli/gateway_setup_wizard.py:16"
+  }
+ ],
+ "unverified": [
+  "~26 parallel slash collections: literal-only AST scan by a child reader (notes/12-cli/task-1.log B3); inline if-ladders and <3-name collections not counted. Verify by extending the scan to Compare nodes.",
+  "curator has no gateway handler: not confirmed against gateway dispatch fallbacks. Verify by sending /curator on a gateway test adapter.",
+  "loc_delta figures are estimates from LOC of files that would disappear or shrink; no prototype built.",
+  "~140ms parser cost is the code comment (main.py:3247), not measured. Verify with python -X importtime.",
+  "External use of hermes-agent --save-trajectories unknown. Verify via issue search / PyPI stats.",
+  "Desktop TS slash palette curation (apps/desktop) likely holds another command list; out of scope, not read.",
+  "284-route count includes 3 SPA/asset routes and excludes 11 dashboard_auth routes (child reader's count)."
+ ]
+}

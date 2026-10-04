@@ -1,0 +1,1688 @@
+{
+ "meta": {
+  "root": "/Users/sid/main-quests/nous-research/hermes-agent-v2",
+  "files_scanned": 1958,
+  "lines_scanned": 799689
+ },
+ "idioms": {
+  "PY-02": {
+   "count": 1414,
+   "files": 1414,
+   "top_files": [
+    [
+     "acp_adapter/auth.py",
+     1
+    ],
+    [
+     "acp_adapter/commands.py",
+     1
+    ],
+    [
+     "acp_adapter/content.py",
+     1
+    ],
+    [
+     "acp_adapter/edit_approval.py",
+     1
+    ],
+    [
+     "acp_adapter/model_catalog.py",
+     1
+    ],
+    [
+     "acp_adapter/permissions.py",
+     1
+    ],
+    [
+     "acp_adapter/provenance.py",
+     1
+    ],
+    [
+     "acp_adapter/server.py",
+     1
+    ],
+    [
+     "acp_adapter/session.py",
+     1
+    ],
+    [
+     "acp_adapter/tools.py",
+     1
+    ],
+    [
+     "agent/account_usage.py",
+     1
+    ],
+    [
+     "agent/acp_openai_bridge.py",
+     1
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 513,
+    "agent": 249,
+    "tools": 172,
+    "plugins": 147,
+    "gateway": 139,
+    "tui_gateway": 74,
+    "pm": 46,
+    "(root)": 28,
+    "cron": 25,
+    "acp_adapter": 10,
+    "hermes_platform": 9,
+    "providers": 2
+   }
+  },
+  "PY-03": {
+   "count": 27821,
+   "files": 1248,
+   "top_files": [
+    [
+     "agent/auxiliary_client.py",
+     653
+    ],
+    [
+     "plugins/platforms/slack/adapter.py",
+     398
+    ],
+    [
+     "plugins/platforms/telegram/adapter.py",
+     317
+    ],
+    [
+     "agent/context_compressor.py",
+     316
+    ],
+    [
+     "gateway/platforms/base.py",
+     266
+    ],
+    [
+     "gateway/platforms/api_server.py",
+     263
+    ],
+    [
+     "hermes_cli/kanban_db.py",
+     256
+    ],
+    [
+     "cron/jobs.py",
+     231
+    ],
+    [
+     "plugins/platforms/feishu/adapter.py",
+     227
+    ],
+    [
+     "gateway/relay/adapter.py",
+     211
+    ],
+    [
+     "agent/credential_pool.py",
+     202
+    ],
+    [
+     "agent/agent_runtime_helpers.py",
+     194
+    ]
+   ],
+   "by_area": {
+    "agent": 6376,
+    "hermes_cli": 6358,
+    "tools": 5138,
+    "plugins": 4308,
+    "gateway": 3456,
+    "(root)": 1302,
+    "cron": 604,
+    "acp_adapter": 120,
+    "tui_gateway": 74,
+    "pm": 69,
+    "hermes_platform": 15,
+    "providers": 1
+   }
+  },
+  "PY-04": {
+   "count": 514,
+   "files": 188,
+   "top_files": [
+    [
+     "hermes_cli/main_desktop.py",
+     26
+    ],
+    [
+     "agent/credential_pool.py",
+     22
+    ],
+    [
+     "agent/chat_completion_helpers.py",
+     17
+    ],
+    [
+     "agent/client_lifecycle.py",
+     16
+    ],
+    [
+     "agent/turn_recovery.py",
+     15
+    ],
+    [
+     "gateway/hosted_room_discussion.py",
+     15
+    ],
+    [
+     "agent/agent_init.py",
+     14
+    ],
+    [
+     "hermes_platform/host/facts.py",
+     10
+    ],
+    [
+     "hermes_constants.py",
+     9
+    ],
+    [
+     "tools/browser_vault_tool.py",
+     9
+    ],
+    [
+     "hermes_cli/tools_config_cua.py",
+     8
+    ],
+    [
+     "hermes_cli/uninstall.py",
+     8
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 197,
+    "agent": 135,
+    "tools": 52,
+    "gateway": 36,
+    "(root)": 28,
+    "plugins": 21,
+    "hermes_platform": 17,
+    "pm": 12,
+    "cron": 9,
+    "tui_gateway": 6,
+    "acp_adapter": 1
+   }
+  },
+  "PY-05": {
+   "count": 4677,
+   "files": 641,
+   "top_files": [
+    [
+     "agent/context_compressor.py",
+     113
+    ],
+    [
+     "agent/auxiliary_client.py",
+     87
+    ],
+    [
+     "plugins/platforms/slack/adapter.py",
+     81
+    ],
+    [
+     "plugins/platforms/telegram/adapter.py",
+     72
+    ],
+    [
+     "gateway/platforms/api_server.py",
+     65
+    ],
+    [
+     "cron/jobs.py",
+     61
+    ],
+    [
+     "gateway/relay/adapter.py",
+     56
+    ],
+    [
+     "agent/moa_loop.py",
+     48
+    ],
+    [
+     "agent/agent_runtime_helpers.py",
+     47
+    ],
+    [
+     "hermes_cli/config.py",
+     47
+    ],
+    [
+     "agent/relay_llm.py",
+     46
+    ],
+    [
+     "hermes_cli/observability/relay_shared_metrics.py",
+     44
+    ]
+   ],
+   "by_area": {
+    "agent": 1368,
+    "hermes_cli": 985,
+    "plugins": 792,
+    "tools": 688,
+    "gateway": 521,
+    "(root)": 136,
+    "cron": 100,
+    "tui_gateway": 45,
+    "acp_adapter": 31,
+    "pm": 9,
+    "providers": 2
+   }
+  },
+  "PY-06": {
+   "count": 48,
+   "files": 48,
+   "top_files": [
+    [
+     "cli.py",
+     1
+    ],
+    [
+     "hermes_bootstrap.py",
+     1
+    ],
+    [
+     "hermes_constants.py",
+     1
+    ],
+    [
+     "hermes_constants_scratch.py",
+     1
+    ],
+    [
+     "hermes_logging.py",
+     1
+    ],
+    [
+     "hermes_startup_watchdog.py",
+     1
+    ],
+    [
+     "hermes_state.py",
+     1
+    ],
+    [
+     "hermes_state_common.py",
+     1
+    ],
+    [
+     "hermes_state_compression.py",
+     1
+    ],
+    [
+     "hermes_state_coverage.py",
+     1
+    ],
+    [
+     "hermes_state_dbfile.py",
+     1
+    ],
+    [
+     "hermes_state_errors.py",
+     1
+    ]
+   ],
+   "by_area": {
+    "(root)": 48
+   }
+  },
+  "PY-07": {
+   "count": 14121,
+   "files": 1352,
+   "top_files": [
+    [
+     "agent/auxiliary_client.py",
+     188
+    ],
+    [
+     "gateway/run.py",
+     188
+    ],
+    [
+     "hermes_cli/gateway.py",
+     150
+    ],
+    [
+     "hermes_cli/main.py",
+     136
+    ],
+    [
+     "gateway/run_turn.py",
+     125
+    ],
+    [
+     "tui_gateway/server.py",
+     118
+    ],
+    [
+     "hermes_cli/cli_commands_mixin.py",
+     112
+    ],
+    [
+     "cron/scheduler.py",
+     102
+    ],
+    [
+     "agent/agent_runtime_helpers.py",
+     95
+    ],
+    [
+     "agent/agent_init.py",
+     94
+    ],
+    [
+     "agent/chat_completion_helpers.py",
+     91
+    ],
+    [
+     "hermes_cli/model_setup_flows.py",
+     90
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 5886,
+    "tools": 1974,
+    "agent": 1796,
+    "gateway": 1621,
+    "tui_gateway": 904,
+    "plugins": 820,
+    "pm": 376,
+    "cron": 327,
+    "(root)": 303,
+    "acp_adapter": 75,
+    "hermes_platform": 20,
+    "providers": 19
+   }
+  },
+  "PY-08": {
+   "count": 29,
+   "files": 26,
+   "top_files": [
+    [
+     "gateway/run.py",
+     3
+    ],
+    [
+     "hermes_cli/_update_takeover.py",
+     2
+    ],
+    [
+     "acp_adapter/entry.py",
+     1
+    ],
+    [
+     "cron/scheduler.py",
+     1
+    ],
+    [
+     "gateway/platforms/base.py",
+     1
+    ],
+    [
+     "hermes_bootstrap.py",
+     1
+    ],
+    [
+     "hermes_cli/_launchers.py",
+     1
+    ],
+    [
+     "hermes_cli/_startup_fast.py",
+     1
+    ],
+    [
+     "hermes_cli/cron.py",
+     1
+    ],
+    [
+     "hermes_cli/doctor_tools.py",
+     1
+    ],
+    [
+     "hermes_cli/gateway.py",
+     1
+    ],
+    [
+     "hermes_cli/main.py",
+     1
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 13,
+    "plugins": 5,
+    "gateway": 4,
+    "pm": 2,
+    "tools": 2,
+    "acp_adapter": 1,
+    "cron": 1,
+    "(root)": 1
+   }
+  },
+  "PY-11": {
+   "count": 154,
+   "files": 154,
+   "top_files": [
+    [
+     "acp_adapter/server.py",
+     1
+    ],
+    [
+     "agent/agent_init.py",
+     1
+    ],
+    [
+     "agent/agent_runtime_helpers.py",
+     1
+    ],
+    [
+     "agent/auxiliary_client.py",
+     1
+    ],
+    [
+     "agent/background_review.py",
+     1
+    ],
+    [
+     "agent/bedrock_adapter.py",
+     1
+    ],
+    [
+     "agent/chat_completion_helpers.py",
+     1
+    ],
+    [
+     "agent/client_lifecycle.py",
+     1
+    ],
+    [
+     "agent/codex_responses_adapter.py",
+     1
+    ],
+    [
+     "agent/codex_runtime.py",
+     1
+    ],
+    [
+     "agent/context_compressor.py",
+     1
+    ],
+    [
+     "agent/conversation_compression.py",
+     1
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 52,
+    "agent": 24,
+    "gateway": 24,
+    "tools": 19,
+    "plugins": 13,
+    "(root)": 10,
+    "tui_gateway": 6,
+    "cron": 4,
+    "acp_adapter": 1,
+    "pm": 1
+   }
+  },
+  "PY-11c": {
+   "count": 333,
+   "files": 217,
+   "top_files": [
+    [
+     "plugins/platforms/discord/adapter.py",
+     11
+    ],
+    [
+     "plugins/platforms/telegram/adapter.py",
+     8
+    ],
+    [
+     "hermes_cli/gateway.py",
+     6
+    ],
+    [
+     "gateway/run_turn.py",
+     5
+    ],
+    [
+     "agent/chat_completion_helpers.py",
+     4
+    ],
+    [
+     "agent/context_compressor.py",
+     4
+    ],
+    [
+     "hermes_cli/main_desktop.py",
+     4
+    ],
+    [
+     "agent/auxiliary_client.py",
+     3
+    ],
+    [
+     "agent/conversation_compression.py",
+     3
+    ],
+    [
+     "agent/turn_recovery.py",
+     3
+    ],
+    [
+     "gateway/platforms/api_server_openai_routes.py",
+     3
+    ],
+    [
+     "gateway/platforms/base.py",
+     3
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 128,
+    "agent": 51,
+    "plugins": 40,
+    "tools": 40,
+    "gateway": 35,
+    "tui_gateway": 14,
+    "(root)": 11,
+    "cron": 8,
+    "pm": 5,
+    "acp_adapter": 1
+   }
+  },
+  "PY-13": {
+   "count": 406,
+   "files": 181,
+   "top_files": [
+    [
+     "cli.py",
+     14
+    ],
+    [
+     "hermes_cli/voice.py",
+     11
+    ],
+    [
+     "hermes_logging.py",
+     11
+    ],
+    [
+     "tui_gateway/methods_voice.py",
+     10
+    ],
+    [
+     "agent/auxiliary_client.py",
+     9
+    ],
+    [
+     "agent/models_dev.py",
+     8
+    ],
+    [
+     "hermes_cli/plugins.py",
+     8
+    ],
+    [
+     "hermes_cli/models.py",
+     7
+    ],
+    [
+     "hermes_cli/cli_render.py",
+     6
+    ],
+    [
+     "tools/mcp_tool.py",
+     6
+    ],
+    [
+     "hermes_cli/free_tier_bootstrap.py",
+     5
+    ],
+    [
+     "hermes_cli/web_server.py",
+     5
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 113,
+    "tools": 80,
+    "agent": 64,
+    "(root)": 43,
+    "tui_gateway": 37,
+    "plugins": 32,
+    "gateway": 23,
+    "cron": 6,
+    "providers": 5,
+    "hermes_platform": 2,
+    "pm": 1
+   }
+  },
+  "PY-14": {
+   "count": 246,
+   "files": 169,
+   "top_files": [
+    [
+     "cli.py",
+     7
+    ],
+    [
+     "hermes_cli/cli_voice_mixin.py",
+     7
+    ],
+    [
+     "tui_gateway/methods_voice.py",
+     6
+    ],
+    [
+     "tui_gateway/server.py",
+     6
+    ],
+    [
+     "agent/chat_completion_helpers.py",
+     4
+    ],
+    [
+     "hermes_cli/web_server.py",
+     4
+    ],
+    [
+     "cron/scheduler.py",
+     3
+    ],
+    [
+     "gateway/run.py",
+     3
+    ],
+    [
+     "gateway/run_agent_cache.py",
+     3
+    ],
+    [
+     "hermes_cli/cli_chat_turn_mixin.py",
+     3
+    ],
+    [
+     "hermes_cli/cli_info_mixin.py",
+     3
+    ],
+    [
+     "hermes_cli/cli_tui_mixin.py",
+     3
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 76,
+    "tools": 53,
+    "agent": 36,
+    "tui_gateway": 33,
+    "(root)": 15,
+    "gateway": 15,
+    "cron": 8,
+    "plugins": 6,
+    "acp_adapter": 2,
+    "pm": 2
+   }
+  },
+  "PY-14d": {
+   "count": 243,
+   "files": 167,
+   "top_files": [
+    [
+     "cli.py",
+     7
+    ],
+    [
+     "hermes_cli/cli_voice_mixin.py",
+     7
+    ],
+    [
+     "tui_gateway/methods_voice.py",
+     6
+    ],
+    [
+     "tui_gateway/server.py",
+     6
+    ],
+    [
+     "agent/chat_completion_helpers.py",
+     4
+    ],
+    [
+     "cron/scheduler.py",
+     3
+    ],
+    [
+     "gateway/run.py",
+     3
+    ],
+    [
+     "gateway/run_agent_cache.py",
+     3
+    ],
+    [
+     "hermes_cli/cli_chat_turn_mixin.py",
+     3
+    ],
+    [
+     "hermes_cli/cli_info_mixin.py",
+     3
+    ],
+    [
+     "hermes_cli/cli_tui_mixin.py",
+     3
+    ],
+    [
+     "hermes_cli/cli_tui_runtime_mixin.py",
+     3
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 74,
+    "tools": 53,
+    "agent": 35,
+    "tui_gateway": 33,
+    "(root)": 15,
+    "gateway": 15,
+    "cron": 8,
+    "plugins": 6,
+    "acp_adapter": 2,
+    "pm": 2
+   }
+  },
+  "PY-15": {
+   "count": 11,
+   "files": 10,
+   "top_files": [
+    [
+     "tui_gateway/compute_host.py",
+     2
+    ],
+    [
+     "gateway/run.py",
+     1
+    ],
+    [
+     "gateway/shutdown_watchdog.py",
+     1
+    ],
+    [
+     "hermes_cli/cli_shutdown.py",
+     1
+    ],
+    [
+     "hermes_cli/cli_single_query.py",
+     1
+    ],
+    [
+     "hermes_cli/main.py",
+     1
+    ],
+    [
+     "hermes_cli/plugin_host_child.py",
+     1
+    ],
+    [
+     "hermes_startup_watchdog.py",
+     1
+    ],
+    [
+     "tui_gateway/entry.py",
+     1
+    ],
+    [
+     "tui_gateway/slash_worker.py",
+     1
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 4,
+    "tui_gateway": 4,
+    "gateway": 2,
+    "(root)": 1
+   }
+  },
+  "PY-16": {
+   "count": 940,
+   "files": 384,
+   "top_files": [
+    [
+     "hermes_cli/gateway.py",
+     27
+    ],
+    [
+     "hermes_cli/main.py",
+     20
+    ],
+    [
+     "tools/kanban_tools.py",
+     16
+    ],
+    [
+     "gateway/run.py",
+     15
+    ],
+    [
+     "hermes_constants.py",
+     15
+    ],
+    [
+     "tui_gateway/server.py",
+     15
+    ],
+    [
+     "hermes_cli/models.py",
+     12
+    ],
+    [
+     "gateway/relay/__init__.py",
+     11
+    ],
+    [
+     "hermes_cli/auth.py",
+     11
+    ],
+    [
+     "hermes_cli/auth_device_flow.py",
+     11
+    ],
+    [
+     "hermes_cli/gateway_windows.py",
+     10
+    ],
+    [
+     "hermes_cli/doctor_tools.py",
+     9
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 431,
+    "tools": 132,
+    "agent": 103,
+    "gateway": 93,
+    "plugins": 65,
+    "(root)": 46,
+    "tui_gateway": 40,
+    "pm": 13,
+    "cron": 8,
+    "hermes_platform": 6,
+    "acp_adapter": 3
+   }
+  },
+  "PY-16w": {
+   "count": 173,
+   "files": 64,
+   "top_files": [
+    [
+     "hermes_cli/main.py",
+     23
+    ],
+    [
+     "gateway/run.py",
+     21
+    ],
+    [
+     "hermes_cli/gateway.py",
+     8
+    ],
+    [
+     "hermes_cli/cli_config_load.py",
+     7
+    ],
+    [
+     "hermes_cli/env_loader.py",
+     5
+    ],
+    [
+     "gateway/config_loader.py",
+     4
+    ],
+    [
+     "hermes_cli/stdio.py",
+     4
+    ],
+    [
+     "tui_gateway/methods_voice.py",
+     4
+    ],
+    [
+     "acp_adapter/server.py",
+     3
+    ],
+    [
+     "cli.py",
+     3
+    ],
+    [
+     "cron/scheduler.py",
+     3
+    ],
+    [
+     "gateway/kanban_watchers_dispatcher.py",
+     3
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 85,
+    "gateway": 35,
+    "tui_gateway": 13,
+    "tools": 9,
+    "(root)": 7,
+    "plugins": 6,
+    "pm": 6,
+    "agent": 5,
+    "cron": 4,
+    "acp_adapter": 3
+   }
+  },
+  "PY-17": {
+   "count": 8018,
+   "files": 1219,
+   "top_files": [
+    [
+     "plugins/platforms/discord/adapter.py",
+     140
+    ],
+    [
+     "plugins/platforms/telegram/adapter.py",
+     114
+    ],
+    [
+     "gateway/run.py",
+     101
+    ],
+    [
+     "plugins/platforms/slack/adapter.py",
+     99
+    ],
+    [
+     "agent/auxiliary_client.py",
+     98
+    ],
+    [
+     "cron/scheduler.py",
+     79
+    ],
+    [
+     "hermes_cli/gateway.py",
+     74
+    ],
+    [
+     "plugins/platforms/matrix/adapter.py",
+     61
+    ],
+    [
+     "gateway/platforms/api_server.py",
+     57
+    ],
+    [
+     "hermes_cli/main.py",
+     57
+    ],
+    [
+     "gateway/run_turn.py",
+     55
+    ],
+    [
+     "hermes_cli/models.py",
+     54
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 2548,
+    "tools": 1142,
+    "gateway": 1139,
+    "agent": 1120,
+    "plugins": 1076,
+    "tui_gateway": 462,
+    "(root)": 215,
+    "cron": 196,
+    "acp_adapter": 64,
+    "pm": 38,
+    "providers": 16,
+    "hermes_platform": 2
+   }
+  },
+  "PY-17s": {
+   "count": 849,
+   "files": 374,
+   "top_files": [
+    [
+     "hermes_cli/main.py",
+     30
+    ],
+    [
+     "plugins/platforms/discord/adapter.py",
+     23
+    ],
+    [
+     "hermes_cli/gateway.py",
+     21
+    ],
+    [
+     "hermes_cli/models.py",
+     18
+    ],
+    [
+     "gateway/run.py",
+     14
+    ],
+    [
+     "hermes_cli/model_switch_providers.py",
+     14
+    ],
+    [
+     "cli.py",
+     11
+    ],
+    [
+     "hermes_cli/cli_chat_turn_mixin.py",
+     10
+    ],
+    [
+     "hermes_cli/cli_modal_mixin.py",
+     10
+    ],
+    [
+     "hermes_cli/cli_status_bar_mixin.py",
+     10
+    ],
+    [
+     "agent/turn_recovery.py",
+     8
+    ],
+    [
+     "hermes_cli/cli_stream_mixin.py",
+     8
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 436,
+    "agent": 101,
+    "tools": 94,
+    "plugins": 83,
+    "gateway": 57,
+    "(root)": 50,
+    "tui_gateway": 12,
+    "cron": 10,
+    "acp_adapter": 4,
+    "providers": 2
+   }
+  },
+  "PY-18": {
+   "count": 31,
+   "files": 24,
+   "top_files": [
+    [
+     "agent/auxiliary_client.py",
+     4
+    ],
+    [
+     "agent/codex_runtime.py",
+     2
+    ],
+    [
+     "hermes_cli/cli_tui_mixin.py",
+     2
+    ],
+    [
+     "hermes_cli/observability/shared_metrics.py",
+     2
+    ],
+    [
+     "tools/file_tools.py",
+     2
+    ],
+    [
+     "acp_adapter/model_catalog.py",
+     1
+    ],
+    [
+     "agent/agent_init.py",
+     1
+    ],
+    [
+     "agent/agent_runtime_helpers.py",
+     1
+    ],
+    [
+     "agent/skill_preprocessing.py",
+     1
+    ],
+    [
+     "cron/scheduler_script.py",
+     1
+    ],
+    [
+     "gateway/platforms/api_server.py",
+     1
+    ],
+    [
+     "gateway/run_topics.py",
+     1
+    ]
+   ],
+   "by_area": {
+    "agent": 9,
+    "hermes_cli": 5,
+    "plugins": 5,
+    "tools": 4,
+    "gateway": 3,
+    "(root)": 2,
+    "acp_adapter": 1,
+    "cron": 1,
+    "tui_gateway": 1
+   }
+  },
+  "PY-19": {
+   "count": 4905,
+   "files": 279,
+   "top_files": [
+    [
+     "hermes_cli/gateway.py",
+     229
+    ],
+    [
+     "hermes_cli/sessions_cmd.py",
+     154
+    ],
+    [
+     "hermes_cli/config.py",
+     133
+    ],
+    [
+     "hermes_cli/cli_commands_mixin.py",
+     131
+    ],
+    [
+     "hermes_cli/uninstall.py",
+     110
+    ],
+    [
+     "hermes_cli/profile_cmd.py",
+     108
+    ],
+    [
+     "hermes_cli/cli_billing_mixin.py",
+     102
+    ],
+    [
+     "hermes_cli/update_cmd.py",
+     102
+    ],
+    [
+     "hermes_cli/update_cmd_maint.py",
+     102
+    ],
+    [
+     "hermes_cli/cli_info_mixin.py",
+     100
+    ],
+    [
+     "hermes_cli/curator.py",
+     99
+    ],
+    [
+     "hermes_cli/cron.py",
+     98
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 4326,
+    "plugins": 279,
+    "pm": 70,
+    "(root)": 62,
+    "tools": 59,
+    "agent": 55,
+    "gateway": 40,
+    "tui_gateway": 6,
+    "acp_adapter": 5,
+    "cron": 3
+   }
+  },
+  "PY-20": {
+   "count": 79,
+   "files": 61,
+   "top_files": [
+    [
+     "gateway/platforms/yuanbao.py",
+     4
+    ],
+    [
+     "plugins/platforms/slack/adapter.py",
+     4
+    ],
+    [
+     "gateway/platforms/base.py",
+     3
+    ],
+    [
+     "plugins/platforms/discord/onboarding.py",
+     3
+    ],
+    [
+     "gateway/platforms/qqbot/adapter.py",
+     2
+    ],
+    [
+     "hermes_state.py",
+     2
+    ],
+    [
+     "plugins/platforms/feishu/adapter.py",
+     2
+    ],
+    [
+     "plugins/platforms/feishu/feishu_comment.py",
+     2
+    ],
+    [
+     "plugins/platforms/telegram/adapter.py",
+     2
+    ],
+    [
+     "tools/send_message_senders.py",
+     2
+    ],
+    [
+     "tools/skills_hub_clawhub.py",
+     2
+    ],
+    [
+     "tools/vision_tools.py",
+     2
+    ]
+   ],
+   "by_area": {
+    "plugins": 19,
+    "tools": 19,
+    "gateway": 17,
+    "hermes_cli": 9,
+    "agent": 7,
+    "(root)": 4,
+    "pm": 2,
+    "cron": 1,
+    "tui_gateway": 1
+   }
+  },
+  "PY-21": {
+   "count": 85,
+   "files": 46,
+   "top_files": [
+    [
+     "hermes_cli/main_desktop.py",
+     13
+    ],
+    [
+     "hermes_cli/update_cmd_git.py",
+     6
+    ],
+    [
+     "hermes_cli/update_cmd_stash.py",
+     5
+    ],
+    [
+     "hermes_cli/uninstall.py",
+     4
+    ],
+    [
+     "hermes_cli/git_credentials.py",
+     3
+    ],
+    [
+     "hermes_cli/main_tui_launch.py",
+     3
+    ],
+    [
+     "hermes_cli/_update_takeover.py",
+     2
+    ],
+    [
+     "hermes_cli/macos_signing.py",
+     2
+    ],
+    [
+     "hermes_cli/main_platform_setup.py",
+     2
+    ],
+    [
+     "hermes_cli/update_cmd.py",
+     2
+    ],
+    [
+     "hermes_cli/update_cmd_zip.py",
+     2
+    ],
+    [
+     "plugins/google_meet/audio_bridge.py",
+     2
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 66,
+    "plugins": 5,
+    "pm": 4,
+    "tools": 4,
+    "tui_gateway": 4,
+    "agent": 1,
+    "(root)": 1
+   }
+  },
+  "PY-21c": {
+   "count": 202,
+   "files": 143,
+   "top_files": [
+    [
+     "hermes_cli/doctor_connectivity.py",
+     7
+    ],
+    [
+     "plugins/platforms/photon/auth.py",
+     6
+    ],
+    [
+     "plugins/platforms/matrix/adapter.py",
+     5
+    ],
+    [
+     "plugins/platforms/photon/adapter.py",
+     5
+    ],
+    [
+     "plugins/platforms/discord/adapter.py",
+     4
+    ],
+    [
+     "agent/account_usage.py",
+     3
+    ],
+    [
+     "agent/model_metadata.py",
+     3
+    ],
+    [
+     "gateway/relay/__init__.py",
+     3
+    ],
+    [
+     "hermes_cli/auth_xai.py",
+     3
+    ],
+    [
+     "hermes_cli/web_server_oauth.py",
+     3
+    ],
+    [
+     "plugins/platforms/slack/adapter.py",
+     3
+    ],
+    [
+     "plugins/platforms/whatsapp/adapter.py",
+     3
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 74,
+    "plugins": 70,
+    "tools": 22,
+    "agent": 17,
+    "gateway": 17,
+    "cron": 1,
+    "tui_gateway": 1
+   }
+  },
+  "PY-22": {
+   "count": 1584,
+   "files": 377,
+   "top_files": [
+    [
+     "hermes_cli/browser_connect.py",
+     47
+    ],
+    [
+     "hermes_cli/update_cmd_zip.py",
+     35
+    ],
+    [
+     "tools/environments/local.py",
+     35
+    ],
+    [
+     "agent/lsp/servers.py",
+     31
+    ],
+    [
+     "gateway/platforms/base.py",
+     27
+    ],
+    [
+     "plugins/platforms/telegram/adapter.py",
+     27
+    ],
+    [
+     "tools/mcp_tool_config.py",
+     24
+    ],
+    [
+     "tools/file_operations_search.py",
+     23
+    ],
+    [
+     "tools/file_operations.py",
+     21
+    ],
+    [
+     "hermes_cli/_startup_fast.py",
+     19
+    ],
+    [
+     "hermes_cli/config.py",
+     19
+    ],
+    [
+     "hermes_state_holders.py",
+     19
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 521,
+    "tools": 444,
+    "agent": 148,
+    "plugins": 137,
+    "gateway": 131,
+    "(root)": 114,
+    "tui_gateway": 28,
+    "hermes_platform": 21,
+    "pm": 20,
+    "cron": 17,
+    "acp_adapter": 2,
+    "providers": 1
+   }
+  },
+  "PY-23": {
+   "count": 107,
+   "files": 107,
+   "top_files": [
+    [
+     "acp_adapter/commands.py",
+     1
+    ],
+    [
+     "agent/activity_tracking.py",
+     1
+    ],
+    [
+     "agent/api_error_summary.py",
+     1
+    ],
+    [
+     "agent/api_request_hooks.py",
+     1
+    ],
+    [
+     "agent/client_lifecycle.py",
+     1
+    ],
+    [
+     "agent/compression_facade.py",
+     1
+    ],
+    [
+     "agent/context_compressor_summary.py",
+     1
+    ],
+    [
+     "agent/credential_pool_admin.py",
+     1
+    ],
+    [
+     "agent/credential_pool_model_cooldowns.py",
+     1
+    ],
+    [
+     "agent/interrupt_control.py",
+     1
+    ],
+    [
+     "agent/micro_compaction.py",
+     1
+    ],
+    [
+     "agent/rate_limit_credits.py",
+     1
+    ]
+   ],
+   "by_area": {
+    "gateway": 34,
+    "hermes_cli": 21,
+    "agent": 19,
+    "(root)": 15,
+    "tools": 12,
+    "plugins": 5,
+    "acp_adapter": 1
+   }
+  },
+  "PY-23b": {
+   "count": 7,
+   "files": 7,
+   "top_files": [
+    [
+     "cli.py",
+     1
+    ],
+    [
+     "gateway/run.py",
+     1
+    ],
+    [
+     "gateway/session.py",
+     1
+    ],
+    [
+     "gateway/slash_commands.py",
+     1
+    ],
+    [
+     "hermes_state.py",
+     1
+    ],
+    [
+     "plugins/platforms/wecom/adapter.py",
+     1
+    ],
+    [
+     "run_agent.py",
+     1
+    ]
+   ],
+   "by_area": {
+    "(root)": 3,
+    "gateway": 3,
+    "plugins": 1
+   }
+  },
+  "PY-26": {
+   "count": 103,
+   "files": 91,
+   "top_files": [
+    [
+     "agent/auxiliary_client.py",
+     2
+    ],
+    [
+     "cron/scheduler.py",
+     2
+    ],
+    [
+     "gateway/pairing.py",
+     2
+    ],
+    [
+     "gateway/platforms/base.py",
+     2
+    ],
+    [
+     "hermes_cli/main.py",
+     2
+    ],
+    [
+     "hermes_cli/plugins.py",
+     2
+    ],
+    [
+     "hermes_cli/setup.py",
+     2
+    ],
+    [
+     "hermes_cli/web_routers/oauth.py",
+     2
+    ],
+    [
+     "hermes_cli/web_routers/status.py",
+     2
+    ],
+    [
+     "hermes_state.py",
+     2
+    ],
+    [
+     "plugins/web/firecrawl/provider.py",
+     2
+    ],
+    [
+     "tools/image_generation_tool.py",
+     2
+    ]
+   ],
+   "by_area": {
+    "hermes_cli": 46,
+    "tools": 17,
+    "agent": 11,
+    "gateway": 9,
+    "plugins": 6,
+    "(root)": 5,
+    "cron": 5,
+    "pm": 2,
+    "tui_gateway": 2
+   }
+  },
+  "PY-27": {
+   "count": 1,
+   "files": 1,
+   "top_files": [
+    [
+     "pm/shell.py",
+     1
+    ]
+   ],
+   "by_area": {
+    "pm": 1
+   }
+  }
+ }
+}

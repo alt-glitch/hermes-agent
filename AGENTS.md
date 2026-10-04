@@ -1,5 +1,9 @@
 # Hermes Agent - Development Guide
 
+> **This is the `v2` rewrite branch.** Before changing code here, read `v2/README.md` (branch rules),
+> `v2/ARCHITECTURE.md` (current state, end state, attack vectors) and `v2/PRINCIPLES.md` (the idioms,
+> PY-01 … PY-27). Where this guide and `v2/` disagree, `v2/` wins on this branch.
+
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 This root file holds only what applies everywhere. Each area has its own `AGENTS.md` (aim for
 ~8k chars; `agent/subdirectory_hints.py` delivers up to 32k and truncates head/tail with a warning

@@ -1,0 +1,1041 @@
+{
+ "seam": "tools",
+ "nn": "06",
+ "title": "Tool registry, toolsets, tool runtime, MCP",
+ "prefix": "TLS",
+ "tldr": [
+  "No single tool abstraction: 7 tool sources, 7 dispatch branches, and two dispatchers with different precedence orders (TLS-01, TLS-02).",
+  "Biggest kill: about 250 lines of plugin-authorization policy with stack-frame inspection inside tools/registry.py, duplicating PluginContext (TLS-07); plus the import-time compat surface in model_tools (TLS-08).",
+  "Biggest simplification: ToolEntry gets a typed context, a prepare() hook and behaviour metadata (pydantic-ai shape). Inline executors, the rewriter table, the skip_* flags and about 20 agent name-lists go away (TLS-01, 05, 10).",
+  "Low-hanging fruit: 5 (TLS-02, 03, 04, 05, 08).",
+  "Seam answer: several abstractions, not one. A toolsets/RunContext shape deletes an estimated 2,000-2,500 lines."
+ ],
+ "scope": {
+  "paths": [
+   "tools/",
+   "model_tools.py",
+   "toolsets.py",
+   "toolset_distributions.py",
+   "mcp_serve.py",
+   "agent/tool_executor.py (dispatch side)",
+   "agent/inline_tool_executors.py",
+   "agent/agent_runtime_helpers.py::invoke_tool"
+  ],
+  "loc": 126443,
+  "files": 349
+ },
+ "modules": [
+  {
+   "path": "tools/registry.py",
+   "loc": 1043,
+   "owns": "ToolEntry, ToolRegistry singleton, AST discovery, check_fn TTL cache, plugin override policy, dispatch"
+  },
+  {
+   "path": "model_tools.py",
+   "loc": 996,
+   "owns": "import-time discovery, get_tool_definitions, handle_function_call pipeline, _run_async"
+  },
+  {
+   "path": "toolsets.py",
+   "loc": 492,
+   "owns": "_HERMES_CORE_TOOLS, static TOOLSETS (61 keys), resolve_toolset merged with registry"
+  },
+  {
+   "path": "agent/tool_executor.py",
+   "loc": 1929,
+   "owns": "sequential/concurrent execution; five-way dispatch resolution"
+  },
+  {
+   "path": "agent/inline_tool_executors.py",
+   "loc": 312,
+   "owns": "INLINE_TOOL_EXECUTORS for 15 agent-state tools"
+  },
+  {
+   "path": "tools/mcp_tool.py (+15 mcp_tool_*, 4 mcp_oauth*)",
+   "loc": 10116,
+   "owns": "MCP client: transport, loop thread, discovery into registry, handlers, OAuth"
+  },
+  {
+   "path": "tools/browser_tool.py (+11 siblings)",
+   "loc": 4400,
+   "owns": "browser tools; siblings read facade state via origin proxy"
+  },
+  {
+   "path": "tools/process_registry.py",
+   "loc": 2898,
+   "owns": "background process service, systemd scopes, process_manage tool"
+  },
+  {
+   "path": "tools/environments/",
+   "loc": 7276,
+   "owns": "terminal backends under one BaseEnvironment ABC, dict-selected"
+  },
+  {
+   "path": "tools/delegate_tool*.py + tools/async_delegation.py",
+   "loc": 5594,
+   "owns": "subagent spawn and async completion"
+  }
+ ],
+ "flows": [
+  {
+   "id": "schema-assembly",
+   "title": "An agent is built and its tool schema list is assembled",
+   "trigger": "AIAgent construction (CLI start, gateway or TUI session start)",
+   "inputs": [
+    {
+     "name": "quiet_mode",
+     "type": "bool",
+     "default": true,
+     "meaning": "gateway/TUI agents; enables the memo"
+    },
+    {
+     "name": "tool_search_active",
+     "type": "bool",
+     "default": false,
+     "meaning": "deferrable MCP/plugin surface exceeds its context share"
+    },
+    {
+     "name": "oneshot",
+     "type": "bool",
+     "default": false,
+     "meaning": "hermes -q finite run"
+    },
+    {
+     "name": "memory_provider_configured",
+     "type": "bool",
+     "default": false,
+     "meaning": "an external memory provider is active and the memory toolset is enabled"
+    },
+    {
+     "name": "context_engine_active",
+     "type": "bool",
+     "default": false,
+     "meaning": "context engine exposes lcm_* tools"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "agent/agent_init.py::init (tool setup)",
+     "loc": "agent/agent_init.py:1139",
+     "does": "calls model_tools.get_tool_definitions(enabled, disabled, quiet_mode)",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 2,
+     "where": "model_tools.py::_tool_defs_cache_key",
+     "loc": "model_tools.py:256",
+     "does": "builds a 10-field memo key (generation, config stat, env var, delegation, scope)",
+     "when": {
+      "input": "quiet_mode",
+      "equals": true
+     },
+     "finding": "TLS-05"
+    },
+    {
+     "n": 3,
+     "where": "model_tools.py::_select_tool_names",
+     "loc": "model_tools.py:315",
+     "does": "resolves enabled toolsets to names",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 4,
+     "where": "toolsets.py::get_toolset",
+     "loc": "toolsets.py:299",
+     "does": "unions static TOOLSETS list with registry membership and MCP aliases",
+     "when": null,
+     "finding": "TLS-03"
+    },
+    {
+     "n": 5,
+     "where": "model_tools.py::_select_tool_names",
+     "loc": "model_tools.py:332",
+     "does": "strips role-reserved toolsets, then subtracts disabled toolsets",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 6,
+     "where": "tools/registry.py::ToolRegistry.get_definitions",
+     "loc": "tools/registry.py:843",
+     "does": "filters by check_fn via TTL cache and merges dynamic_schema_overrides",
+     "when": null,
+     "finding": "TLS-05"
+    },
+    {
+     "n": 7,
+     "where": "model_tools.py::_apply_dynamic_schemas",
+     "loc": "model_tools.py:483",
+     "does": "applies the name-keyed rewriter table",
+     "when": null,
+     "finding": "TLS-05"
+    },
+    {
+     "n": 8,
+     "where": "tools/schema_sanitizer.py::sanitize_tool_schemas",
+     "loc": "model_tools.py:523",
+     "does": "normalizes schema shapes for strict grammars",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 9,
+     "where": "tools/tool_search.py::assemble_tool_defs",
+     "loc": "model_tools.py:533",
+     "does": "replaces deferrable tools with the tool_search bridge",
+     "when": {
+      "input": "tool_search_active",
+      "equals": true
+     },
+     "finding": null
+    },
+    {
+     "n": 10,
+     "where": "agent/oneshot_footprint.py::prune_oneshot_tools",
+     "loc": "agent/agent_init.py:1145",
+     "does": "drops skill-authoring tools for finite runs",
+     "when": {
+      "input": "oneshot",
+      "equals": true
+     },
+     "finding": "TLS-05"
+    },
+    {
+     "n": 11,
+     "where": "tools/connectors/turn.py::side_agent_tool_drops",
+     "loc": "agent/agent_init.py:1146",
+     "does": "removes side-agent tools",
+     "when": null,
+     "finding": "TLS-05"
+    },
+    {
+     "n": 12,
+     "where": "agent/memory_manager.py::inject_memory_provider_tools",
+     "loc": "agent/memory_manager.py:115",
+     "does": "appends memory-provider schemas outside the registry",
+     "when": {
+      "input": "memory_provider_configured",
+      "equals": true
+     },
+     "finding": "TLS-01"
+    },
+    {
+     "n": 13,
+     "where": "agent/agent_init.py::_inject_context_engine_tools",
+     "loc": "agent/agent_init.py:2129",
+     "does": "appends context-engine schemas (copy of step 12)",
+     "when": {
+      "input": "context_engine_active",
+      "equals": true
+     },
+     "finding": "TLS-01"
+    }
+   ]
+  },
+  {
+   "id": "tool-call",
+   "title": "The model emits one tool call and Hermes runs it (sequential path)",
+   "trigger": "assistant reply contains a tool call that is not batched in parallel",
+   "inputs": [
+    {
+     "name": "agent_level_tool",
+     "type": "bool",
+     "default": false,
+     "meaning": "name is in INLINE_TOOL_EXECUTORS (todo_list, memory, clarify, desktop GUI tools...)"
+    },
+    {
+     "name": "is_delegate",
+     "type": "bool",
+     "default": false,
+     "meaning": "tool is delegate_task"
+    },
+    {
+     "name": "context_engine_tool",
+     "type": "bool",
+     "default": false,
+     "meaning": "name owned by the context engine"
+    },
+    {
+     "name": "memory_provider_tool",
+     "type": "bool",
+     "default": false,
+     "meaning": "name owned by a memory provider"
+    },
+    {
+     "name": "bridge_call",
+     "type": "bool",
+     "default": false,
+     "meaning": "tool_search / tool_describe / tool_call"
+    },
+    {
+     "name": "is_async_handler",
+     "type": "bool",
+     "default": false,
+     "meaning": "registry entry registered with is_async=True"
+    }
+   ],
+   "steps": [
+    {
+     "n": 1,
+     "where": "agent/tool_executor.py::execute_tool_calls_sequential",
+     "loc": "agent/tool_executor.py:1871",
+     "does": "parses the call and resolves its dispatch",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 2,
+     "where": "agent/tool_executor.py::_resolve_sequential_dispatch",
+     "loc": "agent/tool_executor.py:1655",
+     "does": "routes agent-state tools to INLINE_TOOL_EXECUTORS",
+     "when": {
+      "input": "agent_level_tool",
+      "equals": true
+     },
+     "finding": "TLS-01"
+    },
+    {
+     "n": 3,
+     "where": "agent/tool_executor.py::_resolve_sequential_dispatch",
+     "loc": "agent/tool_executor.py:1660",
+     "does": "routes delegate_task to agent._dispatch_delegate_task",
+     "when": {
+      "input": "is_delegate",
+      "equals": true
+     },
+     "finding": "TLS-01"
+    },
+    {
+     "n": 4,
+     "where": "agent/tool_executor.py::_resolve_sequential_dispatch",
+     "loc": "agent/tool_executor.py:1664",
+     "does": "routes to context_compressor.handle_tool_call",
+     "when": {
+      "input": "context_engine_tool",
+      "equals": true
+     },
+     "finding": "TLS-01"
+    },
+    {
+     "n": 5,
+     "where": "agent/tool_executor.py::_resolve_sequential_dispatch",
+     "loc": "agent/tool_executor.py:1671",
+     "does": "routes to memory_manager.handle_tool_call",
+     "when": {
+      "input": "memory_provider_tool",
+      "equals": true
+     },
+     "finding": "TLS-01"
+    },
+    {
+     "n": 6,
+     "where": "agent/tool_executor.py::_resolve_sequential_dispatch",
+     "loc": "agent/tool_executor.py:1680",
+     "does": "calls handle_function_call with three skip_* flags inside suppress_post_tool_call_hook",
+     "when": null,
+     "finding": "TLS-02"
+    },
+    {
+     "n": 7,
+     "where": "model_tools.py::handle_function_call",
+     "loc": "model_tools.py:892",
+     "does": "coerces args and maps legacy aliases",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 8,
+     "where": "model_tools.py::_dispatch_bridge_tool",
+     "loc": "model_tools.py:707",
+     "does": "serves catalog reads or unwraps tool_call and re-enters handle_function_call",
+     "when": {
+      "input": "bridge_call",
+      "equals": true
+     },
+     "finding": null
+    },
+    {
+     "n": 9,
+     "where": "model_tools.py::handle_function_call",
+     "loc": "model_tools.py:941",
+     "does": "rejects _AGENT_LOOP_TOOLS that should have been intercepted",
+     "when": null,
+     "finding": "TLS-01"
+    },
+    {
+     "n": 10,
+     "where": "model_tools.py::_pre_dispatch_guards",
+     "loc": "model_tools.py:769",
+     "does": "pre_tool_call hook (skipped here) and ACP edit approval",
+     "when": null,
+     "finding": "TLS-02"
+    },
+    {
+     "n": 11,
+     "where": "model_tools.py::_execute_tool",
+     "loc": "model_tools.py:831",
+     "does": "builds dispatch kwargs; execute_code falls back to the process-global tool list",
+     "when": null,
+     "finding": "TLS-09"
+    },
+    {
+     "n": 12,
+     "where": "tools/registry.py::ToolRegistry.dispatch",
+     "loc": "tools/registry.py:904",
+     "does": "filters kwargs by handler signature and calls the handler",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 13,
+     "where": "model_tools.py::_run_async",
+     "loc": "tools/registry.py:906",
+     "does": "bridges an async handler onto a persistent or fresh event loop",
+     "when": {
+      "input": "is_async_handler",
+      "equals": true
+     },
+     "finding": null
+    },
+    {
+     "n": 14,
+     "where": "tools/registry.py::ToolRegistry._normalize_handler_result",
+     "loc": "tools/registry.py:876",
+     "does": "enforces str or _multimodal dict; bounds error bodies",
+     "when": null,
+     "finding": null
+    },
+    {
+     "n": 15,
+     "where": "model_tools.py::_apply_transform_tool_result_hook",
+     "loc": "model_tools.py:963",
+     "does": "lets plugins replace the result before it enters context",
+     "when": null,
+     "finding": "TLS-02"
+    }
+   ]
+  }
+ ],
+ "findings": [
+  {
+   "id": "TLS-01",
+   "title": "Seven tool sources with seven dispatch branches and two precedence orders; no single tool abstraction",
+   "severity": "critical",
+   "effort": "XL",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "agent/tool_executor.py:1648",
+    "agent/agent_runtime_helpers.py:2576",
+    "agent/inline_tool_executors.py:237",
+    "agent/inline_tool_executors.py:299",
+    "model_tools.py:613",
+    "model_tools.py:941",
+    "agent/memory_manager.py:115",
+    "agent/agent_init.py:2129",
+    "tools/delegate_tool.py:771"
+   ],
+   "problem": "Registry entries go through handle_function_call. 15 agent-state tools go through INLINE_TOOL_EXECUTORS, and most are also registered with registry handlers the agent path never calls (model_tools.py:941 stubs 4; delegate_tool.py:771 calls its handler a 'mirror'). Context-engine and memory-provider tools are not in the registry: two copy-pasted injectors append their schemas and each has its own dispatch branch. Connectors and the Tool Search bridge are special-cased inside handle_function_call. The sequential resolver orders sources inline > delegate > context-engine > memory > registry. The concurrent invoke_tool orders them todo/session_search/memory > memory provider > inline minus message_agent > registry, and has no context-engine branch; it is safe only because the parallel allowlist never admits those names. Every contributor adding an agent-aware tool, and every reviewer, pays to keep the two paths in agreement.",
+   "move": "Give handlers a typed ToolContext (agent handle, ids, messages, UI callbacks, enabled tool names). Register inline tools as ordinary ToolEntry handlers taking ctx. Memory providers and context engines expose a toolset object, combined with the registry view at agent build (CombinedToolset). Delete INLINE_TOOL_EXECUTORS, INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES, _AGENT_LOOP_TOOLS, the five-branch _resolve_sequential_dispatch, both schema injectors and the delegate mirror handler. One dispatcher remains.",
+   "reference": {
+    "repo": "pydantic-ai",
+    "path": "pydantic_ai_slim/pydantic_ai/toolsets/combined.py:27",
+    "pattern": "CombinedToolset over FunctionToolsets; every tool receives RunContext (_run_context.py:169)"
+   },
+   "loc_delta": -900,
+   "risk": "Tool list bytes and order must stay identical per config (prompt cache). GUI callbacks must stay bound per agent. The memory 'gated off by toolset' rule (agent/memory_manager.py:115-135) must hold. Tests patching INLINE_TOOL_EXECUTORS and _resolve_sequential_dispatch must move.",
+   "depends_on": [
+    "TLS-02"
+   ]
+  },
+  {
+   "id": "TLS-02",
+   "title": "The tool-call pipeline runs at three layers, and four skip_* flags plus a ContextVar turn the inner layers off",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": true,
+   "evidence": [
+    "model_tools.py:876",
+    "model_tools.py:30",
+    "agent/tool_executor.py:1680",
+    "agent/agent_runtime_helpers.py:2576",
+    "hermes_cli/plugins.py:714"
+   ],
+   "problem": "Coercion, aliasing, request middleware, the pre_tool_call hook, ACP edit approval, execution middleware, post_tool_call and transform_tool_result are implemented in model_tools.handle_function_call, again in agent/tool_executor.py, and a third time in agent_runtime_helpers.invoke_tool. The outer layers suppress the inner ones with skip_pre_tool_call_hook, skip_tool_request_middleware, skip_tool_execution_middleware and the _post_tool_call_hook_suppressed ContextVar. A grep counts 13/7/6/2 mentions in model_tools/agent_runtime_helpers/tool_executor/connectors. PluginContext.dispatch_tool calls registry.dispatch directly and skips all of it. A new phase must be added in up to three places, and the 'hook fired twice or zero times' bug class follows.",
+   "move": "Create tools/tool_pipeline.py::call_tool(entry, args, ctx), which owns every phase once and in order. handle_function_call, the sequential executor, invoke_tool and PluginContext.dispatch_tool all call it. The executor keeps only display, timeout and parallelism. Delete the skip flags and the ContextVar.",
+   "reference": {
+    "repo": "pydantic-ai",
+    "path": "pydantic_ai_slim/pydantic_ai/tool_manager.py:1078",
+    "pattern": "ToolManager.handle_call: one call path for every tool"
+   },
+   "loc_delta": -350,
+   "risk": "Preserve the single-fire pre_tool_call contract and the phase order. Whether plugin dispatch_tool should run guards is an intent question (unverified).",
+   "depends_on": []
+  },
+  {
+   "id": "TLS-03",
+   "title": "Toolset membership is declared twice (ToolEntry.toolset and static TOOLSETS lists), plus _HERMES_CORE_TOOLS, and the declarations disagree",
+   "severity": "high",
+   "effort": "M",
+   "kind": "boundary",
+   "low_hanging": true,
+   "evidence": [
+    "toolsets.py:12",
+    "toolsets.py:115",
+    "toolsets.py:299",
+    "toolsets.py:420",
+    "tools/browser_cdp_tool.py:398",
+    "tools/browser_dialog_tool.py:103",
+    "tools/browser_use_cli.py:830",
+    "tools/apply_layout_tool.py:47",
+    "tools/kanban_tools.py:1300"
+   ],
+   "problem": "get_toolset unions static lists with registry membership at runtime (toolsets.py:308-315). browser_cdp and browser_dialog register toolset 'browser-cdp' and browser_exec 'browser-use', while TOOLSETS['browser'] lists all three. _get_plugin_toolset_names then reports 'browser-cdp'/'browser-use' as plugin toolsets (toolsets.py:317-321). apply_layout and kanban_schedule are registered but appear in no static list. yb_* register under the bundle name 'hermes-yuanbao'. The contract tests that tools/AGENTS.md cites for this do not exist.",
+   "move": "Declare membership once, on ToolEntry.toolset. Add a core=True field and derive _HERMES_CORE_TOOLS from it. TOOLSETS keeps only composites (includes) and descriptions. Fix the three browser registrations. Add one invariant test: every static toolset resolves to at least one registered tool, and every built-in entry's toolset is a known key.",
+   "reference": {
+    "repo": "inspect_ai",
+    "path": "src/inspect_ai/_util/registry.py:127",
+    "pattern": "registry_add stores identity and info once; lookups derive from it"
+   },
+   "loc_delta": -120,
+   "risk": "Prompt-cache stability of the sorted tool list. hermes tools config keys must keep working. disabled_toolsets: [browser] must still strip browser_cdp.",
+   "depends_on": []
+  },
+  {
+   "id": "TLS-04",
+   "title": "20 hermes-<platform> bundles copy the core list; plugin platforms already get the same bundle synthesized",
+   "severity": "high",
+   "effort": "S",
+   "kind": "collapse",
+   "low_hanging": true,
+   "evidence": [
+    "toolsets.py:58",
+    "toolsets.py:212",
+    "toolsets.py:248",
+    "toolsets.py:355",
+    "hermes_cli/platforms.py:15",
+    "hermes_cli/toolset_validation.py:35"
+   ],
+   "problem": "17 of the 23 hermes-* entries are _bundle(description), meaning core plus nothing. hermes-gateway re-lists 19 bundle names by hand. hermes-yuanbao carries a dead 'module' key. Plugin platforms get the same bundle synthesized by _plugin_platform_bundle. hermes_cli/platforms.py repeats each default_toolset string. Adding a platform means editing three lists.",
+   "move": "Synthesize hermes-<p> for built-in platforms through the plugin path: core plus tools whose toolset belongs to platform p. Delete the static entries, the hermes-gateway list and the per-platform default_toolset strings. Keep hermes-webhook, hermes-api-server and hermes-acp explicit.",
+   "reference": {
+    "repo": "llm",
+    "path": "llm/hookspecs.py:33",
+    "pattern": "register_tools(register): registration in one place; bundles derive from it"
+   },
+   "loc_delta": -60,
+   "risk": "Users' config.yaml names must still validate. Descriptions shown in the UI move to PLATFORMS.",
+   "depends_on": [
+    "TLS-03"
+   ]
+  },
+  {
+   "id": "TLS-05",
+   "title": "Schema assembly has 12 stages across 4 modules and two competing dynamic-schema mechanisms",
+   "severity": "high",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": true,
+   "evidence": [
+    "tools/registry.py:195",
+    "tools/registry.py:860",
+    "model_tools.py:469",
+    "model_tools.py:256",
+    "tools/delegate_tool.py:798",
+    "tools/browser_use_cli.py:838",
+    "agent/agent_init.py:1139"
+   ],
+   "problem": "Per-entry dynamic_schema_overrides covers 9 tools and the name-keyed _DYNAMIC_SCHEMA_REWRITERS covers 10. delegate_task and browser_exec use both. The discord rewriter calls getattr(module, string). Afterwards agent_init prunes, drops and appends four more times. Because the inputs are implicit, the memo key needs 10 fields, including an env var and a config.yaml stat. Answering 'what does the model see' means reading four modules. This is where prompt-cache breaks live (gist: I 333, C 44).",
+   "move": "Add one prepare(ctx, tool_def) -> tool_def | None hook on ToolEntry, with ctx carrying the available-name set and session facts. Add a toolset-level prepare for pruning. Delete dynamic_schema_overrides, _DYNAMIC_SCHEMA_REWRITERS and _compose_rewriters. The memo key becomes a hash of ctx, which makes the gist's Phase-5 prefix-stability check a pure-function test.",
+   "reference": {
+    "repo": "pydantic-ai",
+    "path": "pydantic_ai_slim/pydantic_ai/toolsets/prepared.py:15",
+    "pattern": "PreparedToolset / ToolPrepareFunc (tools.py:106): prepare may drop or edit, not add or rename"
+   },
+   "loc_delta": -250,
+   "risk": "Schemas must be byte-identical for an unchanged config. The 'never name an absent tool' rule must hold.",
+   "depends_on": [
+    "TLS-01"
+   ]
+  },
+  {
+   "id": "TLS-06",
+   "title": "mcp_tool and browser_tool siblings read facade globals through call-time proxies (630 reads; browser walks stack frames)",
+   "severity": "high",
+   "effort": "L",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "tools/mcp_tool_common.py:14",
+    "tools/browser_tool_origin.py:43",
+    "tools/mcp_tool.py:419",
+    "tools/mcp_tool_loop.py:255",
+    "tools/mcp_tool.py:115"
+   ],
+   "problem": "The split left all state in the facades. MCP siblings make 362 _core./_origin. reads (_core._lock x58, _core._servers x38). Browser siblings make 268 _bt./origin. reads, and that proxy calls sys._getframe on each access. mcp_tool.py holds 17 module dicts, 3 sets and 3 locks, and siblings write facade globals. The stated reason is test patching (106 + 125 patch sites). The mechanism is the same class as tui_gateway bind_module, and it hides the package from static analysis.",
+   "move": "Move the state into objects: tools/mcp_state.py::McpClientPool and tools/browser_sessions.py::BrowserSessions. Siblings import the instance and tests patch its attributes. Delete _OriginProxy, browser_tool_origin.py and the PEP 562 SDK loader.",
+   "reference": {
+    "repo": "pydantic-ai",
+    "path": "pydantic_ai_slim/pydantic_ai/mcp.py:717",
+    "pattern": "MCPToolset keeps connection state on the instance"
+   },
+   "loc_delta": -300,
+   "risk": "About 231 test patch sites move. Profile-scoped MCP trust and the reconnect/refresh semantics must be preserved.",
+   "depends_on": []
+  },
+  {
+   "id": "TLS-07",
+   "title": "The registry embeds plugin authorization with stack-frame inspection, duplicating PluginContext checks, and reaches into gateway/",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "kill",
+   "low_hanging": false,
+   "evidence": [
+    "tools/registry.py:200",
+    "tools/registry.py:547",
+    "tools/registry.py:656",
+    "tools/registry.py:686",
+    "hermes_cli/plugins.py:471",
+    "tools/registry.py:271"
+   ],
+   "problem": "About 250 lines of policy: _PluginOverridePolicy with CAS restore, module-to-scope maps, a __globals__/partial/__wrapped__ ownership walk, and sys._getframe(2) to identify deregister callers. PluginContext.register_tool already enforces the same opt-in and shadow rules. In-tree plugins never call registry.register directly. The registry also late-imports gateway.session_context, gateway.browser_control_broker, agent.secret_scope and model_tools, despite its 'no deps' docstring.",
+   "move": "Make the registry a scope-keyed store (register/deregister/restore by scope). Authorization lives only in PluginContext, which knows the plugin identity by construction. Callers pass the check_fn cache scope in.",
+   "reference": {
+    "repo": "llm",
+    "path": "llm/hookspecs.py:33",
+    "pattern": "host hands the plugin a bound register callable; identity known without frame inspection"
+   },
+   "loc_delta": -220,
+   "risk": "The no-override-without-opt-in rule and per-profile plugin isolation must hold for ctx callers. Third-party plugins importing tools.registry directly lose the guard (a policy call).",
+   "depends_on": []
+  },
+  {
+   "id": "TLS-08",
+   "title": "Import-time backward-compat surface in model_tools and the registry state kept alive for it",
+   "severity": "high",
+   "effort": "S",
+   "kind": "kill",
+   "low_hanging": true,
+   "evidence": [
+    "model_tools.py:167",
+    "model_tools.py:976",
+    "tools/registry.py:439",
+    "tools/registry.py:737",
+    "tools/registry.py:978",
+    "hermes_cli/banner.py:490",
+    "toolsets.py:240"
+   ],
+   "problem": "TOOL_TO_TOOLSET_MAP and TOOLSET_REQUIREMENTS are import-time snapshots with 1 and 2 callers. Banner reads only check_fn presence. To serve it, the registry maintains _toolset_checks through register, deregister and restore, and the comment says it gates nothing. There are five one-line pass-throughs, legacy *_tools names, and a dead 'module' key.",
+   "move": "Delete _toolset_checks, get_toolset_requirements, both constants and the pass-throughs. Banner and doctor call registry.get_available_toolsets(). Drop the module key.",
+   "reference": null,
+   "loc_delta": -110,
+   "risk": "Banner's lazy-init versus disabled classification output must stay the same. batch_runner follows the seam 15 decision.",
+   "depends_on": []
+  },
+  {
+   "id": "TLS-09",
+   "title": "_last_resolved_tool_names is a process-global channel for execute_code's allowed tools, saved and restored around delegation",
+   "severity": "medium",
+   "effort": "S",
+   "kind": "kill",
+   "low_hanging": false,
+   "evidence": [
+    "model_tools.py:173",
+    "model_tools.py:249",
+    "model_tools.py:834",
+    "tools/delegate_tool_results.py:305",
+    "tools/delegate_tool_child_run.py:1038",
+    "tools/AGENTS.md:62"
+   ],
+   "problem": "Every get_tool_definitions call overwrites the global, including cache hits and other sessions' agents. execute_code falls back to it when no enabled_tools is passed. The agent paths always pass enabled_tools, so the global serves only code_kernel, code_execution_rpc and the hermes-tools MCP server. In a multi-session process the fallback can hand one session another session's tool set.",
+   "move": "Put enabled_tools in ToolContext. Non-agent callers pass an explicit catalog. Delete the global and the save/restore.",
+   "reference": {
+    "repo": "pydantic-ai",
+    "path": "pydantic_ai_slim/pydantic_ai/_run_context.py:169",
+    "pattern": "per-run state travels in the context"
+   },
+   "loc_delta": -20,
+   "risk": "Sandbox stubs must see the same names for agent calls. Check nested execute_code inside a delegated child.",
+   "depends_on": [
+    "TLS-01"
+   ]
+  },
+  {
+   "id": "TLS-10",
+   "title": "Tool behaviour metadata (parallel-safe, idempotent, mutating, failure-tolerant) lives in about 20 name lists in agent/",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "collapse",
+   "low_hanging": false,
+   "evidence": [
+    "agent/tool_dispatch_helpers.py:30",
+    "agent/tool_guardrails.py:20",
+    "agent/tool_result_classification.py:15",
+    "agent/agent_runtime_helpers.py:87",
+    "tools/code_execution_tool.py:43",
+    "acp_adapter/tools.py:21",
+    "tools/send_message_tool.py:22",
+    "agent/tool_dispatch_helpers.py:110"
+   ],
+   "problem": "A census found 115 literals with two or more tool names in 44 non-test files. The lists drift. IDEMPOTENT_TOOL_NAMES hard-codes eight mcp_filesystem_* names from a third-party server. MUTATING and PROGRESS_RESET list send_message, which is deliberately unregistered, and legacy aliases (cronjob, todo, process). MCP already has per-tool read-only hints but is consulted through a side channel.",
+   "move": "Add typed ToolEntry fields: read_only, idempotent, sequential, failure_is_output. MCP fills them from annotations. Planners and guardrails read registry entries. Display tables stay.",
+   "reference": {
+    "repo": "pydantic-ai",
+    "path": "pydantic_ai_slim/pydantic_ai/tools.py:626",
+    "pattern": "ToolDefinition.sequential/kind/metadata; tool_manager.is_sequential reads it (tool_manager.py:286)"
+   },
+   "loc_delta": -120,
+   "risk": "Parallel batching must not widen. The path-overlap reader/writer rules stay code.",
+   "depends_on": [
+    "TLS-03"
+   ]
+  },
+  {
+   "id": "TLS-11",
+   "title": "process_registry.py mixes a 2,034-line service class, systemd plumbing and the process_manage tool, with an import-time home capture",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "tools/process_registry.py:42",
+    "tools/process_registry.py:98",
+    "tools/process_registry.py:675",
+    "tools/process_registry.py:2709",
+    "tools/process_registry.py:2715",
+    "tui_gateway/methods_tools.py:265"
+   ],
+   "problem": "One 2,898-line file holds the systemd scope probe and argv building, ProcessSession, the ProcessRegistry class (29 public methods), the module singleton imported by 45 non-test files, and the model tool schema and handler. CHECKPOINT_PATH captures get_hermes_home() at import, although _checkpoint_path() exists beside it.",
+   "move": "Split into tools/process_tool.py (schema and handler), tools/process_systemd.py and tools/process_registry.py (the service). Delete the import-time constant. Seam 09 owns the concurrency inside.",
+   "reference": {
+    "repo": "svcs",
+    "path": "src/svcs/_core.py",
+    "pattern": "services fetched from a container instead of module singletons"
+   },
+   "loc_delta": -30,
+   "risk": "Test patch seams on tools.process_registry.* move. The _terminate_host_pid teardown order must be preserved.",
+   "depends_on": []
+  },
+  {
+   "id": "TLS-12",
+   "title": "Tool discovery AST-parses source text (cached on disk per profile), and importing model_tools runs plugin discovery as a side effect",
+   "severity": "medium",
+   "effort": "M",
+   "kind": "restructure",
+   "low_hanging": false,
+   "evidence": [
+    "tools/registry.py:59",
+    "tools/registry.py:96",
+    "tools/registry.py:144",
+    "model_tools.py:149",
+    "cli.py:393"
+   ],
+   "problem": "discover_builtin_tools ast-parses every tools/*.py looking for a literal registry.register at module level, with verdicts cached under HERMES_HOME keyed on mtime and size to save about 145 ms. A tool that registers via a helper is silently skipped. Any import of model_tools runs discovery plus discover_plugins(), which is why cli.py wraps it lazily. AGENTS.md calls the no-list design deliberate; this finding argues against that rule.",
+   "move": "Use an explicit tuple of built-in tool modules in tools/__init__.py, guarded by one invariant test against the tree. Plugin discovery becomes an explicit call at each entry point's startup, next to MCP discovery. Importing model_tools becomes side-effect free.",
+   "reference": {
+    "repo": "pluggy",
+    "path": "src/pluggy/_manager.py",
+    "pattern": "explicit load_setuptools_entrypoints call; llm default plugins are an explicit list"
+   },
+   "loc_delta": -90,
+   "risk": "Deterministic duplicate-name resolution must be kept. Every entry point must call discovery.",
+   "depends_on": []
+  },
+  {
+   "id": "TLS-13",
+   "title": "tools/AGENTS.md makes false claims: no-deps registry, dispatch location, a stale toolset key list, contract tests that do not exist",
+   "severity": "medium",
+   "effort": "S",
+   "kind": "hygiene",
+   "low_hanging": false,
+   "evidence": [
+    "tools/AGENTS.md:9",
+    "tools/AGENTS.md:16",
+    "tools/AGENTS.md:69",
+    "tools/AGENTS.md:152",
+    "toolsets.py:77"
+   ],
+   "problem": "The registry has late deps on gateway, agent and model_tools. handle_function_call lives in model_tools.py:876, not the registry. The key list names moa, rl and messaging (not keys) and omits about 25 real keys. The cited 'every registered tool has a toolset' and 'no schema description names a tool from another toolset' tests are absent. Agents trust this file.",
+   "move": "After TLS-03, the first claim becomes a real invariant test. Cut the key list and correct the dependency and dispatch sentences.",
+   "reference": null,
+   "loc_delta": -10,
+   "risk": "None.",
+   "depends_on": [
+    "TLS-03",
+    "TLS-07"
+   ]
+  }
+ ],
+ "kill_list": [
+  {
+   "target": "tools/registry.py::_toolset_checks + get_toolset_requirements",
+   "why": "feeds one presence check in banner",
+   "callers": 2,
+   "evidence": "tools/registry.py:439; tools/registry.py:978; hermes_cli/banner.py:490"
+  },
+  {
+   "target": "model_tools.py::TOOL_TO_TOOLSET_MAP",
+   "why": "import-time snapshot used only off-path",
+   "callers": 1,
+   "evidence": "batch_runner.py:32"
+  },
+  {
+   "target": "model_tools.py pass-throughs (get_all_tool_names, get_toolset_for_tool, get_available_toolsets, check_toolset_requirements, check_tool_availability)",
+   "why": "one-line registry wrappers",
+   "callers": 17,
+   "evidence": "model_tools.py:976-996"
+  },
+  {
+   "target": "model_tools.py::_last_resolved_tool_names",
+   "why": "process-global channel for execute_code tools",
+   "callers": 3,
+   "evidence": "model_tools.py:834; tools/delegate_tool_results.py:305; tools/delegate_tool_child_run.py:1040"
+  },
+  {
+   "target": "model_tools.py::_AGENT_LOOP_TOOLS + registered mirror handlers for agent-loop tools",
+   "why": "handler never reached on the model path",
+   "callers": 1,
+   "evidence": "model_tools.py:941; tools/delegate_tool.py:771"
+  },
+  {
+   "target": "model_tools.py::_DYNAMIC_SCHEMA_REWRITERS (after TLS-05)",
+   "why": "second dynamic-schema mechanism",
+   "callers": 1,
+   "evidence": "model_tools.py:469-494"
+  },
+  {
+   "target": "tools/registry.py::_caller_module + _PluginOverridePolicy machinery",
+   "why": "duplicates PluginContext checks; frame inspection",
+   "callers": 0,
+   "evidence": "tools/registry.py:200-212; tools/registry.py:547-664; rg 'registry\\.register\\(' plugins = 0"
+  },
+  {
+   "target": "tools/browser_tool_origin.py; tools/mcp_tool_common.py::_OriginProxy",
+   "why": "call-time facade proxies",
+   "callers": 630,
+   "evidence": "tools/browser_tool_origin.py:43-88; tools/mcp_tool_common.py:14-27"
+  },
+  {
+   "target": "toolsets.py 17 _bundle(...) platform entries + hermes-gateway includes",
+   "why": "copies of the core list",
+   "callers": 0,
+   "evidence": "toolsets.py:212-255"
+  },
+  {
+   "target": "toolsets.py hermes-yuanbao 'module' key",
+   "why": "never read",
+   "callers": 0,
+   "evidence": "toolsets.py:240"
+  },
+  {
+   "target": "toolset_distributions.py",
+   "why": "only the off-path batch_runner imports it",
+   "callers": 1,
+   "evidence": "batch_runner.py:34; batch_runner.py:940"
+  },
+  {
+   "target": "tools/process_registry.py::CHECKPOINT_PATH",
+   "why": "import-time home capture; _checkpoint_path() exists",
+   "callers": null,
+   "evidence": "tools/process_registry.py:42-50"
+  }
+ ],
+ "simplify_list": [
+  {
+   "from": [
+    "registry handlers",
+    "agent/inline_tool_executors.py::INLINE_TOOL_EXECUTORS",
+    "delegate branch",
+    "context-engine branch",
+    "memory-provider branch"
+   ],
+   "to": "ToolEntry handler(args, ctx) + combined toolsets",
+   "loc_saved": 900,
+   "evidence": "agent/tool_executor.py:1648-1700; agent/inline_tool_executors.py:237-312"
+  },
+  {
+   "from": [
+    "model_tools.py::handle_function_call",
+    "agent/tool_executor.py pipeline",
+    "agent/agent_runtime_helpers.py::invoke_tool"
+   ],
+   "to": "tools/tool_pipeline.py::call_tool",
+   "loc_saved": 350,
+   "evidence": "model_tools.py:876-969; agent/agent_runtime_helpers.py:2576-2660"
+  },
+  {
+   "from": [
+    "ToolEntry.dynamic_schema_overrides",
+    "model_tools.py::_DYNAMIC_SCHEMA_REWRITERS",
+    "agent_init prune/drop/inject"
+   ],
+   "to": "ToolEntry.prepare + toolset prepare",
+   "loc_saved": 250,
+   "evidence": "tools/registry.py:860-869; model_tools.py:469-494; agent/agent_init.py:1139-1149"
+  },
+  {
+   "from": [
+    "agent/memory_manager.py::inject_memory_provider_tools",
+    "agent/agent_init.py::_inject_context_engine_tools"
+   ],
+   "to": "one add-toolset call",
+   "loc_saved": 45,
+   "evidence": "agent/memory_manager.py:115-158; agent/agent_init.py:2129-2166"
+  },
+  {
+   "from": [
+    "ToolEntry.toolset",
+    "TOOLSETS[*].tools",
+    "toolsets.py::_HERMES_CORE_TOOLS"
+   ],
+   "to": "ToolEntry.toolset + core flag",
+   "loc_saved": 120,
+   "evidence": "toolsets.py:12-41; toolsets.py:77-256"
+  },
+  {
+   "from": [
+    "agent/tool_guardrails.py name sets",
+    "agent/tool_dispatch_helpers.py name sets",
+    "agent/tool_result_classification.py",
+    "agent/agent_runtime_helpers.py:87"
+   ],
+   "to": "ToolEntry metadata fields",
+   "loc_saved": 120,
+   "evidence": "agent/tool_guardrails.py:20-66; agent/tool_dispatch_helpers.py:30-49"
+  },
+  {
+   "from": [
+    "hermes_cli/plugins.py::PluginContext.register_tool checks",
+    "tools/registry.py override policy"
+   ],
+   "to": "PluginContext only",
+   "loc_saved": 220,
+   "evidence": "hermes_cli/plugins.py:471-483; tools/registry.py:547-801"
+  }
+ ],
+ "reference_patterns": [
+  {
+   "repo": "pydantic-ai",
+   "path": "pydantic_ai_slim/pydantic_ai/_run_context.py:169",
+   "pattern": "RunContext passed to every tool",
+   "applies_to": "TLS-01, TLS-09"
+  },
+  {
+   "repo": "pydantic-ai",
+   "path": "pydantic_ai_slim/pydantic_ai/tools.py:106",
+   "pattern": "ToolPrepareFunc(ctx, tool_def) -> tool_def | None",
+   "applies_to": "TLS-05"
+  },
+  {
+   "repo": "pydantic-ai",
+   "path": "pydantic_ai_slim/pydantic_ai/toolsets/combined.py:27",
+   "pattern": "CombinedToolset / FilteredToolset / PreparedToolset composition",
+   "applies_to": "TLS-01, TLS-05"
+  },
+  {
+   "repo": "pydantic-ai",
+   "path": "pydantic_ai_slim/pydantic_ai/tools.py:626",
+   "pattern": "ToolDefinition.sequential, kind, metadata",
+   "applies_to": "TLS-10"
+  },
+  {
+   "repo": "pydantic-ai",
+   "path": "pydantic_ai_slim/pydantic_ai/tool_manager.py:1078",
+   "pattern": "single handle_call path",
+   "applies_to": "TLS-02"
+  },
+  {
+   "repo": "pydantic-ai",
+   "path": "pydantic_ai_slim/pydantic_ai/mcp.py:717",
+   "pattern": "MCPToolset owns state on the instance",
+   "applies_to": "TLS-06"
+  },
+  {
+   "repo": "inspect_ai",
+   "path": "src/inspect_ai/_util/registry.py:127",
+   "pattern": "registry_add stores identity + info once",
+   "applies_to": "TLS-03"
+  },
+  {
+   "repo": "llm",
+   "path": "llm/hookspecs.py:33",
+   "pattern": "register_tools(register) host-bound callable",
+   "applies_to": "TLS-04, TLS-07"
+  },
+  {
+   "repo": "pluggy",
+   "path": "src/pluggy/_manager.py",
+   "pattern": "explicit entry-point loading; policy in the manager",
+   "applies_to": "TLS-07, TLS-12"
+  },
+  {
+   "repo": "svcs",
+   "path": "src/svcs/_core.py",
+   "pattern": "services in a container instead of module singletons",
+   "applies_to": "TLS-06, TLS-11"
+  }
+ ],
+ "seam_answer": "There are several tool abstractions, not one. ToolEntry has schema, handler, check_fn and toolset. But membership is declared again in TOOLSETS and _HERMES_CORE_TOOLS. 15 tools' real handlers live in INLINE_TOOL_EXECUTORS. Memory-provider and context-engine tools bypass the registry. The model-visible schema is rewritten by two mechanisms plus four agent-side passes. Behaviour facts live in name lists in agent/. The call pipeline exists three times. A pydantic-ai toolsets shape fixes this: a ToolEntry whose handler takes a typed RunContext, with a prepare() hook and sequential/read_only metadata, composed by a CombinedToolset filtered by session selection. It deletes INLINE_TOOL_EXECUTORS, _AGENT_LOOP_TOOLS, the five-branch resolver, the skip-flag protocol, _DYNAMIC_SCHEMA_REWRITERS, the static per-tool lists, about 20 behaviour sets and the process-global _last_resolved_tool_names: an estimated -2,000 to -2,500 lines. inspect_ai's registry supplies 'declare once, look up by name'. Plugin authorization belongs in PluginContext, not in the registry.",
+ "cross_seam": [
+  {
+   "seam": "09-concurrency",
+   "note": "_run_async builds a fresh ThreadPoolExecutor and event loop per call under a running loop; MCP runs a separate long-lived loop thread. Two async bridges for one need.",
+   "evidence": "model_tools.py:93"
+  },
+  {
+   "seam": "07-config",
+   "note": "process registry checkpoint path captured from get_hermes_home() at import",
+   "evidence": "tools/process_registry.py:42"
+  },
+  {
+   "seam": "11-plugins",
+   "note": "ctx.dispatch_tool calls registry.dispatch directly, skipping hooks, middleware, aliases and ACP edit approval",
+   "evidence": "hermes_cli/plugins.py:714"
+  },
+  {
+   "seam": "11-plugins",
+   "note": "core toolsets.py hard-codes a spotify toolset whose tools come from plugins/spotify",
+   "evidence": "toolsets.py:178"
+  },
+  {
+   "seam": "04-agent-loop",
+   "note": "agent.tools is post-processed in agent_init after get_tool_definitions; tool list ownership is split across two layers",
+   "evidence": "agent/agent_init.py:1139"
+  },
+  {
+   "seam": "01-layout",
+   "note": "tools import hermes_cli eagerly at module level; registry reaches into gateway",
+   "evidence": "tools/process_registry.py:29"
+  },
+  {
+   "seam": "15-kill",
+   "note": "toolset_distributions.py and TOOL_TO_TOOLSET_MAP exist only for batch_runner",
+   "evidence": "batch_runner.py:34"
+  },
+  {
+   "seam": "14-errors-obs",
+   "note": "library code prints to stdout when quiet_mode=False",
+   "evidence": "model_tools.py:519"
+  },
+  {
+   "seam": "10-gateway",
+   "note": "check_fn cache scope reads gateway session env (browser-control identity) inside the tool registry",
+   "evidence": "tools/registry.py:271"
+  }
+ ],
+ "unverified": [
+  "browser-cdp/browser-use surfacing as 'Plugin toolset' rows in hermes tools or banner: read from code, not run. Verify with toolsets.get_all_toolsets() after discovery on a temp HERMES_HOME.",
+  "Whether kanban_schedule's absence from _HERMES_CORE_TOOLS is intended. Verify with git log -S kanban_schedule -- toolsets.py.",
+  "Whether plugin ctx.dispatch_tool is meant to bypass pre_tool_call hooks and middleware. Verify via git log -S dispatch_tool and plugins/AGENTS.md.",
+  "How many third-party plugins call tools.registry.registry.register directly (TLS-07 risk).",
+  "Whether config migration already rewrote the legacy *_tools toolset names, which would make _LEGACY_TOOLSET_MAP dead.",
+  "loc_delta values are estimates, not prototyped.",
+  "Test patch-site counts (106/125) come from one rg pattern each and may miss monkeypatch.setattr forms.",
+  "Census counts (107 registered names, 115 name-list literals) come from sub-worker scripts in scripts/; mismatches spot-checked, full lists not re-verified.",
+  "The process_registry importer count (45) comes from a sub-worker rg run and was not re-run."
+ ]
+}
