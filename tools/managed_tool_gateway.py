@@ -11,7 +11,7 @@ from typing import Callable, Optional
 from urllib.parse import urlsplit
 
 from hermes_constants import get_hermes_home
-from tools.tool_backend_helpers import fast_search_entitled, managed_nous_tools_enabled
+from tools.tool_backend_helpers import managed_nous_tools_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -199,13 +199,10 @@ def resolve_managed_tool_gateway(
 
 
 def resolve_free_search_gateway(token_reader: Optional[Callable[[], Optional[str]]] = None) -> Optional[ManagedToolGatewayConfig]:
-    """Perplexity ``search_type: "fast"`` is served without funding checks, so it needs a registered
-    Nous identity this profile may use (guest-disabled and refresh rules live in the reader) rather
-    than paid entitlement. The anonymous guest tier is excluded — it has no Portal account, so it
-    keeps the keyless ring. Search only: every other vendor route goes through
-    :func:`resolve_managed_tool_gateway`."""
-    if not fast_search_entitled():
-        return None
+    """Perplexity ``search_type: "fast"`` is served to every Nous identity with no funding check, the
+    anonymous guest tier included, so it needs a token this profile may use (guest-disabled and refresh
+    rules live in the reader), not paid entitlement or a registered account. Search only: every other
+    vendor route goes through :func:`resolve_managed_tool_gateway`."""
     return _vendor_gateway("perplexity", None, token_reader)
 
 

@@ -478,9 +478,9 @@ class TestTickBatchAdvance:
                 threading.Thread(target=run, daemon=True).start()
                 return future
 
-        def record_release(job_id, home=None):
+        def record_release(job_id, home=None, *, owner=None):
             release_calls.append((job_id, threading.current_thread()))
-            real_release(job_id, home=home)
+            real_release(job_id, home=home, owner=owner)
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(sched, "sweep_stale_inflight", lambda _jobs: None)
@@ -596,9 +596,9 @@ class TestTickBatchAdvance:
                 threading.Thread(target=run, daemon=True).start()
                 return future
 
-        def record_release(job_id, home=None):
+        def record_release(job_id, home=None, *, owner=None):
             release_calls.append((job_id, threading.current_thread()))
-            real_release(job_id, home=home)
+            real_release(job_id, home=home, owner=owner)
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(sched, "sweep_stale_inflight", lambda _jobs: None)
