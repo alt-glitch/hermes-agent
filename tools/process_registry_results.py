@@ -45,13 +45,20 @@ def _result_paths():
     return [path for _, path in retained[:MAX_RETAINED_RESULTS]]
 
 
-def save_completed_result(session) -> None:
+def save_completed_result(session, *, lock_held: bool = False) -> None:
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
 
-    with session._lock:
+    # lock_held: ProcessRegistry._move_to_finished already holds session._lock (the
+    # finalization fence); re-acquiring assumes the lock is re-entrant and deadlocks
+    # any caller that substitutes a plain lock.
+    if lock_held:
         record = {key: getattr(session, key) for key in _RESULT_FIELDS}
         record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:]
+    else:
+        with session._lock:
+            record = {key: getattr(session, key) for key in _RESULT_FIELDS}
+            record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:]
     # Live-output opt-out must not persist raw credentials in durable receipts.
     record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
     record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)

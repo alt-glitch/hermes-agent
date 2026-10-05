@@ -1627,7 +1627,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             with self._lock:
                 was_running = session.id in self._running
             if was_running and session._output_finalizer is not None:
-                finalizer, session._output_finalizer = session._output_finalizer, None
+                finalizer = session._output_finalizer
                 result = {"output": session.output_buffer}
                 try:
                     finalizer(result)
@@ -1637,15 +1637,18 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                     logger.exception("Process output finalizer failed for %s", session.id)
                 finally:
                     # Apply cleanup completed before a later bookkeeping failure,
-                    # then preserve the registry's retention contract.
+                    # then preserve the registry's retention contract. Clearing the
+                    # finalizer publishes "output is final" to the fence probe in
+                    # get(), so it happens only after the buffer is replaced.
                     session.output_buffer = str(result.get("output") or "")[-session.max_output_chars:]
+                    session._output_finalizer = None
             with self._lock:
                 if was_running and session.id in self._running:
                     session._finish_claimed = True
                     session.exited_at = time.time()
                     # Keep the session tracked until its result is durable. A finite
                     # parent must not observe completion and exit during this write.
-                    save_completed_result(session)
+                    save_completed_result(session, lock_held=True)
                     self._running.pop(session.id)
                 self._finished[session.id] = session
         # Finished sessions are served from output_buffer; retained process/PTY handles only leak FDs.
@@ -1975,10 +1978,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             session = load_completed_results(session_id).get(session_id)
         if session is None:
             session = self._resolve_prefix(session_id)
-        if session is not None:
+        if session is not None and session._output_finalizer is not None:
             # A finishing session is already addressable so exact/prefix lookup
             # remains stable, but its environment-private output is not readable
-            # until the per-session finalizer releases this fence.
+            # until the per-session finalizer releases this fence. Sessions without
+            # a pending finalizer have nothing private to wait for; probing their
+            # lock here would interleave with readers that snapshot under it.
             with session._lock:
                 pass
         return self._refresh_detached_session(session)

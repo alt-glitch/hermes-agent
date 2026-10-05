@@ -1398,7 +1398,7 @@ class TestKillProcess:
 
         saved = []
 
-        def record_save(session):
+        def record_save(session, **_kwargs):  # _move_to_finished passes lock_held
             saved.append(
                 (session.completion_reason, session.termination_source, session.exit_code)
             )
