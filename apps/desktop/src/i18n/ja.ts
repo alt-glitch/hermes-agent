@@ -2,6 +2,8 @@ import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale } from './define-locale'
 import { introJa } from './intro-ja'
+import { jaModelMenu } from './ja_model_menu'
+import { jaPluginSettings } from './ja_plugins'
 
 export const ja = defineLocale({
   externalOpenFailed: {
@@ -439,22 +441,7 @@ export const ja = defineLocale({
       billingOverview: '概要',
       billingPlans: 'プラン'
     },
-    plugins: {
-      openFolder: 'デスクトッププラグインフォルダーを開く',
-      installModal: {
-        installUncertain:
-          'Hermes はインストール結果の待機を終了しましたが、プラグインのインストールはまだ進行中の可能性があります。この画面を閉じ、再インストールする前にプラグイン一覧を再スキャンしてください。',
-        installFromGit: 'Git からインストール',
-        reviewRepository: 'リポジトリを確認',
-        repoPlaceholder: 'https://github.com/owner/repo',
-        toolsConnected: n => `${n} 個のツールを接続しました`,
-        skillsReady: names =>
-          names.length === 1 ? `スキル ${names[0]} の準備ができました` : `${names.length} 個のスキルの準備ができました`,
-        nextChat: 'ほかのツールは次のチャットで使えます',
-        serverNotConnected: (server, reason) =>
-          `MCP サーバー ${server} は接続されていません${reason ? `: ${reason}` : '。'}`
-      }
-    },
+    plugins: jaPluginSettings.plugins,
     closeSettings: '設定を閉じる',
     exportConfig: '設定を書き出す',
     importConfig: '設定を読み込む',
@@ -462,6 +449,7 @@ export const ja = defineLocale({
     resetConfirm: 'すべての設定を Hermes のデフォルトに戻しますか？',
     exportFailed: '書き出しに失敗しました',
     resetFailed: 'リセットに失敗しました',
+    pluginPages: jaPluginSettings.pluginPages,
     nav: {
       providers: 'プロバイダー',
       providerAccounts: 'アカウント',
@@ -479,7 +467,8 @@ export const ja = defineLocale({
       about: '情報',
       billing: '請求',
       notifications: '通知',
-      vault: 'パスワードとログイン'
+      vault: 'パスワードとログイン',
+      plugins: 'プラグイン'
     },
     vault: {
       title: 'パスワードとログイン',
@@ -1242,6 +1231,8 @@ export const ja = defineLocale({
         'サポートされていないリモートプラットフォームです。Hermes Desktop の SSH モードは Linux、macOS、Windows のリモートホストに対応しています。',
       sshErrTimeout: 'SSH 接続がタイムアウトしました。ホストが到達不能、またはスリープ中の可能性があります。',
       sshErrUpdateRequired: 'Desktop SSH で接続する前に、リモートホストの Hermes を更新してください。',
+      sshErrInteractiveAuth:
+        'Tailscale SSH では対話的なブラウザー確認が必要です。ターミナルで `ssh <host> true` を実行して確認を完了し、再試行してください。Hermes は SSH を非対話的に実行します。',
       sshErrUnknown: 'SSH 接続に失敗しました。'
     },
     keys: {
@@ -3350,22 +3341,7 @@ export const ja = defineLocale({
     windowControls: 'ウィンドウコントロール',
     paneControls: 'ペインコントロール',
     appControls: 'アプリコントロール',
-    modelMenu: {
-      search: 'モデルを検索',
-      noModels: 'モデルが見つかりません',
-      editModels: 'モデルを編集…',
-      followDefault: '設定のデフォルトを使用',
-      refreshModels: 'モデルを更新',
-      favorites: 'お気に入り',
-      addFavorite: 'お気に入りに追加',
-      removeFavorite: 'お気に入りから削除',
-      favoriteShortcut: '⇧ クリック',
-      fast: '高速',
-      free: '無料',
-      cacheRead: 'キャッシュ読み取り',
-      priceTitle: (input: string, output: string, cache: string) =>
-        `入力 ${input}/Mtok · 出力 ${output}/Mtok` + (cache ? ` · キャッシュ読み取り ${cache}/Mtok` : '')
-    },
+    modelMenu: jaModelMenu,
     modelOptions: {
       noOptions: 'このモデルにはオプションがありません',
       options: 'オプション',
@@ -4094,9 +4070,6 @@ export const ja = defineLocale({
     sessionUnavailable: 'セッションが利用できません',
     createSessionFailed: '新しいセッションを作成できませんでした',
     promptFailed: 'プロンプトに失敗しました',
-    staleSessionTitle: 'チャットが最新ではありません',
-    staleSessionBody:
-      'このウィンドウは同じチャットの別ビューより遅れています。最新のメッセージを読み込みました。送信する場合はもう一度送ってください。',
     providerCredentialRequired: '最初のメッセージを送信する前にプロバイダー認証情報を追加してください。',
     emptySlashCommand: '空のスラッシュコマンド',
     slashCommandIgnoredTitle: 'コマンドが送信されませんでした',

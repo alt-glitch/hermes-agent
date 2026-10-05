@@ -1128,38 +1128,6 @@ def _scoped_key_env(name: str) -> str:
         return (os.getenv(name) or "").strip()
 
 
-# Codex Responses → chat.completions adapter, so aux consumers need no changes.
-def _parse_codex_final_response(final: Any) -> Tuple[List[str], List[Any], Any]:
-    """Split a completed Responses object into (text_parts, tool_calls, usage) in chat.completions shape."""
-    text_parts: List[str] = []
-    tool_calls_raw: List[Any] = []
-    for item in (getattr(final, "output", None) or []):
-        item_type = _field(item, "type")
-        if item_type == "message":
-            for part in (_field(item, "content") or []):
-                part_type = _field(part, "type")
-                if part_type in {"output_text", "text"}:
-                    text_parts.append(_field(part, "text", ""))
-                elif part_type == "refusal":
-                    # A refusal part carries the model's explanation; dropping it turns a
-                    # refusal-only turn into an empty response that gets retried.
-                    text_parts.append(_field(part, "refusal", ""))
-        elif item_type == "function_call":
-            tool_calls_raw.append(SimpleNamespace(
-                id=_field(item, "call_id", ""), type="function",
-                function=SimpleNamespace(
-                    name=_field(item, "name", ""), arguments=_field(item, "arguments", "{}"))))
-    usage = None
-    resp_usage = getattr(final, "usage", None)
-    if resp_usage:
-        def _u(key: str) -> int:
-            return getattr(resp_usage, key, 0) or (resp_usage.get(key, 0) if isinstance(resp_usage, dict) else 0)
-        usage = SimpleNamespace(
-            prompt_tokens=_u("input_tokens"), completion_tokens=_u("output_tokens"),
-            total_tokens=_u("total_tokens"))
-    return text_parts, tool_calls_raw, usage
-
-
 def _attempt_stream_socket(stream: Any) -> Any:
     """The raw socket under an SDK event stream (``stream.response`` is the ``httpx.Response``;
     httpcore publishes its connection as the ``network_stream`` extension), or None."""
@@ -1502,9 +1470,10 @@ class _CodexCompletionsAdapter:
         # instead of agent/transports/codex.py's build_kwargs, so they need the same guard applied
         # independently. See #32716.
         # Aux requests run their own model; stamp/filter reasoning provenance against it, not the main agent's.
+        issuer_kind = _classify_responses_issuer(base_url=host, **route._asdict())
         input_items = _chat_messages_to_responses_input(
             replay_messages, is_github_responses=is_copilot,
-            current_issuer_kind=_classify_responses_issuer(base_url=host, **route._asdict()),
+            current_issuer_kind=issuer_kind,
             current_issuer_model=wire_model, native_compaction_eligible=False,
         )
         resp_kwargs: Dict[str, Any] = {
@@ -1548,6 +1517,8 @@ class _CodexCompletionsAdapter:
             resp_kwargs["tools"] = wire_tools
         if wire_aliases:
             resp_kwargs["_wire_aliases"] = wire_aliases
+        # Response normalization is route-sensitive too (popped in ``create()``, never sent).
+        resp_kwargs["_issuer_kind"] = issuer_kind
         # Stable prompt-cache routing: key is content-addressed from the static prefix
         # (instructions + tool schemas) so it survives across turns, scoped by the owning
         # conversation (rotation-stable logical scope, else the physical session id). Skip the
@@ -1591,6 +1562,8 @@ class _CodexCompletionsAdapter:
         # ``response.completed.response.output``, which Codex returns as ``null`` (SDK crash).
         resp_kwargs, model, timeout = self._build_responses_kwargs(kwargs)
         wire_aliases = resp_kwargs.pop("_wire_aliases", None) or {}
+        issuer_kind = resp_kwargs.pop("_issuer_kind", None)
+        issuer_model = str(resp_kwargs.get("model") or model)
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
         guard = _CodexStreamGuard(self._client, total_timeout, no_progress_timeout=kwargs.get("no_progress_timeout"))
         try:
@@ -1612,13 +1585,17 @@ class _CodexCompletionsAdapter:
                     final = event_stream
                 else:
                     final = _consume_codex_event_stream(
-                        event_stream, model=str(resp_kwargs.get("model") or model), on_event=guard.on_event
+                        event_stream, model=issuer_model, on_event=guard.on_event
                     )
             finally:
                 guard.release_stream(event_stream)
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
-            text_parts, tool_calls_raw, usage = _parse_codex_final_response(final)
+            from agent.auxiliary_codex_response import _parse_codex_final_response
+
+            text_parts, tool_calls_raw, usage, finish_reason = _parse_codex_final_response(
+                final, issuer_kind=issuer_kind, issuer_model=issuer_model,
+            )
             # Undo only the aliases THIS request emitted, before the call reaches Hermes dispatch.
             for tc in tool_calls_raw or ():
                 if tc.function.name in wire_aliases:
@@ -1635,9 +1612,7 @@ class _CodexCompletionsAdapter:
             role="assistant", content="".join(text_parts).strip() or None,
             tool_calls=tool_calls_raw or None,
         )
-        choice = SimpleNamespace(
-            index=0, message=message, finish_reason="stop" if not tool_calls_raw else "tool_calls"
-        )
+        choice = SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
         return SimpleNamespace(choices=[choice], model=model, usage=usage)
 
 
@@ -6874,7 +6849,10 @@ def _validate_llm_response(
     an empty route. See #23270.
     """
     if response is None:
-        raise RuntimeError(f"Auxiliary {task or 'call'}: LLM returned None response")
+        raise RuntimeError(
+            f"Auxiliary {task or 'call'}: LLM returned None response"
+        )
+    response = _unwrap_data_envelope(response, task)
     from agent.aux_accounting import record_aux_usage
     record_aux_usage(response, task, provider=provider, base_url=base_url)
     # Adapter SimpleNamespace responses are fine — they have .choices[0].message.
@@ -6952,6 +6930,55 @@ def _fail_relay_auxiliary_call(exc: BaseException) -> None:
         _complete_relay_auxiliary_call(outcome="failed")
     except Exception:
         logger.warning("Relay auxiliary failure finalization failed", exc_info=True)
+
+
+def _unwrap_data_envelope(response: Any, task: str = None) -> Any:
+    """Unwrap gateway envelopes like {"data": {<chat completion>}, "success": true}.
+
+    Some OpenAI-compatible gateways (e.g. api.cline.bot) wrap non-streaming
+    JSON bodies in a data/success envelope.  The SDK leniently parses this
+    into a ChatCompletion with choices=None and keeps the envelope keys as
+    extra fields, so the real completion is reachable at ``response.data``.
+    Error envelopes ({"success": false, "data": {"error": ...}}) raise the
+    provider's actual error instead of a generic invalid-response error.
+    """
+    if _field(response, "choices"):
+        return response
+    data = _field(response, "data")
+    if not isinstance(data, dict):
+        return response
+    if _field(response, "success") is False:
+        err = data.get("error") or data
+        msg = err.get("message") if isinstance(err, dict) else None
+        raise RuntimeError(
+            f"Auxiliary {task or 'call'}: provider returned error envelope: "
+            f"{msg or err}"
+        )
+    if not data.get("choices"):
+        return response
+    try:
+        return type(response).model_validate(data)
+    except (AttributeError, TypeError, ValueError):
+        # No model_validate (SimpleNamespace) or the inner payload fails
+        # strict validation (pydantic ValidationError is a ValueError).
+        pass
+    choices = []
+    for ch in data["choices"]:
+        msg = ch.get("message") if isinstance(ch, dict) else None
+        if isinstance(msg, dict):
+            choices.append(SimpleNamespace(
+                message=SimpleNamespace(**msg),
+                finish_reason=ch.get("finish_reason") or "stop",
+            ))
+    if not choices:
+        return response
+    return SimpleNamespace(
+        id=data.get("id", ""),
+        model=data.get("model", ""),
+        object=data.get("object", "chat.completion"),
+        choices=choices,
+        usage=data.get("usage"),
+    )
 
 
 def _recover_aux_response_message(response: Any) -> Optional[Any]:

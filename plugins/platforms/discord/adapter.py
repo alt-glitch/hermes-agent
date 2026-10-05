@@ -25,7 +25,7 @@ import threading
 import time
 import traceback
 from collections import defaultdict
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
 
@@ -78,6 +78,7 @@ class _Snowflake:
 
     def __init__(self, id: int) -> None:  # noqa: A002 - matches discord API
         self.id = id
+
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
@@ -707,14 +708,27 @@ class VoiceReceiver:
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
+    REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
 
     def __init__(self, voice_client, allowed_user_ids: set = None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
-        self._secret_key: Optional[bytes] = None
-        self._dave_session = None
+
+        # Decryption state, kept as ONE tuple (secret_key, dave_session,
+        # dave_protocol_version, dave_downgraded) so the receive thread
+        # reads a consistent generation in a single reference load while
+        # refreshes happen on other threads — two separate assignments
+        # could pair a new key with an old session for a packet.
+        self._creds: tuple = (b"", None, 0, False)
         self._bot_ssrc: int = 0
+        # Monotonic deadline while DAVE plaintext passthrough is allowed
+        # (mirrors discord.py's set_passthrough_mode windows, see the
+        # voice-ws hook).  Replace-semantics: an upgrade's 10s grace
+        # SHORTENS a residual downgrade window, never extends it.
+        self._dave_passthrough_until: float = 0.0
+
+        # SSRC -> user_id mapping (populated from SPEAKING events)
         self._ssrc_to_user: Dict[int, int] = {}
         self._lock = threading.Lock()
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
@@ -726,18 +740,110 @@ class VoiceReceiver:
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
 
-    # --- Lifecycle ---
+        # Decode-health counters (logged at teardown) and the NaCl failure
+        # streak used to detect stale credentials after a re-key.
+        self._decode_ok = 0
+        self._decode_failed = 0
+        self._dave_unmapped_dropped = 0
+        self._nacl_fail_streak = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def start(self):
         """Start listening for voice packets."""
         conn = self._vc._connection
-        self._secret_key = bytes(conn.secret_key)
-        self._dave_session = conn.dave_session
-        self._bot_ssrc = conn.ssrc
+        self._resolve_credentials(conn)
+
         self._install_speaking_hook(conn)
         conn.add_socket_listener(self._on_packet)
         self._running = True
         logger.info("VoiceReceiver started (bot_ssrc=%d)", self._bot_ssrc)
+
+    def _resolve_credentials(self, conn) -> None:
+        """Read the current decryption state from the live connection.
+
+        Discord rotates the transport ``secret_key`` on every voice
+        (re)connect (op 4 SESSION_DESCRIPTION), and ``reinit_dave_session``
+        REPLACES ``conn.dave_session`` with a new object when none existed
+        yet — e.g. when DAVE finishes negotiating after this receiver
+        started.  Credentials must therefore be re-resolvable at runtime;
+        a one-time snapshot decrypts nothing after either event, silently.
+
+        ``dave_protocol_version`` rides along because a non-null session is
+        NOT proof frames are encrypted: after a downgrade transition the
+        session object survives with the protocol at 0 and senders emit
+        plaintext.
+        """
+        self._creds = (
+            bytes(conn.secret_key),
+            conn.dave_session,
+            int(getattr(conn, "dave_protocol_version", 0) or 0),
+            bool(getattr(conn, "dave_downgraded", False)),
+        )
+        self._bot_ssrc = conn.ssrc
+        # A receiver can start (or refresh) while a downgrade transition is
+        # already pending — upstream has passthrough enabled for up to 120s
+        # but we never saw the op 21.  Seed the window from the connection's
+        # physical pending-transition state; the entry is popped on execute,
+        # so this cannot re-grant after the transition completes.
+        pending = getattr(conn, "dave_pending_transitions", None) or {}
+        if 0 in pending.values() and time.monotonic() >= self._dave_passthrough_until:
+            self.note_dave_passthrough_window(120.0)
+
+    @property
+    def _secret_key(self) -> bytes:
+        return self._creds[0]
+
+    @property
+    def _dave_session(self):
+        return self._creds[1]
+
+    @property
+    def _dave_protocol_version(self) -> int:
+        return self._creds[2]
+
+    @property
+    def _dave_downgraded(self) -> bool:
+        return self._creds[3]
+
+    def note_dave_passthrough_window(self, seconds: float) -> None:
+        """Open a plaintext-passthrough grace window for unmapped SSRCs.
+
+        Mirrors discord.py's own ``set_passthrough_mode`` calls: a pending
+        downgrade transition allows plaintext for up to 120s, and a
+        confirmed upgrade-after-downgrade allows a 10s grace while senders
+        catch up.  Replace-semantics, matching upstream: each grant resets
+        the deadline, so an upgrade's short grace supersedes a residual
+        downgrade window instead of being swallowed by it.
+        """
+        self._dave_passthrough_until = time.monotonic() + seconds
+
+    def refresh_credentials(self, reason: str) -> None:
+        """Re-resolve decryption state from the live connection.
+
+        Cheap and idempotent (attribute reads plus one small copy), so
+        callers invoke it on every trigger — session description, DAVE
+        epoch prepare, a membership change in the channel, or a decrypt
+        failure streak — without needing to coalesce.
+        """
+        if not self._running:
+            return
+        try:
+            conn = self._vc._connection
+            self._resolve_credentials(conn)
+            self._nacl_fail_streak = 0
+            logger.info(
+                "VoiceReceiver credentials refreshed (%s; bot_ssrc=%d, dave=%s)",
+                reason,
+                self._bot_ssrc,
+                "on" if self._dave_session else "off",
+            )
+        except Exception as e:
+            logger.warning(
+                "VoiceReceiver credential refresh failed (%s): %s", reason, e
+            )
 
     def stop(self):
         """Stop listening and clean up."""
@@ -751,7 +857,13 @@ class VoiceReceiver:
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
-        logger.info("VoiceReceiver stopped")
+        logger.info(
+            "VoiceReceiver stopped (frames ok=%d, decrypt_failed=%d, "
+            "dave_unmapped_dropped=%d)",
+            self._decode_ok,
+            self._decode_failed,
+            self._dave_unmapped_dropped,
+        )
 
     def pause(self):
         self._paused = True
@@ -781,6 +893,47 @@ class VoiceReceiver:
                     receiver_self.map_ssrc(int(ssrc), int(user_id))
             if original_hook:
                 await original_hook(ws, msg)
+            # Re-resolve decryption state after the events that change it.
+            # DiscordVoiceWebSocket.received_message dispatches the op (which
+            # is what updates conn.secret_key / conn.dave_session /
+            # conn.dave_protocol_version) BEFORE calling this hook, so the
+            # refresh reads the new values:
+            #   op 4  SESSION_DESCRIPTION — new transport key, and
+            #         reinit_dave_session() may replace conn.dave_session
+            #   op 24 DAVE_PREPARE_EPOCH  — epoch 1 recreates the MLS group
+            #   op 21 DAVE_PREPARE_TRANSITION with protocol_version 0 —
+            #         discord.py opens a 120s plaintext passthrough window
+            #         (set_passthrough_mode(True, 120)); mirror it so the
+            #         unmapped-SSRC gate doesn't drop legitimate plaintext
+            #   op 22 DAVE_EXECUTE_TRANSITION — the protocol version just
+            #         changed; refresh, plus a 10s grace mirroring the
+            #         upgrade path's set_passthrough_mode(True, 10)
+            if isinstance(msg, dict):
+                op = msg.get("op")
+                if op in (4, 24):
+                    receiver_self.refresh_credentials(f"voice ws op {op}")
+                elif op == 21:
+                    if (msg.get("d") or {}).get("protocol_version") == 0:
+                        # Pending downgrade: upstream enables plaintext
+                        # passthrough for up to 120s (set_passthrough_mode).
+                        receiver_self.note_dave_passthrough_window(120.0)
+                elif op == 22:
+                    # A transition may have executed; refresh and detect the
+                    # upgrade-after-downgrade EDGE (dave_downgraded flipping
+                    # True -> False) — the only case upstream grants the 10s
+                    # passthrough grace.  Same-version transitions and
+                    # unknown/duplicate ids change no state upstream, so no
+                    # edge fires and no window opens.
+                    was_downgraded = receiver_self._dave_downgraded
+                    receiver_self.refresh_credentials("voice ws op 22")
+                    if (
+                        was_downgraded
+                        and not receiver_self._dave_downgraded
+                        and receiver_self._dave_protocol_version > 0
+                    ):
+                        receiver_self.note_dave_passthrough_window(10.0)
+
+        # Set on connection state (for future reconnects)
         conn.hook = wrapped_hook
         try:
             from discord.utils import MISSING
@@ -795,6 +948,12 @@ class VoiceReceiver:
     def _on_packet(self, data: bytes):
         if not self._running or self._paused:
             return
+
+        # One consistent credential generation for this packet — a refresh
+        # on another thread swaps the whole tuple, never half of it.
+        secret_key, dave_session, dave_pver, _dave_downgraded = self._creds
+
+        # Log first few raw packets for debugging
         self._packet_debug_count += 1
         if self._packet_debug_count <= 5:
             logger.debug(
@@ -842,11 +1001,26 @@ class VoiceReceiver:
         encrypted = bytes(payload_with_nonce[:-4])
         try:
             import nacl.secret  # noqa: E402 — delayed import, only in voice path
-            box = nacl.secret.Aead(self._secret_key)
+            box = nacl.secret.Aead(secret_key)
             decrypted = box.decrypt(encrypted, header, bytes(nonce))
+            self._nacl_fail_streak = 0
         except Exception as e:
-            if self._packet_debug_count <= 10:
-                logger.warning("NaCl decrypt failed: %s (hdr=%d, enc=%d)", e, header_size, len(encrypted))
+            self._decode_failed += 1
+            self._nacl_fail_streak += 1
+            # Never go fully dark: after the first 10 warnings, keep emitting
+            # one every 250 failures so a deaf session stays diagnosable.
+            if self._packet_debug_count <= 10 or self._nacl_fail_streak % 250 == 0:
+                logger.warning(
+                    "NaCl decrypt failed: %s (hdr=%d, enc=%d, streak=%d)",
+                    e, header_size, len(encrypted), self._nacl_fail_streak,
+                )
+            # A sustained failure streak means the transport key rotated
+            # under us (voice reconnect / re-key) — re-read it from the live
+            # connection instead of staying deaf on a stale copy.  The
+            # refresh resets the streak, so this retries every
+            # REKEY_FAILURE_STREAK packets while the failure persists.
+            if self._nacl_fail_streak >= self.REKEY_FAILURE_STREAK:
+                self.refresh_credentials("decrypt-failure streak")
             return
         # Skip encrypted extension data to get the actual opus payload
         if ext_data_len and len(decrypted) > ext_data_len:
@@ -869,13 +1043,18 @@ class VoiceReceiver:
             if not decrypted:
                 return
         # --- DAVE E2EE decrypt ---
-        if self._dave_session:
+        if dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
+                if not user_id:
+                    # Rejoin race: SPEAKING may never be resent for a user who
+                    # was already talking — try the sole-member inference
+                    # before giving up on this frame.
+                    user_id = self._infer_user_for_ssrc(ssrc)
             if user_id:
                 try:
                     import davey
-                    decrypted = self._dave_session.decrypt(
+                    decrypted = dave_session.decrypt(
                         user_id, davey.MediaType.audio, decrypted
                     )
                 except Exception as e:
@@ -884,11 +1063,36 @@ class VoiceReceiver:
                         if self._packet_debug_count <= 10:
                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
                         return
-            # Unknown SSRC (no SPEAKING yet): skip DAVE, try Opus directly; user_id arrives with SPEAKING.
+            elif (
+                dave_pver > 0
+                and time.monotonic() >= self._dave_passthrough_until
+            ):
+                # E2EE is actively on (protocol > 0, no passthrough window),
+                # so an unmapped SSRC's payload is still ciphertext.  Opus
+                # will happily "decode" it (producing shredded audio and
+                # poisoning decoder state), so drop the frame until a
+                # SPEAKING event maps the SSRC — bounded loss beats corrupt
+                # audio.  A non-null session alone is NOT this predicate: the
+                # session object survives protocol downgrades to 0 and
+                # passthrough transitions, where plaintext is legitimate and
+                # must fall through to opus below.
+                self._dave_unmapped_dropped += 1
+                if (
+                    self._packet_debug_count <= 10
+                    or self._dave_unmapped_dropped % 250 == 1
+                ):
+                    logger.debug(
+                        "Dropping DAVE frame for unmapped ssrc=%d (dropped=%d)",
+                        ssrc, self._dave_unmapped_dropped,
+                    )
+                return
+
+        # --- Opus decode -> PCM ---
         try:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
+            self._decode_ok += 1
             with self._lock:
                 self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
@@ -1048,9 +1252,10 @@ def _read_discord_prompt_timeout() -> int:
 
 
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
+from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesMixin, SemanticThreadRenames
 
 
-class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
     MAX_MESSAGE_LENGTH = 2000
@@ -1113,6 +1318,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
         self._threads = ThreadParticipationTracker("discord")
+        self._semantic_thread_renames = SemanticThreadRenames()
         # Persistent typing loops per channel (DMs don't reliably show bot typing events).
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
@@ -1375,6 +1581,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 await adapter_self._on_platform_thread_create(thread)
 
             @self._client.event
+            async def on_raw_thread_update(payload: Any) -> None:
+                await adapter_self._on_platform_raw_thread_update(payload)
+
+            @self._client.event
             async def on_thread_update(before, after):
                 await adapter_self._on_platform_thread_update(before, after)
 
@@ -1406,6 +1616,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         else f"moved {before.channel.name} -> {after.channel.name}",
                         guild_id,
                     )
+                    # Any membership change in the bot's channel bumps the
+                    # DAVE (E2EE) epoch — re-resolve the receiver's decryption
+                    # state so it never decodes against a stale session.
+                    vc = adapter_self._voice_clients.get(guild_id)
+                    receiver = adapter_self._voice_receivers.get(guild_id)
+                    if vc is not None and receiver is not None:
+                        bot_channel = getattr(vc, "channel", None)
+                        if bot_channel is not None and (
+                            before.channel == bot_channel
+                            or after.channel == bot_channel
+                        ):
+                            receiver.refresh_credentials("membership change")
+
+            # Register slash commands
             if self._slash_commands:
                 # Registration walks the skill catalog on disk (#110707); keep the loop free.
                 await asyncio.to_thread(self._register_slash_commands)
@@ -4764,8 +4988,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             thread_id = str(interaction.channel_id)
         else:
             chat_type = "group"
+        # Named as a message here is: the pinned session-context prompt renders and keys on it.
         chat_name = ""
-        if not is_dm and hasattr(interaction.channel, "name"):
+        if is_dm:
+            chat_name = interaction.user.name
+        elif is_thread:
+            chat_name = self._format_thread_chat_name(interaction.channel)
+        elif hasattr(interaction.channel, "name"):
             chat_name = interaction.channel.name
             if hasattr(interaction.channel, "guild") and interaction.channel.guild:
                 chat_name = f"{interaction.channel.guild.name} / #{chat_name}"
@@ -4787,6 +5016,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return MessageEvent(
             text=text, message_type=msg_type, source=source, raw_message=interaction,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+            # Bound skills load only when a session starts, and "/skill x" or "/queue" can start one.
+            auto_skill=self._resolve_channel_skills(channel_id, parent_id or None),
         )
 
     # --- Thread creation helpers ---
@@ -4821,25 +5052,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             await self._threads.mark_async(thread_id)
         starter = (message or "").strip()
         if starter and thread_id:
-            await self._dispatch_thread_session(interaction, thread_id, thread_name, starter)
+            await self._dispatch_thread_session(interaction, result["thread"], starter)
 
-    async def _dispatch_thread_session(
-        self, interaction: discord.Interaction, thread_id: str, thread_name: str, text: str,
-    ) -> None:
+    async def _dispatch_thread_session(self, interaction: discord.Interaction, thread: Any, text: str) -> None:
         """Build a MessageEvent pointing at a thread and send it through handle_message."""
-        guild_name = ""
-        if hasattr(interaction, "guild") and interaction.guild:
-            guild_name = interaction.guild.name
-        chat_name = f"{guild_name} / {thread_name}" if guild_name else thread_name
-        # Inherit forum topic when the thread was created inside a forum channel.
-        _chan = getattr(interaction, "channel", None)
-        chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
-        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
-        _parent_id = str(getattr(_parent_channel, "id", "") or "")
+        # Name, topic and parent come from the thread, as for a message posted in it (same pinned prompt).
+        thread_id = str(thread.id)
+        _parent_id = self._get_parent_channel_id(thread) or ""
         source = self.build_source(
-            chat_id=thread_id, chat_name=chat_name, chat_type="thread",
+            chat_id=thread_id, chat_name=self._format_thread_chat_name(thread), chat_type="thread",
             user_id=str(interaction.user.id), user_name=interaction.user.display_name,
-            thread_id=thread_id, chat_topic=chat_topic,
+            thread_id=thread_id, chat_topic=self._get_effective_topic(thread, is_thread=True),
             guild_id=self._interaction_guild_id(interaction), parent_chat_id=_parent_id or None,
         )
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
@@ -5384,7 +5607,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     @staticmethod
     def _thread_created(thread: Any, name: str) -> Dict[str, Any]:
-        return {"success": True, "thread_id": str(thread.id), "thread_name": getattr(thread, "name", None) or name}
+        return {"success": True, "thread_id": str(thread.id), "thread_name": getattr(thread, "name", None) or name,
+                "thread": thread}
 
     # ------------------------------------------------------------------
     # Auto-thread helpers
@@ -5488,8 +5712,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         edit = getattr(thread, "edit", None)
         if edit is None:
             return False
+        # Only the title lane's guarded rename is Hermes's own title (see adapter_thread_titles).
+        attempt = (
+            self._semantic_thread_renames.attempt(str(thread_id_int), only_if_current_name, cleaned)
+            if only_if_current_name is not None else nullcontext()
+        )
         try:
-            await edit(name=cleaned, reason="Hermes semantic session title")
+            with attempt:
+                await edit(name=cleaned, reason="Hermes semantic session title")
             logger.info(
                 "[%s] Renamed Discord thread %s from %r to %r",
                 self.name, thread_id, current_name, cleaned,
@@ -5830,21 +6060,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 topic = getattr(parent, "topic", None)
         return topic
 
-    def _format_thread_chat_name(self, thread: Any) -> str:
-        """Build a readable chat name for thread-like Discord channels, including forum context when available."""
-        thread_name = getattr(thread, "name", None) or str(getattr(thread, "id", "thread"))
-        parent = getattr(thread, "parent", None)
-        guild = getattr(thread, "guild", None) or getattr(parent, "guild", None)
-        guild_name = getattr(guild, "name", None)
-        parent_name = getattr(parent, "name", None)
-        if self._is_forum_parent(parent) and guild_name and parent_name:
-            return f"{guild_name} / {parent_name} / {thread_name}"
-        if parent_name and guild_name:
-            return f"{guild_name} / #{parent_name} / {thread_name}"
-        if parent_name:
-            return f"{parent_name} / {thread_name}"
-        return thread_name
-
     # ------------------------------------------------------------------
     # Attachment download helpers
     # Prefer the authenticated bot session (``att.read()``): CDN URLs increasingly 403 without
@@ -6174,8 +6389,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             chat_name = getattr(message.channel, "name", str(message.channel.id))
             if hasattr(message.channel, "guild") and message.channel.guild:
                 chat_name = f"{message.channel.guild.name} / #{chat_name}"
-        # Channel topic (TextChannels only); forum-parented threads inherit the parent topic.
-        chat_topic = self._get_effective_topic(message.channel, is_thread=is_thread)
+        # The session channel's topic, as the auto-thread's next message reads it; forum threads inherit it.
+        chat_topic = self._get_effective_topic(effective_channel, is_thread=is_thread)
         guild = getattr(message, "guild", None)
         source = self.build_source(
             chat_id=str(effective_channel.id),

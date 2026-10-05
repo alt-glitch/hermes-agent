@@ -96,12 +96,15 @@ def _finish(payload: dict, resolved: bool, choice: str | None, reason, **extra) 
     """Fire the post hook and build the decision dict. Unresolved (timeout) and
     a None choice both mean the user never answered; ``cancelled`` carries the
     cause when the prompt was withdrawn rather than answered."""
-    if extra.get("cancelled"):
-        hook_choice = "cancelled"
-    else:
-        hook_choice = "timeout" if not resolved else (choice or "timeout")
-    _ctx._fire_approval_hook("post_approval_response", **payload, choice=hook_choice, **extra)
+    _ctx._fire_approval_hook("post_approval_response", **payload, choice=_hook_choice(resolved, choice, extra), **extra)
     return {"resolved": resolved, "choice": choice, "reason": reason, **extra}
+
+
+def _hook_choice(resolved: bool, choice: str | None, extra: dict) -> str:
+    """Observer-facing outcome of a wait: the choice, else ``cancelled`` / ``timeout``."""
+    if extra.get("cancelled"):
+        return "cancelled"
+    return (choice or "timeout") if resolved else "timeout"
 
 
 def _await_coalesced_leader(session_key: str, leader, payload: dict):
@@ -209,36 +212,40 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
                 logger.debug("approval settle hook failed", exc_info=True)
         return choice, won
 
-    # Plugins hear about the request before the gateway does (real-time observers).
-    _ctx._fire_approval_hook("pre_approval_request", **payload)
-    # Bridges sync agent thread → async gateway.
-    try:
-        notify_cb(dict(entry.data))
-        approval_published()
-    except Exception as exc:
-        logger.warning("Gateway approval notify failed: %s", exc)
-        _drop_entry("notify_failed", terminal_status="cancelled")
-        _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
-        return {"resolved": False, "choice": None, "notify_failed": True}
+    from tools.human_input_hooks import human_input_request
+    with human_input_request("approval", prompt=payload["command"], session_key=session_key) as human:
+        # Plugins hear about the request before the gateway does (real-time observers).
+        _ctx._fire_approval_hook("pre_approval_request", **payload)
+        # Bridges sync agent thread → async gateway.
+        try:
+            notify_cb(dict(entry.data))
+            approval_published()
+        except Exception as exc:
+            logger.warning("Gateway approval notify failed: %s", exc)
+            _drop_entry("notify_failed", terminal_status="cancelled")
+            _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
+            human.outcome = "notify_failed"
+            return {"resolved": False, "choice": None, "notify_failed": True}
 
-    state = _poll_event(entry.event, session_key,
-                        interrupt_log="Approval wait interrupted — returning deny for session %s")
-    cancelled = _cancel_cause(state, entry)
-    if state == "interrupted":
-        entry.cancelled = cancelled
-        entry.event.set()
-    terminal_status = "cancelled" if state == "interrupted" else "expired" if state == "timeout" else None
-    choice, won = _drop_entry(state, terminal_status=terminal_status)
-    if not won and state != "set":
-        # A resolver removed and signalled the entry while this waiter crossed its local deadline. Its lock-held
-        # terminal decision is authoritative, including a late answer acknowledged at the boundary.
-        entry.event.wait()
-        choice = entry.result
-    if state == "interrupted":
-        # This direct wait fails closed; coalesced followers receive the stamped cancellation cause separately.
-        choice = "deny"
-    resolved = entry.terminal_status != "expired" and (state != "timeout" or choice is not None)
-    if not won and entry.terminal_status == "cancelled" and choice is None:
-        cancelled = entry.cancelled or cancelled
-    extra = {"cancelled": cancelled} if cancelled else {}
-    return _finish(payload, resolved, choice, entry.reason, **extra)
+        state = _poll_event(entry.event, session_key,
+                            interrupt_log="Approval wait interrupted — returning deny for session %s")
+        cancelled = _cancel_cause(state, entry)
+        if state == "interrupted":
+            entry.cancelled = cancelled
+            entry.event.set()
+        terminal_status = "cancelled" if state == "interrupted" else "expired" if state == "timeout" else None
+        choice, won = _drop_entry(state, terminal_status=terminal_status)
+        if not won and state != "set":
+            # A resolver removed and signalled the entry while this waiter crossed its local deadline. Its
+            # lock-held terminal decision is authoritative, including a late answer acknowledged at the boundary.
+            entry.event.wait()
+            choice = entry.result
+        if state == "interrupted":
+            # This direct wait fails closed; coalesced followers receive the stamped cancellation cause separately.
+            choice = "deny"
+        resolved = entry.terminal_status != "expired" and (state != "timeout" or choice is not None)
+        if not won and entry.terminal_status == "cancelled" and choice is None:
+            cancelled = entry.cancelled or cancelled
+        extra = {"cancelled": cancelled} if cancelled else {}
+        human.outcome = _hook_choice(resolved, choice, extra)
+        return _finish(payload, resolved, choice, entry.reason, **extra)
