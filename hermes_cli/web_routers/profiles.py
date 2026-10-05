@@ -687,7 +687,11 @@ def _merge_profile_tree(
             session["profile"] = profile
             session["is_default_profile"] = profile == "default"
 
-        key = project.get("path") or project["id"]
+        # Same folder-identity notion the per-profile tree builder uses (``_path_key``):
+        # shape-derived — Windows paths case-fold on any host, separators unify, NFC —
+        # so the cross-profile merge agrees by construction with the trees it merges.
+        from tui_gateway.project_tree import _path_key
+        key = _path_key(project.get("path") or project["id"])
         existing = merged.get(key)
         if existing is None:
             merged[key] = project

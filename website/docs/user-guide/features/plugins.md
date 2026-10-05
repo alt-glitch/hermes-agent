@@ -190,7 +190,7 @@ hermes plugins enable <name>      # add to allow-list
 hermes plugins disable <name>     # remove from allow-list + add to disabled
 ```
 
-After `hermes plugins install owner/repo`, you're asked `Enable 'name' now? [y/N]` — defaults to no. Skip the prompt for scripted installs with `--enable` or `--no-enable`.
+After `hermes plugins install owner/repo`, you're asked `Enable 'name' now? [y/N]` — defaults to no. Skip the prompt for scripted installs with `--enable` or `--no-enable`. A memory provider (a plugin whose `__init__.py` registers a `MemoryProvider`) asks `Use 'name' as the memory provider now?` instead: yes (or `--enable`) sets `memory.provider`, which is the only switch that activates a provider; no leaves it for `hermes memory setup`.
 
 For a reproducible install, pin a full immutable commit (tags, branches, and
 abbreviated SHAs are not accepted):
