@@ -22,7 +22,7 @@ def test_tools_configure_rejects_running_session_before_config_mutation() -> Non
 
     assert response["error"] == {
         "code": 4009,
-        "message": "session busy — interrupt the current turn before changing tools",
+        "message": "session busy — Hermes is still replying. Stop the current reply first (Stop button, or Ctrl+C in a terminal), then run /tools.",
     }
     load_config.assert_not_called()
     reset_agent.assert_not_called()
