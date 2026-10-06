@@ -1,6 +1,8 @@
 import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
 
+import { enAuxTasks } from './en_aux_tasks'
 import { enModelMenu } from './en_model_menu'
+import { enSharedMetrics } from './en_shared_metrics'
 import type { Translations } from './types'
 
 export const en: Translations = {
@@ -14,41 +16,7 @@ export const en: Translations = {
       message: 'This file does not exist — it may have been deleted or moved, or it lives on another machine.'
     }
   },
-  sharedMetrics: {
-    consentTitle: 'Help improve Hermes?',
-    consentBody:
-      'Shared metrics contain only bounded counters. Never prompts, files, paths or error text. Collection is local. Sending them to Nous is a separate opt-in.',
-    whatIsCollected: 'What is collected',
-    collectedIntro: 'Only bounded counters:',
-    collectedActivity: 'Activity, session length, outcomes and error classes',
-    collectedModels: 'Model routes and token totals',
-    collectedNames: 'Built-in tool, command and catalog names',
-    collectedMilestones: 'Bucketed setup counts',
-    collectedReliability: 'Update results and timing, crashes, startup and reply speed, messaging-platform health',
-    collectedUsage:
-      'How Hermes gets used: agent accuracy and efficiency (edit matches, loops, recoveries, tokens and tool calls per task, cache breaks), active time per surface and Desktop mode, which app areas, actions and settings are used, closed quickly or switched off, and provider setup outcomes',
-    collectedMachine:
-      'Coarse machine facts: RAM range, GPU type, Hermes version age and release channel, updates behind, whether a local model server is used',
-    installId:
-      'Sending uploads each daily package to the Nous telemetry service. Packages carry this profile’s install ID: a stable random UUID with no personal information, reset by deleting the shared-metrics directory.',
-    consentWindow:
-      'Only packages whose entire collection period falls inside a recorded consent window are ever sent — data from before you opt in, or from any gap while sending was off, stays on this machine. Sending can be turned off again at any time.',
-    readDocs: 'Read the full details',
-    share: 'Collect and send to Nous',
-    local: 'Collect locally only',
-    off: 'No thanks',
-    changeLater: 'You can change this any time in Settings → Safety.',
-    saveFailed: 'Couldn’t save your choice',
-    collectLabel: 'Collect usage stats',
-    collectDesc: 'Bounded counters kept on this device. Never prompts, files, paths or error text.',
-    sendLabel: 'Send usage stats to Nous',
-    sendDesc:
-      'Upload each daily package to the Nous telemetry service. Only data from inside a consent window is sent. Needs collection on.',
-    unavailable: 'Update the Hermes backend to change this setting.',
-    stripBody: 'Bounded counters only, never prompts or files.',
-    stripChoices: { share: 'Send to Nous', local: 'Local only', off: 'No thanks' },
-    stripDetails: 'Details'
-  },
+  sharedMetrics: enSharedMetrics,
   // English editorial copy stays in the shipped JSONL; other locales override it.
   intro: { stock: {}, custom: () => [] },
   connectors: {
@@ -1798,6 +1766,8 @@ export const en: Translations = {
       change: 'Change',
       autoUseMain: 'auto · use main model',
       inheritMainEffort: 'inherit · main model effort',
+      inheritsFrom: task => `inherits ${task}`,
+      followTask: task => `Follow ${task}`,
       providerDefault: '(provider default)',
       fallbackAdd: 'Add fallback',
       fallbackEmpty: 'No fallback models — the default model is used unless it fails.',
@@ -1809,19 +1779,7 @@ export const en: Translations = {
       moaAggregator: 'Aggregator',
       moaAggregatorBilled: 'acting model · billed for the run',
       moaReferenceHint: 'advises once per turn by default',
-      tasks: {
-        vision: { label: 'Vision', hint: 'Image analysis' },
-        compression: { label: 'Compression', hint: 'Context compaction' },
-        skills_hub: { label: 'Skills hub', hint: 'Skill search' },
-        approval: { label: 'Approval', hint: 'Smart auto-approve' },
-        mcp: { label: 'MCP', hint: 'MCP tool routing' },
-        title_generation: { label: 'Title gen', hint: 'Session titles' },
-        review: { label: 'Review', hint: '/review reviewer subagent' },
-        triage_specifier: { label: 'Triage specifier', hint: 'Kanban spec fleshing' },
-        kanban_decomposer: { label: 'Kanban decomposer', hint: 'Task decomposition' },
-        profile_describer: { label: 'Profile describer', hint: 'Auto profile descriptions' },
-        curator: { label: 'Curator', hint: 'Skill-usage review' }
-      }
+      tasks: enAuxTasks
     },
     localModels: {
       connectionChanged: 'Local models connection changed',
@@ -4274,10 +4232,10 @@ export const en: Translations = {
       restarting: 'Backend restarting to load the update…',
       notAvailable: 'Update not available for this backend.',
       failed: 'Backend update failed.',
-      noReturn: 'Backend didn’t come back online. The update may not have completed — check the backend host.'
+      noReturn: 'Backend didn’t come back online. The update may not have completed — check the backend host.',
+      owed: steps => `Backend updated, but still owed: ${steps}. Re-run \`hermes update\` to finish them.`
     },
-    // Update-status overlay + version-details (mechanism-aware update UI).
-    appName: 'Hermes',
+    appName: 'Hermes', // Update-status overlay + version-details (mechanism-aware update UI).
     version: (value: string) => `Version ${value}`,
     versionUnavailable: 'Version unavailable',
     checkNow: 'Check now',

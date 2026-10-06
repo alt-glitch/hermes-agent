@@ -1,46 +1,13 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
+import { deAuxTasks } from './de_aux_tasks'
 import { deModelMenu } from './de_model_menu'
+import { deSharedMetrics } from './de_shared_metrics'
 import { defineLocale, type TranslationOverrides } from './define-locale'
 import { introDe } from './intro-de'
 
 export const deOverrides = {
-  sharedMetrics: {
-    consentTitle: 'Hermes verbessern helfen?',
-    consentBody:
-      'Geteilte Metriken enthalten nur begrenzte Zähler. Niemals Prompts, Dateien, Pfade oder Fehlertexte. Die Erfassung bleibt lokal. Das Senden an Nous ist eine separate Zustimmung.',
-    whatIsCollected: 'Was erfasst wird',
-    collectedIntro: 'Nur begrenzte Zähler:',
-    collectedActivity: 'Aktivität, Session-Länge, Ergebnisse und Fehlerklassen',
-    collectedModels: 'Modellrouten und Token-Summen',
-    collectedNames: 'Namen integrierter Tools, Befehle und Katalogeinträge',
-    collectedMilestones: 'Gruppierte Einrichtungszahlen',
-    collectedReliability:
-      'Update-Ergebnisse und -Dauer, Abstürze, Start- und Antwortzeiten, Zustand der Messaging-Plattformen',
-    collectedUsage:
-      'Wie Hermes genutzt wird: Genauigkeit und Effizienz des Agenten (Treffer bei Bearbeitungen, Schleifen, Erholung nach Fehlern, Tokens und Tool-Aufrufe pro Aufgabe, Cache-Brüche), aktive Zeit pro Oberfläche und Desktop-Modus, welche App-Bereiche, Aktionen und Einstellungen genutzt, schnell geschlossen oder abgeschaltet werden, sowie Ergebnisse der Anbietereinrichtung',
-    collectedMachine:
-      'Grobe Gerätedaten: RAM-Bereich, GPU-Typ, Alter und Kanal der Hermes-Version, Anzahl ausstehender Updates, ob ein lokaler Modellserver genutzt wird',
-    installId:
-      'Beim Senden wird jedes Tagespaket an den Nous-Telemetriedienst hochgeladen. Pakete tragen die Installations-ID dieses Profils: eine feste zufällige UUID ohne persönliche Daten, zurückgesetzt durch Löschen des Shared-Metrics-Ordners.',
-    consentWindow:
-      'Gesendet werden nur Pakete, deren gesamter Erfassungszeitraum in ein erfasstes Zustimmungsfenster fällt – Daten von vor Ihrer Zustimmung oder aus Lücken, in denen das Senden aus war, bleiben auf diesem Rechner. Das Senden lässt sich jederzeit wieder abschalten.',
-    readDocs: 'Alle Details lesen',
-    share: 'Erfassen und an Nous senden',
-    local: 'Nur lokal erfassen',
-    off: 'Nein, danke',
-    changeLater: 'Sie können das jederzeit unter Einstellungen → Sicherheit ändern.',
-    saveFailed: 'Ihre Auswahl konnte nicht gespeichert werden',
-    collectLabel: 'Nutzungsstatistiken erfassen',
-    collectDesc: 'Begrenzte Zähler auf diesem Gerät. Niemals Prompts, Dateien, Pfade oder Fehlertexte.',
-    sendLabel: 'Nutzungsstatistiken an Nous senden',
-    sendDesc:
-      'Jedes Tagespaket an den Nous-Telemetriedienst hochladen. Nur Daten aus einem Zustimmungsfenster werden gesendet. Erfordert aktive Erfassung.',
-    unavailable: 'Aktualisieren Sie das Hermes-Backend, um diese Einstellung zu ändern.',
-    stripBody: 'Nur begrenzte Zähler, niemals Prompts oder Dateien.',
-    stripChoices: { share: 'An Nous senden', local: 'Nur lokal', off: 'Nein danke' },
-    stripDetails: 'Details'
-  },
+  sharedMetrics: deSharedMetrics,
   intro: introDe,
   connectors: {
     title: 'Verbinden Sie Ihre Apps',
@@ -2125,6 +2092,8 @@ export const deOverrides = {
       change: 'Ändern',
       autoUseMain: 'automatisch · Hauptmodell verwenden',
       inheritMainEffort: 'übernehmen · Aufwand des Hauptmodells',
+      inheritsFrom: task => `erbt von ${task}`,
+      followTask: task => `${task} folgen`,
       providerDefault: '(Anbietervorgabe)',
       fallbackAdd: 'Fallback hinzufügen',
       fallbackEmpty: 'Keine Fallback-Modelle — es wird das Standardmodell verwendet, außer es schlägt fehl.',
@@ -2137,52 +2106,7 @@ export const deOverrides = {
       moaAggregator: 'Aggregator',
       moaAggregatorBilled: 'handelndes Modell · wird für den Lauf berechnet',
       moaReferenceHint: 'berät standardmäßig einmal pro Turn',
-      tasks: {
-        vision: {
-          label: 'Sehen',
-          hint: 'Bildanalyse'
-        },
-        compression: {
-          label: 'Kompression',
-          hint: 'Kontext-Verdichtung'
-        },
-        skills_hub: {
-          label: 'Skills-Hub',
-          hint: 'Skill-Suche'
-        },
-        approval: {
-          label: 'Freigabe',
-          hint: 'Intelligente Auto-Freigabe'
-        },
-        mcp: {
-          label: 'MCP',
-          hint: 'MCP-Tool-Routing'
-        },
-        title_generation: {
-          label: 'Titel-Generierung',
-          hint: 'Session-Titel'
-        },
-        review: {
-          label: 'Review',
-          hint: '/review Bewertungs-Subagent'
-        },
-        triage_specifier: {
-          label: 'Triage-Spezifizierer',
-          hint: 'Kanban-Spezifikation ausarbeiten'
-        },
-        kanban_decomposer: {
-          label: 'Kanban-Zerleger',
-          hint: 'Aufgaben zerlegen'
-        },
-        profile_describer: {
-          label: 'Profil-Beschreiber',
-          hint: 'Automatische Profilbeschreibungen'
-        },
-        curator: {
-          label: 'Kurator',
-          hint: 'Skill-Nutzungs-Review'
-        }
-      }
+      tasks: deAuxTasks
     },
     localModels: {
       connectionChanged: 'Verbindung für lokale Modelle geändert',

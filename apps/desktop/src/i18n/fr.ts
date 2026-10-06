@@ -1,47 +1,13 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale, type TranslationOverrides } from './define-locale'
+import { frAuxTasks } from './fr_aux_tasks'
 import { frModelMenu } from './fr_model_menu'
+import { frSharedMetrics } from './fr_shared_metrics'
 import { introFr } from './intro-fr'
 
 export const frOverrides = {
-  sharedMetrics: {
-    consentTitle: 'Aider à améliorer Hermes ?',
-    consentBody:
-      'Les métriques partagées ne contiennent que des compteurs bornés. Jamais de prompts, fichiers, chemins ni textes d’erreur. La collecte reste locale. Les envoyer à Nous est un consentement distinct.',
-    whatIsCollected: 'Ce qui est collecté',
-    collectedIntro: 'Uniquement des compteurs bornés :',
-    collectedActivity: 'Activité, durée des sessions, résultats et classes d’erreur',
-    collectedModels: 'Routes de modèles et totaux de tokens',
-    collectedNames: 'Noms des outils, commandes et éléments du catalogue intégrés',
-    collectedMilestones: 'Comptes de configuration regroupés',
-    collectedReliability:
-      'Résultats et durée des mises à jour, plantages, vitesse de démarrage et de réponse, état des plateformes de messagerie',
-    collectedUsage:
-      "Comment Hermes est utilisé : précision et efficacité de l'agent (modifications réussies, boucles, reprises après erreur, jetons et appels d'outils par tâche, ruptures de cache), temps actif par interface et mode Desktop, zones, actions et réglages de l'app utilisés, vite fermés ou désactivés, et résultats de la configuration des fournisseurs",
-    collectedMachine:
-      "Données générales de la machine : plage de RAM, type de GPU, âge et canal de la version de Hermes, mises à jour en retard, utilisation d'un serveur de modèles local",
-    installId:
-      'L’envoi transmet chaque paquet quotidien au service de télémétrie de Nous. Les paquets portent l’identifiant d’installation de ce profil : un UUID aléatoire stable sans information personnelle, réinitialisé en supprimant le dossier des métriques partagées.',
-    consentWindow:
-      'Seuls les paquets dont toute la période de collecte tombe dans une fenêtre de consentement enregistrée sont envoyés — les données d’avant votre accord, ou de toute période où l’envoi était désactivé, restent sur cette machine. L’envoi peut être désactivé à tout moment.',
-    readDocs: 'Lire tous les détails',
-    share: 'Collecter et envoyer à Nous',
-    local: 'Collecter en local uniquement',
-    off: 'Non merci',
-    changeLater: 'Vous pouvez changer cela à tout moment dans Réglages → Sécurité.',
-    saveFailed: 'Impossible d’enregistrer votre choix',
-    collectLabel: 'Collecter les statistiques d’utilisation',
-    collectDesc:
-      'Compteurs bornés conservés sur cet appareil. Jamais de prompts, fichiers, chemins ni textes d’erreur.',
-    sendLabel: 'Envoyer les statistiques d’utilisation à Nous',
-    sendDesc:
-      'Envoyer chaque paquet quotidien au service de télémétrie de Nous. Seules les données d’une fenêtre de consentement sont envoyées. Nécessite la collecte activée.',
-    unavailable: 'Mettez à jour le backend Hermes pour modifier ce réglage.',
-    stripBody: 'Uniquement des compteurs bornés, jamais de prompts ni de fichiers.',
-    stripChoices: { share: 'Envoyer à Nous', local: 'Local uniquement', off: 'Non merci' },
-    stripDetails: 'Détails'
-  },
+  sharedMetrics: frSharedMetrics,
   intro: introFr,
   connectors: {
     title: 'Connectez vos applications',
@@ -2022,7 +1988,7 @@ export const frOverrides = {
       sshErrTimeout: "Expiration de la connexion SSH. L'hôte peut être inaccessible ou en veille.",
       sshErrUpdateRequired: "Mettez à jour Hermes sur l'hôte distant avant de vous connecter avec Desktop SSH.",
       sshErrInteractiveAuth:
-        "Tailscale SSH exige une vérification interactive dans le navigateur. Exécutez `ssh <host> true` dans le terminal, terminez la vérification, puis réessayez — Hermes exécute SSH de façon non interactive.",
+        'Tailscale SSH exige une vérification interactive dans le navigateur. Exécutez `ssh <host> true` dans le terminal, terminez la vérification, puis réessayez — Hermes exécute SSH de façon non interactive.',
       sshErrUnknown: 'Échec de la connexion SSH.'
     },
     keys: {
@@ -2131,6 +2097,8 @@ export const frOverrides = {
       change: 'Modifier',
       autoUseMain: 'auto · utiliser le modèle principal',
       inheritMainEffort: 'hériter · effort du modèle principal',
+      inheritsFrom: task => `hérite de ${task}`,
+      followTask: task => `Suivre ${task}`,
       providerDefault: '(par défaut du fournisseur)',
       fallbackAdd: 'Ajouter un secours',
       fallbackEmpty: "Aucun modèle de secours — le modèle par défaut est utilisé sauf en cas d'échec.",
@@ -2143,52 +2111,7 @@ export const frOverrides = {
       moaAggregator: 'Agrégateur',
       moaAggregatorBilled: "modèle actif · facturé pour l'exécution",
       moaReferenceHint: 'donne un avis une fois par tour par défaut',
-      tasks: {
-        vision: {
-          label: 'Vision',
-          hint: "Analyse d'image"
-        },
-        compression: {
-          label: 'Compression',
-          hint: 'Compaction de contexte'
-        },
-        skills_hub: {
-          label: 'Hub de skills',
-          hint: 'Recherche de skills'
-        },
-        approval: {
-          label: 'Approbation',
-          hint: 'Auto-approbation intelligente'
-        },
-        mcp: {
-          label: 'MCP',
-          hint: "Routage d'outils MCP"
-        },
-        title_generation: {
-          label: 'Génération de titre',
-          hint: 'Titres de session'
-        },
-        review: {
-          label: 'Révision',
-          hint: 'Sous-agent de révision /review'
-        },
-        triage_specifier: {
-          label: 'Précision du triage',
-          hint: 'Détail des spécifications Kanban'
-        },
-        kanban_decomposer: {
-          label: 'Décomposition Kanban',
-          hint: 'Décomposition des tâches'
-        },
-        profile_describer: {
-          label: 'Description de profil',
-          hint: 'Descriptions automatiques des profils'
-        },
-        curator: {
-          label: 'Curateur',
-          hint: "Revue d'utilisation des skills"
-        }
-      }
+      tasks: frAuxTasks
     },
     localModels: {
       connectionChanged: 'La connexion des modèles locaux a changé',

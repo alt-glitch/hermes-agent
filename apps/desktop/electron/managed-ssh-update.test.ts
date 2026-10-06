@@ -508,6 +508,106 @@ test.runIf(process.platform !== 'win32')(
 )
 
 test.runIf(process.platform !== 'win32')(
+  'a committed update that still owes a step stays a success but names the owed step',
+  async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-owed-'))
+
+    const run = async (
+      followups: unknown[],
+      { exitCode = 0, outcome = 'success', restoreFails = false, userAction = null as unknown } = {}
+    ) => {
+      const receipts = path.join(home, 'logs', 'update_receipts')
+      await mkdir(receipts, { recursive: true })
+      await writeFile(path.join(home, `.update_exit_code.${CORRELATION}`), String(exitCode))
+      await writeFile(
+        path.join(receipts, 'update_x.json'),
+        JSON.stringify({
+          correlation_id: CORRELATION,
+          outcome,
+          started_at: '2026-08-23T00:00:00Z',
+          finished_at: '2026-08-23T00:01:00Z',
+          followups,
+          user_action: userAction
+        })
+      )
+
+      const command = buildRemoteUpdateObservationCommand(
+        { ssh: { exec: async () => '' }, platform: 'Linux', hermesPath: '/opt/hermes/hermes', hermesHome: home },
+        CORRELATION
+      )
+
+      const observed = parseRemoteUpdateObservation((await exec(command, { shell: 'sh' })).stdout, CORRELATION)
+
+      return runManagedSshUpdate({
+        connectionId: 'home',
+        correlationId: CORRELATION,
+        scopes: [{ key: 'conn:home::default', profile: 'default' }],
+        preflightRemote: async () => {},
+        drainScope: async () => {},
+        updateRemote: async () => ({ exitCode: observed.exitCode!, receipt: observed.receipt! }),
+        awaitRestoreClearance: async () => {},
+        closeTransports: async () => {},
+        restoreScope: async () => {
+          if (restoreFails) {
+            throw new Error('restore refused')
+          }
+        },
+        releaseGate: () => {}
+      })
+    }
+
+    try {
+      const owed = await run([{ step: 'dependencies', reason: 'sync failed', at: '2026-08-23T00:01:00Z' }])
+
+      assert.equal(owed.ok, true)
+      assert.equal(owed.updateOk, true)
+      assert.equal(owed.restoreOk, true)
+      assert.deepEqual(owed.owed, [{ step: 'dependencies', reason: 'sync failed' }])
+      assert.match(owed.message || '', /still owed: dependencies \(sync failed\)/)
+      assert.match(owed.message || '', /hermes update/)
+      assert.match(managedSshUpdateAllRow({ id: 'home' }, owed).detail || '', /dependencies/)
+
+      const clean = await run([])
+
+      assert.equal(clean.ok, true)
+      assert.equal(clean.owed, undefined)
+      assert.equal(clean.message, 'Remote Hermes updated and every managed SSH profile is ready.')
+
+      // The debt survives a failed restoration: update and restore verdicts stay independent.
+      const unrestored = await run([{ step: 'dependencies', reason: 'sync failed' }], { restoreFails: true })
+
+      assert.equal(unrestored.updateOk, true)
+      assert.equal(unrestored.restoreOk, false)
+      assert.deepEqual(unrestored.owed, [{ step: 'dependencies', reason: 'sync failed' }])
+      assert.match(
+        managedSshUpdateAllRow({ id: 'home' }, unrestored).detail || '',
+        /still owed: dependencies \(sync failed\)/
+      )
+
+      // record_user_action turns a success into partial/exit 1: its exact manual instruction is shown,
+      // and the rerun advice is never offered for a parked stash.
+      const instruction = 'Run `git stash apply stash@{0}` in /opt/hermes to restore your local changes.'
+
+      const partial = await run([], {
+        exitCode: 1,
+        outcome: 'partial',
+        userAction: { step: 'local_changes', reason: instruction }
+      })
+
+      assert.equal(partial.updateOk, false)
+      assert.equal(partial.restoreOk, true)
+      assert.deepEqual(partial.owed, [{ step: 'local_changes', reason: instruction }])
+      const detail = managedSshUpdateAllRow({ id: 'home' }, partial).detail || ''
+      assert.ok(detail.includes(instruction), detail)
+      assert.match(detail, /local_changes/)
+      assert.doesNotMatch(detail, /Re-run `hermes update`/)
+    } finally {
+      await rm(home, { force: true, recursive: true })
+    }
+  }
+)
+
+test.runIf(process.platform !== 'win32')(
   'managed observer unwraps a named profile home for the install-wide marker',
   async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-profile-marker-'))
@@ -532,6 +632,53 @@ test.runIf(process.platform !== 'win32')(
 
       assert.equal(parsed.marker, 'live')
       assert.equal(parsed.markerPid, process.pid)
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  }
+)
+
+test.runIf(process.platform !== 'win32')(
+  'managed observer reads a named profile update receipt from the root home the CLI writes',
+  async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-profile-receipt-'))
+    const profileHome = path.join(root, 'profiles', 'research')
+
+    const receipt = (outcome: string) =>
+      JSON.stringify({
+        correlation_id: CORRELATION,
+        outcome,
+        started_at: '2026-08-23T00:00:00Z',
+        finished_at: '2026-08-23T00:01:00Z'
+      })
+
+    try {
+      // The CLI's receipt store is install-wide; a stale copy under the profile is not its source.
+      await mkdir(path.join(root, 'logs', 'update_receipts'), { recursive: true })
+      await mkdir(path.join(profileHome, 'logs', 'update_receipts'), { recursive: true })
+      await writeFile(path.join(profileHome, `.update_exit_code.${CORRELATION}`), '0')
+      await writeFile(path.join(root, 'logs', 'update_receipts', `update_${CORRELATION}.json`), receipt('success'))
+      await writeFile(
+        path.join(profileHome, 'logs', 'update_receipts', `update_${CORRELATION}.json`),
+        receipt('failed')
+      )
+
+      const command = buildRemoteUpdateObservationCommand(
+        {
+          ssh: { exec: async () => '' },
+          platform: 'Linux',
+          hermesPath: '/opt/hermes/hermes',
+          hermesHome: profileHome
+        },
+        CORRELATION
+      )
+
+      const { stdout } = await exec(command, { shell: 'sh' })
+      const parsed = parseRemoteUpdateObservation(stdout, CORRELATION)
+
+      assert.equal(parsed.exitCode, 0)
+      assert.equal(parsed.receipt?.correlationId, CORRELATION)
+      assert.equal(parsed.receipt?.outcome, 'success')
     } finally {
       await rm(root, { force: true, recursive: true })
     }

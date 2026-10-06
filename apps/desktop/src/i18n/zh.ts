@@ -2,7 +2,9 @@ import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale } from './define-locale'
 import { introZh } from './intro-zh'
+import { zhAuxTasks } from './zh_aux_tasks'
 import { zhModelMenu } from './zh_model_menu'
+import { zhSharedMetrics } from './zh_shared_metrics'
 
 export const zh = defineLocale({
   externalOpenFailed: {
@@ -11,40 +13,7 @@ export const zh = defineLocale({
     copyUrl: '复制链接',
     close: '关闭'
   },
-  sharedMetrics: {
-    consentTitle: '帮助改进 Hermes？',
-    consentBody:
-      '共享指标只包含有上限的计数，绝不包含提示词、文件、路径或错误文本。收集仅在本地进行；发送给 Nous 需要另行同意。',
-    whatIsCollected: '收集哪些内容',
-    collectedIntro: '仅限有上限的计数：',
-    collectedActivity: '活动、会话时长、结果和错误类别',
-    collectedModels: '模型路由和 token 总量',
-    collectedNames: '内置工具、命令和目录项名称',
-    collectedMilestones: '分桶的设置计数',
-    collectedReliability: '更新结果与耗时、崩溃、启动与回复速度、消息平台状态',
-    collectedUsage:
-      'Hermes 的使用方式：代理的准确度与效率（编辑是否成功、循环、错误后的恢复、每个任务的 token 与工具调用数、缓存中断），各界面与 Desktop 模式的活跃时间，哪些应用区域、操作与设置被使用、很快关闭或被关闭，以及提供商设置的结果',
-    collectedMachine:
-      '概略的机器信息：内存范围、GPU 类型、Hermes 版本新旧与发布通道、落后的更新数、是否使用本地模型服务器',
-    installId:
-      '发送会把每日数据包上传到 Nous 遥测服务。数据包带有此配置文件的安装 ID：一个不含个人信息的固定随机 UUID，删除共享指标目录即可重置。',
-    consentWindow:
-      '只有整个收集周期都落在已记录同意时段内的数据包才会被发送——你同意之前的数据，或发送关闭期间的数据，都会留在本机。你可以随时再次关闭发送。',
-    readDocs: '查看完整说明',
-    share: '收集并发送给 Nous',
-    local: '仅在本地收集',
-    off: '不用了',
-    changeLater: '你可以随时在 设置 → 安全 中更改。',
-    saveFailed: '无法保存你的选择',
-    collectLabel: '收集使用统计',
-    collectDesc: '在此设备上保存有上限的计数。绝不包含提示词、文件、路径或错误文本。',
-    sendLabel: '向 Nous 发送使用统计',
-    sendDesc: '将每日数据包上传到 Nous 遥测服务。只发送同意时段内的数据。需要先开启收集。',
-    unavailable: '请更新 Hermes 后端以更改此设置。',
-    stripBody: '仅限有界计数器，绝不包含提示词或文件。',
-    stripChoices: { share: '发送给 Nous', local: '仅本地', off: '不用了' },
-    stripDetails: '详情'
-  },
+  sharedMetrics: zhSharedMetrics,
   intro: introZh,
   connectors: {
     title: '连接你的应用',
@@ -1725,6 +1694,8 @@ export const zh = defineLocale({
       change: '更改',
       autoUseMain: '自动 · 使用主模型',
       inheritMainEffort: '继承 · 主模型推理强度',
+      inheritsFrom: task => `继承 ${task}`,
+      followTask: task => `跟随 ${task}`,
       providerDefault: '(提供方默认)',
       fallbackAdd: '添加备用模型',
       fallbackEmpty: '未配置备用模型 — 默认模型失败时才会使用备用模型。',
@@ -1736,19 +1707,7 @@ export const zh = defineLocale({
       moaAggregator: '聚合模型',
       moaAggregatorBilled: '执行模型 · 整个运行在此计费',
       moaReferenceHint: '默认每轮仅建议一次',
-      tasks: {
-        vision: { label: '视觉', hint: '图片分析' },
-        compression: { label: '压缩', hint: '上下文压缩' },
-        skills_hub: { label: '技能中心', hint: '技能搜索' },
-        approval: { label: '审批', hint: '智能自动批准' },
-        mcp: { label: 'MCP', hint: 'MCP 工具路由' },
-        title_generation: { label: '标题生成', hint: '会话标题' },
-        review: { label: '评审', hint: '/review 评审子智能体' },
-        triage_specifier: { label: '分类指定', hint: '看板任务规格补全' },
-        kanban_decomposer: { label: '看板分解', hint: '任务拆解' },
-        profile_describer: { label: '配置描述', hint: '自动生成配置描述' },
-        curator: { label: '维护器', hint: '技能使用审查' }
-      }
+      tasks: zhAuxTasks
     },
     localModels: {
       connectionChanged: '本地模型连接已更改',

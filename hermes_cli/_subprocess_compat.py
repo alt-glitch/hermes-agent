@@ -220,6 +220,26 @@ def windows_hide_flags() -> int:
     return _CREATE_NO_WINDOW if IS_WINDOWS else 0
 
 
+
+def no_prompt_git_kwargs() -> dict:
+    """``subprocess.run`` kwargs for the updater's network git calls.
+
+    GitHub answers anonymous fetches with HTTP 401 during outages (and for
+    unreachable repos); git then prompts ``Username for 'https://github.com':``
+    on the inherited terminal and the update sits there forever. Disable the
+    prompt so the fetch fails fast into ``_classify_fetch_failure``. Only the
+    *prompt* is disabled — a configured credential helper / askpass still
+    runs, so a private-fork origin keeps authenticating non-interactively.
+    Lives here, dependency-free, because the update hand-off's bootstrap
+    interpreter runs the treeless conversion before any dependency exists.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "Never"
+    # Every network git spawn (fetch/pull/shallow heal) runs under a console-less
+    # desktop backend on Windows; hide the per-spawn console (#117781).
+    return {"stdin": subprocess.DEVNULL, "env": env, "creationflags": windows_hide_flags()}
+
 def suppress_platform_ver_console() -> None:
     """Stub ``platform._syscmd_ver`` on Windows so it never flashes a console. No-op elsewhere.
 
@@ -778,10 +798,12 @@ def bounded_probe_run(
     argv: Sequence[str], *, timeout: float, errors: str = "replace",
     env: "Mapping[str, str] | None" = None, cwd: "str | os.PathLike[str] | None" = None,
     raise_on_spawn_failure: bool = False, input: "str | None" = None,
+    popen_kwargs: "Mapping[str, object] | None" = None,
 ) -> "subprocess.CompletedProcess[str] | None":
     """Deadlock-safe ``subprocess.run(argv, capture_output=True, timeout=…)`` for fail-open probes.
 
     ``input`` is written to the child's stdin (closed afterwards); without it stdin is ``DEVNULL``.
+    ``popen_kwargs`` adds Popen arguments (the update's custody: ``pass_fds``/``preexec_fn``).
 
     Returns a ``CompletedProcess`` when the child finished within *timeout* (any exit code), or
     ``None`` on spawn failure or timeout. With ``raise_on_spawn_failure=True`` the ``Popen``
@@ -796,6 +818,7 @@ def bounded_probe_run(
     machines (#87134); the git probes hit it first (#68609 / #66037).
     """
     _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
+    _popen_kwargs.update(popen_kwargs or {})
     job = None
     try:
         # Windows: contain the probe in a Job Object. `taskkill /T` walks LIVE parent pids, and a
