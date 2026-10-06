@@ -29,10 +29,17 @@ def test_openrouter_explicit_transport_across_credentials(
     monkeypatch.setattr(rp, "load_config", lambda: {"model": model_config})
     # Credential reads go through the canonical agent.secret_scope.get_secret_str, imported by name into
     # runtime_provider_backends (upstream dd1baee0e43 removed the rp._getenv shim this test used to patch).
+    # The OpenRouter fallback key itself is read via get_env_value_prefer_dotenv since b6e8e657cf
+    # (.env beats an exhausted pool entry) — patch both readers.
     from hermes_cli import runtime_provider_backends as rpb
+    import hermes_cli.config as hermes_config
 
     monkeypatch.setattr(
         rpb, "get_secret_str", lambda name, default="": "environment-key" if name == "OPENROUTER_API_KEY" else default
+    )
+    monkeypatch.setattr(
+        hermes_config, "get_env_value_prefer_dotenv",
+        lambda key: "environment-key" if key == "OPENROUTER_API_KEY" else None,
     )
     entry = SimpleNamespace(
         access_token="pool-key", source="manual", base_url=rp.OPENROUTER_BASE_URL

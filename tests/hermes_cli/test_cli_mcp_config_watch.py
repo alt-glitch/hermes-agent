@@ -218,6 +218,7 @@ def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
     """#111105: cp -p / rsync -t style replacement (same mtime, same size) must still reload."""
     import os
     import shutil
+    import time
 
     obj, cfg_file = _make_cli(tmp_path, mcp_servers={"bb": {"command": "b"}})
     cfg_file.write_text("mcp_servers:\n  bb: {command: b}\n")
@@ -225,6 +226,10 @@ def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
     other = tmp_path / "other.yaml"
     other.write_text("mcp_servers:\n  aa: {command: a}\n")
     shutil.copy2(other, cfg_file)
+    # The signature's ctime is what catches this rewrite; kernel timestamps tick at
+    # jiffy granularity (4 ms at HZ=250), so crossing a tick must be guaranteed,
+    # not raced — without the wait the utime can land in the sig's own tick.
+    time.sleep(0.01)
     os.utime(cfg_file, ns=(obj._config_sig[0], obj._config_sig[0]))
 
     with patch("hermes_cli.config.get_config_path", return_value=cfg_file):

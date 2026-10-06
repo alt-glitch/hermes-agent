@@ -1,5 +1,6 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
+import { deModelMenu } from './de_model_menu'
 import { defineLocale, type TranslationOverrides } from './define-locale'
 import { introDe } from './intro-de'
 
@@ -868,6 +869,14 @@ export const deOverrides = {
     resetConfirm: 'Alle Einstellungen auf Hermes-Standard zurücksetzen?',
     exportFailed: 'Export fehlgeschlagen',
     resetFailed: 'Zurücksetzen fehlgeschlagen',
+    pluginPages: {
+      blurb: 'Optionen installierter Plugins. Jedes Plugin hat eine eigene Seite, manche mit Unterseiten.',
+      empty: 'Noch kein Plugin hat Einstellungen.',
+      manage: 'Plugins verwalten',
+      agentSettings: 'Agent-Einstellungen',
+      pageCount: (n: number) => (n === 1 ? '1 Seite' : `${n} Seiten`),
+      missing: 'Dieses Plugin hat keine Einstellungsseite. Es ist eventuell deaktiviert oder deinstalliert.'
+    },
     nav: {
       providers: 'Anbieter',
       providerAccounts: 'Konten',
@@ -889,23 +898,15 @@ export const deOverrides = {
     },
     plugins: {
       title: 'Desktop-Plugins',
-      blurb: 'Gebündelt oder im Ordner „Desktop-Plugins“ abgelegt. Deaktivieren, um live zu entladen.',
-      count: n => `${n} installiert`,
       openFolder: 'Ordner für Desktop-Plugins öffnen',
       rescan: 'Erneut scannen',
       reveal: 'Im Dateimanager anzeigen',
-      enable: 'Aktivieren',
-      disable: 'Deaktivieren',
       failed: 'fehlgeschlagen',
-      empty: 'Noch keine Desktop-Plugins installiert.',
       kinds: {
         bundled: 'gebündelt',
         disk: 'auf Datenträger',
         runtime: 'Laufzeit'
       },
-      agentHalfMissing: 'Agent-Hälfte fehlt hier',
-      agentHalfMissingTip:
-        'Das ist die Desktop-Hälfte eines gebündelten Plugins, aber seine Agent-Hälfte ist auf dem aktuell verbundenen Backend/Profil nicht installiert. Installieren Sie sie unter Fähigkeiten → Plugins.',
       installModal: {
         installFromGit: 'Von Git installieren',
         reviewRepository: 'Repository prüfen',
@@ -2015,6 +2016,8 @@ export const deOverrides = {
         'Nicht unterstützte Remote-Plattform. Der Desktop-SSH-Modus von Hermes unterstützt Linux-, macOS- und Windows-Remote-Hosts.',
       sshErrTimeout: 'SSH-Verbindung ist ausgelaufen. Der Host ist möglicherweise nicht erreichbar oder schläft.',
       sshErrUpdateRequired: 'Aktualisieren Sie Hermes auf dem Remote-Host, bevor Sie sich mit Desktop-SSH verbinden.',
+      sshErrInteractiveAuth:
+        'Tailscale SSH erfordert eine interaktive Browser-Prüfung. Führen Sie im Terminal `ssh <host> true` aus, schließen Sie die Prüfung ab und versuchen Sie es erneut – Hermes führt SSH nicht interaktiv aus.',
       sshErrUnknown: 'SSH-Verbindung fehlgeschlagen.'
     },
     keys: {
@@ -2911,7 +2914,7 @@ export const deOverrides = {
         save: 'Einstellungen speichern',
         saved: (name: string) => `Einstellungen von ${name} gespeichert.`,
         saveFailed: (name: string) => `Einstellungen von ${name} konnten nicht gespeichert werden`,
-        optional: '(optional)',
+        required: 'Erforderlich',
         secretSet: '•••••••• (gesetzt)',
         secretStoredAs: (env: string) =>
           `Wird in der .env des Profils als ${env} gespeichert, nie in config.yaml; leer lassen, um den aktuellen Wert zu behalten.`
@@ -5049,22 +5052,7 @@ export const deOverrides = {
     windowControls: 'Fenster-Bedienelemente',
     paneControls: 'Panele-Bedienelemente',
     appControls: 'App-Bedienelemente',
-    modelMenu: {
-      search: 'Modelle durchsuchen',
-      noModels: 'Keine Modelle gefunden',
-      editModels: 'Modelle bearbeiten…',
-      followDefault: 'Standard aus den Einstellungen verwenden',
-      refreshModels: 'Modelle aktualisieren',
-      favorites: 'Favoriten',
-      addFavorite: 'Zu Favoriten hinzufügen',
-      removeFavorite: 'Aus Favoriten entfernen',
-      favoriteShortcut: '⇧ Klick',
-      fast: 'Schnell',
-      free: 'kostenlos',
-      cacheRead: 'Cache-Lesung',
-      priceTitle: (input: string, output: string, cache: string) =>
-        `Eingabe ${input}/Mtok · Ausgabe ${output}/Mtok` + (cache ? ` · Cache-Lesung ${cache}/Mtok` : '')
-    },
+    modelMenu: deModelMenu,
     modelOptions: {
       noOptions: 'Keine Optionen für dieses Modell',
       options: 'Optionen',
@@ -6027,9 +6015,6 @@ export const deOverrides = {
     sessionUnavailable: 'Session nicht verfügbar',
     createSessionFailed: 'Neue Session konnte nicht erstellt werden',
     promptFailed: 'Prompt fehlgeschlagen',
-    staleSessionTitle: 'Chat veraltet',
-    staleSessionBody:
-      'Dieses Fenster war hinter einer anderen Ansicht desselben Chats. Die neuesten Nachrichten wurden geladen. Senden Sie erneut, wenn Sie noch möchten.',
     providerCredentialRequired:
       'Fügen Sie Anmeldedaten für einen Anbieter hinzu, bevor Sie Ihre erste Nachricht senden.',
     emptySlashCommand: 'leerer Slash-Befehl',

@@ -190,7 +190,7 @@ hermes plugins enable <name>      # add to allow-list
 hermes plugins disable <name>     # remove from allow-list + add to disabled
 ```
 
-After `hermes plugins install owner/repo`, you're asked `Enable 'name' now? [y/N]` — defaults to no. Skip the prompt for scripted installs with `--enable` or `--no-enable`.
+After `hermes plugins install owner/repo`, you're asked `Enable 'name' now? [y/N]` — defaults to no. Skip the prompt for scripted installs with `--enable` or `--no-enable`. A memory provider (a plugin whose `__init__.py` registers a `MemoryProvider`) asks `Use 'name' as the memory provider now?` instead: yes (or `--enable`) sets `memory.provider`, which is the only switch that activates a provider; no leaves it for `hermes memory setup`.
 
 For a reproducible install, pin a full immutable commit (tags, branches, and
 abbreviated SHAs are not accepted):
@@ -327,7 +327,7 @@ Plugins can register the 27 lifecycle events currently accepted by `hermes_cli.p
 |---|---|
 | **Directive/control** | `pre_tool_call`, `pre_llm_call`, `pre_verify`, `pre_gateway_dispatch` |
 | **Transform** | `transform_tool_result`, `transform_terminal_output`, `transform_llm_output`, `pre_transcription` |
-| **Observer** | `post_tool_call`, `post_llm_call`, `pre_api_request`, `post_api_request`, `api_request_error`, `pre_auxiliary_call`, `post_auxiliary_call`, `on_stream_start`, `on_stream_delta`, `on_stream_end`, `on_interim_message`, `on_session_start`, `on_session_end`, `on_session_finalize`, `on_session_reset`, `agent_loop_stopped`, `on_skill_lifecycle`, `subagent_start`, `subagent_stop`, `pre_approval_request`, `post_approval_response`, `pre_command`, `kanban_task_claimed`, `kanban_task_completed`, `kanban_task_blocked` |
+| **Observer** | `post_tool_call`, `post_llm_call`, `pre_api_request`, `post_api_request`, `api_request_error`, `pre_auxiliary_call`, `post_auxiliary_call`, `on_stream_start`, `on_stream_delta`, `on_stream_end`, `on_interim_message`, `on_session_start`, `on_session_end`, `on_session_finalize`, `on_session_reset`, `agent_loop_stopped`, `on_skill_lifecycle`, `subagent_start`, `subagent_stop`, `pre_approval_request`, `post_approval_response`, `on_human_input_request`, `on_human_input_resolved`, `pre_command`, `kanban_task_claimed`, `kanban_task_completed`, `kanban_task_blocked` |
 
 These categories describe current behavior rather than defining future naming rules. Plugin middleware remains a separate registry/surface.
 ## Plugin types

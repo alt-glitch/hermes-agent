@@ -605,11 +605,14 @@ def _print_fetch_failure(c: Console, sources, identifier: str, meta=None, source
     rate_limited = any(getattr(src, "is_rate_limited", False)
                        or getattr(getattr(src, "github", None), "is_rate_limited", False)
                        for src in sources)
+    # Credentials GitHub refused with 401 (the fetch already fell through past them, #98725).
+    rejected = next((r for src in sources
+                     if isinstance(r := getattr(getattr(src, "auth", None), "rejected", None), list) and r), [])
     # Index hit but files gone: a stale index entry, not a user typo — name it so users stop
-    # re-trying spellings (#3259). Only when no adapter was rate limited: a throttled fetch
-    # also yields meta-without-bundle, and calling that "stale" would send users away from a
-    # skill that exists.
-    if meta is not None and not rate_limited:
+    # re-trying spellings (#3259). Only when no adapter was rate limited or refused a credential:
+    # those fetches also yield meta-without-bundle, and calling that "stale" would send users away
+    # from a skill that exists.
+    if meta is not None and not rate_limited and not rejected:
         src_id = getattr(source, "source_id", lambda: "the registry")()
         c.print(f"[bold red]Error:[/] '{identifier}' is listed in the {src_id} index, "
                 f"but its files no longer exist upstream.")
@@ -617,6 +620,9 @@ def _print_fetch_failure(c: Console, sources, identifier: str, meta=None, source
                 "its author. Try `hermes skills search` for an alternative.[/]\n")
         return
     c.print(f"[bold red]Error:[/] Could not download '{identifier}'.")
+    if rejected:
+        c.print(f"[yellow]Hint:[/] GitHub rejected {' and '.join(rejected)} (401 Bad credentials). "
+                f"Replace or remove the token in {display_hermes_home()}/.env, or re-run [bold]gh auth login[/].")
     if rate_limited:
         c.print("[yellow]Hint:[/] GitHub API rate limit exhausted "
                 "(unauthenticated: 60 requests/hour).\n"
