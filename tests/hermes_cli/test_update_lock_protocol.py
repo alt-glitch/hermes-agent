@@ -79,6 +79,7 @@ time.sleep(60)
 
 
 @posix_only
+@pytest.mark.live_system_guard_bypass  # SIGCONTs only its own reader child; without psutil the guard cannot prove that
 def test_a_stale_reclaim_never_deletes_a_claim_published_after_its_read(tmp_path):
     """R3: the reader judged a dead marker, then paused right at its unlink. A second real
     process claims meanwhile. Pre-A7 the resumed reader deleted that live claim; now the
@@ -98,6 +99,68 @@ def test_a_stale_reclaim_never_deletes_a_claim_published_after_its_read(tmp_path
         assert marker.read_text(encoding="utf-8").startswith(f"{claimant.pid}\n"), \
             "a stale reader deleted a live claim published after its read"
         assert marker_mutex_path(marker).exists(), "the sidecar is never deleted"
+    finally:
+        if reader.poll() is None:
+            os.kill(reader.pid, signal.SIGCONT)
+            reader.kill()
+        reader.wait()
+        if claimant is not None:
+            claimant.kill()
+            claimant.wait()
+
+
+_RECLAIM_PAUSED_READER = """
+import os, signal, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from hermes_cli import update_lock
+def trace(frame, event, arg):
+    if event == "call" and frame.f_code.co_name == "_reclaim_dead":
+        sys.settrace(None)
+        os.kill(os.getpid(), signal.SIGSTOP)   # stale snapshot taken; a scheduling pause, nothing replaced
+    return None
+sys.settrace(trace)
+print(update_lock.read_live_update(path=Path(sys.argv[2]), install_root=Path(sys.argv[3])) is not None, flush=True)
+"""
+
+_MARKER_ONLY_CLAIMANT = """
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from hermes_cli.update_lock import UpdateLock
+assert UpdateLock(path=Path(sys.argv[2]), install_root=Path(sys.argv[3]), checkout_first=False).acquire()
+Path(sys.argv[4]).touch()
+time.sleep(60)
+"""
+
+
+@posix_only
+@pytest.mark.live_system_guard_bypass  # SIGCONTs only its own reader child; without psutil the guard cannot prove that
+def test_a_reader_reports_the_live_claim_that_replaced_its_stale_snapshot(tmp_path):
+    """F2: the reader read a dead marker and paused before the locked recheck; a real marker-only
+    claimant (no checkout lease, as the launch hand-off does) replaced it meanwhile. The recheck
+    kept the replacement but the reader still answered "no update" — a skew-retirement vote."""
+    home, install = tmp_path / "home", tmp_path / "install"
+    home.mkdir()
+    install.mkdir()
+    marker = home / ".hermes-update-in-progress"
+    _dead_marker(marker)
+    reader = _python(tmp_path, _RECLAIM_PAUSED_READER, marker, install, stdout=subprocess.PIPE, text=True)
+    claimant = None
+    try:
+        _pid, status = os.waitpid(reader.pid, os.WUNTRACED)
+        assert os.WIFSTOPPED(status)
+        claimant = _python(tmp_path, _MARKER_ONLY_CLAIMANT, marker, install, tmp_path / "claimed")
+        _wait_for(tmp_path / "claimed", claimant)
+        claim = marker.read_bytes()
+        os.kill(reader.pid, signal.SIGCONT)
+        out, _err = reader.communicate(timeout=30)
+        assert reader.returncode == 0
+        assert out.strip() == "True", "the reader reported a live replacement claim as no update"
+        assert marker.read_bytes() == claim, "the live replacement claim was not preserved byte-for-byte"
+        from hermes_cli.update_lock import checkout_lock_held
+        # update_in_progress() is this answer OR the checkout lease, which a marker-only claim lacks.
+        assert checkout_lock_held(install) is False, "the claim is marker-only: no checkout lease answers for it"
     finally:
         if reader.poll() is None:
             os.kill(reader.pid, signal.SIGCONT)
@@ -217,7 +280,7 @@ from hermes_cli.update_lock import UpdateLock
 from hermes_cli.update_cmd import _git_run
 root = Path(sys.argv[2])
 assert UpdateLock(path=root / "owner-marker", install_root=root).acquire()
-_git_run(["git"], ["commit", "-qm", "after"], cwd=root, check=True)
+_git_run(["git"], ["add", "tracked"], cwd=root, check=True)
 """
 
 
@@ -228,8 +291,9 @@ def _git(root: Path, *args: str) -> str:
 
 @posix_only
 def test_git_keeps_checkout_custody_after_its_updater_is_killed(tmp_path):
-    """R2: `_git_run`'s git (and the hook it runs) inherits the checkout lock. Pre-fix the
-    killed updater's lock fell free while its git still committed, and a contender acquired."""
+    """R2: `_git_run`'s git (and any program it runs) inherits the checkout lock. Pre-fix the
+    killed updater's lock fell free while its git still wrote the index, and a contender acquired.
+    A clean filter stalls git: repository hooks never run under the updater (F1)."""
     root = tmp_path / "checkout"
     root.mkdir()
     _git(root, "init", "-q")
@@ -238,22 +302,23 @@ def test_git_keeps_checkout_custody_after_its_updater_is_killed(tmp_path):
     (root / "tracked").write_text("before\n")
     _git(root, "add", "tracked")
     _git(root, "commit", "-qm", "before")
+    stall = tmp_path / "stall.py"
+    stall.write_text(f"import os, sys, time\nfrom pathlib import Path\nr = Path({str(tmp_path)!r})\n"
+                     "(r / 'stalled').write_text(str(os.getpid()))\n"
+                     "while not (r / 'go').exists(): time.sleep(0.02)\n"
+                     "sys.stdout.buffer.write(sys.stdin.buffer.read())\n")
+    _git(root, "config", "filter.stall.clean", f"'{sys.executable}' '{stall}'")
+    (root / ".git/info/attributes").write_text("tracked filter=stall\n")
     (root / "tracked").write_text("after\n")
-    _git(root, "add", "tracked")
-    hook = root / ".git/hooks/pre-commit"
-    hook.write_text(f"#!{sys.executable}\nimport os, time\nfrom pathlib import Path\nr = Path({str(tmp_path)!r})\n"
-                    "(r / 'hook').write_text(str(os.getpid()))\n"
-                    "while not (r / 'go').exists(): time.sleep(0.02)\n")
-    hook.chmod(0o700)
     owner = _python(tmp_path, _GIT_OWNER, root, env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1",
                                            "GIT_CONFIG_GLOBAL": os.devnull})
     contender = UpdateLock(path=tmp_path / "contender-marker", install_root=root)
     try:
-        hook_pid = int(_wait_for(tmp_path / "hook", owner))
+        stalled_pid = int(_wait_for(tmp_path / "stalled", owner))
         owner.kill()
         owner.wait()
-        assert _alive(hook_pid)
-        assert contender.acquire() is False, "a contender owns the checkout while git still commits"
+        assert _alive(stalled_pid)
+        assert contender.acquire() is False, "a contender owns the checkout while git still writes"
         (tmp_path / "go").touch()
         end = time.monotonic() + 30
         while not contender.acquire():

@@ -1321,8 +1321,8 @@ DEFAULT_CONFIG = {
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
         "nudge_interval": 10,
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
-        # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("honcho",
-        # "hindsight", "supermemory").
+        # "holographic", "retaindb", "byterover", or a catalog-installed one ("honcho", "hindsight",
+        # "supermemory", "mem0").
         "provider": "",
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
@@ -1465,7 +1465,7 @@ DEFAULT_CONFIG = {
         # Substitute ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} in SKILL.md content.
         "template_vars": True,
         # Pre-execute !`cmd` snippets in SKILL.md, inlining stdout (dates, git state...). Off:
-        # skill-author content would run on the host unapproved — trusted sources only.
+        # host-unapproved skill-author code; community hub installs never auto-execute (#63307).
         "inline_shell": False,
         "inline_shell_timeout": 10,  # seconds per !`cmd` snippet
         # Security-scan skills the agent writes via skill_manage. Off: the agent can run the same

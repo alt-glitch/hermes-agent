@@ -8,7 +8,7 @@ can still write the checkout, and must NOT leak into processes that outlive the 
   forks a detached gc/maintenance child that would inherit (POSIX) or outlive (Windows) the lock.
 * POSIX: the lock fd is inherited ONLY by git commands that mutate the worktree, index or refs
   locally (:data:`LOCAL_MUTATORS`, run with ``core.fsmonitor=false`` so no fsmonitor daemon
-  starts under them, and with no credential helper). Network/credential commands (fetch,
+  starts under them, with no credential helper and no repository hooks). Network/credential commands (fetch,
   ls-remote, credential) and readers run without it: a ``git credential-cache--daemon`` they
   start never holds the checkout. A partial clone's mutator would lazily fetch the objects a move
   needs as a child holding the fd (and start the daemon under it), so before a move the objects
@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -50,17 +51,21 @@ logger = logging.getLogger(__name__)
 GIT_NO_DETACH = ("-c", "gc.autoDetach=false", "-c", "maintenance.auto=false")
 # Local mutators only (they hold the lock fd): never start an fsmonitor daemon under it, and no
 # credential helper — a promisor lazy fetch under a mutator would start `git
-# credential-cache--daemon` holding the fd for its lifetime (900 s by default, m3).
-_MUTATOR_CONFIG = ("-c", "core.fsmonitor=false", "-c", "credential.helper=")
+# credential-cache--daemon` holding the fd for its lifetime (900 s by default, m3). No repository
+# hooks either (F1): a hook inherits the fd, and one that backgrounds a process (a post-merge
+# daemon) kept a completed update's checkout locked until it exited. Per command only: the
+# repository's own hook configuration is untouched.
+_MUTATOR_CONFIG = ("-c", "core.fsmonitor=false", "-c", "credential.helper=", "-c", f"core.hooksPath={os.devnull}")
 
 # git subcommands that write the worktree, the index or refs on THIS machine. Only these inherit
 # the checkout lock fd: if the updater dies mid-command, the checkout stays locked until git exits.
 # No `pull` (fetch + merge: its network half must not hold the fd; the updater fetches, then
-# merges). `gc` packs refs (and its repack writes the object store).
+# merges). `gc` packs refs (and its repack writes the object store); `pack-objects` is the pack
+# tidy's merge, whose output the update moves into the object store.
 LOCAL_MUTATORS = frozenset({
     "add", "am", "apply", "checkout", "checkout-index", "cherry-pick", "clean", "commit", "gc",
-    "merge", "mv", "read-tree", "rebase", "reset", "restore", "revert", "rm", "stash", "switch",
-    "update-index", "update-ref", "symbolic-ref", "tag", "branch", "worktree",
+    "merge", "mv", "pack-objects", "read-tree", "rebase", "reset", "restore", "revert", "rm", "stash",
+    "switch", "update-index", "update-ref", "symbolic-ref", "tag", "branch", "worktree",
 })
 # Mutators that move the checkout to another commit: what they read from a promisor remote is
 # fetched first, without the fd (_prefetch_for_move).
@@ -125,7 +130,7 @@ def _past_commit() -> bool:
         from hermes_cli.update_receipt import _current
 
         current = _current.get()
-    except Exception:  # noqa: BLE001 - unknown: never claim that nothing changed
+    except Exception:  # health: allow BLE001 -- fail closed: unknown = past commit, never "nothing changed"
         return True
     return current is not None and any(stage.get("name") == "apply" for stage in current.data.get("stages") or ())
 
@@ -166,7 +171,7 @@ def git_argv(git_cmd: Sequence[str], args: Sequence[str]) -> list[str]:
 def _held() -> dict | None:
     try:
         from hermes_cli import update_lock
-    except Exception:  # noqa: BLE001 - a torn tree's launch repair: no updater runs from it
+    except Exception:  # health: allow BLE001 -- a torn tree's half-written module raises anything; no updater runs
         return None
     return update_lock._HELD
 
@@ -176,7 +181,7 @@ def _death_signal_preexec():
     on it. For the git children that do NOT hold the lock fd (fetch, ls-remote, readers): a
     killed owner must not leave a fetch rewriting refs under the next lock owner. The ruling's
     stale-lock rules recover a fetch killed mid-write. ``None`` elsewhere (Windows: the job;
-    macOS: no parent-death signal — see NOT_COVERED)."""
+    macOS has no parent-death signal: :func:`run_git` puts a fetch under :func:`_owner_watch`)."""
     if not sys.platform.startswith("linux"):
         return None
     import ctypes
@@ -262,14 +267,13 @@ def run(argv: Sequence[str], *, inherit_lock: bool = False, **kwargs) -> subproc
         try:
             stdout, stderr = proc.communicate(input, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            _kill_tree(proc)
-            proc.kill()
-            try:
-                exc.stdout, exc.stderr = proc.communicate(timeout=_DRAIN_SECONDS)
-            except subprocess.TimeoutExpired:
-                # A descendant the tree kill missed still holds the pipes: leave them to the
-                # reader threads (closing a pipe a thread is reading blocks) and give up on them.
-                proc.stdin = proc.stdout = proc.stderr = None
+            # git.exe's git-remote-https inherits the pipes: kill the tree, not git.exe alone (and
+            # never the job: it also holds the update's other children).
+            from hermes_cli._subprocess_compat import kill_and_drain
+
+            drained = kill_and_drain(proc, _DRAIN_SECONDS)
+            if drained is not None:
+                exc.stdout, exc.stderr = drained
             raise
         except BaseException:
             proc.kill()
@@ -314,16 +318,6 @@ def popen_post_commit(argv: Sequence[str], *, label: str, **kwargs) -> subproces
 _DRAIN_SECONDS = 5
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """Windows: kill the child AND what it started (git.exe's git-remote-https inherits the
-    stdout/stderr pipes; killing git.exe alone leaves communicate() waiting on the helper). Not
-    TerminateJobObject: the job also holds the update's other children."""
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-
-
 def run_git(git_cmd: Sequence[str], args: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
     """THE updater git runner: custody config in argv, the lock fd only into local mutators,
     Windows job binding inside an update. ``kwargs`` are ``subprocess.run``'s."""
@@ -331,7 +325,87 @@ def run_git(git_cmd: Sequence[str], args: Sequence[str], **kwargs) -> subprocess
     mutator = is_local_mutator(argv[1:])
     if mutator:
         _prefetch_for_move(list(git_cmd), list(args), kwargs)
+    elif git_subcommand(argv[1:]) in _FD_LESS_REF_WRITERS and sys.platform != "win32" \
+            and _held() is not None and "preexec_fn" not in kwargs and _death_signal_preexec() is None:
+        return _run_owner_watched(argv, kwargs)
     return run(argv, inherit_lock=mutator, **kwargs)
+
+
+# git commands that write refs WITHOUT the lock fd (m3: their network half must not hold it). On
+# Linux the parent-death signal ends one whose owner died; where there is none (macOS) a watchdog
+# does (R3), or it would go on rewriting refs and leave live `*.lock` files under the next owner.
+_FD_LESS_REF_WRITERS = frozenset({"fetch"})
+
+# The watchdog: stdin is a pipe only the owner writes. A byte = the child finished; EOF with no
+# byte = the owner died (the kernel closed its end), so SIGKILL the child, as PR_SET_PDEATHSIG
+# would. It holds no lock fd and runs in its own session (a terminal's ^C/hang-up is the owner's).
+_OWNER_WATCH = (
+    "import os, signal, sys\n"
+    "if not os.read(0, 1):\n"
+    "    try:\n"
+    "        os.kill(int(sys.argv[1]), signal.SIGKILL)\n"  # windows-footgun: ok -- POSIX only (run_git gates win32 out)
+    "    except OSError:\n"
+    "        pass\n"
+)
+
+
+def _owner_watch(pid: int):
+    """Start the parent-death stand-in for child ``pid``; returns the callable that dismisses it
+    once the child is done, or ``None`` when it could not start (logged: the fetch still runs, as
+    it did before; only the owner's death mid-fetch is then unfenced)."""
+    import os
+
+    read_end, write_end = os.pipe()  # non-inheritable: no other child keeps the owner's end open
+    try:
+        watcher = subprocess.Popen([sys.executable, "-I", "-S", "-c", _OWNER_WATCH, str(pid)], stdin=read_end,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        os.close(write_end)
+        logger.warning("Could not watch update child %s for its owner's death: %s", pid, exc)
+        return None
+    finally:
+        os.close(read_end)
+
+    def dismiss() -> None:
+        with contextlib.suppress(OSError):  # the watcher already gone: nothing left to tell it
+            os.write(write_end, b"x")
+        os.close(write_end)
+        with contextlib.suppress(subprocess.TimeoutExpired):  # it exits on the byte; never block on it
+            watcher.wait(timeout=5)
+
+    return dismiss
+
+
+def _run_owner_watched(argv: Sequence[str], kwargs: dict) -> subprocess.CompletedProcess:
+    """``subprocess.run`` for an fd-less ref writer, under :func:`_owner_watch` while it runs."""
+    input, timeout = kwargs.pop("input", None), kwargs.pop("timeout", None)
+    check = kwargs.pop("check", False)
+    if input is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = kwargs["stderr"] = subprocess.PIPE
+    with subprocess.Popen(list(argv), **kwargs) as proc:
+        dismiss = _owner_watch(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(input, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            try:
+                exc.stdout, exc.stderr = proc.communicate(timeout=_DRAIN_SECONDS)
+            except subprocess.TimeoutExpired:
+                # A helper git started still holds the pipes: leave them to the reader threads.
+                proc.stdin = proc.stdout = proc.stderr = None
+            raise
+        except BaseException:
+            proc.kill()
+            raise
+        finally:
+            if dismiss is not None:
+                dismiss()
+        code = proc.poll()
+    if check and code:
+        raise subprocess.CalledProcessError(code, proc.args, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(proc.args, code, stdout, stderr)
 
 
 def _partial_clone(git_cmd: Sequence[str], kwargs: dict) -> bool:
@@ -477,30 +551,158 @@ def _join_launcher_python() -> str:
     return sys.executable
 
 
-# POSIX twin of the launcher: Node marks the donated lock fd close-on-exec, so nothing node
-# starts (npm, esbuild, sh) keeps the checkout locked. The command runs as its own process group
-# under this stdlib parent, which holds the fd too and, once the command exits (or this parent is
-# interrupted), kills the whole group: no descendant outlives the custodial command (N13).
-_OWN_GROUP = (
-    "import os, signal, subprocess, sys\n"
-    "fds = tuple(int(fd) for fd in sys.argv[1].split(','))\n"
-    "p = subprocess.Popen(sys.argv[2:], pass_fds=fds, start_new_session=True)\n"
-    "try:\n"
-    "    code = p.wait()\n"
-    "finally:\n"
-    "    try:\n"
-    "        os.killpg(p.pid, signal.SIGKILL)\n"  # windows-footgun: ok — POSIX-only launcher
-    "    except OSError:\n"
-    "        pass\n"
-    "sys.exit(code if code >= 0 else 128 - code)\n"
-)
+# POSIX twin of the launcher (N13, review L1/L6). Node marks the donated lock fd close-on-exec,
+# so nothing node starts (npm, esbuild, sh) keeps the checkout locked: custody of them rests on
+# this stdlib parent, which holds the fd until no descendant of the command is left.
+# * The command stays in the CALLER's process group: every group kill that stops a build (a
+#   Ctrl-C'd completion child's ``killpg``, Desktop's ``kill(-pid)``) reaches node and everything
+#   under it that did not start a session of its own. The custodian leaves that group (E): a
+#   SIGKILL of the group would otherwise kill it too, and a descendant in a session of its own
+#   would go on writing with the checkout lock free. It outlives the kill, settles the tree as
+#   below, and only then exits (releasing the fd).
+# * Linux: the custodian is a child subreaper, so a descendant orphaned by node's exit (or by any
+#   intermediate's) is re-parented to it, never to init. Once node exits it SIGKILLs and reaps
+#   its children until none is left; it only signals its own unreaped children, so no pid it
+#   kills can have been reused (never a ``killpg`` of an already reaped leader's group).
+# * Elsewhere (macOS has no subreaper) it records node's descendant tree from ``ps`` while node
+#   runs and, once node exits, kills every recorded process whose start time still matches,
+#   plus what they started. Best effort: a process born and orphaned between two samples escapes.
+# * SIGINT/SIGTERM/SIGHUP are forwarded to node (a node still running 10 s later is killed); the
+#   descendants are then killed as above.
+# * The custodian is NOT the process the runner sees (R4): ``subprocess.run`` SIGKILLs its own
+#   child when Ctrl-C reaches the caller, and no group separation survives a direct kill. The
+#   runner's child only forks the custodian (own group) and relays signals to it and its exit
+#   status back; it leaves the caller's group too, or a terminal's Ctrl-C would reach node twice. Killed, it leaves the custodian to settle: node gets the same 10 s it gets after
+#   a forwarded signal (it is usually still cleaning up from the same Ctrl-C), then the tree is
+#   killed as above and only then is the fd dropped.
+_REAP_TREE = r"""
+import os, signal, subprocess, sys, time
+KILL = signal.SIGKILL  # windows-footgun: ok - POSIX-only launcher
+fds = tuple(int(fd) for fd in sys.argv[1].split(','))
+caller = os.getpgrp()
+if caller != os.getpid():
+    os.setpgid(0, 0)
+stand_in = os.getpid()
+custodian = os.fork()
+if custodian:
+    def relay(signum, frame):
+        try:
+            os.kill(custodian, signum)
+        except OSError:
+            pass
+    for name in ('SIGINT', 'SIGTERM', 'SIGHUP'):
+        signal.signal(getattr(signal, name), relay)
+    code = os.waitstatus_to_exitcode(os.waitpid(custodian, 0)[1])
+    sys.exit(code if code >= 0 else 128 - code)
+os.setpgid(0, 0)
+me = os.getpid()
+reaper = False
+if sys.platform.startswith('linux'):
+    try:
+        import ctypes
+        reaper = ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
+    except (OSError, AttributeError):
+        reaper = False
+
+def children():
+    found = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            with open('/proc/%s/stat' % entry, 'rb') as fh:
+                stat = fh.read()
+            if int(stat[stat.rindex(b')') + 2:].split()[1]) == me:
+                found.append(int(entry))
+        except (OSError, ValueError, IndexError):
+            continue
+    return found
+
+def table():
+    try:
+        out = subprocess.run(['ps', '-A', '-o', 'pid=,ppid=,stat=,lstart='], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, errors='replace', timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    rows = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit() and not parts[2].startswith('Z'):
+            rows[int(parts[0])] = (int(parts[1]), parts[3].strip())
+    return rows
+
+seen = {}
+
+def sample(root):
+    rows = table()
+    tree = {pid for pid, start in seen.items() if rows.get(pid, (0, None))[1] == start}
+    if root is not None:
+        tree.add(root)
+    grew = True
+    while grew:
+        grew = False
+        for pid, (ppid, start) in rows.items():
+            if ppid in tree and pid not in tree:
+                tree.add(pid)
+                seen[pid] = start
+                grew = True
+    return [pid for pid, start in seen.items() if rows.get(pid, (0, None))[1] == start]
+
+def kill(pids):
+    for pid in pids:
+        try:
+            os.kill(pid, KILL)
+        except OSError:
+            pass
+
+p = subprocess.Popen(sys.argv[2:], pass_fds=fds, process_group=caller)
+got = []
+
+def forward(signum, frame):
+    got.append(signum)
+    try:
+        p.send_signal(signum)
+    except OSError:
+        pass
+
+for name in ('SIGINT', 'SIGTERM', 'SIGHUP'):
+    signal.signal(getattr(signal, name), forward)
+deadline = None
+while True:
+    try:
+        code = p.wait(timeout=0.5)
+        break
+    except subprocess.TimeoutExpired:
+        pass
+    if not reaper:
+        sample(p.pid)
+    if got or os.getppid() != stand_in:
+        deadline = deadline or time.monotonic() + 10
+        if time.monotonic() > deadline:
+            p.kill()
+end = time.monotonic() + 10
+while time.monotonic() < end:
+    live = children() if reaper else sample(None)
+    if not live:
+        break
+    kill(live)
+    while reaper:
+        try:
+            if not os.waitpid(-1, os.WNOHANG)[0]:
+                break
+        except ChildProcessError:
+            break
+    time.sleep(0.02)
+sys.exit(code if code >= 0 else 128 - code)
+"""
 
 
 @contextlib.contextmanager
 def contained_command(argv: Sequence[str], *, inherit_lock: bool = True, root=None):
     """``(argv, kwargs)`` for a checkout writer started by a runner that hides its Popen (the Node
     build in ``pm.progress.run_contained``). POSIX: the lock fd (this process's, or one it
-    inherited for checkout ``root``), with the command's process group killed when it exits.
+    inherited for checkout ``root``), under a launcher that keeps the command in the caller's
+    process group and kills every descendant left when it exits (:data:`_REAP_TREE`).
     Windows inside an update: the command runs under a launcher that joins the update's
     kill-on-close job first; when the job cannot be handed over or the join is refused, the
     command never runs and :class:`CustodyRefused` is raised (D2)."""
@@ -510,7 +712,7 @@ def contained_command(argv: Sequence[str], *, inherit_lock: bool = True, root=No
 
         fds = tuple(checkout_lock_fds(root)) if inherit_lock and root is not None else _lock_fds(inherit_lock)
         if fds:
-            argv = [sys.executable, "-I", "-S", "-c", _OWN_GROUP, ",".join(map(str, fds)), *argv]
+            argv = [sys.executable, "-I", "-S", "-c", _REAP_TREE, ",".join(map(str, fds)), *argv]
         yield argv, ({"pass_fds": fds} if fds else {})
         return
     try:

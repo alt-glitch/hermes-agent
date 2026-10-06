@@ -798,12 +798,10 @@ def bounded_probe_run(
     argv: Sequence[str], *, timeout: float, errors: str = "replace",
     env: "Mapping[str, str] | None" = None, cwd: "str | os.PathLike[str] | None" = None,
     raise_on_spawn_failure: bool = False, input: "str | None" = None,
-    popen_kwargs: "Mapping[str, object] | None" = None,
 ) -> "subprocess.CompletedProcess[str] | None":
     """Deadlock-safe ``subprocess.run(argv, capture_output=True, timeout=…)`` for fail-open probes.
 
     ``input`` is written to the child's stdin (closed afterwards); without it stdin is ``DEVNULL``.
-    ``popen_kwargs`` adds Popen arguments (the update's custody: ``pass_fds``/``preexec_fn``).
 
     Returns a ``CompletedProcess`` when the child finished within *timeout* (any exit code), or
     ``None`` on spawn failure or timeout. With ``raise_on_spawn_failure=True`` the ``Popen``
@@ -818,7 +816,6 @@ def bounded_probe_run(
     machines (#87134); the git probes hit it first (#68609 / #66037).
     """
     _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
-    _popen_kwargs.update(popen_kwargs or {})
     job = None
     try:
         # Windows: contain the probe in a Job Object. `taskkill /T` walks LIVE parent pids, and a
@@ -842,15 +839,24 @@ def bounded_probe_run(
         # Timeout OR any other communicate() failure (torn-down pipe, decode error): tree-kill and
         # drain bounded — leaving it running would leak the suspended-descendant class this guards.
         _close_job(job)
-        kill_process_tree(proc)
-        try:
-            proc.communicate(timeout=1)
-        except Exception:
-            pass
+        kill_and_drain(proc, 1)
         return None
     # The probe exited on its own; anything it left behind (`&` jobs) goes with the job.
     _close_job(job)
     return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
+
+
+def kill_and_drain(proc: "subprocess.Popen", seconds: float) -> "tuple | None":
+    """Tree-kill *proc* (:func:`kill_process_tree`), then read what its pipes still hold for at
+    most *seconds*: ``(stdout, stderr)``, or ``None`` when a descendant the kill missed still
+    holds them. Those pipes are left to ``communicate()``'s reader threads, never closed
+    (closing a pipe a thread is reading blocks; a ``with Popen`` exit would close them)."""
+    kill_process_tree(proc)
+    try:
+        return proc.communicate(timeout=seconds)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        proc.stdin = proc.stdout = proc.stderr = None
+        return None
 
 
 def _close_job(job) -> None:

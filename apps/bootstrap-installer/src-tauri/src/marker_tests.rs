@@ -466,6 +466,26 @@ fn pid_is_alive_never_interprets_unsigned_pids_as_groups() {
     assert!(!pid_is_alive(u32::MAX - std::process::id() + 1));
 }
 
+#[cfg(windows)]
+#[test]
+fn pid_is_alive_false_for_an_exited_process_whose_exit_code_is_259() {
+    // 259 is STILL_ACTIVE: an exit-code probe reads this exited child as running for as long
+    // as our `Child` keeps its process object open.
+    let mut exited = std::process::Command::new("cmd")
+        .args(["/C", "exit 259"])
+        .spawn()
+        .unwrap();
+    assert_eq!(exited.wait().unwrap().code(), Some(259));
+    assert!(!pid_is_alive(exited.id()), "an exited process is dead");
+    let mut running = std::process::Command::new("cmd")
+        .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+        .spawn()
+        .unwrap();
+    assert!(pid_is_alive(running.id()), "a running process is alive");
+    let _ = running.kill();
+    let _ = running.wait();
+}
+
 #[test]
 fn pid_is_alive_false_for_pid_zero() {
     // pid 0 means the caller's process GROUP to kill(2), so kill(0, 0)
@@ -1177,6 +1197,29 @@ fn claim_sweeps_dead_claimants_tmp_litter() {
         assert!(dir.join(name).exists(), "{name} must be kept");
     }
     drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stale_tmp_under_our_own_pid_number_is_swept() {
+    // Containers reuse pid numbers every boot: a tmp a previous holder of our pid left is
+    // litter once it is older than any write of ours; a fresh one may be in flight.
+    let dir = unique_tmp_dir("marker-own-pid-litter");
+    let marker = dir.join(".hermes-update-in-progress");
+    let me = std::process::id();
+    let stale = dir.join(format!(".hermes-update-in-progress.{me}.deadbeef.tmp"));
+    let fresh = dir.join(format!(".hermes-update-in-progress.{me}.cafe.tmp"));
+    std::fs::write(&fresh, "").unwrap();
+    let file = std::fs::File::create(&stale).unwrap();
+    file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    drop(file);
+    sweep_tmp_litter(&marker);
+    assert!(
+        !stale.exists(),
+        "a stale tmp under our pid number is litter"
+    );
+    assert!(fresh.exists(), "a fresh tmp under our pid may be in flight");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

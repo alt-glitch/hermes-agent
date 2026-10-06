@@ -125,7 +125,10 @@ def _run_child(request: dict) -> tuple[int, dict]:
     env.setdefault("HERMES_UPDATE_HANDOFF_PID", str(os.getpid()))
     # Everything the user saw so far came from the OLD updater; say so before the
     # new one (package manager) takes over, so logs show where the switch happened.
-    print("→ Handing off to the new updater (package manager) for the rest of this update...", flush=True)
+    # ASCII only, like every line printed before the child starts: a Windows pipe encodes this
+    # process's stdout in the ANSI code page, and a non-cp1252 character raised here, before the
+    # takeover ever ran (review S1).
+    print("-> Handing off to the new updater (package manager) for the rest of this update...", flush=True)
     with tempfile.TemporaryDirectory(prefix="hermes-update-takeover-") as directory:
         context = Path(directory) / "request.json"
         result = Path(directory) / "result.json"
@@ -149,14 +152,21 @@ def _run_in_custody(argv: list, root: Path, **kwargs) -> int:
     lock = sys.modules.get("hermes_cli.update_lock")
     bind, resume = (getattr(lock, name, None) for name in ("bind_child_to_update_tree", "resume_suspended_child"))
     if os.name != "nt" or bind is None or resume is None or getattr(lock, "_HELD", None) is None:
+        # Unbounded for the same reason as the Windows wait below (review L7): the takeover is
+        # the rest of a committed update (sync + build), and it holds the checkout lock fd, so the
+        # checkout stays locked for as long as it runs, even past this updater's death.
+        # health: allow HX006 -- unbounded by design: the update's own supervised child
         return subprocess.run(argv, **kwargs, **_checkout_custody(root)).returncode
     proc = subprocess.Popen(argv, creationflags=lock.CREATE_SUSPENDED, **kwargs)
     try:
         refusal = bind(proc)
         if refusal is not None:
-            print(f"  ⚠ The update's job would not take the takeover ({refusal}); it runs outside the job, "
+            print(f"  ! The update's job would not take the takeover ({refusal}); it runs outside the job, "
                   "holding its own checkout lease.", flush=True)
         resume(proc)
+        # The takeover is the rest of a committed update (sync + build): a bound would abandon it
+        # mid-write. It dies with this updater (kill-on-close job, or the except path below).
+        # health: allow HX006 -- unbounded by design: the update's own supervised child
         return proc.wait()
     except BaseException:
         proc.kill()
@@ -170,7 +180,7 @@ def _checkout_custody(root: Path) -> dict:
     held = getattr(sys.modules.get("hermes_cli.update_lock"), "checkout_lock_fds", None)
     try:
         fds = tuple(held(root)) if held is not None and os.name == "posix" else ()
-    except Exception:  # noqa: BLE001 - an old module's surprise must not fail the update
+    except Exception:  # health: allow BLE001 -- any older release's checkout_lock_fds; no fds = takeover locks itself
         fds = ()
     return {"pass_fds": fds} if fds else {}
 

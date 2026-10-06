@@ -111,14 +111,62 @@ def test_lock_fd_reaches_local_mutators_only(repo, tmp_path, monkeypatch):
     assert "yes" in out_stash.read_text(encoding="utf-8-sig").split(), "a local mutator's child lost the checkout lock"
 
 
+@pytest.mark.platforms("posix")
+@pytest.mark.live_system_guard_bypass  # kills the orphaned hook child it planted
+def test_a_background_hook_never_keeps_a_completed_update_locked(repo, tmp_path):
+    """F1: a local mutator holds the lock fd, and a repository hook it ran inherited that fd; a
+    hook that backgrounds a daemon kept the checkout locked after the merge returned and the
+    owner released, so the next update was refused. Once the owner releases, a contender acquires."""
+    import signal
+
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "two")
+    target = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "reset", "-q", "--hard", base)
+    pid_file = tmp_path / "hook-child.pid"
+    hook = repo / ".git" / "hooks" / "post-merge"
+    hook.write_text(f"#!/bin/sh\nsleep 60 </dev/null >/dev/null 2>&1 &\necho $! > {pid_file}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    from hermes_cli.update_custody import run_git
+
+    lock = ul.UpdateLock(path=tmp_path / "marker", install_root=repo)
+    assert lock.acquire()
+    try:
+        merged = run_git(["git"], ["merge", "--ff-only", target], cwd=repo, capture_output=True, text=True, timeout=30)
+        assert merged.returncode == 0, merged.stderr
+    finally:
+        lock.release()
+    contender = ul.UpdateLock(path=tmp_path / "next-marker", install_root=repo)
+    try:
+        assert (repo / "f.txt").read_text(encoding="utf-8") == "two\n"
+        assert contender.acquire(), f"a background git hook kept the completed update's checkout locked: {contender.holder}"
+    finally:
+        contender.release()
+        if pid_file.exists():
+            os.kill(int(pid_file.read_text(encoding="utf-8")), signal.SIGKILL)  # windows-footgun: ok - POSIX-only test
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="parent-death signal is Linux-only")
 def test_network_git_dies_with_its_killed_owner(repo, tmp_path):
     """The fd-less fetch must not keep rewriting refs after the owner died (the next owner's lease)."""
+    _assert_fetch_dies_with_killed_owner(repo, tmp_path, "")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the fetch's pid from /proc")
+def test_network_git_dies_with_its_killed_owner_without_a_parent_death_signal(repo, tmp_path):
+    """R3: where there is no parent-death signal (macOS), the fetch must still die with its owner."""
+    _assert_fetch_dies_with_killed_owner(
+        repo, tmp_path, "from hermes_cli import update_custody\nupdate_custody._death_signal_preexec = lambda: None\n")
+
+
+def _assert_fetch_dies_with_killed_owner(repo, tmp_path, prelude: str) -> None:
     script = textwrap.dedent(f"""
         import sys
         sys.path.insert(0, {str(REPO_ROOT)!r})
         from pathlib import Path
         from hermes_cli import update_lock as ul, update_cmd
+    """) + prelude + textwrap.dedent("""
         lock = ul.UpdateLock(path=Path(sys.argv[2]), install_root=sys.argv[1])
         assert lock.acquire()
         update_cmd._git_run(["git"], ["fetch", "--upload-pack=" + sys.argv[3], "origin"], cwd=sys.argv[1], network=True)
@@ -302,6 +350,15 @@ def test_run_git_hands_the_lock_fd_to_local_mutators_only(repo, tmp_path, monkey
     assert out.read_text(encoding="utf-8-sig").split() == (["yes"] if holds else ["no"]), args
 
 
+class _Win32Sys:
+    """``sys`` as one module sees it on Windows; everything but ``platform`` is the real module."""
+
+    platform = "win32"
+
+    def __getattr__(self, name):
+        return getattr(sys, name)
+
+
 @pytest.mark.platforms("posix")
 def test_a_timed_out_child_never_waits_on_a_grandchild_holding_its_pipes(monkeypatch):
     """N14: the in-update (Windows) run() killed only the direct child on a timeout, then waited
@@ -309,7 +366,9 @@ def test_a_timed_out_child_never_waits_on_a_grandchild_holding_its_pipes(monkeyp
     Driven here through that branch with a POSIX grandchild the tree kill (taskkill) cannot reach."""
     from hermes_cli import update_custody
 
-    monkeypatch.setattr(update_custody.sys, "platform", "win32")
+    # Only update_custody sees win32: patching sys.platform itself would send every lazy import
+    # in this window (the suite's Popen guard imports gateway.status) down its Windows branch.
+    monkeypatch.setattr(update_custody, "sys", _Win32Sys())
     monkeypatch.setattr(update_custody, "_held", lambda: {"fd": None})
     monkeypatch.setattr(update_custody, "popen", lambda argv, **kw: subprocess.Popen(list(argv), **kw))
     started = time.monotonic()
@@ -349,6 +408,191 @@ def test_no_build_descendant_outlives_the_build_call(repo, tmp_path, monkeypatch
         lock.release()
     time.sleep(3)
     assert not late.exists(), "a build descendant kept writing after the build call returned"
+
+
+def _late_writer(late: Path, *, detach: bool = False, delay: float = 2.0) -> str:
+    """Python source for a build descendant that writes ``late`` after ``delay`` seconds, holding
+    no inherited fd and no pipe (so nothing but a kill stops it); ``detach`` starts its own session."""
+    detach_code = "os.setsid(); " if detach else ""  # windows-footgun: ok - the callers are POSIX-only
+    return (f"import os, pathlib, time; {detach_code}os.closerange(3, 4096); "
+            f"time.sleep({delay}); pathlib.Path({str(late)!r}).touch()")
+
+
+def _node_starting(writer: str, *, then: str) -> list[str]:
+    """A stand-in for node: starts ``writer`` (stdio detached), then runs ``then``."""
+    return [sys.executable, "-c",
+            "import subprocess, sys, time; d = subprocess.DEVNULL; "
+            f"subprocess.Popen([sys.executable, '-c', {writer!r}], stdin=d, stdout=d, stderr=d); {then}"]
+
+
+def _launch_in_custody(repo: Path, tmp_path: Path, command: list[str], *, platform: str | None = None,
+                       **popen) -> subprocess.Popen:
+    """Start ``command`` the way the build runner does (contained_command under a held checkout
+    lock); ``platform`` makes the launcher see another ``sys.platform`` (its no-subreaper path)."""
+    from hermes_cli.update_custody import contained_command
+
+    lock = ul.UpdateLock(path=tmp_path / "marker", install_root=repo)
+    assert lock.acquire()
+    try:
+        with contained_command(command, root=repo) as (argv, custody):
+            assert argv[3] == "-c", argv
+            if platform is not None:
+                argv[4] = f"import sys; sys.platform = {platform!r}\n" + argv[4]
+            return subprocess.Popen(argv, stdin=subprocess.DEVNULL, **custody, **popen)
+    finally:
+        lock.release()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX process groups + /proc")
+def test_a_group_kill_of_the_caller_stops_the_whole_build(repo, tmp_path):
+    """L1: the completion child's Ctrl-C path ``killpg``s its own group and Desktop kills the
+    backend's group; the build (node and what it starts) must be inside that group. A build
+    moved into a session of its own outlived the kill and kept writing after the lock was free."""
+    import signal
+
+    late_node, late_child = tmp_path / "late-node", tmp_path / "late-child"
+    node = _node_starting(_late_writer(late_child), then=f"time.sleep(2); __import__('pathlib').Path({str(late_node)!r}).touch()")
+    # The launcher leads a fresh group here, as the completion child does for its build.
+    launcher = _launch_in_custody(repo, tmp_path, node, start_new_session=True)
+    time.sleep(1)
+    os.killpg(launcher.pid, signal.SIGKILL)  # windows-footgun: ok - Linux-only test
+    launcher.wait(timeout=10)
+    time.sleep(3)
+    assert not late_node.exists(), "node survived a group kill of its caller"
+    assert not late_child.exists(), "a build descendant survived a group kill of its caller"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX sessions + /proc")
+@pytest.mark.live_system_guard_bypass  # the caller's group kill is the scenario under test
+def test_a_group_kill_of_the_caller_keeps_custody_until_a_detached_writer_is_gone(repo, tmp_path):
+    """E: the completion child ``killpg``s its own group on interruption; the launcher holding
+    the lock fd for node's tree was in that group and died with it, so a descendant in a session
+    of its own kept writing while a contender owned the checkout. A contender must only acquire
+    once that writer has stopped."""
+    import contextlib
+    import signal
+
+    beat = tmp_path / "beat"
+    writer = (f"import os, pathlib, time; os.setsid(); os.closerange(3, 4096); p = pathlib.Path({str(beat)!r})\n"  # windows-footgun: ok - Linux-only test
+              "for i in range(300):\n    p.write_text(f'{os.getpid()} {i}'); time.sleep(0.1)")
+    caller = textwrap.dedent(f"""
+        import subprocess, sys
+        sys.path.insert(0, {str(REPO_ROOT)!r})
+        from pathlib import Path
+        from hermes_cli import update_lock as ul
+        from hermes_cli.update_custody import contained_command
+        repo = Path({str(repo)!r})
+        lock = ul.UpdateLock(path=Path({str(tmp_path / "marker")!r}), install_root=repo)
+        assert lock.acquire()
+        with contained_command({_node_starting(writer, then="time.sleep(60)")!r}, root=repo) as (argv, custody):
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, **custody).wait()
+    """)
+    owner = subprocess.Popen([sys.executable, "-c", caller], start_new_session=True)
+    deadline = time.monotonic() + 20
+    while not beat.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert beat.exists(), "the detached writer never started"
+    os.killpg(owner.pid, signal.SIGKILL)  # windows-footgun: ok - Linux-only test
+    owner.wait(timeout=10)
+    contender = ul.UpdateLock(path=tmp_path / "next-marker", install_root=repo)
+    deadline = time.monotonic() + 20
+    while not contender.acquire():
+        assert time.monotonic() < deadline, "the checkout stayed locked after the group kill"
+        time.sleep(0.1)
+    try:
+        seen = beat.read_text(encoding="utf-8")
+        time.sleep(1)
+        assert beat.read_text(encoding="utf-8") == seen, "a detached build writer kept writing under the next owner"
+    finally:
+        contender.release()
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(int(beat.read_text(encoding="utf-8").split()[0]), signal.SIGKILL)  # windows-footgun: ok - Linux-only test
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX sessions + /proc")
+@pytest.mark.live_system_guard_bypass  # Ctrl-C of the caller's own group is the scenario under test
+@pytest.mark.parametrize(("verbose", "cleanup"), [("1", 2), ("0", 0)], ids=["verbose-slow-cleanup", "captured-instant-exit"])
+def test_a_ctrl_c_keeps_custody_until_a_detached_writer_is_gone(repo, tmp_path, verbose, cleanup):
+    """R4: on Ctrl-C the build runner's ``subprocess.run`` SIGKILLs its own child, which was the
+    launcher holding custody; a command still cleaning up from the interrupt then exited and
+    dropped the last lock fd while a writer in a session of its own went on writing under the
+    next owner. A contender must only acquire once that writer has stopped."""
+    import contextlib
+    import signal
+
+    beat, ready = tmp_path / "beat", tmp_path / "ready"
+    writer = (f"import os, pathlib, time; os.setsid(); os.closerange(3, 4096); p = pathlib.Path({str(beat)!r})\n"  # windows-footgun: ok - Linux-only test
+              "for i in range(300):\n    p.write_text(f'{os.getpid()} {i}'); time.sleep(0.1)")
+    # A build that cleans up for `cleanup` s after SIGINT (2 s: longer than subprocess.run's interrupt wait).
+    command = [sys.executable, "-c", textwrap.dedent(f"""
+        import pathlib, signal, subprocess, sys, time
+        signal.signal(signal.SIGINT, lambda *_: (time.sleep({cleanup}), sys.exit(130)))
+        subprocess.Popen([sys.executable, '-c', {writer!r}], stdin=subprocess.DEVNULL)
+        pathlib.Path({str(ready)!r}).touch()
+        while True: time.sleep(0.1)
+    """)]
+    caller = textwrap.dedent(f"""
+        import os, sys
+        sys.path.insert(0, {str(REPO_ROOT)!r})
+        os.environ["HERMES_VERBOSE"] = {verbose!r}
+        from pathlib import Path
+        from hermes_cli import update_lock as ul
+        from hermes_cli.source_build import run_in_custody
+        repo = Path({str(repo)!r})
+        assert ul.UpdateLock(path=Path({str(tmp_path / "marker")!r}), install_root=repo).acquire()
+        run_in_custody(repo, {command!r}, "probe build", stdin=__import__("subprocess").DEVNULL)
+    """)
+    owner = subprocess.Popen([sys.executable, "-c", caller], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 20
+    while not (beat.exists() and ready.exists()) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert beat.exists() and ready.exists(), "the build never started"
+    os.killpg(owner.pid, signal.SIGINT)  # windows-footgun: ok - Linux-only test
+    owner.wait(timeout=10)
+    contender = ul.UpdateLock(path=tmp_path / "next-marker", install_root=repo)
+    deadline = time.monotonic() + 30
+    while not contender.acquire():
+        assert time.monotonic() < deadline, "the checkout stayed locked after the interrupted build settled"
+        time.sleep(0.1)
+    try:
+        seen = beat.read_text(encoding="utf-8")
+        time.sleep(1)
+        assert beat.read_text(encoding="utf-8") == seen, "a detached build writer kept writing under the next owner"
+    finally:
+        contender.release()
+        with contextlib.suppress(ProcessLookupError, ValueError):
+            os.kill(int(beat.read_text(encoding="utf-8").split()[0]), signal.SIGKILL)  # windows-footgun: ok - Linux-only test
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX sessions + /proc")
+@pytest.mark.parametrize("platform", [None, "darwin"], ids=["subreaper", "ps-walk"])
+def test_a_detached_grandchild_outliving_node_dies_before_the_build_returns(repo, tmp_path, platform):
+    """N13/L1: a descendant that left node's process group (its own session) and outlives node
+    is still killed before the build call returns: Linux through the subreaper, elsewhere
+    through the recorded descendant tree."""
+    late = tmp_path / "late"
+    node = _node_starting(_late_writer(late, detach=True), then="time.sleep(1.2)")
+    launcher = _launch_in_custody(repo, tmp_path, node, platform=platform)
+    assert launcher.wait(timeout=30) == 0
+    time.sleep(3)
+    assert not late.exists(), "a detached build descendant kept writing after the build call returned"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX signals + /proc")
+def test_a_terminated_launcher_takes_node_and_its_descendants_with_it(repo, tmp_path):
+    """L1: SIGTERM to the launcher (a service manager, the caller's polite stop) is forwarded to
+    node, and what node started is killed too, before the launcher exits."""
+    import signal
+
+    late = tmp_path / "late"
+    node = _node_starting(_late_writer(late), then="time.sleep(30)")
+    launcher = _launch_in_custody(repo, tmp_path, node, start_new_session=True)
+    time.sleep(1)
+    launcher.send_signal(signal.SIGTERM)
+    assert launcher.wait(timeout=20) == 128 + signal.SIGTERM
+    time.sleep(3)
+    assert not late.exists(), "a build descendant kept writing after its launcher was terminated"
 
 
 @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc fd listing")

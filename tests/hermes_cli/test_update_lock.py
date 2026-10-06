@@ -16,6 +16,7 @@ disk.
 
 from __future__ import annotations
 
+import errno
 import os
 import subprocess
 import sys
@@ -68,7 +69,7 @@ def _claim(marker, pid, started_at=None):
 
 def _claim_v2(marker, pid, started_at=None, ct_offset=0.0):
     started = int(time.time() if started_at is None else started_at)
-    marker.write_text(f"{pid}\n{started}\nct:{process_create_time(pid) + ct_offset:.3f}\n", encoding="utf-8")
+    marker.write_text(f"{pid}\n{started}\nct:{process_create_time(pid) + ct_offset:.3f}\n", encoding="utf-8", newline="")
 
 
 def test_marker_path_is_the_profile_tree_root(tmp_path, monkeypatch):
@@ -191,6 +192,22 @@ def test_v2_marker_naming_our_pid_at_a_nearby_creation_time_is_a_killed_update(m
     lock.release()
 
 
+def test_one_incarnation_rule_when_our_own_creation_time_is_unreadable(marker, monkeypatch):
+    """Degraded (our creation time unreadable): we write no-ct claims, so a no-ct claim naming our
+    pid is ours and a ct one is a previous incarnation. The marker reader said so while the
+    holder-record reader answered "unprovable" and named the dead incarnation as the holder."""
+    from hermes_cli import update_lock
+
+    monkeypatch.setattr(update_lock, "_OWN_CT", {"pid": os.getpid(), "ct": None})
+    now = int(time.time())
+    for text, ours in ((f"{os.getpid()}\n{now}\n", True), (f"{os.getpid()}\n{now}\nct:{now - 1}.000\n", False)):
+        marker.write_text(text, encoding="utf-8")
+        parsed = update_lock._parse_marker(marker.read_bytes())
+        assert parsed.owner_live() is ours
+        assert update_lock.incarnation_live(os.getpid(), parsed.create_time) is ours, text
+        assert update_lock._lock_holder(marker).held is not ours, text
+
+
 def test_release_leaves_a_marker_a_handoff_partner_now_owns(marker):
     """The desktop writes the marker, then the Tauri updater takes ownership.
 
@@ -256,7 +273,7 @@ def test_delegate_keeps_the_claim_live_after_the_partner_dies(marker, monkeypatc
     assert marker.read_bytes().startswith(base) and lines[3].startswith(f"delegate:{os.getpid()} ct:")
 
     dead_partner = f"{DEAD_PID}\n{int(time.time())}\nct:1.000\n{lines[3]}\n"
-    marker.write_text(dead_partner, encoding="utf-8")
+    marker.write_text(dead_partner, encoding="utf-8", newline="")
     holder = read_live_update(path=marker)
     assert holder is not None and holder.pid == os.getpid(), "the running delegate keeps the update visible"
     marker.write_bytes(base + f"{lines[3]}\n".encode())
@@ -328,6 +345,81 @@ def test_claim_publishes_whole_and_reclaims_dead_writers_tmp_files(marker):
     lock.release()
 
 
+def test_stale_tmp_under_our_own_pid_number_is_reclaimed(marker):
+    """Containers hand out the same pids every boot: a tmp a previous holder of our pid number
+    left is litter once it is older than any write of ours, while a fresh one may be in flight."""
+    stale = marker.with_name(f"{marker.name}.{os.getpid()}.deadbeef.tmp")
+    fresh = marker.with_name(f"{marker.name}.{os.getpid()}.cafe.tmp")
+    stale.write_bytes(b"x")
+    fresh.write_bytes(b"x")
+    hour_ago = time.time() - 3600
+    os.utime(stale, (hour_ago, hour_ago))
+
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+    lock.release()
+    assert not stale.exists()
+    assert fresh.exists()
+
+
+@pytest.mark.parametrize("owner", ["\u00b2", "\u2460"], ids=["superscript-two", "circled-one"])
+def test_tmp_litter_with_a_digit_lookalike_pid_never_breaks_admission(marker, owner):
+    """A sibling whose pid field is a Unicode digit lookalike is not a pid we can judge: it is
+    left alone and the claim still lands (``str.isdigit`` accepts it, ``int`` refuses it)."""
+    odd = marker.with_name(f"{marker.name}.{owner}.tmp")
+    odd.write_bytes(b"x")
+
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+    assert marker.read_bytes().startswith(f"{os.getpid()}\n".encode())
+    lock.release()
+
+
+def _torn_write(after=None):
+    """An ``os.write`` that lands part of the claim, then fails like a full disk."""
+    real_write = os.write
+
+    def torn(fd, data):
+        real_write(fd, data[: len(data) // 2])
+        if after is not None:
+            after()
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    return torn
+
+
+def _no_hard_links(*_args, **_kwargs):
+    raise PermissionError(errno.EPERM, "Operation not permitted")
+
+
+def test_failed_exclusive_create_leaves_no_torn_claim(marker, monkeypatch):
+    """Contract A3 without hard links (FAT, some network mounts): a claim whose write fails
+    part-way is withdrawn — a process that never acquired must not block every updater while
+    it lives."""
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(os, "write", _torn_write())
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is False
+    monkeypatch.undo()
+    assert not marker.exists()
+    assert read_live_update(path=marker) is None
+
+
+@pytest.mark.platforms("posix")  # replacing a file someone holds open needs POSIX unlink
+def test_withdrawing_a_torn_claim_never_deletes_a_replacement(marker, monkeypatch, other_pid):
+    """The withdrawal deletes only the inode it created: a claimant that reclaimed the torn
+    marker and published its own in between keeps its claim."""
+    def replace():
+        marker.unlink()
+        _claim_v2(marker, other_pid)
+
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(os, "write", _torn_write(replace))
+    assert UpdateLock(path=marker).acquire() is False
+    monkeypatch.undo()
+    assert marker.read_bytes().startswith(f"{other_pid}\n".encode())
+
+
 def test_unreadable_creation_time_gets_the_v1_ceiling(marker, other_pid, monkeypatch):
     """Contract A1: a live pid whose creation time cannot be read (Windows denies it for
     elevated/other-user pids) is live only within the legacy ceiling: it may be a reused pid."""
@@ -391,6 +483,20 @@ def test_unwritable_marker_location_refuses_instead_of_running_unlocked(tmp_path
     assert "Cannot lock this install" in describe_holder(lock.holder)
 
 
+
+def test_an_unwritable_marker_location_says_why_the_update_needs_it_and_how_to_fix_it(tmp_path):
+    """Review P2 (5411135165): the refusal stays (the marker is what the Desktop gate, gateways and
+    the other updaters read), so it must say what the path is for and how to make it writable."""
+    blocker = tmp_path / "home"
+    blocker.write_bytes(b"a file where the marker directory should be")
+    lock = UpdateLock(path=blocker / "marker")
+
+    assert lock.acquire() is False
+    message = describe_holder(lock.holder)
+    assert str(blocker) in message
+    assert "Desktop app" in message and "other updaters" in message, message
+    assert "read-only filesystem" in message, message
+
 _HOLD_CHECKOUT = """
 import sys, time
 sys.path.insert(0, sys.argv[1])
@@ -425,6 +531,37 @@ def test_checkout_lock_excludes_an_update_from_another_home(tmp_path):
     lock = UpdateLock(path=tmp_path / "homeB-marker", install_root=install)
     assert lock.acquire() is True
     lock.release()
+
+
+@pytest.mark.platforms("posix")
+def test_an_unjudgeable_marker_never_admits_a_contender_past_a_held_checkout_lock(tmp_path, monkeypatch):
+    """L5: read_live_update never raises, so a marker it cannot judge (any exception) reads as
+    "no live update". That fails open on the marker only: the checkout kernel lock stays the
+    guard, so update_in_progress still answers True and a contender's acquire is refused."""
+    from hermes_cli import update_lock
+
+    install = tmp_path / "checkout"
+    install.mkdir()
+    marker_path = tmp_path / "marker"
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_CHECKOUT, str(REPO_ROOT), str(install), str(tmp_path / "homeA" / "m")],
+        stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        _claim_v2(marker_path, holder.pid)
+
+        def unjudgeable(_path):
+            raise RuntimeError("an error the parse was never expected to raise")
+
+        monkeypatch.setattr(update_lock, "_read_marker", unjudgeable)
+        assert read_live_update(path=marker_path, install_root=install) is None
+        assert update_in_progress(install), "an unjudgeable marker hid a held checkout lock"
+        lock = UpdateLock(path=marker_path, install_root=install)
+        assert lock.acquire() is False, "a contender got past a held checkout lock"
+    finally:
+        holder.kill()
+        holder.wait()
 
 
 @pytest.mark.platforms("posix")
@@ -806,3 +943,39 @@ def test_unwritable_lock_file_still_locks_the_checkout(tmp_path):
     )
     first.release()
     assert second.returncode == 3, "a second update ran while the read-only-locked checkout was held"
+
+
+@pytest.mark.platforms("windows")
+def test_read_only_lock_file_is_refused_on_windows(tmp_path):
+    """Windows children cannot inherit the lock; they find their owner by the record in it. An
+    owner that can only open the lock file read-only refuses up front instead of admitting
+    itself and then having its own completion child refused."""
+    root = tmp_path / "install"
+    root.mkdir()
+    lock_file = checkout_lock_path(root)
+    lock_file.write_bytes(b"0\n0\n")
+    lock_file.chmod(0o444)  # FILE_ATTRIBUTE_READONLY: O_RDWR is denied, the read-only open works
+    marker = tmp_path / "home" / ".hermes-update-in-progress"
+    try:
+        lock = UpdateLock(path=marker, install_root=root)
+        assert lock.acquire() is False
+        assert lock.holder is not None and lock.holder.reason
+        assert not marker.exists()
+    finally:
+        lock_file.chmod(0o666)
+
+
+@pytest.mark.parametrize("link", [pytest.param("symlink", marks=pytest.mark.platforms("posix")), "link"])
+def test_checkout_lock_never_writes_through_a_link_to_a_file_outside_the_install(tmp_path, link):
+    """The holder record is written into the lock file itself: a symlink or hard link planted at
+    its name is refused, never followed into truncating the file it points at."""
+    root = tmp_path / "install"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"PRECIOUS USER DATA")
+    getattr(os, link)(outside, checkout_lock_path(root))
+
+    lock = UpdateLock(path=tmp_path / "home" / ".hermes-update-in-progress", install_root=root)
+    assert lock.acquire() is False
+    assert lock.holder is not None and lock.holder.reason
+    assert outside.read_bytes() == b"PRECIOUS USER DATA"
