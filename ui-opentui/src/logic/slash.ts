@@ -86,6 +86,8 @@ import type { Message } from './store.ts'
 import { normalizeBusyInputMode, type BusyInputMode } from './busyQueue.ts'
 import { batteryInfoFromResponse, batteryLabel } from './battery.ts'
 import { scoreSlashMenuItem } from './slashFuzzy.ts'
+import { detectLightMode, lightModeSource, type Theme } from './theme.ts'
+import { themePin } from './themePin.ts'
 
 export interface ParsedSlash {
   name: string
@@ -286,6 +288,13 @@ export interface SlashContext {
   readonly attachImage?: (input: string) => Promise<void>
   readonly configureTerminal?: (target: string) => Promise<void>
   readonly runExternalSetup?: (args: readonly string[]) => Promise<void>
+  /** Re-derive the live theme after a polarity input changed (`/theme` pin). */
+  readonly reapplyTheme?: () => void
+  /** The live resolved theme (`/theme-info` palette summary). */
+  readonly theme?: () => Theme
+  /** The renderer's terminal color probe answer, when one exists (`null` =
+   *  no reply yet / unsupported). `/theme-info` only reports it. */
+  readonly terminalThemeMode?: () => 'dark' | 'light' | null
   /** Mounted-renderable count under the live renderer root (a /mem diagnostic);
    *  undefined when no renderer is reachable (tests). */
   readonly renderableCount: () => number | undefined
@@ -365,7 +374,16 @@ const INLINE_SLASH_RE = /\s\/([A-Za-z][\w-]*)?$/
  * prose, never a command).
  * Returns null when there's no completion to run (so the dropdown clears).
  */
-export function planCompletion(text: string, cursor: number = text.length): CompletionPlan | null {
+export function planCompletion(text: string, cursor: number = text.length, sessionId?: string): CompletionPlan | null {
+  const plan = planCompletionFor(text, cursor)
+  // Skill completions are per session: project-local skills follow the
+  // session's repo, so complete.slash names the asking session (Ink 9b0ca895b3).
+  if (plan?.method === 'complete.slash' && sessionId)
+    return { ...plan, params: { ...plan.params, session_id: sessionId } }
+  return plan
+}
+
+function planCompletionFor(text: string, cursor: number): CompletionPlan | null {
   const pos = Math.max(0, Math.min(cursor, text.length))
   const head = text.slice(0, pos)
   // Inline skill reference — detected BEFORE the leading-command branch because
@@ -533,6 +551,10 @@ const claimSlashFlight = (ctx: SlashContext): number => {
 }
 
 const slashFlightIsCurrent = (ctx: SlashContext, flight: number): boolean => SLASH_FLIGHTS.get(ctx) === flight
+
+/** `{session_id}` when a session exists, else `{}` — the session-less gateway
+ *  fallback binds the same workspace it seeds a new session with. */
+export const sessionScope = (sid: string | undefined): { session_id?: string } => (sid ? { session_id: sid } : {})
 
 const currentSessionIs = (ctx: SlashContext, expected: string | undefined, flight: number) =>
   slashFlightIsCurrent(ctx, flight) && ctx.sessionId() === expected
@@ -1278,10 +1300,40 @@ const themeCmd: ClientHandler = async (arg, ctx) => {
       ctx.pushSystem('/theme: invalid config.set response')
       return
     }
+    // Apply only after the write is confirmed (Ink 6982c61b8c): a failed
+    // persist must not leave a theme that reverts on restart.
+    if (themePin.apply(value)) ctx.reapplyTheme?.()
     ctx.pushSystem(`theme → ${response.value || value}`)
   } catch (error) {
     ctx.pushSystem(`/theme: ${error instanceof Error ? error.message : 'config.set failed'}`)
   }
+}
+
+/** `/theme-info` — polarity diagnostics (Ink cd05498e2c debug.ts). Reports
+ *  the renderer's terminal probe answer when one exists; it never probes. */
+const themeInfoCmd: ClientHandler = (_arg, ctx) => {
+  const env = process.env
+  const unset = '(unset)'
+  const probe = ctx.terminalThemeMode?.()
+  const pinOwner = themePin.owner()
+  const rows: Array<[string, string]> = [
+    ['terminal probe', probe ?? 'no reply'],
+    ['HERMES_TUI_LIGHT', env.HERMES_TUI_LIGHT ?? unset],
+    ['HERMES_TUI_THEME', `${env.HERMES_TUI_THEME ?? unset}${pinOwner === 'none' ? '' : ` (${pinOwner} pin)`}`],
+    ['HERMES_TUI_BACKGROUND', env.HERMES_TUI_BACKGROUND ?? unset],
+    ['COLORFGBG', env.COLORFGBG ?? unset],
+    ['TERM_PROGRAM', env.TERM_PROGRAM ?? unset],
+    ['detected mode', detectLightMode(env) ? 'light' : 'dark'],
+    ['polarity source', lightModeSource(env)]
+  ]
+  const theme = ctx.theme?.()
+  if (theme) {
+    for (const key of ['text', 'bg', 'completionBg', 'selectionBg', 'statusBg'] as const) {
+      rows.push([key, theme.color[key]])
+    }
+  }
+  const width = Math.max(...rows.map(([label]) => label.length))
+  ctx.pushSystem(['Theme', ...rows.map(([label, value]) => `  ${label.padEnd(width)}  ${value}`)].join('\n'))
 }
 
 /** `/battery [on|off|status]` owns both persistence and the native poller.
@@ -1666,8 +1718,8 @@ const petCmd: ClientHandler = async (arg, ctx, flight) => {
 
 const fastCmd: ClientHandler = async (arg, ctx, flight) => {
   const mode = arg.trim().toLowerCase()
-  if (!['', 'status', 'normal', 'fast', 'auto', 'cold', 'on', 'off', 'toggle'].includes(mode)) {
-    ctx.pushSystem('usage: /fast [normal|fast|auto|cold|status|on|off|toggle]')
+  if (!['', 'status', 'normal', 'fast', 'ultrafast', 'auto', 'cold', 'on', 'off', 'toggle'].includes(mode)) {
+    ctx.pushSystem('usage: /fast [normal|fast|ultrafast|auto|cold|status|on|off|toggle]')
     return
   }
   const sid = ctx.sessionId()
@@ -1684,7 +1736,7 @@ const fastCmd: ClientHandler = async (arg, ctx, flight) => {
   )
   if (!currentSessionIs(ctx, sid, flight)) return
   if (!response) return ctx.pushSystem('error: invalid response: fast mode')
-  const value = ['fast', 'auto', 'cold'].includes(response.value) ? response.value : 'normal'
+  const value = ['fast', 'ultrafast', 'auto', 'cold'].includes(response.value) ? response.value : 'normal'
   ctx.pushSystem(`fast mode: ${value}`)
 }
 
@@ -1912,8 +1964,11 @@ const reloadCmd: ClientHandler = async (_arg, ctx, flight) => {
  *  dropping dynamically learned plugin commands. */
 const reloadSkillsCmd: ClientHandler = async (_arg, ctx, flight) => {
   const expectedSid = ctx.sessionId()
+  // Bound to the session so the rescan and the refreshed catalog see its
+  // repo's project-local skills, not the launch environment's (Ink 9b0ca895b3).
+  const params = sessionScope(expectedSid)
   try {
-    const raw = await ctx.request('skills.reload', {})
+    const raw = await ctx.request('skills.reload', params)
     if (!currentSessionIs(ctx, expectedSid, flight)) return
     const response = decodeSkillsReloadResponse(raw)
     if (!response) {
@@ -1928,7 +1983,7 @@ const reloadSkillsCmd: ClientHandler = async (_arg, ctx, flight) => {
     ctx.refreshCommandCatalog(undefined, removedSkills)
 
     try {
-      const catalogRaw = await ctx.request('commands.catalog', {})
+      const catalogRaw = await ctx.request('commands.catalog', params)
       if (!currentSessionIs(ctx, expectedSid, flight)) return
       const catalog = decodeCommandsCatalogResponse(catalogRaw)
       if (!catalog) {
@@ -2831,7 +2886,7 @@ const helpCmd: ClientHandler = async (_arg, ctx, flight) => {
 
   const sid = ctx.sessionId()
   try {
-    const raw = await ctx.request('commands.catalog', {})
+    const raw = await ctx.request('commands.catalog', sessionScope(sid))
     if (!currentSessionIs(ctx, sid, flight)) return
     const catalog = decodeCommandsCatalogResponse(raw)
     if (catalog) ctx.refreshCommandCatalog(catalog, [])
@@ -2923,24 +2978,15 @@ async function wakeCmd(arg: string, ctx: SlashContext): Promise<void> {
 async function browserCmd(arg: string, ctx: SlashContext, flight: number): Promise<void> {
   const [rawAction = 'status', ...rest] = arg.trim().split(/\s+/).filter(Boolean)
   const action = rawAction.toLowerCase()
-  if (action === 'use') {
-    const mode = (rest[0] ?? 'on').toLowerCase()
-    if (rest.length > 1 || (mode !== 'on' && mode !== 'off')) {
-      ctx.pushSystem('usage: /browser use [off]')
-      return
-    }
-
-    const sid = ctx.sessionId()
-    await ctx.request('config.set', { key: 'browser_backend', value: mode })
-    if (!currentSessionIs(ctx, sid, flight)) return
-    ctx.newSession(
-      mode === 'on'
-        ? 'Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0'
-        : 'Browser Use mode disabled — built-in browser tools restored'
-    )
+  // `/browser use [on|off]` (Ink 5654863ccd): profile-scoped browser.manage
+  // write. The live agent keeps its tools (prompt cache), so the switch applies
+  // to new sessions — no forced session replacement.
+  const mode = action === 'use' ? (rest[0] ?? 'on').toLowerCase() : undefined
+  if (mode !== undefined && (rest.length > 1 || (mode !== 'on' && mode !== 'off'))) {
+    ctx.pushSystem('usage: /browser use [off]')
     return
   }
-  if (action !== 'connect' && action !== 'disconnect' && action !== 'status') {
+  if (action !== 'connect' && action !== 'disconnect' && action !== 'status' && action !== 'use') {
     ctx.pushSystem(
       'usage: /browser [connect|disconnect|status|use] [url] · persistent: set browser.cdp_url in config.yaml'
     )
@@ -2954,7 +3000,8 @@ async function browserCmd(arg: string, ctx: SlashContext, flight: number): Promi
   const raw = await ctx.request('browser.manage', {
     action,
     session_id: sid ?? null,
-    ...(url ? { url } : {})
+    ...(url ? { url } : {}),
+    ...(mode ? { enabled: mode === 'on' } : {})
   })
   if (!currentSessionIs(ctx, sid, flight)) return
   const response = decodeBrowserManageResponse(raw)
@@ -2966,12 +3013,22 @@ async function browserCmd(arg: string, ctx: SlashContext, flight: number): Promi
   ctx.setBrowserState(response.connected, response.url)
   if (!sid) response.messages?.forEach(message => ctx.pushSystem(message))
 
+  if (action === 'use') {
+    ctx.pushSystem(
+      mode === 'on'
+        ? 'Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0'
+        : 'Browser Use mode disabled — built-in browser tools restored'
+    )
+    ctx.pushSystem('applies to new sessions — this one keeps its current tools (/new to start one)')
+    return
+  }
   if (action === 'status') {
     ctx.pushSystem(
       response.connected
         ? `browser connected: ${response.url || '(url unavailable)'}`
         : 'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)'
     )
+    if (response.browser_use) ctx.pushSystem('Browser: Browser Use mode (browser_exec via the Browser Use CLI 3.0)')
     return
   }
   if (action === 'disconnect') {
@@ -3055,6 +3112,7 @@ const CLIENT: Record<string, ClientHandler> = {
   stop: stopCmd,
   tasks: agentsCmd,
   theme: themeCmd,
+  'theme-info': themeInfoCmd,
   timestamps: timestampsCmd,
   topup: topupCmd,
   title: titleCmd,

@@ -2,6 +2,8 @@
 import { Option, Schema } from 'effect'
 
 const BrowserManageResponseSchema = Schema.Struct({
+  /** Browser Use CLI mode for the session's profile (status/use replies). */
+  browser_use: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
   connected: Schema.Boolean,
   messages: Schema.optionalKey(Schema.Array(Schema.String)),
   url: Schema.optionalKey(Schema.String)

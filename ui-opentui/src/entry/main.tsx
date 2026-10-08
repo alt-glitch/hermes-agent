@@ -72,6 +72,7 @@ import {
 } from '../boundary/sessionLifecycle.ts'
 import { configSyncBlocked, createConfigSyncTracker, normalizeStatusBarFields } from '../logic/configSync.ts'
 import { batteryEnabledFromConfig, createBatteryPoller } from '../logic/battery.ts'
+import { themePin, tuiThemeFromConfig } from '../logic/themePin.ts'
 import { destructiveSlashConfirmFromConfig, skipDestructiveConfirm } from '../logic/approval.ts'
 import {
   bellOnPromptFromConfig,
@@ -392,6 +393,7 @@ const postSessionSetup = (
     const detailsRevision = store.getDetailsRevision()
     const batteryRevision = store.getBatteryRevision()
     const timestampsRevision = store.getTimestampsRevision()
+    const themePinRevision = themePin.revision()
 
     // Claim model hydration for this SID before the first async yield. Session
     // transitions clear the previous claim, so an immediate `/model` can only
@@ -426,7 +428,7 @@ const postSessionSetup = (
     // instead of only after its completion batch was browsed earlier. Best-effort
     // — a failure just leaves the old lazy-learn behavior.
     const cmdCatalog = yield* gateway
-      .request('commands.catalog', {})
+      .request('commands.catalog', { session_id: sid })
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
     const decodedCommandCatalog = decodeCommandsCatalogResponse(cmdCatalog)
     if (isActive() && decodedCommandCatalog) {
@@ -455,6 +457,7 @@ const postSessionSetup = (
       store.hydrateDetails(details.mode, details.sections, detailsRevision)
       store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedBusyConfig.config), batteryRevision)
       store.hydrateTimestamps(timestampsFromConfig(decodedBusyConfig.config), timestampsRevision)
+      if (themePin.hydrate(tuiThemeFromConfig(decodedBusyConfig.config), themePinRevision)) store.reapplyTheme()
       store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedBusyConfig.config))
       store.setBellOnPrompt(bellOnPromptFromConfig(decodedBusyConfig.config))
       store.setStatusBarFields(statusBarFieldsFromConfig(decodedBusyConfig.config))
@@ -1197,6 +1200,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               const detailsRevision = store.getDetailsRevision()
               const batteryRevision = store.getBatteryRevision()
               const timestampsRevision = store.getTimestampsRevision()
+              const themePinRevision = themePin.revision()
 
               if (plan.reload) {
                 const reload = yield* gateway
@@ -1224,6 +1228,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               store.hydrateDetails(details.mode, details.sections, detailsRevision)
               store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedConfig.config), batteryRevision)
               store.hydrateTimestamps(timestampsFromConfig(decodedConfig.config), timestampsRevision)
+              if (themePin.hydrate(tuiThemeFromConfig(decodedConfig.config), themePinRevision)) store.reapplyTheme()
               store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedConfig.config))
               store.setBellOnPrompt(bellOnPromptFromConfig(decodedConfig.config))
               store.setStatusBarFields(statusBarFieldsFromConfig(decodedConfig.config))
@@ -3013,6 +3018,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         setModelItems: items => store.setModelItems(items),
         setCurrentModel: model => store.applyInfo({ model }),
         setBrowserState: (connected, url) => store.setBrowserState({ connected, ...(url ? { url } : {}) }),
+        reapplyTheme: () => store.reapplyTheme(),
+        theme: () => store.state.theme,
+        terminalThemeMode: () => renderer.themeMode,
         setVoiceMode: patch => store.setVoiceMode(patch),
         logTail: limit => gateway.logTail(limit),
         agentsControl: {
@@ -3251,7 +3259,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const completionGate = createCompletionGate()
       const onType = (text: string, cursor: number = text.length) => {
         const token = completionGate.claim()
-        const plan = planCompletion(text, cursor)
+        const plan = planCompletion(text, cursor, gateway.sessionId())
         if (!plan) {
           store.clearCompletions()
           return

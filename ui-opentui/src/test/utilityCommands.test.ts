@@ -337,7 +337,7 @@ describe('/fast, /yolo, /reload-mcp', () => {
       'fast mode: fast',
       'fast mode: auto',
       'fast mode: cold',
-      'usage: /fast [normal|fast|auto|cold|status|on|off|toggle]'
+      'usage: /fast [normal|fast|ultrafast|auto|cold|status|on|off|toggle]'
     ])
   })
 

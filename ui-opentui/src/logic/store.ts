@@ -63,7 +63,7 @@ import {
   type BackgroundProcess
 } from './backgroundActivity.ts'
 import { stripAnsi, stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
-import { DEFAULT_THEME, type Theme, themeFromSkin } from './theme.ts'
+import { DEFAULT_THEME, defaultThemeForEnv, type Theme, themeFromSkin } from './theme.ts'
 import {
   captureLiveSpawnTree,
   emptySpawnHistory,
@@ -1372,8 +1372,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return stderrRing.slice(-STDERR_TAIL).join('\n')
   }
 
+  // The last skin payload, kept so a polarity change (`/theme` pin, config
+  // hydrate) can re-derive the theme without waiting for a new skin event.
+  let lastSkin: GatewaySkinDecoded | undefined
   function setSkin(skin: GatewaySkinDecoded | undefined): void {
-    setState('theme', themeFromSkin(skin))
+    lastSkin = skin
+    setState('theme', skin ? themeFromSkin(skin) : defaultThemeForEnv())
+  }
+  /** Re-theme from the CURRENT polarity signals (Ink `reapplyTheme`). */
+  function reapplyTheme(): void {
+    setState('theme', lastSkin ? themeFromSkin(lastSkin) : defaultThemeForEnv())
   }
 
   // Trim the transcript to MESSAGE_CAP, dropping the OLDEST non-live rows IN
@@ -2223,6 +2231,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.info = info
         draft.hint = undefined
         draft.catalog = undefined
+        // Per-session: project-local skills follow the session's repo, so
+        // postSessionSetup refetches `commands.catalog` with the new session_id.
+        draft.commandCatalog = undefined
         draft.modelItems = undefined
         draft.sessionId = sessionId
         draft.resumeId = resumeId
@@ -4084,6 +4095,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     getDelegationControlRevision,
     setCatalog,
     setCommandCatalog,
+    reapplyTheme,
     addPendingImage,
     removePendingImage,
     restorePendingImage,
