@@ -407,7 +407,11 @@ const GatewayProtocolError = Schema.Struct({
 const GatewayExited = Schema.Struct({
   type: Schema.Literal('gateway.exited'),
   session_id: opt(Str),
-  payload: opt(Schema.Struct({ reason: opt(Str), code: opt(Schema.Number), signal: opt(Str) }))
+  // `attached`: the dashboard WebSocket dropped; the backend (and any live
+  // turn) is still running, so the copy says "reconnecting", not "exited".
+  payload: opt(
+    Schema.Struct({ reason: opt(Str), code: opt(Schema.Number), signal: opt(Str), attached: opt(Schema.Boolean) })
+  )
 })
 // Synthesized by the transport when the crash-loop respawn budget is spent:
 // no more respawns will be attempted. `code` is the last child exit code.
@@ -419,7 +423,9 @@ const GatewayRecoveryExhausted = Schema.Struct({
 const GatewayRecovering = Schema.Struct({
   type: Schema.Literal('gateway.recovering'),
   session_id: opt(Str),
-  payload: opt(Schema.Struct({ attempt: opt(Schema.Number), delay_ms: opt(Schema.Number) }))
+  payload: opt(
+    Schema.Struct({ attempt: opt(Schema.Number), delay_ms: opt(Schema.Number), attached: opt(Schema.Boolean) })
+  )
 })
 
 // ── The union ─────────────────────────────────────────────────────────
