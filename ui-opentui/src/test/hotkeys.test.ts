@@ -45,10 +45,11 @@ describe('platform action hotkeys', () => {
     expect(isRedrawHotkey(key('l', { ctrl: true, eventType: 'release' }), 'linux')).toBe(false)
   })
 
-  test('exit is action+D with the same platform mapping', () => {
+  test('exit is action+D, plus literal Ctrl+D (EOF) on macOS', () => {
     expect(isExitHotkey(key('d', { ctrl: true }), 'linux')).toBe(true)
     expect(isExitHotkey(key('d', { meta: true }), 'darwin')).toBe(true)
-    expect(isExitHotkey(key('d', { ctrl: true }), 'darwin')).toBe(false)
+    expect(isExitHotkey(key('d', { ctrl: true }), 'darwin')).toBe(true)
+    expect(isExitHotkey(key('d', { meta: true }), 'linux')).toBe(false)
     expect(isExitHotkey(key('d', { meta: true, eventType: 'release' }), 'darwin')).toBe(false)
   })
 
@@ -77,7 +78,7 @@ describe('platform action hotkeys', () => {
     expect(openTuiHotkeys('linux')).toContainEqual(['Ctrl+U/K', 'kill to line start / end (repeat across lines)'])
     expect(openTuiHotkeys('darwin')).toContainEqual([
       'Esc Esc',
-      'discard draft (recall with ↑) / open prompt history when empty'
+      'discard draft (recall with ↑) / stop the turn / open prompt history when empty'
     ])
   })
 

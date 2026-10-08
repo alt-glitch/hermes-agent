@@ -268,6 +268,10 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
     const index = selectedIndex()
     return index < 0 ? undefined : rows()[index]
   })
+  const enterOpensTail = () => {
+    const node = selected()
+    return node !== undefined && !replayMode() && isActiveSubagentStatus(node.item.status)
+  }
   const wide = () => dims().width >= 110
   const split = () => wide() && mode() !== 'list'
   const listWidth = () => (split() ? Math.min(52, Math.floor(dims().width * 0.4)) : Math.max(12, dims().width - 4))
@@ -321,8 +325,14 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
       history().snapshots.length > 0
         ? ` · [ / ] history ${String(historyIndex())}/${String(history().snapshots.length)}`
         : ''
-    const full = `↑↓/jk move · ←/→ fold · Enter detail · t tail · e steer${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · v timeline · ? keys · q close`
-    const medium = `↑↓ move · ←/→ fold · Enter inspect · t tail · e steer · s/f view · v timeline · ? keys · q close${replayMode() ? ' · controls locked' : ''}`
+    const enterHint = enterOpensTail()
+      ? 'Enter/t tail · d detail'
+      : replayMode()
+        ? 'Enter/d detail'
+        : 'Enter detail · t tail'
+    const full = `↑↓/jk move · ←/→ fold · ${enterHint} · e steer${locked} · s sort:${AGENTS_SORT_LABEL[sort()]} · f filter:${AGENTS_FILTER_LABEL[filter()]}${historyHint} · v timeline · ? keys · q close`
+    const mediumEnter = enterOpensTail() ? 'Enter/t tail · d detail' : 'Enter inspect · t tail'
+    const medium = `↑↓ move · ←/→ fold · ${mediumEnter} · e steer · s/f view · v timeline · ? keys · q close${replayMode() ? ' · controls locked' : ''}`
     const compact = `↑↓ move · ←/→ fold · Enter open · ? keys · q close${replayMode() ? ' · controls locked' : ''}`
     const tiny = `↑↓ · Enter open · ? keys · q close`
     const available = Math.max(8, dims().width - 4)
@@ -662,7 +672,9 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
     else if (key.name === 'left' || key.name === 'h') foldBranch(false)
     else if (key.name === 'right' || key.name === 'l') foldBranch(true)
     else if (key.name === 'return' && selected() !== undefined) {
-      setMode('detail')
+      // Ink parity (3863d13440): Enter opens the live tail for a live agent;
+      // replay rows and finished agents keep Enter → detail.
+      setMode(enterOpensTail() ? 'tail' : 'detail')
     } else if (key.name === 'up' || key.name === 'k') moveSelection(-1)
     else if (key.name === 'down' || key.name === 'j') moveSelection(1)
     else if (key.name === 'pageup') moveSelection(-listCapacity())
@@ -706,7 +718,7 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
                 >
                   <text wrapMode="word" fg={theme().color.text}>
                     {
-                      'Keys · Tab: list/detail · ↑↓/jk: move/scroll · PgUp/PgDn: page · Home/g: top · End/G: bottom\nTree: ←/h fold or parent · →/l expand or child · Enter detail · Esc back · q close\n[ older · ] newer/live · v timeline · t tail · e steer\nDetail: r reasoning · a activity · t tools · o output · b budget · d details · e trace · f files · n progress · L follow/bottom\nList: s sort · f filter (filtered/sorted views unfold branches) · x kill agent · X kill subtree · p pause/resume spawning (does not pause running agents)'
+                      'Keys · Tab: list/detail · ↑↓/jk: move/scroll · PgUp/PgDn: page · Home/g: top · End/G: bottom\nTree: ←/h fold or parent · →/l expand or child · Enter tail (live) / detail · d detail · Esc back · q close\n[ older · ] newer/live · v timeline · t tail · e steer\nDetail: r reasoning · a activity · t tools · o output · b budget · d details · e trace · f files · n progress · L follow/bottom\nList: s sort · f filter (filtered/sorted views unfold branches) · x kill agent · X kill subtree · p pause/resume spawning (does not pause running agents)'
                     }
                   </text>
                 </scrollbox>

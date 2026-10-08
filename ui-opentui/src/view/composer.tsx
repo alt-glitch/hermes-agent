@@ -183,6 +183,9 @@ export function Composer(props: {
    *  parent opens the session prompt-history viewer (or does nothing when the
    *  session has no prompts yet — never an empty modal). */
   onDoubleEsc?: (() => void) | undefined
+  /** Ctrl+X with a keyboard selection: write it to the clipboard; the
+   *  selection is removed only when this resolves true (transactional cut). */
+  onCutSelection?: ((text: string) => Promise<boolean>) | undefined
   /** The persisted draft to seed the buffer with on mount (survives the
    *  composer unmounting when a blocking prompt replaces it). */
   initialDraft?: (() => string) | undefined
@@ -752,6 +755,33 @@ export function Composer(props: {
       props.onQueueEdit?.(undefined)
       clearBuffer(true)
       doubleEsc.reset()
+      return
+    }
+    // Ctrl+X cuts a keyboard (Shift+arrow) selection before it can mean
+    // "delete queued row". Transactional (Ink 24af6685b0): the text leaves the
+    // buffer only after the clipboard write succeeds, and only if the same
+    // selection is still in place when the awaited write resolves.
+    if (
+      key.ctrl &&
+      key.name === 'x' &&
+      key.eventType !== 'release' &&
+      !key.meta &&
+      !key.option &&
+      ta?.focused === true &&
+      ta.hasSelection() &&
+      props.onCutSelection
+    ) {
+      key.preventDefault()
+      const range = ta.getSelection()
+      const text = ta.getSelectedText()
+      if (!range || text === '') return
+      const target = ta
+      void props.onCutSelection(text).then(ok => {
+        if (!ok || target.isDestroyed) return
+        const current = target.getSelection()
+        if (!current || current.start !== range.start || current.end !== range.end) return
+        target.deleteSelection()
+      })
       return
     }
     if (editIndex !== undefined && key.ctrl && key.name === 'x' && key.eventType !== 'release') {
