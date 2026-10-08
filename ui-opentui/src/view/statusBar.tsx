@@ -216,10 +216,16 @@ function shortModel(model: string): string {
   return model.includes('/') ? (model.split('/').at(-1) ?? model) : model
 }
 
-/** Reasoning effort → a compact suffix; hidden only when unset/default. */
-export function effortSuffix(effort: string | undefined, fast: boolean | undefined): string {
+/** Reasoning effort → a compact suffix; hidden only when unset/default. `wire`
+ *  is the level the route actually sends (`reasoning_effort_wire`): a clamped
+ *  Hermes step reads `ultra→max`, never as a distinct wire level. An unknown
+ *  ('') or verbatim wire makes no claim (Ink 171a1777b5). */
+export function effortSuffix(effort: string | undefined, fast: boolean | undefined, wire?: string): string {
   const parts: string[] = []
-  if (effort && effort !== 'default') parts.push(effort)
+  if (effort && effort !== 'default') {
+    const sent = (wire ?? '').trim().toLowerCase()
+    parts.push(sent && sent !== effort.trim().toLowerCase() ? `${effort}→${sent}` : effort)
+  }
   if (fast) parts.push('fast')
   return parts.length ? ` ·${parts.join('·')}` : ''
 }
@@ -306,7 +312,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     const m = info().model
     return m ? shortModel(m) : ''
   }
-  const effort = () => effortSuffix(info().effort, info().fast)
+  const effort = () => effortSuffix(info().effort, info().fast, info().effortWire)
   const pct = () => info().contextPercent
 
   /** Plain text of the ctx segment (`ctx: ███░░ 42% · 84k` / `ctx: 42%`). */
