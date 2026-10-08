@@ -27,20 +27,31 @@
  * the text staged for editing — clarifyRevisitState). A locked answer renders
  * on its own indented line under its question (muted italic "(skipped)" for an
  * empty lock). PromptOverlay owns Esc/Ctrl+C for both cancellation and an
- * uncertain local dismissal. multi_select rides the state untouched — no checkbox UX yet
- * (same deliberate gap as Ink).
+ * uncertain local dismissal.
+ *
+ * MULTI-SELECT (`multi_select` questions, Ink parity 5eea87882a): each choice row gets a
+ * `[ ]`/`[x]` checkbox; Space or a digit toggles, Enter locks the picks (or the highlighted
+ * choice when nothing is picked), and typed input text joins the picks. The answer is a raw
+ * JSON array string; an empty set is a skip. Revisiting restores the picks.
  */
 import { type BoxRenderable, type InputRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, Show } from 'solid-js'
 
-import { clarifyRevisitState, type ClarifyBatchQuestion } from '../../logic/clarifyBatch.ts'
+import {
+  clarifyAnswerText,
+  clarifyMultiAnswer,
+  clarifyRevisitState,
+  type ClarifyBatchQuestion
+} from '../../logic/clarifyBatch.ts'
 import { Markdown } from '../markdown.tsx'
 import { useTheme } from '../theme.tsx'
 
 export function ClarifyPrompt(props: {
   question: string
   choices: string[] | null
+  /** Single question: checkbox picks answered as a JSON array string. */
+  multiSelect?: boolean | undefined
   /** Batch mode: the ordered question list (single-question when absent/empty). */
   questions?: ClarifyBatchQuestion[] | undefined
   /** Batch mode: answers already locked (qid → answer). */
@@ -71,6 +82,11 @@ export function ClarifyPrompt(props: {
   // single question's. All cursor/quick-pick/input logic below is shared.
   const choices = createMemo(() => (isBatch() ? (activeQuestion()?.choices ?? []) : (props.choices ?? [])))
   const hasChoices = () => choices().length > 0
+  // Checkbox mode for the working question (only meaningful with choices).
+  const multi = () => hasChoices() && (isBatch() ? activeQuestion()?.multiSelect === true : props.multiSelect === true)
+  const [picked, setPicked] = createSignal<string[]>([])
+  const togglePick = (choice: string) =>
+    setPicked(current => (current.includes(choice) ? current.filter(v => v !== choice) : [...current, choice]))
   // The inline custom input sits at index === choices().length (the last row).
   const inputIndex = () => choices().length
   // Start on the first choice, or on the input when there are no choices.
@@ -106,10 +122,11 @@ export function ClarifyPrompt(props: {
     const next = questions().findIndex(q => answers()[q.qid] === undefined)
     if (next < 0) return
     const q = questions()[next]
-    const restored = clarifyRevisitState(q?.choices ?? [], q ? answers()[q.qid] : undefined)
+    const restored = clarifyRevisitState(q?.choices ?? [], q ? answers()[q.qid] : undefined, q?.multiSelect)
     setStaged(restored.custom)
     setActive(next)
     setSelected(restored.selected)
+    setPicked(restored.picked)
     if (inputRef) inputRef.value = restored.custom
   })
 
@@ -125,9 +142,16 @@ export function ClarifyPrompt(props: {
 
   const answerChoice = () => {
     const c = choices()[selected()]
-    if (c !== undefined) commit(c)
+    if (c === undefined) return
+    // Multi-select: Enter locks the picks, or the highlighted choice when nothing is picked.
+    if (multi()) commit(clarifyMultiAnswer(picked().length ? picked() : [c], []))
+    else commit(c)
   }
-  const submitCustom = () => commit(inputRef?.value ?? '')
+  // Typed text joins the picks in multi-select; a blank submit is a skip either way.
+  const submitCustom = () => {
+    const typed = inputRef?.value ?? ''
+    commit(multi() ? clarifyMultiAnswer(picked(), [typed]) : typed)
+  }
 
   /** Tab/Shift-Tab: cycle the active batch question (with wrap), restoring the
    *  revisited question's earlier state (cursor on its choice, or its typed
@@ -137,12 +161,13 @@ export function ClarifyPrompt(props: {
     if (qs.length === 0) return
     const next = (active() + delta + qs.length) % qs.length
     const q = qs[next]
-    const restored = clarifyRevisitState(q?.choices ?? [], q ? answers()[q.qid] : undefined)
+    const restored = clarifyRevisitState(q?.choices ?? [], q ? answers()[q.qid] : undefined, q?.multiSelect)
     // staged before active: the revisited question's input mounts synchronously
     // when `active` flips, reading the staged text in its ref callback.
     setStaged(restored.custom)
     setActive(next)
     setSelected(restored.selected)
+    setPicked(restored.picked)
     if (inputRef) inputRef.value = restored.custom
   }
 
@@ -162,7 +187,15 @@ export function ClarifyPrompt(props: {
       const quickIndex = key.name === '0' ? 9 : /^[1-9]$/.test(key.name) ? Number(key.name) - 1 : -1
       const choice = choices()[quickIndex]
       if (choice !== undefined) {
-        commit(choice)
+        // Multi-select: a digit toggles its choice instead of answering.
+        if (multi()) togglePick(choice)
+        else commit(choice)
+        key.preventDefault()
+        return
+      }
+      if (multi() && key.name === 'space') {
+        const highlighted = choices()[selected()]
+        if (highlighted !== undefined) togglePick(highlighted)
         key.preventDefault()
         return
       }
@@ -206,7 +239,9 @@ export function ClarifyPrompt(props: {
             {/* numbered + accent-when-selected; the choice text renders
                 markdown (bold/`code`) and wraps within the flex column (F5).
                 `fg` carries the selection accent as the base prose color. */}
-            <text fg={i() === selected() ? theme().color.accent : theme().color.muted}>{`${i() + 1}. `}</text>
+            <text fg={i() === selected() ? theme().color.accent : theme().color.muted}>
+              {`${multi() ? (picked().includes(choice) ? '[x] ' : '[ ] ') : ''}${i() + 1}. `}
+            </text>
             <box style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
               <Markdown text={choice} fg={i() === selected() ? theme().color.accent : theme().color.text} />
             </box>
@@ -274,8 +309,10 @@ export function ClarifyPrompt(props: {
             <text fg={theme().color.muted}>
               {props.statusHint ??
                 (onInput()
-                  ? '↑↓ select · Enter send · Esc/Ctrl+C send cancellation'
-                  : `↑↓ select · Enter choose · 1-${Math.min(choices().length, 10)} quick pick · Esc/Ctrl+C send cancellation`)}
+                  ? '↑↓ select · Enter send (blank skips) · Esc/Ctrl+C send cancellation'
+                  : multi()
+                    ? `↑↓ select · Space/1-${Math.min(choices().length, 10)} toggle · Enter send · Esc/Ctrl+C send cancellation`
+                    : `↑↓ select · Enter choose · 1-${Math.min(choices().length, 10)} quick pick · Esc/Ctrl+C send cancellation`)}
             </text>
           </>
         }
@@ -312,7 +349,9 @@ export function ClarifyPrompt(props: {
                           </text>
                         }
                       >
-                        {locked => <text fg={theme().color.ok}>{`→ ${locked()}`}</text>}
+                        {locked => (
+                          <text fg={theme().color.ok}>{`→ ${clarifyAnswerText(locked(), q.multiSelect)}`}</text>
+                        )}
                       </Show>
                     </box>
                   </Show>
@@ -327,7 +366,7 @@ export function ClarifyPrompt(props: {
 
         <text fg={theme().color.muted}>
           {props.statusHint ??
-            `${answeredCount()}/${questions().length} answered · ↑↓ select · Enter ${lockVerb()} · Tab/Shift+Tab switch question · Esc/Ctrl+C cancel all`}
+            `${answeredCount()}/${questions().length} answered · ↑↓ select${multi() ? ' · Space toggle' : ''} · Enter ${lockVerb()} (blank skips) · Tab/Shift+Tab switch question · Esc/Ctrl+C cancel all`}
         </text>
       </Show>
     </box>

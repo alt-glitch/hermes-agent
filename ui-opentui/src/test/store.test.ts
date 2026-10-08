@@ -1091,7 +1091,7 @@ describe('session store — batch (multi-question) clarify', () => {
     expect(p).toMatchObject({ choices: ['x', 'y'], qid: 'q2', question: 'Survivor?' })
   })
 
-  test('a clarify request with no askable question (or the removed single-question shape) is refused', () => {
+  test('a clarify request with no askable question is answered at once; the removed single-question shape is refused', () => {
     const decode = (params: Record<string, unknown>) =>
       decodeServerRequest({
         id: 'req-bad',
@@ -1099,7 +1099,7 @@ describe('session store — batch (multi-question) clarify', () => {
         params: { session_id: 'live-1', ...params },
         respond: () => false
       })
-    expect(decode({ questions: [] })).toBe('invalid-params')
+    expect(decode({ questions: [] })).toBe('answered')
     expect(
       decode({
         questions: [
@@ -1107,7 +1107,7 @@ describe('session store — batch (multi-question) clarify', () => {
           { qid: 'q1', question: '   ' }
         ]
       })
-    ).toBe('invalid-params')
+    ).toBe('answered')
     expect(decode({ question: 'Legacy?', choices: ['x'] })).toBe('invalid-params')
   })
 

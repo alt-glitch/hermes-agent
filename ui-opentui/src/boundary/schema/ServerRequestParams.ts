@@ -21,16 +21,13 @@ const ClarifyQuestion = Schema.Struct({
 })
 
 // One shape for 1-5 questions. `answers` rides only on a reconnect replay (null = skipped).
-// A list with no askable entry (non-empty qid and question) asks nothing: -32602.
+// A list with no askable entry (non-empty qid and question) asks nothing; the clarify row answers it
+// `{}` at once (Ink parity 5eea87882a) instead of opening an empty card.
 const ClarifyParams = Schema.Struct({
   session_id: Str,
   questions: Schema.mutable(Schema.Array(ClarifyQuestion)),
   answers: opt(Schema.NullOr(Schema.Record(Str, Schema.NullOr(Str))))
-}).check(
-  Schema.makeFilter(p => p.questions.some(q => q.qid !== '' && q.question.trim() !== ''), {
-    expected: 'a questions list with at least one non-empty qid and question'
-  })
-)
+})
 
 const ApprovalParams = Schema.Struct({
   session_id: Str,

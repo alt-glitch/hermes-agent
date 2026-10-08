@@ -690,20 +690,24 @@ describe('ClarifyPrompt — batch mode', () => {
 
 describe('clarifyRevisitState (pure restore helper)', () => {
   test('restores the cursor onto a choice answer', () => {
-    expect(clarifyRevisitState(['red', 'blue'], 'blue')).toEqual({ custom: '', selected: 1 })
+    expect(clarifyRevisitState(['red', 'blue'], 'blue')).toEqual({ custom: '', picked: [], selected: 1 })
   })
 
   test('stages a typed answer on the input row for editing', () => {
-    expect(clarifyRevisitState(['red', 'blue'], 'chartreuse')).toEqual({ custom: 'chartreuse', selected: 2 })
+    expect(clarifyRevisitState(['red', 'blue'], 'chartreuse')).toEqual({
+      custom: 'chartreuse',
+      picked: [],
+      selected: 2
+    })
   })
 
   test('stages a typed answer for an open-ended question (no choices)', () => {
-    expect(clarifyRevisitState([], 'free text')).toEqual({ custom: 'free text', selected: 0 })
+    expect(clarifyRevisitState([], 'free text')).toEqual({ custom: 'free text', picked: [], selected: 0 })
   })
 
   test('resets cleanly for unanswered and empty answers', () => {
-    expect(clarifyRevisitState(['red'], undefined)).toEqual({ custom: '', selected: 0 })
-    expect(clarifyRevisitState(['red'], '')).toEqual({ custom: '', selected: 0 })
+    expect(clarifyRevisitState(['red'], undefined)).toEqual({ custom: '', picked: [], selected: 0 })
+    expect(clarifyRevisitState(['red'], '')).toEqual({ custom: '', picked: [], selected: 0 })
   })
 })
 

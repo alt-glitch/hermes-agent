@@ -10,7 +10,13 @@ import type { AnswerOutcome, PromptAnswer, ServerRequestRouter } from './gateway
  */
 export type PromptReply =
   | { readonly kind: 'answer'; readonly requestId: string; readonly result: PromptAnswer }
-  | { readonly kind: 'lock'; readonly requestId: string; readonly questionId: string; readonly answer: string }
+  | {
+      readonly kind: 'lock'
+      readonly requestId: string
+      readonly questionId: string
+      /** null = skipped (a blank submit); `clarify.lock` keeps it as a skip. */
+      readonly answer: string | null
+    }
 
 export type PromptResponseDisposition =
   | { readonly kind: 'accepted' }
@@ -67,7 +73,7 @@ export interface PromptResponderOptions {
   readonly router: Pick<ServerRequestRouter, 'answer' | 'forget'>
   /** The `clarify.lock` RPC. */
   readonly lock: (params: {
-    readonly answer: string
+    readonly answer: string | null
     readonly question_id: string
     readonly request_id: string
   }) => Promise<unknown>
