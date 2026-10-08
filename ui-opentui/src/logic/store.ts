@@ -71,7 +71,7 @@ import {
   decodeSessionControlReadResponse,
   type GoalSnapshot
 } from '../boundary/schema/SessionControl.ts'
-import { DEFAULT_THEME, defaultThemeForEnv, type Theme, themeFromSkin } from './theme.ts'
+import { DEFAULT_THEME, type Theme, themeFromSkin } from './theme.ts'
 import {
   captureLiveSpawnTree,
   emptySpawnHistory,
