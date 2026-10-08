@@ -63,6 +63,12 @@ import {
   type BackgroundProcess
 } from './backgroundActivity.ts'
 import { stripAnsi, stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
+import { decodeProcessListResponse, type ProcessEntry } from '../boundary/schema/ProcessResponses.ts'
+import {
+  decodeGoalSnapshot,
+  decodeSessionControlReadResponse,
+  type GoalSnapshot
+} from '../boundary/schema/SessionControl.ts'
 import { DEFAULT_THEME, type Theme, themeFromSkin } from './theme.ts'
 import {
   captureLiveSpawnTree,
@@ -807,6 +813,11 @@ export interface StoreState {
   connection: ConnectionCard | undefined
   /** OS background processes (from `agents.list`) — shown in the /processes panel. */
   backgroundProcesses: BackgroundProcess[]
+  /** This session's background processes (from session-scoped `process.list`
+   *  polling) — the Processes block in the agents tray and /agents overlay. */
+  sessionProcesses: readonly ProcessEntry[]
+  /** The standing /goal (`session.control.read` / `session.control.update`) — the goal row. */
+  goal: GoalSnapshot | null
   /** In-flight background-PROMPT task ids (`/bg` → `prompt.background`, cleared on
    *  `background.complete`) — drives the `bg: N` status-bar badge. */
   bgTasks: string[]
@@ -1229,6 +1240,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
     subscription: undefined,
     connection: undefined,
     backgroundProcesses: [],
+    sessionProcesses: [],
+    goal: null,
     bgTasks: [],
     voice: {
       enabled: false,
@@ -2156,6 +2169,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
   ): void {
     clearStatusRestoreTimer()
     lastStatusNote = ''
+    goalReadSid = undefined
     if (noticeTimer) clearTimeout(noticeTimer)
     noticeTimer = undefined
     applied.clear()
@@ -2205,6 +2219,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // from `pending_connection` after the commit.
         draft.connection = undefined
         draft.bgTasks = []
+        draft.sessionProcesses = []
+        draft.goal = null
         draft.status = undefined
         draft.lastNotification = undefined
         draft.notice = null
@@ -2348,6 +2364,38 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('subscription', prev => (prev ? { ...prev, ...next } : prev))
   }
   /** Replace the OS-process snapshot (drives the /processes panel). */
+  // The session whose goal snapshot was (or is being) read once; reset with the
+  // session so a resume/new session re-reads instead of polling state.db.
+  let goalReadSid: string | undefined
+
+  /** True exactly once per adopted session: the caller should issue `session.control.read`. */
+  function claimGoalRead(sid: string): boolean {
+    if (goalReadSid === sid) return false
+    goalReadSid = sid
+    return true
+  }
+
+  /** A failed read releases the claim so the next poll tick retries. */
+  function releaseGoalRead(sid: string): void {
+    if (goalReadSid === sid) goalReadSid = undefined
+  }
+
+  /** `session.control.read` result for the CURRENT session (callers fence the sid). */
+  function applySessionControlRead(raw: unknown): boolean {
+    const decoded = decodeSessionControlReadResponse(raw)
+    if (Option.isNone(decoded)) return false
+    setState('goal', decodeGoalSnapshot(decoded.value.control.goal))
+    return true
+  }
+
+  /** Session-scoped `process.list` poll result (callers fence the sid). */
+  function applyProcessListResponse(raw: unknown): boolean {
+    const decoded = decodeProcessListResponse(raw)
+    if (Option.isNone(decoded)) return false
+    setState('sessionProcesses', decoded.value.processes ?? [])
+    return true
+  }
+
   function setBackgroundProcesses(procs: BackgroundProcess[]) {
     setState('backgroundProcesses', procs)
   }
@@ -3130,11 +3178,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       case 'session.control.update':
-        // The structured snapshot backs Desktop's interactive automation
-        // cards. Native controls remain /goal, /loop, /heartbeat and /subgoal;
-        // their command output plus status.update/turn events already provide
-        // the intended terminal behavior. Claim this decoded event explicitly
-        // without introducing a second session-control store or duplicate UI.
+        // Native controls remain /goal, /loop, /heartbeat and /subgoal; only the
+        // goal slot feeds terminal chrome (the standing goal row above the dock,
+        // Ink goalBar.tsx). Loop/heartbeat stay on their status/turn surfaces.
+        setState('goal', decodeGoalSnapshot(event.payload.control.goal))
         break
       // notification.show — background-activity notice (process/run state change,
       // credits, etc.). Renders as a distinct inline card (NOT a plain line) and
@@ -4158,6 +4205,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
     connectionSettled,
     patchSubscription,
     setBackgroundProcesses,
+    claimGoalRead,
+    releaseGoalRead,
+    applySessionControlRead,
+    applyProcessListResponse,
     addBgTask,
     hydrate,
     beginBuffer,

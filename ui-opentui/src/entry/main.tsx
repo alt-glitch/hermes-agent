@@ -792,9 +792,54 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         onFailure: cause => getLog().debug('sessions', 'session.active_list failed', { cause: String(cause) }),
         onInvalid: () => getLog().warn('sessions', 'invalid session.active_list response')
       })
+      // Live-work dock feeds (Ink useMainApp): the session's background
+      // processes poll with the dock tick; the standing goal is read ONCE per
+      // session (later changes arrive as session.control.update).
+      interface SessionScopedPacket {
+        readonly response: unknown
+        readonly sessionId: string
+      }
+      const isCurrentSession = (sessionId: string) =>
+        sessionId === gateway.sessionId() && sessionId === store.state.sessionId
+      const processListRefresher = createDelegationStatusRefresher({
+        intervalMs: 1_000,
+        apply: packet => {
+          if (!packet || typeof packet !== 'object') return false
+          const value = packet as SessionScopedPacket
+          if (!isCurrentSession(value.sessionId)) return true
+          return store.applyProcessListResponse(value.response)
+        },
+        fetch: async (): Promise<SessionScopedPacket> => {
+          const sessionId = gateway.sessionId()
+          if (!sessionId) throw new Error('no active session')
+          const response = await Effect.runPromise(gateway.request('process.list', { session_id: sessionId }))
+          return { response, sessionId }
+        },
+        onFailure: cause => getLog().debug('processes', 'process.list failed', { cause: String(cause) }),
+        onInvalid: () => getLog().debug('processes', 'invalid process.list response')
+      })
+      const readGoal = (sessionId: string) => {
+        if (!store.claimGoalRead(sessionId)) return
+        Effect.runPromise(gateway.request('session.control.read', { session_id: sessionId }))
+          .then(response => {
+            if (isCurrentSession(sessionId) && !store.applySessionControlRead(response)) {
+              getLog().debug('goal', 'invalid session.control.read response')
+            }
+          })
+          .catch((cause: unknown) => {
+            store.releaseGoalRead(sessionId)
+            getLog().debug('goal', 'session.control.read failed', { cause: String(cause) })
+          })
+      }
+
       const activeSessionsTimer = setInterval(() => {
-        if (!gateway.sessionId()) return
+        const liveSessionId = gateway.sessionId()
+        if (!liveSessionId) return
         void activeSessionsRefresher.refresh()
+        if (liveSessionId === store.state.sessionId) {
+          readGoal(liveSessionId)
+          void processListRefresher.refresh()
+        }
         // The roster poll is demand-driven: an idle session with an all-terminal
         // (or empty) roster and the full /agents dashboard closed would otherwise
         // issue a wasted Node→Python subagent.list RPC every 1.5s. Poll only when
@@ -812,6 +857,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           clearInterval(activeSessionsTimer)
           activeSessionsRefresher.invalidate()
           subagentListRefresher.invalidate()
+          processListRefresher.invalidate()
         })
       )
 
@@ -900,6 +946,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           delegationStatusRefresher.invalidate()
           activeSessionsRefresher.invalidate()
           subagentListRefresher.invalidate()
+          processListRefresher.invalidate()
         } else if (event.type === 'gateway.ready') {
           void delegationStatusRefresher.refresh(true)
           if (gateway.sessionId()) void subagentListRefresher.refresh(true)
