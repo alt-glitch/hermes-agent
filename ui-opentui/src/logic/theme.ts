@@ -496,6 +496,36 @@ export function detectLightMode(
   return lightDefaultTermPrograms.has(termProgram)
 }
 
+/** Which `detectLightMode` rung decided the polarity (for `/theme-info`).
+ *  Same ordered precedence as `detectLightMode`, so the two cannot disagree. */
+export type LightModeSource =
+  | 'HERMES_TUI_LIGHT'
+  | 'HERMES_TUI_THEME'
+  | 'HERMES_TUI_BACKGROUND'
+  | 'COLORFGBG'
+  | 'TERM_PROGRAM'
+  | 'default'
+
+export function lightModeSource(env: Record<string, string | undefined> = process.env): LightModeSource {
+  const lightFlag = (env.HERMES_TUI_LIGHT ?? '').trim().toLowerCase()
+  if (TRUE_RE.test(lightFlag) || FALSE_RE.test(lightFlag)) return 'HERMES_TUI_LIGHT'
+  const themeFlag = (env.HERMES_TUI_THEME ?? '').trim().toLowerCase()
+  if (themeFlag === 'light' || themeFlag === 'dark') return 'HERMES_TUI_THEME'
+  if (backgroundLuminance(env.HERMES_TUI_BACKGROUND ?? '') !== null) return 'HERMES_TUI_BACKGROUND'
+  const lastField = (env.COLORFGBG ?? '').trim().split(';').at(-1) ?? ''
+  if (/^\d+$/.test(lastField) && Number(lastField) < 16) return 'COLORFGBG'
+  if (LIGHT_DEFAULT_TERM_PROGRAMS.has((env.TERM_PROGRAM ?? '').trim())) return 'TERM_PROGRAM'
+  return 'default'
+}
+
+/** The skin-less theme for the CURRENT env signals (unlike `DEFAULT_THEME`,
+ *  which is frozen at module load): a live `/theme light|dark` pin must
+ *  re-derive the default palette too, not only skinned ones. */
+export function defaultThemeForEnv(env: Record<string, string | undefined> = process.env): Theme {
+  const isLight = detectLightMode(env)
+  return normalizeThemeForAnsiLightTerminal(isLight ? LIGHT_THEME : DARK_THEME, env, isLight)
+}
+
 function shouldNormalizeAnsiLightTheme(
   env: Record<string, string | undefined> = process.env,
   isLight = detectLightMode(env)

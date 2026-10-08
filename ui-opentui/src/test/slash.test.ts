@@ -1021,22 +1021,29 @@ describe('Ctrl+O model picker (upstream f27d45e288)', () => {
 
 describe('browser command parity', () => {
   test.each(['/browser use', '/browser use on'])(
-    '%s enables Browser Use and replaces the session after persistence',
+    '%s enables Browser Use through profile-scoped browser.manage without replacing the session',
     async command => {
-      const p = makeCtx(async () => ({ key: 'browser_backend', value: 'on' }))
+      const p = makeCtx(async () => ({ browser_use: true, connected: false }))
       await dispatchSlash(command, p.ctx)
-      expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'on' } }])
-      expect(p.newSessions).toEqual([
-        ['Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0', undefined]
+      expect(p.calls).toEqual([
+        { method: 'browser.manage', params: { action: 'use', enabled: true, session_id: 'sid-1' } }
+      ])
+      expect(p.newSessions).toEqual([])
+      expect(p.system).toEqual([
+        'Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0',
+        'applies to new sessions — this one keeps its current tools (/new to start one)'
       ])
     }
   )
 
-  test('/browser use off disables Browser Use and replaces the session after persistence', async () => {
-    const p = makeCtx(async () => ({ key: 'browser_backend', value: 'off' }))
+  test('/browser use off disables Browser Use via browser.manage and keeps the session', async () => {
+    const p = makeCtx(async () => ({ browser_use: false, connected: false }))
     await dispatchSlash('/browser use off', p.ctx)
-    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'off' } }])
-    expect(p.newSessions).toEqual([['Browser Use mode disabled — built-in browser tools restored', undefined]])
+    expect(p.calls).toEqual([
+      { method: 'browser.manage', params: { action: 'use', enabled: false, session_id: 'sid-1' } }
+    ])
+    expect(p.newSessions).toEqual([])
+    expect(p.system[0]).toBe('Browser Use mode disabled — built-in browser tools restored')
   })
 
   test('/browser use rejects invalid arguments without persistence or a session replacement', async () => {
@@ -1052,9 +1059,17 @@ describe('browser command parity', () => {
       throw new Error('config unavailable')
     })
     await dispatchSlash('/browser use', p.ctx)
-    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'on' } }])
     expect(p.newSessions).toEqual([])
     expect(p.system).toEqual(['/browser: config unavailable'])
+  })
+
+  test('/browser status reports Browser Use mode when the profile has it on', async () => {
+    const p = makeCtx(async () => ({ browser_use: true, connected: false }))
+    await dispatchSlash('/browser status', p.ctx)
+    expect(p.system).toEqual([
+      'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)',
+      'Browser: Browser Use mode (browser_exec via the Browser Use CLI 3.0)'
+    ])
   })
 
   test('connect uses the direct browser.manage boundary and commits live CDP chrome state', async () => {
@@ -2816,8 +2831,8 @@ describe('dispatchSlash — client commands', () => {
     })
     await dispatchSlash('/reload_skills', p.ctx)
     expect(p.calls).toEqual([
-      { method: 'skills.reload', params: {} },
-      { method: 'commands.catalog', params: {} }
+      { method: 'skills.reload', params: { session_id: 'sid-1' } },
+      { method: 'commands.catalog', params: { session_id: 'sid-1' } }
     ])
     expect(p.paged).toEqual([
       {
