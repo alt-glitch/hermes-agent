@@ -337,6 +337,13 @@ const WakeDetected = Schema.Struct({
     })
   )
 })
+// Core-detected affection (ily / <3 / good bot) → a brief status-bar ♥ flash
+// (upstream fbefb5c075). `kind` is open-ended; unknown payload keys are kept.
+const Reaction = Schema.Struct({
+  type: Schema.Literal('reaction'),
+  session_id: opt(Str),
+  payload: opt(Schema.StructWithRest(Schema.Struct({ kind: opt(Str) }), [Schema.Record(Str, Schema.Unknown)]))
+})
 const BrowserProgress = Schema.Struct({
   type: Schema.Literal('browser.progress'),
   session_id: opt(Str),
@@ -456,6 +463,7 @@ const ChromeTransportEvents = Schema.Union([
   VoiceStatus,
   VoiceTranscript,
   WakeDetected,
+  Reaction,
   BrowserProgress,
   BackgroundComplete,
   BtwComplete,

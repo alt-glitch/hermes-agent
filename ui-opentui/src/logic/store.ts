@@ -912,6 +912,11 @@ export interface StoreState {
   /** Persisted `display.bell_on_prompt`; rings once when a blocking prompt
    * opens in an interactive terminal. Config-owned across session resets. */
   bellOnPrompt: boolean
+  /** Monotonic affection-heart beat (gateway `reaction`: core-detected ily /
+   *  <3 / good bot). The status bar flashes ♥ on each bump (Ink fbefb5c075).
+   *  Not session-owned: a counter carries no session data, and scoped late
+   *  events are already dropped at the entry gate. */
+  goodVibesTick: number
   /** /reasoning full — expand ALL thinking ("Thinking"/"Thought") sections to show
    *  their full body, independently of the global /details mode. Defaults OFF;
    *  bare `/reasoning` syncs it from the persisted `display.reasoning_full` (via
@@ -1207,7 +1212,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
     ready: false,
     messages: [],
     dropped: 0,
-    theme: DEFAULT_THEME,
+    // A COPY: `setState('theme', next)` shallow-merges into this object, so
+    // seeding the module constant would let the first skin overwrite
+    // DEFAULT_THEME/DARK_THEME's `color` (a later canvas-less skin then kept
+    // the old background and the OSC 111 restore never fired).
+    theme: { ...DEFAULT_THEME },
     prompt: undefined,
     composerDraft: '',
     composerCursor: 0,
@@ -1276,6 +1285,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     detailsCommandOverride: false,
     detailsSections: {},
     bellOnPrompt: false,
+    goodVibesTick: 0,
     timestamps: false,
     destructiveSlashConfirm: true,
     reasoningFull: false,
@@ -1381,16 +1391,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return stderrRing.slice(-STDERR_TAIL).join('\n')
   }
 
-  // The last skin payload, kept so a polarity change (`/theme` pin, config
-  // hydrate) can re-derive the theme without waiting for a new skin event.
+  // The last applied skin, so a polarity change (terminal probe answer, live
+  // THEME_MODE, `/theme` pin, config hydrate) re-derives against the same skin.
   let lastSkin: GatewaySkinDecoded | undefined
   function setSkin(skin: GatewaySkinDecoded | undefined): void {
     lastSkin = skin
-    setState('theme', skin ? themeFromSkin(skin) : defaultThemeForEnv())
+    setState('theme', themeFromSkin(skin))
   }
-  /** Re-theme from the CURRENT polarity signals (Ink `reapplyTheme`). */
+  /** Re-theme from the current skin + polarity signals (Ink `reapplyTheme`). */
   function reapplyTheme(): void {
-    setState('theme', lastSkin ? themeFromSkin(lastSkin) : defaultThemeForEnv())
+    setState('theme', themeFromSkin(lastSkin))
   }
 
   // Trim the transcript to MESSAGE_CAP, dropping the OLDEST non-live rows IN
@@ -2869,6 +2879,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       case 'skin.changed':
         setSkin(event.payload)
+        break
+      case 'reaction':
+        setState('goodVibesTick', n => n + 1)
         break
       case 'session.info':
         applyInfo(event.payload)
