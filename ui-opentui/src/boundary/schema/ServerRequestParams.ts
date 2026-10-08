@@ -56,13 +56,24 @@ const SecretParams = Schema.Struct({
 
 const VaultUnlockParams = Schema.Struct({ session_id: Str, backend: Str, display_name: Str })
 
+const VaultSaveLoginParams = Schema.Struct({ session_id: Str, origin: Str, site: Str })
+
+const VaultCodeParams = Schema.Struct({ session_id: Str, site: opt(Schema.NullOr(Str)), hint: opt(Schema.NullOr(Str)) })
+
 const decoder = <T>(schema: Schema.Decoder<T>) => {
   const decode = Schema.decodeUnknownOption(schema)
   return (raw: unknown): T | undefined => Option.getOrUndefined(decode(raw))
 }
 
 /** Request methods ui-opentui answers with a prompt. */
-export type PromptMethod = 'approval' | 'clarify' | 'secret' | 'sudo' | 'vault.unlock_prompt'
+export type PromptMethod =
+  | 'approval'
+  | 'clarify'
+  | 'secret'
+  | 'sudo'
+  | 'vault.unlock_prompt'
+  | 'vault.save_login'
+  | 'vault.code'
 
 export const SERVER_REQUEST_DECODERS: {
   readonly [M in PromptMethod]: (raw: unknown) => ServerRequestParams<M> | undefined
@@ -71,5 +82,7 @@ export const SERVER_REQUEST_DECODERS: {
   clarify: decoder(ClarifyParams),
   secret: decoder(SecretParams),
   sudo: decoder(SudoParams),
-  'vault.unlock_prompt': decoder(VaultUnlockParams)
+  'vault.unlock_prompt': decoder(VaultUnlockParams),
+  'vault.save_login': decoder(VaultSaveLoginParams),
+  'vault.code': decoder(VaultCodeParams)
 }

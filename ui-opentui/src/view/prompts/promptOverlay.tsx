@@ -1,7 +1,8 @@
 /**
  * PromptOverlay — renders the active blocking prompt and answers the backend→client
  * request that opened it (result shapes per tui_gateway/contracts/server_requests.py):
- *   clarify {answers} · approval {choice} · sudo / secret / vault.unlock_prompt {value};
+ *   clarify {answers} · approval {choice} · sudo / secret / vault.* {value};
+ *   vault.save_login answers `{value: JSON {identifier, password}}`, `''` declining;
  *   a single-question clarify answers `{answers: {[qid]: text | null}}` (null = skipped); a
  *   batch clarify locks one answer at a time through the `clarify.lock` RPC.
  * Idle Esc/Ctrl+C sends the deny/empty reply. While delivery is pending or
@@ -29,6 +30,7 @@ import { ApprovalPrompt } from './approvalPrompt.tsx'
 import { ClarifyPrompt } from './clarifyPrompt.tsx'
 import { ConfirmPrompt } from './confirmPrompt.tsx'
 import { MaskedPrompt } from './maskedPrompt.tsx'
+import { VaultSaveLoginPrompt } from './vaultSaveLoginPrompt.tsx'
 
 export interface PromptOverlayProps {
   readonly store: SessionStore
@@ -60,9 +62,13 @@ type GatewayPromptOf<K extends GatewayPromptKind> = Extract<GatewayPrompt, { kin
  * (ValueResult), with `''` as the cancellation. Each kind is one row here — the
  * card copy is declared once, so submit, cancel and keyboard focus cannot drift apart.
  */
-type MaskedKind = 'sudo' | 'secret' | 'vaultUnlock'
+type MaskedKind = 'sudo' | 'secret' | 'vaultUnlock' | 'vaultCode'
 interface MaskedCard<K extends MaskedKind> {
   readonly icon: string
+  /** Show the typed text (a one-time code); omitted = masked. */
+  readonly reveal?: true
+  /** The `{value}` sent for what was typed; omitted = as typed. */
+  readonly encode?: (typed: string) => string
   readonly label: (prompt: GatewayPromptOf<K>) => string
   /** Secondary line; `''` renders nothing. */
   readonly sub: (prompt: GatewayPromptOf<K>) => string
@@ -78,6 +84,14 @@ const MASKED_CARDS = {
     icon: '🔐',
     label: prompt => `Unlock ${prompt.displayName} for this session`,
     sub: () => 'master password · goes to the manager CLI only · Esc keeps it locked'
+  },
+  vaultCode: {
+    icon: '🔢',
+    label: prompt => (prompt.site ? `Verification code for ${prompt.site}` : 'Verification code'),
+    sub: prompt =>
+      [prompt.hint, 'typed into the page only · never shown to the model · Esc skips'].filter(Boolean).join(' · '),
+    reveal: true,
+    encode: typed => typed.trim()
   }
 } satisfies { [K in MaskedKind]: MaskedCard<K> }
 
@@ -101,7 +115,9 @@ const CANCEL_RESULTS = {
   clarify: {},
   secret: { value: '' },
   sudo: { value: '' },
-  vaultUnlock: { value: '' }
+  vaultUnlock: { value: '' },
+  vaultSaveLogin: { value: '' },
+  vaultCode: { value: '' }
 } as const satisfies Record<GatewayPromptKind, PromptAnswer>
 
 export function PromptOverlay(props: PromptOverlayProps) {
@@ -116,7 +132,9 @@ export function PromptOverlay(props: PromptOverlayProps) {
   // Keyboard-only cards (no pointer target) take focus on the overlay root so
   // Enter/Esc reach them; approval and confirm own their own focus handling.
   const focusKeyboardOnlyPrompt = (current: ActivePrompt | undefined): void => {
-    if (current && (current.kind === 'clarify' || isMasked(current))) rootRef?.focus()
+    if (current && (current.kind === 'clarify' || current.kind === 'vaultSaveLogin' || isMasked(current))) {
+      rootRef?.focus()
+    }
   }
 
   onMount(() => focusKeyboardOnlyPrompt(prompt()))
@@ -270,6 +288,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
   const asApproval = narrow('approval')
   const asClarify = narrow('clarify')
   const asConfirm = narrow('confirm')
+  const asVaultSaveLogin = narrow('vaultSaveLogin')
   const asMasked = (): GatewayPromptOf<MaskedKind> | undefined => {
     const p = prompt()
     return p && isMasked(p) ? p : undefined
@@ -320,11 +339,26 @@ export function PromptOverlay(props: PromptOverlayProps) {
                 icon={card().icon}
                 label={card().label(p())}
                 sub={card().sub(p())}
+                reveal={card().reveal}
                 statusHint={responseHint()}
-                onSubmit={value => respond(answer(p(), { value }))}
+                onSubmit={typed => respond(answer(p(), { value: card().encode?.(typed) ?? typed }))}
               />
             )
           }}
+        </Match>
+        <Match when={asVaultSaveLogin()} keyed>
+          {p => (
+            // Keyed: a new save-login request restarts at the identifier step.
+            <VaultSaveLoginPrompt
+              site={p.site}
+              statusHint={responseHint()}
+              onReady={(identifier, password) =>
+                identifier && password
+                  ? respond(answer(p, { value: JSON.stringify({ identifier, password }) }))
+                  : respond(answer(p, CANCEL_RESULTS.vaultSaveLogin), 'cancel')
+              }
+            />
+          )}
         </Match>
         <Match when={asConfirm()}>
           {p => (

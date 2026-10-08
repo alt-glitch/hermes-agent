@@ -255,6 +255,10 @@ export type ActivePrompt =
   | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
   /** External password-manager unlock — masked master password for one session. */
   | { kind: 'vaultUnlock'; backend: string; displayName: string; requestId: string }
+  /** Save a login for `site` (`vault.save_login`): identifier, then masked password; never stored here. */
+  | { kind: 'vaultSaveLogin'; origin: string; site: string; requestId: string }
+  /** One-time / 2FA code the user reads from their device (`vault.code`); `site`/`hint` may be ''. */
+  | { kind: 'vaultCode'; site: string; hint: string; requestId: string }
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
   | { kind: 'confirm'; spec: ConfirmSpec; onConfirm: () => void }
 
@@ -277,7 +281,9 @@ const PROMPT_LABEL: Record<ActivePrompt['kind'], string> = {
   confirm: 'confirmation',
   secret: 'secret prompt',
   sudo: 'sudo prompt',
-  vaultUnlock: 'password-manager unlock'
+  vaultUnlock: 'password-manager unlock',
+  vaultSaveLogin: 'save-login prompt',
+  vaultCode: 'verification-code prompt'
 }
 
 const BATCH_SETTLEMENT_REASON: Partial<Record<PromptSettlement, string>> = {

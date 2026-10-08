@@ -7,6 +7,7 @@
  * normal single-line input without ever placing the secret in a renderable.
  *
  * Enter submits the real buffer; PromptOverlay owns scoped Esc/Ctrl+C handling.
+ * `reveal` shows what is typed (a username or one-time code, never a password).
  */
 import { useKeyboard, usePaste } from '@opentui/solid'
 import { createMemo, createSignal, Show } from 'solid-js'
@@ -77,11 +78,15 @@ export function MaskedPrompt(props: {
   /** Standalone owners may provide close; PromptOverlay uses its scoped layer. */
   onCancel?: (() => void) | undefined
   statusHint?: string | undefined
+  /** Show the typed text instead of `*` (an identifier or a one-time code — not a secret). */
+  reveal?: boolean | undefined
 }) {
   const theme = useTheme()
   const [editor, setEditor] = createSignal<MaskedEditorState>({ graphemes: [], cursor: 0 })
-  const beforeCursor = createMemo(() => '*'.repeat(editor().cursor))
-  const afterCursor = createMemo(() => '*'.repeat(editor().graphemes.length - editor().cursor))
+  const shown = (graphemes: readonly string[]): string =>
+    props.reveal ? graphemes.join('') : '*'.repeat(graphemes.length)
+  const beforeCursor = createMemo(() => shown(editor().graphemes.slice(0, editor().cursor)))
+  const afterCursor = createMemo(() => shown(editor().graphemes.slice(editor().cursor)))
 
   usePaste(event => {
     setEditor(state => maskedInsert(state, new TextDecoder().decode(event.bytes)))
@@ -133,7 +138,10 @@ export function MaskedPrompt(props: {
         <text fg={theme().color.accent}>▍</text>
         <text fg={theme().color.text}>{afterCursor()}</text>
       </box>
-      <text fg={theme().color.muted}>{props.statusHint ?? 'Enter send · Esc/Ctrl+C send cancellation · masked'}</text>
+      <text fg={theme().color.muted}>
+        {props.statusHint ??
+          `Enter send · Esc/Ctrl+C send cancellation · ${props.reveal ? 'shown as typed' : 'masked'}`}
+      </text>
     </box>
   )
 }
