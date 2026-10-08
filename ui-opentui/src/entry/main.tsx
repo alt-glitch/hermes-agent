@@ -89,6 +89,7 @@ import {
 } from '../logic/agentsRuntime.ts'
 import { isTerminalStatus } from '../logic/subagentTree.ts'
 import { nthAssistantResponse } from '../logic/copy.ts'
+import { SETUP_REQUIRED_TITLE, setupRequiredText } from '../logic/errorCopy.ts'
 import { presentBillingVerification } from '../logic/billingVerification.ts'
 import { performHeapdump } from '../logic/diagnostics.ts'
 import {
@@ -2407,16 +2408,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
             if (result.kind === 'setup-required') {
               store.setHint('setup required')
-              store.openPager(
-                'Setup Required',
-                [
-                  'A new session cannot start until a model provider is configured.',
-                  '',
-                  '• /model — choose from available configured providers',
-                  '• /setup — run the guided provider setup',
-                  '• Ctrl+C — exit, then run `hermes setup`'
-                ].join('\n')
-              )
+              store.openPager(SETUP_REQUIRED_TITLE, setupRequiredText())
               return
             }
 

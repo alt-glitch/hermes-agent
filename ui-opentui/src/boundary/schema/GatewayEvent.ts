@@ -12,7 +12,7 @@
  *
  * Types are INFERRED from the schema (`typeof X["Type"]`), never hand-declared.
  */
-import { Schema } from 'effect'
+import { Effect, Option, Schema } from 'effect'
 
 import { ConnectionRequestPayloadSchema, ConnectionUpdatePayloadSchema } from './Connection.ts'
 import { SpawnTreeSubagentSchema } from './Delegation.ts'
@@ -108,6 +108,17 @@ export const BillingBlockSchema = Schema.Struct({
 })
 export type BillingBlockDecoded = typeof BillingBlockSchema.Type
 
+// Advisory {layer, code, retryable, provider} failure descriptor on a
+// status:error message.complete (agent/error_surface.py). Every field is
+// lenient and the whole descriptor drops to absent when malformed: it only
+// picks copy (logic/errorCopy.ts), so it must never fail the terminal frame.
+const LenientStr = opt(Str).pipe(Schema.catchDecoding(() => Effect.succeed(Option.none())))
+const LenientBool = opt(Schema.Boolean).pipe(Schema.catchDecoding(() => Effect.succeed(Option.none())))
+export const ErrorSurfaceSchema = Schema.StructWithRest(
+  Schema.Struct({ code: LenientStr, layer: LenientStr, provider: LenientStr, retryable: LenientBool }),
+  [Schema.Record(Str, Schema.Unknown)]
+)
+
 const MessageComplete = Schema.Struct({
   type: Schema.Literal('message.complete'),
   session_id: opt(Str),
@@ -132,6 +143,7 @@ const MessageComplete = Schema.Struct({
       error: opt(Str),
       partial: opt(Schema.Boolean),
       recoverable: opt(Schema.Boolean),
+      error_surface: opt(ErrorSurfaceSchema).pipe(Schema.catchDecoding(() => Effect.succeed(Option.none()))),
       usage: opt(Schema.Record(Str, Schema.Unknown))
     })
   )
@@ -390,6 +402,13 @@ const GatewayExited = Schema.Struct({
   session_id: opt(Str),
   payload: opt(Schema.Struct({ reason: opt(Str), code: opt(Schema.Number), signal: opt(Str) }))
 })
+// Synthesized by the transport when the crash-loop respawn budget is spent:
+// no more respawns will be attempted. `code` is the last child exit code.
+const GatewayRecoveryExhausted = Schema.Struct({
+  type: Schema.Literal('gateway.recovery_exhausted'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ code: opt(Schema.Number), reason: opt(Str) }))
+})
 const GatewayRecovering = Schema.Struct({
   type: Schema.Literal('gateway.recovering'),
   session_id: opt(Str),
@@ -454,7 +473,8 @@ const ChromeTransportEvents = Schema.Union([
   GatewayStartTimeout,
   GatewayProtocolError,
   GatewayExited,
-  GatewayRecovering
+  GatewayRecovering,
+  GatewayRecoveryExhausted
 ])
 export const GatewayEventSchema = Schema.Union([SessionTurnEvents, ChromeTransportEvents]).pipe(
   Schema.toTaggedUnion('type')

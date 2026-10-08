@@ -15,6 +15,7 @@
 import { Effect, Layer, Option, Schema } from 'effect'
 import { batch } from 'solid-js'
 
+import { exitCodeFromReason } from '../../logic/errorCopy.ts'
 import { backoffMs, planGatewayRecovery } from '../../logic/gatewayRecovery.ts'
 import { GatewayError } from '../errors.ts'
 import { getLog } from '../log.ts'
@@ -201,7 +202,10 @@ function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
     const plan = planGatewayRecovery(exitedSessionId ?? null, recoverSid ?? null, recoveryAttempts, Date.now())
     recoveryAttempts = plan.attempts
     if (!plan.recover) {
-      enqueue({ type: 'error', payload: { message: 'gateway exited repeatedly — restart the TUI to retry' } })
+      // Budget spent: the store says so ONCE with the exit code + last stderr
+      // line (Ink useMainApp backendGaveUp) instead of a bare error row.
+      const code = exitCodeFromReason(reason)
+      enqueue({ type: 'gateway.recovery_exhausted', payload: { reason, ...(code === undefined ? {} : { code }) } })
       return
     }
     recoverSid = plan.sid ?? undefined
