@@ -25,6 +25,7 @@ import { actionCommand, promptHistoryEntries } from '../logic/promptHistory.ts'
 import type { BackgroundProcess } from '../logic/backgroundActivity.ts'
 import type { PickerItem, SessionStore } from '../logic/store.ts'
 import { AgentsTray, type AgentsTrayApi } from './agentsTray.tsx'
+import { GoalRow, ProcessesTray } from './liveWorkDock.tsx'
 import { Composer } from './composer.tsx'
 import { DimensionsProvider } from './dimensions.tsx'
 import { Header } from './header.tsx'
@@ -261,6 +262,8 @@ export function App(props: AppProps) {
                   {/* ambient widget dock — reserves ≤6 rows directly above the
                       status bar; the composer below stays mounted + focused. */}
                   <WidgetDock placement="dock-bottom" />
+                  {/* standing /goal row above the live-work dock (Ink goalBar.tsx) */}
+                  <GoalRow goal={props.store.state.goal} />
                   <StatusBar store={props.store} subagentsVisible={subagentsVisible()} />
                   <Switch
                     fallback={
@@ -384,6 +387,12 @@ export function App(props: AppProps) {
                       bind={api => (trayApi = api)}
                     />
                   </Show>
+                  {/* session background processes (process.list) — surfaces on its
+                      own, keeps an exit verdict for 60s after exited_at. */}
+                  <ProcessesTray
+                    processes={props.store.state.sessionProcesses}
+                    collapsed={props.store.state.agentsTrayCollapsed}
+                  />
                 </box>
               </>
             }
@@ -394,6 +403,7 @@ export function App(props: AppProps) {
                 subagents={props.store.state.subagents}
                 delegation={props.store.state.delegation}
                 history={props.store.state.spawnHistory}
+                processes={props.store.state.sessionProcesses}
                 initialHistoryIndex={props.store.state.dashboardHistoryIndex}
                 onClose={closeDashboard}
                 {...(props.store.state.dashboardAgent === undefined

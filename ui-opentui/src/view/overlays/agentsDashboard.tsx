@@ -12,6 +12,7 @@ import {
   isActiveSubagentStatus,
   type DelegationState
 } from '../../logic/agentStatus.ts'
+import type { ProcessEntry } from '../../boundary/schema/ProcessResponses.ts'
 import { diffSpawnSnapshots, type SpawnHistoryState, type SpawnSnapshot } from '../../logic/spawnHistory.ts'
 import {
   buildSubagentTree,
@@ -25,6 +26,7 @@ import {
 import { truncRight } from '../../logic/truncate.ts'
 import { useDimensions } from '../dimensions.tsx'
 import { useCloseLayer } from '../keymap.tsx'
+import { ProcessesSection } from '../liveWorkDock.tsx'
 import { useTheme } from '../theme.tsx'
 import {
   AGENTS_FILTER_LABEL,
@@ -58,6 +60,8 @@ export interface AgentsDashboardProps {
   readonly delegation?: DelegationState
   readonly diffPair?: AgentsDashboardDiffPair
   readonly history?: SpawnHistoryState
+  /** This session's background processes (`process.list`), listed under the tree. */
+  readonly processes?: readonly ProcessEntry[]
   readonly initialHistoryIndex?: number
   readonly onClearDiff?: () => void
   readonly onKillAgent?: (id: string) => MaybePromise<DashboardActionResult>
@@ -921,6 +925,9 @@ export function AgentsDashboard(props: AgentsDashboardProps) {
               </box>
             </Show>
 
+            <Show when={!replayMode()}>
+              <ProcessesSection processes={props.processes ?? []} width={Math.max(10, dims().width - 6)} />
+            </Show>
             <box style={{ flexDirection: 'column', flexShrink: 0, paddingLeft: 1, paddingRight: 1 }}>
               <Show when={visibleFlash()}>
                 {message => (
