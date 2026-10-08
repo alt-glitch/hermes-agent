@@ -127,12 +127,26 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
     run = subprocess.run
     pushes = []
 
+    def _upstream_sha():
+        # The fork sync merges the commit it resolved from refs/remotes/upstream/main (m2).
+        found = run(['git', 'rev-parse', '-q', '--verify', 'refs/remotes/upstream/main'], cwd=t.clone,
+                    capture_output=True, text=True, encoding='utf-8')
+        return found.stdout.strip() or '<no upstream>'
+
     def fault(command, *args, **kwargs):
         # The stash-restore import-health probe runs the managed-runtime python, not
         # sys.executable (pm envs resolve a PM interpreter); any python binary is legit.
         name = Path(command[0]).name.lower()
         assert name in {'git', 'git.exe'} or name.startswith('python') or command[0] == sys.executable, command
         assert Path(kwargs['cwd']).resolve() in {t.clone, t.origin}, command
+        if 'merge' in command and _upstream_sha() in command:  # the fork sync's local fast-forward
+            result = run(command, *args, **kwargs)
+            if case.startswith('fork-late'):
+                if case.endswith('wrong-branch'):
+                    run(['git', 'checkout', '-qb', 'wrong'], cwd=t.clone, check=True, capture_output=True)
+                if case.endswith('reverted'):
+                    run(['git', 'reset', '--hard', t.base], cwd=t.clone, check=True, capture_output=True)
+            return result
         if 'merge' in command and '--ff-only' in command:
             if case == 'no-move':
                 return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
@@ -143,11 +157,6 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
                 run(['git', 'reset', '--hard', t.base], cwd=t.clone, check=True, capture_output=True)
             return result
         result = run(command, *args, **kwargs)
-        if 'pull' in command and case.startswith('fork-late'):
-            if case.endswith('wrong-branch'):
-                run(['git', 'checkout', '-qb', 'wrong'], cwd=t.clone, check=True, capture_output=True)
-            if case.endswith('reverted'):
-                run(['git', 'reset', '--hard', t.base], cwd=t.clone, check=True, capture_output=True)
         if 'push' in command and 'origin' in command:
             pushes.append(result.returncode)
         return result
@@ -330,7 +339,11 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
             local += '?' + parsed.query
         return real_open(local, *args, **kwargs)
 
-    def guarded_run(command, *args, **kwargs):
+    from hermes_cli import update_custody
+
+    real_custody_run, seam = update_custody.run, threading.local()
+
+    def guard(command, args, kwargs, call):
         nonlocal fetched, failed
         command = list(map(str, command))
         assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
@@ -343,10 +356,27 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
         if fetched and not failed and '--abbrev-ref' in command and kwargs.get('check'):
             failed = True
             raise subprocess.CalledProcessError(128, command, '', 'fixture: Git file I/O failed')
-        result = real_run(command, *args, **kwargs)
+        result = call(command, *args, **kwargs)
         if 'fetch' in command:
             fetched = True
         return result
+
+    def guarded_run(command, *args, **kwargs):
+        if getattr(seam, 'custody', False):  # already guarded at the custody seam below
+            return real_run(command, *args, **kwargs)
+        return guard(command, args, kwargs, real_run)
+
+    def custody_call(command, *args, **kwargs):
+        seam.custody = True
+        try:
+            return real_custody_run(command, *args, **kwargs)
+        finally:
+            seam.custody = False
+
+    def guarded_custody_run(command, *args, **kwargs):
+        # The updater's git goes through update_custody.run: on Windows inside an update that is a
+        # suspended Popen bound to the update's job, not subprocess.run, so faults go in here too.
+        return guard(command, args, kwargs, custody_call)
 
     if transport in {'gitless', 'no-git'}:
         (t.clone / '.git').rename(tmp_path / 'git-state')
@@ -355,6 +385,7 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
     before = (t.clone / 'content.txt').read_bytes()
     monkeypatch.setattr(urllib.request, 'urlopen', local_open)
     monkeypatch.setattr(subprocess, 'run', guarded_run)
+    monkeypatch.setattr(update_custody, 'run', guarded_custody_run)
     try:
         if transport == 'dirty':
             with pytest.raises(SystemExit) as error:

@@ -647,6 +647,26 @@ export interface FreeTierStatusResult {
   error_code?: string | null
   retryable?: boolean | null
   retry_after?: number | null
+  challenge?: FreeTierChallengePayload | null
+}
+/** ``hermes_cli/anon_challenge.py::BrowserChallenge.as_payload``: the ``free_tier.challenge`` event, and ``free_tier.status``'s ``challenge`` field for a client that connected after it. */
+export interface FreeTierChallengePayload {
+  type: 'browser'
+  url: string
+  required: boolean
+  expires_in: number
+  message: string
+  attempt?: number
+  [key: string]: unknown
+}
+export interface FreeTierChallengeResultParams {
+  profile?: string | null
+  url: string
+  attempt?: number
+  outcome: 'done' | 'failed' | 'closed' | 'timeout' | 'refused' | 'error' | 'unsupported'
+}
+export interface FreeTierChallengeResult {
+  accepted: boolean
 }
 export interface FreeTierProvisionResult {
   has_guest: boolean
@@ -659,11 +679,12 @@ export interface FreeTierProvisionResult {
 export interface FreeTierAckNoticeResult {
   acked: boolean
 }
-/** The focused profile's ``telemetry.shared_metrics`` opt-ins. ``send`` is never true while ``enabled`` is false; ``decided`` = either key is written in config.yaml (the shipped defaults are not an answer). */
+/** The focused profile's ``telemetry.shared_metrics`` opt-ins. ``send`` is never true while ``enabled`` is false; ``decided`` = either key is written in config.yaml (the shipped defaults are not an answer) and it is not a ``reask``: an "off" from before the type-ahead fix, offered once more with the reason. */
 export interface SharedMetricsConsentResult {
   enabled: boolean
   send: boolean
   decided: boolean
+  reask?: boolean
 }
 /** ``send`` is ignored unless ``enabled``; ``first_run`` marks the Desktop first-run answer. */
 export interface SharedMetricsSetParams {
@@ -5189,6 +5210,8 @@ export interface RpcMethods {
   'file.attach': { params: FileAttachParams; result: FileAttachResult }
   /** Mark the one-time availability notice as shown on the free-tier identity. */
   'free_tier.ack_notice': { params: ProfileParams; result: FreeTierAckNoticeResult }
+  /** Report a browser window outcome for the matching pending attempt; mint remains authoritative. */
+  'free_tier.challenge_result': { params: FreeTierChallengeResultParams; result: FreeTierChallengeResult }
   /** Explicit retry of the free-tier identity mint when the boot bootstrap could not create it. */
   'free_tier.provision': { params: ProfileParams; result: FreeTierProvisionResult }
   /** Pure read of the focused profile's free-tier identity state (no network, no side effects). */
@@ -5647,6 +5670,7 @@ export const RPC_METHODS = [
   'display.thumbnail',
   'file.attach',
   'free_tier.ack_notice',
+  'free_tier.challenge_result',
   'free_tier.provision',
   'free_tier.status',
   'gateway.capabilities',
@@ -5934,6 +5958,8 @@ export interface BackendGatewayEventMap {
   'display.status': DisplayStatusPayload
   /** A session-level failure outside a turn (agent init, model switch, compression, resume). */
   error: ErrorPayload
+  /** The account service wants a browser challenge cleared before the free-tier token exchange (broadcast); the desktop loads ``url`` in a hidden window. */
+  'free_tier.challenge': FreeTierChallengePayload
   /** First frame of a connection: the resolved skin, the change-event capability and the replay epoch. */
   'gateway.ready': GatewayReadyPayload
   /** Apply a named desktop layout preset. */
@@ -6076,6 +6102,7 @@ export const GATEWAY_EVENT_TYPES = [
   'display.lease',
   'display.status',
   'error',
+  'free_tier.challenge',
   'gateway.ready',
   'layout.apply',
   'message.complete',

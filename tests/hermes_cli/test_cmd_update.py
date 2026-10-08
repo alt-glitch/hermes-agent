@@ -202,7 +202,8 @@ class TestForkBareUpdateFollowsCheckoutBranch:
         monkeypatch.setattr(hm, "_run_pre_update_backup", lambda *_: None)
         monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
         monkeypatch.setattr(hm, "_resume_windows_gateways_after_update", lambda *_a, **_k: None)
-        monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (False, ["git"], False))
+        monkeypatch.setattr(
+            update_cmd, "_prepare_git_command", lambda **_k: (False, ["git"], False))
         # The unpublished main record resolves to the main source branch without
         # reaching R2; the fork's checkout-branch following must survive it.
         monkeypatch.setattr(
