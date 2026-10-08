@@ -5,8 +5,8 @@
  * fail are answered -32602. One row per method turns the decoded params into the store's
  * `ActivePrompt`; the prompt overlay renders it and answers through `answer(id, result)`, which
  * writes the JSON-RPC response `{jsonrpc, id, result}`.
- * Methods without a row (desktop GUI bridges: preview.*, window.read, terminal.read, tour,
- * vault.save_login, vault.code) are not handled; the client answers -32601 so the tool fails fast.
+ * Methods without a row (desktop GUI bridges: preview.*, window.read, terminal.read, tour) are not
+ * handled; the client answers -32601 so the tool fails fast.
  */
 import { createEffect, createRoot, on } from 'solid-js'
 
@@ -68,6 +68,15 @@ export const SERVER_REQUEST_PROMPTS: { readonly [M in PromptMethod]: PromptRow<M
   },
   'vault.unlock_prompt': {
     open: (id, p) => ({ kind: 'vaultUnlock', backend: p.backend, displayName: p.display_name, requestId: id }),
+    accepts: isValue
+  },
+  // The answer is `{value: JSON {identifier, password}}`; `''` declines (nothing is saved).
+  'vault.save_login': {
+    open: (id, p) => ({ kind: 'vaultSaveLogin', origin: p.origin, site: p.site || p.origin, requestId: id }),
+    accepts: isValue
+  },
+  'vault.code': {
+    open: (id, p) => ({ kind: 'vaultCode', site: p.site ?? '', hint: p.hint ?? '', requestId: id }),
     accepts: isValue
   }
 }
