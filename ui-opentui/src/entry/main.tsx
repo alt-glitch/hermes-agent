@@ -33,6 +33,7 @@ import { openInEditor } from '../boundary/externalInput.ts'
 import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../boundary/terminalSetup.ts'
 import { GatewayService, type GatewayTransport } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
+import { installDeadOutputGuard } from '../boundary/deadOutput.ts'
 import { getLog } from '../boundary/log.ts'
 import { createPromptResponder } from '../boundary/promptResponses.ts'
 import { createServerRequestRouter } from '../boundary/gateway/serverRequests.ts'
@@ -72,6 +73,7 @@ import {
 } from '../boundary/sessionLifecycle.ts'
 import { configSyncBlocked, createConfigSyncTracker, normalizeStatusBarFields } from '../logic/configSync.ts'
 import { batteryEnabledFromConfig, createBatteryPoller } from '../logic/battery.ts'
+import { themePin, tuiThemeFromConfig } from '../logic/themePin.ts'
 import { destructiveSlashConfirmFromConfig, skipDestructiveConfirm } from '../logic/approval.ts'
 import {
   bellOnPromptFromConfig,
@@ -88,6 +90,7 @@ import {
 } from '../logic/agentsRuntime.ts'
 import { isTerminalStatus } from '../logic/subagentTree.ts'
 import { nthAssistantResponse } from '../logic/copy.ts'
+import { SETUP_REQUIRED_TITLE, setupRequiredText } from '../logic/errorCopy.ts'
 import { presentBillingVerification } from '../logic/billingVerification.ts'
 import { performHeapdump } from '../logic/diagnostics.ts'
 import {
@@ -107,7 +110,7 @@ import {
   DASHBOARD_NEW_SESSION_MESSAGE,
   isAgentsDashboardKey,
   isAgentsDockToggleKey,
-  isExitHotkey,
+  shouldExitOnHotkey,
   isRedrawHotkey
 } from '../logic/hotkeys.ts'
 import { isVoiceRecordKey, voiceRecordKeyFromConfig } from '../logic/voiceKey.ts'
@@ -175,6 +178,7 @@ import {
   type InterruptCorrectionDelivery,
   type SteerDelivery
 } from '../logic/busySubmit.ts'
+import { stripImageTokens } from '../logic/imageTokens.ts'
 import {
   createSessionStore,
   startupCatalogRetryDelay,
@@ -183,6 +187,8 @@ import {
   type SessionStore
 } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
+import type { ConnectionCardOps } from '../view/prompts/connectionCard.tsx'
+import { openExternalUrl } from '../boundary/openExternalUrl.ts'
 import { refreshLearnedNames, seedLearnedNames } from '../view/composer.tsx'
 import { TerminalChrome } from '../view/terminalChrome.tsx'
 import { mergeWidgetCompletionItems } from '../widgets/completion.ts'
@@ -390,6 +396,7 @@ const postSessionSetup = (
     const detailsRevision = store.getDetailsRevision()
     const batteryRevision = store.getBatteryRevision()
     const timestampsRevision = store.getTimestampsRevision()
+    const themePinRevision = themePin.revision()
 
     // Claim model hydration for this SID before the first async yield. Session
     // transitions clear the previous claim, so an immediate `/model` can only
@@ -424,7 +431,7 @@ const postSessionSetup = (
     // instead of only after its completion batch was browsed earlier. Best-effort
     // — a failure just leaves the old lazy-learn behavior.
     const cmdCatalog = yield* gateway
-      .request('commands.catalog', {})
+      .request('commands.catalog', { session_id: sid })
       .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
     const decodedCommandCatalog = decodeCommandsCatalogResponse(cmdCatalog)
     if (isActive() && decodedCommandCatalog) {
@@ -453,6 +460,7 @@ const postSessionSetup = (
       store.hydrateDetails(details.mode, details.sections, detailsRevision)
       store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedBusyConfig.config), batteryRevision)
       store.hydrateTimestamps(timestampsFromConfig(decodedBusyConfig.config), timestampsRevision)
+      if (themePin.hydrate(tuiThemeFromConfig(decodedBusyConfig.config), themePinRevision)) store.reapplyTheme()
       store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedBusyConfig.config))
       store.setBellOnPrompt(bellOnPromptFromConfig(decodedBusyConfig.config))
       store.setStatusBarFields(statusBarFieldsFromConfig(decodedBusyConfig.config))
@@ -790,9 +798,54 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         onFailure: cause => getLog().debug('sessions', 'session.active_list failed', { cause: String(cause) }),
         onInvalid: () => getLog().warn('sessions', 'invalid session.active_list response')
       })
+      // Live-work dock feeds (Ink useMainApp): the session's background
+      // processes poll with the dock tick; the standing goal is read ONCE per
+      // session (later changes arrive as session.control.update).
+      interface SessionScopedPacket {
+        readonly response: unknown
+        readonly sessionId: string
+      }
+      const isCurrentSession = (sessionId: string) =>
+        sessionId === gateway.sessionId() && sessionId === store.state.sessionId
+      const processListRefresher = createDelegationStatusRefresher({
+        intervalMs: 1_000,
+        apply: packet => {
+          if (!packet || typeof packet !== 'object') return false
+          const value = packet as SessionScopedPacket
+          if (!isCurrentSession(value.sessionId)) return true
+          return store.applyProcessListResponse(value.response)
+        },
+        fetch: async (): Promise<SessionScopedPacket> => {
+          const sessionId = gateway.sessionId()
+          if (!sessionId) throw new Error('no active session')
+          const response = await Effect.runPromise(gateway.request('process.list', { session_id: sessionId }))
+          return { response, sessionId }
+        },
+        onFailure: cause => getLog().debug('processes', 'process.list failed', { cause: String(cause) }),
+        onInvalid: () => getLog().debug('processes', 'invalid process.list response')
+      })
+      const readGoal = (sessionId: string) => {
+        if (!store.claimGoalRead(sessionId)) return
+        Effect.runPromise(gateway.request('session.control.read', { session_id: sessionId }))
+          .then(response => {
+            if (isCurrentSession(sessionId) && !store.applySessionControlRead(response)) {
+              getLog().debug('goal', 'invalid session.control.read response')
+            }
+          })
+          .catch((cause: unknown) => {
+            store.releaseGoalRead(sessionId)
+            getLog().debug('goal', 'session.control.read failed', { cause: String(cause) })
+          })
+      }
+
       const activeSessionsTimer = setInterval(() => {
-        if (!gateway.sessionId()) return
+        const liveSessionId = gateway.sessionId()
+        if (!liveSessionId) return
         void activeSessionsRefresher.refresh()
+        if (liveSessionId === store.state.sessionId) {
+          readGoal(liveSessionId)
+          void processListRefresher.refresh()
+        }
         // The roster poll is demand-driven: an idle session with an all-terminal
         // (or empty) roster and the full /agents dashboard closed would otherwise
         // issue a wasted Node→Python subagent.list RPC every 1.5s. Poll only when
@@ -810,6 +863,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           clearInterval(activeSessionsTimer)
           activeSessionsRefresher.invalidate()
           subagentListRefresher.invalidate()
+          processListRefresher.invalidate()
         })
       )
 
@@ -898,6 +952,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           delegationStatusRefresher.invalidate()
           activeSessionsRefresher.invalidate()
           subagentListRefresher.invalidate()
+          processListRefresher.invalidate()
         } else if (event.type === 'gateway.ready') {
           void delegationStatusRefresher.refresh(true)
           if (gateway.sessionId()) void subagentListRefresher.refresh(true)
@@ -1195,6 +1250,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               const detailsRevision = store.getDetailsRevision()
               const batteryRevision = store.getBatteryRevision()
               const timestampsRevision = store.getTimestampsRevision()
+              const themePinRevision = themePin.revision()
 
               if (plan.reload) {
                 const reload = yield* gateway
@@ -1222,6 +1278,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               store.hydrateDetails(details.mode, details.sections, detailsRevision)
               store.hydrateBatteryEnabled(batteryEnabledFromConfig(decodedConfig.config), batteryRevision)
               store.hydrateTimestamps(timestampsFromConfig(decodedConfig.config), timestampsRevision)
+              if (themePin.hydrate(tuiThemeFromConfig(decodedConfig.config), themePinRevision)) store.reapplyTheme()
               store.setDestructiveSlashConfirm(destructiveSlashConfirmFromConfig(decodedConfig.config))
               store.setBellOnPrompt(bellOnPromptFromConfig(decodedConfig.config))
               store.setStatusBarFields(statusBarFieldsFromConfig(decodedConfig.config))
@@ -1430,6 +1487,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         void writeClipboard(text)
         flashHint('Copied selection')
       }
+      // Composer Ctrl+X: the composer removes the selection only when this
+      // resolves true (a native clipboard backend accepted the text).
+      const onCutSelection = async (text: string): Promise<boolean> => {
+        const ok = await writeClipboard(text)
+        flashHint(ok ? 'Cut selection' : 'clipboard unavailable — selection kept', ok ? 1500 : 3000)
+        return ok
+      }
 
       // Paste an IMAGE (item 1): reuse the gateway's cross-platform clipboard
       // implementation (the same path Ink uses), then mirror the queued image
@@ -1629,7 +1693,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           redrawRenderer(renderer, { clearSelection: true })
           return
         }
-        if (!isExitHotkey(key) || actionExitBlocked(store.state)) return
+        // Ctrl+D is EOF: exit only from an empty composer (no text, no image
+        // attachments). With a draft the key reaches the textarea instead.
+        if (!shouldExitOnHotkey(key, store.state)) return
         key.preventDefault()
         if (hostedDashboard) requestDashboardNewSession()
         else doQuit(0)
@@ -1858,7 +1924,12 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               client_submission_id: current.submissionId,
               queued: current.queued,
               session_id: current.sessionId,
-              text: current.text
+              // The transcript keeps the `[Image #N]` marker; the model input
+              // drops it (Ink expandTokens) — the gateway splices the image.
+              text: stripImageTokens(
+                current.text,
+                store.state.pendingImages.map(image => image.token)
+              )
             })
             .pipe(
               Effect.tap(response =>
@@ -2391,16 +2462,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
 
             if (result.kind === 'setup-required') {
               store.setHint('setup required')
-              store.openPager(
-                'Setup Required',
-                [
-                  'A new session cannot start until a model provider is configured.',
-                  '',
-                  '• /model — choose from available configured providers',
-                  '• /setup — run the guided provider setup',
-                  '• Ctrl+C — exit, then run `hermes setup`'
-                ].join('\n')
-              )
+              store.openPager(SETUP_REQUIRED_TITLE, setupRequiredText())
               return
             }
 
@@ -3011,6 +3073,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         setModelItems: items => store.setModelItems(items),
         setCurrentModel: model => store.applyInfo({ model }),
         setBrowserState: (connected, url) => store.setBrowserState({ connected, ...(url ? { url } : {}) }),
+        reapplyTheme: () => store.reapplyTheme(),
+        theme: () => store.state.theme,
+        terminalThemeMode: () => renderer.themeMode,
         setVoiceMode: patch => store.setVoiceMode(patch),
         logTail: limit => gateway.logTail(limit),
         agentsControl: {
@@ -3249,7 +3314,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const completionGate = createCompletionGate()
       const onType = (text: string, cursor: number = text.length) => {
         const token = completionGate.claim()
-        const plan = planCompletion(text, cursor)
+        const plan = planCompletion(text, cursor, gateway.sessionId())
         if (!plan) {
           store.clearCompletions()
           return
@@ -3320,6 +3385,32 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // background-PROMPT tasks from the event stream, and the /processes panel
       // fetches `agents.list` on open. Nothing to poll for.)
 
+      // manage_connections card: answers go back on the operation the session owns. Ctrl+C on the
+      // card stops the turn, which settles the operation as `interrupt`.
+      const connectionOwner = () => {
+        const sid = gateway.sessionId()
+        if (!sid) throw new Error('no live session')
+        return { type: 'session' as const, session_id: sid }
+      }
+      const connectionOps: ConnectionCardOps = {
+        respond: (opId, result) =>
+          Effect.runPromise(
+            gateway.request('connection.respond', {
+              op_id: opId,
+              owner: connectionOwner(),
+              result
+            })
+          ),
+        reconnect: name =>
+          Effect.runPromise(
+            gateway.request('connectors.connect', { connectors: [name], owner: connectionOwner(), reconnect: true })
+          ),
+        interrupt: () => interruptTurn(),
+        openUrl: url => openExternalUrl(url),
+        dismiss: opId => store.dismissConnection(opId),
+        isSettled: opId => store.connectionSettled(opId)
+      }
+
       // Contact point #1: the single render bridge. After this, the screen is Solid's.
       // The theme is sourced reactively from the store (skin events update it).
       yield* Effect.promise(() =>
@@ -3334,6 +3425,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   onSubmitQueued={submitQueued}
                   onSendQueuedIndex={sendQueuedAt}
                   onDoubleEmptySubmit={onDoubleEmptySubmit}
+                  onInterruptTurn={interruptTurn}
+                  onCutSelection={onCutSelection}
                   onQueueEditChange={index => {
                     if (index === undefined) releaseQueueEditDrain()
                   }}
@@ -3357,6 +3450,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   onPasteLimitExceeded={showPasteLimit}
                   backgroundOps={backgroundOps}
                   agentsOps={agentsOps}
+                  connectionOps={connectionOps}
                 />
               </ThemeProvider>
             </KeymapProvider>
@@ -3402,6 +3496,20 @@ if (import.meta.main) {
     getLog().error('entry', 'fatal', { error: String(error) })
     process.exitCode = 1
   }
+
+  // A closed terminal without SIGHUP leaves every frame write failing with
+  // EIO/EPIPE while the renderer's error handler keeps the process alive. Exit
+  // after 5 in a row instead of lingering as a zombie (Ink 296303302d).
+  installDeadOutputGuard({
+    onDeadOutput: (code, count) => {
+      try {
+        getLog().error('entry', 'dead output stream → exiting', { code, count })
+      } catch {
+        // the log sink may share the dead stream.
+      }
+      process.exit(1)
+    }
+  })
 
   if (fake) {
     const { layer, controller } = makeFakeGatewayLayer()

@@ -30,7 +30,7 @@ const KEY_ALIASES: Record<string, string> = {
   spc: 'space'
 }
 const NAMED = new Set(['backspace', 'delete', 'escape', 'return', 'space', 'tab'])
-const RESERVED_CTRL = new Set(['c', 'd', 'l'])
+const RESERVED_CTRL = new Set(['c', 'd', 'l', 'r'])
 
 export function parseVoiceRecordKey(value: unknown): VoiceRecordKey {
   if (typeof value !== 'string') return DEFAULT_VOICE_RECORD_KEY

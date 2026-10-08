@@ -171,7 +171,7 @@ describe('native agents dashboard parity', () => {
         { width, height: 30 }
       )
       try {
-        probe.keys.pressEnter()
+        probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
         await probe.settle()
         const scroll = descendants(probe.renderer.root).find(
           (item): item is ScrollBoxRenderable => item instanceof ScrollBoxRenderable
@@ -369,13 +369,13 @@ describe('native agents dashboard parity', () => {
     })
     try {
       probe.keys.pressKey(KeyCodes.END)
-      probe.keys.pressEnter()
+      probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
       await probe.settle()
       expect(probe.frame()).toContain('#30')
       probe.keys.pressTab({ shift: true })
       probe.keys.pressKey(KeyCodes.HOME)
       probe.keys.pressKey('\u001b[6~')
-      probe.keys.pressEnter()
+      probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
       await probe.settle()
       expect(probe.frame()).not.toContain('#1 ')
       probe.keys.pressKey('n')
@@ -928,7 +928,7 @@ describe('native agents dashboard parity', () => {
       { height: 24, width: 100 }
     )
     try {
-      probe.keys.pressEnter()
+      probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
       probe.keys.pressKey('e')
       await probe.settle()
       expect((probe.frame().match(/TRACE_/g) ?? []).length).toBeLessThan(20)
@@ -1167,7 +1167,7 @@ describe('native agents dashboard parity', () => {
       dimensions
     )
     try {
-      probe.keys.pressEnter()
+      probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
       await probe.settle()
       {
         expect(

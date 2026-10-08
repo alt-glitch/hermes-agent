@@ -231,7 +231,9 @@ function CompactTrayRows(props: { agents: SubagentInfo[]; collapsed: boolean }) 
           <b>{`◆ ${props.agents.length} agent${props.agents.length === 1 ? '' : 's'} active`}</b>
         </span>
         <span style={{ fg: theme().color.muted }}>
-          {props.collapsed ? '  ·  Ctrl+T inspect · F7 restore' : '  ·  ↓ inspect · Ctrl+T expand · F7 collapse'}
+          {props.collapsed
+            ? '  ·  Ctrl+T inspect · Ctrl+R restore'
+            : '  ·  ↓ inspect · Ctrl+T expand · Ctrl+R collapse'}
         </span>
       </text>
       <For each={props.collapsed ? [] : visible()}>

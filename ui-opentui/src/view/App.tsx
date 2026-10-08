@@ -17,6 +17,7 @@
 import { createEffect, Match, Show, Switch } from 'solid-js'
 
 import { deferClose } from '../logic/defer.ts'
+import { emptyDoubleEscAction } from '../logic/hotkeys.ts'
 import { sectionMode } from '../logic/details.ts'
 import type { PromptHistory as ComposerHistory } from '../logic/history.ts'
 import type { PasteStore } from '../logic/pastes.ts'
@@ -24,6 +25,7 @@ import { actionCommand, promptHistoryEntries } from '../logic/promptHistory.ts'
 import type { BackgroundProcess } from '../logic/backgroundActivity.ts'
 import type { PickerItem, SessionStore } from '../logic/store.ts'
 import { AgentsTray, type AgentsTrayApi } from './agentsTray.tsx'
+import { GoalRow, ProcessesTray } from './liveWorkDock.tsx'
 import { Composer } from './composer.tsx'
 import { DimensionsProvider } from './dimensions.tsx'
 import { Header } from './header.tsx'
@@ -41,6 +43,7 @@ import { CustomModelSetup } from './overlays/customModelSetup.tsx'
 import { PluginsHub, type PluginOps } from './overlays/pluginsHub.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
 import { SessionOrchestrator, type SessionOrchestratorOps } from './overlays/sessionOrchestrator.tsx'
+import { ConnectionCard, type ConnectionCardOps } from './prompts/connectionCard.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
 import type { PromptReply, PromptResponseDisposition } from '../boundary/promptResponses.ts'
 import { SessionInfoProvider } from './sessionInfo.tsx'
@@ -61,6 +64,12 @@ export interface AppProps {
    * the native textarea. */
   readonly onSendQueuedIndex?: (index: number) => boolean | void
   readonly onDoubleEmptySubmit?: () => void
+  /** Esc Esc on an empty composer while a turn runs: the same interrupt path
+   *  Ctrl+C and /stop use. Idle, Esc Esc keeps opening prompt history. */
+  readonly onInterruptTurn?: (() => void) | undefined
+  /** Composer Ctrl+X: write the keyboard selection to the clipboard; the
+   *  composer removes it only when this resolves true. */
+  readonly onCutSelection?: ((text: string) => Promise<boolean>) | undefined
   /** Entry observes edit end so a queue held across turn-settle can drain. */
   readonly onQueueEditChange?: (index: number | undefined) => void
   readonly onType?: (text: string, cursor: number) => void
@@ -87,6 +96,8 @@ export interface AppProps {
     stopAll: () => Promise<void>
   }
   readonly journeyOps?: JourneyOps
+  /** manage_connections card answers (entry-owned gateway calls). */
+  readonly connectionOps?: ConnectionCardOps
   readonly pluginOps?: PluginOps
   readonly petOps?: PetOps
   /** Native Agents dashboard controls. Views remain transport-free; the entry
@@ -120,6 +131,16 @@ const NOOP_PET_OPS: PetOps = {
   select: slug => Promise.resolve({ displayName: slug, ok: false, slug })
 }
 
+/** Headless mounts without a gateway: answers fail visibly; local dismissal still works. */
+const connectionOpsFor = (store: SessionStore): ConnectionCardOps => ({
+  respond: () => Promise.reject(new Error('gateway unavailable')),
+  reconnect: () => Promise.reject(new Error('gateway unavailable')),
+  interrupt: () => {},
+  openUrl: () => false,
+  dismiss: opId => store.dismissConnection(opId),
+  isSettled: opId => store.connectionSettled(opId)
+})
+
 /** Inert picker ops for headless mounts that pass no gateway (tests). */
 const NOOP_OPS: SessionOrchestratorOps = {
   history: () => Promise.resolve({ sessions: [] }),
@@ -137,6 +158,7 @@ export function App(props: AppProps) {
   let trayApi: AgentsTrayApi | undefined
   let focusComposer: (() => void) | undefined
   const blocked = () => props.store.state.prompt !== undefined
+  const connection = () => props.store.state.connection
   const pager = () => props.store.state.pager
   const dashboard = () => props.store.state.dashboard
   const backgroundPanel = () => props.store.state.backgroundPanel
@@ -190,6 +212,13 @@ export function App(props: AppProps) {
   const openPromptHistory = () => {
     if (promptHistoryEntries(props.store.state.messages).length > 0) props.store.openPromptHistory()
   }
+  const onEmptyDoubleEsc = () => {
+    const busy = props.store.state.info.running === true || props.store.isTurnInFlight()
+    const interrupt = props.onInterruptTurn
+    const canInterrupt = interrupt !== undefined && props.store.state.sessionId !== undefined
+    if (emptyDoubleEscAction(busy, canInterrupt) === 'interrupt' && interrupt) interrupt()
+    else openPromptHistory()
+  }
   const resume = (id: string) => {
     ;(props.onResume ?? NOOP_RESUME)(id)
     // a PICK closes without the no-pick callback (the resume owns the session)
@@ -233,6 +262,8 @@ export function App(props: AppProps) {
                   {/* ambient widget dock — reserves ≤6 rows directly above the
                       status bar; the composer below stays mounted + focused. */}
                   <WidgetDock placement="dock-bottom" />
+                  {/* standing /goal row above the live-work dock (Ink goalBar.tsx) */}
+                  <GoalRow goal={props.store.state.goal} />
                   <StatusBar store={props.store} subagentsVisible={subagentsVisible()} />
                   <Switch
                     fallback={
@@ -252,7 +283,8 @@ export function App(props: AppProps) {
                         onPasteLimitExceeded={props.onPasteLimitExceeded}
                         onFocusDown={() => trayApi?.focusTray() ?? false}
                         registerFocus={fn => (focusComposer = fn)}
-                        onDoubleEsc={openPromptHistory}
+                        onDoubleEsc={onEmptyDoubleEsc}
+                        onCutSelection={props.onCutSelection}
                         initialDraft={() => props.store.state.composerDraft}
                         initialCursor={() => props.store.state.composerCursor}
                         clearVersion={() => props.store.state.composerClearVersion}
@@ -276,6 +308,13 @@ export function App(props: AppProps) {
                   >
                     <Match when={blocked()}>
                       <PromptOverlay store={props.store} onRespond={props.onRespond ?? NOOP_RESPOND} />
+                    </Match>
+                    {/* manage_connections card: the backend tool waits on it, so it
+                        replaces the composer like a blocking prompt. */}
+                    <Match when={connection()}>
+                      {card => (
+                        <ConnectionCard card={card()} ops={props.connectionOps ?? connectionOpsFor(props.store)} />
+                      )}
                     </Match>
                     {/* modal widget app: owns every keypress while open (the
                         composer is replaced, Picker-style); its reducer closes it. */}
@@ -303,18 +342,25 @@ export function App(props: AppProps) {
                     <Match when={customModelSetup()}>
                       {setup => <CustomModelSetup setup={setup()} onClose={closeCustomModelSetup} />}
                     </Match>
-                    <Match when={picker()}>
+                    {/* keyed: a chained picker (the /model effort step) is a NEW
+                        PickerState, so the overlay remounts with fresh rows/query. */}
+                    <Match when={picker()} keyed>
                       {p => (
                         <Picker
-                          title={p().title}
-                          items={p().items}
-                          errorLabel={p().errorLabel ?? 'Could not load options'}
-                          initialRefresh={p().initialRefresh === true}
-                          initialTab={p().initialTab ?? 'current'}
-                          loadingLabel={p().loadingLabel ?? 'Loading…'}
+                          title={p.title}
+                          items={p.items}
+                          errorLabel={p.errorLabel ?? 'Could not load options'}
+                          initialRefresh={p.initialRefresh === true}
+                          initialTab={p.initialTab ?? 'current'}
+                          loadingLabel={p.loadingLabel ?? 'Loading…'}
                           onPick={value => {
-                            p().onPick(value)
-                            closePicker()
+                            const picked = p
+                            picked.onPick(value)
+                            // A pick may chain a follow-up picker (the /model
+                            // effort step): only close if it did not replace us.
+                            deferClose(() => {
+                              if (props.store.state.picker === picked) props.store.closePicker()
+                            })
                           }}
                           onClose={closePicker}
                         />
@@ -341,6 +387,12 @@ export function App(props: AppProps) {
                       bind={api => (trayApi = api)}
                     />
                   </Show>
+                  {/* session background processes (process.list) — surfaces on its
+                      own, keeps an exit verdict for 60s after exited_at. */}
+                  <ProcessesTray
+                    processes={props.store.state.sessionProcesses}
+                    collapsed={props.store.state.agentsTrayCollapsed}
+                  />
                 </box>
               </>
             }
@@ -351,6 +403,7 @@ export function App(props: AppProps) {
                 subagents={props.store.state.subagents}
                 delegation={props.store.state.delegation}
                 history={props.store.state.spawnHistory}
+                processes={props.store.state.sessionProcesses}
                 initialHistoryIndex={props.store.state.dashboardHistoryIndex}
                 onClose={closeDashboard}
                 {...(props.store.state.dashboardAgent === undefined

@@ -3,10 +3,13 @@
  * Pure string work (no OpenTUI imports); the boundary shim
  * (`boundary/termChrome.ts`) owns the renderer writes and focus tracking.
  *
- * Title: OSC 0/2 content is set natively via `renderer.setTerminalTitle`
- * (the zig side emits the escape) — this module only SHAPES the text:
- * `"{session title} — Hermes"` once the gateway titles the session,
- * `"Hermes Agent"` until then.
+ * Title: split tab (OSC 1) / window (OSC 2) titles with a busy/blocked/idle
+ * marker plus model and cwd (Ink f1a91ad416) — `terminalTitlesFor` shapes the
+ * text and `titleSequences` the escapes; the boundary writes them.
+ *
+ * Terminal defaults: `defaultColorSlot` is the OSC 10/11 paint + OSC 110/111
+ * restore state machine (Ink 727f6704a7 / 1f652214df); `terminalDefaultsFor`
+ * picks the colors from a theme (ansi256 tones resolved to hex, 0b1ee22b9e).
  *
  * Notifications: the desktop ping itself is the renderer's native
  * `triggerNotification(message, title)` (boundary/termChrome.ts) — protocol
@@ -16,6 +19,7 @@
  */
 
 const ESC = '\u001b'
+const BEL = '\u0007'
 
 /** Strip control chars (C0/C1, incl. ESC/BEL) so user text can never
  *  terminate or splice an escape sequence; collapse runs of whitespace;
@@ -29,10 +33,71 @@ export function sanitizeOscText(text: string, max = 120): string {
   return clean.length > max ? clean.slice(0, Math.max(1, max - 1)) + '…' : clean
 }
 
-/** The window-title string: session title when known, Ink-era generic otherwise. */
-export function windowTitleFor(sessionTitle: string | undefined): string {
-  const title = sanitizeOscText(sessionTitle ?? '', 80)
-  return title ? `${title} — Hermes` : 'Hermes Agent'
+/** Activity marker leading both titles (Ink f1a91ad416): `⚠` blocked on the
+ *  user, `⏳` turn running, `✓` idle. */
+export type TitleMarker = '⚠' | '⏳' | '✓'
+
+/** Prompt kinds that block the AGENT on the user (Ink: approval, clarify and
+ *  the sensitive prompts). The client-local `confirm` dialog is not one. */
+const BLOCKING_PROMPT_KINDS: ReadonlySet<string> = new Set(['approval', 'clarify', 'secret', 'sudo', 'vaultUnlock'])
+
+export function titleMarker(promptKind: string | undefined, running: boolean | undefined): TitleMarker {
+  if (promptKind !== undefined && BLOCKING_PROMPT_KINDS.has(promptKind)) return '⚠'
+  return running === true ? '⏳' : '✓'
+}
+
+/** Brand title before the session's model is known (Ink `'Hermes'`). */
+export const GENERIC_TITLE = 'Hermes'
+
+/** Ink `shortCwd`: `~`-relative, head-elided to `max` cells. */
+export function shortTitleCwd(cwd: string, max = 24, home: string | undefined = process.env.HOME): string {
+  const p = home && (cwd === home || cwd.startsWith(home + '/')) ? `~${cwd.slice(home.length)}` : cwd
+  return p.length <= max ? p : `…${p.slice(-(max - 1))}`
+}
+
+/** Ink `composeTabTitle`: `<marker> <name> · <model> · <cwd>`, empty parts dropped. */
+function composeTitle(marker: TitleMarker, name: string, model: string, cwd: string, maxName = 28): string {
+  const trimmed = name.trim()
+  const shortName = trimmed.length > maxName ? `${trimmed.slice(0, maxName - 1)}…` : trimmed
+  const segments = [shortName, model, cwd].filter(Boolean)
+  return segments.length ? `${marker} ${segments.join(' · ')}` : marker
+}
+
+/** The tab (OSC 1) and window (OSC 2) titles. `tab` undefined ⇒ one shared
+ *  title (OSC 0) — the generic brand before the model is known. */
+export interface TerminalTitles {
+  readonly window: string
+  readonly tab?: string
+}
+
+export interface TitleInputs {
+  readonly marker: TitleMarker
+  readonly sessionTitle?: string | undefined
+  readonly model?: string | undefined
+  readonly cwd?: string | undefined
+}
+
+/** Split titles (Ink f1a91ad416): Terminal.app truncates narrow background tabs
+ *  from the LEFT, so the tab gets only `<marker> <session>` while the window
+ *  bar carries the full `· model · cwd` string. */
+export function terminalTitlesFor(inputs: TitleInputs, home: string | undefined = process.env.HOME): TerminalTitles {
+  const model = sanitizeOscText((inputs.model ?? '').replace(/^.*\//, ''), 60)
+  if (!model) return { window: GENERIC_TITLE }
+  const name = sanitizeOscText(inputs.sessionTitle ?? '', 80)
+  const rawCwd = sanitizeOscText(inputs.cwd ?? '', 400)
+  const cwd = rawCwd ? shortTitleCwd(rawCwd, 24, home) : ''
+  return {
+    tab: composeTitle(inputs.marker, name, '', ''),
+    window: composeTitle(inputs.marker, name, model, cwd)
+  }
+}
+
+/** OSC 1 (icon/tab) + OSC 2 (window) for a split pair. Text must already be
+ *  sanitized (terminalTitlesFor does it). */
+export function titleSequences(titles: TerminalTitles): string {
+  return titles.tab === undefined
+    ? `${ESC}]0;${titles.window}${BEL}`
+    : `${ESC}]1;${titles.tab}${BEL}${ESC}]2;${titles.window}${BEL}`
 }
 
 /** A notification's two text parts (body optional). */
@@ -62,6 +127,10 @@ export function promptNotification(kind: string): TermNotification {
       return { title: 'Hermes', body: 'needs a secret/API key' }
     case 'vaultUnlock':
       return { title: 'Hermes', body: 'needs your password manager unlocked' }
+    case 'vaultSaveLogin':
+      return { title: 'Hermes', body: 'wants to save a login' }
+    case 'vaultCode':
+      return { title: 'Hermes', body: 'needs a verification code' }
     case 'confirm':
       return { title: 'Hermes', body: 'is asking you to confirm' }
     default:
@@ -84,4 +153,49 @@ export const TURN_COMPLETE_NOTIFICATION: TermNotification = {
 export function notifyEnabled(env: { readonly [k: string]: string | undefined } = process.env): boolean {
   const raw = (env.HERMES_TUI_NOTIFY ?? '').trim().toLowerCase()
   return raw !== '0' && raw !== 'false' && raw !== 'off'
+}
+
+// ── Terminal default fg/bg (OSC 10/11) ───────────────────────────────
+
+const HEX6_RE = /^#[0-9a-f]{6}$/i
+
+/** True when `hex` can be painted as a terminal default (OSC 10/11 speak `#rrggbb`). */
+export const isPaintableHex = (hex: string): boolean => HEX6_RE.test(hex)
+
+/** The terminal defaults a theme owns: a skin with a paintable canvas (`bg` =
+ *  ui_bg ?? background) owns BOTH defaults — the backdrop and the default-fg
+ *  text tone — otherwise both are '' (restore the terminal's own). */
+export function terminalDefaultsFor(
+  theme: { readonly color: { readonly bg: string; readonly text: string } },
+  toneHex: (tone: string) => string
+): { readonly fg: string; readonly bg: string } {
+  const bg = isPaintableHex(theme.color.bg) ? theme.color.bg : ''
+  return { bg, fg: bg ? toneHex(theme.color.text) : '' }
+}
+
+/** One paintable terminal default (fg=10, bg=11). `set(hex)` returns the bytes
+ *  to write: a paint for a valid hex, a restore (OSC 1xx) only if we painted
+ *  earlier, '' otherwise — a skinless session never touches the terminal.
+ *  `restoreSeq()` is the exit-time restore ('' when nothing is painted). */
+export function defaultColorSlot(osc: 10 | 11): {
+  readonly set: (hex: string) => string
+  readonly restoreSeq: () => string
+  readonly painted: () => boolean
+} {
+  const restore = `${ESC}]1${osc}${BEL}`
+  let current = ''
+  return {
+    set: hex => {
+      if (isPaintableHex(hex)) {
+        if (hex.toLowerCase() === current) return ''
+        current = hex.toLowerCase()
+        return `${ESC}]${osc};${current}${BEL}`
+      }
+      if (!current) return ''
+      current = ''
+      return restore
+    },
+    restoreSeq: () => (current ? restore : ''),
+    painted: () => current !== ''
+  }
 }

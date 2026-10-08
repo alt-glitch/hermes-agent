@@ -156,6 +156,32 @@ quick-command discovery/dispatch are covered through `complete.slash`,
 | Upstream alignment docs | Covered | Dependency versions, native-Yoga state, renderer shim ledger, and the current 1,430-test gate match the f7c9 release record; versioned 0.4.1 startup, hydration, real-PTY, and repeated-cycle measurements supersede the historical 0.4.0 figures. |
 | Env flags docs | Covered | Hosted dashboard, sidecar, and remote-gateway attachment variables are classified as internal plumbing, while user-facing behavior remains in `config.yaml`. |
 
+## Ink drift since f7c9 (audited at fork base `bb2362878b33`)
+
+318 upstream commits touched `ui-tui/src` between f7c9 and the fork base. Each was
+classified (user-visible vs internal) and checked against OpenTUI; raw audit with
+per-family file:line evidence lives outside the repo. Closed on `sid/opentui-parity`:
+
+| Family | Status | Notes |
+|---|---|---|
+| `manage_connections` card (`connection.request`/`update`, `pending_connection`) | Covered | Native composer-zone card; live-verified connect/skip/multi-target/MCP form/Ctrl+C. |
+| Vault save-login / verification-code prompts | Covered | Server-request rows; secrets never painted. |
+| Clarify unified shape (multi-select, skip, cancel, empty) | Covered | Live-verified multi-select round trip. |
+| `/fast ultrafast`, `/browser use` via `browser.manage`, session-scoped catalogs | Covered | |
+| `/theme auto\|light\|dark` live + `display.tui_theme` hydrate, `/theme-info` | Covered | |
+| Esc Esc interrupts a running turn, Ctrl+R dock toggle, Ctrl+D empty-only (macOS too), Ctrl+X cut, Enter→live tail | Covered | Esc Esc live-verified. |
+| Plain-language error copy (`error_surface`, RPC errors, prompt timeouts, crash-loop exhausted, slash fallback, Setup Required) | Covered | Resumed failed turn still shows raw `inflight.error` (snapshot lacks `error_surface`). |
+| Tab/window title split with ⏳/⚠/✓ markers, OSC 10/11 skin defaults, terminal polarity probe, `reaction` ♥ | Covered | Title markers live-verified. |
+| `/model` effort step, `effort→wire` label, MCP lazy status, completion columns, catalog shimmer | Covered | Effort step + `ultra→max` live-verified. |
+| Goal row, session processes block (tray + `/agents`) | Covered | |
+| `◈ model changed` resume marker, inflight display metadata, image-token strip on submit | Covered | |
+| Heartbeat any-frame liveness, attached-drop copy, `HERMES_PYTHON` resolution, dead-output exit | Covered | EIO exit unit-tested only; native writes may not surface EIO. |
+| Queue preview shows collapsed paste token | Thinner | Queue stores expanded text; needs `{display,text}` queue entries. |
+| Theme engine (derived tone ladder, contrast floors, boot theme cache) | Missing | Design-level; deferred. |
+| Built-in widget apps (`/weather`, `/ticker`), corner/rail zones | Missing | Deferred. |
+| Fetched page-title labels for bare URLs | Missing | Deferred. |
+| Banner tiers / per-surface visual polish | Thinner | Deferred. |
+
 ## Verification policy
 
 Each task keeps focused unit/contract coverage and an inline isolated-home

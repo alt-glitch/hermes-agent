@@ -143,18 +143,22 @@ export async function readClipboardText(
   return undefined
 }
 
-/** Copy `text` to the clipboard: OSC 52 (always) + the first native command that works. */
-export async function writeClipboard(text: string): Promise<void> {
+/** Copy `text` to the clipboard: OSC 52 (always) + the first native command that works.
+ * Resolves true only when a native backend confirmed the write (OSC 52 is
+ * fire-and-forget — the terminal may silently ignore it). Destructive callers
+ * (composer cut) gate on this so text is never lost without a copy. */
+export async function writeClipboard(text: string): Promise<boolean> {
   writeOsc52(text) // primary path — SSH/tmux-safe, no subprocess
   for (const [cmd, args] of copyCandidates()) {
     if (!commandExists(cmd)) continue // never spawn a missing tool (avoids EPIPE/SIGPIPE)
     try {
       await run(cmd, args, text)
-      return
+      return true
     } catch {
       // try the next candidate
     }
   }
+  return false
 }
 
 /** Read a clipboard IMAGE as base64 PNG (for paste-to-attach); undefined if none. */

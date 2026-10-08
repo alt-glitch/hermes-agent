@@ -153,10 +153,11 @@ test('a server request method without a handler is answered -32601 at once', asy
   client.stop()
 })
 
-test('a clarify frame whose params fail the contract is answered -32602 and opens nothing', async () => {
+test('a clarify frame whose params fail the contract is answered -32602; one that asks nothing is answered {}', async () => {
   const gateway = mockGateway()
   const { store, router, client } = startClient(gateway, 's')
-  // The removed single-question shape (no `questions`), and a list with no askable entry: nothing to ask.
+  // The removed single-question shape (no `questions`) fails the contract; a list with no askable
+  // entry asks nothing and is answered `{}` at once (Ink parity 5eea87882a).
   gateway.send({
     jsonrpc: '2.0',
     id: 'srq-bad',
@@ -176,11 +177,10 @@ test('a clarify frame whose params fail the contract is answered -32602 and open
     }
   })
   await vi.waitFor(() => expect(gateway.responsesFor('srq-blank')).toHaveLength(1))
-  for (const id of ['srq-bad', 'srq-blank']) {
-    expect(gateway.responsesFor(id)).toHaveLength(1)
-    expect(gateway.responsesFor(id)[0]).toMatchObject({ id, error: { code: -32602 } })
-    expect(router.answer(id, { answers: { q0: 'x' } })).toBe('closed')
-  }
+  expect(gateway.responsesFor('srq-bad')).toHaveLength(1)
+  expect(gateway.responsesFor('srq-bad')[0]).toMatchObject({ id: 'srq-bad', error: { code: -32602 } })
+  expect(gateway.responsesFor('srq-blank')).toEqual([{ jsonrpc: '2.0', id: 'srq-blank', result: {} }])
+  for (const id of ['srq-bad', 'srq-blank']) expect(router.answer(id, { answers: { q0: 'x' } })).toBe('closed')
   expect(store.state.prompt).toBeUndefined()
   expect(router.pending()).toEqual([])
   client.stop()

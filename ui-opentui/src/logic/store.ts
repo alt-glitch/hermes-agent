@@ -13,6 +13,7 @@
  */
 import type { RpcRequest } from '../boundary/gateway/rpc.ts'
 import { Option } from 'effect'
+import { batch } from 'solid-js'
 import { createStore, produce } from 'solid-js/store'
 
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
@@ -30,6 +31,7 @@ import {
 } from '../boundary/schema/Delegation.ts'
 import {
   decodeCatalog,
+  decodeMcpServerStatus,
   decodeSessionInfoPatch,
   type CatalogDecoded,
   type SessionInfoPatchDecoded
@@ -63,6 +65,12 @@ import {
   type BackgroundProcess
 } from './backgroundActivity.ts'
 import { stripAnsi, stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
+import { decodeProcessListResponse, type ProcessEntry } from '../boundary/schema/ProcessResponses.ts'
+import {
+  decodeGoalSnapshot,
+  decodeSessionControlReadResponse,
+  type GoalSnapshot
+} from '../boundary/schema/SessionControl.ts'
 import { DEFAULT_THEME, type Theme, themeFromSkin } from './theme.ts'
 import {
   captureLiveSpawnTree,
@@ -82,7 +90,16 @@ import {
 import type { ApprovalChoicePolicy } from './approval.ts'
 import { formatAbandonedClarifyBatch, remainingClarifyQids, type ClarifyBatchQuestion } from './clarifyBatch.ts'
 import { billingWallAction, billingWallCopy, runBillingWallAction, type BillingWallHost } from './billingWall.ts'
+import { ConnectionOpMemory, requestCard, updateCard, type ConnectionCard } from './connectionCard.ts'
+import type { ConnectionRequestPayload } from '../boundary/schema/Connection.ts'
 import { appendSubagentTrace, finishSubagentTrace, trimSubagentTrace } from './subagentTrace.ts'
+import {
+  backendGaveUp,
+  describeRpcError,
+  describeTurnFailure,
+  lastStderrLine,
+  promptTimeoutNotice
+} from './errorCopy.ts'
 
 /** Monotonic identity for one concrete overlay instance. Async work must carry
  * this token back to patch/close so a completion from an old session cannot
@@ -235,6 +252,8 @@ export type ActivePrompt =
       requestId: string
       /** Single question: its id, the key of the `{answers}` result. A batch's ids ride `questions`. */
       qid?: string
+      /** Single question: checkbox picks; the answer is a JSON array string (Ink parity). */
+      multiSelect?: boolean
       /** Batch (multi-question) clarify — present instead of question/choices. */
       questions?: ClarifyBatchQuestion[]
       /** Answers locked server-side (qid → answer; '' = skipped): seeded from the reconnect
@@ -253,6 +272,10 @@ export type ActivePrompt =
   | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
   /** External password-manager unlock — masked master password for one session. */
   | { kind: 'vaultUnlock'; backend: string; displayName: string; requestId: string }
+  /** Save a login for `site` (`vault.save_login`): identifier, then masked password; never stored here. */
+  | { kind: 'vaultSaveLogin'; origin: string; site: string; requestId: string }
+  /** One-time / 2FA code the user reads from their device (`vault.code`); `site`/`hint` may be ''. */
+  | { kind: 'vaultCode'; site: string; hint: string; requestId: string }
   // local (non-gateway) Y/N confirm — e.g. /clear, /new (spec §2a)
   | { kind: 'confirm'; spec: ConfirmSpec; onConfirm: () => void }
 
@@ -275,7 +298,9 @@ const PROMPT_LABEL: Record<ActivePrompt['kind'], string> = {
   confirm: 'confirmation',
   secret: 'secret prompt',
   sudo: 'sudo prompt',
-  vaultUnlock: 'password-manager unlock'
+  vaultUnlock: 'password-manager unlock',
+  vaultSaveLogin: 'save-login prompt',
+  vaultCode: 'verification-code prompt'
 }
 
 const BATCH_SETTLEMENT_REASON: Partial<Record<PromptSettlement, string>> = {
@@ -337,6 +362,10 @@ export interface PickerItem {
    *  hint): hidden by default, revealed dimmed + NON-selectable by the
    *  picker's Ctrl+U toggle; ↑↓ traversal skips it (picker v2.1). */
   unavailable?: boolean
+  /** `false` only when the catalog says this model has no reasoning control
+   *  (`model.options` capabilities[model].reasoning === false); the `/model`
+   *  picker then skips its effort step. Unknown keeps the step (Ink 2c0bec33f9). */
+  reasoning?: boolean
 }
 
 /** An open generic picker overlay: a titled list whose pick runs `onPick(value)`. */
@@ -641,6 +670,10 @@ export interface TodoSnapshot {
 export interface SessionInfo {
   model?: string
   effort?: string
+  /** The effort level the route actually sends (`reasoning_effort_wire`);
+   *  '' when not stamped yet. The status bar shows `effort→wire` when they
+   *  differ (a clamped `ultra` sends `max` — Ink 171a1777b5). */
+  effortWire?: string
   fast?: boolean
   /** Inference provider backing the active model (`provider`) — round-tripped
    *  from the merged server's session.info; compat-only, no chrome consumes it yet. */
@@ -683,9 +716,21 @@ export interface SessionInfo {
   /** Count of connected MCP servers from `session.info`; the status bar uses
    *  this only as a fallback until the enabled startup catalog is available. */
   mcpServers?: number
+  /** Per-server MCP status from `session.info.mcp_servers` (decoded per entry);
+   *  the home panel annotates servers with it (e.g. `3 tools (lazy)`). */
+  mcpServerStatus?: ReadonlyArray<McpServerStatus>
   /** Epoch ms when this TUI session started (set once at store creation; never
    *  patched from the wire) — drives the status-bar session duration. */
   startedAt?: number
+}
+
+/** One MCP server's runtime status (`session.info.mcp_servers[]`). */
+export interface McpServerStatus {
+  readonly name: string
+  readonly connected: boolean
+  /** `connected` | `disabled` | `connecting` | `failed` | `lazy` | `configured` (open). */
+  readonly status: string
+  readonly tools: number
 }
 
 /** Startup catalog (tools/skills/MCP) for the home-screen panel (item 9 / banner parity). */
@@ -801,8 +846,15 @@ export interface StoreState {
   billing: OwnedBillingOverlayState | undefined
   /** The open /subscription plan-management overlay. */
   subscription: OwnedSubscriptionOverlayState | undefined
+  /** The open manage_connections card (session-owned; the backend tool waits on it). */
+  connection: ConnectionCard | undefined
   /** OS background processes (from `agents.list`) — shown in the /processes panel. */
   backgroundProcesses: BackgroundProcess[]
+  /** This session's background processes (from session-scoped `process.list`
+   *  polling) — the Processes block in the agents tray and /agents overlay. */
+  sessionProcesses: readonly ProcessEntry[]
+  /** The standing /goal (`session.control.read` / `session.control.update`) — the goal row. */
+  goal: GoalSnapshot | null
   /** In-flight background-PROMPT task ids (`/bg` → `prompt.background`, cleared on
    *  `background.complete`) — drives the `bg: N` status-bar badge. */
   bgTasks: string[]
@@ -893,6 +945,11 @@ export interface StoreState {
   /** Persisted `display.bell_on_prompt`; rings once when a blocking prompt
    * opens in an interactive terminal. Config-owned across session resets. */
   bellOnPrompt: boolean
+  /** Monotonic affection-heart beat (gateway `reaction`: core-detected ily /
+   *  <3 / good bot). The status bar flashes ♥ on each bump (Ink fbefb5c075).
+   *  Not session-owned: a counter carries no session data, and scoped late
+   *  events are already dropped at the entry gate. */
+  goodVibesTick: number
   /** /reasoning full — expand ALL thinking ("Thinking"/"Thought") sections to show
    *  their full body, independently of the global /details mode. Defaults OFF;
    *  bare `/reasoning` syncs it from the persisted `display.reasoning_full` (via
@@ -977,7 +1034,12 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   const avgTps = d.usage?.avg_tps ?? d.avg_tps
   if (avgTps !== undefined) patch.avgTps = avgTps
   if (d.model) patch.model = d.model
-  if (d.reasoning_effort) patch.effort = d.reasoning_effort
+  if (d.reasoning_effort) {
+    patch.effort = d.reasoning_effort
+    // A new effort without a wire stamp clears the old clamp so a stale
+    // `→max` never pairs with a new pick.
+    patch.effortWire = d.reasoning_effort_wire ?? ''
+  } else if (d.reasoning_effort_wire !== undefined) patch.effortWire = d.reasoning_effort_wire
   if (d.fast !== undefined) patch.fast = d.fast
   if (d.provider) patch.provider = d.provider
   if (d.cwd) patch.cwd = d.cwd
@@ -1009,7 +1071,10 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   // `mcp: N` matches the classic CLI banner (`sum(s.connected)`) and the Ink
   // SessionPanel headline. Each wire entry is `{name,transport,connected,tools}`
   // (Schema.Unknown elements — read `connected` defensively).
-  if (d.mcp_servers) patch.mcpServers = countConnectedMcp(d.mcp_servers)
+  if (d.mcp_servers) {
+    patch.mcpServers = countConnectedMcp(d.mcp_servers)
+    patch.mcpServerStatus = readMcpServerStatus(d.mcp_servers)
+  }
   return patch
 }
 
@@ -1025,10 +1090,31 @@ function onlyStrings(items: ReadonlyArray<unknown> | undefined): string[] {
  *  (connected !== true) is excluded — matching the classic CLI banner's
  *  `sum(s.connected)` and the Ink SessionPanel headline. */
 function countConnectedMcp(items: ReadonlyArray<unknown> | undefined): number {
-  return (items ?? []).reduce<number>(
-    (n, s) => (typeof s === 'object' && s !== null && (s as { connected?: unknown }).connected === true ? n + 1 : n),
-    0
-  )
+  // `lazy` servers count as available: registered from the schema cache, their
+  // tools are callable and the process spawns on first use (Ink abdb402701).
+  return (items ?? []).reduce<number>((n, s) => {
+    if (typeof s !== 'object' || s === null) return n
+    const entry = s as { connected?: unknown; status?: unknown }
+    return entry.connected === true || entry.status === 'lazy' ? n + 1 : n
+  }, 0)
+}
+
+/** Decode each `mcp_servers[]` entry once; malformed entries are dropped alone. */
+function readMcpServerStatus(items: ReadonlyArray<unknown>): McpServerStatus[] {
+  const out: McpServerStatus[] = []
+  for (const item of items) {
+    const decoded = decodeMcpServerStatus(item)
+    if (Option.isNone(decoded)) continue
+    const d = decoded.value
+    const connected = d.connected === true
+    out.push({
+      connected,
+      name: d.name,
+      status: d.status ?? (connected ? 'connected' : 'configured'),
+      tools: d.tools !== undefined && Number.isFinite(d.tools) && d.tools > 0 ? Math.trunc(d.tools) : 0
+    })
+  }
+  return out
 }
 
 function normalizeTodoStatus(s: unknown): TodoStatus {
@@ -1131,6 +1217,17 @@ export interface SessionStoreOptions {
   readonly uncappedFixture?: boolean
 }
 
+/** Attached-mode (dashboard WebSocket) drop copy — mirrors Ink's
+ * `userMessages.backend.connectionLost*` / `reconnecting*` strings. */
+export const ATTACHED_CONNECTION_LOST_STATUS = 'connection lost · reconnecting…'
+export const ATTACHED_CONNECTION_LOST_NOTICE = 'Connection to Hermes lost — reconnecting and reopening your chat…'
+
+/** Ink `backendReconnecting`: `retrying in Ns` (+ ` (attempt N)` when known). */
+export function attachedReconnectingStatus(attempt: number | undefined, delayMs: number | undefined): string {
+  const secs = Math.max(1, Math.round((delayMs ?? 1000) / 1000))
+  return attempt && attempt > 0 ? `retrying in ${secs}s (attempt ${attempt})` : `retrying in ${secs}s`
+}
+
 export function createSessionStore(options?: SessionStoreOptions) {
   let overlayOwnerSequence = 0
   let delegationControlRevision = 0
@@ -1188,7 +1285,11 @@ export function createSessionStore(options?: SessionStoreOptions) {
     ready: false,
     messages: [],
     dropped: 0,
-    theme: DEFAULT_THEME,
+    // A COPY: `setState('theme', next)` shallow-merges into this object, so
+    // seeding the module constant would let the first skin overwrite
+    // DEFAULT_THEME/DARK_THEME's `color` (a later canvas-less skin then kept
+    // the old background and the OSC 111 restore never fired).
+    theme: { ...DEFAULT_THEME },
     prompt: undefined,
     composerDraft: '',
     composerCursor: 0,
@@ -1223,7 +1324,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
     backgroundPanel: false,
     billing: undefined,
     subscription: undefined,
+    connection: undefined,
     backgroundProcesses: [],
+    sessionProcesses: [],
+    goal: null,
     bgTasks: [],
     voice: {
       enabled: false,
@@ -1256,6 +1360,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     detailsCommandOverride: false,
     detailsSections: {},
     bellOnPrompt: false,
+    goodVibesTick: 0,
     timestamps: false,
     destructiveSlashConfirm: true,
     reasoningFull: false,
@@ -1347,6 +1452,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
   const STDERR_TRUNCATED_SUFFIX = '… [truncated]'
   const STDERR_TAIL = 5
   const stderrRing: string[] = []
+  // Crash-loop give-up copy is said once per outage; reset on gateway.ready.
+  let recoveryGaveUpReported = false
   function pushStderr(line: string): void {
     const bounded =
       line.length <= STDERR_LINE_LIMIT
@@ -1359,8 +1466,16 @@ export function createSessionStore(options?: SessionStoreOptions) {
     return stderrRing.slice(-STDERR_TAIL).join('\n')
   }
 
+  // The last applied skin, so a polarity change (terminal probe answer, live
+  // THEME_MODE, `/theme` pin, config hydrate) re-derives against the same skin.
+  let lastSkin: GatewaySkinDecoded | undefined
   function setSkin(skin: GatewaySkinDecoded | undefined): void {
+    lastSkin = skin
     setState('theme', themeFromSkin(skin))
+  }
+  /** Re-theme from the current skin + polarity signals (Ink `reapplyTheme`). */
+  function reapplyTheme(): void {
+    setState('theme', themeFromSkin(lastSkin))
   }
 
   // Trim the transcript to MESSAGE_CAP, dropping the OLDEST non-live rows IN
@@ -2151,6 +2266,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
   ): void {
     clearStatusRestoreTimer()
     lastStatusNote = ''
+    goalReadSid = undefined
     if (noticeTimer) clearTimeout(noticeTimer)
     noticeTimer = undefined
     applied.clear()
@@ -2196,7 +2312,12 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.backgroundPanel = false
         draft.billing = undefined
         draft.subscription = undefined
+        // The card belongs to the session being left; a resumed/activated one restores its own
+        // from `pending_connection` after the commit.
+        draft.connection = undefined
         draft.bgTasks = []
+        draft.sessionProcesses = []
+        draft.goal = null
         draft.status = undefined
         draft.lastNotification = undefined
         draft.notice = null
@@ -2207,6 +2328,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.info = info
         draft.hint = undefined
         draft.catalog = undefined
+        // Per-session: project-local skills follow the session's repo, so
+        // postSessionSetup refetches `commands.catalog` with the new session_id.
+        draft.commandCatalog = undefined
         draft.modelItems = undefined
         draft.sessionId = sessionId
         draft.resumeId = resumeId
@@ -2340,6 +2464,38 @@ export function createSessionStore(options?: SessionStoreOptions) {
     setState('subscription', prev => (prev ? { ...prev, ...next } : prev))
   }
   /** Replace the OS-process snapshot (drives the /processes panel). */
+  // The session whose goal snapshot was (or is being) read once; reset with the
+  // session so a resume/new session re-reads instead of polling state.db.
+  let goalReadSid: string | undefined
+
+  /** True exactly once per adopted session: the caller should issue `session.control.read`. */
+  function claimGoalRead(sid: string): boolean {
+    if (goalReadSid === sid) return false
+    goalReadSid = sid
+    return true
+  }
+
+  /** A failed read releases the claim so the next poll tick retries. */
+  function releaseGoalRead(sid: string): void {
+    if (goalReadSid === sid) goalReadSid = undefined
+  }
+
+  /** `session.control.read` result for the CURRENT session (callers fence the sid). */
+  function applySessionControlRead(raw: unknown): boolean {
+    const decoded = decodeSessionControlReadResponse(raw)
+    if (Option.isNone(decoded)) return false
+    setState('goal', decodeGoalSnapshot(decoded.value.control.goal))
+    return true
+  }
+
+  /** Session-scoped `process.list` poll result (callers fence the sid). */
+  function applyProcessListResponse(raw: unknown): boolean {
+    const decoded = decodeProcessListResponse(raw)
+    if (Option.isNone(decoded)) return false
+    setState('sessionProcesses', decoded.value.processes ?? [])
+    return true
+  }
+
   function setBackgroundProcesses(procs: BackgroundProcess[]) {
     setState('backgroundProcesses', procs)
   }
@@ -2382,7 +2538,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   /** Open the generic picker (model picker, skills hub, …). */
   function openPicker(picker: PickerState) {
-    setState('picker', picker)
+    // Replace, never merge: a store setter merges an object into an existing
+    // one, so a chained picker (the /model effort step) would inherit the
+    // previous picker's optional fields and identity.
+    batch(() => {
+      setState('picker', undefined)
+      setState('picker', picker)
+    })
   }
 
   /** Close the generic picker. */
@@ -2790,6 +2952,26 @@ export function createSessionStore(options?: SessionStoreOptions) {
   }
 
   /** Reduce a decoded gateway event into the store. The sole boundary->Solid sink. */
+  // Op ids that settled or were dismissed, so a late frame cannot reopen a card. Process-wide like
+  // Ink's: op ids are unique, and a settle for a dismissed card must still write its outcome lines.
+  const connectionOps = new ConnectionOpMemory()
+
+  /** Restore the card from a resume/activate snapshot (`pending_connection`). */
+  function restoreConnection(payload: ConnectionRequestPayload): void {
+    setState('connection', current => requestCard(current, payload, connectionOps))
+  }
+
+  /** Close the card locally; the settle that follows still writes its outcome lines. */
+  function dismissConnection(opId: string): void {
+    connectionOps.markDismissed(opId)
+    if (state.connection?.opId === opId) setState('connection', undefined)
+  }
+
+  /** The card's answer was settled by the backend already (no frame needed to stop answering). */
+  function connectionSettled(opId: string): boolean {
+    return connectionOps.isSettled(opId)
+  }
+
   function apply(event: GatewayEvent): void {
     if (buffering) {
       buffering.push(event)
@@ -2801,6 +2983,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function applyNow(event: GatewayEvent): void {
     switch (event.type) {
       case 'gateway.ready':
+        // A live gateway ends the outage: the next exhaustion is said again.
+        recoveryGaveUpReported = false
         setState('ready', true)
         // Clear any transient status: on a recovery-respawn ready this drops the
         // lingering 'gateway recovering (attempt N)…' line; no-op on first connect.
@@ -2811,6 +2995,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       case 'skin.changed':
         setSkin(event.payload)
+        break
+      case 'reaction':
+        setState('goodVibesTick', n => n + 1)
         break
       case 'session.info':
         applyInfo(event.payload)
@@ -2928,6 +3115,21 @@ export function createSessionStore(options?: SessionStoreOptions) {
                   event.payload.partial === true || event.payload.billing !== undefined ? event.payload.text : undefined
               }
             : undefined
+        // A failed turn with no reply text reads as a plain title + Details +
+        // next step from the structured error_surface (Ink describeTurnFailure,
+        // upstream 66878996dd), never the bare `error: <provider body>`. Partial
+        // and billing failures keep their short detail row (their text already
+        // carries the reply / recovery guidance).
+        const failureRow =
+          failure === undefined
+            ? undefined
+            : failure.partialText === undefined
+              ? describeTurnFailure({
+                  error: event.payload?.error?.trim() || event.payload?.text?.trim() || undefined,
+                  error_surface: event.payload?.error_surface,
+                  recoverable: event.payload?.recoverable
+                })
+              : `error: ${failure.message}`
         if (event.payload?.reasoning) {
           setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning, event.payload?.text)))
         }
@@ -2954,7 +3156,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
           )
           // The visible failure marker — same system-row surface as the bare
           // `error` event, so a failed turn never reads as a healthy reply.
-          pushSystem(`error: ${failure.message}`)
+          pushSystem(failureRow ?? `error: ${failure.message}`)
         } else {
           setState(
             produce(draft => {
@@ -3092,12 +3294,20 @@ export function createSessionStore(options?: SessionStoreOptions) {
         }
         break
       }
+      case 'connection.request':
+        setState('connection', current => requestCard(current, event.payload, connectionOps))
+        break
+      case 'connection.update': {
+        const { card, lines } = updateCard(state.connection, event.payload, connectionOps)
+        setState('connection', card)
+        for (const line of lines) pushSystem(line)
+        break
+      }
       case 'session.control.update':
-        // The structured snapshot backs Desktop's interactive automation
-        // cards. Native controls remain /goal, /loop, /heartbeat and /subgoal;
-        // their command output plus status.update/turn events already provide
-        // the intended terminal behavior. Claim this decoded event explicitly
-        // without introducing a second session-control store or duplicate UI.
+        // Native controls remain /goal, /loop, /heartbeat and /subgoal; only the
+        // goal slot feeds terminal chrome (the standing goal row above the dock,
+        // Ink goalBar.tsx). Loop/heartbeat stay on their status/turn surfaces.
+        setState('goal', decodeGoalSnapshot(event.payload.control.goal))
         break
       // notification.show — background-activity notice (process/run state change,
       // credits, etc.). Renders as a distinct inline card (NOT a plain line) and
@@ -3435,12 +3645,20 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       // ── blocking prompts: opened by server requests (serverRequests.ts) ──
-      case 'request.cancel':
+      case 'request.cancel': {
         // The backend withdrew the request: close only the prompt it opened.
-        if (state.prompt && 'requestId' in state.prompt && state.prompt.requestId === event.payload.id) {
-          settlePrompt(state.prompt, CANCEL_SETTLEMENT[event.payload.reason] ?? 'expired')
+        const open = state.prompt
+        if (open && 'requestId' in open && open.requestId === event.payload.id) {
+          // A timed-out password/secret/vault card says what was skipped and how
+          // to get it back (Ink promptTimeoutNotice); clarify keeps its own record.
+          const timeoutNotice =
+            open.kind === 'clarify' ? undefined : promptTimeoutNotice(event.payload.method, event.payload.reason)
+          if (timeoutNotice) {
+            if (clearPrompt(open)) pushSystem(timeoutNotice)
+          } else settlePrompt(open, CANCEL_SETTLEMENT[event.payload.reason] ?? 'expired')
         }
         break
+      }
       // ── subagents (agents dashboard) — track the delegation tree by id ──
       case 'subagent.spawn_requested':
       case 'subagent.start':
@@ -3574,18 +3792,40 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // Neutral status: we don't ALWAYS recover (budget exhaustion). The
         // "recovering…" wording now comes from the gateway.recovering case,
         // which fires only when a respawn is actually scheduled.
-        setState('status', 'gateway exited')
         // The dead child's compaction pause cannot complete — drop the latch so
         // the idle spinner doesn't outlive the process that owned it.
         setState('compacting', false)
+        // Attached (dashboard WebSocket) drop: the backend and any live turn are
+        // still alive server-side — Ink's "connection lost · reconnecting…"
+        // copy, not the spawn-mode crash line (Ink useMainApp exitHandler).
+        if (event.payload?.attached === true) {
+          setState('status', ATTACHED_CONNECTION_LOST_STATUS)
+          // Ink only narrates the drop when a chat was open to reopen.
+          if (state.sessionId) pushSystem(ATTACHED_CONNECTION_LOST_NOTICE)
+          break
+        }
+        setState('status', 'gateway exited')
         const reason = event.payload?.reason
         const base = 'gateway exited — recovering your session (any in-flight reply was lost)'
         pushSystem(reason ? `${base}: ${reason}` : base)
         break
       }
+      // Crash-loop budget spent: no more respawns. Say it ONCE per outage with
+      // the exit code + last stderr line (Ink useMainApp backendGaveUp).
+      case 'gateway.recovery_exhausted': {
+        setState('status', 'stopped')
+        if (recoveryGaveUpReported) break
+        recoveryGaveUpReported = true
+        pushSystem(`error: ${backendGaveUp(event.payload?.code, lastStderrLine(stderrRing))}`)
+        break
+      }
       // A respawn+resume attempt is in flight — reflect the attempt in the status.
       case 'gateway.recovering': {
         const attempt = event.payload?.attempt
+        if (event.payload?.attached === true) {
+          setState('status', attachedReconnectingStatus(attempt, event.payload.delay_ms))
+          break
+        }
         setState('status', attempt ? `gateway recovering (attempt ${attempt})…` : 'gateway recovering…')
         break
       }
@@ -3618,7 +3858,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // prevents neverWindow from pinning one native row per failed turn.
         setState(produce(settleFailedAssistant))
         const message = event.payload?.message
-        pushSystem(message ? `error: ${message}` : 'error')
+        pushSystem(message ? `error: ${describeRpcError(message)}` : 'error')
         // A deferred agent build can fail before `message.start`; the gateway
         // clears its running flag but emits no trailing session.info in that
         // path. Settle the optimistic client flag and drain exactly once. For a
@@ -4039,6 +4279,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     getDelegationControlRevision,
     setCatalog,
     setCommandCatalog,
+    reapplyTheme,
     addPendingImage,
     removePendingImage,
     restorePendingImage,
@@ -4116,8 +4357,15 @@ export function createSessionStore(options?: SessionStoreOptions) {
     patchBilling,
     openSubscription,
     closeSubscription,
+    restoreConnection,
+    dismissConnection,
+    connectionSettled,
     patchSubscription,
     setBackgroundProcesses,
+    claimGoalRead,
+    releaseGoalRead,
+    applySessionControlRead,
+    applyProcessListResponse,
     addBgTask,
     hydrate,
     beginBuffer,

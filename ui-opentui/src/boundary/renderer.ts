@@ -149,24 +149,7 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
   // `client.stop()` EOFs the Python child's stdin so it exits (no orphan). When a
   // blocking prompt is up, it owns Ctrl+C (→ deny/cancel) so we suppress the quit
   // (gotcha §8 #6) — the prompt's own handler sends the cancel reply.
-  const isBlocked = options.isBlocked ?? (() => false)
-  renderer.keyInput.on('keypress', (key: KeyEvent) => {
-    if (!(key.ctrl && key.name === 'c') || renderer.isDestroyed) return
-    // Copy a live mouse selection first (item 1) — takes precedence over the
-    // interrupt/quit machine and over a blocking prompt's cancel.
-    if (options.onCopySelection) {
-      const selection = renderer.getSelection()
-      const text = selection ? selectionCopyText(selection) : ''
-      if (text) {
-        options.onCopySelection(text)
-        renderer.clearSelection()
-        return
-      }
-    }
-    if (isBlocked()) return // an overlay/prompt owns Ctrl+C (close/cancel)
-    if (options.onCtrlC) options.onCtrlC()
-    else renderer.destroy()
-  })
+  renderer.keyInput.on('keypress', (key: KeyEvent) => handleCtrlCKey(renderer, options, key))
 
   // Copy-on-select (item 1 parity with free-code/Ink): the renderer's "selection"
   // event fires ONCE when a free-form mouse selection COMPLETES (drag finish);
@@ -185,6 +168,40 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
 
   return { renderer, shutdown } as const
 })
+
+type CtrlCRenderer = Pick<CliRenderer, 'clearSelection' | 'destroy' | 'getSelection' | 'isDestroyed'>
+
+/**
+ * Global Ctrl+C precedence: copy a live selection first, and only then fall
+ * through to the prompt cancel / clear-draft / interrupt / quit machine. A
+ * composer Shift+arrow selection is a renderer selection too (OpenTUI's
+ * textarea calls ctx.startSelection for keyboard selection), so Ctrl+C copies
+ * it instead of clearing the draft (Ink be250390db).
+ * `exitOnCtrlC:false` hands Ctrl+C to us as a key event (not SIGINT). When a
+ * blocking prompt is up, it owns Ctrl+C (deny/cancel) so the quit is
+ * suppressed (gotcha §8 #6).
+ */
+export function handleCtrlCKey(
+  renderer: CtrlCRenderer,
+  options: Pick<RendererOptions, 'isBlocked' | 'onCopySelection' | 'onCtrlC'>,
+  key: Pick<KeyEvent, 'ctrl' | 'name'>
+): void {
+  if (!(key.ctrl && key.name === 'c') || renderer.isDestroyed) return
+  if (options.onCopySelection) {
+    // Copy a live mouse or keyboard selection first (item 1) — takes precedence
+    // over the interrupt/quit machine and over a blocking prompt's cancel.
+    const selection = renderer.getSelection()
+    const text = selection ? selectionCopyText(selection) : ''
+    if (text) {
+      options.onCopySelection(text)
+      renderer.clearSelection()
+      return
+    }
+  }
+  if (options.isBlocked?.() === true) return // an overlay/prompt owns Ctrl+C (close/cancel)
+  if (options.onCtrlC) options.onCtrlC()
+  else renderer.destroy()
+}
 
 const CLEAR_SCREEN_AND_HOME = '\u001b[2J\u001b[H'
 

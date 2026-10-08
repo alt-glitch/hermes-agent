@@ -54,7 +54,13 @@ import { SyntaxStyle, type PasteEvent, type TextareaRenderable } from '@opentui/
 import { useKeyboard, useRenderer } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
-import { MENU_MAX, acceptChangesToken, completionEdit, routeMenuKey } from '../logic/completionMenu.ts'
+import {
+  MENU_MAX,
+  acceptChangesToken,
+  completionEdit,
+  completionNameWidth,
+  routeMenuKey
+} from '../logic/completionMenu.ts'
 import { BUSY_QUEUE_MAX_CHARS, BUSY_QUEUE_MAX_EDIT_CHARS } from '../logic/busyQueue.ts'
 import { composerHighlightSpans } from '../logic/composerHighlights.ts'
 import { envComposerRows } from '../logic/env.ts'
@@ -183,6 +189,9 @@ export function Composer(props: {
    *  parent opens the session prompt-history viewer (or does nothing when the
    *  session has no prompts yet — never an empty modal). */
   onDoubleEsc?: (() => void) | undefined
+  /** Ctrl+X with a keyboard selection: write it to the clipboard; the
+   *  selection is removed only when this resolves true (transactional cut). */
+  onCutSelection?: ((text: string) => Promise<boolean>) | undefined
   /** The persisted draft to seed the buffer with on mount (survives the
    *  composer unmounting when a blocking prompt replaces it). */
   initialDraft?: (() => string) | undefined
@@ -754,6 +763,33 @@ export function Composer(props: {
       doubleEsc.reset()
       return
     }
+    // Ctrl+X cuts a keyboard (Shift+arrow) selection before it can mean
+    // "delete queued row". Transactional (Ink 24af6685b0): the text leaves the
+    // buffer only after the clipboard write succeeds, and only if the same
+    // selection is still in place when the awaited write resolves.
+    if (
+      key.ctrl &&
+      key.name === 'x' &&
+      key.eventType !== 'release' &&
+      !key.meta &&
+      !key.option &&
+      ta?.focused === true &&
+      ta.hasSelection() &&
+      props.onCutSelection
+    ) {
+      key.preventDefault()
+      const range = ta.getSelection()
+      const text = ta.getSelectedText()
+      if (!range || text === '') return
+      const target = ta
+      void props.onCutSelection(text).then(ok => {
+        if (!ok || target.isDestroyed) return
+        const current = target.getSelection()
+        if (!current || current.start !== range.start || current.end !== range.end) return
+        target.deleteSelection()
+      })
+      return
+    }
     if (editIndex !== undefined && key.ctrl && key.name === 'x' && key.eventType !== 'release') {
       key.preventDefault()
       props.onQueueRemove?.(editIndex)
@@ -955,17 +991,30 @@ export function Composer(props: {
               selection (item 4). The highlighted row tracks `selected()` (Epic 8)
               with the THEMED completionCurrentBg — Up/Down move it on the slash
               menu; on path menus it stays on the top match (Tab's target). */}
+          {/* Two-column grid (Ink ce8c2c97aa): the name track auto-sizes to
+              the widest visible row so descriptions align in their own column,
+              in the neutral statusFg tone — label vs muted are near-twins on
+              the gold skins, which made name + description one unparseable run. */}
           <For each={menuItems()}>
             {(c, i) => (
               <box
                 style={{
-                  backgroundColor: i() === selected() ? theme().color.completionCurrentBg : theme().color.completionBg
+                  backgroundColor: i() === selected() ? theme().color.completionCurrentBg : theme().color.completionBg,
+                  flexDirection: 'row'
                 }}
               >
-                <text selectable={false} fg={i() === selected() ? theme().color.accent : theme().color.text}>
-                  {c.display || c.text}
-                  {c.meta ? `  ${c.meta}` : ''}
-                </text>
+                <box style={{ flexShrink: 0, width: completionNameWidth(menuItems()) }}>
+                  <text selectable={false} fg={i() === selected() ? theme().color.accent : theme().color.text}>
+                    {c.display || c.text}
+                  </text>
+                </box>
+                <Show when={c.meta}>
+                  <box style={{ flexGrow: 1, flexShrink: 1 }}>
+                    <text selectable={false} fg={theme().color.statusFg}>
+                      {c.meta}
+                    </text>
+                  </box>
+                </Show>
               </box>
             )}
           </For>

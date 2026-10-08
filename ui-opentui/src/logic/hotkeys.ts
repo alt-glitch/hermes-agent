@@ -26,21 +26,18 @@ export function isAgentsDashboardKey(key: AgentsKey): boolean {
   )
 }
 
+/** F7, or Ctrl+R (Ink 65ad5296ea): macOS terminals often reserve the function
+ * row for hardware controls, so Ctrl+R is the portable dock toggle. */
 export function isAgentsDockToggleKey(key: AgentsKey): boolean {
-  return (
-    key.eventType !== 'release' &&
-    !key.ctrl &&
-    !key.meta &&
-    key.super !== true &&
-    !key.option &&
-    !key.shift &&
-    key.name.toLowerCase() === 'f7'
-  )
+  if (key.eventType === 'release' || key.meta || key.super === true || key.option || key.shift) return false
+  const name = key.name.toLowerCase()
+  return (name === 'f7' && !key.ctrl) || (name === 'r' && key.ctrl)
 }
 
 interface ActionExitOverlayState {
   readonly backgroundPanel: boolean
   readonly billing: unknown
+  readonly connection?: unknown
   readonly dashboard: boolean
   readonly journey?: boolean
   readonly pluginsHub?: boolean
@@ -61,6 +58,7 @@ export function actionExitBlocked(state: ActionExitOverlayState): boolean {
     state.sessionPicker ||
     state.picker ||
     state.billing ||
+    state.connection ||
     state.dashboard ||
     state.journey ||
     state.pluginsHub ||
@@ -83,9 +81,48 @@ export function isRedrawHotkey(key: ActionKey, platform: NodeJS.Platform = proce
   return isActionHotkey(key, 'l', platform)
 }
 
-/** Ink's action+D exit gesture: Cmd+D on macOS, Ctrl+D everywhere else. */
+/** Ink's action+D exit gesture: Cmd+D on macOS, Ctrl+D everywhere. Literal
+ * Ctrl+D is the terminal EOF convention, so macOS accepts it too (Ghostty
+ * consumes Cmd+D for split panes; Ink b787fb9128). */
 export function isExitHotkey(key: ActionKey, platform: NodeJS.Platform = process.platform): boolean {
-  return isActionHotkey(key, 'd', platform)
+  if (isActionHotkey(key, 'd', platform)) return true
+  return (
+    platform === 'darwin' &&
+    key.eventType !== 'release' &&
+    key.ctrl &&
+    !key.meta &&
+    key.super !== true &&
+    key.name === 'd'
+  )
+}
+
+interface ComposerContents {
+  readonly composerDraft: string
+  readonly pendingImages: readonly unknown[]
+}
+
+/** Text or attachments in the composer: Ctrl+D must not exit over an unsent draft. */
+export function composerHasDraft(state: ComposerContents): boolean {
+  return state.composerDraft !== '' || state.pendingImages.length > 0
+}
+
+/** Ctrl/Cmd+D exits only from an empty composer with no overlay up. With a
+ * draft the key falls through to the textarea (forward delete). */
+export function shouldExitOnHotkey(
+  key: ActionKey,
+  state: ActionExitOverlayState & ComposerContents,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  return isExitHotkey(key, platform) && !actionExitBlocked(state) && !composerHasDraft(state)
+}
+
+export type DoubleEscAction = 'interrupt' | 'prompt-history'
+
+/** Esc Esc on an EMPTY composer (Ink e49e359823): while a turn runs it is the
+ * fast emergency brake (same path as Ctrl+C / /stop); idle it keeps opening
+ * the session prompt history. A draft is discarded by the composer itself. */
+export function emptyDoubleEscAction(busy: boolean, canInterrupt: boolean): DoubleEscAction {
+  return busy && canInterrupt ? 'interrupt' : 'prompt-history'
 }
 
 export type CtrlCAction = 'clear-draft' | 'interrupt' | 'exit'
@@ -107,11 +144,11 @@ export function openTuiHotkeys(platform: NodeJS.Platform = process.platform): re
     [`${action}+L`, 'redraw / repaint'],
     ['Tab', 'apply completion'],
     ['↑/↓', 'completions / queued edit / input history / cursor'],
-    ['Ctrl+X', 'delete queued message while editing'],
+    ['Ctrl+X', 'cut selection / delete queued message while editing'],
     ['Ctrl+T', 'open live agents'],
-    ['F7', 'collapse / restore live-agent dock'],
+    ['Ctrl+R / F7', 'collapse / restore live-agent dock'],
     ['Enter Enter (empty)', 'stop the turn / force the next queued message'],
-    ['Esc Esc', 'discard draft (recall with ↑) / open prompt history when empty'],
+    ['Esc Esc', 'discard draft (recall with ↑) / stop the turn / open prompt history when empty'],
     ['Cmd/Super+Backspace/Delete', 'kill to current line start / end'],
     ['Option/Ctrl+Backspace', 'delete word'],
     ['Ctrl+U/K', 'kill to line start / end (repeat across lines)'],

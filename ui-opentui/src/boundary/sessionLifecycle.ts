@@ -208,7 +208,23 @@ function inflightParts(
 function liveSnapshotMessages(response: LiveSessionSnapshot): Message[] {
   const messages = mapResumeHistory(response.messages)
   const inflightUser = response.inflight?.user?.trim()
-  if (inflightUser) messages.push({ role: 'user', text: inflightUser })
+  if (inflightUser) {
+    // Route the in-flight user turn through the same display_kind handling as
+    // resume history (Ink liveSessionInflightMessages, upstream 9583c8c45a):
+    // a synthetic turn renders as its typed row, not its raw model prompt.
+    const displayKind = response.inflight?.display_kind
+    const displayMetadata = response.inflight?.display_metadata
+    messages.push(
+      ...mapResumeHistory([
+        {
+          role: 'user',
+          text: inflightUser,
+          ...(displayKind ? { display_kind: displayKind } : {}),
+          ...(displayMetadata ? { display_metadata: displayMetadata } : {})
+        }
+      ])
+    )
+  }
   const inflightAssistant = response.inflight?.assistant ?? ''
   const parts = inflightParts(inflightAssistant, response.inflight?.corrections, response.inflight?.correction_offsets)
   const inflightError = response.inflight?.error?.trim()
@@ -320,6 +336,7 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
     )
     // After the commit (it clears the prompt): pending backend questions reappear.
     gateway.replayRequests?.(response.open_requests ?? [])
+    if (response.pending_connection) store.restoreConnection(response.pending_connection)
     for (const text of preservedQueue) store.enqueuePrompt(text)
     for (const image of preservedImages) store.restorePendingImage(image)
     if (preservedDraft) store.replaceComposerDraft(preservedDraft)
@@ -392,6 +409,7 @@ export const activateSession = Effect.fn('SessionLifecycle.activate')(function* 
     )
     // After the commit (it clears the prompt): pending backend questions reappear.
     gateway.replayRequests?.(response.open_requests ?? [])
+    if (response.pending_connection) store.restoreConnection(response.pending_connection)
     committed = true
     return {
       messageCount: snapshot.length,
