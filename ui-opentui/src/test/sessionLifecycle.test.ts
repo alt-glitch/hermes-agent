@@ -264,6 +264,60 @@ describe('resumeSession', () => {
     })
   })
 
+  it.effect('renders a synthetic in-flight user turn through its display_kind (Ink 9583c8c45a)', () => {
+    const store = createSessionStore()
+    const service = fakeGateway(() =>
+      Effect.succeed({
+        inflight: {
+          assistant: '',
+          display_kind: 'process_complete',
+          display_metadata: { display_text: 'Finished syncing the workspace' },
+          streaming: true,
+          user: '[IMPORTANT: Background process proc_1 completed]'
+        },
+        messages: [],
+        running: true,
+        session_id: 'synthetic-live',
+        status: 'working'
+      })
+    ).service
+    return Effect.gen(function* () {
+      yield* resumeSession(service, store, { cols: 80, targetSessionId: 'durable-key' })
+      assert.deepStrictEqual(
+        store.state.messages.map(message => [message.role, message.text]),
+        [
+          ['system', '◈ Finished syncing the workspace'],
+          ['assistant', '']
+        ]
+      )
+    })
+  })
+
+  it.effect('keeps a plain in-flight user turn and skips a hidden one', () => {
+    const plain = createSessionStore()
+    const hidden = createSessionStore()
+    const snapshot = (inflight: Record<string, unknown>) =>
+      fakeGateway(() =>
+        Effect.succeed({ inflight, messages: [], running: true, session_id: 'live', status: 'working' })
+      ).service
+    return Effect.gen(function* () {
+      yield* resumeSession(snapshot({ assistant: '', display_kind: null, streaming: false, user: 'hi' }), plain, {
+        cols: 80,
+        targetSessionId: 'durable-key'
+      })
+      yield* resumeSession(
+        snapshot({ assistant: '', display_kind: 'hidden', streaming: false, user: 'widget intent' }),
+        hidden,
+        { cols: 80, targetSessionId: 'durable-key' }
+      )
+      assert.deepStrictEqual(
+        plain.state.messages.map(message => [message.role, message.text]),
+        [['user', 'hi']]
+      )
+      assert.deepStrictEqual(hidden.state.messages, [])
+    })
+  })
+
   it.effect('rebuilds mid-turn corrections at their persisted assistant offsets', () => {
     const store = createSessionStore()
     const service = fakeGateway(() =>

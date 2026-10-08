@@ -41,6 +41,11 @@ export const SessionInflightSchema = Schema.StructWithRest(
     assistant: opt(Str),
     correction_offsets: opt(Schema.Array(Num)),
     corrections: opt(Schema.Array(Str)),
+    // Synthetic turn typing (upstream 9583c8c45a): a live auto-continue /
+    // process-completion turn carries the same display_kind/display_metadata
+    // as its persisted history row, so attach renders it identically.
+    display_kind: opt(Schema.NullOr(Str)),
+    display_metadata: opt(Schema.NullOr(Schema.Record(Str, Schema.Unknown))),
     // Retained failed turn (upstream 57b351d3689): the gateway keeps a compact
     // error snapshot when the terminal frame may have been lost to a
     // disconnect. `error` is the failure message; `status` is "error";

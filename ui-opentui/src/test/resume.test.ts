@@ -259,16 +259,38 @@ describe('mapResumeHistory (Phase 4b)', () => {
     expect(msgs[1]?.parts?.map(part => part.type)).toEqual(['text'])
   })
 
-  test('keeps model-switch bookkeeping hidden instead of resurrecting a user bubble', () => {
+  test('renders a model switch as a dim ◈ marker instead of a user bubble (Ink a4bc1ca502)', () => {
     const msgs = mapResumeHistory([
       { role: 'user', text: 'before' },
-      { role: 'user', text: '[System: model changed to gpt-5]', display_kind: 'model_switch' },
+      { role: 'tool', name: 'orphan', context: 'x' },
+      { role: 'user', text: '[System: model changed to gpt-5]', display_kind: 'model_switch', timestamp: 42 },
       { role: 'assistant', text: 'after' }
     ])
 
     expect(msgs.map(message => [message.role, message.text])).toEqual([
       ['user', 'before'],
+      ['system', '◈ model changed'],
       ['assistant', 'after']
+    ])
+    expect(msgs[1]?.timestamp).toBe(42)
+    // the orphaned tool row is dropped at the display-only boundary
+    expect(msgs[2]?.parts?.map(part => part.type)).toEqual(['text'])
+  })
+
+  test('renders a typed process completion row as a ◈ marker with its display text', () => {
+    expect(
+      mapResumeHistory([
+        { role: 'user', text: '[IMPORTANT: Background process done]', display_kind: 'process_complete' },
+        {
+          role: 'user',
+          text: '[IMPORTANT: Background process done]',
+          display_kind: 'process_complete',
+          display_metadata: { display_text: 'Finished syncing the workspace' }
+        }
+      ]).map(message => [message.role, message.text])
+    ).toEqual([
+      ['system', '◈ background process finished'],
+      ['system', '◈ Finished syncing the workspace']
     ])
   })
 })

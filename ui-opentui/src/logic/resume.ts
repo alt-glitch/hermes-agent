@@ -89,6 +89,11 @@ function delegationEventLabel(metadata: unknown): string {
   return `${count} background agent${count === 1 ? '' : 's'} finished`
 }
 
+function processEventLabel(metadata: unknown): string {
+  const display = readStr(metadata, 'display_text')
+  return display !== undefined && display.trim() ? display : 'background process finished'
+}
+
 /** Map a `session.list` result into switcher rows (loose-typed read). */
 export function mapSessionList(result: unknown): SessionItem[] {
   if (!result || typeof result !== 'object') return []
@@ -123,12 +128,19 @@ export function mapResumeHistory(history: unknown): Message[] {
     const ts = readOptNum(raw, 'timestamp')
 
     // Persisted display-only rows are not ordinary conversation turns. Hidden
-    // handoffs and model-switch bookkeeping follow the gateway's current
-    // transcript policy and stay invisible. Delegation completions remain
-    // useful timeline facts, rendered through the existing dim system-row
-    // surface as a typed ◈ marker instead of resurrecting their raw user prompt.
+    // handoffs stay invisible. Model switches and delegation/process
+    // completions remain useful timeline facts, rendered through the existing
+    // dim system-row surface as a typed ◈ marker (Ink `toTranscriptMessages`,
+    // upstream a4bc1ca502) instead of resurrecting their raw user prompt.
     const displayKind = readStr(raw, 'display_kind')
-    if (displayKind === 'hidden' || displayKind === 'model_switch') continue
+    if (displayKind === 'hidden') continue
+    if (displayKind === 'model_switch') {
+      const message: Message = { role: 'system', text: '◈ model changed' }
+      if (ts !== undefined) message.timestamp = ts
+      out.push(message)
+      pendingTools = []
+      continue
+    }
     // A crash-interrupted turn the gateway auto-continued (upstream
     // 082bd17122d): the stored user row is the synthesized interruption note
     // (system note + embedded original prompt). Render the timeline fact as a
@@ -150,10 +162,11 @@ export function mapResumeHistory(history: unknown): Message[] {
       pendingTools = []
       continue
     }
-    if (displayKind === 'async_delegation_complete') {
+    if (displayKind === 'async_delegation_complete' || displayKind === 'process_complete') {
       const metadata =
         raw && typeof raw === 'object' ? (raw as { display_metadata?: unknown }).display_metadata : undefined
-      const message: Message = { role: 'system', text: `◈ ${delegationEventLabel(metadata)}` }
+      const label = displayKind === 'process_complete' ? processEventLabel(metadata) : delegationEventLabel(metadata)
+      const message: Message = { role: 'system', text: `◈ ${label}` }
       if (ts !== undefined) message.timestamp = ts
       out.push(message)
       pendingTools = []
