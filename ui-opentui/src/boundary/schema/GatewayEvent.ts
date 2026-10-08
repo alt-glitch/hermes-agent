@@ -14,6 +14,7 @@
  */
 import { Schema } from 'effect'
 
+import { ConnectionRequestPayloadSchema, ConnectionUpdatePayloadSchema } from './Connection.ts'
 import { SpawnTreeSubagentSchema } from './Delegation.ts'
 import { TodoStateSchema } from './TodoState.ts'
 
@@ -276,6 +277,17 @@ const BillingStepUpVerification = Schema.Struct({
   session_id: opt(Str),
   payload: Schema.Struct({ user_code: opt(Str), verification_url: Str })
 })
+// manage_connections card (tui_gateway/contracts/connectors_operation.py).
+const ConnectionRequest = Schema.Struct({
+  type: Schema.Literal('connection.request'),
+  session_id: opt(Str),
+  payload: ConnectionRequestPayloadSchema
+})
+const ConnectionUpdate = Schema.Struct({
+  type: Schema.Literal('connection.update'),
+  session_id: opt(Str),
+  payload: ConnectionUpdatePayloadSchema
+})
 const VoiceStatus = Schema.Struct({
   type: Schema.Literal('voice.status'),
   session_id: opt(Str),
@@ -420,6 +432,8 @@ const ChromeTransportEvents = Schema.Union([
   NotificationShow,
   NotificationClear,
   BillingStepUpVerification,
+  ConnectionRequest,
+  ConnectionUpdate,
   VoiceStatus,
   VoiceTranscript,
   WakeDetected,

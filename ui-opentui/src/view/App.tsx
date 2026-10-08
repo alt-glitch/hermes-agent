@@ -41,6 +41,7 @@ import { CustomModelSetup } from './overlays/customModelSetup.tsx'
 import { PluginsHub, type PluginOps } from './overlays/pluginsHub.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
 import { SessionOrchestrator, type SessionOrchestratorOps } from './overlays/sessionOrchestrator.tsx'
+import { ConnectionCard, type ConnectionCardOps } from './prompts/connectionCard.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
 import type { PromptReply, PromptResponseDisposition } from '../boundary/promptResponses.ts'
 import { SessionInfoProvider } from './sessionInfo.tsx'
@@ -87,6 +88,8 @@ export interface AppProps {
     stopAll: () => Promise<void>
   }
   readonly journeyOps?: JourneyOps
+  /** manage_connections card answers (entry-owned gateway calls). */
+  readonly connectionOps?: ConnectionCardOps
   readonly pluginOps?: PluginOps
   readonly petOps?: PetOps
   /** Native Agents dashboard controls. Views remain transport-free; the entry
@@ -120,6 +123,16 @@ const NOOP_PET_OPS: PetOps = {
   select: slug => Promise.resolve({ displayName: slug, ok: false, slug })
 }
 
+/** Headless mounts without a gateway: answers fail visibly; local dismissal still works. */
+const connectionOpsFor = (store: SessionStore): ConnectionCardOps => ({
+  respond: () => Promise.reject(new Error('gateway unavailable')),
+  reconnect: () => Promise.reject(new Error('gateway unavailable')),
+  interrupt: () => {},
+  openUrl: () => false,
+  dismiss: opId => store.dismissConnection(opId),
+  isSettled: opId => store.connectionSettled(opId)
+})
+
 /** Inert picker ops for headless mounts that pass no gateway (tests). */
 const NOOP_OPS: SessionOrchestratorOps = {
   history: () => Promise.resolve({ sessions: [] }),
@@ -137,6 +150,7 @@ export function App(props: AppProps) {
   let trayApi: AgentsTrayApi | undefined
   let focusComposer: (() => void) | undefined
   const blocked = () => props.store.state.prompt !== undefined
+  const connection = () => props.store.state.connection
   const pager = () => props.store.state.pager
   const dashboard = () => props.store.state.dashboard
   const backgroundPanel = () => props.store.state.backgroundPanel
@@ -276,6 +290,13 @@ export function App(props: AppProps) {
                   >
                     <Match when={blocked()}>
                       <PromptOverlay store={props.store} onRespond={props.onRespond ?? NOOP_RESPOND} />
+                    </Match>
+                    {/* manage_connections card: the backend tool waits on it, so it
+                        replaces the composer like a blocking prompt. */}
+                    <Match when={connection()}>
+                      {card => (
+                        <ConnectionCard card={card()} ops={props.connectionOps ?? connectionOpsFor(props.store)} />
+                      )}
                     </Match>
                     {/* modal widget app: owns every keypress while open (the
                         composer is replaced, Picker-style); its reducer closes it. */}

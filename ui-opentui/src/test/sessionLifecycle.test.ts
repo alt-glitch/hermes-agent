@@ -580,6 +580,55 @@ describe('activateSession', () => {
       assert.strictEqual(store.state.latestTodos?.todos[0]?.content, 'target plan')
     })
   })
+
+  it.effect('drops the prior session card and restores the target pending_connection', () => {
+    const store = createSessionStore()
+    store.adoptFreshSession('old-live')
+    const card = (opId: string) => ({
+      op_id: opId,
+      seq: 1,
+      deadline_at: 2_000_000_000,
+      targets: [{ name: 'notion', kind: 'connector', action: 'connect', state: 'initiated' as const }]
+    })
+    store.apply({ type: 'connection.request', session_id: 'old-live', payload: card('old-op') })
+    const fake = fakeGateway(
+      method =>
+        method === 'session.activate'
+          ? Effect.succeed({ messages: [], session_id: 'target-live', pending_connection: card('target-op') })
+          : Effect.die('unexpected RPC'),
+      'old-live'
+    )
+    return Effect.gen(function* () {
+      yield* activateSession(fake.service, store, { targetSessionId: 'target-live' })
+      assert.strictEqual(store.state.connection?.opId, 'target-op')
+    })
+  })
+})
+
+describe('resumeSession pending_connection', () => {
+  it.effect('restores the open card after the snapshot commits', () => {
+    const store = createSessionStore()
+    const fake = fakeGateway(method =>
+      method === 'session.resume'
+        ? Effect.succeed({
+            messages: [],
+            session_id: 'live-1',
+            pending_connection: {
+              op_id: 'op-r',
+              seq: 3,
+              deadline_at: 2_000_000_000,
+              timeout_seconds: 300,
+              targets: [{ name: 'linear', kind: 'connector', action: 'connect', state: 'pending' }]
+            }
+          })
+        : Effect.die('unexpected RPC')
+    )
+    return Effect.gen(function* () {
+      yield* resumeSession(fake.service, store, { cols: 80, targetSessionId: 'stored-1' })
+      assert.strictEqual(store.state.connection?.opId, 'op-r')
+      assert.strictEqual(store.state.connection?.targets[0]?.name, 'linear')
+    })
+  })
 })
 
 describe('branchSession', () => {

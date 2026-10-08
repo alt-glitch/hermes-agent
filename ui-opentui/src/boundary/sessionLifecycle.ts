@@ -320,6 +320,7 @@ export const resumeSession = Effect.fn('SessionLifecycle.resume')(function* (
     )
     // After the commit (it clears the prompt): pending backend questions reappear.
     gateway.replayRequests?.(response.open_requests ?? [])
+    if (response.pending_connection) store.restoreConnection(response.pending_connection)
     for (const text of preservedQueue) store.enqueuePrompt(text)
     for (const image of preservedImages) store.restorePendingImage(image)
     if (preservedDraft) store.replaceComposerDraft(preservedDraft)
@@ -392,6 +393,7 @@ export const activateSession = Effect.fn('SessionLifecycle.activate')(function* 
     )
     // After the commit (it clears the prompt): pending backend questions reappear.
     gateway.replayRequests?.(response.open_requests ?? [])
+    if (response.pending_connection) store.restoreConnection(response.pending_connection)
     committed = true
     return {
       messageCount: snapshot.length,

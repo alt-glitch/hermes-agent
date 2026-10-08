@@ -183,6 +183,8 @@ import {
   type SessionStore
 } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
+import type { ConnectionCardOps } from '../view/prompts/connectionCard.tsx'
+import { openExternalUrl } from '../boundary/openExternalUrl.ts'
 import { refreshLearnedNames, seedLearnedNames } from '../view/composer.tsx'
 import { TerminalChrome } from '../view/terminalChrome.tsx'
 import { mergeWidgetCompletionItems } from '../widgets/completion.ts'
@@ -3320,6 +3322,32 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // background-PROMPT tasks from the event stream, and the /processes panel
       // fetches `agents.list` on open. Nothing to poll for.)
 
+      // manage_connections card: answers go back on the operation the session owns. Ctrl+C on the
+      // card stops the turn, which settles the operation as `interrupt`.
+      const connectionOwner = () => {
+        const sid = gateway.sessionId()
+        if (!sid) throw new Error('no live session')
+        return { type: 'session' as const, session_id: sid }
+      }
+      const connectionOps: ConnectionCardOps = {
+        respond: (opId, result) =>
+          Effect.runPromise(
+            gateway.request('connection.respond', {
+              op_id: opId,
+              owner: connectionOwner(),
+              result
+            })
+          ),
+        reconnect: name =>
+          Effect.runPromise(
+            gateway.request('connectors.connect', { connectors: [name], owner: connectionOwner(), reconnect: true })
+          ),
+        interrupt: () => interruptTurn(),
+        openUrl: url => openExternalUrl(url),
+        dismiss: opId => store.dismissConnection(opId),
+        isSettled: opId => store.connectionSettled(opId)
+      }
+
       // Contact point #1: the single render bridge. After this, the screen is Solid's.
       // The theme is sourced reactively from the store (skin events update it).
       yield* Effect.promise(() =>
@@ -3357,6 +3385,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   onPasteLimitExceeded={showPasteLimit}
                   backgroundOps={backgroundOps}
                   agentsOps={agentsOps}
+                  connectionOps={connectionOps}
                 />
               </ThemeProvider>
             </KeymapProvider>

@@ -82,6 +82,8 @@ import {
 import type { ApprovalChoicePolicy } from './approval.ts'
 import { formatAbandonedClarifyBatch, remainingClarifyQids, type ClarifyBatchQuestion } from './clarifyBatch.ts'
 import { billingWallAction, billingWallCopy, runBillingWallAction, type BillingWallHost } from './billingWall.ts'
+import { ConnectionOpMemory, requestCard, updateCard, type ConnectionCard } from './connectionCard.ts'
+import type { ConnectionRequestPayload } from '../boundary/schema/Connection.ts'
 import { appendSubagentTrace, finishSubagentTrace, trimSubagentTrace } from './subagentTrace.ts'
 
 /** Monotonic identity for one concrete overlay instance. Async work must carry
@@ -801,6 +803,8 @@ export interface StoreState {
   billing: OwnedBillingOverlayState | undefined
   /** The open /subscription plan-management overlay. */
   subscription: OwnedSubscriptionOverlayState | undefined
+  /** The open manage_connections card (session-owned; the backend tool waits on it). */
+  connection: ConnectionCard | undefined
   /** OS background processes (from `agents.list`) — shown in the /processes panel. */
   backgroundProcesses: BackgroundProcess[]
   /** In-flight background-PROMPT task ids (`/bg` → `prompt.background`, cleared on
@@ -1223,6 +1227,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
     backgroundPanel: false,
     billing: undefined,
     subscription: undefined,
+    connection: undefined,
     backgroundProcesses: [],
     bgTasks: [],
     voice: {
@@ -2196,6 +2201,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
         draft.backgroundPanel = false
         draft.billing = undefined
         draft.subscription = undefined
+        // The card belongs to the session being left; a resumed/activated one restores its own
+        // from `pending_connection` after the commit.
+        draft.connection = undefined
         draft.bgTasks = []
         draft.status = undefined
         draft.lastNotification = undefined
@@ -2790,6 +2798,26 @@ export function createSessionStore(options?: SessionStoreOptions) {
   }
 
   /** Reduce a decoded gateway event into the store. The sole boundary->Solid sink. */
+  // Op ids that settled or were dismissed, so a late frame cannot reopen a card. Process-wide like
+  // Ink's: op ids are unique, and a settle for a dismissed card must still write its outcome lines.
+  const connectionOps = new ConnectionOpMemory()
+
+  /** Restore the card from a resume/activate snapshot (`pending_connection`). */
+  function restoreConnection(payload: ConnectionRequestPayload): void {
+    setState('connection', current => requestCard(current, payload, connectionOps))
+  }
+
+  /** Close the card locally; the settle that follows still writes its outcome lines. */
+  function dismissConnection(opId: string): void {
+    connectionOps.markDismissed(opId)
+    if (state.connection?.opId === opId) setState('connection', undefined)
+  }
+
+  /** The card's answer was settled by the backend already (no frame needed to stop answering). */
+  function connectionSettled(opId: string): boolean {
+    return connectionOps.isSettled(opId)
+  }
+
   function apply(event: GatewayEvent): void {
     if (buffering) {
       buffering.push(event)
@@ -3090,6 +3118,15 @@ export function createSessionStore(options?: SessionStoreOptions) {
         } else {
           scheduleStatusRestore(4_000)
         }
+        break
+      }
+      case 'connection.request':
+        setState('connection', current => requestCard(current, event.payload, connectionOps))
+        break
+      case 'connection.update': {
+        const { card, lines } = updateCard(state.connection, event.payload, connectionOps)
+        setState('connection', card)
+        for (const line of lines) pushSystem(line)
         break
       }
       case 'session.control.update':
@@ -4116,6 +4153,9 @@ export function createSessionStore(options?: SessionStoreOptions) {
     patchBilling,
     openSubscription,
     closeSubscription,
+    restoreConnection,
+    dismissConnection,
+    connectionSettled,
     patchSubscription,
     setBackgroundProcesses,
     addBgTask,

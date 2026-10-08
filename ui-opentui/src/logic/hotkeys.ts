@@ -41,6 +41,7 @@ export function isAgentsDockToggleKey(key: AgentsKey): boolean {
 interface ActionExitOverlayState {
   readonly backgroundPanel: boolean
   readonly billing: unknown
+  readonly connection?: unknown
   readonly dashboard: boolean
   readonly journey?: boolean
   readonly pluginsHub?: boolean
@@ -61,6 +62,7 @@ export function actionExitBlocked(state: ActionExitOverlayState): boolean {
     state.sessionPicker ||
     state.picker ||
     state.billing ||
+    state.connection ||
     state.dashboard ||
     state.journey ||
     state.pluginsHub ||
