@@ -16,35 +16,11 @@ import { installTerminalChrome, type TerminalChromeSeam } from '../boundary/term
 import { createSessionStore } from '../logic/store.ts'
 import { SERVER_REQUEST_PROMPTS } from '../boundary/gateway/serverRequests.ts'
 import { bellOnPromptFromConfig } from '../logic/details.ts'
-import {
-  notifyEnabled,
-  promptNotification,
-  sanitizeOscText,
-  TURN_COMPLETE_NOTIFICATION,
-  windowTitleFor
-} from '../logic/termChrome.ts'
+import { notifyEnabled, promptNotification, sanitizeOscText, TURN_COMPLETE_NOTIFICATION } from '../logic/termChrome.ts'
 import { TerminalChrome } from '../view/terminalChrome.tsx'
 
 const ESC = '\u001b'
 const BEL = '\u0007'
-
-describe('windowTitleFor — title shaping', () => {
-  test('generic until the session is titled', () => {
-    expect(windowTitleFor(undefined)).toBe('Hermes Agent')
-    expect(windowTitleFor('')).toBe('Hermes Agent')
-    expect(windowTitleFor('   ')).toBe('Hermes Agent')
-  })
-
-  test('session title gets the — Hermes suffix', () => {
-    expect(windowTitleFor('fix the flaky tests')).toBe('fix the flaky tests — Hermes')
-  })
-
-  test('long titles are capped', () => {
-    const long = 'x'.repeat(200)
-    expect(windowTitleFor(long).length).toBeLessThanOrEqual(80 + ' — Hermes'.length)
-    expect(windowTitleFor(long)).toContain('…')
-  })
-})
 
 describe('sanitizeOscText — escape-splice safety', () => {
   test('control chars (incl. ESC/BEL) can never splice a sequence', () => {
@@ -169,16 +145,20 @@ describe('promptNotification + env gate', () => {
 describe('<TerminalChrome> wiring — store edges drive the seam', () => {
   function mount() {
     const store = createSessionStore()
-    const titles: Array<string | undefined> = []
+    const titles: string[] = []
     const notifications: string[] = []
     const bells: string[] = []
     const seam: TerminalChromeSeam = {
       bell: () => void bells.push(BEL),
       notify: n => notifications.push(n.body ?? n.title),
-      setTitle: t => titles.push(t)
+      // Record each distinct window title (the real seam de-duplicates too).
+      setTitles: t => {
+        if (titles.at(-1) !== t.window) titles.push(t.window)
+      },
+      setDefaultColors: () => {}
     }
     const dispose = createRoot(d => {
-      TerminalChrome({ chrome: seam, store })
+      TerminalChrome({ chrome: seam, store, themeProbe: () => () => {} })
       return d
     })
     return { bells, dispose, notifications, store, titles }
@@ -187,9 +167,9 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
   test('sets the generic title immediately, then tracks session.info title', () => {
     const { dispose, store, titles } = mount()
     try {
-      expect(titles).toEqual([undefined]) // boot → windowTitleFor(undefined) inside the seam
-      store.apply({ type: 'session.info', payload: { title: 'rename the moon' } })
-      expect(titles).toEqual([undefined, 'rename the moon'])
+      expect(titles).toEqual(['Hermes']) // boot: generic brand until the model is known
+      store.apply({ type: 'session.info', payload: { model: 'm', title: 'rename the moon' } })
+      expect(titles).toEqual(['Hermes', '✓ rename the moon · m'])
     } finally {
       dispose()
     }
@@ -198,15 +178,16 @@ describe('<TerminalChrome> wiring — store edges drive the seam', () => {
   test('a live session.title push retitles the window chrome without restart', () => {
     const { dispose, store, titles } = mount()
     try {
+      store.apply({ type: 'session.info', payload: { model: 'm' } })
       store.apply({
         type: 'session.title',
         session_id: 'live-1',
         payload: { session_id: 'db-key-9', title: 'name it the moment it starts' }
       })
-      expect(titles).toEqual([undefined, 'name it the moment it starts'])
+      expect(titles).toEqual(['Hermes', '✓ m', '✓ name it the moment it starts · m'])
       // a blank push is inert — the window keeps the landed title.
       store.apply({ type: 'session.title', session_id: 'live-1', payload: { title: '  ' } })
-      expect(titles).toEqual([undefined, 'name it the moment it starts'])
+      expect(titles).toEqual(['Hermes', '✓ m', '✓ name it the moment it starts · m'])
     } finally {
       dispose()
     }

@@ -45,8 +45,11 @@ describe('App render (Phase 1, themed)', () => {
 
   test('applying a skin re-themes the brand name (skinnable, no hardcoding)', async () => {
     const store = createSessionStore()
-    store.apply({ type: 'gateway.ready', payload: { skin: { branding: { agent_name: 'Zephyr' } } } })
     seedHello(store)
+    // After seedHello: its skinless gateway.ready legitimately resets to the
+    // default theme (this used to pass only because the store merged skins
+    // INTO the shared DEFAULT_THEME constant).
+    store.apply({ type: 'gateway.ready', payload: { skin: { branding: { agent_name: 'Zephyr' } } } })
 
     const frame = await captureFrame(
       () => (

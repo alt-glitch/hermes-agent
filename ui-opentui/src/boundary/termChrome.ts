@@ -1,6 +1,17 @@
 /**
- * Terminal chrome seam — window title (OSC 0/2) + desktop notifications
- * through the renderer's native primitives.
+ * Terminal chrome seam — tab/window titles (OSC 1/2), skin-owned terminal
+ * default colors (OSC 10/11, restored with OSC 110/111) + desktop
+ * notifications through the renderer's native primitives.
+ *
+ * Titles: the native `setTerminalTitle` only emits OSC 0 (one shared string),
+ * so the split tab (OSC 1) / window (OSC 2) pair is written as raw bytes via
+ * `writeOut`, which serializes with frame presentation. Win32 keeps the
+ * native call (classic conhost has no OSC titles).
+ *
+ * Default colors: a skin with a paintable canvas repaints the terminal's
+ * DEFAULT fg/bg so cells rendered without an explicit color, the area outside
+ * the renderer and scrollback match the skin. Only what we painted is
+ * restored — on skin change (empty hex) and on renderer destroy.
  *
  * Why the renderer and not process.stdout: the zig side owns the terminal —
  * `setTerminalTitle` and `triggerNotification` are native FFI calls and
@@ -29,21 +40,24 @@
  */
 import type { CliRenderer } from '@opentui/core'
 
-import type { TermNotification } from '../logic/termChrome.ts'
+import type { TermNotification, TerminalTitles } from '../logic/termChrome.ts'
 import {
+  defaultColorSlot,
   notifyEnabled,
   sanitizeOscText,
+  titleSequences,
   TITLE_STACK_RESTORE,
-  TITLE_STACK_SAVE,
-  windowTitleFor
+  TITLE_STACK_SAVE
 } from '../logic/termChrome.ts'
 import { getLog } from './log.ts'
 const BEL = '\u0007'
 
 /** What the view layer needs from the chrome seam (DI-friendly for tests). */
 export interface TerminalChromeSeam {
-  /** Set the window title from the session title (undefined → generic). */
-  readonly setTitle: (sessionTitle: string | undefined) => void
+  /** Set the tab (OSC 1) + window (OSC 2) titles; de-duplicated. */
+  readonly setTitles: (titles: TerminalTitles) => void
+  /** Paint (hex) or restore ('') the terminal default fg/bg; de-duplicated. */
+  readonly setDefaultColors: (colors: { readonly fg: string; readonly bg: string }) => void
   /** Announce "waiting on you" to the hosting terminal (no-op while focused). */
   readonly notify: (notification: TermNotification) => void
   /** Ring the terminal bell; no-op when stdout is not interactive. */
@@ -65,7 +79,8 @@ interface RendererSeam {
  *  the entry calls it once, right next to the render bridge. */
 export function installTerminalChrome(
   renderer: CliRenderer,
-  output: Pick<NodeJS.WriteStream, 'isTTY'> = process.stdout
+  output: Pick<NodeJS.WriteStream, 'isTTY'> = process.stdout,
+  platform: NodeJS.Platform = process.platform
 ): TerminalChromeSeam {
   const seam = renderer as unknown as RendererSeam
   const notificationsOn = notifyEnabled()
@@ -86,22 +101,38 @@ export function installTerminalChrome(
   // Bracket our title ownership: save the user's title now, restore on quit.
   // Best-effort — terminals without the XTWINOPS title stack ignore both.
   writeRaw(seam, TITLE_STACK_SAVE)
-  seam.once('destroy', () => writeRaw(seam, TITLE_STACK_RESTORE, { evenIfDestroyed: true }))
+  const foreground = defaultColorSlot(10)
+  const background = defaultColorSlot(11)
+  // Exit restore: only the defaults we actually painted, then the title stack.
+  seam.once('destroy', () =>
+    writeRaw(seam, foreground.restoreSeq() + background.restoreSeq() + TITLE_STACK_RESTORE, {
+      evenIfDestroyed: true
+    })
+  )
 
   let lastTitle = ''
   return {
     bell: () => {
       if (output.isTTY) writeRaw(seam, BEL)
     },
-    setTitle: sessionTitle => {
-      const title = windowTitleFor(sessionTitle)
-      if (title === lastTitle) return
-      lastTitle = title
-      try {
-        if (!seam.isDestroyed) seam.setTerminalTitle(title)
-      } catch (cause) {
-        getLog().warn('chrome', 'setTerminalTitle failed', { cause: String(cause) })
+    setTitles: titles => {
+      const sequence = titleSequences(titles)
+      if (sequence === lastTitle) return
+      lastTitle = sequence
+      if (platform === 'win32') {
+        try {
+          if (!seam.isDestroyed) seam.setTerminalTitle(titles.window)
+        } catch (cause) {
+          getLog().warn('chrome', 'setTerminalTitle failed', { cause: String(cause) })
+        }
+        return
       }
+      writeRaw(seam, sequence)
+    },
+    setDefaultColors: colors => {
+      if (!output.isTTY) return
+      const sequence = foreground.set(colors.fg) + background.set(colors.bg)
+      if (sequence) writeRaw(seam, sequence)
     },
     notify: notification => {
       if (!notificationsOn || focused === true) return

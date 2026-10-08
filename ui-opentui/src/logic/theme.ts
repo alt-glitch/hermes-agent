@@ -466,10 +466,62 @@ function backgroundLuminance(raw: string): null | number {
   return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
 }
 
-/** Pick light vs dark with ordered, explainable env signals (mirror Ink). */
+// ── Terminal polarity probe slot ─────────────────────────────────────
+//
+// The live terminal's measured polarity (OSC 11 background, OSC 10 foreground
+// tiebreaker), fed by the boundary probe (boundary/themeProbe.ts) from
+// @opentui/core's renderer.themeMode / THEME_MODE. `null` = unanswered or
+// untrusted — the env heuristics below decide, exactly as before the probe.
+
+export type TerminalPolarity = 'dark' | 'light'
+
+let probedPolarity: TerminalPolarity | null = null
+
+/** Record the probe's answer; returns true when the effective slot changed. */
+export function setProbedPolarity(mode: TerminalPolarity | null): boolean {
+  if (mode === probedPolarity) return false
+  probedPolarity = mode
+  return true
+}
+
+export function getProbedPolarity(): TerminalPolarity | null {
+  return probedPolarity
+}
+
+/** Ink `polarityBackgroundFromForeground`, as a pole: transparent profiles
+ *  report an unset `#000000` background but their theme's real foreground — a
+ *  bright fg means dark, a dim fg means light. Mid-gray and pure black/white
+ *  (themselves unset defaults) are ambiguous → null. */
+export function polarityFromForeground(hex: string): TerminalPolarity | null {
+  const rgb = parseHex(hex)
+  if (!rgb) return null
+  const norm = hex.toLowerCase().replace(/^#?/, '#')
+  if (norm === '#000000' || norm === '#ffffff') return null
+  const luminance = relativeLuminance(rgb[0], rgb[1], rgb[2])
+  if (luminance >= 0.45) return 'dark'
+  if (luminance <= 0.2) return 'light'
+  return null
+}
+
+/** Combine core's inferred mode with the raw replies (Ink's distrust rule):
+ *  exactly-`#000000` is the "unset default" fingerprint (xterm.js hosts,
+ *  tmux), not a measurement — the OSC 10 foreground decides, else nothing. */
+export function resolveProbedPolarity(
+  mode: TerminalPolarity | null,
+  replies: { readonly background?: string | undefined; readonly foreground?: string | undefined }
+): TerminalPolarity | null {
+  const bg = replies.background?.toLowerCase()
+  if (bg === '#000000') return replies.foreground ? polarityFromForeground(replies.foreground) : null
+  return mode
+}
+
+/** Pick light vs dark with ordered, explainable signals (mirror Ink):
+ *  HERMES_TUI_LIGHT / HERMES_TUI_THEME pins, then the live terminal probe,
+ *  then the env fallbacks (HERMES_TUI_BACKGROUND, COLORFGBG, TERM_PROGRAM). */
 export function detectLightMode(
   env: Record<string, string | undefined> = process.env,
-  lightDefaultTermPrograms: ReadonlySet<string> = LIGHT_DEFAULT_TERM_PROGRAMS
+  lightDefaultTermPrograms: ReadonlySet<string> = LIGHT_DEFAULT_TERM_PROGRAMS,
+  probed: TerminalPolarity | null = probedPolarity
 ): boolean {
   const lightFlag = (env.HERMES_TUI_LIGHT ?? '').trim().toLowerCase()
   if (TRUE_RE.test(lightFlag)) return true
@@ -478,6 +530,8 @@ export function detectLightMode(
   const themeFlag = (env.HERMES_TUI_THEME ?? '').trim().toLowerCase()
   if (themeFlag === 'light') return true
   if (themeFlag === 'dark') return false
+
+  if (probed !== null) return probed === 'light'
 
   const bgHint = backgroundLuminance(env.HERMES_TUI_BACKGROUND ?? '')
   if (bgHint !== null) return bgHint >= LUMA_LIGHT_THRESHOLD
@@ -524,6 +578,38 @@ export const DEFAULT_THEME: Theme = normalizeThemeForAnsiLightTerminal(
   process.env,
   DEFAULT_LIGHT_MODE
 )
+
+/** The skinless theme for the CURRENT polarity signals (env + live probe).
+ *  Unlike the frozen module-load DEFAULT_THEME, this re-reads them, so a probe
+ *  answer that lands after boot re-derives the default palette. */
+export function defaultThemeForCurrentPolarity(env: Record<string, string | undefined> = process.env): Theme {
+  const isLight = detectLightMode(env)
+  return normalizeThemeForAnsiLightTerminal(isLight ? LIGHT_THEME : DARK_THEME, env, isLight)
+}
+
+const ANSI256_RE = /^ansi256\((\d{1,3})\)$/
+
+function toHex([r, g, b]: readonly [number, number, number]): string {
+  return '#' + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1)
+}
+
+/**
+ * The literal `#rrggbb` a theme tone paints as, or '' when it has none
+ * (Ink 0b1ee22b9e). A limited-palette terminal rewrites foregrounds to
+ * `ansi256(N)`, which OSC 10 cannot speak — resolve through the xterm cube /
+ * grayscale ramp instead of hex-testing, which would silently skip exactly
+ * the terminals that quantized.
+ */
+export function themeToneHex(tone: string): string {
+  const t = tone.trim()
+  const ansi = ANSI256_RE.exec(t)
+  if (ansi) {
+    const n = Number(ansi[1])
+    return n <= 255 ? toHex(xtermEightBitRgb(n)) : ''
+  }
+  const rgb = parseHex(t)
+  return rgb ? toHex(rgb) : ''
+}
 
 // ── Skin → Theme ─────────────────────────────────────────────────────
 
@@ -683,7 +769,7 @@ export function skinColorsForPolarity(skin: GatewaySkin, isLight: boolean): Reco
 
 /** Convenience: map a GatewaySkin payload straight to a Theme (defaults if empty). */
 export function themeFromSkin(skin: GatewaySkin | undefined): Theme {
-  if (!skin) return DEFAULT_THEME
+  if (!skin) return defaultThemeForCurrentPolarity()
   // Resolve polarity from the base palette before choosing its paired overlay;
   // an authored canvas wins, while a background-less skin keeps host behavior.
   return fromSkin(
