@@ -446,7 +446,7 @@ describe('App render (Phase 1, themed)', () => {
       expect(frame).not.toContain('Web Search') // overview is ownership, not activity
       expect(frame).toContain('Enter open') // list→detail interaction hint
       expect(frame).not.toContain('parent turn') // transcript replaced by the dashboard
-      probe.keys.pressEnter()
+      probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
       await probe.settle()
       await probe.keys.typeText('t') // tool activity is explicitly expanded in detail
       expect(await probe.waitForFrame(next => next.includes('Web Search'))).toContain('Web Search')

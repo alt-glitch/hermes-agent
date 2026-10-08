@@ -190,7 +190,7 @@ test('ownership overview hides messages until inspection and retains deep tree n
     expect(find(probe.renderer.root, 'agents-master')?.width).toBeGreaterThan(100)
     expect(probe.frame()).toContain('worker-010')
     expect(probe.frame()).toContain('worker-011')
-    probe.keys.pressEnter()
+    probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
     await probe.settle()
     expect(probe.frame()).toContain('Report from worker-011')
     probe.keys.pressEscape()
@@ -208,7 +208,7 @@ test('ownership overview hides messages until inspection and retains deep tree n
     await probe.settle()
     expect(probe.frame()).toContain('worker-011')
     expect(probe.frame()).toContain('q close')
-    probe.keys.pressEnter()
+    probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
     await probe.settle()
     expect(probe.frame()).toContain('Report from worker-011')
   } finally {

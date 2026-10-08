@@ -17,6 +17,7 @@
 import { createEffect, Match, Show, Switch } from 'solid-js'
 
 import { deferClose } from '../logic/defer.ts'
+import { emptyDoubleEscAction } from '../logic/hotkeys.ts'
 import { sectionMode } from '../logic/details.ts'
 import type { PromptHistory as ComposerHistory } from '../logic/history.ts'
 import type { PasteStore } from '../logic/pastes.ts'
@@ -62,6 +63,12 @@ export interface AppProps {
    * the native textarea. */
   readonly onSendQueuedIndex?: (index: number) => boolean | void
   readonly onDoubleEmptySubmit?: () => void
+  /** Esc Esc on an empty composer while a turn runs: the same interrupt path
+   *  Ctrl+C and /stop use. Idle, Esc Esc keeps opening prompt history. */
+  readonly onInterruptTurn?: (() => void) | undefined
+  /** Composer Ctrl+X: write the keyboard selection to the clipboard; the
+   *  composer removes it only when this resolves true. */
+  readonly onCutSelection?: ((text: string) => Promise<boolean>) | undefined
   /** Entry observes edit end so a queue held across turn-settle can drain. */
   readonly onQueueEditChange?: (index: number | undefined) => void
   readonly onType?: (text: string, cursor: number) => void
@@ -204,6 +211,13 @@ export function App(props: AppProps) {
   const openPromptHistory = () => {
     if (promptHistoryEntries(props.store.state.messages).length > 0) props.store.openPromptHistory()
   }
+  const onEmptyDoubleEsc = () => {
+    const busy = props.store.state.info.running === true || props.store.isTurnInFlight()
+    const interrupt = props.onInterruptTurn
+    const canInterrupt = interrupt !== undefined && props.store.state.sessionId !== undefined
+    if (emptyDoubleEscAction(busy, canInterrupt) === 'interrupt' && interrupt) interrupt()
+    else openPromptHistory()
+  }
   const resume = (id: string) => {
     ;(props.onResume ?? NOOP_RESUME)(id)
     // a PICK closes without the no-pick callback (the resume owns the session)
@@ -266,7 +280,8 @@ export function App(props: AppProps) {
                         onPasteLimitExceeded={props.onPasteLimitExceeded}
                         onFocusDown={() => trayApi?.focusTray() ?? false}
                         registerFocus={fn => (focusComposer = fn)}
-                        onDoubleEsc={openPromptHistory}
+                        onDoubleEsc={onEmptyDoubleEsc}
+                        onCutSelection={props.onCutSelection}
                         initialDraft={() => props.store.state.composerDraft}
                         initialCursor={() => props.store.state.composerCursor}
                         clearVersion={() => props.store.state.composerClearVersion}

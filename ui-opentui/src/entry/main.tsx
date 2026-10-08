@@ -108,7 +108,7 @@ import {
   DASHBOARD_NEW_SESSION_MESSAGE,
   isAgentsDashboardKey,
   isAgentsDockToggleKey,
-  isExitHotkey,
+  shouldExitOnHotkey,
   isRedrawHotkey
 } from '../logic/hotkeys.ts'
 import { isVoiceRecordKey, voiceRecordKeyFromConfig } from '../logic/voiceKey.ts'
@@ -1437,6 +1437,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         void writeClipboard(text)
         flashHint('Copied selection')
       }
+      // Composer Ctrl+X: the composer removes the selection only when this
+      // resolves true (a native clipboard backend accepted the text).
+      const onCutSelection = async (text: string): Promise<boolean> => {
+        const ok = await writeClipboard(text)
+        flashHint(ok ? 'Cut selection' : 'clipboard unavailable — selection kept', ok ? 1500 : 3000)
+        return ok
+      }
 
       // Paste an IMAGE (item 1): reuse the gateway's cross-platform clipboard
       // implementation (the same path Ink uses), then mirror the queued image
@@ -1636,7 +1643,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           redrawRenderer(renderer, { clearSelection: true })
           return
         }
-        if (!isExitHotkey(key) || actionExitBlocked(store.state)) return
+        // Ctrl+D is EOF: exit only from an empty composer (no text, no image
+        // attachments). With a draft the key reaches the textarea instead.
+        if (!shouldExitOnHotkey(key, store.state)) return
         key.preventDefault()
         if (hostedDashboard) requestDashboardNewSession()
         else doQuit(0)
@@ -3370,6 +3379,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   onSubmitQueued={submitQueued}
                   onSendQueuedIndex={sendQueuedAt}
                   onDoubleEmptySubmit={onDoubleEmptySubmit}
+                  onInterruptTurn={interruptTurn}
+                  onCutSelection={onCutSelection}
                   onQueueEditChange={index => {
                     if (index === undefined) releaseQueueEditDrain()
                   }}

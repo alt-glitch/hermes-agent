@@ -61,7 +61,7 @@ describe('agents message-first native view', () => {
     })
     const probe = await renderProbe(node, { width: 132, height: 34 })
     try {
-      probe.keys.pressEnter()
+      probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
       await probe.settle()
       const reply = descendants(probe.renderer.root).find(
         item => item instanceof MarkdownRenderable && item.content.startsWith('# Release')
