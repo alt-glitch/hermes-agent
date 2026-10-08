@@ -29,6 +29,7 @@ import {
   pickerTabs,
   planCompletion,
   readReplaceFrom,
+  REASONING_PICKER_ROWS,
   registerModelPrefetch,
   registerPickerRefresh,
   registerPickerTabs,
@@ -1745,8 +1746,11 @@ describe('dispatchSlash — client commands', () => {
     expect(selectable[0]!.current).toBe(true)
     expect(selectable[0]!.label).toBe('claude-sonnet-4.6')
     expect(selectable[1]!.current).toBeUndefined()
-    // picking switches through config.set with session scope
+    // picking opens the effort step; "Keep current effort" switches through
+    // config.set with session scope and no --reasoning flag
     p.pickers[0]!.onPick('claude-opus-4.6 --provider anthropic')
+    expect(p.pickers[1]!.title).toBe('Reasoning effort for claude-opus-4.6')
+    p.pickers[1]!.onPick('')
     await new Promise(r => setTimeout(r, 0))
     expect(
       p.calls.some(
@@ -1756,6 +1760,46 @@ describe('dispatchSlash — client commands', () => {
           c.params.session_id === 'sid-1'
       )
     ).toBe(true)
+  })
+
+  test('/model effort step: picks send --reasoning <level>; reasoning:false models skip the step (Ink 2c0bec33f9)', async () => {
+    const options = {
+      ...MODEL_OPTIONS,
+      providers: MODEL_OPTIONS.providers.map(provider =>
+        provider.slug === 'nous'
+          ? { ...provider, capabilities: { 'hermes-4-405b': { fast: false, reasoning: false } } }
+          : provider.slug === 'anthropic'
+            ? { ...provider, capabilities: { 'claude-opus-4.6': { fast: false, reasoning: true } } }
+            : provider
+      )
+    }
+    const items = mapModelOptions(options)
+    expect(items.find(i => i.label === 'hermes-4-405b')?.reasoning).toBe(false)
+    expect(items.find(i => i.label === 'claude-opus-4.6')?.reasoning).toBeUndefined()
+
+    const p = makeCtx(async method => (method === 'model.options' ? options : { value: 'switched' }))
+    p.modelCache.value = items
+    await dispatchSlash('/model', p.ctx)
+    p.pickers[0]!.onPick('claude-opus-4.6 --provider anthropic')
+    // step 2: the shared ladder + none + keep current
+    expect(p.pickers).toHaveLength(2)
+    expect(p.pickers[1]!.title).toBe('Reasoning effort for claude-opus-4.6')
+    expect(p.pickers[1]!.items.map(i => i.value)).toEqual(REASONING_PICKER_ROWS.map(r => r.value))
+    expect(p.pickers[1]!.items.at(-2)?.label).toBe('none (disable reasoning)')
+    expect(p.pickers[1]!.items.at(-1)?.label).toBe('Keep current effort')
+    p.pickers[1]!.onPick('high')
+    await new Promise(r => setTimeout(r, 0))
+    expect(p.calls.filter(c => c.method === 'config.set').map(c => c.params.value)).toEqual([
+      'claude-opus-4.6 --provider anthropic --reasoning high --session'
+    ])
+
+    // capability says no reasoning control → no effort step, switch at once
+    p.pickers[0]!.onPick('hermes-4-405b --provider nous')
+    expect(p.pickers).toHaveLength(2)
+    await new Promise(r => setTimeout(r, 0))
+    expect(p.calls.filter(c => c.method === 'config.set').at(-1)?.params.value).toBe(
+      'hermes-4-405b --provider nous --session'
+    )
   })
 
   test('/model --refresh refetches and opens the picker without config.set — even mid-turn (f27d45e288)', async () => {
@@ -1869,6 +1913,7 @@ describe('dispatchSlash — client commands', () => {
     // cross-provider pick: switch lands on the gateway, then a background
     // refresh re-fetches model.options so the cached ✓ stays fresh.
     p.pickers[0]!.onPick('hermes-4-405b --provider nous')
+    p.pickers[1]!.onPick('')
     await new Promise(r => setTimeout(r, 0))
     expect(
       p.calls.some(c => c.method === 'config.set' && c.params.value === 'hermes-4-405b --provider nous --session')

@@ -339,18 +339,25 @@ export function App(props: AppProps) {
                     <Match when={customModelSetup()}>
                       {setup => <CustomModelSetup setup={setup()} onClose={closeCustomModelSetup} />}
                     </Match>
-                    <Match when={picker()}>
+                    {/* keyed: a chained picker (the /model effort step) is a NEW
+                        PickerState, so the overlay remounts with fresh rows/query. */}
+                    <Match when={picker()} keyed>
                       {p => (
                         <Picker
-                          title={p().title}
-                          items={p().items}
-                          errorLabel={p().errorLabel ?? 'Could not load options'}
-                          initialRefresh={p().initialRefresh === true}
-                          initialTab={p().initialTab ?? 'current'}
-                          loadingLabel={p().loadingLabel ?? 'Loading…'}
+                          title={p.title}
+                          items={p.items}
+                          errorLabel={p.errorLabel ?? 'Could not load options'}
+                          initialRefresh={p.initialRefresh === true}
+                          initialTab={p.initialTab ?? 'current'}
+                          loadingLabel={p.loadingLabel ?? 'Loading…'}
                           onPick={value => {
-                            p().onPick(value)
-                            closePicker()
+                            const picked = p
+                            picked.onPick(value)
+                            // A pick may chain a follow-up picker (the /model
+                            // effort step): only close if it did not replace us.
+                            deferClose(() => {
+                              if (props.store.state.picker === picked) props.store.closePicker()
+                            })
                           }}
                           onClose={closePicker}
                         />

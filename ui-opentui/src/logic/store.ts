@@ -13,6 +13,7 @@
  */
 import type { RpcRequest } from '../boundary/gateway/rpc.ts'
 import { Option } from 'effect'
+import { batch } from 'solid-js'
 import { createStore, produce } from 'solid-js/store'
 
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
@@ -30,6 +31,7 @@ import {
 } from '../boundary/schema/Delegation.ts'
 import {
   decodeCatalog,
+  decodeMcpServerStatus,
   decodeSessionInfoPatch,
   type CatalogDecoded,
   type SessionInfoPatchDecoded
@@ -354,6 +356,10 @@ export interface PickerItem {
    *  hint): hidden by default, revealed dimmed + NON-selectable by the
    *  picker's Ctrl+U toggle; ↑↓ traversal skips it (picker v2.1). */
   unavailable?: boolean
+  /** `false` only when the catalog says this model has no reasoning control
+   *  (`model.options` capabilities[model].reasoning === false); the `/model`
+   *  picker then skips its effort step. Unknown keeps the step (Ink 2c0bec33f9). */
+  reasoning?: boolean
 }
 
 /** An open generic picker overlay: a titled list whose pick runs `onPick(value)`. */
@@ -658,6 +664,10 @@ export interface TodoSnapshot {
 export interface SessionInfo {
   model?: string
   effort?: string
+  /** The effort level the route actually sends (`reasoning_effort_wire`);
+   *  '' when not stamped yet. The status bar shows `effort→wire` when they
+   *  differ (a clamped `ultra` sends `max` — Ink 171a1777b5). */
+  effortWire?: string
   fast?: boolean
   /** Inference provider backing the active model (`provider`) — round-tripped
    *  from the merged server's session.info; compat-only, no chrome consumes it yet. */
@@ -700,9 +710,21 @@ export interface SessionInfo {
   /** Count of connected MCP servers from `session.info`; the status bar uses
    *  this only as a fallback until the enabled startup catalog is available. */
   mcpServers?: number
+  /** Per-server MCP status from `session.info.mcp_servers` (decoded per entry);
+   *  the home panel annotates servers with it (e.g. `3 tools (lazy)`). */
+  mcpServerStatus?: ReadonlyArray<McpServerStatus>
   /** Epoch ms when this TUI session started (set once at store creation; never
    *  patched from the wire) — drives the status-bar session duration. */
   startedAt?: number
+}
+
+/** One MCP server's runtime status (`session.info.mcp_servers[]`). */
+export interface McpServerStatus {
+  readonly name: string
+  readonly connected: boolean
+  /** `connected` | `disabled` | `connecting` | `failed` | `lazy` | `configured` (open). */
+  readonly status: string
+  readonly tools: number
 }
 
 /** Startup catalog (tools/skills/MCP) for the home-screen panel (item 9 / banner parity). */
@@ -1001,7 +1023,12 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   const avgTps = d.usage?.avg_tps ?? d.avg_tps
   if (avgTps !== undefined) patch.avgTps = avgTps
   if (d.model) patch.model = d.model
-  if (d.reasoning_effort) patch.effort = d.reasoning_effort
+  if (d.reasoning_effort) {
+    patch.effort = d.reasoning_effort
+    // A new effort without a wire stamp clears the old clamp so a stale
+    // `→max` never pairs with a new pick.
+    patch.effortWire = d.reasoning_effort_wire ?? ''
+  } else if (d.reasoning_effort_wire !== undefined) patch.effortWire = d.reasoning_effort_wire
   if (d.fast !== undefined) patch.fast = d.fast
   if (d.provider) patch.provider = d.provider
   if (d.cwd) patch.cwd = d.cwd
@@ -1033,7 +1060,10 @@ function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   // `mcp: N` matches the classic CLI banner (`sum(s.connected)`) and the Ink
   // SessionPanel headline. Each wire entry is `{name,transport,connected,tools}`
   // (Schema.Unknown elements — read `connected` defensively).
-  if (d.mcp_servers) patch.mcpServers = countConnectedMcp(d.mcp_servers)
+  if (d.mcp_servers) {
+    patch.mcpServers = countConnectedMcp(d.mcp_servers)
+    patch.mcpServerStatus = readMcpServerStatus(d.mcp_servers)
+  }
   return patch
 }
 
@@ -1049,10 +1079,31 @@ function onlyStrings(items: ReadonlyArray<unknown> | undefined): string[] {
  *  (connected !== true) is excluded — matching the classic CLI banner's
  *  `sum(s.connected)` and the Ink SessionPanel headline. */
 function countConnectedMcp(items: ReadonlyArray<unknown> | undefined): number {
-  return (items ?? []).reduce<number>(
-    (n, s) => (typeof s === 'object' && s !== null && (s as { connected?: unknown }).connected === true ? n + 1 : n),
-    0
-  )
+  // `lazy` servers count as available: registered from the schema cache, their
+  // tools are callable and the process spawns on first use (Ink abdb402701).
+  return (items ?? []).reduce<number>((n, s) => {
+    if (typeof s !== 'object' || s === null) return n
+    const entry = s as { connected?: unknown; status?: unknown }
+    return entry.connected === true || entry.status === 'lazy' ? n + 1 : n
+  }, 0)
+}
+
+/** Decode each `mcp_servers[]` entry once; malformed entries are dropped alone. */
+function readMcpServerStatus(items: ReadonlyArray<unknown>): McpServerStatus[] {
+  const out: McpServerStatus[] = []
+  for (const item of items) {
+    const decoded = decodeMcpServerStatus(item)
+    if (Option.isNone(decoded)) continue
+    const d = decoded.value
+    const connected = d.connected === true
+    out.push({
+      connected,
+      name: d.name,
+      status: d.status ?? (connected ? 'connected' : 'configured'),
+      tools: d.tools !== undefined && Number.isFinite(d.tools) && d.tools > 0 ? Math.trunc(d.tools) : 0
+    })
+  }
+  return out
 }
 
 function normalizeTodoStatus(s: unknown): TodoStatus {
@@ -2428,7 +2479,13 @@ export function createSessionStore(options?: SessionStoreOptions) {
 
   /** Open the generic picker (model picker, skills hub, …). */
   function openPicker(picker: PickerState) {
-    setState('picker', picker)
+    // Replace, never merge: a store setter merges an object into an existing
+    // one, so a chained picker (the /model effort step) would inherit the
+    // previous picker's optional fields and identity.
+    batch(() => {
+      setState('picker', undefined)
+      setState('picker', picker)
+    })
   }
 
   /** Close the generic picker. */

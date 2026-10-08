@@ -45,6 +45,9 @@ export const SessionInfoPatchSchema = Schema.Struct({
   ...TelemetryFields,
   model: opt(Str),
   reasoning_effort: opt(Str),
+  // The level the route actually sends (a clamped Hermes step such as `ultra`
+  // can go out as `max`); '' = not stamped yet / verbatim. Ink 171a1777b5.
+  reasoning_effort_wire: opt(Str),
   fast: opt(Bool),
   // inference provider backing the active model (e.g. "openrouter", "anthropic")
   // — round-tripped from the merged server's session.info; compat-only, no UI.
@@ -75,6 +78,22 @@ export const SessionInfoPatchSchema = Schema.Struct({
   usage: opt(UsageSchema)
 })
 export type SessionInfoPatchDecoded = typeof SessionInfoPatchSchema.Type
+
+// One `session.info.mcp_servers[]` entry (tools/mcp_tool_discovery.py
+// get_mcp_status). Decoded per element so one malformed server never drops the
+// others; `status` stays an open string for forward compatibility (`lazy` =
+// registered from the schema cache, process not spawned yet — Ink abdb402701).
+export const McpServerStatusSchema = Schema.StructWithRest(
+  Schema.Struct({
+    name: Str,
+    connected: opt(Bool),
+    status: opt(Str),
+    tools: opt(Num)
+  }),
+  [Schema.Record(Str, Schema.Unknown)]
+)
+export type McpServerStatusDecoded = typeof McpServerStatusSchema.Type
+export const decodeMcpServerStatus = Schema.decodeUnknownOption(McpServerStatusSchema)
 
 /** Decode a loose session.info payload → `Option<SessionInfoPatchDecoded>`. */
 export const decodeSessionInfoPatch = Schema.decodeUnknownOption(SessionInfoPatchSchema)

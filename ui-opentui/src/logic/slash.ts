@@ -646,6 +646,22 @@ export function mapModelOptions(opts: unknown): PickerItem[] {
       .map(provider => readStr(provider, 'slug'))
       .filter((slug): slug is string => Boolean(slug))
   )
+  // Per-provider reasoning capability (`capabilities[model].reasoning`), so a
+  // recent/frequent row inherits its provider's flag too.
+  const noReasoning = new Set<string>()
+  for (const provider of providers) {
+    if (!provider || typeof provider !== 'object') continue
+    const slug = readStr(provider, 'slug') ?? readStr(provider, 'name') ?? ''
+    const caps = (provider as { capabilities?: unknown }).capabilities
+    if (!caps || typeof caps !== 'object') continue
+    for (const [model, cap] of Object.entries(caps as Record<string, unknown>)) {
+      if (cap && typeof cap === 'object' && (cap as { reasoning?: unknown }).reasoning === false)
+        noReasoning.add(`${slug}\u0000${model}`)
+    }
+  }
+  const markReasoning = (item: PickerItem, slug: string, model: string) => {
+    if (noReasoning.has(`${slug}\u0000${model}`)) item.reasoning = false
+  }
   const appendUsage = (key: 'recent_models' | 'frequent_models', group: string) => {
     const rows = (opts as Record<string, unknown>)[key]
     if (!Array.isArray(rows)) return
@@ -666,6 +682,7 @@ export function mapModelOptions(opts: unknown): PickerItem[] {
         value: `${model} --provider ${provider}`
       }
       if (model === current && (activeProviderSlugs.has(provider) || currentProvider === provider)) item.current = true
+      markReasoning(item, provider, model)
       items.push(item)
     }
   }
@@ -707,6 +724,7 @@ export function mapModelOptions(opts: unknown): PickerItem[] {
       if (lab) item.group = lab
       const haystacks = [slug, lab, ...modelSearchAliases(m)].filter(Boolean)
       if (haystacks.length) item.haystacks = haystacks
+      markReasoning(item, slug, m)
       items.push(item)
     }
   }
@@ -928,6 +946,39 @@ async function switchModel(
   }
 }
 
+/** Rows of the `/model` picker's effort step: the shared ladder (mirrors
+ *  `VALID_REASONING_EFFORTS` / apps/shared REASONING_EFFORTS), the off state,
+ *  then "keep current" (empty value = no `--reasoning` flag). Ink 2c0bec33f9. */
+export const REASONING_PICKER_ROWS: ReadonlyArray<{ readonly label: string; readonly value: string }> = [
+  ...['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(level => ({ label: level, value: level })),
+  { label: 'none (disable reasoning)', value: 'none' },
+  { label: 'Keep current effort', value: '' }
+]
+
+/** The `/model` switch argument with an optional `--reasoning <level>`. */
+export function withReasoningFlag(modelArg: string, level: string): string {
+  const effort = level.trim()
+  return effort ? `${modelArg.trim()} --reasoning ${effort}` : modelArg.trim()
+}
+
+/** Step after a model pick: choose its reasoning effort, then switch once with
+ *  `--reasoning <level>`. Skipped when the catalog says the model has no
+ *  reasoning control (`reasoning === false`). */
+function pickModelEffort(ctx: SlashContext, item: PickerItem | undefined, modelArg: string): void {
+  if (item?.reasoning === false) {
+    void switchModel(ctx, modelArg, false, 'session')
+    return
+  }
+  registerPickerRefresh(undefined)
+  registerPickerTabs(undefined)
+  const model = item?.label ?? modelArg.split(/\s+/)[0] ?? modelArg
+  ctx.openPicker({
+    items: REASONING_PICKER_ROWS.map(row => ({ label: row.label, value: row.value })),
+    onPick: level => void switchModel(ctx, withReasoningFlag(modelArg, level), false, 'session'),
+    title: `Reasoning effort for ${model}`
+  })
+}
+
 /** `/model` — bare opens the model picker; `/model <name>` switches directly.
  *  Opens from the CACHED catalog when present — zero RPCs, same-frame paint
  *  (Epic 7; the catalog is prefetched at bootstrap and refreshed on switch).
@@ -972,7 +1023,12 @@ const modelCmd: ClientHandler = async (arg, ctx) => {
             ctx.pushSystem('Custom model setup is unavailable in this TUI host.')
           }
         } else {
-          void switchModel(ctx, name, false, 'session')
+          const rows = ctx.modelItems() ?? items
+          pickModelEffort(
+            ctx,
+            rows.find(row => row.value === name),
+            name
+          )
         }
       },
       title: 'Switch model'

@@ -54,7 +54,13 @@ import { SyntaxStyle, type PasteEvent, type TextareaRenderable } from '@opentui/
 import { useKeyboard, useRenderer } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
-import { MENU_MAX, acceptChangesToken, completionEdit, routeMenuKey } from '../logic/completionMenu.ts'
+import {
+  MENU_MAX,
+  acceptChangesToken,
+  completionEdit,
+  completionNameWidth,
+  routeMenuKey
+} from '../logic/completionMenu.ts'
 import { BUSY_QUEUE_MAX_CHARS, BUSY_QUEUE_MAX_EDIT_CHARS } from '../logic/busyQueue.ts'
 import { composerHighlightSpans } from '../logic/composerHighlights.ts'
 import { envComposerRows } from '../logic/env.ts'
@@ -985,17 +991,30 @@ export function Composer(props: {
               selection (item 4). The highlighted row tracks `selected()` (Epic 8)
               with the THEMED completionCurrentBg — Up/Down move it on the slash
               menu; on path menus it stays on the top match (Tab's target). */}
+          {/* Two-column grid (Ink ce8c2c97aa): the name track auto-sizes to
+              the widest visible row so descriptions align in their own column,
+              in the neutral statusFg tone — label vs muted are near-twins on
+              the gold skins, which made name + description one unparseable run. */}
           <For each={menuItems()}>
             {(c, i) => (
               <box
                 style={{
-                  backgroundColor: i() === selected() ? theme().color.completionCurrentBg : theme().color.completionBg
+                  backgroundColor: i() === selected() ? theme().color.completionCurrentBg : theme().color.completionBg,
+                  flexDirection: 'row'
                 }}
               >
-                <text selectable={false} fg={i() === selected() ? theme().color.accent : theme().color.text}>
-                  {c.display || c.text}
-                  {c.meta ? `  ${c.meta}` : ''}
-                </text>
+                <box style={{ flexShrink: 0, width: completionNameWidth(menuItems()) }}>
+                  <text selectable={false} fg={i() === selected() ? theme().color.accent : theme().color.text}>
+                    {c.display || c.text}
+                  </text>
+                </box>
+                <Show when={c.meta}>
+                  <box style={{ flexGrow: 1, flexShrink: 1 }}>
+                    <text selectable={false} fg={theme().color.statusFg}>
+                      {c.meta}
+                    </text>
+                  </box>
+                </Show>
               </box>
             )}
           </For>
