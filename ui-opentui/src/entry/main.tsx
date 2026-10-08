@@ -177,6 +177,7 @@ import {
   type InterruptCorrectionDelivery,
   type SteerDelivery
 } from '../logic/busySubmit.ts'
+import { stripImageTokens } from '../logic/imageTokens.ts'
 import {
   createSessionStore,
   startupCatalogRetryDelay,
@@ -1922,7 +1923,12 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               client_submission_id: current.submissionId,
               queued: current.queued,
               session_id: current.sessionId,
-              text: current.text
+              // The transcript keeps the `[Image #N]` marker; the model input
+              // drops it (Ink expandTokens) — the gateway splices the image.
+              text: stripImageTokens(
+                current.text,
+                store.state.pendingImages.map(image => image.token)
+              )
             })
             .pipe(
               Effect.tap(response =>
