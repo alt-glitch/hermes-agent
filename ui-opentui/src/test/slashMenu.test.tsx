@@ -319,7 +319,9 @@ describe('slash menu — opens on the first slash, hydrating the full command li
       await h.probe.settle()
       const frame = await h.probe.waitForFrame(f => f.includes('/clear'))
       expect(frame).toContain('/copy')
-      expect(frame).not.toContain('/help') // filtered out by the `/c` prefix
+      // filtered out by the `/c` prefix (the home summary's `/help for commands`
+      // hint is not a menu row)
+      expect(frame).not.toContain('list commands')
       expect(frame).toContain('↑/↓ select')
     } finally {
       h.probe.destroy()

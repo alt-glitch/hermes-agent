@@ -29,6 +29,7 @@ import {
   pickerTabs,
   planCompletion,
   readReplaceFrom,
+  REASONING_PICKER_ROWS,
   registerModelPrefetch,
   registerPickerRefresh,
   registerPickerTabs,
@@ -1021,22 +1022,29 @@ describe('Ctrl+O model picker (upstream f27d45e288)', () => {
 
 describe('browser command parity', () => {
   test.each(['/browser use', '/browser use on'])(
-    '%s enables Browser Use and replaces the session after persistence',
+    '%s enables Browser Use through profile-scoped browser.manage without replacing the session',
     async command => {
-      const p = makeCtx(async () => ({ key: 'browser_backend', value: 'on' }))
+      const p = makeCtx(async () => ({ browser_use: true, connected: false }))
       await dispatchSlash(command, p.ctx)
-      expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'on' } }])
-      expect(p.newSessions).toEqual([
-        ['Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0', undefined]
+      expect(p.calls).toEqual([
+        { method: 'browser.manage', params: { action: 'use', enabled: true, session_id: 'sid-1' } }
+      ])
+      expect(p.newSessions).toEqual([])
+      expect(p.system).toEqual([
+        'Browser Use mode enabled — browser_exec via the Browser Use CLI 3.0',
+        'applies to new sessions — this one keeps its current tools (/new to start one)'
       ])
     }
   )
 
-  test('/browser use off disables Browser Use and replaces the session after persistence', async () => {
-    const p = makeCtx(async () => ({ key: 'browser_backend', value: 'off' }))
+  test('/browser use off disables Browser Use via browser.manage and keeps the session', async () => {
+    const p = makeCtx(async () => ({ browser_use: false, connected: false }))
     await dispatchSlash('/browser use off', p.ctx)
-    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'off' } }])
-    expect(p.newSessions).toEqual([['Browser Use mode disabled — built-in browser tools restored', undefined]])
+    expect(p.calls).toEqual([
+      { method: 'browser.manage', params: { action: 'use', enabled: false, session_id: 'sid-1' } }
+    ])
+    expect(p.newSessions).toEqual([])
+    expect(p.system[0]).toBe('Browser Use mode disabled — built-in browser tools restored')
   })
 
   test('/browser use rejects invalid arguments without persistence or a session replacement', async () => {
@@ -1052,9 +1060,17 @@ describe('browser command parity', () => {
       throw new Error('config unavailable')
     })
     await dispatchSlash('/browser use', p.ctx)
-    expect(p.calls).toEqual([{ method: 'config.set', params: { key: 'browser_backend', value: 'on' } }])
     expect(p.newSessions).toEqual([])
     expect(p.system).toEqual(['/browser: config unavailable'])
+  })
+
+  test('/browser status reports Browser Use mode when the profile has it on', async () => {
+    const p = makeCtx(async () => ({ browser_use: true, connected: false }))
+    await dispatchSlash('/browser status', p.ctx)
+    expect(p.system).toEqual([
+      'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)',
+      'Browser: Browser Use mode (browser_exec via the Browser Use CLI 3.0)'
+    ])
   })
 
   test('connect uses the direct browser.manage boundary and commits live CDP chrome state', async () => {
@@ -1730,8 +1746,11 @@ describe('dispatchSlash — client commands', () => {
     expect(selectable[0]!.current).toBe(true)
     expect(selectable[0]!.label).toBe('claude-sonnet-4.6')
     expect(selectable[1]!.current).toBeUndefined()
-    // picking switches through config.set with session scope
+    // picking opens the effort step; "Keep current effort" switches through
+    // config.set with session scope and no --reasoning flag
     p.pickers[0]!.onPick('claude-opus-4.6 --provider anthropic')
+    expect(p.pickers[1]!.title).toBe('Reasoning effort for claude-opus-4.6')
+    p.pickers[1]!.onPick('')
     await new Promise(r => setTimeout(r, 0))
     expect(
       p.calls.some(
@@ -1741,6 +1760,46 @@ describe('dispatchSlash — client commands', () => {
           c.params.session_id === 'sid-1'
       )
     ).toBe(true)
+  })
+
+  test('/model effort step: picks send --reasoning <level>; reasoning:false models skip the step (Ink 2c0bec33f9)', async () => {
+    const options = {
+      ...MODEL_OPTIONS,
+      providers: MODEL_OPTIONS.providers.map(provider =>
+        provider.slug === 'nous'
+          ? { ...provider, capabilities: { 'hermes-4-405b': { fast: false, reasoning: false } } }
+          : provider.slug === 'anthropic'
+            ? { ...provider, capabilities: { 'claude-opus-4.6': { fast: false, reasoning: true } } }
+            : provider
+      )
+    }
+    const items = mapModelOptions(options)
+    expect(items.find(i => i.label === 'hermes-4-405b')?.reasoning).toBe(false)
+    expect(items.find(i => i.label === 'claude-opus-4.6')?.reasoning).toBeUndefined()
+
+    const p = makeCtx(async method => (method === 'model.options' ? options : { value: 'switched' }))
+    p.modelCache.value = items
+    await dispatchSlash('/model', p.ctx)
+    p.pickers[0]!.onPick('claude-opus-4.6 --provider anthropic')
+    // step 2: the shared ladder + none + keep current
+    expect(p.pickers).toHaveLength(2)
+    expect(p.pickers[1]!.title).toBe('Reasoning effort for claude-opus-4.6')
+    expect(p.pickers[1]!.items.map(i => i.value)).toEqual(REASONING_PICKER_ROWS.map(r => r.value))
+    expect(p.pickers[1]!.items.at(-2)?.label).toBe('none (disable reasoning)')
+    expect(p.pickers[1]!.items.at(-1)?.label).toBe('Keep current effort')
+    p.pickers[1]!.onPick('high')
+    await new Promise(r => setTimeout(r, 0))
+    expect(p.calls.filter(c => c.method === 'config.set').map(c => c.params.value)).toEqual([
+      'claude-opus-4.6 --provider anthropic --reasoning high --session'
+    ])
+
+    // capability says no reasoning control → no effort step, switch at once
+    p.pickers[0]!.onPick('hermes-4-405b --provider nous')
+    expect(p.pickers).toHaveLength(2)
+    await new Promise(r => setTimeout(r, 0))
+    expect(p.calls.filter(c => c.method === 'config.set').at(-1)?.params.value).toBe(
+      'hermes-4-405b --provider nous --session'
+    )
   })
 
   test('/model --refresh refetches and opens the picker without config.set — even mid-turn (f27d45e288)', async () => {
@@ -1854,6 +1913,7 @@ describe('dispatchSlash — client commands', () => {
     // cross-provider pick: switch lands on the gateway, then a background
     // refresh re-fetches model.options so the cached ✓ stays fresh.
     p.pickers[0]!.onPick('hermes-4-405b --provider nous')
+    p.pickers[1]!.onPick('')
     await new Promise(r => setTimeout(r, 0))
     expect(
       p.calls.some(c => c.method === 'config.set' && c.params.value === 'hermes-4-405b --provider nous --session')
@@ -2816,8 +2876,8 @@ describe('dispatchSlash — client commands', () => {
     })
     await dispatchSlash('/reload_skills', p.ctx)
     expect(p.calls).toEqual([
-      { method: 'skills.reload', params: {} },
-      { method: 'commands.catalog', params: {} }
+      { method: 'skills.reload', params: { session_id: 'sid-1' } },
+      { method: 'commands.catalog', params: { session_id: 'sid-1' } }
     ])
     expect(p.paged).toEqual([
       {

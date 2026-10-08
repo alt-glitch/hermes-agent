@@ -45,8 +45,11 @@ describe('App render (Phase 1, themed)', () => {
 
   test('applying a skin re-themes the brand name (skinnable, no hardcoding)', async () => {
     const store = createSessionStore()
-    store.apply({ type: 'gateway.ready', payload: { skin: { branding: { agent_name: 'Zephyr' } } } })
     seedHello(store)
+    // After seedHello: its skinless gateway.ready legitimately resets to the
+    // default theme (this used to pass only because the store merged skins
+    // INTO the shared DEFAULT_THEME constant).
+    store.apply({ type: 'gateway.ready', payload: { skin: { branding: { agent_name: 'Zephyr' } } } })
 
     const frame = await captureFrame(
       () => (
@@ -446,7 +449,7 @@ describe('App render (Phase 1, themed)', () => {
       expect(frame).not.toContain('Web Search') // overview is ownership, not activity
       expect(frame).toContain('Enter open') // list→detail interaction hint
       expect(frame).not.toContain('parent turn') // transcript replaced by the dashboard
-      probe.keys.pressEnter()
+      probe.keys.pressKey('d') // d = detail; Enter on a live agent opens its tail
       await probe.settle()
       await probe.keys.typeText('t') // tool activity is explicitly expanded in detail
       expect(await probe.waitForFrame(next => next.includes('Web Search'))).toContain('Web Search')

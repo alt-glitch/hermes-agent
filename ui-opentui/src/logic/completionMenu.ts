@@ -19,6 +19,8 @@
  */
 
 /** Max dropdown rows shown (the view slices candidates to this). */
+import stringWidth from 'string-width'
+
 export const MENU_MAX = 8
 
 export interface MenuKeyContext {
@@ -131,4 +133,13 @@ export function completionEdit(
 /** Apply the gateway replacement while preserving legacy string-only callers. */
 export function applyCompletion(bufText: string, itemText: string, from: number, end?: number): string {
   return completionEdit(bufText, itemText, from, end).text
+}
+
+/** Name-track width for the completion popover's two-column grid: the widest
+ *  visible display in terminal cells + a 2-cell gutter, so descriptions align
+ *  in their own column (Ink ce8c2c97aa). */
+export function completionNameWidth(items: ReadonlyArray<{ readonly display: string; readonly text: string }>): number {
+  let widest = 0
+  for (const item of items) widest = Math.max(widest, stringWidth(item.display || item.text))
+  return widest + 2
 }

@@ -21,16 +21,13 @@ const ClarifyQuestion = Schema.Struct({
 })
 
 // One shape for 1-5 questions. `answers` rides only on a reconnect replay (null = skipped).
-// A list with no askable entry (non-empty qid and question) asks nothing: -32602.
+// A list with no askable entry (non-empty qid and question) asks nothing; the clarify row answers it
+// `{}` at once (Ink parity 5eea87882a) instead of opening an empty card.
 const ClarifyParams = Schema.Struct({
   session_id: Str,
   questions: Schema.mutable(Schema.Array(ClarifyQuestion)),
   answers: opt(Schema.NullOr(Schema.Record(Str, Schema.NullOr(Str))))
-}).check(
-  Schema.makeFilter(p => p.questions.some(q => q.qid !== '' && q.question.trim() !== ''), {
-    expected: 'a questions list with at least one non-empty qid and question'
-  })
-)
+})
 
 const ApprovalParams = Schema.Struct({
   session_id: Str,
@@ -56,13 +53,24 @@ const SecretParams = Schema.Struct({
 
 const VaultUnlockParams = Schema.Struct({ session_id: Str, backend: Str, display_name: Str })
 
+const VaultSaveLoginParams = Schema.Struct({ session_id: Str, origin: Str, site: Str })
+
+const VaultCodeParams = Schema.Struct({ session_id: Str, site: opt(Schema.NullOr(Str)), hint: opt(Schema.NullOr(Str)) })
+
 const decoder = <T>(schema: Schema.Decoder<T>) => {
   const decode = Schema.decodeUnknownOption(schema)
   return (raw: unknown): T | undefined => Option.getOrUndefined(decode(raw))
 }
 
 /** Request methods ui-opentui answers with a prompt. */
-export type PromptMethod = 'approval' | 'clarify' | 'secret' | 'sudo' | 'vault.unlock_prompt'
+export type PromptMethod =
+  | 'approval'
+  | 'clarify'
+  | 'secret'
+  | 'sudo'
+  | 'vault.unlock_prompt'
+  | 'vault.save_login'
+  | 'vault.code'
 
 export const SERVER_REQUEST_DECODERS: {
   readonly [M in PromptMethod]: (raw: unknown) => ServerRequestParams<M> | undefined
@@ -71,5 +79,7 @@ export const SERVER_REQUEST_DECODERS: {
   clarify: decoder(ClarifyParams),
   secret: decoder(SecretParams),
   sudo: decoder(SudoParams),
-  'vault.unlock_prompt': decoder(VaultUnlockParams)
+  'vault.unlock_prompt': decoder(VaultUnlockParams),
+  'vault.save_login': decoder(VaultSaveLoginParams),
+  'vault.code': decoder(VaultCodeParams)
 }

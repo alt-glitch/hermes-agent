@@ -1,6 +1,7 @@
 /** Effect 4 decode boundaries for the unified live-session orchestrator RPCs. */
 import { Option, Schema } from 'effect'
 
+import { ConnectionRequestPayloadSchema } from './Connection.ts'
 import { TodoStateSchema } from './TodoState.ts'
 
 const Str = Schema.String
@@ -40,6 +41,11 @@ export const SessionInflightSchema = Schema.StructWithRest(
     assistant: opt(Str),
     correction_offsets: opt(Schema.Array(Num)),
     corrections: opt(Schema.Array(Str)),
+    // Synthetic turn typing (upstream 9583c8c45a): a live auto-continue /
+    // process-completion turn carries the same display_kind/display_metadata
+    // as its persisted history row, so attach renders it identically.
+    display_kind: opt(Schema.NullOr(Str)),
+    display_metadata: opt(Schema.NullOr(Schema.Record(Str, Schema.Unknown))),
     // Retained failed turn (upstream 57b351d3689): the gateway keeps a compact
     // error snapshot when the terminal frame may have been lost to a
     // disconnect. `error` is the failure message; `status` is "error";
@@ -66,6 +72,8 @@ export const LiveSessionSnapshotSchema = Schema.StructWithRest(
     open_requests: opt(
       Schema.NullOr(Schema.Array(Schema.Struct({ id: Str, method: Str, params: Schema.Record(Str, Schema.Unknown) })))
     ),
+    // The open manage_connections operation; restores the card after resume/activate.
+    pending_connection: opt(Schema.NullOr(ConnectionRequestPayloadSchema)),
     resumed: opt(Str),
     running: opt(Bool),
     session_id: Str,

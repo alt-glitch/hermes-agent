@@ -49,7 +49,7 @@
  * Read-only chrome — the only input handled is Esc-to-dismiss for the notice.
  */
 import { useKeyboard } from '@opentui/solid'
-import { createEffect, createMemo, createSignal, onCleanup, Show } from 'solid-js'
+import { createEffect, createMemo, createSignal, on, onCleanup, Show } from 'solid-js'
 
 import { delegationPressure, idleSubagentResumeStatus, type DelegationState } from '../logic/agentStatus.ts'
 import { batteryLabel, type BatteryCategory } from '../logic/battery.ts'
@@ -216,10 +216,16 @@ function shortModel(model: string): string {
   return model.includes('/') ? (model.split('/').at(-1) ?? model) : model
 }
 
-/** Reasoning effort → a compact suffix; hidden only when unset/default. */
-export function effortSuffix(effort: string | undefined, fast: boolean | undefined): string {
+/** Reasoning effort → a compact suffix; hidden only when unset/default. `wire`
+ *  is the level the route actually sends (`reasoning_effort_wire`): a clamped
+ *  Hermes step reads `ultra→max`, never as a distinct wire level. An unknown
+ *  ('') or verbatim wire makes no claim (Ink 171a1777b5). */
+export function effortSuffix(effort: string | undefined, fast: boolean | undefined, wire?: string): string {
   const parts: string[] = []
-  if (effort && effort !== 'default') parts.push(effort)
+  if (effort && effort !== 'default') {
+    const sent = (wire ?? '').trim().toLowerCase()
+    parts.push(sent && sent !== effort.trim().toLowerCase() ? `${effort}→${sent}` : effort)
+  }
   if (fast) parts.push('fast')
   return parts.length ? ` ·${parts.join('·')}` : ''
 }
@@ -238,10 +244,34 @@ function ctxBar(pct: number, width: number): string {
   return '█'.repeat(filled) + '░'.repeat(width - filled)
 }
 
+/** How long the affection ♥ stays lit after a `reaction` (Ink GoodVibesHeart). */
+export const GOOD_VIBES_FLASH_MS = 650
+
 export function StatusBar(props: { store: SessionStore; subagentsVisible?: boolean }) {
   const theme = useTheme()
   const dims = useDimensions()
   const info = () => props.store.state.info
+
+  // Affection ♥ flash: each `reaction` bumps goodVibesTick; light the heart in
+  // a random warm tone for GOOD_VIBES_FLASH_MS, restarting on a fresh bump.
+  const [heart, setHeart] = createSignal<string | undefined>(undefined)
+  let heartTimer: ReturnType<typeof setTimeout> | undefined
+  createEffect(
+    on(
+      () => props.store.state.goodVibesTick,
+      tick => {
+        if (tick <= 0) return
+        const palette = [theme().color.error, theme().color.warn, theme().color.accent]
+        setHeart(palette[Math.floor(Math.random() * palette.length)] ?? theme().color.accent)
+        if (heartTimer) clearTimeout(heartTimer)
+        heartTimer = setTimeout(() => setHeart(undefined), GOOD_VIBES_FLASH_MS)
+      },
+      { defer: true }
+    )
+  )
+  onCleanup(() => {
+    if (heartTimer) clearTimeout(heartTimer)
+  })
   const tick = useElapsedTick()
   const fieldEnabled = (name: string): boolean => {
     const fields = props.store.state.statusBarFields
@@ -306,7 +336,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
     const m = info().model
     return m ? shortModel(m) : ''
   }
-  const effort = () => effortSuffix(info().effort, info().fast)
+  const effort = () => effortSuffix(info().effort, info().fast, info().effortWire)
   const pct = () => info().contextPercent
 
   /** Plain text of the ctx segment (`ctx: ███░░ 42% · 84k` / `ctx: 42%`). */
@@ -560,6 +590,7 @@ export function StatusBar(props: { store: SessionStore; subagentsVisible?: boole
             <span style={{ fg: theme().color.border }}>{SEP}</span>
           </Show>
           <span style={{ fg: dotColor() }}>{dot()}</span>
+          <Show when={heart()}>{fg => <span style={{ fg: fg() }}>{' ♥'}</span>}</Show>
           <Show when={model()}>
             <span style={{ fg: theme().color.statusFg }}>{` ${model()}`}</span>
             <span style={{ fg: theme().color.muted }}>{effort()}</span>

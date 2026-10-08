@@ -302,6 +302,12 @@ export class RawGatewayClient {
   }
 
   /** Spawn the gateway child and begin reading frames. Idempotent. */
+  /** True while this client targets a dashboard WebSocket (attach mode) rather
+   * than a spawned child. Still true inside `onExit` for an attached drop. */
+  get attached(): boolean {
+    return this.attachUrl !== undefined
+  }
+
   start(): void {
     const requestedAttachUrl = resolveGatewayAttachUrl()
     if (this.proc || this.ws) {
@@ -321,7 +327,7 @@ export class RawGatewayClient {
       return
     }
     const srcRoot = resolveSrcRoot()
-    const python = resolvePython(srcRoot)
+    const python = resolvePython()
     const env: Record<string, string> = { ...(process.env as Record<string, string>) }
     env.PYTHONPATH = env.PYTHONPATH ? `${srcRoot}:${env.PYTHONPATH}` : srcRoot
     env.HERMES_PYTHON_SRC_ROOT = srcRoot
@@ -501,19 +507,7 @@ export class RawGatewayClient {
       }
 
       const id = `h${++this.heartbeatSeq}`
-      const ackHandle = setTimeout(() => {
-        if (
-          this.ws !== ws ||
-          this.processGeneration !== generation ||
-          this.heartbeatAckWatchdog?.generation !== generation ||
-          this.heartbeatAckWatchdog.id !== id
-        ) {
-          return
-        }
-        this.finishAttachedGeneration(generation, 'gateway websocket heartbeat acknowledgement timed out')
-      }, WS_HEARTBEAT_DEAD_MS)
-      ackHandle.unref()
-      this.heartbeatAckWatchdog = { generation, id, handle: ackHandle }
+      this.armHeartbeatAck(generation, ws, id)
 
       try {
         ws.send(JSON.stringify({ id, jsonrpc: '2.0', method: 'gateway.ping', params: {} }))
@@ -523,6 +517,37 @@ export class RawGatewayClient {
     }, WS_HEARTBEAT_INTERVAL_MS)
     handle.unref()
     this.heartbeatInterval = { generation, handle }
+  }
+
+  /** (Re)arm the dead-socket deadline for the outstanding ping `id`. */
+  private armHeartbeatAck(generation: number, ws: WebSocket, id: string): void {
+    const previous = this.heartbeatAckWatchdog
+    if (previous) clearTimeout(previous.handle)
+    const handle = setTimeout(() => {
+      if (
+        this.ws !== ws ||
+        this.processGeneration !== generation ||
+        this.heartbeatAckWatchdog?.generation !== generation ||
+        this.heartbeatAckWatchdog.id !== id
+      ) {
+        return
+      }
+      this.finishAttachedGeneration(generation, 'gateway websocket heartbeat acknowledgement timed out')
+    }, WS_HEARTBEAT_DEAD_MS)
+    handle.unref()
+    this.heartbeatAckWatchdog = { generation, id, handle }
+  }
+
+  /** Any inbound frame on the current generation's socket is liveness (Ink
+   * 1cf8a9fb41, #115251): a turn streaming deltas for minutes must never trip
+   * the deadline just because the pong queued behind them. The outstanding
+   * ping stays outstanding (its ack still clears it); only the deadline moves,
+   * so a socket gone fully silent still fails WS_HEARTBEAT_DEAD_MS after its
+   * last frame. */
+  private noteInboundLiveness(generation: number, ws: WebSocket): void {
+    const watchdog = this.heartbeatAckWatchdog
+    if (watchdog?.generation !== generation) return
+    this.armHeartbeatAck(generation, ws, watchdog.id)
   }
 
   private clearHeartbeat(generation?: number): void {
@@ -854,6 +879,7 @@ export class RawGatewayClient {
 
   private dispatchWebSocketFrame(raw: unknown, ws: WebSocket, generation: number): void {
     if (this.ws !== ws || this.processGeneration !== generation) return
+    this.noteInboundLiveness(generation, ws)
     const text = websocketFrameText(raw)
     if (text === undefined) return
     let msg: unknown

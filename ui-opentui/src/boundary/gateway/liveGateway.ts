@@ -15,6 +15,7 @@
 import { Effect, Layer, Option, Schema } from 'effect'
 import { batch } from 'solid-js'
 
+import { exitCodeFromReason } from '../../logic/errorCopy.ts'
 import { backoffMs, planGatewayRecovery } from '../../logic/gatewayRecovery.ts'
 import { GatewayError } from '../errors.ts'
 import { getLog } from '../log.ts'
@@ -191,7 +192,8 @@ function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
     // Establish transport-down state synchronously before RawGatewayClient
     // rejects pending RPCs. The entry can then classify their prompt/steer
     // delivery as uncertain and retain the text for an explicit user retry.
-    enqueue({ type: 'gateway.exited', payload: { reason } })
+    const attached = client.attached
+    enqueue({ type: 'gateway.exited', payload: attached ? { reason, attached } : { reason } })
     flush()
     const exitedSessionId = sessionId
     // The ephemeral id belonged to the dead Python process. Recovery resumes by
@@ -201,13 +203,19 @@ function makeLiveGateway(): { service: GatewayTransport; stop: () => void } {
     const plan = planGatewayRecovery(exitedSessionId ?? null, recoverSid ?? null, recoveryAttempts, Date.now())
     recoveryAttempts = plan.attempts
     if (!plan.recover) {
-      enqueue({ type: 'error', payload: { message: 'gateway exited repeatedly — restart the TUI to retry' } })
+      // Budget spent: the store says so ONCE with the exit code + last stderr
+      // line (Ink useMainApp backendGaveUp) instead of a bare error row.
+      const code = exitCodeFromReason(reason)
+      enqueue({ type: 'gateway.recovery_exhausted', payload: { reason, ...(code === undefined ? {} : { code }) } })
       return
     }
     recoverSid = plan.sid ?? undefined
     const attempt = recoveryAttempts.length
     const delay = backoffMs(attempt)
-    enqueue({ type: 'gateway.recovering', payload: { attempt, delay_ms: delay } })
+    enqueue({
+      type: 'gateway.recovering',
+      payload: attached ? { attempt, delay_ms: delay, attached } : { attempt, delay_ms: delay }
+    })
     if (restartTimer) clearTimeout(restartTimer)
     restartTimer = setTimeout(() => {
       restartTimer = undefined
