@@ -313,6 +313,7 @@ export function PromptOverlay(props: PromptOverlayProps) {
             <ClarifyPrompt
               question={p().question}
               choices={p().choices}
+              multiSelect={p().multiSelect}
               questions={p().questions}
               answers={p().answers}
               statusHint={responseHint()}
@@ -320,10 +321,11 @@ export function PromptOverlay(props: PromptOverlayProps) {
               onQuestionAnswer={(qid, text) =>
                 // Per-question lock: the prompt stays open until no questions
                 // remain. Only an accepted clarify.lock updates the local mirror.
+                // A blank submit locks null (skipped); the local mirror records it as ''.
                 respond(
-                  { kind: 'lock', requestId: p().requestId, questionId: qid, answer: text },
+                  { kind: 'lock', requestId: p().requestId, questionId: qid, answer: text.trim() ? text : null },
                   'answer',
-                  () => props.store.recordClarifyAnswer(qid, text) === 0
+                  () => props.store.recordClarifyAnswer(qid, text.trim() ? text : '') === 0
                 )
               }
             />

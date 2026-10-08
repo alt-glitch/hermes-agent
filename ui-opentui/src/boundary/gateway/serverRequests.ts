@@ -21,6 +21,8 @@ import type { ServerRequestParams, ServerRequestResult } from './rpc.ts'
 export type PromptAnswer = ServerRequestResult<PromptMethod>
 
 interface PromptRow<M extends PromptMethod> {
+  /** Params that ask the user nothing: the result written at once (no prompt opens, nothing is held). */
+  readonly immediate?: (params: ServerRequestParams<M>) => ServerRequestResult<M> | undefined
   /** The prompt for decoded params (SERVER_REQUEST_DECODERS already checked the frame). */
   readonly open: (id: string, params: ServerRequestParams<M>) => ActivePrompt
   /** True when an overlay answer is this method's result shape; only then is it written. */
@@ -31,13 +33,22 @@ const isValue = (answer: PromptAnswer): answer is ServerRequestResult<'sudo'> =>
 
 export const SERVER_REQUEST_PROMPTS: { readonly [M in PromptMethod]: PromptRow<M> } = {
   clarify: {
+    // No askable entry (empty list, or every entry lacks a qid/question): answer `{}` at once.
+    immediate: p => (normalizeClarifyQuestions(p.questions).length === 0 ? {} : undefined),
     open: (id, p) => {
-      // The decoder guarantees at least one askable entry, so `questions` is never empty here.
       const questions = normalizeClarifyQuestions(p.questions)
       const [only] = questions
-      // One question keeps the single-question card; its answer is `{answers: {[qid]: …}}`.
+      // One question keeps the single-question card; its answer is `{answers: {[qid]: …}}`
+      // (null = skipped; a multi-select answer is a JSON array string).
       if (questions.length === 1 && only) {
-        return { kind: 'clarify', question: only.question, choices: only.choices, qid: only.qid, requestId: id }
+        return {
+          kind: 'clarify',
+          question: only.question,
+          choices: only.choices,
+          qid: only.qid,
+          requestId: id,
+          ...(only.multiSelect ? { multiSelect: true } : {})
+        }
       }
       // A batch locks one answer at a time (clarify.lock); a replay carries the locks so far.
       const answers = lockedClarifyAnswers(p.answers)
@@ -94,11 +105,19 @@ export interface DecodedServerRequest {
 
 const isPromptMethod = (method: string): method is PromptMethod => Object.hasOwn(SERVER_REQUEST_PROMPTS, method)
 
-function decodeAs<M extends PromptMethod>(method: M, request: ServerRequest): DecodedServerRequest | undefined {
+function decodeAs<M extends PromptMethod>(
+  method: M,
+  request: ServerRequest
+): DecodedServerRequest | 'answered' | undefined {
   const params = SERVER_REQUEST_DECODERS[method](request.params)
   if (params === undefined) return undefined
   const row: PromptRow<M> = SERVER_REQUEST_PROMPTS[method]
   const send: (result: ServerRequestResult<M>) => boolean = request.respond
+  const reply = row.immediate?.(params)
+  if (reply !== undefined) {
+    send(reply)
+    return 'answered'
+  }
   return {
     id: request.id,
     method,
@@ -109,10 +128,11 @@ function decodeAs<M extends PromptMethod>(method: M, request: ServerRequest): De
 }
 
 /** Decode a raw request frame once: unknown method → 'method-not-found', params that fail the
- *  method's decoder → 'invalid-params'. */
+ *  method's decoder → 'invalid-params', params that ask nothing → 'answered' (its reply is
+ *  already written; nothing is held or shown). */
 export function decodeServerRequest(
   request: ServerRequest
-): DecodedServerRequest | Exclude<ServerRequestDisposition, 'held'> {
+): DecodedServerRequest | 'answered' | Exclude<ServerRequestDisposition, 'held'> {
   if (!isPromptMethod(request.method)) return 'method-not-found'
   return decodeAs(request.method, request) ?? 'invalid-params'
 }
@@ -205,6 +225,11 @@ export function createServerRequestRouter(options: ServerRequestRouterOptions): 
   return {
     handle: request => {
       const next = decodeServerRequest(request)
+      // Answered at decode time (nothing to ask): the client writes no error frame for 'held'.
+      if (next === 'answered') {
+        close(request.id)
+        return 'held'
+      }
       if (typeof next === 'string') return next
       // Already answered or settled: a replay from a snapshot older than that. Nothing to show or write.
       if (closed.has(next.id)) return 'held'

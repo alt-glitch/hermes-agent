@@ -237,6 +237,8 @@ export type ActivePrompt =
       requestId: string
       /** Single question: its id, the key of the `{answers}` result. A batch's ids ride `questions`. */
       qid?: string
+      /** Single question: checkbox picks; the answer is a JSON array string (Ink parity). */
+      multiSelect?: boolean
       /** Batch (multi-question) clarify — present instead of question/choices. */
       questions?: ClarifyBatchQuestion[]
       /** Answers locked server-side (qid → answer; '' = skipped): seeded from the reconnect
