@@ -85,6 +85,13 @@ import { billingWallAction, billingWallCopy, runBillingWallAction, type BillingW
 import { ConnectionOpMemory, requestCard, updateCard, type ConnectionCard } from './connectionCard.ts'
 import type { ConnectionRequestPayload } from '../boundary/schema/Connection.ts'
 import { appendSubagentTrace, finishSubagentTrace, trimSubagentTrace } from './subagentTrace.ts'
+import {
+  backendGaveUp,
+  describeRpcError,
+  describeTurnFailure,
+  lastStderrLine,
+  promptTimeoutNotice
+} from './errorCopy.ts'
 
 /** Monotonic identity for one concrete overlay instance. Async work must carry
  * this token back to patch/close so a completion from an old session cannot
@@ -1352,6 +1359,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
   const STDERR_TRUNCATED_SUFFIX = '… [truncated]'
   const STDERR_TAIL = 5
   const stderrRing: string[] = []
+  // Crash-loop give-up copy is said once per outage; reset on gateway.ready.
+  let recoveryGaveUpReported = false
   function pushStderr(line: string): void {
     const bounded =
       line.length <= STDERR_LINE_LIMIT
@@ -2829,6 +2838,8 @@ export function createSessionStore(options?: SessionStoreOptions) {
   function applyNow(event: GatewayEvent): void {
     switch (event.type) {
       case 'gateway.ready':
+        // A live gateway ends the outage: the next exhaustion is said again.
+        recoveryGaveUpReported = false
         setState('ready', true)
         // Clear any transient status: on a recovery-respawn ready this drops the
         // lingering 'gateway recovering (attempt N)…' line; no-op on first connect.
@@ -2956,6 +2967,21 @@ export function createSessionStore(options?: SessionStoreOptions) {
                   event.payload.partial === true || event.payload.billing !== undefined ? event.payload.text : undefined
               }
             : undefined
+        // A failed turn with no reply text reads as a plain title + Details +
+        // next step from the structured error_surface (Ink describeTurnFailure,
+        // upstream 66878996dd), never the bare `error: <provider body>`. Partial
+        // and billing failures keep their short detail row (their text already
+        // carries the reply / recovery guidance).
+        const failureRow =
+          failure === undefined
+            ? undefined
+            : failure.partialText === undefined
+              ? describeTurnFailure({
+                  error: event.payload?.error?.trim() || event.payload?.text?.trim() || undefined,
+                  error_surface: event.payload?.error_surface,
+                  recoverable: event.payload?.recoverable
+                })
+              : `error: ${failure.message}`
         if (event.payload?.reasoning) {
           setState(produce(draft => appendFallbackReasoning(draft, event.payload?.reasoning, event.payload?.text)))
         }
@@ -2982,7 +3008,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
           )
           // The visible failure marker — same system-row surface as the bare
           // `error` event, so a failed turn never reads as a healthy reply.
-          pushSystem(`error: ${failure.message}`)
+          pushSystem(failureRow ?? `error: ${failure.message}`)
         } else {
           setState(
             produce(draft => {
@@ -3472,12 +3498,20 @@ export function createSessionStore(options?: SessionStoreOptions) {
         break
       }
       // ── blocking prompts: opened by server requests (serverRequests.ts) ──
-      case 'request.cancel':
+      case 'request.cancel': {
         // The backend withdrew the request: close only the prompt it opened.
-        if (state.prompt && 'requestId' in state.prompt && state.prompt.requestId === event.payload.id) {
-          settlePrompt(state.prompt, CANCEL_SETTLEMENT[event.payload.reason] ?? 'expired')
+        const open = state.prompt
+        if (open && 'requestId' in open && open.requestId === event.payload.id) {
+          // A timed-out password/secret/vault card says what was skipped and how
+          // to get it back (Ink promptTimeoutNotice); clarify keeps its own record.
+          const timeoutNotice =
+            open.kind === 'clarify' ? undefined : promptTimeoutNotice(event.payload.method, event.payload.reason)
+          if (timeoutNotice) {
+            if (clearPrompt(open)) pushSystem(timeoutNotice)
+          } else settlePrompt(open, CANCEL_SETTLEMENT[event.payload.reason] ?? 'expired')
         }
         break
+      }
       // ── subagents (agents dashboard) — track the delegation tree by id ──
       case 'subagent.spawn_requested':
       case 'subagent.start':
@@ -3620,6 +3654,15 @@ export function createSessionStore(options?: SessionStoreOptions) {
         pushSystem(reason ? `${base}: ${reason}` : base)
         break
       }
+      // Crash-loop budget spent: no more respawns. Say it ONCE per outage with
+      // the exit code + last stderr line (Ink useMainApp backendGaveUp).
+      case 'gateway.recovery_exhausted': {
+        setState('status', 'stopped')
+        if (recoveryGaveUpReported) break
+        recoveryGaveUpReported = true
+        pushSystem(`error: ${backendGaveUp(event.payload?.code, lastStderrLine(stderrRing))}`)
+        break
+      }
       // A respawn+resume attempt is in flight — reflect the attempt in the status.
       case 'gateway.recovering': {
         const attempt = event.payload?.attempt
@@ -3655,7 +3698,7 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // prevents neverWindow from pinning one native row per failed turn.
         setState(produce(settleFailedAssistant))
         const message = event.payload?.message
-        pushSystem(message ? `error: ${message}` : 'error')
+        pushSystem(message ? `error: ${describeRpcError(message)}` : 'error')
         // A deferred agent build can fail before `message.start`; the gateway
         // clears its running flag but emits no trailing session.info in that
         // path. Settle the optimistic client flag and drain exactly once. For a

@@ -1802,7 +1802,10 @@ describe('session store — terminal error frames (upstream 57b351d3689/b8675a18
     })
     // the empty caret row is removed, not filled with the "Error: …" string
     expect(store.state.messages.some(message => message.role === 'assistant')).toBe(false)
-    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: provider exploded' })
+    expect(store.state.messages.at(-1)).toMatchObject({
+      role: 'system',
+      text: 'The request failed. Your message was not answered.\nDetails: provider exploded\nSend /retry, or switch with /model.'
+    })
     expect(store.state.info.running).toBe(false)
     expect(store.state.status).toBeUndefined()
   })
@@ -1856,7 +1859,7 @@ describe('session store — terminal error frames (upstream 57b351d3689/b8675a18
     expect(store.state.info.running).toBe(false)
     expect(store.isTurnInFlight()).toBe(false)
     expect(settled).toHaveBeenCalledTimes(1)
-    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: agent initialization failed' })
+    expect(store.state.messages.at(-1)?.text).toContain('Details: agent initialization failed')
     // the trailing session.info the gateway emits after this frame must not double-drain
     store.apply({ type: 'session.info', payload: { running: false } })
     expect(settled).toHaveBeenCalledTimes(1)
@@ -1866,7 +1869,7 @@ describe('session store — terminal error frames (upstream 57b351d3689/b8675a18
     const store = createSessionStore()
     store.apply({ type: 'message.start' })
     store.apply({ type: 'message.complete', payload: { status: 'error', text: 'Error: boom' } })
-    expect(store.state.messages.at(-1)).toMatchObject({ role: 'system', text: 'error: Error: boom' })
+    expect(store.state.messages.at(-1)?.text).toContain('\nDetails: boom\n')
   })
 
   test('a healthy message.complete is untouched by the terminal-frame path', () => {

@@ -79,6 +79,7 @@ import { decodeProcessStopResponse } from '../boundary/schema/ProcessResponses.t
 import { buildBillingCtx } from './billing.ts'
 import { dailyFortune, randomFortune } from './fortunes.ts'
 import { formatHelp } from './help.ts'
+import { describeRpcError, describeSlashExecError, shouldFallbackToDispatch } from './errorCopy.ts'
 import { launchWidget } from '../widgets/host.ts'
 import { getWidgetApp } from '../widgets/registry.ts'
 import { loadUserWidgets } from '../widgets/userWidgets.ts'
@@ -3254,15 +3255,24 @@ export async function dispatchSlash(input: string, ctx: SlashContext): Promise<v
     const text = warning ? `warning: ${warning}\n${output}` : output
     // Long output → pager (Ink: >180 chars or >2 non-empty lines), else a system line.
     present(ctx, titleCase(parsed.name), text)
-  } catch {
+  } catch (execError) {
     if (!currentSessionIs(ctx, sid, flight)) return
+    // Only "slash.exec does not own this command" refusals fall through to
+    // command.dispatch (Ink createSlashHandler, upstream 66878996dd). A helper
+    // timeout/crash or a dead transport surfaces as itself — the fallback's
+    // "unknown command" refusal used to bury the real cause, and re-dispatching
+    // a forwarded mutating command would run it twice.
+    if (!shouldFallbackToDispatch(execError)) {
+      ctx.pushSystem(`error: ${describeSlashExecError(parsed.name, execError)}`)
+      return
+    }
     try {
       const raw = await ctx.request('command.dispatch', { arg: parsed.arg, name: parsed.name, session_id: sid })
       if (!currentSessionIs(ctx, sid, flight)) return
       handleDispatchResult(parsed, raw, ctx)
     } catch (error) {
       if (currentSessionIs(ctx, sid, flight)) {
-        ctx.pushSystem(`error: ${error instanceof Error ? error.message : String(error)}`)
+        ctx.pushSystem(`error: ${describeRpcError(error)}`)
       }
     }
   }
