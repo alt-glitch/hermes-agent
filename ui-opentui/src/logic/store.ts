@@ -1135,6 +1135,17 @@ export interface SessionStoreOptions {
   readonly uncappedFixture?: boolean
 }
 
+/** Attached-mode (dashboard WebSocket) drop copy — mirrors Ink's
+ * `userMessages.backend.connectionLost*` / `reconnecting*` strings. */
+export const ATTACHED_CONNECTION_LOST_STATUS = 'connection lost · reconnecting…'
+export const ATTACHED_CONNECTION_LOST_NOTICE = 'Connection to Hermes lost — reconnecting and reopening your chat…'
+
+/** Ink `backendReconnecting`: `retrying in Ns` (+ ` (attempt N)` when known). */
+export function attachedReconnectingStatus(attempt: number | undefined, delayMs: number | undefined): string {
+  const secs = Math.max(1, Math.round((delayMs ?? 1000) / 1000))
+  return attempt && attempt > 0 ? `retrying in ${secs}s (attempt ${attempt})` : `retrying in ${secs}s`
+}
+
 export function createSessionStore(options?: SessionStoreOptions) {
   let overlayOwnerSequence = 0
   let delegationControlRevision = 0
@@ -3611,10 +3622,19 @@ export function createSessionStore(options?: SessionStoreOptions) {
         // Neutral status: we don't ALWAYS recover (budget exhaustion). The
         // "recovering…" wording now comes from the gateway.recovering case,
         // which fires only when a respawn is actually scheduled.
-        setState('status', 'gateway exited')
         // The dead child's compaction pause cannot complete — drop the latch so
         // the idle spinner doesn't outlive the process that owned it.
         setState('compacting', false)
+        // Attached (dashboard WebSocket) drop: the backend and any live turn are
+        // still alive server-side — Ink's "connection lost · reconnecting…"
+        // copy, not the spawn-mode crash line (Ink useMainApp exitHandler).
+        if (event.payload?.attached === true) {
+          setState('status', ATTACHED_CONNECTION_LOST_STATUS)
+          // Ink only narrates the drop when a chat was open to reopen.
+          if (state.sessionId) pushSystem(ATTACHED_CONNECTION_LOST_NOTICE)
+          break
+        }
+        setState('status', 'gateway exited')
         const reason = event.payload?.reason
         const base = 'gateway exited — recovering your session (any in-flight reply was lost)'
         pushSystem(reason ? `${base}: ${reason}` : base)
@@ -3623,6 +3643,10 @@ export function createSessionStore(options?: SessionStoreOptions) {
       // A respawn+resume attempt is in flight — reflect the attempt in the status.
       case 'gateway.recovering': {
         const attempt = event.payload?.attempt
+        if (event.payload?.attached === true) {
+          setState('status', attachedReconnectingStatus(attempt, event.payload.delay_ms))
+          break
+        }
         setState('status', attempt ? `gateway recovering (attempt ${attempt})…` : 'gateway recovering…')
         break
       }

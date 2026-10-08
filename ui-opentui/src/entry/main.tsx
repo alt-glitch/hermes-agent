@@ -33,6 +33,7 @@ import { openInEditor } from '../boundary/externalInput.ts'
 import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../boundary/terminalSetup.ts'
 import { GatewayService, type GatewayTransport } from '../boundary/gateway/GatewayService.ts'
 import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
+import { installDeadOutputGuard } from '../boundary/deadOutput.ts'
 import { getLog } from '../boundary/log.ts'
 import { createPromptResponder } from '../boundary/promptResponses.ts'
 import { createServerRequestRouter } from '../boundary/gateway/serverRequests.ts'
@@ -3431,6 +3432,20 @@ if (import.meta.main) {
     getLog().error('entry', 'fatal', { error: String(error) })
     process.exitCode = 1
   }
+
+  // A closed terminal without SIGHUP leaves every frame write failing with
+  // EIO/EPIPE while the renderer's error handler keeps the process alive. Exit
+  // after 5 in a row instead of lingering as a zombie (Ink 296303302d).
+  installDeadOutputGuard({
+    onDeadOutput: (code, count) => {
+      try {
+        getLog().error('entry', 'dead output stream → exiting', { code, count })
+      } catch {
+        // the log sink may share the dead stream.
+      }
+      process.exit(1)
+    }
+  })
 
   if (fake) {
     const { layer, controller } = makeFakeGatewayLayer()
