@@ -486,18 +486,20 @@ import {
 import { migrateActiveProfileIfMissing as migrateActiveProfileIfMissingPure } from './profile-migration'
 import { prepareProfileRenameLifecycle, profileRenameFromRequest } from './profile-rename-routing'
 import {
+  applyRemoteProfileSessionOutcomes,
   assembleSidebarSessionSlices,
   buildSidebarSessionSliceParams,
+  composeUnifiedSessionResponse,
   fetchPrimaryProfileSessions,
   fetchRegistrySessionRows,
   fetchRemoteProfileSessions,
   findRemoteOwnerProfileForSession,
   hasPinnedRegistrySessionSource,
   isAllProfilesSessionListRequest,
-  mergeProfileSessionWindow,
   pathWithRemoteOwnerScope,
   type RegistrySessionSource,
   remoteProfileQueryScope,
+  settleRemoteProfileSessions,
   shouldIncludeLocalRegistrySessionSource,
   spliceRegistrySessionRows,
   tagRegistrySessionResponse,
@@ -4944,10 +4946,6 @@ function readBootstrapMarker() {
 // "already installed" off the filesystem alone, not just the marker.
 async function isSourceRuntimeUsable(root: string): Promise<boolean> {
   return (await resolveSourceInstallationBackend(root, [], { hermesHome: HERMES_HOME })) !== null
-}
-
-function isActiveRuntimeUsable(): Promise<boolean> {
-  return isSourceRuntimeUsable(ACTIVE_HERMES_ROOT)
 }
 
 function activeRuntimeState(backend: SourceBackend | null): ActiveRuntimeState {
@@ -17423,23 +17421,26 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles, registry
   const profileTotals = { ...(base.profile_totals || {}) }
   let total = (Number(base.total) || 0) - remoteProfiles.reduce((n, p) => n + (profileTotals[p] || 0), 0)
 
-  // Swap each remote profile's stale local rows/total for the remote's real ones.
-  await Promise.all(
-    remoteProfiles.map(async name => {
-      const list = await remoteSessionList(name, remoteParams).catch(() => null)
-
-      if (!list) {
-        delete profileTotals[name] // dead remote → drop its stale local total too
-
-        return
-      }
-
-      const rows = rowsOf(list)
-      merged.push(...rows)
-      profileTotals[name] = Number(list.total) || rows.length
-      total += profileTotals[name]
-    })
+  // Swap each remote profile's stale local rows/total for the remote's real
+  // ones. #75712: each remote fetch runs under its own bounded budget and
+  // settles — one unavailable remote no longer holds the whole aggregate (and
+  // the sidebar behind it) hostage for the 180s backend readiness wait. A
+  // dead or still-pending remote contributes no rows, drops its stale local
+  // total, and is NAMED in the response `errors` instead of silently
+  // vanishing; the fetch itself keeps running so a remote that is merely slow
+  // to boot lands on a later refresh.
+  const remoteOutcomes = await settleRemoteProfileSessions(remoteProfiles, name =>
+    remoteSessionList(name, remoteParams)
   )
+
+  const { total: remoteTotal, errors: remoteErrors } = applyRemoteProfileSessionOutcomes(
+    remoteOutcomes,
+    merged,
+    profileTotals,
+    total
+  )
+
+  total = remoteTotal
 
   // Registry gateways (v2 connections): splice every CONNECTED gateway's rows
   // into the unified list. Only already-pooled backends are read — a sidebar
@@ -17460,12 +17461,7 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles, registry
   const recency = s => s?.[order] ?? s?.started_at ?? 0
   merged.sort((a, b) => recency(b) - recency(a))
 
-  return {
-    ...(base as any),
-    sessions: mergeProfileSessionWindow(merged, offset, limit),
-    total,
-    profile_totals: profileTotals
-  }
+  return composeUnifiedSessionResponse(base, merged, offset, limit, total, profileTotals, remoteErrors)
 }
 
 // Every CONNECTED registry gateway as a session source: resolved descriptors
@@ -19125,7 +19121,9 @@ registerDesktopUninstallIpc({
   stamp: INSTALL_STAMP,
   fallbackSummary: fallbackUninstallSummary,
   probeSummary: probeUninstallSummary,
-  runUninstall: runDesktopUninstall
+  runUninstall: runDesktopUninstall,
+  removableAppPath: () => resolveRemovableAppPath(process.execPath, process.platform, process.env),
+  openAppsSettings: () => shell.openExternal('ms-settings:appsfeatures')
 })
 
 // Download a VS Code Marketplace extension and return the raw color-theme JSON

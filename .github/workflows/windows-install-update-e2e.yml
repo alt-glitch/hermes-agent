@@ -14,6 +14,23 @@ name: Windows install + update E2E
 
 on:
   workflow_call:
+    inputs:
+      strict_acceptance:
+        description: >-
+          Acceptance runs only: known_failure owners whose gaps FAIL this run instead of xfailing ('upd-txn', a comma list, or '1' for every gap). Sets HERMES_E2E_STRICT_ACCEPTANCE for the E2E suites (tests/e2e/core/_pending_fixes.py).
+        type: string
+        required: false
+        default: ''
+  # An acceptance run of an integrated batch on its own: e.g.
+  # `gh workflow run windows-install-update-e2e.yml --ref <branch> -f strict_acceptance=upd-txn`.
+  workflow_dispatch:
+    inputs:
+      strict_acceptance:
+        description: >-
+          Acceptance runs only: known_failure owners whose gaps FAIL this run instead of xfailing ('upd-txn', a comma list, or '1' for every gap). Sets HERMES_E2E_STRICT_ACCEPTANCE for the E2E suites (tests/e2e/core/_pending_fixes.py).
+        type: string
+        required: false
+        default: ''
   push:
     branches: ['wine2e-install/**']
 
@@ -30,7 +47,7 @@ jobs:
     # Forks have no larger runners: fall back to windows-latest with 2x time.
     runs-on: ${{ github.repository_owner == 'NousResearch' && 'windows-latest-32-core' || 'windows-latest' }}
     # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 50 || 180 }}
+    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 75 || 180 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -54,6 +71,7 @@ jobs:
             -m "platforms and integration" -v --tb=short -rA
         env:
           HERMES_E2E_WINDOWS_INSTALL: '1'
+          HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
           # Fork: the hosted windows-latest runner is ~4x slower than upstream's
           # 32-core and its network/disk is shared by all parallel journeys: with
           # 6 workers every install (~250 MB of tool downloads each) starved past
@@ -73,11 +91,29 @@ jobs:
           # One journey per file, all in parallel (each is mostly network + subprocess wait).
           # Fork: 3 workers on the hosted runner (see the install-timeout note above).
           HERMES_TEST_WORKERS: ${{ github.repository_owner == 'NousResearch' && '6' || '3' }}
-          HERMES_TEST_FILE_TIMEOUT: ${{ github.repository_owner == 'NousResearch' && '2400' || '3600' }}
+          # test_crash_cells.py runs its whole journey (install, gateway phase, six crash cells)
+          # inside one file: ~2,100 s on a normal runner, past 2,400 s on a slow one.
+          # Fork: the hosted runner already ran at 3,600 s (above its 2,400 s install timeout),
+          # so both owners now share this budget.
+          HERMES_TEST_FILE_TIMEOUT: '3600'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''
+
+      - name: Every crash cell ran
+        # run_tests.sh passes a file whose tests were all deselected (pytest exit 5) or skipped,
+        # so a lost marker or opt-in would run zero crash cells green. The crash journey writes
+        # this manifest only when it ran (tests/e2e/core/windows_update/test_crash_cells.py).
+        shell: pwsh
+        env:
+          HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
+        run: |
+          $manifest = Join-Path $env:HERMES_E2E_ARTIFACTS 'crash-cells-ran.txt'
+          if (-not (Test-Path -LiteralPath $manifest)) {
+            throw "test_crash_cells.py ran no crash cells: $manifest is missing"
+          }
+          Get-Content -LiteralPath $manifest
 
       - name: Upload transcripts, logs and receipts
         if: always()

@@ -529,6 +529,33 @@ def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
         return {"decision": "verify_fresh_state", "hint": ("Input was delivered but not confirmed. Re-capture and check the "
                 "result BEFORE any retry — do not repeat the input on an escalation recommendation alone.")}
     if res.effect == "suspected_noop" or not res.ok or res.code is not None:
+        meta = res.meta if isinstance(res.meta, dict) else {}
+        delivered, requested = meta.get("delivered_chars"), meta.get("requested_chars")
+        if (
+            res.action in ("type", "type_text")
+            and res.code == "type_text_incomplete"
+            and isinstance(delivered, int)
+            and isinstance(requested, int)
+            and requested > 0
+            and delivered <= 0
+        ):
+            # Zero delivery on the driver's own partial-delivery verdict: the field swallowed every
+            # synthetic keystroke (trusted-event checks on web inputs do this). Neither rung of the
+            # delivery ladder can fix a target that drops events at the source — the AX set_value
+            # path writes the value directly and bypasses event filtering. The code gate matters:
+            # `type_text_synthesis_budget_exceeded` also reports delivered 0, but that is the bounded
+            # synthesis budget declining to emit at all, and the driver's own `chunk` recommendation
+            # stays the right next step there.
+            return {
+                "decision": "escalate",
+                "recommended": "set_value",
+                "hint": (
+                    "0 characters landed: this input drops synthetic keystrokes, so no delivery rung will fix it. "
+                    "Climb to the set_value action on the field's element index instead — it is an action, not a "
+                    "delivery mode, and sets the value through the accessibility API, bypassing event filtering. "
+                    "Re-capture first if the index is stale."
+                ),
+            }
         return {"decision": "escalate", **({"recommended": res.escalation.get("recommended")}
                                            if isinstance(res.escalation, dict) else {}), "hint": (
             "The input likely did not land. Climb one rung following `recommended`: 'px' → re-issue by coordinate; "

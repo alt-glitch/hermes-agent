@@ -7669,6 +7669,38 @@
         "title": "CatalogAppState",
         "type": "string"
       },
+      "CatalogApproved": {
+        "additionalProperties": false,
+        "description": "The non-secret Advanced choices the user approved on a catalog row; a Try again after the\noperation settled repeats them.",
+        "properties": {
+          "force": {
+            "title": "Force",
+            "type": "boolean"
+          },
+          "enable": {
+            "title": "Enable",
+            "type": "boolean"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ref"
+          }
+        },
+        "required": [
+          "force",
+          "enable"
+        ],
+        "title": "CatalogApproved",
+        "type": "object"
+      },
       "CatalogScan": {
         "additionalProperties": false,
         "description": "The catalog's security scan of the pinned commit; read-only on the card.",
@@ -7696,6 +7728,26 @@
         ],
         "title": "CatalogScanStatus",
         "type": "string"
+      },
+      "CatalogServerError": {
+        "additionalProperties": false,
+        "description": "An MCP server an installed plugin brought that did not connect, with the raw reason.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "error": {
+            "title": "Error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "error"
+        ],
+        "title": "CatalogServerError",
+        "type": "object"
       },
       "CatalogTier": {
         "enum": [
@@ -9388,6 +9440,18 @@
           "state": {
             "$ref": "#/components/schemas/ConnectionTargetState"
           },
+          "resolved": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Resolved"
+          },
           "detail": {
             "anyOf": [
               {
@@ -9599,20 +9663,17 @@
             ],
             "default": null
           },
-          "requirements": {
+          "requires_hermes": {
             "anyOf": [
               {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
+                "type": "string"
               },
               {
                 "type": "null"
               }
             ],
             "default": null,
-            "title": "Requirements"
+            "title": "Requires Hermes"
           },
           "has_desktop_half": {
             "anyOf": [
@@ -9660,6 +9721,82 @@
             ],
             "default": null,
             "title": "Skill"
+          },
+          "phase": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InstallPhase"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "approved": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CatalogApproved"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Enabled"
+          },
+          "missing_env": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Missing Env"
+          },
+          "server_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CatalogServerError"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Server Errors"
+          },
+          "already_installed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Already Installed"
           }
         },
         "required": [
@@ -16898,6 +17035,16 @@
         ],
         "title": "InsightsGetResult",
         "type": "object"
+      },
+      "InstallPhase": {
+        "description": "The slow steps of an install, as ids; the desktop catalog card words them in its own language.",
+        "enum": [
+          "downloading",
+          "python_packages",
+          "loading_tools"
+        ],
+        "title": "InstallPhase",
+        "type": "string"
       },
       "InterruptStatus": {
         "enum": [
@@ -31744,6 +31891,18 @@
             "title": "Source",
             "type": "string"
           },
+          "_lineage_root_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Lineage Root Id"
+          },
           "cwd": {
             "anyOf": [
               {
@@ -37939,6 +38098,15 @@
         "title": "ToolsetsListResult",
         "type": "object"
       },
+      "TourPreset": {
+        "description": "Which built-in tour ``start`` without steps runs.",
+        "enum": [
+          "quick",
+          "full"
+        ],
+        "title": "TourPreset",
+        "type": "string"
+      },
       "TourRequestParams": {
         "additionalProperties": false,
         "description": "``tools/tour_tool.py`` field set.",
@@ -38037,6 +38205,17 @@
             ],
             "default": null,
             "title": "Step Index"
+          },
+          "preset": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TourPreset"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
@@ -39559,6 +39738,21 @@
           "verification"
         ],
         "title": "VerificationStatusResult",
+        "type": "object"
+      },
+      "VoicePartialPayload": {
+        "additionalProperties": false,
+        "description": "``methods_voice`` voice.record ``on_partial`` \u2014 live STT text so far (``stt.streaming``).",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "VoicePartialPayload",
         "type": "object"
       },
       "VoiceRecordAction": {
@@ -41802,6 +41996,18 @@
           "schema": {
             "type": "object",
             "additionalProperties": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "voice.partial",
+      "summary": "Live STT text so far while the user is still speaking.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/VoicePartialPayload"
           }
         }
       ]
