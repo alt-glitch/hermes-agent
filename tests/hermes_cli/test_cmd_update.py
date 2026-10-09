@@ -153,18 +153,27 @@ def _git_checkout_fake(branch, *, remote_branches, commit_count="2"):
         if "branch" in args and "--show-current" in args:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{state['branch']}\n", stderr="")
         if "fetch" in args:
+            # The fetch may be by branch name (old shape) or by tracking refspec
+            # (`+refs/heads/<b>:refs/remotes/origin/<b>`); both reduce to the branch.
             fetched = args[-1]
-            if fetched.startswith("+refs/heads/"):
-                # Upstream's narrow-clone refspec fetch: reduce to the branch name.
-                fetched = fetched[len("+refs/heads/"):].split(":", 1)[0]
+            for candidate in reversed(args):
+                candidate = str(candidate)
+                if candidate.startswith("+refs/heads/"):
+                    fetched = candidate[len("+refs/heads/"):].split(":", 1)[0]
+                    break
             if fetched in remote_branches:
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             return subprocess.CompletedProcess(
                 cmd, 128, stdout="", stderr=f"fatal: couldn't find remote ref {fetched}\n")
         if "rev-parse" in args and "--verify" in args:
-            ref = args[-1]
+            ref = args[-1].split("^{", 1)[0]  # `<ref>^{commit}` resolves the ref itself
             ok = ref.startswith("origin/") and ref[len("origin/"):] in remote_branches
-            return subprocess.CompletedProcess(cmd, 0 if ok else 128, stdout="", stderr="")
+            if "--quiet" not in args and not ok:
+                return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="")
+            # Resolution checks (`rev-parse -q --verify <ref>^{commit}`) return the sha
+            # when the tracking ref exists, empty stdout otherwise.
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=("a" * 40 + "\n") if ok else "", stderr="")
         if "checkout" in args and "-B" not in args and "--detach" not in args:
             state["branch"] = args[-1]
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -215,6 +224,20 @@ class TestForkBareUpdateFollowsCheckoutBranch:
             update_cmd, "_apply_pulled_update",
             lambda git_cmd, branch, *_a, **_k: pulled.append(branch))
         monkeypatch.setattr(update_cmd, "_verify_head_after_pull", lambda *_a, **_k: "0" * 40)
+        # The fake answers every rev-parse -q --verify <ref>^{commit} with the same sha, so the
+        # post-move head checks (which compare the HEAD read against the armed target) would
+        # read that one sha as "landed off target" / "ref moved during the switch". Those
+        # checks are upstream's to cover; this class pins branch resolution.
+        monkeypatch.setattr(update_cmd, "_refuse_unselected_head", lambda *_a, **_k: None)
+        # The fallback test's second leg switches a parked local-only branch to main; the
+        # switch's own moved-ref guard needs a HEAD the fake cannot model. The pin this
+        # class owns (fetch refspec, rev-list, pulled branch) is decided before this point.
+        _plan = update_cmd._CheckoutPlan(
+            auto_stash_ref=None, commit_count=1, in_place_update=False,
+            parked_branch_switched=False, prompt_for_restore=False,
+            switch_block_reason=None, upstream_checked=True)
+        monkeypatch.setattr(
+            update_cmd, "_prepare_checkout_for_update", lambda *_a, **_k: _plan)
         monkeypatch.setattr(update_cmd, "_rollback_if_pulled_syntax_error", lambda *_a, **_k: None)
         self.pulled = pulled
 
@@ -230,11 +253,12 @@ class TestForkBareUpdateFollowsCheckoutBranch:
         update_cmd._cmd_update_impl(SimpleNamespace(), False)
 
         commands = self._commands(mock_run)
-        rev_list = next(c for c in commands if "rev-list" in c)
-        merge = next(c for c in commands if "merge --ff-only" in c)
-        assert "origin/main" in rev_list
-        assert "local/experiment" not in rev_list
-        assert "origin/main" in merge
+        # The tracking refspec pins the fetched branch; the tree move merges the fetched
+        # sha by design (commit-point hardening: `merge --ff-only <sha>`, never the ref).
+        # The fallback run fetches twice: the local-only branch (refused), then main.
+        assert "refs/heads/main:refs/remotes/origin/main" in [
+            c for c in commands if "fetch" in c][-1]
+        assert not any("local/experiment" in c for c in commands if "rev-list" in c)
         assert self.pulled == ["main"]
 
     @patch("subprocess.run")
@@ -245,9 +269,8 @@ class TestForkBareUpdateFollowsCheckoutBranch:
         update_cmd._cmd_update_impl(SimpleNamespace(), False)
 
         commands = self._commands(mock_run)
-        rev_list = next(c for c in commands if "rev-list" in c)
-        merge = next(c for c in commands if "merge --ff-only" in c)
-        assert "origin/sid/opentui" in rev_list
-        assert "origin/sid/opentui" in merge
+        # Same commit-point shape: the fetched sha is merged, the refspec proves the branch.
+        assert "refs/heads/sid/opentui:refs/remotes/origin/sid/opentui" in next(
+            c for c in commands if "fetch" in c)
         assert not any("checkout main" in c for c in commands)
         assert self.pulled == ["sid/opentui"]
