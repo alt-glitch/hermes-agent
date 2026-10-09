@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from agent.agent_runtime_helpers import cleanup_dead_connections
+from agent.agent_runtime_helpers_dead_connections import cleanup_dead_connections
 
 
 class _ProbeSocket:
