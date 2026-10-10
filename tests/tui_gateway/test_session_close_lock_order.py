@@ -171,6 +171,8 @@ def test_sibling_close_rechecks_reconnected_transport(monkeypatch, registered_se
     monkeypatch.setattr(server.threading, "Timer", PendingTimer)
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 1)
     monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_: False)
+    # The wakeup-schedule probe reads the loop/heartbeat stores off disk; keep this lock-order test on a stub.
+    monkeypatch.setattr(server, "_session_owns_live_wakeup_schedule", lambda *_: False)
     monkeypatch.setattr(server, "_pending_ws_reaps", {})
     if path == "supersession":
         def action():
