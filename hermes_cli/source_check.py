@@ -65,7 +65,7 @@ def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, t
     try:
         return subprocess.run(
             [git, *args], capture_output=True, timeout=timeout, cwd=str(cwd) if cwd is not None else None,
-            **(_GIT_TEXT_KW if text else {}), **kwargs)
+            **(_GIT_TEXT_KW if text else {}), **kwargs, check=False)
     except Exception:
         return None
 

@@ -79,7 +79,7 @@ class _ScriptedEnv(BaseEnvironment):
     def execute(self, command, cwd="", **kwargs):
         import subprocess
         proc = subprocess.run(["bash", "-c", command], capture_output=True,
-                              text=True, encoding="utf-8", timeout=10)
+                              text=True, encoding="utf-8", timeout=10, check=False)
         return {"output": "echo login-noise\n" + proc.stdout + proc.stderr, "returncode": proc.returncode}
 
 
