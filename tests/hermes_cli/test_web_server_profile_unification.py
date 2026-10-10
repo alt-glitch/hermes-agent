@@ -720,7 +720,7 @@ class TestProfileScopedChatPty:
             make_tui_argv,
             raising=False,
         )
-        argv, cwd, env = _web_server_chat._resolve_chat_argv(profile="worker_beta")
+        _argv, _cwd, env = _web_server_chat._resolve_chat_argv(profile="worker_beta")
         assert env is not None
         assert env["HERMES_HOME"] == str(isolated_profiles["worker_beta"])
         assert observed["opentui_runtime_state_dir"] == (

@@ -331,7 +331,7 @@ class _ChildProgressRelay:
         kw["tool_count"] = self.tool_count
         return kw
 
-    def _relay(self, event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+    def _relay(self, event_type: str, tool_name: str | None = None, preview: str | None = None, args=None, **kwargs):
         if self.parent_cb:
             # kwargs override identity (e.g. status, duration_seconds).
             with _quiet("Parent callback failed: %s"):
@@ -427,7 +427,7 @@ class _ChildProgressRelay:
             if len(self.batch) >= self._BATCH_SIZE:
                 self._flush()
 
-    def __call__(self, event_type, tool_name: str = None, preview: str = None, args=None, **kwargs):
+    def __call__(self, event_type, tool_name: str | None = None, preview: str | None = None, args=None, **kwargs):
         # Timeout is cooperative: the provider may still call us while unwinding.
         # Serialize terminal delivery with deltas without touching newer callbacks.
         with self._event_lock:
