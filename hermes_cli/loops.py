@@ -82,14 +82,14 @@ def parse_interval_token(token: str) -> Optional[int]:
     return total if total > 0 else None
 
 
-def parse_loop_args(text: str) -> Dict[str, Any]:
+def parse_loop_args(text: str) -> dict[str, Any]:
     """Parse ``/loop [interval] <prompt> [--times N] [--until ...]``.
 
     Returns ``{"interval_seconds": int|None, "prompt", "times", "until", "error"}``;
     ``interval_seconds`` None means self-paced, ``error`` is set for unusable input.
     """
     raw = (text or "").strip()
-    result: Dict[str, Any] = {"interval_seconds": None, "prompt": "", "times": 0, "until": "", "error": None}
+    result: dict[str, Any] = {"interval_seconds": None, "prompt": "", "times": 0, "until": "", "error": None}
     if not raw:
         return {**result, "error": "empty"}
 
@@ -138,7 +138,7 @@ def format_interval(seconds: float) -> str:
     return "".join(parts)
 
 
-def _loops_config() -> Dict[str, Any]:
+def _loops_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config
 
@@ -198,7 +198,7 @@ class LoopState:
     last_stop_reason: Optional[str] = None
     # Gateway routing (platform / chat_id / chat_type / thread_id) captured at creation so the
     # idle watcher can inject ticks into the right chat. Empty for CLI/TUI (own schedulers).
-    route: Dict[str, Any] = field(default_factory=dict)
+    route: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -207,7 +207,7 @@ class LoopState:
     def from_json(cls, raw: str) -> "LoopState":
         data = json.loads(raw)
         route = data.get("route")
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "prompt": data.get("prompt", ""),
             "status": data.get("status", "active"),
             "mode": data.get("mode", "interval"),
@@ -349,7 +349,7 @@ def clear_loop(session_id: str) -> None:
         save_loop(session_id, state)
 
 
-def list_active_loops() -> List[Tuple[str, LoopState]]:
+def list_active_loops() -> list[tuple[str, LoopState]]:
     """``[(session_id, LoopState), ...]`` for every ACTIVE loop; ``[]`` on any DB error.
 
     Used by the gateway's idle wakeup watcher, which scans for due loops on a coarse tick.
@@ -357,7 +357,7 @@ def list_active_loops() -> List[Tuple[str, LoopState]]:
     db = _get_session_db()
     if db is None:
         return []
-    out: List[Tuple[str, LoopState]] = []
+    out: list[tuple[str, LoopState]] = []
     for key, raw in _db_op("list_meta_prefix", lambda: db.list_meta_prefix(_META_PREFIX), []):
         session_id = key[len(_META_PREFIX):]
         state = _parse_state(raw) if session_id and raw else None
@@ -464,7 +464,7 @@ class LoopManager:
         self._raw = state.to_json()
         return True
 
-    def _ownership_changed(self) -> Dict[str, Any]:
+    def _ownership_changed(self) -> dict[str, Any]:
         return {
             "status": self._state.status if self._state else None,
             "stopped": False,
@@ -516,7 +516,7 @@ class LoopManager:
         interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
-        route: Optional[Dict[str, Any]] = None,
+        route: Optional[dict[str, Any]] = None,
     ) -> LoopState:
         """Start a new loop (replaces any existing one for the session).
 
@@ -705,7 +705,7 @@ class LoopManager:
 
     def complete_tick(
         self, last_response: str, claim_id: Optional[str] = None
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
 
         Returns a decision dict::
@@ -881,8 +881,8 @@ def dispatch_loop_command(
     mgr: "LoopManager",
     args: str,
     *,
-    route: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    route: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Surface-agnostic handler for ``/loop <args>`` → ``{"output": str, "created": bool}``.
 
     ``output`` is printed/sent verbatim by each surface. ``route`` is stored on new loops so the

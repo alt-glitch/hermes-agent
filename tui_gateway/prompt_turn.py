@@ -768,13 +768,12 @@ def _install_has_prior_sessions(session: dict) -> bool:
         return False
 
 
-def _stage_first_contact_onboarding_note(session: dict, agent, history_empty: bool) -> None:
+def _stage_first_contact_onboarding_note(session: dict, agent, history_empty: bool, message: str) -> None:
     """Stage the install's first-message onboarding note for THIS turn (#82750).
 
-    The messaging gateway appends the consent-gated profile-build directive to
+    The messaging gateway appends the directive to
     the very first message ever (``_hmwa_first_contact_notes``); the
-    TUI/Desktop surface never did, so a fresh install's first Desktop chat
-    skipped the opt-in profile flow entirely. Stage the same note through
+    TUI/Desktop surface never did. Stage the same note through
     ``agent._gateway_turn_context_notes`` — consumed by
     ``agent.turn_context`` on the user message — never the ephemeral system
     prompt, which must stay byte-stable for the conversation (prompt-cache
@@ -791,6 +790,8 @@ def _stage_first_contact_onboarding_note(session: dict, agent, history_empty: bo
             get_hermes_home() / "config.yaml",
             session_history_empty=history_empty,
             install_has_prior_sessions=_install_has_prior_sessions(session),
+            message=message,
+            setup_handoff=bool(session.get("setup_handoff")),
         )
         if not note:
             return
@@ -842,7 +843,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
         st.history_version = int(session.get("history_version", 0))
     # Install-first-message onboarding (#82750): gateway parity for the TUI/Desktop
     # surface — no-op unless this is the install's very first message ever.
-    _stage_first_contact_onboarding_note(session, agent, not st.history)
+    _stage_first_contact_onboarding_note(session, agent, not st.history, text if isinstance(text, str) else "")
     cwd = _session_cwd(session)
     _register_session_cwd(session)
     cols = session.get("cols", 80)
@@ -868,12 +869,13 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     from agent.notification_presentation import event_presentation_muted
     if not event_presentation_muted("message.delta", sid):
         st.tts_queue, st.thinking_started = _start_turn_voice()
-    # Per-turn API-message notes: barge mid-speech, reactions, HUD surface (per-turn state
+    # Per-turn API-message notes: barge mid-speech, reactions, card retries, HUD surface (per-turn state
     # that must not touch the byte-stable system prompt).
     from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
     if take_speech_interrupted():
         run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
     run_message = _prepend_note(run_message, _pending_reaction_notes(session))
+    run_message = _prepend_note(run_message, _pending_tool_retry_notes(session))
     agent._voice_turn_pending = bool(session.pop("voice_turn", False))  # auxiliary.voice_chat route
     return prompt, _prepend_note(run_message, _hud_surface_note(session)), cols, streamer
 
@@ -960,6 +962,12 @@ def _invoke_agent(
                 logger.debug("failed to capture synthetic display row boundary", exc_info=True)
     if turn_author and "turn_author" in run_params:
         run_kwargs["turn_author"] = turn_author
+    if "prelude" in run_params:
+        from agent.initiate_setup_prompt import initiate_setup_prelude
+        prelude = initiate_setup_prelude(
+            text, _resolve_agent_platform(_session_source(session)), agent.valid_tool_names, st.history)
+        if prelude is not None:
+            run_kwargs["prelude"] = prelude
     _adopt_submit_user_row(session, agent, run_kwargs["persist_user_message"], text)
     # Live-rename hook: auto-titling fires inside the turn prologue.
     agent._on_session_title = lambda title, _source: _emit_title_refresh(sid, title)
@@ -1461,6 +1469,10 @@ def _run_prompt_submit(
             _report_history_commit(history_commit_callback, history_outcome)
             history_commit_reported = True
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols, sid=sid)
+            if status == "complete":
+                # Before message.complete: the desktop re-reads the sign-in offer on that event.
+                from tui_gateway.free_tier_task_done import note_task_done
+                note_task_done(session, st.result, st.agent, display_kind)
             _emit("message.complete", sid, payload)
             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
             _settle_loop_claim(sid, session, raw, status, loop_claim_id)
@@ -1486,6 +1498,7 @@ def _run_prompt_submit(
                     session["running"] = False
                     session["last_active"] = time.time()
                     session["_active_client_submission_ids"] = []
+                    session.pop("_turn_user_input", None)  # per turn: never leaks into the next one
                     if not st.error_retained:
                         _clear_inflight_turn(session)
                     _release_hosted_room_turn_slot(session)

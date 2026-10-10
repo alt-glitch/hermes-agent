@@ -25,8 +25,8 @@ logger = logging.getLogger("tools.approval")
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
     __slots__ = (
-        "event", "data", "result", "reason", "acknowledged", "terminal_status",
-        "surface_session_ids", "lifecycle_callbacks", "settle", "cancelled",
+        "acknowledged", "cancelled", "data", "event", "lifecycle_callbacks", "reason", "result", "settle",
+        "surface_session_ids", "terminal_status",
     )
 
     def __init__(self, data: dict):
