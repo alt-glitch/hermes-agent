@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-import gateway.media_fetch as media_fetch
+from gateway import media_fetch
 from gateway.platforms.base import BasePlatformAdapter
 from tools.environments.base import BaseEnvironment, FileFetchError
 
@@ -79,7 +79,7 @@ class _ScriptedEnv(BaseEnvironment):
     def execute(self, command, cwd="", **kwargs):
         import subprocess
         proc = subprocess.run(["bash", "-c", command], capture_output=True,
-                              text=True, encoding="utf-8", timeout=10)
+                              text=True, encoding="utf-8", timeout=10, check=False)
         return {"output": "echo login-noise\n" + proc.stdout + proc.stderr, "returncode": proc.returncode}
 
 

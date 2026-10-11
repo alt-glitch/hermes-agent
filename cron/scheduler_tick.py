@@ -2,6 +2,32 @@
 
 import concurrent.futures
 import contextlib
+import logging
+import time
+
+from cron import store_health
+from cron.constants import is_recurring
+
+logger = logging.getLogger("cron.scheduler")
+
+# Log the yield at most once per episode (reset when the skew changes) to avoid per-interval spam.
+_YIELD_LOG_INTERVAL_SECONDS = 3600.0
+_last_yield_log: dict[str, object] = {}
+
+
+def _log_tick_yield_once(reason: str) -> None:
+    """Log the yield at error level once per episode (skew signature)."""
+    global _last_yield_log
+    now = time.monotonic()
+    last_reason = _last_yield_log.get("reason")
+    last_at = _last_yield_log.get("at", 0.0)
+    if last_reason != reason or (now - float(last_at)) >= _YIELD_LOG_INTERVAL_SECONDS:
+        logger.error(
+            "Cron tick yielded: this process is running stale code (%s) and a "
+            "fresher gateway owns the runtime lock — jobs will fire from that "
+            "process. Restart this one to reclaim its ticks.",
+            reason)
+    _last_yield_log = {"reason": reason, "at": now}
 
 
 def _advance_gated_dispatches(_sched, pending_dispatches: list) -> None:
@@ -52,6 +78,51 @@ def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None
         return _tick_admitted(verbose, adapters, loop, sync, can_dispatch=can_dispatch)
 
 
+def _acquire_tick_lock_or_degrade(_sched):
+    """The tick lock fd, or None when this tick must not run: another ticker holds the lock, or
+    the store cannot be written (read-only/full/denied: the lock file cannot even be created), in
+    which case the store is marked degraded and the MCP orphan sweep still runs."""
+    lock_dir, lock_file = _sched._get_lock_paths()
+    _sched._ensure_cron_dir(lock_dir)
+    try:
+        return _sched._acquire_tick_lock(lock_file)
+    except OSError as exc:
+        if exc.errno not in store_health.UNWRITABLE_ERRNOS:
+            raise  # EMFILE/ENFILE etc. stay a FAILED tick (#87644)
+        store_health.note_unwritable(exc, "tick lock unavailable", "lock", cron_dir=lock_dir)
+        _sched._sweep_mcp_orphans()
+        return None
+
+
+def _cancel_gated_dispatches(_sched, due_jobs: list, pending_dispatches: list, err: BaseException) -> bool:
+    """Cancel every unstarted gated worker after a failed collection or batch advance: clear the
+    one-shot run claims, wake the workers (each owns its release_running_job) and settle their
+    receipts. True when the store refused the write (read-only/full/denied): no durable advance ->
+    no run (at-most-once), so the batch is recorded as skipped on the degraded store and the tick
+    returns cleanly; any other failure is re-raised by the caller."""
+    for pending in pending_dispatches:
+        pending[4].set()
+    dispatched_ids = {pending[1] for pending in pending_dispatches}
+    for job in due_jobs:
+        claim = job.get("run_claim")
+        if job["id"] in dispatched_ids and isinstance(claim, dict) and claim.get("token"):
+            with contextlib.suppress(Exception):
+                _sched.clear_run_claim(job["id"], expected_token=claim["token"])
+    unwritable = isinstance(err, OSError) and err.errno in store_health.UNWRITABLE_ERRNOS
+    error = f"Cron store unwritable; not started: {err}" if unwritable else f"Schedule advance failed: {err}"
+    # The awakened worker owns release_running_job in its finally; never release here.
+    for pending in pending_dispatches:
+        pending[3].set()
+        _sched._finish_execution_best_effort(pending[2], success=False, error=error)
+    if unwritable:
+        skipped = [job for job in due_jobs if job["id"] in dispatched_ids]
+        recurring = sum(1 for job in skipped if is_recurring(job))
+        oneshots = len(skipped) - recurring
+        consequence = f"skipped {recurring} recurring job(s)" + (f" and {oneshots} one-shot(s)" if oneshots else "")
+        store_health.note_unwritable(err, consequence, "advance", skipped)
+    return unwritable
+
+
 def _tick_admitted(
     verbose: bool = True, adapters=None, loop=None, sync: bool = True, *, can_dispatch=None):
     """Check and run all due jobs. File-locked so only one tick runs at a time (gateway ticker vs
@@ -64,12 +135,10 @@ def _tick_admitted(
     # lock, ITS ticker dispatches. With no fresh holder (desktop-standalone) the tick proceeds.
     _skew = _sched._should_yield_tick_to_fresh_gateway()
     if _skew is not None:
-        _sched._log_tick_yield_once(f"boot={_skew[0]} disk={_skew[1]}")
+        _log_tick_yield_once(f"boot={_skew[0]} disk={_skew[1]}")
         raise _sched.CronTickYielded(_skew[0], _skew[1])
 
-    lock_dir, lock_file = _sched._get_lock_paths()
-    _sched._ensure_cron_dir(lock_dir)
-    lock_fd = _sched._acquire_tick_lock(lock_file)
+    lock_fd = _acquire_tick_lock_or_degrade(_sched)
     if lock_fd is None:
         return 0
 
@@ -108,6 +177,13 @@ def _tick_admitted(
                 # idle ticks so orphaned stdio children from crashed jobs are reaped even when nothing is
                 # due.
                 _sched.logger.info("%s - No jobs due", _sched._hermes_now().strftime('%H:%M:%S'))
+            store_health.recheck_idle()
+            _sched._sweep_mcp_orphans()
+            return 0
+
+        if store_health.dispatch_blocked(due_jobs):
+            # Known-unwritable store, re-probed at most once a minute: every advance/claim would
+            # fail, so skip them (the skip is recorded) and keep the tick's housekeeping alive.
             _sched._sweep_mcp_orphans()
             return 0
 
@@ -138,20 +214,11 @@ def _tick_admitted(
             if pending_dispatches:
                 _advance_gated_dispatches(_sched, pending_dispatches)
         except BaseException as advance_err:
-            for pending in pending_dispatches:
-                pending[4].set()
-            dispatched_ids = {pending[1] for pending in pending_dispatches}
-            for job in due_jobs:
-                claim = job.get("run_claim")
-                if job["id"] in dispatched_ids and isinstance(claim, dict) and claim.get("token"):
-                    with contextlib.suppress(Exception):
-                        _sched.clear_run_claim(job["id"], expected_token=claim["token"])
-            # The awakened worker owns release_running_job in its finally; never release here.
-            for pending in pending_dispatches:
-                pending[3].set()
-                _sched._finish_execution_best_effort(
-                    pending[2], success=False, error=f"Schedule advance failed: {advance_err}")
-            raise
+            if not _cancel_gated_dispatches(_sched, due_jobs, pending_dispatches, advance_err):
+                raise
+            # Unwritable store: nothing started and the skip is recorded; keep the housekeeping.
+            _sched._sweep_mcp_orphans()
+            return 0
         for fut, _, _, start_gate, _ in pending_dispatches:
             start_gate.set()
             _all_futures.append(fut)

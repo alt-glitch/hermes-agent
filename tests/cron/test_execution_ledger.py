@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 def _point_ledger(monkeypatch, tmp_path):
-    import cron.executions as executions
+    from cron import executions
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
@@ -190,7 +190,7 @@ def test_foreign_process_cannot_start_or_finish_execution(monkeypatch, tmp_path)
 
 
 def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path):
-    import cron.executions as executions
+    from cron import executions
 
     current_home = {"path": tmp_path / "default"}
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", None)
@@ -352,7 +352,7 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
 
 
 def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     class BrokenPool:
         def submit(self, _callable):
@@ -382,7 +382,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     events = []
     run_execution_ids = []
@@ -530,7 +530,7 @@ def test_early_return_still_closes_connection(monkeypatch, tmp_path):
 
 
 def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
-    import cron.jobs as jobs
+    from cron import jobs
 
     monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")

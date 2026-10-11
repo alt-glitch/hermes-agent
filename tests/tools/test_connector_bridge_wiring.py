@@ -100,7 +100,7 @@ def test_resolve_unknown_name_points_at_tool_search_not_direct_call():
     # NOT be told "call it directly" — that is the opposite of the required correction.
     from tools.registry import registry
 
-    name, args, err = resolve_underlying_call({"name": "not_a_real_tool", "arguments": {}})
+    name, _args, err = resolve_underlying_call({"name": "not_a_real_tool", "arguments": {}})
     assert name is None
     assert "not a known tool name" in err and "call it directly" not in err.lower()
     registry.register(name="mcp__mempalace__mempalace_search", toolset="mcp-mempalace",
@@ -475,7 +475,7 @@ def test_describe_connector_names_fall_to_not_found_when_dark_and_to_connectors_
 
 
 def test_peel_admits_pure_connector_batch_as_sentinel():
-    name, args = _peel_bridge_call(
+    name, _args = _peel_bridge_call(
         "tool_call",
         {"calls": [
             {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
@@ -490,7 +490,7 @@ def test_peel_keeps_mixed_and_local_batches_as_sequential_barrier():
         {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
         {"name": "write_file", "arguments": {"path": "x"}},
     ]}
-    name, args = _peel_bridge_call("tool_call", mixed)
+    name, _args = _peel_bridge_call("tool_call", mixed)
     assert name == "tool_call"  # barrier: local entries never got admission
 
     all_local = {"calls": [
@@ -637,7 +637,7 @@ def _sent_tools(transport):
 
 
 def test_hook_rewrite_and_restored_vendor_slug_reach_the_gateway_request_body(monkeypatch):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     transport = _RecordingTransport()
     _connectors_on(monkeypatch, _recording_client_factory(transport))

@@ -226,7 +226,7 @@ def test_session_close_interrupts_before_releasing_captured_clarify_callback(mon
         )
         waiter.join(timeout=1)
 
-        assert response["result"] == {"closed": True}
+        assert response["result"] == {"closed": True, "messages": []}
         assert not waiter.is_alive()
         assert agent.interrupted.is_set()
         assert result == {"first": cancelled}

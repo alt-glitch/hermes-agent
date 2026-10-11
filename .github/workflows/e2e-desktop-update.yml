@@ -29,8 +29,8 @@ jobs:
     # Forks have no larger runners: fall back to ubuntu-latest with 2x time.
     runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
     timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 30 || 60 }}
-    # Advisory until stable on CI (see ci.yaml): a red shard does not fail the caller.
-    continue-on-error: true
+    # Required whenever the e2e_desktop_update lane fires (see ci.yaml): it was
+    # advisory until it proved stable, and every main push shard since has passed.
     strategy:
       fail-fast: false
       # One install per shard (every spec restores it; paths are baked in, so
