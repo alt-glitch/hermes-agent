@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1068,3 +1069,189 @@ def test_failed_stale_recovery_keeps_cron_paused_and_journal_for_retry(
     assert holder["job"]["state"] == "paused"
     assert holder["job"]["enabled"] is False
     assert configure._deployment_journal_path(runtime).is_file()
+
+
+RUNTIME_SCRIPT = (
+    "import argparse\n"
+    "def _parser():\n"
+    "    parser = argparse.ArgumentParser()\n"
+    "    parser.add_subparsers(dest='command')\n"
+    "    return parser\n"
+    "if __name__ == '__main__':\n"
+    "    _parser().parse_args()\n"
+)
+
+
+def _git_test(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _commit_all(repo: Path, message: str) -> str:
+    _git_test(repo, "add", "-A")
+    _git_test(
+        repo, "-c", "user.email=t@example.com", "-c", "user.name=test",
+        "commit", "--no-gpg-sign", "-m", message,
+    )
+    return _git_test(repo, "rev-parse", "HEAD")
+
+
+def _self_deploy_fixture(tmp_path: Path, monkeypatch):
+    """A real checkout with a committed ops subtree and one published branch."""
+    repo = tmp_path / "checkout"
+    ops = repo / "ops/opentui-fork-maintainer"
+    (ops / "scripts").mkdir(parents=True)
+    (ops / "skills/opentui-maintainer/references").mkdir(parents=True)
+    (ops / "scripts/maintainer_runtime.py").write_text(RUNTIME_SCRIPT)
+    (ops / "skills/opentui-maintainer/SKILL.md").write_text(
+        "---\nname: opentui-maintainer\n---\n"
+    )
+    (ops / "skills/opentui-maintainer/references/profile-learning.md").write_text(
+        "versioned\n"
+    )
+    monkeypatch.setattr(configure, "RUNTIME_ASSETS", (Path("scripts/maintainer_runtime.py"),))
+    monkeypatch.setattr(
+        configure,
+        "MAINTAINER_SKILL_SOURCES",
+        {"opentui-maintainer": ops / "skills/opentui-maintainer"},
+    )
+    _git_test(repo, "init", "-q", "-b", "main")
+    sha = _commit_all(repo, "ops change")
+    # "Published" means the remote serves it: a bare origin, pushed to.
+    origin = tmp_path / "origin.git"
+    _git_test(repo, "init", "-q", "--bare", str(origin))
+    _git_test(repo, "remote", "add", "origin", str(origin))
+    published_ref = "sid/maintainer-self-heal"
+    _git_test(repo, "push", "-q", "origin", f"HEAD:refs/heads/{published_ref}")
+
+    runtime = tmp_path / "runtime"
+    state = runtime / "state"
+    state.mkdir(parents=True)
+    token = "caller-run-token"
+    configure._atomic_write_json(
+        state / "run.lease.json",
+        {"token": token, "run_id": "run-abc", "expires_unix": int(time.time()) + 3600},
+    )
+    return {
+        "repo": repo,
+        "ops": ops,
+        "sha": sha,
+        "ref": published_ref,
+        "runtime": runtime,
+        "state": state,
+        "token": token,
+        "hermes_home": tmp_path / "hermes",
+    }
+
+
+def _self_deploy(fixture, **overrides):
+    kwargs = {
+        "repo": fixture["repo"],
+        "sha": fixture["sha"],
+        "published_refs": [fixture["ref"]],
+        "run_token": fixture["token"],
+        "state_dir": fixture["state"],
+        "runtime_home": fixture["runtime"],
+        "hermes_home": fixture["hermes_home"],
+    }
+    kwargs.update(overrides)
+    return configure.self_deploy_configuration(**kwargs)
+
+
+def test_self_deploy_installs_the_pinned_commit_and_writes_a_receipt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fixture = _self_deploy_fixture(tmp_path, monkeypatch)
+    installed_skill = fixture["hermes_home"] / "skills/software-development/opentui-maintainer"
+    (installed_skill / "references").mkdir(parents=True)
+    # Profile-owned learning must survive the wholesale versioned refresh.
+    (installed_skill / "references/profile-learning.md").write_text("learned\n")
+
+    result = _self_deploy(fixture)
+
+    receipt = json.loads(Path(result["receipt"]).read_text(encoding="utf-8"))
+    assert receipt["status"] == "applied"
+    assert receipt["sha"] == fixture["sha"]
+    assert receipt["run_id"] == "run-abc"
+    assert result["effective"] == "next-tick"
+    assert receipt["files_after"]
+    installed_asset = fixture["runtime"] / "scripts/maintainer_runtime.py"
+    assert installed_asset.read_text(encoding="utf-8") == RUNTIME_SCRIPT
+    assert configure._installed_blob(
+        fixture["repo"], installed_asset
+    ) == receipt["files_blob"]["scripts/maintainer_runtime.py"]
+    assert (installed_skill / "references/profile-learning.md").read_text() == "learned\n"
+    assert (installed_skill / "SKILL.md").read_text().startswith("---")
+
+
+def test_self_deploy_refuses_a_commit_outside_the_published_branch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fixture = _self_deploy_fixture(tmp_path, monkeypatch)
+    repo = fixture["repo"]
+    _git_test(repo, "checkout", "-q", "-b", "side")
+    (fixture["ops"] / "scripts/other.py").write_text("x\n")
+    outsider = _commit_all(repo, "unpublished sibling")
+
+    with pytest.raises(configure.ConfigurationError, match="is not an ancestor"):
+        _self_deploy(fixture, sha=outsider)
+
+    assert not (fixture["runtime"] / "scripts/maintainer_runtime.py").exists()
+
+
+def test_self_deploy_ignores_a_fabricated_local_tracking_ref(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fixture = _self_deploy_fixture(tmp_path, monkeypatch)
+    repo = fixture["repo"]
+    _git_test(repo, "checkout", "-q", "-b", "side")
+    (fixture["ops"] / "scripts/other.py").write_text("x\n")
+    outsider = _commit_all(repo, "never pushed")
+    # A local remote-tracking ref is one update-ref away; it must not count.
+    _git_test(repo, "update-ref", f"refs/remotes/origin/{fixture['ref']}", outsider)
+
+    with pytest.raises(configure.ConfigurationError, match="is not an ancestor"):
+        _self_deploy(fixture, sha=outsider)
+
+    assert not (fixture["runtime"] / "scripts/maintainer_runtime.py").exists()
+
+
+def test_self_deploy_refuses_a_live_foreign_run_lease(tmp_path: Path, monkeypatch) -> None:
+    fixture = _self_deploy_fixture(tmp_path, monkeypatch)
+    configure._atomic_write_json(
+        fixture["state"] / "run.lease.json",
+        {"token": "another-run", "run_id": "other", "expires_unix": int(time.time()) + 3600},
+    )
+
+    with pytest.raises(configure.ConfigurationError, match="active lease"):
+        _self_deploy(fixture)
+
+    assert not (fixture["runtime"] / "scripts/maintainer_runtime.py").exists()
+
+
+def test_self_deploy_rolls_back_and_records_a_blob_mismatch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fixture = _self_deploy_fixture(tmp_path, monkeypatch)
+    installed_asset = fixture["runtime"] / "scripts/maintainer_runtime.py"
+    installed_asset.parent.mkdir(parents=True)
+    installed_asset.write_text("OLD\n")
+    real_blobs = configure._commit_blobs
+
+    def torn_blobs(repo: Path, sha: str, prefix: str) -> dict[str, str]:
+        blobs = real_blobs(repo, sha, prefix)
+        return {
+            path: ("0" * 40 if path.endswith("scripts/maintainer_runtime.py") else blob)
+            for path, blob in blobs.items()
+        }
+
+    monkeypatch.setattr(configure, "_commit_blobs", torn_blobs)
+
+    with pytest.raises(configure.ConfigurationError, match="does not match the pinned commit blob"):
+        _self_deploy(fixture)
+
+    assert installed_asset.read_text() == "OLD\n"
+    receipts = list((fixture["runtime"] / "state").glob("self-deploy.*.json"))
+    assert len(receipts) == 1
+    assert json.loads(receipts[0].read_text(encoding="utf-8"))["status"] == "rolled-back"

@@ -103,6 +103,12 @@ REVIEW_TIMEOUT_SECONDS = 30 * 60
 REVIEW_PROMPT_MAX_BYTES = 350_000
 TRUSTED_FETCH_TIMEOUT_SECONDS = 10 * 60
 TRUSTED_FETCH_ATTEMPTS = 3
+# A transient network failure while merely observing the remote must not be
+# allowed to widen the lease or file a prepared publication. Reads are retried
+# a bounded number of times; writes are never retried.
+REMOTE_OBSERVE_ATTEMPTS = 3
+REMOTE_OBSERVE_BACKOFF_SECONDS = (2, 4)
+RETRIABLE_GIT_OPS = frozenset({"ls-remote", "fetch"})
 REVIEW_PREREQUISITE_GATES = (
     "opentui-install",
     "focused-contracts",
@@ -487,10 +493,12 @@ def submit_request(state_dir: Path, value: Any) -> dict[str, Any]:
             existing = _read_bound_request(pending[0], state_dir, label="pending request")
             if existing != value:
                 raise ControlError("another request is pending; inspect it instead of replacing it")
+            _clear_request_deferral(state_dir, value)
             status = "claimed" if pending[0].name.endswith("inflight.json") else "queued"
             created = False
         else:
             _atomic_json(state_dir / "run-request.json", value)
+            _clear_request_deferral(state_dir, value)
             status, created = "queued", True
     return {"request_id": _canonical_json_sha256(value), "status": status, "created": created}
 
@@ -649,6 +657,100 @@ def _record_retry_context(
     )
 
 
+def _runtime_fingerprint() -> str:
+    """Hash the deployed control-plane script so a refusal binds to a deploy."""
+    return _file_sha256(Path(__file__).resolve())
+
+
+def _request_deferral_path(state_dir: Path) -> Path:
+    return state_dir / "request-deferred.json"
+
+
+def _record_request_refusal(
+    state_dir: Path,
+    request_value: dict[str, Any],
+    *,
+    run_id: str,
+    stage: str,
+    reason_code: str,
+) -> None:
+    """Remember that this exact request was refused by this exact runtime.
+
+    The next claim of the same request under the same deployed runtime would
+    repeat the same doomed attempt: nothing changed except the clock. Keep the
+    refusal durable and keyed by both hashes so a deploy (a new runtime file)
+    or an explicit operator resubmission releases it.
+    """
+    _atomic_json(
+        _request_deferral_path(state_dir),
+        {
+            "schema_version": 1,
+            "request_sha256": _canonical_json_sha256(request_value),
+            "runtime_sha256": _runtime_fingerprint(),
+            "run_id": run_id,
+            "stage": stage,
+            "reason_code": reason_code,
+            "refused_unix": int(time.time()),
+        },
+    )
+
+
+def _request_deferral(
+    state_dir: Path, request_value: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return the refusal that still applies to this request, if any."""
+    path = _request_deferral_path(state_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    if value.get("request_sha256") != _canonical_json_sha256(request_value):
+        return None
+    if value.get("runtime_sha256") != _runtime_fingerprint():
+        return None
+    return value
+
+
+def _clear_request_deferral(state_dir: Path, request_value: dict[str, Any]) -> None:
+    """Release a refusal when the operator explicitly resubmits that request."""
+    path = _request_deferral_path(state_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(value, dict) and value.get(
+        "request_sha256"
+    ) == _canonical_json_sha256(request_value):
+        path.unlink(missing_ok=True)
+
+
+def _defer_doomed_request(
+    state_dir: Path, request_value: dict[str, Any], refusal: dict[str, Any]
+) -> dict[str, Any]:
+    """Record one refused claim without consuming a run, and leave the queue."""
+    run_id = str(refusal["run_id"])
+    reason = f"runtime unchanged since refusal by run {run_id}"
+    _atomic_json(
+        _request_deferral_path(state_dir),
+        {
+            **refusal,
+            "reason": reason,
+            "deferred_unix": int(time.time()),
+            "deferred_count": int(refusal.get("deferred_count", 0)) + 1,
+        },
+    )
+    return {
+        "status": "deferred",
+        "request_id": _canonical_json_sha256(request_value),
+        "reason": reason,
+        "refused_by": run_id,
+        "stage": refusal.get("stage"),
+        "reason_code": refusal.get("reason_code"),
+    }
+
+
 def _claim_request_unlocked(
     state_dir: Path, evidence_dir: Path
 ) -> dict[str, Any] | None:
@@ -671,6 +773,12 @@ def _claim_request_unlocked(
         value = _validate_request(json.loads(source.read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError) as exc:
         raise ControlError(f"invalid request file: {type(exc).__name__}") from exc
+    refusal = _request_deferral(state_dir, value)
+    if refusal is not None:
+        # The request stays queued: the next claim re-evaluates the runtime
+        # hash, so a deploy retries it automatically and an operator
+        # resubmission clears the refusal.
+        return _defer_doomed_request(state_dir, value, refusal)
     if source == request:
         os.replace(request, inflight)
     _atomic_json(evidence_dir / "request.claimed.json", value)
@@ -1128,6 +1236,26 @@ def _git(repo: Path, args: list[str], *, check: bool = True) -> str:
     if check and result.returncode != 0:
         raise ControlError(f"git operation failed: {args[0]}")
     return result.stdout.strip()
+
+
+def _git_retry(repo: Path, args: list[str]) -> str:
+    """Run a read-only remote observation with bounded backoff.
+
+    Only the allowlisted read-only network operations are retried: they
+    advertise or transfer objects and cannot create, move, or delete a ref.
+    Every write (notably ``push``) and every local operation runs exactly once
+    so a transient failure can never be laundered into a second mutation.
+    """
+    if args[0] not in RETRIABLE_GIT_OPS:
+        return _git(repo, args)
+    for attempt in range(REMOTE_OBSERVE_ATTEMPTS):
+        try:
+            return _git(repo, args)
+        except (ControlError, subprocess.TimeoutExpired):
+            if attempt + 1 >= REMOTE_OBSERVE_ATTEMPTS:
+                raise
+            time.sleep(REMOTE_OBSERVE_BACKOFF_SECONDS[attempt])
+    raise ControlError(f"git operation failed: {args[0]}")
 
 
 def _git_status(repo: Path, args: list[str]) -> int:
@@ -1614,7 +1742,7 @@ def validate_gate_manifest(
 
 
 def _remote_sha(repo: Path, remote: str, branch: str) -> str:
-    output = _git(repo, ["ls-remote", "--heads", remote, f"refs/heads/{branch}"])
+    output = _git_retry(repo, ["ls-remote", "--heads", remote, f"refs/heads/{branch}"])
     parts = output.split()
     if len(parts) != 2 or not SHA_RE.fullmatch(parts[0]):
         raise ControlError("could not resolve the remote branch exactly")
@@ -1805,6 +1933,13 @@ def ship_candidate(
             state_dir, manifest_path.parent, token
         ) != manifest["run_binding"]:
             raise ControlError("bound request changed after verification")
+        # Observe the remote before widening the lease or filing the prepared
+        # journal. A transient observation failure must leave no post-publish
+        # lease and no prepared publication behind to reconcile; only a
+        # successfully observed remote may open the pre-push crash window.
+        current_remote = _remote_sha(repo, remote, branch)
+        if current_remote not in {base_sha, candidate_sha}:
+            raise ControlError("remote branch moved since base capture")
         # All expensive implementation and acceptance work is complete. Bound
         # the only remaining crash window before touching the remote so a
         # post-push process death can be retried after minutes, not six hours.
@@ -1842,9 +1977,6 @@ def ship_candidate(
             prepared = prior
         else:
             _atomic_json(_journal_path(state_dir), prepared)
-        current_remote = _remote_sha(repo, remote, branch)
-        if current_remote not in {base_sha, candidate_sha}:
-            raise ControlError("remote branch moved since base capture")
         if current_remote == base_sha:
             subprocess.run(
                 [
@@ -3833,6 +3965,48 @@ def _validate_success_cleanup_worktree(
     return resolved_cwd
 
 
+def _terminal_unshipped_outcome(
+    outcome: dict[str, Any],
+    *,
+    state_dir: Path,
+    source_root: Path,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> bool:
+    """Accept only a terminal refusal or a journal-proven aborted publication."""
+    if (
+        outcome.get("status") != "failed"
+        or outcome.get("published") is not False
+        or outcome.get("needs_finalization") is not False
+    ):
+        return False
+    if (
+        outcome.get("stage") == "publish"
+        and outcome.get("reason_code") == "publish-refused"
+    ):
+        return True
+    if not (
+        outcome.get("stage") == "external"
+        and outcome.get("reason_code") == "external-blocker"
+    ):
+        return False
+    try:
+        journal = _load_publish_journal(
+            state_dir, require_manifest_evidence=False
+        )
+    except ControlError:
+        return False
+    return bool(
+        journal is not None
+        and journal["phase"] == "aborted"
+        and Path(journal["evidence_dir"]).resolve() == source_root.resolve()
+        and Path(journal["manifest_path"]).resolve() == manifest_path.resolve()
+        and journal["candidate_sha"] == manifest.get("candidate_sha")
+        and journal["base_sha"] == manifest.get("base_sha")
+        and journal["manifest_sha256"] == _file_sha256(manifest_path)
+    )
+
+
 def validate_retained_gate(
     repo: Path, receipt: dict[str, Any], evidence_root: Path,
 ) -> dict[str, Any]:
@@ -3852,17 +4026,19 @@ def validate_retained_gate(
             raise ControlError(f"retained {key} changed")
     context = _load_gate(Path(receipt["context_path"]))
     outcome = _load_gate(Path(receipt["outcome_path"]))
+    original = _load_gate(source)
     if (
         context.get("run_id") != root.name
         or not context.get("execution_id")
-        or outcome.get("status") != "failed"
-        or outcome.get("stage") != "publish"
-        or outcome.get("reason_code") != "publish-refused"
-        or outcome.get("published") is not False
-        or outcome.get("needs_finalization") is not False
+        or not _terminal_unshipped_outcome(
+            outcome,
+            state_dir=evidence_root.parent.parent,
+            source_root=root,
+            manifest_path=source,
+            manifest=original,
+        )
     ):
         raise ControlError("original run has no terminal unshipped publication failure")
-    original = _load_gate(source)
     if (
         original.get("base_sha") != context.get("base_sha")
         or not _run_context_matches_captured_upstream(
@@ -4003,6 +4179,7 @@ def _publication_recovery_source(
         if _file_sha256(path) != receipt[f"{key}_sha256"]:
             raise ControlError(f"publication recovery {key} changed")
     context = _load_gate(Path(receipt["context_path"]))
+    original = _load_gate(Path(receipt["manifest_path"]))
     if owner == "terminal-prior-owner":
         outcome = _evidence_path(
             receipt.get("outcome_path"), source_root, label="recovery outcome"
@@ -4010,12 +4187,12 @@ def _publication_recovery_source(
         if _file_sha256(outcome) != receipt.get("outcome_sha256"):
             raise ControlError("publication recovery outcome changed")
         outcome_value = _load_gate(outcome)
-        if (
-            outcome_value.get("status") != "failed"
-            or outcome_value.get("stage") != "publish"
-            or outcome_value.get("reason_code") != "publish-refused"
-            or outcome_value.get("published") is not False
-            or outcome_value.get("needs_finalization") is not False
+        if not _terminal_unshipped_outcome(
+            outcome_value,
+            state_dir=evidence_root.parent.parent,
+            source_root=source_root,
+            manifest_path=Path(receipt["manifest_path"]),
+            manifest=original,
         ):
             raise ControlError("prior owner has no terminal unshipped publication failure")
     elif owner != "live-owner":
@@ -4026,7 +4203,6 @@ def _publication_recovery_source(
         or not SHA256_RE.fullmatch(str(context.get("lease_token_sha256", "")))
     ):
         raise ControlError("publication recovery context identity is invalid")
-    original = _load_gate(Path(receipt["manifest_path"]))
     packet = _load_gate(Path(receipt["packet_path"]))
     items = packet.get("checks") if set(packet) == {"checks"} else None
     checks = original.get("checks")
@@ -5239,6 +5415,7 @@ def finalize_failure(
     request_recovered = request_retired = retirement_undecided = False
     request_deferred = False
     retry_after_unix: int | None = None
+    recovered_request: dict[str, Any] | None = None
     with _request_lock(state_dir):
         if claimed.exists():
             if (evidence_root / "request.consumed.json").exists():
@@ -5251,6 +5428,7 @@ def finalize_failure(
                 if _read_bound_request(queued, state_dir, label="queued request") != claimed_value:
                     raise ControlError("queued request does not match this failed run")
                 request_recovered = True
+                recovered_request = claimed_value
             elif not inflight.exists() and stale.exists():
                 if _read_bound_request(stale, evidence_root, label="stale request") != claimed_value:
                     raise ControlError("stale request does not match this failed run")
@@ -5310,8 +5488,23 @@ def finalize_failure(
                 else:
                     _recover_request_unlocked(state_dir)
                     request_recovered = True
+                    recovered_request = claimed_value
         elif inflight.exists():
             raise ControlError("in-flight request is not bound to this failed run")
+        if recovered_request is not None and recovered_request.get("mode") == "resume":
+            # A refused publication-continuation has no path forward except the
+            # same resume-publication attempt against the same retained evidence,
+            # so claiming it again under this same runtime would repeat the same
+            # doomed attempt and spend a whole run re-proving the refusal. Recovered
+            # backport/repair/issue work is different: a fresh owner can reuse its
+            # retry context and still make progress, so it is never suppressed here.
+            _record_request_refusal(
+                state_dir,
+                recovered_request,
+                run_id=evidence_root.name,
+                stage=stage,
+                reason_code=reason_code,
+            )
     return _record_run_outcome(
         state_dir,
         evidence_root,
@@ -5510,6 +5703,10 @@ def reconcile_run(
             if not journal_matches:
                 raise
 
+    # A run with no publication journal, or one whose remote is neither the
+    # captured base nor a descendant of the candidate, is blocked by something
+    # external to this run's own publication.
+    stage, reason_code = "external", "external-blocker"
     if (
         journal_matches
         and journal is not None
@@ -5545,12 +5742,19 @@ def reconcile_run(
             )
             release_lease(state_dir, token)
             return {"status": "success", **result}
+        if journal["phase"] == "prepared" and remote_sha == journal["base_sha"]:
+            # The prepared journal plus an untouched remote proves this run's
+            # own publication was refused, not blocked by an outside cause.
+            # Consumers accept this shape and the historical
+            # external/external-blocker one for runs closed before the
+            # distinction existed.
+            stage, reason_code = "publish", "publish-refused"
 
     outcome = finalize_failure(
         state_dir,
         evidence_root,
-        stage="external",
-        reason_code="external-blocker",
+        stage=stage,
+        reason_code=reason_code,
     )
     release_lease(state_dir, token)
     return outcome
